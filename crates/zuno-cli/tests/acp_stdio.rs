@@ -2049,8 +2049,13 @@ fn acp_session_lifecycle_uses_the_durable_zuno_store() {
             .as_array()
             .and_then(|options| options.iter().find(|option| option["id"] == "agent"))
             .and_then(|option| option["options"].as_array())
-            .is_some_and(|agents| agents.iter().any(|agent| agent["value"] == "plan")),
-        "new session must expose plan in the Agent selector: {created}"
+            .is_some_and(|agents| agents.iter().all(|agent| agent["value"] != "plan")),
+        "Plan must be exposed as a mode rather than a Work Agent: {created}"
+    );
+    assert!(
+        created["modes"]["availableModes"]
+            .as_array()
+            .is_some_and(|modes| modes.iter().any(|mode| mode["id"] == "plan"))
     );
     let commands = read_session_update(&mut stdout);
     assert_eq!(commands["sessionId"], session_id);
@@ -2114,38 +2119,27 @@ fn acp_session_lifecycle_uses_the_durable_zuno_store() {
         projected.is_some(),
         "an active ACP session did not project the newly installed Skill"
     );
-    let selected_plan = request(
+    let (planned, plan_updates) = request_with_all_updates(
         &mut stdin,
         &mut stdout,
         3,
-        "session/set_config_option",
-        json!({"sessionId": session_id, "configId": "agent", "value": "plan"}),
+        "session/set_mode",
+        json!({"sessionId": session_id, "modeId": "plan"}),
     );
-    assert!(
-        selected_plan["configOptions"]
-            .as_array()
-            .is_some_and(|options| {
-                options
-                    .iter()
-                    .any(|option| option["id"] == "agent" && option["currentValue"] == "plan")
-            })
-    );
-    let plan_updates = (0..3)
-        .map(|_| read_session_update(&mut stdout)["update"].clone())
-        .collect::<Vec<_>>();
+    assert_eq!(planned, json!({}));
     assert!(plan_updates.iter().any(|update| {
         update["sessionUpdate"] == "current_mode_update" && update["currentModeId"] == "plan"
     }));
     assert!(plan_updates.iter().any(|update| {
         update["sessionUpdate"] == "config_option_update"
             && update["configOptions"].as_array().is_some_and(|options| {
-                options
-                    .iter()
-                    .any(|option| option["id"] == "agent" && option["currentValue"] == "plan")
+                options.iter().any(|option| {
+                    option["id"] == "agent" && option["currentValue"] == "orchestrator"
+                })
             })
     }));
 
-    let selected_deep = request(
+    let (selected_deep, deep_updates) = request_with_all_updates(
         &mut stdin,
         &mut stdout,
         4,
@@ -2161,22 +2155,22 @@ fn acp_session_lifecycle_uses_the_durable_zuno_store() {
                     .any(|option| option["id"] == "agent" && option["currentValue"] == "deep")
             })
     );
-    let deep_updates = (0..3)
-        .map(|_| read_session_update(&mut stdout)["update"].clone())
-        .collect::<Vec<_>>();
     assert!(deep_updates.iter().any(|update| {
-        update["sessionUpdate"] == "current_mode_update" && update["currentModeId"] == "build"
+        update["sessionUpdate"] == "current_mode_update" && update["currentModeId"] == "plan"
     }));
-    assert!(deep_updates.iter().any(|update| {
-        update["sessionUpdate"] == "config_option_update"
-            && update["configOptions"].as_array().is_some_and(|options| {
-                options
-                    .iter()
-                    .any(|option| option["id"] == "agent" && option["currentValue"] == "deep")
-            })
-    }));
+    assert!(
+        deep_updates.iter().any(|update| {
+            update["sessionUpdate"] == "config_option_update"
+                && update["configOptions"].as_array().is_some_and(|options| {
+                    options
+                        .iter()
+                        .any(|option| option["id"] == "agent" && option["currentValue"] == "deep")
+                })
+        }),
+        "{deep_updates:?}"
+    );
 
-    let planned = request(
+    let (planned, mode_plan_updates) = request_with_all_updates(
         &mut stdin,
         &mut stdout,
         5,
@@ -2184,30 +2178,7 @@ fn acp_session_lifecycle_uses_the_durable_zuno_store() {
         json!({"sessionId": session_id, "modeId": "plan"}),
     );
     assert_eq!(planned, json!({}));
-    let mode_plan_updates = (0..3)
-        .map(|_| read_session_update(&mut stdout)["update"].clone())
-        .collect::<Vec<_>>();
     assert!(mode_plan_updates.iter().any(|update| {
-        update["sessionUpdate"] == "config_option_update"
-            && update["configOptions"].as_array().is_some_and(|options| {
-                options
-                    .iter()
-                    .any(|option| option["id"] == "agent" && option["currentValue"] == "plan")
-            })
-    }));
-
-    let building = request(
-        &mut stdin,
-        &mut stdout,
-        6,
-        "session/set_mode",
-        json!({"sessionId": session_id, "modeId": "build"}),
-    );
-    assert_eq!(building, json!({}));
-    let mode_build_updates = (0..3)
-        .map(|_| read_session_update(&mut stdout)["update"].clone())
-        .collect::<Vec<_>>();
-    assert!(mode_build_updates.iter().any(|update| {
         update["sessionUpdate"] == "config_option_update"
             && update["configOptions"].as_array().is_some_and(|options| {
                 options
@@ -2215,6 +2186,20 @@ fn acp_session_lifecycle_uses_the_durable_zuno_store() {
                     .any(|option| option["id"] == "agent" && option["currentValue"] == "deep")
             })
     }));
+
+    let building = request_failure(
+        &mut stdin,
+        &mut stdout,
+        6,
+        "session/set_mode",
+        json!({"sessionId": session_id, "modeId": "build"}),
+    );
+    assert_eq!(building["code"], -32602);
+    assert!(
+        building["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("no durable Plan"))
+    );
 
     let listed = request(
         &mut stdin,
@@ -2228,8 +2213,8 @@ fn acp_session_lifecycle_uses_the_durable_zuno_store() {
             .as_array()
             .is_some_and(|sessions| sessions
                 .iter()
-                .all(|session| session["sessionId"] != session_id)),
-        "opening and configuring an unused ACP panel created durable history: {listed}"
+                .any(|session| session["sessionId"] == session_id)),
+        "entering durable Plan mode must materialize the session: {listed}"
     );
 
     request(
@@ -2249,7 +2234,7 @@ fn acp_session_lifecycle_uses_the_durable_zuno_store() {
     assert!(after_close["sessions"].as_array().is_some_and(|sessions| {
         sessions
             .iter()
-            .all(|session| session["sessionId"] != session_id)
+            .any(|session| session["sessionId"] == session_id)
     }));
 
     drop(stdin);
@@ -2264,6 +2249,153 @@ fn acp_session_lifecycle_uses_the_durable_zuno_store() {
             .expect("read ACP stderr");
         panic!("ACP lifecycle process failed: {stderr}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_set_mode_build_authorizes_and_drives_the_exact_plan_without_fake_user_history() {
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(compatible_text_response("implemented"))
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("ACP test root");
+    let config = config_with_second_model(&provider.uri());
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(acp_stderr())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    request_with_all_updates(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/set_mode",
+        json!({"sessionId": &session_id, "modeId": "plan"}),
+    );
+
+    let pool = Arc::new(
+        zuno_db::Pool::open(&zuno_paths::DbLocation::File(
+            root.path().join("zuno-acp.db"),
+        ))
+        .expect("open ACP database"),
+    );
+    let plan = zuno_tools::WorkStateStore::new(Arc::clone(&pool))
+        .update_plan(
+            &session_id,
+            zuno_tools::PlanUpdateParams {
+                expected_revision: None,
+                goal_id: None,
+                title: "Implement the approved change".to_owned(),
+                steps: vec![zuno_tools::PlanStep {
+                    id: "step_implement".to_owned(),
+                    title: "Implement".to_owned(),
+                    status: zuno_tools::PlanStepStatus::InProgress,
+                }],
+            },
+        )
+        .expect("create durable Plan");
+    zuno_session_control::SessionControlService::new(Arc::clone(&pool))
+        .mark_plan_handoff(&session_id, zuno_db::message::now_millis())
+        .expect("mark Plan handoff");
+
+    let (building, updates) = request_with_all_updates(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "session/set_mode",
+        json!({"sessionId": &session_id, "modeId": "build"}),
+    );
+    assert_eq!(building, json!({}));
+    assert!(updates.iter().any(|update| {
+        update["sessionUpdate"] == "current_mode_update" && update["currentModeId"] == "build"
+    }));
+    assert!(updates.iter().any(|update| {
+        update["sessionUpdate"] == "agent_message_chunk"
+            && update["content"]["text"] == "implemented"
+    }));
+
+    let execution = zuno_db::session_execution::SessionExecutionStore::new(Arc::clone(&pool))
+        .get(&session_id)
+        .expect("read execution state")
+        .expect("execution state");
+    assert_eq!(
+        execution.mode,
+        zuno_types::execution::CollaborationMode::Work
+    );
+    assert_eq!(
+        execution.authorized_plan_id.as_deref(),
+        Some(plan.id.as_str())
+    );
+    assert_eq!(execution.authorized_plan_revision, Some(plan.revision));
+    assert!(execution.cycle_id.is_some());
+    let user_messages: i64 = pool
+        .get()
+        .expect("connection")
+        .query_row(
+            "SELECT count(*) FROM message \
+             WHERE session_id = ?1 AND json_extract(data, '$.role') = 'user'",
+            [&session_id],
+            |row| row.get(0),
+        )
+        .expect("count user messages");
+    assert_eq!(
+        user_messages, 0,
+        "Start Work must use UserControl/Recovery instead of manufacturing user history"
+    );
+
+    let requests_after_first_start = provider
+        .received_requests()
+        .await
+        .expect("provider requests after first Start Work")
+        .len();
+    request(
+        &mut stdin,
+        &mut stdout,
+        5,
+        "session/set_mode",
+        json!({"sessionId": &session_id, "modeId": "build"}),
+    );
+    assert_eq!(
+        provider
+            .received_requests()
+            .await
+            .expect("provider requests")
+            .len(),
+        requests_after_first_start,
+        "repeated Start Work for the same cycle must be idempotent"
+    );
+    request(
+        &mut stdin,
+        &mut stdout,
+        6,
+        "session/close",
+        json!({"sessionId": &session_id}),
+    );
+    drop(stdin);
+    assert!(child.wait().expect("wait for ACP process").success());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3198,12 +3330,12 @@ async fn acp_load_recovers_an_active_goal_without_a_retained_user_message() {
         .collect::<Vec<_>>();
     assert_eq!(
         objective_anchors.len(),
-        1,
-        "Goal recovery must create exactly one durable user anchor"
+        0,
+        "Goal recovery must not manufacture a durable user anchor"
     );
     let retained = zuno_engine::r#loop::hydrate_retained_history(&connection, &session_id)
         .expect("hydrate recovered provider history");
-    assert!(zuno_engine::r#loop::has_requested_user_message(&retained));
+    assert!(!zuno_engine::r#loop::has_requested_user_message(&retained));
     assert_eq!(
         connection
             .query_row(
@@ -3213,7 +3345,7 @@ async fn acp_load_recovers_an_active_goal_without_a_retained_user_message() {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count consumed Goal anchors"),
-        1
+        0
     );
     drop(connection);
 
@@ -3353,13 +3485,6 @@ async fn acp_reconfiguration_reuses_mcp_while_load_rebuilds_resources() {
         5,
         "session/set_mode",
         json!({"sessionId": &session_id, "modeId": "plan"}),
-    );
-    request(
-        &mut stdin,
-        &mut stdout,
-        6,
-        "session/set_mode",
-        json!({"sessionId": &session_id, "modeId": "build"}),
     );
     request(
         &mut stdin,

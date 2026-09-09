@@ -11,7 +11,7 @@ pub enum SessionCommand {
     Learn,
     /// Run the isolated learning extractor for the latest turn or full session.
     Reflect,
-    /// Enter Plan mode, or resume Work mode when already planning.
+    /// Enter Plan mode idempotently.
     Plan,
     /// Enter the read-only planning Agent immediately.
     StartPlan,
@@ -53,7 +53,7 @@ impl SessionCommand {
             Self::Goal => "Set, view, or manage the durable session goal",
             Self::Learn => "View or manage durable user experiences and reviewed Skill candidates",
             Self::Reflect => "Extract learning from the latest turn or the durable session",
-            Self::Plan => "Enter Plan mode, or resume Work mode when already planning",
+            Self::Plan => "Enter read-only Plan mode idempotently",
             Self::StartPlan => "Enter read-only Plan mode immediately",
             Self::StartWork => "Resume implementation from the durable plan",
         }
@@ -62,7 +62,10 @@ impl SessionCommand {
     /// Whether the command owns an unparsed argument tail.
     #[must_use]
     pub const fn accepts_arguments(self) -> bool {
-        matches!(self, Self::Goal | Self::Learn | Self::Reflect)
+        matches!(
+            self,
+            Self::Goal | Self::Learn | Self::Reflect | Self::StartWork
+        )
     }
 
     /// Optional completion hint for clients that render command arguments.
@@ -72,7 +75,8 @@ impl SessionCommand {
             Self::Goal => Some("objective | action [value]"),
             Self::Learn => Some("remember|issue|solved|forget|promote|feedback ..."),
             Self::Reflect => Some("turn | session"),
-            Self::Compact | Self::Plan | Self::StartPlan | Self::StartWork => None,
+            Self::StartWork => Some("[--accept-draft-risk <reason>]"),
+            Self::Compact | Self::Plan | Self::StartPlan => None,
         }
     }
 
@@ -156,11 +160,15 @@ mod tests {
             SessionCommand::Goal.input_hint(),
             Some("objective | action [value]")
         );
+        assert!(SessionCommand::StartWork.accepts_arguments());
+        assert_eq!(
+            SessionCommand::StartWork.input_hint(),
+            Some("[--accept-draft-risk <reason>]")
+        );
         for command in [
             SessionCommand::Compact,
             SessionCommand::Plan,
             SessionCommand::StartPlan,
-            SessionCommand::StartWork,
         ] {
             assert!(!command.accepts_arguments(), "{command:?}");
             assert_eq!(command.input_hint(), None, "{command:?}");

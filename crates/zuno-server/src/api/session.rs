@@ -387,6 +387,7 @@ impl DrivenInput {
             }
             DurableInputKind::TuiPrompt
             | DurableInputKind::AcpPrompt
+            | DurableInputKind::SessionControl
             | DurableInputKind::HostMessage => None,
         }
     }

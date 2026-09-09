@@ -13,21 +13,25 @@ The editor launches one process and keeps it. That process is the one serving th
 protocol, so terminating it ends the session and its pipes reach end of file — see
 [One invocation, one process](/cli/#one-invocation-one-process).
 
-Opening Zuno in an Agent Panel calls ACP `session/new`, but that only reserves an
-in-process session id and resolves configuration, commands, Skills, and MCP. It
-does not create a durable Session or make an empty “New Agent Thread” appear in
-`session/list`. Agent, model, Mode, and reasoning choices made before the first
-message stay process-local. The first accepted user prompt or durable native
-command atomically creates the Session with its first input; closing an unused
-panel leaves no history row.
+Opening Zuno in an Agent Panel calls ACP `session/new`, which reserves an
+in-process session id and resolves configuration, commands, Skills, and MCP. An
+ordinary unused panel remains ephemeral. A durable native collaboration control,
+such as entering Plan mode, materializes the Session because its mode, Goal pause,
+and future Work identity must survive restart.
 
 ## Agent, Mode, Plan, and file projection
 
-The Agent selector includes `plan`. `active_agent` is the authoritative state:
-selecting `plan` switches to Plan mode, while selecting `build`,
-`orchestrator`, `deep`, or another implementation Agent switches back to Build
-mode. The inverse Mode change selects the corresponding Agent and publishes
-both `current_mode_update` and `config_option_update`.
+Mode and Agent are independent durable choices. **Mode** owns the Plan/Work
+boundary. The Agent selector contains only implementation Agents; while Plan is
+active it updates the saved Work Agent without leaving the read-only `plan`
+host. Model and reasoning changes update the same future Work identity.
+
+`/plan` and `/start-plan` enter Plan idempotently. `/start-work` and
+`session/set_mode(build)` invoke the same atomic authorization: the exact Plan
+revision must be handoff-ready, a bound review must be Ready unless the user
+supplies `--accept-draft-risk <reason>`, and the saved Agent/provider/model/
+reasoning identity is restored. Idle sessions start immediately; busy sessions
+queue the durable control for the next safe point.
 
 Idle Agent, model, Mode, and reasoning changes atomically replace the turn host.
 The session keeps its connected MCP runtime when the resolved MCP server set and
@@ -51,6 +55,12 @@ Withdrawing a prompt request with `$/cancel_request` before it returns cancels
 the durable row that request admitted, so the withdrawn text never reaches the
 model, and answers that request with `-32800` and `data.admission: "withdrawn"`.
 See [Zed ACP integration](/reference/zed-acp) for the full shape.
+
+Background completion is different from a slash command. Terminal commands,
+subagents, workflows, and product Agents publish a deterministic completion
+envelope and wake the parent automatically. Synchronous `bg wait` is capped at
+60 seconds and competes with callback delivery for one durable owner, preventing
+duplicate turns.
 
 Plan projection is driven by durable work-state revisions, not by recognizing a
 `plan_update` tool call. Each session reads and publishes the authoritative

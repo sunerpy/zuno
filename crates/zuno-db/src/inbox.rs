@@ -6,6 +6,7 @@ use rusqlite::{OptionalExtension, Row, Transaction, params};
 use serde_json::{Map, Value};
 use std::sync::Arc;
 use zuno_error::DbError;
+use zuno_types::execution::InputTriggerKind;
 
 /// When an admitted input should become model-visible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +126,11 @@ pub enum DurableInputKind {
     HumanRequestAnswer,
     /// A durable message sent by one root session to another root or its own child.
     SessionMessage,
+    /// A host-owned collaboration control such as Start Work.
+    ///
+    /// This shape carries a typed continuation token and never becomes a synthetic
+    /// user message.
+    SessionControl,
     /// A turn host message admitted, promoted, and consumed in one transaction.
     ///
     /// This shape carries no `kind` and is never observed pending.
@@ -146,6 +152,7 @@ impl DurableInputKind {
             Some("backgroundExecutionReport") => Some(Self::BackgroundExecutionReport),
             Some("humanRequestAnswer") => Some(Self::HumanRequestAnswer),
             Some("sessionMessage") => Some(Self::SessionMessage),
+            Some("sessionControl") => Some(Self::SessionControl),
             Some(_) => None,
             None => prompt.get("message").is_some().then_some(Self::HostMessage),
         }
@@ -165,6 +172,7 @@ impl DurableInputKind {
             Self::BackgroundExecutionReport => Some("backgroundExecutionReport"),
             Self::HumanRequestAnswer => Some("humanRequestAnswer"),
             Self::SessionMessage => Some("sessionMessage"),
+            Self::SessionControl => Some("sessionControl"),
             Self::HostMessage => None,
         }
     }
@@ -199,6 +207,7 @@ impl DurableInputKind {
             | Self::CouncilReport
             | Self::BackgroundExecutionReport => prompt.get("text").and_then(Value::as_str),
             Self::TuiPrompt | Self::User | Self::HostMessage => None,
+            Self::SessionControl => None,
         }
     }
 
@@ -220,6 +229,7 @@ impl DurableInputKind {
             | Self::WorkflowReport
             | Self::CouncilReport
             | Self::BackgroundExecutionReport => None,
+            Self::SessionControl => None,
         }
     }
 }
@@ -235,6 +245,12 @@ pub struct NewSessionInput {
     pub prompt: Value,
     /// Requested delivery behavior.
     pub delivery: InputDelivery,
+    /// Deterministic producer identity used for idempotent admission.
+    pub source_key: Option<String>,
+    /// Typed reason this input may start or steer a turn.
+    pub trigger_kind: InputTriggerKind,
+    /// Durable execution cycle associated with this input.
+    pub cycle_id: Option<String>,
     /// Creation timestamp in milliseconds since the Unix epoch.
     pub time_created: i64,
 }
@@ -254,8 +270,29 @@ impl NewSessionInput {
             session_id: session_id.into(),
             prompt,
             delivery,
+            source_key: None,
+            trigger_kind: InputTriggerKind::Legacy,
+            cycle_id: None,
             time_created,
         }
+    }
+
+    #[must_use]
+    pub fn with_source_key(mut self, source_key: impl Into<String>) -> Self {
+        self.source_key = Some(source_key.into());
+        self
+    }
+
+    #[must_use]
+    pub const fn with_trigger_kind(mut self, trigger_kind: InputTriggerKind) -> Self {
+        self.trigger_kind = trigger_kind;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cycle_id(mut self, cycle_id: Option<impl Into<String>>) -> Self {
+        self.cycle_id = cycle_id.map(Into::into);
+        self
     }
 }
 
@@ -270,6 +307,9 @@ pub struct SessionInput {
     pub prompt: Value,
     /// Requested delivery behavior.
     pub delivery: InputDelivery,
+    pub source_key: Option<String>,
+    pub trigger_kind: InputTriggerKind,
+    pub cycle_id: Option<String>,
     /// Current durable lifecycle state.
     pub state: SubmissionState,
     /// Optimistic revision used by queue edits and cancellation.
@@ -346,7 +386,8 @@ impl SessionInbox {
             let stored = transaction
                 .query_row(
                     "SELECT id, session_id, prompt, delivery, state, revision, admitted_seq, \
-                            promoted_seq, error, time_created, time_updated \
+                            promoted_seq, error, source_key, trigger_kind, cycle_id, \
+                            time_created, time_updated \
                      FROM session_input \
                      WHERE session_id = ?1 AND id = ?2 AND state IN ('queued', 'steering')",
                     params![session_id, input_id],
@@ -412,6 +453,16 @@ impl SessionInbox {
     pub fn get(&self, session_id: &str, input_id: &str) -> Result<Option<SessionInput>, DbError> {
         let connection = self.pool.get()?;
         select_by_id(&connection, session_id, input_id)
+    }
+
+    /// Read one input by its deterministic producer identity.
+    pub fn get_by_source_key(
+        &self,
+        session_id: &str,
+        source_key: &str,
+    ) -> Result<Option<SessionInput>, DbError> {
+        let connection = self.pool.get()?;
+        select_by_source_key(&connection, session_id, source_key)
     }
 
     /// Replace one still-pending prompt using optimistic concurrency.
@@ -520,6 +571,24 @@ pub(crate) fn validate_input(input: &NewSessionInput) -> Result<(), DbError> {
             "input id and session id must not be empty",
         )));
     }
+    if input
+        .source_key
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty() || value.chars().count() > 512)
+    {
+        return Err(query_error(std::io::Error::other(
+            "input source_key must contain 1 to 512 characters",
+        )));
+    }
+    if input
+        .cycle_id
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty() || value.chars().count() > 128)
+    {
+        return Err(query_error(std::io::Error::other(
+            "input cycle_id must contain 1 to 128 characters",
+        )));
+    }
     Ok(())
 }
 
@@ -532,6 +601,12 @@ pub fn admit_in(
     transaction: &Transaction<'_>,
     input: NewSessionInput,
 ) -> Result<SessionInput, DbError> {
+    validate_input(&input)?;
+    if let Some(source_key) = input.source_key.as_deref()
+        && let Some(existing) = select_by_source_key(transaction, &input.session_id, source_key)?
+    {
+        return Ok(existing);
+    }
     let event = append_in(
         transaction,
         &input.session_id,
@@ -543,8 +618,8 @@ pub fn admit_in(
         .execute(
             "INSERT INTO session_input \
              (id, session_id, prompt, delivery, state, revision, admitted_seq, promoted_seq, \
-              error, time_created, time_updated) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, NULL, NULL, ?7, ?7)",
+              error, source_key, trigger_kind, cycle_id, time_created, time_updated) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, NULL, NULL, ?7, ?8, ?9, ?10, ?10)",
             params![
                 input.id,
                 input.session_id,
@@ -552,6 +627,9 @@ pub fn admit_in(
                 input.delivery.as_str(),
                 state.as_str(),
                 event.sequence,
+                input.source_key,
+                input.trigger_kind.as_str(),
+                input.cycle_id,
                 input.time_created
             ],
         )
@@ -561,6 +639,9 @@ pub fn admit_in(
         session_id: input.session_id,
         prompt: input.prompt,
         delivery: input.delivery,
+        source_key: input.source_key,
+        trigger_kind: input.trigger_kind,
+        cycle_id: input.cycle_id,
         state,
         revision: 1,
         admitted_sequence: event.sequence,
@@ -605,7 +686,8 @@ fn select_next(
         Some(delivery) => transaction
             .query_row(
                 "SELECT id, session_id, prompt, delivery, state, revision, admitted_seq, \
-                        promoted_seq, error, time_created, time_updated \
+                        promoted_seq, error, source_key, trigger_kind, cycle_id, \
+                        time_created, time_updated \
                  FROM session_input \
                  WHERE session_id = ?1 AND state IN ('queued', 'steering') AND delivery = ?2 \
                  ORDER BY admitted_seq LIMIT 1",
@@ -617,7 +699,8 @@ fn select_next(
         None => transaction
             .query_row(
                 "SELECT id, session_id, prompt, delivery, state, revision, admitted_seq, \
-                        promoted_seq, error, time_created, time_updated \
+                        promoted_seq, error, source_key, trigger_kind, cycle_id, \
+                        time_created, time_updated \
                  FROM session_input \
                  WHERE session_id = ?1 AND state IN ('queued', 'steering') \
                  ORDER BY admitted_seq LIMIT 1",
@@ -683,6 +766,9 @@ struct StoredInput {
     admitted_sequence: i64,
     promoted_sequence: Option<i64>,
     error: Option<String>,
+    source_key: Option<String>,
+    trigger_kind: String,
+    cycle_id: Option<String>,
     time_created: i64,
     time_updated: i64,
 }
@@ -698,8 +784,11 @@ fn decode_stored_input(row: &Row<'_>) -> rusqlite::Result<StoredInput> {
         admitted_sequence: row.get(6)?,
         promoted_sequence: row.get(7)?,
         error: row.get(8)?,
-        time_created: row.get(9)?,
-        time_updated: row.get(10)?,
+        source_key: row.get(9)?,
+        trigger_kind: row.get(10)?,
+        cycle_id: row.get(11)?,
+        time_created: row.get(12)?,
+        time_updated: row.get(13)?,
     })
 }
 
@@ -709,6 +798,14 @@ fn decode_input(stored: StoredInput) -> Result<SessionInput, DbError> {
         session_id: stored.session_id,
         prompt: serde_json::from_str(&stored.prompt).map_err(query_error)?,
         delivery: InputDelivery::parse(&stored.delivery)?,
+        source_key: stored.source_key,
+        trigger_kind: InputTriggerKind::parse(&stored.trigger_kind).ok_or_else(|| {
+            query_error(std::io::Error::other(format!(
+                "unknown input trigger kind `{}`",
+                stored.trigger_kind
+            )))
+        })?,
+        cycle_id: stored.cycle_id,
         state: SubmissionState::parse(&stored.state)?,
         revision: stored.revision,
         admitted_sequence: stored.admitted_sequence,
@@ -720,7 +817,7 @@ fn decode_input(stored: StoredInput) -> Result<SessionInput, DbError> {
 }
 
 fn event_properties_new(input: &NewSessionInput) -> Map<String, Value> {
-    [
+    let mut properties = [
         ("inputID".to_owned(), Value::String(input.id.clone())),
         (
             "sessionID".to_owned(),
@@ -737,12 +834,23 @@ fn event_properties_new(input: &NewSessionInput) -> Map<String, Value> {
         ),
         ("revision".to_owned(), Value::Number(1.into())),
         (
+            "triggerKind".to_owned(),
+            Value::String(input.trigger_kind.as_str().to_owned()),
+        ),
+        (
             "timeCreated".to_owned(),
             Value::Number(input.time_created.into()),
         ),
     ]
     .into_iter()
-    .collect()
+    .collect::<Map<_, _>>();
+    if let Some(source_key) = &input.source_key {
+        properties.insert("sourceKey".to_owned(), Value::String(source_key.clone()));
+    }
+    if let Some(cycle_id) = &input.cycle_id {
+        properties.insert("cycleID".to_owned(), Value::String(cycle_id.clone()));
+    }
+    properties
 }
 
 fn event_properties(input: &SessionInput, include_prompt: bool) -> Map<String, Value> {
@@ -762,6 +870,10 @@ fn event_properties(input: &SessionInput, include_prompt: bool) -> Map<String, V
         ),
         ("revision".to_owned(), Value::Number(input.revision.into())),
         (
+            "triggerKind".to_owned(),
+            Value::String(input.trigger_kind.as_str().to_owned()),
+        ),
+        (
             "timeUpdated".to_owned(),
             Value::Number(input.time_updated.into()),
         ),
@@ -774,6 +886,12 @@ fn event_properties(input: &SessionInput, include_prompt: bool) -> Map<String, V
     if let Some(error) = &input.error {
         properties.insert("error".to_owned(), Value::String(error.clone()));
     }
+    if let Some(source_key) = &input.source_key {
+        properties.insert("sourceKey".to_owned(), Value::String(source_key.clone()));
+    }
+    if let Some(cycle_id) = &input.cycle_id {
+        properties.insert("cycleID".to_owned(), Value::String(cycle_id.clone()));
+    }
     properties
 }
 
@@ -785,9 +903,30 @@ fn select_by_id(
     connection
         .query_row(
             "SELECT id, session_id, prompt, delivery, state, revision, admitted_seq, \
-                    promoted_seq, error, time_created, time_updated \
+                    promoted_seq, error, source_key, trigger_kind, cycle_id, \
+                    time_created, time_updated \
              FROM session_input WHERE session_id = ?1 AND id = ?2",
             params![session_id, input_id],
+            decode_stored_input,
+        )
+        .optional()
+        .map_err(open::map_error)?
+        .map(decode_input)
+        .transpose()
+}
+
+fn select_by_source_key(
+    connection: &rusqlite::Connection,
+    session_id: &str,
+    source_key: &str,
+) -> Result<Option<SessionInput>, DbError> {
+    connection
+        .query_row(
+            "SELECT id, session_id, prompt, delivery, state, revision, admitted_seq, \
+                    promoted_seq, error, source_key, trigger_kind, cycle_id, \
+                    time_created, time_updated \
+             FROM session_input WHERE session_id = ?1 AND source_key = ?2",
+            params![session_id, source_key],
             decode_stored_input,
         )
         .optional()
@@ -817,7 +956,8 @@ pub fn pending_in(
     let mut statement = connection
         .prepare(
             "SELECT id, session_id, prompt, delivery, state, revision, admitted_seq, \
-                    promoted_seq, error, time_created, time_updated \
+                    promoted_seq, error, source_key, trigger_kind, cycle_id, \
+                    time_created, time_updated \
              FROM session_input \
              WHERE session_id = ?1 AND state IN ('queued', 'steering') \
              ORDER BY admitted_seq",
@@ -842,7 +982,8 @@ pub(crate) fn unconsumed_in(
     let mut statement = connection
         .prepare(
             "SELECT id, session_id, prompt, delivery, state, revision, admitted_seq, \
-                    promoted_seq, error, time_created, time_updated \
+                    promoted_seq, error, source_key, trigger_kind, cycle_id, \
+                    time_created, time_updated \
              FROM session_input \
              WHERE session_id = ?1 AND state IN ('queued', 'steering', 'promoted') \
              ORDER BY admitted_seq",

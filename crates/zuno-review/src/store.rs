@@ -1,9 +1,9 @@
 use crate::{
     ActorRef, ClaimKind, ClaimPriority, ClaimStatus, DelegationEvidenceReport, EvidenceAnchor,
     MAX_CLAIM_STATEMENT_CHARS, MAX_EVIDENCE_ANCHORS, MAX_LOAD_BEARING_CLAIMS, NewReviewClaim,
-    ReviewBlocker, ReviewClaim, ReviewDelegateReceipt, ReviewFinalizeOutcome, ReviewIssue,
-    ReviewIssueKind, ReviewReadiness, ReviewReceipt, ReviewSourceSnapshot, ReviewStatus,
-    ReviewVerificationReceipt, delegation_report_digest,
+    PlanReviewGate, ReviewBlocker, ReviewClaim, ReviewDelegateReceipt, ReviewFinalizeOutcome,
+    ReviewIssue, ReviewIssueKind, ReviewReadiness, ReviewReceipt, ReviewSourceSnapshot,
+    ReviewStatus, ReviewVerificationReceipt, delegation_report_digest,
 };
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -235,6 +235,84 @@ impl ReviewStore {
         Ok(projection_in(&connection, session_id, review_id)?
             .map(|value| value.claims)
             .unwrap_or_default())
+    }
+
+    /// Read the implementation gate for one exact durable Plan revision.
+    ///
+    /// The result is rebuilt from committed review events. When more than one
+    /// review is bound to the Plan, the newest `review.started` sequence owns
+    /// the gate even if an older review receives a later claim or finalize
+    /// event.
+    pub fn plan_review_gate(
+        &self,
+        session_id: &str,
+        plan_id: &str,
+        plan_revision: i64,
+    ) -> Result<PlanReviewGate, ReviewError> {
+        let connection = self.pool.get()?;
+        Self::plan_review_gate_in(&connection, session_id, plan_id, plan_revision)
+    }
+
+    /// Read a Plan review gate through a caller-owned SQLite snapshot.
+    ///
+    /// A [`zuno_db::Transaction`] dereferences to [`Connection`], allowing a
+    /// Start Work authorization to observe the Plan, review gate, Goal, and
+    /// session execution state inside the same transaction.
+    pub fn plan_review_gate_in(
+        connection: &Connection,
+        session_id: &str,
+        plan_id: &str,
+        plan_revision: i64,
+    ) -> Result<PlanReviewGate, ReviewError> {
+        let mut latest: Option<(i64, String)> = None;
+        for event in read_of_type_after_in(connection, session_id, REVIEW_STARTED_EVENT, None)? {
+            let payload: StartedPayload = decode_payload(&event)?;
+            if payload.review_id != payload.readiness.review_id {
+                return Err(corrupt(
+                    &event,
+                    "started payload review_id does not match readiness.review_id",
+                ));
+            }
+            if payload.readiness.session_id != session_id {
+                return Err(corrupt(
+                    &event,
+                    "started payload session_id does not match the owning event stream",
+                ));
+            }
+            if payload.readiness.plan_id.as_deref() == Some(plan_id)
+                && payload.readiness.plan_revision == Some(plan_revision)
+                && latest
+                    .as_ref()
+                    .is_none_or(|(sequence, _)| event.sequence > *sequence)
+            {
+                latest = Some((event.sequence, payload.review_id));
+            }
+        }
+        let Some((_, review_id)) = latest else {
+            return Ok(PlanReviewGate::Unbound);
+        };
+        let projection = require_projection(connection, session_id, &review_id)?;
+        if projection.readiness.review_id != review_id
+            || projection.readiness.session_id != session_id
+            || projection.readiness.plan_id.as_deref() != Some(plan_id)
+            || projection.readiness.plan_revision != Some(plan_revision)
+        {
+            return Err(ReviewError::CorruptEvent {
+                event_type: "review projection".to_owned(),
+                detail: "the reconstructed review changed its durable Plan binding".to_owned(),
+            });
+        }
+        let review_revision = projection.readiness.revision;
+        Ok(match projection.readiness.status {
+            ReviewStatus::Draft => PlanReviewGate::Draft {
+                review_id,
+                review_revision,
+            },
+            ReviewStatus::Ready => PlanReviewGate::Ready {
+                review_id,
+                review_revision,
+            },
+        })
     }
 
     pub fn record_claim(

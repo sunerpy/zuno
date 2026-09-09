@@ -43,6 +43,7 @@ use zuno_orchestration::{
     PackIdentity, sha256_text,
 };
 use zuno_tool::{ToolDefinition, ToolOutput, ToolUiIntent};
+use zuno_types::execution::{CollaborationMode, ContinuationToken};
 
 const SESSION_ID: &str = "ses_loop_test";
 
@@ -1523,6 +1524,96 @@ async fn goal_turn_uses_current_host_identity_and_preserves_the_historical_ancho
             && attempt["providerID"] == "fake"
             && attempt["modelID"] == "fake-model"
     }));
+}
+
+#[tokio::test]
+async fn automatic_and_recovery_turns_do_not_require_a_retained_user_message() {
+    for (turn_id, start, expected_trigger, expected_cycle) in [
+        (
+            "turn-goal-without-user",
+            TurnStart::GoalContinuation {
+                goal_id: "goal-no-user".to_owned(),
+                goal_revision: 3,
+                identity: TurnExecutionIdentity::new("build", "fake", "fake-model"),
+            },
+            "goal",
+            None,
+        ),
+        (
+            "turn-recovery-without-user",
+            TurnStart::Recovery {
+                continuation: ContinuationToken {
+                    cycle_id: "cycle-recovery".to_owned(),
+                    identity: TurnExecutionIdentity::new("build", "fake", "fake-model"),
+                    mode: CollaborationMode::Work,
+                    plan_id: Some("plan_1".to_owned()),
+                    plan_revision: Some(4),
+                    context_epoch: 2,
+                    anchor_message_id: None,
+                },
+            },
+            "recovery",
+            Some("cycle-recovery"),
+        ),
+    ] {
+        let mut connection = seeded();
+        let provider = Arc::new(FakeProvider::new(vec![ScriptedResponse::complete(vec![
+            StreamEvent::TextDelta("continued without a user row".to_owned()),
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::Stop),
+            },
+        ])]));
+        let providers = registry(&provider);
+        let resolver = FakeResolver;
+        let dispatcher = FakeDispatcher::default();
+        let interrupt = InterruptSignal::new();
+        let (sender, receiver) = event_channel();
+        let turn = run_turn(
+            request(turn_id).with_start(start),
+            TurnContext::new(
+                &mut connection,
+                &providers,
+                &resolver,
+                &dispatcher,
+                &interrupt,
+            ),
+            sender,
+        );
+        let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+
+        assert!(matches!(
+            outcome,
+            Ok(TurnOutcome::Completed { steps: 1, .. })
+        ));
+        let history = MessageStore::new(&connection)
+            .hydrate_session(SESSION_ID)
+            .expect("hydrate recovered turn");
+        let assistant = history
+            .iter()
+            .find(|message| message.info.role == zuno_db::message::MessageRole::Assistant)
+            .expect("assistant response");
+        assert!(
+            assistant.info.data.get("parentID").is_none(),
+            "recovery fabricated a user parent: {:?}",
+            assistant.info.data
+        );
+        let event: String = connection
+            .query_row(
+                "SELECT data FROM event \
+                 WHERE aggregate_id = ?1 AND type = 'session.turn.started.1' \
+                 ORDER BY seq DESC LIMIT 1",
+                [SESSION_ID],
+                |row| row.get(0),
+            )
+            .expect("turn started event");
+        let event: Value = serde_json::from_str(&event).expect("turn event JSON");
+        assert_eq!(event["turnTrigger"], expected_trigger);
+        match expected_cycle {
+            Some(cycle) => assert_eq!(event["cycleID"], cycle),
+            None => assert!(event.get("cycleID").is_none()),
+        }
+        assert!(event.get("anchorMessageID").is_none());
+    }
 }
 
 #[tokio::test]

@@ -183,9 +183,9 @@ cannot shadow a runtime control.
 | --- | --- |
 | `/compact` | Compact history through the durable compaction pipeline |
 | `/goal [objective \| action]` | Set, view, or manage the durable session goal; use `/goal help` for syntax |
-| `/plan` | Enter Plan mode, or confirm starting work when already planning |
+| `/plan` | Enter Plan mode idempotently |
 | `/start-plan` | Enter read-only Plan mode immediately |
-| `/start-work` | Review the durable plan and confirm implementation |
+| `/start-work` | Authorize the exact handoff-ready Plan revision and start implementation |
 | `/preset` | Switch the configured model team, or choose one |
 | `/council` | Run a native multi-agent Council preset |
 | `/undo` | Restore the worktree before the last completed turn |

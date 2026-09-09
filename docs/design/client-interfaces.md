@@ -357,12 +357,13 @@ The TUI favors dense, keyboard-first operation:
   `compaction.auto: false` disables that proactive trigger without removing
   manual compaction or bounded context-limit recovery;
 - `/plan`, `/start-plan`, and `/start-work` are native collaboration-mode
-  controls. ACP publishes standard mode/config updates after a transactional
-  host replacement, while the TUI keeps its explicit confirmation surface.
-  Neither path may return from Plan to Work without a durable plan. Entering Plan
-  atomically records `paused(plan_mode)` for an active Goal; Start Work only clears
-  that reason and cannot silently resume a Goal waiting on credentials, a human
-  request, permission, interruption review, or uncertain-side-effect inspection;
+  controls. Plan entry is idempotent and Agent selection is independent from
+  mode. ACP publishes standard mode/config updates, while the TUI keeps its
+  explicit confirmation surface. Neither path may return from Plan to Work
+  without an exact handoff-ready Plan revision. Entering Plan atomically records
+  `paused(plan_mode)` for an active Goal; Start Work records durable Work
+  authority and a `UserControl` continuation rather than fabricating a user
+  message. A bound Draft review requires explicit persisted risk acceptance;
 - the same session list owns row actions: `Ctrl+R` opens a pre-filled rename
   prompt, while `Ctrl+D` must be pressed twice on the same row before deletion.
   Both actions are revalidated by the host and use the transactional session

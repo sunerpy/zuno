@@ -194,7 +194,12 @@ Plan 模式总是激活只读的 `plan` Agent。回到 Build 模式会恢复所�
 
 该命令的输出投影为一条普通的 Agent 消息，而不是推理内容；显式 action 的非法参数会返回 JSON-RPC invalid params，而不是内部会话错误。创建或编辑成功后会立即推进 active Goal；新会话会先把目标持久化为首个 user turn anchor，字面的斜杠命令不会进入 provider 输入。
 
-`/plan` 在 Build 与 Plan 之间切换。`/start-plan` 直接进入只读的 Plan 模式，而 `/start-work` 返回 Build。离开 Plan 需要存在一个持久 plan，因此过早的交接会显式失败，而不是削弱模式边界。成功的更改会发出 ACP 的 `current_mode_update` 与 `config_option_update` 通知，让 Zed 的选择器保持同步。这些原生命令都不会被发送给模型。
+`/plan` 与 `/start-plan` 都会幂等进入只读 Plan，Agent selector 只更新未来 Work Agent，
+不会退出 Plan。`/start-work` 是斜杠命令中唯一的 Build 交接：当前精确 Plan revision 必须
+handoff-ready；绑定 Draft review 时默认拒绝，除非用户提供
+`--accept-draft-risk <原因>`。成功后恢复保存的 Agent/provider/model/reasoning，并发出
+`current_mode_update` 与 `config_option_update`。控制本身以 `UserControl` turn 启动，
+不会伪造 user message。
 
 执行 `/name arguments` 使用 Zuno 已有的命令模板或 Skill driver，包括常规的权限与持久会话行为。ACP 不会创建产品特定的 `/dual-review`、`/auto-release` 或其他工作流；用户可以在自己的命令或 Skill 目录中定义它们。
 

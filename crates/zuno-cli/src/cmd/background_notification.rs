@@ -11,24 +11,28 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox, SessionInput, SubmissionState};
+use zuno_db::completion_delivery::CompletionDeliveryStore;
+use zuno_db::inbox::{InputDelivery, NewSessionInput};
+use zuno_db::inbox::{SessionInbox, SessionInput, SubmissionState};
 use zuno_db::job::AgentJobStore;
 use zuno_engine::status::SessionRunRegistry;
-use zuno_pty::{
-    BackgroundExecutionEvent, BackgroundExecutionInfo, BackgroundExecutionPurpose,
-    BackgroundExecutionService,
-};
+use zuno_pty::{BackgroundExecutionEvent, BackgroundExecutionInfo, BackgroundExecutionService};
+use zuno_types::execution::{CompletionSource, InputTriggerKind};
 
 use super::child_turn::{ParentReportWake, wake_parent_report};
 
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
+const INLINE_WAIT_GRACE: Duration = Duration::from_millis(25);
 
 #[derive(Clone)]
 struct NotificationTarget {
     inbox: SessionInbox,
+    completion: CompletionDeliveryStore,
     jobs: AgentJobStore,
     runs: SessionRunRegistry,
     wake: Arc<dyn ParentReportWake>,
@@ -38,6 +42,7 @@ pub(super) struct BackgroundNotificationRegistration {
     pub(super) service: Arc<BackgroundExecutionService>,
     pub(super) session_id: String,
     pub(super) inbox: SessionInbox,
+    pub(super) completion: CompletionDeliveryStore,
     pub(super) jobs: AgentJobStore,
     pub(super) runs: SessionRunRegistry,
     pub(super) wake: Arc<dyn ParentReportWake>,
@@ -118,6 +123,7 @@ impl BackgroundNotificationRegistry {
             service,
             session_id,
             inbox,
+            completion,
             jobs,
             runs,
             wake,
@@ -128,6 +134,7 @@ impl BackgroundNotificationRegistry {
         };
         let target = NotificationTarget {
             inbox,
+            completion,
             jobs,
             runs,
             wake,
@@ -316,66 +323,18 @@ async fn reconcile(
 /// the same delivery covers it. A conflicting or unwritable row is logged and left for
 /// the next scan rather than replaced.
 fn admit_execution(target: &NotificationTarget, info: &BackgroundExecutionInfo) {
-    let input_id = format!("msg_{}", info.id.as_str());
-    let input = match target.inbox.get(&info.session_id, &input_id) {
-        Ok(Some(input)) => match validate_execution_input(&input, info.id.as_str()) {
-            Ok(()) => input,
-            Err(error) => {
-                tracing::error!(
-                    execution_id = %info.id,
-                    input_id,
-                    %error,
-                    "background completion input identity conflicts with durable state"
-                );
-                return;
-            }
-        },
-        Ok(None) => {
-            let candidate = execution_input(info);
-            match target.inbox.admit(candidate) {
-                Ok(input) => input,
-                Err(error) => match target.inbox.get(&info.session_id, &input_id) {
-                    Ok(Some(input))
-                        if validate_execution_input(&input, info.id.as_str()).is_ok() =>
-                    {
-                        input
-                    }
-                    _ => {
-                        tracing::error!(
-                            execution_id = %info.id,
-                            input_id,
-                            %error,
-                            "could not admit durable background completion input"
-                        );
-                        return;
-                    }
-                },
-            }
-        }
-        Err(error) => {
-            tracing::error!(
-                execution_id = %info.id,
-                input_id,
-                %error,
-                "could not inspect durable background completion input"
-            );
-            return;
-        }
-    };
-
-    if input.state == SubmissionState::Promoted {
-        let _recovery = match target.runs.begin_recovery(&input.session_id) {
-            Ok(recovery) => recovery,
-            Err(_) => return,
-        };
-        if let Err(error) = target.inbox.recover_promoted(&input.session_id, &input.id) {
-            tracing::error!(
-                execution_id = %info.id,
-                input_id = %input.id,
-                %error,
-                "could not recover promoted background completion input"
-            );
-        }
+    let envelope = zuno_tools::bg::background_completion_envelope(info);
+    let at_ms = info
+        .time_completed
+        .unwrap_or(info.time_updated)
+        .max(info.time_created);
+    if let Err(error) = target.completion.publish(envelope.clone(), at_ms) {
+        tracing::error!(
+            execution_id = %info.id,
+            source_key = %envelope.source_key,
+            %error,
+            "could not publish durable background completion"
+        );
     }
 }
 
@@ -390,6 +349,112 @@ fn admit_execution(target: &NotificationTarget, info: &BackgroundExecutionInfo) 
 ///
 /// A report the wake cannot place stays pending, and the next scan retries it.
 async fn deliver_pending_inputs(session_id: &str, target: &NotificationTarget) {
+    let unclaimed = match target.completion.unclaimed_for_session(session_id) {
+        Ok(unclaimed) => unclaimed,
+        Err(error) => {
+            tracing::error!(
+                session_id,
+                %error,
+                "could not inspect unclaimed terminal completions"
+            );
+            return;
+        }
+    };
+    if !unclaimed.is_empty() && target.runs.active_sessions().contains(session_id) {
+        // A synchronous `bg wait` runs inside the active turn. Give it one short,
+        // bounded chance to claim inline before callback delivery injects the same
+        // terminal fact back into that turn.
+        tokio::time::sleep(INLINE_WAIT_GRACE).await;
+    }
+    let unclaimed = match target.completion.unclaimed_for_session(session_id) {
+        Ok(unclaimed) => unclaimed,
+        Err(error) => {
+            tracing::error!(
+                session_id,
+                %error,
+                "could not refresh unclaimed terminal completions"
+            );
+            return;
+        }
+    };
+    for delivery in unclaimed {
+        if delivery.envelope.source != CompletionSource::BackgroundExecution {
+            continue;
+        }
+        let Some(execution_id) = delivery
+            .envelope
+            .payload
+            .get("executionID")
+            .and_then(Value::as_str)
+        else {
+            tracing::error!(
+                source_key = %delivery.envelope.source_key,
+                "background completion payload has no executionID"
+            );
+            continue;
+        };
+        let input_id = format!("msg_{execution_id}");
+        let existing = match target.inbox.get(session_id, &input_id) {
+            Ok(existing) => existing,
+            Err(error) => {
+                tracing::error!(
+                    source_key = %delivery.envelope.source_key,
+                    input_id,
+                    %error,
+                    "could not inspect callback completion input"
+                );
+                continue;
+            }
+        };
+        let recovery = if existing
+            .as_ref()
+            .is_some_and(|input| input.state == SubmissionState::Promoted)
+        {
+            match target.runs.begin_recovery(session_id) {
+                Ok(recovery) => Some(recovery),
+                Err(_) => continue,
+            }
+        } else {
+            None
+        };
+        let input = NewSessionInput::new(
+            input_id,
+            session_id,
+            delivery.envelope.payload.clone(),
+            InputDelivery::Steer,
+            delivery.time_created,
+        )
+        .with_source_key(delivery.envelope.source_key.clone())
+        .with_trigger_kind(InputTriggerKind::Automatic)
+        .with_cycle_id(delivery.envelope.cycle_id.clone());
+        let claimed = match target.completion.claim_callback(
+            &delivery.envelope.source_key,
+            input,
+            delivery.time_updated,
+        ) {
+            Ok(Some((_claimed, input))) => input,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::error!(
+                    source_key = %delivery.envelope.source_key,
+                    %error,
+                    "could not claim terminal completion for callback delivery"
+                );
+                continue;
+            }
+        };
+        if claimed.state == SubmissionState::Promoted
+            && let Err(error) = target.inbox.recover_promoted(session_id, &claimed.id)
+        {
+            tracing::error!(
+                source_key = %delivery.envelope.source_key,
+                input_id = %claimed.id,
+                %error,
+                "could not recover promoted background completion input"
+            );
+        }
+        drop(recovery);
+    }
     let pending = match target.inbox.pending(session_id) {
         Ok(pending) => pending,
         Err(error) => {
@@ -433,76 +498,6 @@ async fn wake_with_retry(wake: &dyn ParentReportWake, input: SessionInput) {
             "durable asynchronous input remains pending for periodic or restart recovery"
         );
     }
-}
-
-fn execution_input(info: &BackgroundExecutionInfo) -> NewSessionInput {
-    let text = execution_report_text(info);
-    NewSessionInput::new(
-        format!("msg_{}", info.id.as_str()),
-        info.session_id.clone(),
-        json!({
-            "kind": "backgroundExecutionReport",
-            "executionID": info.id.as_str(),
-            "status": info.status.as_str(),
-            "title": info.title,
-            "command": info.command,
-            "purpose": info.purpose.as_str(),
-            "requiresAuthoritativeRefresh": info.purpose.requires_authoritative_refresh(),
-            "exitCode": info.exit_code,
-            "timedOut": info.timed_out,
-            "error": info.error,
-            "text": text,
-        }),
-        InputDelivery::Steer,
-        info.time_completed
-            .unwrap_or(info.time_updated)
-            .max(info.time_created),
-    )
-}
-
-fn execution_report_text(info: &BackgroundExecutionInfo) -> String {
-    let exit = info
-        .exit_code
-        .map(|code| format!(", exit code {code}"))
-        .unwrap_or_default();
-    let error = info
-        .error
-        .as_deref()
-        .map(|error| format!("\nRecorded error: {error}"))
-        .unwrap_or_default();
-    let continuation = match info.purpose {
-        BackgroundExecutionPurpose::Command => String::from(
-            "Inspect the durable output with the `bg` tool when needed, then continue the parent \
-             task.",
-        ),
-        BackgroundExecutionPurpose::RemoteObserver => String::from(
-            "This process was registered as a remote observer. Its terminal status is only a wake \
-             signal, not proof that the remote workflow, job, or release reached the requested \
-             state. Inspect durable output with the `bg` tool, then re-query authoritative remote \
-             state using a stable repository, run/attempt, or ref identifier. Reconcile every \
-             required child job and artifact before updating the Plan or declaring completion; a \
-             skipped, cancelled, or missing required child is not success unless an explicit \
-             policy permits it.",
-        ),
-    };
-    format!(
-        "Background command `{}` ({}) reached terminal status `{}`{exit}.{error}\n\
-         The earlier assistant turn may have ended while it was running. {continuation} Do not rerun a \
-         command with possible side effects unless authoritative state proves that replay is safe.",
-        info.id,
-        info.title,
-        info.status.as_str()
-    )
-}
-
-fn validate_execution_input(input: &SessionInput, execution_id: &str) -> Result<(), &'static str> {
-    if input.prompt.get("kind").and_then(Value::as_str) != Some("backgroundExecutionReport") {
-        return Err("the deterministic input id belongs to another input kind");
-    }
-    if input.prompt.get("executionID").and_then(Value::as_str) != Some(execution_id) {
-        return Err("the deterministic input id belongs to another background execution");
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -552,6 +547,7 @@ mod tests {
 
     fn fixture() -> (
         SessionInbox,
+        CompletionDeliveryStore,
         AgentJobStore,
         SessionRunRegistry,
         Arc<ClaimingWake>,
@@ -580,13 +576,14 @@ mod tests {
             .expect("insert session");
         drop(connection);
         let inbox = SessionInbox::new(Arc::clone(&pool));
+        let completion = CompletionDeliveryStore::new(Arc::clone(&pool));
         let jobs = AgentJobStore::new(pool);
         let runs = SessionRunRegistry::new();
         let wake = Arc::new(ClaimingWake {
             inbox: inbox.clone(),
             calls: AtomicUsize::new(0),
         });
-        (inbox, jobs, runs, wake)
+        (inbox, completion, jobs, runs, wake)
     }
 
     /// Another terminal execution for the same or a different session.
@@ -668,7 +665,7 @@ mod tests {
         info.command = "gh run watch 123456".to_owned();
         info.purpose = BackgroundExecutionPurpose::RemoteObserver;
 
-        let input = execution_input(&info);
+        let input = zuno_tools::bg::background_completion_input(&info);
         let text = input.prompt["text"]
             .as_str()
             .expect("model-facing report text");
@@ -686,9 +683,10 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_execution_admits_one_input_and_does_not_redrive_after_consumption() {
-        let (inbox, jobs, runs, wake) = fixture();
+        let (inbox, completion, jobs, runs, wake) = fixture();
         let target = NotificationTarget {
             inbox: inbox.clone(),
+            completion,
             jobs,
             runs,
             wake: Arc::clone(&wake) as Arc<dyn ParentReportWake>,
@@ -713,11 +711,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inline_wait_claim_suppresses_the_later_callback_turn() {
+        let (inbox, completion, jobs, runs, wake) = fixture();
+        let target = NotificationTarget {
+            inbox: inbox.clone(),
+            completion,
+            jobs,
+            runs,
+            wake: Arc::clone(&wake) as Arc<dyn ParentReportWake>,
+        };
+        let info = info();
+        admit_execution(&target, &info);
+        let source_key = zuno_tools::bg::background_completion_source_key(&info);
+        assert!(
+            target
+                .completion
+                .claim_inline(&source_key, 21)
+                .expect("inline claim")
+                .is_some()
+        );
+
+        deliver_pending_inputs("ses_parent", &target).await;
+
+        assert_eq!(wake.calls.load(Ordering::Relaxed), 0);
+        assert!(
+            inbox
+                .get("ses_parent", &format!("msg_{}", info.id))
+                .expect("inspect callback input")
+                .is_none(),
+            "callback delivery admitted a duplicate after inline wait owned completion"
+        );
+    }
+
+    #[tokio::test]
     async fn orphaned_promoted_completion_returns_to_its_lane_before_wake() {
-        let (inbox, jobs, runs, wake) = fixture();
+        let (inbox, completion, jobs, runs, wake) = fixture();
         let info = info();
         let admitted = inbox
-            .admit(execution_input(&info))
+            .admit(zuno_tools::bg::background_completion_input(&info))
             .expect("admit completion");
         inbox
             .promote_id(&admitted.session_id, &admitted.id)
@@ -725,6 +756,7 @@ mod tests {
             .expect("completion was pending");
         let target = NotificationTarget {
             inbox: inbox.clone(),
+            completion,
             jobs,
             runs,
             wake: Arc::clone(&wake) as Arc<dyn ParentReportWake>,
@@ -746,10 +778,10 @@ mod tests {
 
     #[tokio::test]
     async fn live_turn_ownership_prevents_promoted_completion_recovery() {
-        let (inbox, jobs, runs, wake) = fixture();
+        let (inbox, completion, jobs, runs, wake) = fixture();
         let info = info();
         let admitted = inbox
-            .admit(execution_input(&info))
+            .admit(zuno_tools::bg::background_completion_input(&info))
             .expect("admit completion");
         inbox
             .promote_id(&admitted.session_id, &admitted.id)
@@ -760,6 +792,7 @@ mod tests {
             .expect("live turn owns the promoted completion");
         let target = NotificationTarget {
             inbox: inbox.clone(),
+            completion,
             jobs,
             runs: runs.clone(),
             wake: Arc::clone(&wake) as Arc<dyn ParentReportWake>,
@@ -795,7 +828,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_delivery_redrives_every_pending_report_and_leaves_the_user_queue() {
-        let (inbox, jobs, runs, wake) = fixture();
+        let (inbox, completion, jobs, runs, wake) = fixture();
         inbox
             .admit(NewSessionInput::new(
                 "msg_report",
@@ -825,6 +858,7 @@ mod tests {
             .expect("admit user input");
         let target = NotificationTarget {
             inbox: inbox.clone(),
+            completion,
             jobs,
             runs,
             wake: Arc::clone(&wake) as Arc<dyn ParentReportWake>,
@@ -865,9 +899,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_settlement_burst_is_admitted_before_the_batch_is_delivered() {
-        let (inbox, jobs, runs, wake) = fixture();
+        let (inbox, completion, jobs, runs, wake) = fixture();
         let target = NotificationTarget {
             inbox: inbox.clone(),
+            completion,
             jobs,
             runs,
             wake: Arc::clone(&wake) as Arc<dyn ParentReportWake>,
@@ -897,15 +932,20 @@ mod tests {
         );
 
         for info in [&first, &second, &third] {
-            let input = inbox
-                .get("ses_parent", &format!("msg_{}", info.id))
-                .expect("read admitted settlement")
+            let source_key = zuno_tools::bg::background_completion_source_key(info);
+            let delivery = target
+                .completion
+                .get(&source_key)
+                .expect("read published settlement")
                 .expect("every settlement in the burst is durable before any turn");
-            assert!(input.state.is_pending(), "{}", info.id);
+            assert!(delivery.owner.is_none(), "{}", info.id);
         }
         assert!(
-            inbox
-                .get("ses_other", &format!("msg_{}", other_session.id))
+            target
+                .completion
+                .get(&zuno_tools::bg::background_completion_source_key(
+                    &other_session
+                ))
                 .expect("inspect the other session")
                 .is_none(),
             "another session's settlement belongs to that session's watcher"
@@ -935,7 +975,7 @@ mod tests {
     #[tokio::test]
     async fn restart_scan_recovers_a_promoted_child_report_and_redrives_it() {
         let directory = tempfile::tempdir().expect("notification workspace");
-        let (inbox, jobs, runs, wake) = fixture();
+        let (inbox, completion, jobs, runs, wake) = fixture();
         jobs.create(NewAgentJob::new(
             "job_child",
             "ses_parent",
@@ -978,6 +1018,7 @@ mod tests {
                 service,
                 session_id: "ses_parent".to_owned(),
                 inbox: inbox.clone(),
+                completion,
                 jobs,
                 runs,
                 wake: Arc::clone(&wake) as Arc<dyn ParentReportWake>,
@@ -1012,7 +1053,7 @@ mod tests {
             .build()
             .expect("notification runtime");
         let directory = tempfile::tempdir().expect("notification workspace");
-        let (inbox, jobs, runs, wake) = fixture();
+        let (inbox, completion, jobs, runs, wake) = fixture();
         inbox
             .admit(NewSessionInput::new(
                 "msg_sync_surface",
@@ -1035,6 +1076,7 @@ mod tests {
                 service,
                 session_id: "ses_parent".to_owned(),
                 inbox,
+                completion,
                 jobs,
                 runs,
                 wake: Arc::clone(&wake) as Arc<dyn ParentReportWake>,
@@ -1059,7 +1101,7 @@ mod tests {
     #[tokio::test]
     async fn live_settlement_event_resumes_an_idle_session() {
         let directory = tempfile::tempdir().expect("notification workspace");
-        let (inbox, jobs, runs, wake) = fixture();
+        let (inbox, completion, jobs, runs, wake) = fixture();
         let service = Arc::new(
             BackgroundExecutionService::open(directory.path().join("background"))
                 .expect("background service"),
@@ -1072,6 +1114,7 @@ mod tests {
                 service: Arc::clone(&service),
                 session_id: "ses_parent".to_owned(),
                 inbox: inbox.clone(),
+                completion,
                 jobs,
                 runs,
                 wake: Arc::clone(&wake) as Arc<dyn ParentReportWake>,
@@ -1116,7 +1159,7 @@ mod tests {
     #[tokio::test]
     async fn a_restart_delivers_every_terminal_execution_as_one_batch() {
         let directory = tempfile::tempdir().expect("notification workspace");
-        let (inbox, jobs, runs, wake) = fixture();
+        let (inbox, completion, jobs, runs, wake) = fixture();
         let service = Arc::new(
             BackgroundExecutionService::open(directory.path().join("background"))
                 .expect("background service"),
@@ -1147,6 +1190,7 @@ mod tests {
                 service: Arc::clone(&service),
                 session_id: "ses_parent".to_owned(),
                 inbox: inbox.clone(),
+                completion,
                 jobs,
                 runs,
                 wake: Arc::clone(&wake) as Arc<dyn ParentReportWake>,
@@ -1180,7 +1224,7 @@ mod tests {
     #[tokio::test]
     async fn unregister_prevents_explicitly_closed_session_from_reopening() {
         let directory = tempfile::tempdir().expect("notification workspace");
-        let (inbox, jobs, runs, wake) = fixture();
+        let (inbox, completion, jobs, runs, wake) = fixture();
         let service = Arc::new(
             BackgroundExecutionService::open(directory.path().join("background"))
                 .expect("background service"),
@@ -1193,6 +1237,7 @@ mod tests {
                 service: Arc::clone(&service),
                 session_id: "ses_parent".to_owned(),
                 inbox: inbox.clone(),
+                completion,
                 jobs,
                 runs,
                 wake: Arc::clone(&wake) as Arc<dyn ParentReportWake>,

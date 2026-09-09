@@ -70,6 +70,7 @@ zuno-review = { workspace = true }
 zuno-runtime = { workspace = true }
 zuno-sandbox = { workspace = true }
 zuno-search = { workspace = true }
+zuno-session-control = { workspace = true }
 zuno-server = { workspace = true }
 zuno-snapshot = { workspace = true }
 zuno-tool = { workspace = true }

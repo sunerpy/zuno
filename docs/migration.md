@@ -1,9 +1,9 @@
 # Zuno database lifecycle
 
-Zuno owns its configuration and data roots. The current database format is 9.
+Zuno owns its configuration and data roots. The current database format is 10.
 Empty databases are created at the current format, and supported older formats advance
 through guarded forward migrations. Format 5 is the first supported historical format
-and upgrades in place to format 9 without rebuilding the database.
+and formats 5 through 9 upgrade in place to format 10 without rebuilding the database.
 
 ## The channel database
 
@@ -52,20 +52,21 @@ it opened. See
 
 Database opening recognizes these states:
 
-1. **Empty database.** The complete format-9 schema and the single `zuno_schema`
+1. **Empty database.** The complete format-10 schema and the single `zuno_schema`
    marker are created atomically.
-2. **Format 9.** The marker and required current tables are validated before
+2. **Format 10.** The marker and required current tables are validated before
    application queries run.
-3. **Format 8.** The revisioned `session_memory_policy` table and its index are added
-   in place.
-4. **Format 7.** The `verification_receipt` ledger, then session memory policy, are
-   added in place.
-5. **Format 6.** Durable Plan-stack columns, `work_plan_archive`, the
-   `verification_receipt` ledger, and session memory policy are added in place.
-6. **Format 5.** The additive learning schema, Plan-stack schema,
-   `verification_receipt`, and session memory policy are migrated to format 9 in one
-   transaction.
-7. **Any other state.** An older unsupported format, a future format, a missing marker,
+3. **Format 9.** Durable session execution state, completion-delivery arbitration, and
+   typed inbox trigger columns are added in place.
+4. **Format 8.** The revisioned `session_memory_policy` table and its index are added,
+   followed by the format-10 execution schema.
+5. **Format 7.** The `verification_receipt` ledger, session memory policy, and execution
+   schema are added in place.
+6. **Format 6.** Durable Plan-stack columns, `work_plan_archive`, the
+   `verification_receipt` ledger, session memory policy, and execution schema are added.
+7. **Format 5.** The additive learning schema and every later supported migration are
+   applied in one transaction.
+8. **Any other state.** An older unsupported format, a future format, a missing marker,
    or a marker whose required tables are absent fails closed without modification.
 
 Two processes that open or upgrade the same database at the same time both decide from
@@ -76,12 +77,12 @@ reported as a schema mismatch; a database whose format keeps changing under the 
 fails closed with a conflict on the `zuno_schema` marker. Neither path writes to the
 database.
 
-### Format 5, 6, 7, or 8 to format 9
+### Format 5, 6, 7, 8, or 9 to format 10
 
 The supported migration uses one SQLite `BEGIN IMMEDIATE` transaction:
 
 1. Re-read the table inventory and require the marker to be exactly format 5, 6, 7,
-   or 8.
+   8, or 9.
 2. Require the historical `session` and `work_plan` tables before changing anything.
 3. From format 5, create all format-6 learning tables and indexes.
 4. From format 5 or 6, add nullable `parent_plan_id`, defaulted `stack_depth`, and
@@ -89,14 +90,31 @@ The supported migration uses one SQLite `BEGIN IMMEDIATE` transaction:
 5. Create the `verification_receipt` ledger, which starts empty and rewrites no row.
 6. Create `session_memory_policy`, which starts empty so every existing session keeps
    using the default supplied by its caller.
-7. Update the singleton marker from 5, 6, 7, or 8 to 9 with a conditional update.
-8. Commit only after every schema operation and the marker update succeed.
+7. Add `source_key`, `trigger_kind`, and `cycle_id` to `session_input`; create
+   `session_execution_state` and `completion_delivery` plus their indexes. Existing
+   inputs retain `trigger_kind = 'legacy'`.
+8. Update the singleton marker from 5, 6, 7, 8, or 9 to 10 with a conditional update.
+9. Commit only after every schema operation and the marker update succeed.
 
 Any failure rolls the transaction back. The migration does not rewrite existing
 `session`, `message`, `memory_candidate`, `learning_job`, `verification_receipt`, or
-`work_plan` values. Tests use exact format-5, format-6, format-7, and v0.10.5
-format-8 fixtures, compare every old row before and after, then query the new policy
-table.
+`work_plan` values. Tests use exact format-5 through format-9 fixtures, compare every
+old row before and after, then query the new policy and execution tables.
+
+### Session execution and completion delivery
+
+`session_execution_state` stores collaboration mode independently from the selected
+Agent, the saved Work identity, exact authorized and handoff-ready Plan revisions,
+continuation cycle and context epoch, and any explicit Draft-review risk acceptance.
+`/start-work` reads the Plan and review gate, updates Goal state, writes Work authority,
+and admits its `UserControl` input in one `BEGIN IMMEDIATE` transaction.
+
+`completion_delivery` is the exactly-once ownership ledger for background commands,
+subagents, workflows, and product Agents. A synchronous `bg wait` and an asynchronous
+callback compete for one `inline` or `callback` owner. The losing path cannot admit a
+second turn. `session_input.source_key` makes producer admission idempotent across
+restarts, while `trigger_kind` distinguishes user, control, automatic, and recovery
+turns without inventing user history.
 
 ### Per-session memory policy
 
@@ -132,7 +150,7 @@ copy before any operator-led recovery.
 For important data, use the exact older binary to export it or implement and validate an
 explicit forward migration. Do not guess the schema, silently drop rows, or require a
 rebuild for a format that the current binary supports. A valid format-5, format-6,
-format-7, or format-8 database should open and migrate automatically.
+format-7, format-8, or format-9 database should open and migrate automatically.
 
 ## Rules for future schema changes
 

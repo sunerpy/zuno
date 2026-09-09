@@ -10,18 +10,27 @@
 编辑器只启动并持有一个进程。那个进程就是提供协议服务的进程，因此终止它就结束该会话，它的
 管道也随之到达 EOF。参见[一次调用就是一个进程](/zh/cli/#一次调用就是一个进程)。
 
-在 Agent Panel 中打开 Zuno 会调用 ACP `session/new`，但此时只保留进程内 session id，
-并解析配置、命令、Skill 与 MCP；不会创建持久 Session，也不会让空的「New Agent Thread」
-出现在 `session/list`。第一条消息之前选择的 Agent、模型、Mode 与推理等级只保存在进程内。
-首条被接纳的用户 prompt 或持久原生命令会在同一事务中创建 Session 与首个输入；关闭从未
-发送消息的面板不会留下历史行。
+在 Agent Panel 中打开 Zuno 会调用 ACP `session/new`，先保留进程内 session id 并解析
+配置、命令、Skill 与 MCP。普通空面板仍然是临时的；但进入 Plan 这类持久原生协作控制会
+物化 Session，因为 mode、Goal pause 与未来 Work identity 必须能够跨重启恢复。
+普通空面板不会创建持久 Session，也不会让空的「New Agent Thread」出现在列表中；关闭从未
+发送消息且没有执行持久控制的面板不会留下历史行。
+换句话说，关闭从未发送消息的面板不会留下历史行；执行过 Plan 等持久控制的面板已经不再是
+空面板。
+普通空面板不会创建持久 Session，也不会让空的「New Agent Thread」出现在列表中；关闭从未
+发送消息且没有执行持久控制的面板不会留下历史行。
 
 ## Agent、Mode 与 Plan 投影
 
-Agent selector 会显示 `plan`。`active_agent` 是唯一状态源：选择 `plan` 会自动切换到
-Plan mode；选择 `build`、`orchestrator`、`deep` 或其他实现 Agent 会自动回到 Build
-mode。反向切换 Mode 也会选择对应 Agent，并同时发送 `current_mode_update` 与
-`config_option_update`，避免 Zed 的两个 selector 漂移。
+Mode 与 Agent 是两份独立的持久选择。Mode 拥有 Plan/Work 边界；Agent selector 只显示
+实现 Agent。Plan 活跃时切换 Agent 只更新未来 Work Agent，不会离开只读 `plan` host；
+模型与 reasoning 选择也会更新同一份未来 Work identity。
+
+`/plan` 与 `/start-plan` 都是幂等进入 Plan。`/start-work` 与
+`session/set_mode(build)` 调用同一个原子授权：当前精确 Plan revision 必须
+handoff-ready；绑定 review 时默认要求 Ready，除非用户通过
+`--accept-draft-risk <原因>` 显式接受；随后恢复保存的 Agent/provider/model/reasoning。
+空闲会话立即开始，忙碌会话把控制持久排队到下一个安全点。
 
 空闲状态下切换 Agent、模型、Mode 或推理等级时，Zuno 仍会原子替换 turn host，
 但如果解析后的 MCP server 集合与连接并发度没有变化，会保留该会话已经连接的 MCP
@@ -38,6 +47,10 @@ runtime，避免重复网络或子进程握手。结构性 MCP 配置发生变�
 撤回它，会取消该请求接纳的那条持久行，使被撤回的文本永不到达模型，并以 `-32800`
 与 `data.admission: "withdrawn"` 回答该请求。完整形态见
 [Zed ACP 集成](/zh/guide/editors)。
+
+后台完成不是斜杠命令。终态命令、子 Agent、workflow 与 product Agent 会发布确定性的
+completion envelope 并主动唤醒父会话。同步 `bg wait` 最长 60 秒，并与 callback 竞争
+唯一 durable owner，避免重复 turn。
 
 Plan 投影由 durable work-state revision 驱动，不再依赖识别 `plan_update` 工具调用。
 每个会话订阅当前 host，发生变化后读取权威 Plan 并发送完整的

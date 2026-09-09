@@ -2,17 +2,20 @@
 //!
 //! User-visible Plan steps describe strategic outcomes. This driver records the
 //! machine-owned execution phase separately, then decides from typed durable
-//! state whether a host may finish, should continue, or must wait for a human.
+//! state whether a host may finish, should recover, must wait for background
+//! completion, or should pause after durable evidence of no progress.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use zuno_db::Pool;
 use zuno_db::event_log::{NewSessionEvent, SessionEventLog};
 use zuno_error::DbError;
 
 const DRIVER_PHASE_EVENT: &str = "session.driver.phase";
-const DEFAULT_RECONCILIATION_LIMIT: u8 = 2;
+const NO_PROGRESS_STREAK_LIMIT: u8 = 3;
+const PROGRESS_FINGERPRINT_DOMAIN: &[u8] = b"zuno.plan.progress.v1\0";
 
 /// Durable machine-owned phase for one session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +27,7 @@ pub enum DriverPhase {
     WaitingRetry,
     WaitingBackground,
     WaitingHuman,
+    Paused,
     Terminal,
 }
 
@@ -37,6 +41,7 @@ impl DriverPhase {
             Self::WaitingRetry => "waiting_retry",
             Self::WaitingBackground => "waiting_background",
             Self::WaitingHuman => "waiting_human",
+            Self::Paused => "paused",
             Self::Terminal => "terminal",
         }
     }
@@ -90,12 +95,22 @@ impl PlanReconciliationInput {
 pub enum PlanReconciliationDecision {
     Finish,
     ContinueGoal,
-    ContinueOrdinary { attempt: u8 },
+    /// Recover authorized ordinary work. `attempt` is the current consecutive
+    /// unchanged-progress observation and resets when the fingerprint changes.
+    ContinueOrdinary {
+        attempt: u8,
+    },
     WaitForBackground,
-    WaitForHuman { reason: PlanWaitingReason },
+    /// Compatibility-only decision retained for older hosts.
+    ///
+    /// The driver no longer emits this decision for unreconciled work. Lack of
+    /// progress is a typed pause, not a request for new user input.
+    WaitForHuman {
+        reason: PlanWaitingReason,
+    },
 }
 
-/// Typed reason an ordinary session cannot be delivered as successful.
+/// Compatibility-only reason retained for older host APIs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanWaitingReason {
@@ -111,13 +126,51 @@ impl PlanWaitingReason {
     }
 }
 
+/// Typed reason that automatic recovery paused without asking the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanPauseReason {
+    NoProgress,
+}
+
+impl PlanPauseReason {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoProgress => "no_progress",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "no_progress" => Some(Self::NoProgress),
+            _ => None,
+        }
+    }
+}
+
+/// Detailed reconciliation outcome used by the execution-state controller.
+///
+/// Older hosts can continue calling [`PlanReconciliationDriver::reconcile`].
+/// New hosts should call [`PlanReconciliationDriver::reconcile_with_progress`]
+/// so a typed pause cannot be mistaken for a human-input request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanReconciliationOutcome {
+    Decision(PlanReconciliationDecision),
+    Paused { reason: PlanPauseReason },
+}
+
 /// Latest durable phase projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriverPhaseProjection {
     pub phase: DriverPhase,
     pub cycle_id: String,
+    /// Compatibility projection of the unchanged-progress count.
     pub reconciliation_attempt: u8,
     pub reason: Option<String>,
+    pub progress_fingerprint: Option<String>,
+    pub unchanged_progress_count: u8,
+    pub pause_reason: Option<PlanPauseReason>,
     pub sequence: i64,
 }
 
@@ -125,7 +178,6 @@ pub struct DriverPhaseProjection {
 #[derive(Clone)]
 pub struct PlanReconciliationDriver {
     events: SessionEventLog,
-    reconciliation_limit: u8,
 }
 
 impl PlanReconciliationDriver {
@@ -133,15 +185,6 @@ impl PlanReconciliationDriver {
     pub fn new(pool: Arc<Pool>) -> Self {
         Self {
             events: SessionEventLog::new(pool),
-            reconciliation_limit: DEFAULT_RECONCILIATION_LIMIT,
-        }
-    }
-
-    #[cfg(test)]
-    fn with_limit(pool: Arc<Pool>, reconciliation_limit: u8) -> Self {
-        Self {
-            events: SessionEventLog::new(pool),
-            reconciliation_limit,
         }
     }
 
@@ -168,7 +211,7 @@ impl PlanReconciliationDriver {
             session_id,
             cycle_id,
             DriverPhase::WaitingRetry,
-            self.attempts_for_cycle(session_id, cycle_id)?,
+            self.latest_attempt_for_cycle(session_id, cycle_id)?,
             Some(reason.into()),
         )
     }
@@ -202,27 +245,41 @@ impl PlanReconciliationDriver {
         cycle_id: &str,
         input: PlanReconciliationInput,
     ) -> Result<PlanReconciliationDecision, DbError> {
-        let attempt = self.attempts_for_cycle(session_id, cycle_id)?;
-        if input.planning_handoff && !input.active_job && !input.remote_observer_running {
-            self.record(
-                session_id,
-                cycle_id,
-                DriverPhase::Terminal,
-                attempt,
-                Some("planning_handoff_ready".to_owned()),
-            )?;
-            return Ok(PlanReconciliationDecision::Finish);
+        let legacy_fingerprint = legacy_progress_fingerprint(input);
+        match self.reconcile_with_progress(
+            session_id,
+            cycle_id,
+            input,
+            true,
+            &legacy_fingerprint,
+        )? {
+            PlanReconciliationOutcome::Decision(decision) => Ok(decision),
+            PlanReconciliationOutcome::Paused { .. } => {
+                // Compatibility hosts only understand terminal, continuation,
+                // background wait, and human wait. Preserve the durable typed
+                // pause while deliberately avoiding the human-request path.
+                Ok(PlanReconciliationDecision::Finish)
+            }
         }
-        if input.settled() {
-            self.record(
-                session_id,
-                cycle_id,
-                DriverPhase::Terminal,
-                attempt,
-                Some("durable_work_settled".to_owned()),
-            )?;
-            return Ok(PlanReconciliationDecision::Finish);
-        }
+    }
+
+    /// Reconcile durable state with explicit execution authorization and a
+    /// stable fingerprint of executable Plan/Todo/Job progress.
+    ///
+    /// `progress_fingerprint` should be derived from authoritative durable
+    /// revisions or content digests. The driver hashes it with the typed input,
+    /// persists only the bounded digest, and pauses after three consecutive
+    /// identical observations. Process restarts therefore neither reset nor
+    /// fabricate progress.
+    pub fn reconcile_with_progress(
+        &self,
+        session_id: &str,
+        cycle_id: &str,
+        input: PlanReconciliationInput,
+        work_authorized: bool,
+        progress_fingerprint: &str,
+    ) -> Result<PlanReconciliationOutcome, DbError> {
+        let attempt = self.latest_attempt_for_cycle(session_id, cycle_id)?;
         if input.remote_observer_running {
             self.record(
                 session_id,
@@ -231,39 +288,106 @@ impl PlanReconciliationDriver {
                 attempt,
                 Some("remote_observer_running".to_owned()),
             )?;
-            return Ok(PlanReconciliationDecision::WaitForBackground);
+            return Ok(PlanReconciliationOutcome::Decision(
+                PlanReconciliationDecision::WaitForBackground,
+            ));
         }
-        if input.goal_active {
+        if input.planning_handoff {
             self.record(
+                session_id,
+                cycle_id,
+                DriverPhase::Terminal,
+                attempt,
+                Some("planning_handoff_ready".to_owned()),
+            )?;
+            return Ok(PlanReconciliationOutcome::Decision(
+                PlanReconciliationDecision::Finish,
+            ));
+        }
+        if !input.goal_active {
+            if input.settled() {
+                self.record(
+                    session_id,
+                    cycle_id,
+                    DriverPhase::Terminal,
+                    attempt,
+                    Some("durable_work_settled".to_owned()),
+                )?;
+                return Ok(PlanReconciliationOutcome::Decision(
+                    PlanReconciliationDecision::Finish,
+                ));
+            }
+            if !work_authorized {
+                self.record(
+                    session_id,
+                    cycle_id,
+                    DriverPhase::Terminal,
+                    attempt,
+                    Some("work_not_authorized".to_owned()),
+                )?;
+                return Ok(PlanReconciliationOutcome::Decision(
+                    PlanReconciliationDecision::Finish,
+                ));
+            }
+        }
+
+        let fingerprint = stable_progress_fingerprint(input, progress_fingerprint);
+        let unchanged_progress_count =
+            self.progress_for_cycle(session_id, cycle_id)?
+                .map_or(1, |previous| {
+                    if previous.fingerprint == fingerprint {
+                        previous.unchanged_count.saturating_add(1)
+                    } else {
+                        1
+                    }
+                });
+        if unchanged_progress_count >= NO_PROGRESS_STREAK_LIMIT {
+            self.record_progress(
+                session_id,
+                cycle_id,
+                DriverPhase::Paused,
+                unchanged_progress_count,
+                Some(PlanPauseReason::NoProgress.as_str().to_owned()),
+                &fingerprint,
+                unchanged_progress_count,
+                Some(PlanPauseReason::NoProgress),
+            )?;
+            return Ok(PlanReconciliationOutcome::Paused {
+                reason: PlanPauseReason::NoProgress,
+            });
+        }
+
+        if input.goal_active {
+            self.record_progress(
                 session_id,
                 cycle_id,
                 DriverPhase::Executing,
-                attempt,
+                unchanged_progress_count,
                 Some("active_goal_owns_continuation".to_owned()),
+                &fingerprint,
+                unchanged_progress_count,
+                None,
             )?;
-            return Ok(PlanReconciliationDecision::ContinueGoal);
+            return Ok(PlanReconciliationOutcome::Decision(
+                PlanReconciliationDecision::ContinueGoal,
+            ));
         }
-        if attempt < self.reconciliation_limit {
-            let next = attempt.saturating_add(1);
-            self.record(
-                session_id,
-                cycle_id,
-                DriverPhase::Reconciling,
-                next,
-                Some("durable_work_unreconciled".to_owned()),
-            )?;
-            return Ok(PlanReconciliationDecision::ContinueOrdinary { attempt: next });
-        }
-        self.record(
+
+        self.record_progress(
             session_id,
             cycle_id,
-            DriverPhase::WaitingHuman,
-            attempt,
-            Some("plan_unreconciled".to_owned()),
+            DriverPhase::Reconciling,
+            unchanged_progress_count,
+            Some("authorized_work_recovery".to_owned()),
+            &fingerprint,
+            unchanged_progress_count,
+            None,
         )?;
-        Ok(PlanReconciliationDecision::WaitForHuman {
-            reason: PlanWaitingReason::PlanUnreconciled,
-        })
+        Ok(PlanReconciliationOutcome::Decision(
+            PlanReconciliationDecision::ContinueOrdinary {
+                attempt: unchanged_progress_count,
+            },
+        ))
     }
 
     /// Rebuild the latest machine phase from the existing session event log.
@@ -291,34 +415,84 @@ impl PlanReconciliationDriver {
                     .get("reason")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                let progress_fingerprint = event
+                    .properties
+                    .get("progressFingerprint")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let unchanged_progress_count = event
+                    .properties
+                    .get("unchangedProgressCount")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u8::try_from(value).ok())
+                    .unwrap_or(0);
+                let pause_reason = event
+                    .properties
+                    .get("pauseReason")
+                    .and_then(Value::as_str)
+                    .and_then(PlanPauseReason::parse);
                 Some(DriverPhaseProjection {
                     phase,
                     cycle_id,
                     reconciliation_attempt,
                     reason,
+                    progress_fingerprint,
+                    unchanged_progress_count,
+                    pause_reason,
                     sequence: event.sequence,
                 })
             }))
     }
 
-    fn attempts_for_cycle(&self, session_id: &str, cycle_id: &str) -> Result<u8, DbError> {
-        let attempts = self
+    fn latest_attempt_for_cycle(&self, session_id: &str, cycle_id: &str) -> Result<u8, DbError> {
+        let attempt = self
             .events
             .read_of_type_after(session_id, DRIVER_PHASE_EVENT, None)?
             .into_iter()
+            .rev()
             .filter(|event| {
                 event.properties.get("cycleId").and_then(Value::as_str) == Some(cycle_id)
             })
-            .filter_map(|event| {
+            .find_map(|event| {
                 event
                     .properties
                     .get("reconciliationAttempt")
                     .and_then(Value::as_u64)
                     .and_then(|value| u8::try_from(value).ok())
             })
-            .max()
             .unwrap_or(0);
-        Ok(attempts)
+        Ok(attempt)
+    }
+
+    fn progress_for_cycle(
+        &self,
+        session_id: &str,
+        cycle_id: &str,
+    ) -> Result<Option<DurableProgress>, DbError> {
+        Ok(self
+            .events
+            .read_of_type_after(session_id, DRIVER_PHASE_EVENT, None)?
+            .into_iter()
+            .rev()
+            .filter(|event| {
+                event.properties.get("cycleId").and_then(Value::as_str) == Some(cycle_id)
+            })
+            .find_map(|event| {
+                let fingerprint = event
+                    .properties
+                    .get("progressFingerprint")?
+                    .as_str()?
+                    .to_owned();
+                let unchanged_count = event
+                    .properties
+                    .get("unchangedProgressCount")?
+                    .as_u64()
+                    .and_then(|value| u8::try_from(value).ok())?;
+                Some(DurableProgress {
+                    fingerprint,
+                    unchanged_count,
+                })
+            }))
     }
 
     fn record(
@@ -328,6 +502,58 @@ impl PlanReconciliationDriver {
         phase: DriverPhase,
         reconciliation_attempt: u8,
         reason: Option<String>,
+    ) -> Result<(), DbError> {
+        self.record_state(
+            session_id,
+            cycle_id,
+            phase,
+            reconciliation_attempt,
+            reason,
+            None,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the durable progress event records every typed reconciliation dimension explicitly"
+    )]
+    fn record_progress(
+        &self,
+        session_id: &str,
+        cycle_id: &str,
+        phase: DriverPhase,
+        reconciliation_attempt: u8,
+        reason: Option<String>,
+        progress_fingerprint: &str,
+        unchanged_progress_count: u8,
+        pause_reason: Option<PlanPauseReason>,
+    ) -> Result<(), DbError> {
+        self.record_state(
+            session_id,
+            cycle_id,
+            phase,
+            reconciliation_attempt,
+            reason,
+            Some(ProgressRecord {
+                fingerprint: progress_fingerprint,
+                unchanged_count: unchanged_progress_count,
+                pause_reason,
+            }),
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the shared event writer keeps phase and optional progress evidence in one append"
+    )]
+    fn record_state(
+        &self,
+        session_id: &str,
+        cycle_id: &str,
+        phase: DriverPhase,
+        reconciliation_attempt: u8,
+        reason: Option<String>,
+        progress: Option<ProgressRecord<'_>>,
     ) -> Result<(), DbError> {
         let mut properties = Map::new();
         properties.insert("phase".to_owned(), Value::String(phase.as_str().to_owned()));
@@ -339,6 +565,22 @@ impl PlanReconciliationDriver {
         if let Some(reason) = reason {
             properties.insert("reason".to_owned(), Value::String(reason));
         }
+        if let Some(progress) = progress {
+            properties.insert(
+                "progressFingerprint".to_owned(),
+                Value::String(progress.fingerprint.to_owned()),
+            );
+            properties.insert(
+                "unchangedProgressCount".to_owned(),
+                Value::from(progress.unchanged_count),
+            );
+            if let Some(pause_reason) = progress.pause_reason {
+                properties.insert(
+                    "pauseReason".to_owned(),
+                    Value::String(pause_reason.as_str().to_owned()),
+                );
+            }
+        }
         self.events
             .append(
                 session_id,
@@ -346,6 +588,36 @@ impl PlanReconciliationDriver {
             )
             .map(|_| ())
     }
+}
+
+struct DurableProgress {
+    fingerprint: String,
+    unchanged_count: u8,
+}
+
+struct ProgressRecord<'a> {
+    fingerprint: &'a str,
+    unchanged_count: u8,
+    pause_reason: Option<PlanPauseReason>,
+}
+
+fn legacy_progress_fingerprint(input: PlanReconciliationInput) -> String {
+    stable_progress_fingerprint(input, "legacy-typed-state")
+}
+
+fn stable_progress_fingerprint(input: PlanReconciliationInput, source: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(PROGRESS_FINGERPRINT_DOMAIN);
+    digest.update([
+        u8::from(input.plan_exists),
+        u8::from(input.plan_terminal),
+        u8::from(input.active_todo),
+        u8::from(input.active_job),
+        u8::from(input.goal_active),
+    ]);
+    digest.update((source.len() as u64).to_be_bytes());
+    digest.update(source.as_bytes());
+    format!("sha256:{}", hex::encode(digest.finalize()))
 }
 
 #[cfg(test)]
@@ -373,45 +645,121 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_reconciliation_survives_a_driver_restart_and_then_waits() {
+    fn changing_progress_survives_a_driver_restart_without_requesting_human_input() {
         let pool = pool();
-        let first = PlanReconciliationDriver::with_limit(Arc::clone(&pool), 2);
+        let first = PlanReconciliationDriver::new(Arc::clone(&pool));
         assert_eq!(first.begin("ses", "cycle").expect("begin"), "cycle");
         assert_eq!(
             first
+                .reconcile_with_progress("ses", "cycle", unfinished(), true, "plan-revision-1")
+                .expect("first"),
+            PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueOrdinary {
+                attempt: 1
+            })
+        );
+
+        let restarted = PlanReconciliationDriver::new(pool);
+        assert_eq!(
+            restarted.begin("ses", "replacement").expect("resume"),
+            "cycle",
+            "a restarted host must retain the durable reconciliation cycle"
+        );
+        assert_eq!(
+            restarted
+                .reconcile_with_progress("ses", "cycle", unfinished(), true, "plan-revision-2")
+                .expect("second"),
+            PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueOrdinary {
+                attempt: 1
+            }),
+            "authoritative progress resets the no-progress streak"
+        );
+        assert_eq!(
+            restarted
+                .reconcile_with_progress("ses", "cycle", unfinished(), true, "plan-revision-3")
+                .expect("third"),
+            PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueOrdinary {
+                attempt: 1
+            })
+        );
+        let projection = restarted.projection("ses").expect("projection").unwrap();
+        assert_eq!(projection.phase, DriverPhase::Reconciling);
+        assert_eq!(projection.unchanged_progress_count, 1);
+        assert_eq!(projection.pause_reason, None);
+    }
+
+    #[test]
+    fn third_identical_fingerprint_returns_a_durable_typed_no_progress_pause() {
+        let pool = pool();
+        let first = PlanReconciliationDriver::new(Arc::clone(&pool));
+        assert_eq!(
+            first
+                .reconcile_with_progress("ses", "cycle", unfinished(), true, "plan-revision-1")
+                .expect("first"),
+            PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueOrdinary {
+                attempt: 1
+            })
+        );
+        assert_eq!(
+            first
+                .reconcile_with_progress("ses", "cycle", unfinished(), true, "plan-revision-1")
+                .expect("second"),
+            PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueOrdinary {
+                attempt: 2
+            })
+        );
+
+        let restarted = PlanReconciliationDriver::new(pool);
+        assert_eq!(
+            restarted.begin("ses", "replacement").expect("resume"),
+            "cycle",
+            "the persisted reconciliation phase must restore the original cycle"
+        );
+        assert_eq!(
+            restarted
+                .reconcile_with_progress("ses", "cycle", unfinished(), true, "plan-revision-1")
+                .expect("third after restart"),
+            PlanReconciliationOutcome::Paused {
+                reason: PlanPauseReason::NoProgress
+            }
+        );
+        let projection = restarted.projection("ses").expect("projection").unwrap();
+        assert_eq!(projection.phase, DriverPhase::Paused);
+        assert_eq!(projection.reason.as_deref(), Some("no_progress"));
+        assert_eq!(projection.pause_reason, Some(PlanPauseReason::NoProgress));
+        assert_eq!(projection.unchanged_progress_count, 3);
+        assert!(
+            projection
+                .progress_fingerprint
+                .as_deref()
+                .is_some_and(|fingerprint| fingerprint.starts_with("sha256:"))
+        );
+    }
+
+    #[test]
+    fn compatibility_entry_finishes_a_no_progress_pause_without_human_wait() {
+        let driver = PlanReconciliationDriver::new(pool());
+        assert_eq!(
+            driver
                 .reconcile("ses", "cycle", unfinished())
                 .expect("first"),
             PlanReconciliationDecision::ContinueOrdinary { attempt: 1 }
         );
-
-        let restarted = PlanReconciliationDriver::with_limit(pool, 2);
         assert_eq!(
-            restarted.begin("ses", "replacement").expect("resume"),
-            "cycle",
-            "a restarted host must retain the durable reconciliation budget"
-        );
-        assert_eq!(
-            restarted
+            driver
                 .reconcile("ses", "cycle", unfinished())
                 .expect("second"),
             PlanReconciliationDecision::ContinueOrdinary { attempt: 2 }
         );
         assert_eq!(
-            restarted
+            driver
                 .reconcile("ses", "cycle", unfinished())
-                .expect("wait"),
-            PlanReconciliationDecision::WaitForHuman {
-                reason: PlanWaitingReason::PlanUnreconciled
-            }
+                .expect("typed pause through compatibility entry"),
+            PlanReconciliationDecision::Finish,
+            "a no-progress pause must not enter the legacy human-request path"
         );
-        assert_eq!(
-            restarted
-                .projection("ses")
-                .expect("projection")
-                .unwrap()
-                .phase,
-            DriverPhase::WaitingHuman
-        );
+        let projection = driver.projection("ses").expect("projection").unwrap();
+        assert_eq!(projection.phase, DriverPhase::Paused);
+        assert_eq!(projection.pause_reason, Some(PlanPauseReason::NoProgress));
     }
 
     #[test]
@@ -466,21 +814,46 @@ mod tests {
         assert_eq!(
             driver
                 .reconcile("ses_job", "cycle", active_job)
-                .expect("active jobs still reconcile"),
-            PlanReconciliationDecision::ContinueGoal
+                .expect("planning handoff does not execute active jobs"),
+            PlanReconciliationDecision::Finish
         );
 
         active_job.goal_active = false;
         assert_eq!(
             driver
                 .reconcile("ses_job_without_goal", "cycle", active_job)
-                .expect("ordinary active jobs still reconcile"),
-            PlanReconciliationDecision::ContinueOrdinary { attempt: 1 }
+                .expect("planning handoff remains read-only"),
+            PlanReconciliationDecision::Finish
         );
     }
 
     #[test]
-    fn a_plan_left_with_live_steps_still_spends_the_continuation_budget() {
+    fn ordinary_work_requires_authorization_but_an_active_goal_keeps_continuation() {
+        let driver = PlanReconciliationDriver::new(pool());
+        assert_eq!(
+            driver
+                .reconcile_with_progress("ses", "cycle", unfinished(), false, "plan-revision-1")
+                .expect("unauthorized"),
+            PlanReconciliationOutcome::Decision(PlanReconciliationDecision::Finish)
+        );
+        let projection = driver.projection("ses").expect("projection").unwrap();
+        assert_eq!(projection.phase, DriverPhase::Terminal);
+        assert_eq!(projection.reason.as_deref(), Some("work_not_authorized"));
+
+        let mut goal = unfinished();
+        goal.plan_exists = false;
+        goal.goal_active = true;
+        assert_eq!(
+            driver
+                .reconcile_with_progress("goal", "cycle", goal, false, "goal-revision-1")
+                .expect("active goal"),
+            PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueGoal),
+            "an active Goal is continuation authority even without ordinary executable work"
+        );
+    }
+
+    #[test]
+    fn a_plan_left_with_live_steps_enters_authorized_recovery() {
         // The other half of the same edge: what makes a session unreconciled is a durable
         // row that is not terminal, and that must still be driven rather than delivered.
         let driver = PlanReconciliationDriver::new(pool());
@@ -521,6 +894,7 @@ mod tests {
         assert_eq!(waiting.phase, DriverPhase::WaitingBackground);
         assert_eq!(waiting.reconciliation_attempt, 0);
         assert_eq!(waiting.reason.as_deref(), Some("remote_observer_running"));
+        assert_eq!(waiting.unchanged_progress_count, 0);
 
         input.remote_observer_running = false;
         input.goal_active = false;
@@ -534,7 +908,7 @@ mod tests {
     }
 
     #[test]
-    fn an_active_goal_owns_continuation_without_spending_ordinary_attempts() {
+    fn an_active_goal_owns_continuation() {
         let driver = PlanReconciliationDriver::new(pool());
         let mut input = unfinished();
         input.goal_active = true;

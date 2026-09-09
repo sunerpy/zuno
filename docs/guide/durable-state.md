@@ -637,8 +637,10 @@ allows inspection, read-only search and LSP, `shell` and `bg`, questions, Skills
 Goal/Plan/Todo operations, while denying file mutation, delegation, `job`, and `execute`.
 Plan mode is a no-mutation boundary, not a shell-free one: the runtime forces any read-only
 role to `SandboxMode::ReadOnly`, so a command can gather evidence and cannot change the
-tree. Returning to Work mode requires a durable plan to exist, and the confirmation names
-its title, revision, and completed-step count.
+tree. `/plan` and `/start-plan` enter this mode idempotently; Agent selection only changes
+the saved future Work Agent. Returning to Work requires `/start-work`, the exact current
+Plan revision to have a handoff-ready record, and any bound review to be Ready unless the
+user explicitly persists a Draft-risk reason.
 
 The default host owns collaboration-mode enforcement, active-state reconciliation, and
 final reconciliation through typed planning services; the model owns the Work-mode
@@ -647,9 +649,11 @@ tool prevents new model mutations, while existing Plan persistence, client proje
 restart recovery remain intact.
 
 Entering Plan while a Goal is active atomically records `paused(plan_mode)`. Start Work
-resumes only that exact pause and does so once, even after a process restart. It deliberately
-does not clear pauses owned by authentication repair, a pending human request, permission,
-manual interruption, or uncertain side effects.
+atomically restores the saved Agent/provider/model/reasoning identity, records
+`authorized_plan_id`, `authorized_plan_revision`, `cycle_id`, and the continuation token,
+then admits one idempotent `UserControl` input. It resumes only an eligible pause and does so
+once, even after a process restart. It deliberately does not use Goal resume as a substitute
+for Work authorization.
 
 A Goal that an older release parked on a request it recorded as cancelled, expired, or
 failed cannot be resumed by Start Work, because that request can no longer become
@@ -661,6 +665,13 @@ the request row is left intact as evidence.
 /start-plan
 /start-work
 ```
+
+Automatic completion and recovery use their own durable triggers rather than synthetic user
+messages. `session_input.source_key` deduplicates producer delivery;
+`completion_delivery` gives synchronous wait and callback one consumption owner; and
+`session_execution_state.context_epoch` advances after compaction. A background callback
+therefore wakes an idle Work session automatically, remains read-only in Plan mode, and cannot
+start a duplicate turn after `bg wait` already consumed the same terminal result.
 
 ## Todo
 
@@ -760,8 +771,8 @@ poll loops, and do not treat an overall green run as proof that skipped, cancell
 missing, or unexpanded required jobs executed.
 
 If durable work remains while that observer is running, the reconciliation
-driver persists `waiting_background` without consuming either ordinary
-reconciliation attempt or creating a `PlanUnreconciled` human request. Active
+driver persists `waiting_background` without polling or creating a generic
+human request. Active
 Goal auto-continuation is suppressed only while the observer remains live. Its
 terminal report is the durable wake that resumes the session; it is not remote
 success evidence.

@@ -55,6 +55,8 @@ use zuno_tool::{
     ToolDefinition, ToolDynamicContextRefresh, ToolOutput, ToolReplayPolicy,
     ToolResultPresentation, ToolUiIntent,
 };
+pub use zuno_types::execution::TurnExecutionIdentity;
+use zuno_types::execution::{CompletionSource, ContinuationToken, TurnStartKind, UserControlKind};
 
 use crate::budget::{
     BudgetDecision, BudgetPolicyError, BudgetStop, NoopBudgetPolicy, ProviderRequestUsage,
@@ -1274,32 +1276,6 @@ pub trait DynamicContextRefresher: Send + Sync {
     ) -> Result<DynamicContext, String>;
 }
 
-/// Exact Agent and catalog model selected for one automatic turn.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TurnExecutionIdentity {
-    /// Collaboration Agent selected by the current host.
-    pub agent: String,
-    /// Catalog provider selected by the current host.
-    pub provider_id: String,
-    /// Catalog model selected by the current host.
-    pub model_id: String,
-}
-
-impl TurnExecutionIdentity {
-    #[must_use]
-    pub fn new(
-        agent: impl Into<String>,
-        provider_id: impl Into<String>,
-        model_id: impl Into<String>,
-    ) -> Self {
-        Self {
-            agent: agent.into(),
-            provider_id: provider_id.into(),
-            model_id: model_id.into(),
-        }
-    }
-}
-
 /// Why a turn started and where its execution identity comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnStart {
@@ -1314,6 +1290,30 @@ pub enum TurnStart {
         /// Current host identity used to resolve this automatic turn.
         identity: TurnExecutionIdentity,
     },
+    /// A user-owned session control operation starts from durable authority.
+    UserControl {
+        control: UserControlKind,
+        continuation: ContinuationToken,
+    },
+    /// A terminal completion wakes a session without inventing user history.
+    Automatic {
+        source: CompletionSource,
+        continuation: ContinuationToken,
+    },
+    /// Compaction or process recovery continues the same execution cycle.
+    Recovery { continuation: ContinuationToken },
+}
+
+impl TurnStart {
+    #[must_use]
+    pub const fn kind(&self) -> TurnStartKind {
+        match self {
+            Self::UserMessage => TurnStartKind::User,
+            Self::GoalContinuation { .. } | Self::Recovery { .. } => TurnStartKind::Recovery,
+            Self::UserControl { control, .. } => TurnStartKind::UserControl(*control),
+            Self::Automatic { source, .. } => TurnStartKind::Automatic(*source),
+        }
+    }
 }
 
 /// Stable caller-owned identity and volatile suffix for one run.
@@ -1648,7 +1648,7 @@ async fn require_context_compaction_before_request(
 
 #[derive(Debug)]
 struct RequestedTurn {
-    user_message_id: String,
+    anchor_message_id: Option<String>,
     agent: String,
     provider_id: String,
     model_id: String,
@@ -3857,15 +3857,29 @@ fn requested_turn(
     history: &[MessageWithParts],
     start: &TurnStart,
 ) -> Result<RequestedTurn, TurnError> {
-    let user = requested_user_message(history).ok_or_else(|| TurnError::NoUserMessage {
-        session_id: session_id.to_owned(),
-    })?;
-    let identity = match start {
-        TurnStart::UserMessage => execution_identity_from_user(user)?,
-        TurnStart::GoalContinuation { identity, .. } => identity.clone(),
+    let user = requested_user_message(history);
+    let (identity, anchor_message_id) = match start {
+        TurnStart::UserMessage => {
+            let user = user.ok_or_else(|| TurnError::NoUserMessage {
+                session_id: session_id.to_owned(),
+            })?;
+            (
+                execution_identity_from_user(user)?,
+                Some(user.info.id.clone()),
+            )
+        }
+        TurnStart::GoalContinuation { identity, .. } => {
+            (identity.clone(), user.map(|user| user.info.id.clone()))
+        }
+        TurnStart::UserControl { continuation, .. }
+        | TurnStart::Automatic { continuation, .. }
+        | TurnStart::Recovery { continuation } => (
+            continuation.identity.clone(),
+            continuation.anchor_message_id.clone(),
+        ),
     };
     Ok(RequestedTurn {
-        user_message_id: user.info.id.clone(),
+        anchor_message_id,
         agent: identity.agent,
         provider_id: identity.provider_id,
         model_id: identity.model_id,
@@ -6307,21 +6321,23 @@ fn assistant_message(
         now_millis(),
         history.iter().map(|entry| entry.info.time_created).max(),
     );
-    MessageRecord::from_json(json!({
+    let mut data = json!({
         "id": assistant_message_id(&request.turn_id, step),
         "sessionID": request.session_id,
         "role": "assistant",
         "turnID": request.turn_id,
         "time": { "created": created },
-        "parentID": requested.user_message_id,
         "modelID": model.catalog_model_id,
         "providerID": model.catalog_provider_id,
         "mode": agent.name,
         "agent": agent.name,
         "path": { "cwd": session.directory, "root": session.directory },
         "cost": 0.0
-    }))
-    .map_err(TurnError::from)
+    });
+    if let Some(anchor_message_id) = requested.anchor_message_id.as_ref() {
+        data["parentID"] = Value::String(anchor_message_id.clone());
+    }
+    MessageRecord::from_json(data).map_err(TurnError::from)
 }
 
 fn append_turn_started(
@@ -6333,10 +6349,6 @@ fn append_turn_started(
 ) -> Result<(), TurnError> {
     let mut properties = Map::from_iter([
         ("turnID".to_owned(), Value::String(request.turn_id.clone())),
-        (
-            "anchorMessageID".to_owned(),
-            Value::String(requested.user_message_id.clone()),
-        ),
         ("agent".to_owned(), Value::String(agent.name.clone())),
         (
             "providerID".to_owned(),
@@ -6347,6 +6359,12 @@ fn append_turn_started(
             Value::String(model.catalog_model_id.clone()),
         ),
     ]);
+    if let Some(anchor_message_id) = requested.anchor_message_id.as_ref() {
+        properties.insert(
+            "anchorMessageID".to_owned(),
+            Value::String(anchor_message_id.clone()),
+        );
+    }
     append_turn_origin_properties(&mut properties, &request.start);
     append_with_connection(
         connection,
@@ -6364,10 +6382,6 @@ fn append_turn_rejected(
 ) -> Result<(), TurnError> {
     let mut properties = Map::from_iter([
         ("turnID".to_owned(), Value::String(request.turn_id.clone())),
-        (
-            "anchorMessageID".to_owned(),
-            Value::String(requested.user_message_id.clone()),
-        ),
         ("agent".to_owned(), Value::String(requested.agent.clone())),
         (
             "providerID".to_owned(),
@@ -6379,6 +6393,12 @@ fn append_turn_rejected(
         ),
         ("errorKind".to_owned(), Value::String(error_kind.to_owned())),
     ]);
+    if let Some(anchor_message_id) = requested.anchor_message_id.as_ref() {
+        properties.insert(
+            "anchorMessageID".to_owned(),
+            Value::String(anchor_message_id.clone()),
+        );
+    }
     append_turn_origin_properties(&mut properties, &request.start);
     append_with_connection(
         connection,
@@ -6690,6 +6710,64 @@ fn append_turn_origin_properties(properties: &mut Map<String, Value>, start: &Tu
             properties.insert("turnTrigger".to_owned(), Value::String("goal".to_owned()));
             properties.insert("goalID".to_owned(), Value::String(goal_id.clone()));
             properties.insert("goalRevision".to_owned(), Value::from(*goal_revision));
+        }
+        TurnStart::UserControl {
+            control,
+            continuation,
+        } => {
+            properties.insert(
+                "turnTrigger".to_owned(),
+                Value::String("user_control".to_owned()),
+            );
+            properties.insert(
+                "userControl".to_owned(),
+                Value::String(
+                    serde_json::to_value(control)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                ),
+            );
+            properties.insert(
+                "cycleID".to_owned(),
+                Value::String(continuation.cycle_id.clone()),
+            );
+        }
+        TurnStart::Automatic {
+            source,
+            continuation,
+        } => {
+            properties.insert(
+                "turnTrigger".to_owned(),
+                Value::String("automatic".to_owned()),
+            );
+            properties.insert(
+                "completionSource".to_owned(),
+                Value::String(
+                    serde_json::to_value(source)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                ),
+            );
+            properties.insert(
+                "cycleID".to_owned(),
+                Value::String(continuation.cycle_id.clone()),
+            );
+        }
+        TurnStart::Recovery { continuation } => {
+            properties.insert(
+                "turnTrigger".to_owned(),
+                Value::String("recovery".to_owned()),
+            );
+            properties.insert(
+                "cycleID".to_owned(),
+                Value::String(continuation.cycle_id.clone()),
+            );
+            properties.insert(
+                "contextEpoch".to_owned(),
+                Value::from(continuation.context_epoch),
+            );
         }
     }
 }

@@ -273,7 +273,19 @@ impl WorkStateStore {
 
     pub fn plan(&self, session_id: &str) -> Result<Option<WorkPlan>, WorkStateError> {
         let connection = self.pool.get()?;
-        plan_in(&connection, session_id).map_err(Into::into)
+        Self::plan_in(&connection, session_id)
+    }
+
+    /// Read the visible Plan through a caller-owned SQLite snapshot or transaction.
+    ///
+    /// Session-control uses this form so the exact Plan revision it authorizes is read
+    /// in the same `BEGIN IMMEDIATE` transaction that records Work authority and admits
+    /// the Start Work control input.
+    pub fn plan_in(
+        connection: &Connection,
+        session_id: &str,
+    ) -> Result<Option<WorkPlan>, WorkStateError> {
+        plan_in(connection, session_id).map_err(Into::into)
     }
 
     pub fn update_plan(

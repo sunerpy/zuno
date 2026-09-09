@@ -5,7 +5,7 @@ use rusqlite::Transaction;
 use zuno_error::DbError;
 
 /// Number of application tables created by the current schema's single `up`.
-pub const TABLE_COUNT: usize = 39;
+pub const TABLE_COUNT: usize = 41;
 
 const CORE_SCHEMA_SQL: &str = r#"
 CREATE TABLE `workspace` (
@@ -710,6 +710,61 @@ CREATE INDEX `session_memory_policy_generation_updated_idx`
   ON `session_memory_policy` (`generation`,`time_updated`,`session_id`);
 "#;
 
+const EXECUTION_SCHEMA_SQL: &str = r#"
+ALTER TABLE `session_input` ADD COLUMN `source_key` text;
+ALTER TABLE `session_input` ADD COLUMN `trigger_kind` text NOT NULL DEFAULT 'legacy'
+  CHECK (`trigger_kind` IN ('legacy','user','user_control','automatic','recovery'));
+ALTER TABLE `session_input` ADD COLUMN `cycle_id` text;
+CREATE TABLE `session_execution_state` (
+  `session_id` text PRIMARY KEY,
+  `revision` integer NOT NULL CHECK (`revision` >= 1),
+  `mode` text NOT NULL CHECK (`mode` IN ('plan','work')),
+  `work_identity` text CHECK (`work_identity` IS NULL OR json_valid(`work_identity`)),
+  `authorized_plan_id` text,
+  `authorized_plan_revision` integer CHECK (`authorized_plan_revision` IS NULL OR `authorized_plan_revision` >= 1),
+  `handoff_plan_id` text,
+  `handoff_plan_revision` integer CHECK (`handoff_plan_revision` IS NULL OR `handoff_plan_revision` >= 1),
+  `draft_review_risk` text CHECK (`draft_review_risk` IS NULL OR json_valid(`draft_review_risk`)),
+  `cycle_id` text,
+  `phase` text NOT NULL CHECK (`phase` IN ('idle','planning','authorized','running','waiting','paused','completed','blocked')),
+  `continuation` text CHECK (`continuation` IS NULL OR json_valid(`continuation`)),
+  `time_created` integer NOT NULL CHECK (`time_created` >= 0),
+  `time_updated` integer NOT NULL CHECK (`time_updated` >= `time_created`),
+  CONSTRAINT `session_execution_authorized_plan_pair`
+    CHECK ((`authorized_plan_id` IS NULL) = (`authorized_plan_revision` IS NULL)),
+  CONSTRAINT `session_execution_handoff_plan_pair`
+    CHECK ((`handoff_plan_id` IS NULL) = (`handoff_plan_revision` IS NULL)),
+  CONSTRAINT `fk_session_execution_state_session_id_session_id_fk`
+    FOREIGN KEY (`session_id`) REFERENCES `session`(`id`) ON DELETE CASCADE
+);
+CREATE TABLE `completion_delivery` (
+  `source_key` text PRIMARY KEY,
+  `session_id` text NOT NULL,
+  `source` text NOT NULL CHECK (`source` IN ('background_execution','agent_job','workflow','product_agent')),
+  `terminal_revision` integer NOT NULL CHECK (`terminal_revision` >= 0),
+  `cycle_id` text,
+  `payload` text NOT NULL CHECK (json_valid(`payload`)),
+  `owner` text CHECK (`owner` IS NULL OR `owner` IN ('callback','inline')),
+  `input_id` text,
+  `time_created` integer NOT NULL CHECK (`time_created` >= 0),
+  `time_updated` integer NOT NULL CHECK (`time_updated` >= `time_created`),
+  CONSTRAINT `completion_delivery_owner_input`
+    CHECK ((`owner` = 'callback' AND `input_id` IS NOT NULL)
+      OR (`owner` IS NULL AND `input_id` IS NULL)
+      OR (`owner` = 'inline' AND `input_id` IS NULL)),
+  CONSTRAINT `fk_completion_delivery_session_id_session_id_fk`
+    FOREIGN KEY (`session_id`) REFERENCES `session`(`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_completion_delivery_input_id_session_input_id_fk`
+    FOREIGN KEY (`input_id`) REFERENCES `session_input`(`id`) ON DELETE SET NULL
+);
+CREATE UNIQUE INDEX `session_input_session_source_key_idx`
+  ON `session_input` (`session_id`,`source_key`) WHERE `source_key` IS NOT NULL;
+CREATE INDEX `session_execution_state_mode_phase_updated_idx`
+  ON `session_execution_state` (`mode`,`phase`,`time_updated`,`session_id`);
+CREATE INDEX `completion_delivery_session_owner_updated_idx`
+  ON `completion_delivery` (`session_id`,`owner`,`time_updated`,`source_key`);
+"#;
+
 /// Every table name the current schema's DDL declares, in declaration order.
 ///
 /// Read out of the DDL instead of restated as a list, so a table is enrolled everywhere that
@@ -727,6 +782,7 @@ pub(crate) fn declared_tables() -> Vec<&'static str> {
         LEARNING_SCHEMA_SQL,
         VERIFICATION_SCHEMA_SQL,
         MEMORY_POLICY_SCHEMA_SQL,
+        EXECUTION_SCHEMA_SQL,
     ]
     .into_iter()
     .flat_map(declared_tables_in)
@@ -756,7 +812,8 @@ pub fn up(transaction: &Transaction<'_>) -> Result<(), DbError> {
         .map_err(migration::map_error)?;
     up_learning(transaction)?;
     up_verification(transaction)?;
-    up_memory_policy(transaction)
+    up_memory_policy(transaction)?;
+    up_execution(transaction)
 }
 
 /// Add the learning-flywheel tables to a format-5 database.
@@ -782,6 +839,13 @@ pub(crate) fn up_verification(transaction: &Transaction<'_>) -> Result<(), DbErr
 pub(crate) fn up_memory_policy(transaction: &Transaction<'_>) -> Result<(), DbError> {
     transaction
         .execute_batch(MEMORY_POLICY_SCHEMA_SQL)
+        .map_err(migration::map_error)
+}
+
+/// Add durable session execution control and source-keyed inbox delivery.
+pub(crate) fn up_execution(transaction: &Transaction<'_>) -> Result<(), DbError> {
+    transaction
+        .execute_batch(EXECUTION_SCHEMA_SQL)
         .map_err(migration::map_error)
 }
 

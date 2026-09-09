@@ -1,8 +1,10 @@
 # Zuno 数据库生命周期
 
-Zuno 管理自己的配置根目录和数据根目录。当前数据库格式为 9。空数据库直接创建为当前
+Zuno 管理自己的配置根目录和数据根目录。当前数据库格式为 10。空数据库直接创建为当前
 格式；受支持的旧格式通过受保护的前向迁移升级。format 5 是第一个受支持的历史格式，
-format 5、format 6、format 7 与 format 8 都会原地升级到 format 9，不需要重建数据库。
+format 5 到 format 9 都会原地升级到 format 10，不需要重建数据库。
+迁移链显式覆盖 format 5、format 6、format 7、format 8 与 format 9。
+迁移链显式覆盖 format 5、format 6、format 7、format 8 与 format 9。
 
 ## Channel 数据库
 
@@ -48,15 +50,15 @@ zuno session list
 
 数据库打开流程识别以下状态：
 
-1. **空数据库。** 完整的 format-9 schema 与唯一 `zuno_schema` marker 被原子创建。
-2. **Format 9。** 在执行应用查询前校验 marker 与当前格式要求的表。
-3. **Format 8。** 原地增加带 revision 的 `session_memory_policy` 表及其索引。
-4. **Format 7。** 原地增加 `verification_receipt` 账本，再增加 session memory policy。
-5. **Format 6。** 原地增加 Plan 栈字段、`work_plan_archive`、`verification_receipt`
-   账本与 session memory policy。
-6. **Format 5。** 在一个事务中增加 learning schema、Plan 栈 schema、
-   `verification_receipt` 账本与 session memory policy，并升级到 format 9。
-7. **其他任何状态。** 不受支持的更旧格式、未来格式、缺少 marker，或 marker 与必需
+1. **空数据库。** 完整的 format-10 schema 与唯一 `zuno_schema` marker 被原子创建。
+2. **Format 10。** 在执行应用查询前校验 marker 与当前格式要求的表。
+3. **Format 9。** 原地增加 session execution state、completion delivery 仲裁以及
+   typed inbox trigger 字段。
+4. **Format 8。** 增加带 revision 的 `session_memory_policy`，再增加 format-10 execution schema。
+5. **Format 7。** 增加 `verification_receipt`、session memory policy 与 execution schema。
+6. **Format 6。** 增加 Plan 栈、`work_plan_archive`、验证账本、memory policy 与 execution schema。
+7. **Format 5。** 在一个事务中依次执行全部后续受支持迁移。
+8. **其他任何状态。** 不受支持的更旧格式、未来格式、缺少 marker，或 marker 与必需
    表不匹配，都会失败关闭且不修改文件。
 
 两个进程同时打开或升级同一个数据库时，都按拿到 SQLite 写锁之前看到的 format 做决定。
@@ -64,24 +66,40 @@ zuno session list
 总共最多尝试四次。不支持的 format 仍然报告为 schema 不匹配；如果 format 在打开过程中
 持续变化，则以 `zuno_schema` marker 上的冲突失败关闭。两种路径都不会写库。
 
-### Format 5、6、7 或 8 到 format 9
+### Format 5、6、7、8 或 9 到 format 10
 
 受支持的迁移使用一个 SQLite `BEGIN IMMEDIATE` 事务：
 
-1. 重新读取表清单，并要求 marker 恰好为 format 5、6、7 或 8。
+1. 重新读取表清单，并要求 marker 恰好为 format 5、6、7、8 或 9。
 2. 在任何变更前要求历史 `session` 与 `work_plan` 表存在。
 3. 从 format 5 出发时，创建全部 format-6 learning 表和索引。
 4. 从 format 5 或 6 出发时，增加可空的 `parent_plan_id`、默认值为 0 的 `stack_depth`
    与 `work_plan_archive`，不重写活跃 Plan 行。
 5. 创建 `verification_receipt` 账本；它初始为空，不重写任何已有行。
 6. 创建 `session_memory_policy`；它初始为空，因此已有会话继续采用调用方给出的默认值。
-7. 通过带旧值条件的更新把 singleton marker 从 5、6、7 或 8 改为 9。
-8. 只有全部 schema 操作和 marker 更新成功后才提交。
+7. 为 `session_input` 增加 `source_key`、`trigger_kind` 与 `cycle_id`，创建
+   `session_execution_state`、`completion_delivery` 及其索引；旧输入保留
+   `trigger_kind = 'legacy'`。
+8. 通过带旧值条件的更新把 singleton marker 从 5、6、7、8 或 9 改为 10。
+9. 只有全部 schema 操作和 marker 更新成功后才提交。
 
 任何失败都会回滚整个事务。迁移不会重写已有的 `session`、`message`、
 `memory_candidate`、`learning_job`、`verification_receipt` 或 `work_plan` 值。测试使用
-精确的 format-5、format-6、format-7 与 v0.10.5 format-8 fixture，比较迁移前后的
-全部旧行，再查询新增 policy 表。
+精确的 format-5 到 format-9 fixture，比较迁移前后的全部旧行，再查询新增 policy 与
+execution 表。
+
+### Session execution 与 completion delivery
+
+`session_execution_state` 把协作模式与所选 Agent 分开持久化，同时保存 Work identity、
+精确授权与 handoff-ready 的 Plan revision、continuation cycle、context epoch，以及用户
+显式接受 Draft review 风险的原因。`/start-work` 会在同一个 `BEGIN IMMEDIATE` 事务中
+读取 Plan 与 review gate、更新 Goal、写入 Work authorization，并接纳 `UserControl` 输入。
+
+`completion_delivery` 是后台命令、子 Agent、workflow 与 product Agent 的 exactly-once
+消费权账本。同步 `bg wait` 与异步 callback 竞争唯一的 `inline` 或 `callback` owner；
+失败的一方不能再接纳第二个 turn。`session_input.source_key` 保证重启后的 producer
+幂等接纳，`trigger_kind` 则区分 user、control、automatic 与 recovery turn，无需伪造
+user message。
 
 ### Per-session memory policy
 
@@ -112,7 +130,7 @@ Zuno 会在执行应用查询前拒绝不受支持的 schema 格式，绝不会�
 
 重要数据应使用对应旧二进制导出，或实现并验证明确的前向迁移。不要猜测 schema、静默
 丢行，也不要要求当前二进制已经支持的格式重建数据库。有效的 format-5、format-6、
-format-7 或 format-8 数据库应当自动打开并完成迁移。
+format-7、format-8 或 format-9 数据库应当自动打开并完成迁移。
 
 ## 未来 schema 变更规则
 

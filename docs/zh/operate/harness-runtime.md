@@ -176,18 +176,17 @@ Goal/Plan/Todo/Job 上下文，Plan mutation 还会把一次性的 Required 指�
 恢复策略是 Pause，活跃 Goal 记录 `no_progress`，不会自动重复同一付费读取。
 
 机器执行阶段单独持久化为 `DriverPhase`，不进入用户可见 Plan。阶段包括 `idle`、
-`executing`、`reconciling`、`waiting_retry`、`waiting_background`、`waiting_human`
+`executing`、`reconciling`、`waiting_retry`、`waiting_background`、`paused`
 与 `terminal`。最终回复前，`PlanReconciliationDriver` 只检查 Plan、Todo、Job、Goal、
 后台观察器、工具结果与验证记录：
-没有记录任何持久工作的会话在第一次回复后直接结束；普通会话在持有未对账的持久工作时
-最多续跑两次对账；仍不一致则进入 typed `PlanUnreconciled` 人工等待，不能以成功状态
-交付。Work 模式的 `Optional` 决策不是已记录工作；没有产生任何 Plan、Todo 或 Job 的
+没有记录任何持久工作的会话在第一次回复后直接结束；已授权 Work 从 durable
+`Recovery` token 继续。driver 把权威 revision 哈希为 progress fingerprint，连续三次
+相同才以 typed `no_progress` 暂停，不制造通用人工确认。Work 模式的 `Optional` 决策不是已记录工作；没有产生任何 Plan、Todo 或 Job 的
 请求视为已结算，不会为不存在的状态额外续跑。进程重启会继续原对账 cycle，不解析模型
 自然语言判断“已经完成”。
 
 若未完成的持久工作仍依赖一个运行中的 `backgroundPurpose: "remoteObserver"`，driver
-进入 `waiting_background`，结束当前回合，但不消耗两次普通对账机会，也不创建
-`PlanUnreconciled` 人工问题。活跃 Goal 在观察器仍运行时不会立即再次自动续跑；已有后台
+进入 `waiting_background`，结束当前回合，不轮询，也不创建通用人工问题。活跃 Goal 在观察器仍运行时不会立即再次自动续跑；已有后台
 完成 watcher 会在进程结算后把终态报告写入 inbox 并唤醒会话，后续回合重新查询远端权威状态，
 再恢复普通对账。
 

@@ -24,6 +24,8 @@ use serde_json::{Map, Value, json};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use zuno_db::completion_delivery::CompletionDeliveryStore;
+use zuno_db::inbox::{InputDelivery, NewSessionInput};
 use zuno_error::ToolError;
 use zuno_paths::GeneratedDirectory;
 use zuno_pty::{
@@ -33,6 +35,7 @@ use zuno_pty::{
 use zuno_tool::{
     ToolContext, ToolEffect, ToolOutput, ToolOutputStore, ToolReplayPolicy, TypedTool,
 };
+use zuno_types::execution::{CompletionEnvelope, CompletionSource, InputTriggerKind};
 
 pub const WIRE_ID: &str = "bg";
 
@@ -43,7 +46,7 @@ pub const BACKGROUND_METADATA_KEY: &str = "background_execution";
 pub const ARTIFACT_METADATA_KEY: &str = "tool_output_artifact";
 
 const DEFAULT_WAIT_MS: u64 = 30_000;
-const MAX_WAIT_MS: u64 = 120_000;
+const MAX_WAIT_MS: u64 = 60_000;
 
 /// Bytes returned when a read does not ask for a size.
 ///
@@ -149,6 +152,7 @@ pub struct BackgroundParams {
 pub struct BackgroundTool {
     service: Arc<BackgroundExecutionService>,
     output_store: Option<ToolOutputStore>,
+    completion_delivery: Option<CompletionDeliveryStore>,
 }
 
 impl BackgroundTool {
@@ -171,6 +175,7 @@ impl BackgroundTool {
         Self {
             service,
             output_store,
+            completion_delivery: None,
         }
     }
 
@@ -181,6 +186,13 @@ impl BackgroundTool {
     #[must_use]
     pub fn with_output_store(mut self, store: ToolOutputStore) -> Self {
         self.output_store = Some(store);
+        self
+    }
+
+    /// Arbitrate terminal completion with the asynchronous callback path.
+    #[must_use]
+    pub fn with_completion_delivery(mut self, pool: Arc<zuno_db::Pool>) -> Self {
+        self.completion_delivery = Some(CompletionDeliveryStore::new(pool));
         self
     }
 
@@ -237,8 +249,11 @@ impl TypedTool for BackgroundTool {
         "List, inspect, wait for, or cancel shell commands that are already running in the \
          background, and page through output that was withheld for size. Reads return one \
          bounded window plus the cursor the next window starts at, so ask again with that \
-         cursor instead of slicing a file with a shell command. Cancellation is a side effect \
-         and this tool is never automatically replayed."
+         cursor instead of slicing a file with a shell command. Background completion normally \
+         notifies and wakes the parent automatically. Use wait only when the current step \
+         synchronously depends on the result; one wait is capped at 60 seconds, so do not loop \
+         waiting across turns. Cancellation is a side effect and this tool is never \
+         automatically replayed."
     }
 
     fn replay_policy(&self) -> ToolReplayPolicy {
@@ -299,6 +314,27 @@ impl TypedTool for BackgroundTool {
                 let title = format!("{}: {}", id, waited.info.status.as_str());
                 let mut fields = render_window(&window);
                 fields.insert("waitTimedOut".to_owned(), Value::Bool(waited.timed_out));
+                let claimed_inline = if waited.info.status.is_terminal() {
+                    match &self.completion_delivery {
+                        Some(delivery) => {
+                            let envelope = background_completion_envelope(&waited.info);
+                            delivery
+                                .publish(envelope.clone(), completion_time(&waited.info))
+                                .map_err(failed)?;
+                            delivery
+                                .claim_inline(&envelope.source_key, completion_time(&waited.info))
+                                .map_err(failed)?
+                                .is_some()
+                        }
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+                fields.insert(
+                    "completionClaimedInline".to_owned(),
+                    Value::Bool(claimed_inline),
+                );
                 fields.insert("execution".to_owned(), render_info(waited.info));
                 render(title, BACKGROUND_METADATA_KEY, Value::Object(fields))
             }
@@ -373,6 +409,101 @@ impl TypedTool for BackgroundTool {
             }
         }
     }
+}
+
+/// Deterministic terminal identity shared by synchronous wait and callback delivery.
+#[must_use]
+pub fn background_completion_source_key(info: &BackgroundExecutionInfo) -> String {
+    format!("background:{}:{}", info.id.as_str(), info.time_updated)
+}
+
+/// Canonical terminal completion published before either consumer claims it.
+#[must_use]
+pub fn background_completion_envelope(info: &BackgroundExecutionInfo) -> CompletionEnvelope {
+    CompletionEnvelope {
+        source_key: background_completion_source_key(info),
+        source: CompletionSource::BackgroundExecution,
+        terminal_revision: u64::try_from(info.time_updated).unwrap_or_default(),
+        parent_session_id: info.session_id.clone(),
+        cycle_id: None,
+        payload: background_completion_payload(info),
+    }
+}
+
+/// Canonical callback input for one terminal background execution.
+#[must_use]
+pub fn background_completion_input(info: &BackgroundExecutionInfo) -> NewSessionInput {
+    NewSessionInput::new(
+        format!("msg_{}", info.id.as_str()),
+        info.session_id.clone(),
+        background_completion_payload(info),
+        InputDelivery::Steer,
+        completion_time(info),
+    )
+    .with_source_key(background_completion_source_key(info))
+    .with_trigger_kind(InputTriggerKind::Automatic)
+}
+
+fn background_completion_payload(info: &BackgroundExecutionInfo) -> Value {
+    json!({
+        "kind": "backgroundExecutionReport",
+        "executionID": info.id.as_str(),
+        "status": info.status.as_str(),
+        "title": info.title,
+        "command": info.command,
+        "purpose": info.purpose.as_str(),
+        "requiresAuthoritativeRefresh": info.purpose.requires_authoritative_refresh(),
+        "exitCode": info.exit_code,
+        "timedOut": info.timed_out,
+        "error": info.error,
+        "text": background_execution_report_text(info),
+    })
+}
+
+fn completion_time(info: &BackgroundExecutionInfo) -> i64 {
+    info.time_completed
+        .unwrap_or(info.time_updated)
+        .max(info.time_created)
+}
+
+/// Model-visible terminal report shared by every background completion producer.
+#[must_use]
+pub fn background_execution_report_text(info: &BackgroundExecutionInfo) -> String {
+    use zuno_pty::BackgroundExecutionPurpose;
+
+    let exit = info
+        .exit_code
+        .map(|code| format!(", exit code {code}"))
+        .unwrap_or_default();
+    let error = info
+        .error
+        .as_deref()
+        .map(|error| format!("\nRecorded error: {error}"))
+        .unwrap_or_default();
+    let continuation = match info.purpose {
+        BackgroundExecutionPurpose::Command => String::from(
+            "Inspect the durable output with the `bg` tool when needed, then continue the parent \
+             task.",
+        ),
+        BackgroundExecutionPurpose::RemoteObserver => String::from(
+            "This process was registered as a remote observer. Its terminal status is only a wake \
+             signal, not proof that the remote workflow, job, or release reached the requested \
+             state. Inspect durable output with the `bg` tool, then re-query authoritative remote \
+             state using a stable repository, run/attempt, or ref identifier. Reconcile every \
+             required child job and artifact before updating the Plan or declaring completion; a \
+             skipped, cancelled, or missing required child is not success unless an explicit \
+             policy permits it.",
+        ),
+    };
+    format!(
+        "Background command `{}` ({}) reached terminal status `{}`{exit}.{error}\n\
+         The earlier assistant turn may have ended while it was running. {continuation} Do not \
+         rerun a command with possible side effects unless authoritative state proves that replay \
+         is safe.",
+        info.id,
+        info.title,
+        info.status.as_str()
+    )
 }
 
 /// Rejects a parameter that has no meaning for the action it was sent with.

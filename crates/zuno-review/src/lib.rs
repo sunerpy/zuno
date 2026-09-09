@@ -14,9 +14,10 @@ mod tools;
 pub use model::{
     ActorRef, ClaimKind, ClaimPriority, ClaimStatus, CodeGraphIndexSnapshot, Countercheck,
     CountercheckKind, EvidenceAnchor, MAX_CLAIM_STATEMENT_CHARS, MAX_EVIDENCE_ANCHORS,
-    MAX_LOAD_BEARING_CLAIMS, NewReviewClaim, ReviewArtifactSnapshot, ReviewBlocker, ReviewClaim,
-    ReviewDelegateReceipt, ReviewFinalizeOutcome, ReviewIssue, ReviewIssueKind, ReviewReadiness,
-    ReviewReceipt, ReviewSourceSnapshot, ReviewStatus, ReviewVerificationReceipt, SystemLayer,
+    MAX_LOAD_BEARING_CLAIMS, NewReviewClaim, PlanReviewGate, ReviewArtifactSnapshot, ReviewBlocker,
+    ReviewClaim, ReviewDelegateReceipt, ReviewFinalizeOutcome, ReviewIssue, ReviewIssueKind,
+    ReviewReadiness, ReviewReceipt, ReviewSourceSnapshot, ReviewStatus, ReviewVerificationReceipt,
+    SystemLayer,
 };
 pub use report::{
     DEFAULT_MAX_CLAIMS_PER_REPORT, DelegationEvidenceReport, MAX_COUNTERCHECKS_PER_CLAIM,

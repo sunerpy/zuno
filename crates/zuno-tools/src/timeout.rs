@@ -36,8 +36,9 @@ pub fn timeout_promoted_output(
          Status file: {}\n\n\
          The command is still running; do not rerun it unless you intentionally want a second \
          copy.\n\
-         Use `bg` with action=\"wait\" and taskID=\"{}\" to wait for completion or the next \
-         progress checkpoint.\n\
+         Completion normally wakes the parent automatically. Use `bg` with action=\"wait\" and \
+         taskID=\"{}\" only when this same step synchronously depends on the result; one wait is \
+         capped at 60 seconds, so do not loop it across turns.\n\
          Use `bg` with action=\"output\" and taskID=\"{}\" to inspect output.\n\
          If you expected it to finish quickly and it did not, the `timeout` parameter is in \
          MILLISECONDS; pass a larger value or omit it.",

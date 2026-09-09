@@ -410,7 +410,7 @@ impl ProductionAcpAgent {
         let withdrawable = session.track_prompt_request(request);
         let prompt = parse_prompt(params)?;
         session
-            .prompt(&withdrawable, prompt, self.state.as_ref(), client)
+            .prompt(&withdrawable, prompt, Arc::clone(&self.state), client)
             .await
     }
 
@@ -421,16 +421,10 @@ impl ProductionAcpAgent {
     ) -> Result<Value, zuno_acp::RpcError> {
         let session_id = required_string(params, "sessionId")?;
         let mode_id = required_string(params, "modeId")?;
-        let configuration = self
-            .session(&session_id)
+        self.session(&session_id)
             .await?
-            .reconfigure(
-                SessionReconfiguration::Mode(mode_id),
-                self.state.as_ref(),
-                client.clone(),
-            )
+            .set_mode_selection(mode_id, Arc::clone(&self.state), client)
             .await?;
-        defer_configuration_updates(&client, &session_id, &configuration)?;
         Ok(json!({}))
     }
 
@@ -442,6 +436,12 @@ impl ProductionAcpAgent {
         let session_id = required_string(params, "sessionId")?;
         let config_id = required_string(params, "configId")?;
         let value = required_string(params, "value")?;
+        let session = self.session(&session_id).await?;
+        if config_id == "agent" && session.current_configuration().await?.mode == "plan" {
+            let configuration = session.select_plan_work_agent(&value).await?;
+            publish_configuration_updates(&client, &session_id, &configuration).await?;
+            return Ok(json!({ "configOptions": configuration.config_options() }));
+        }
         let change = match config_id.as_str() {
             "agent" => SessionReconfiguration::Agent(value),
             "model" => SessionReconfiguration::Model(value),
@@ -452,11 +452,18 @@ impl ProductionAcpAgent {
                 )));
             }
         };
-        let configuration = self
-            .session(&session_id)
-            .await?
+        let configuration = session
             .reconfigure(change, self.state.as_ref(), client.clone())
             .await?;
+        if configuration.mode == "plan" {
+            zuno_session_control::SessionControlService::new(Arc::new(durable_pool()?))
+                .update_work_identity(
+                    &session_id,
+                    configuration.work_identity()?,
+                    zuno_db::message::now_millis(),
+                )
+                .map_err(session_control_rpc_error)?;
+        }
         defer_configuration_updates(&client, &session_id, &configuration)?;
         Ok(json!({ "configOptions": configuration.config_options() }))
     }
@@ -599,7 +606,7 @@ impl ProductionAcpAgent {
 
     async fn open_dormant_session(
         &self,
-        options: TurnOptions,
+        mut options: TurnOptions,
         session_slot: OwnedSemaphorePermit,
         mcp_servers: Vec<zuno_acp::AcpMcpServer>,
     ) -> Result<Arc<AcpSession>, zuno_acp::RpcError> {
@@ -611,6 +618,32 @@ impl ProductionAcpAgent {
                 ));
             }
         };
+        let execution =
+            zuno_db::session_execution::SessionExecutionStore::new(Arc::new(durable_pool()?))
+                .get(&session_id)
+                .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
+        let preserved_build_agent = execution
+            .as_ref()
+            .and_then(|state| state.work_identity.as_ref())
+            .map(|identity| identity.agent.as_str());
+        if let Some(execution) = execution.as_ref() {
+            match execution.mode {
+                zuno_types::execution::CollaborationMode::Plan => {
+                    options.agent = Some("plan".to_owned());
+                }
+                zuno_types::execution::CollaborationMode::Work => {
+                    if let Some(identity) = execution.work_identity.as_ref() {
+                        options.agent = Some(identity.agent.clone());
+                        options.model =
+                            Some(format!("{}/{}", identity.provider_id, identity.model_id));
+                        options.effort = identity
+                            .reasoning
+                            .as_deref()
+                            .and_then(|reasoning| reasoning.parse().ok());
+                    }
+                }
+            }
+        }
         let _composition = self.state.composition_gate.lock().await;
         let plan = TurnPlan::resolve(&options, &self.state.environment)
             .await
@@ -621,7 +654,7 @@ impl ProductionAcpAgent {
             .to_path_buf();
         let background_notification_directory = plan.directory().to_path_buf();
         let background_notifications = self.state.environment.background_notifications();
-        let configuration = SessionConfiguration::from_plan(&plan, None);
+        let configuration = SessionConfiguration::from_plan(&plan, preserved_build_agent);
         let available_commands =
             available_commands_for_plan(&plan, self.state.environment.resolved())
                 .map_err(zuno_acp::RpcError::internal)?;
@@ -1693,6 +1726,48 @@ impl AcpSession {
             .ok_or_else(|| self.closed_error())
     }
 
+    async fn select_plan_work_agent(
+        &self,
+        agent: &str,
+    ) -> Result<SessionConfiguration, zuno_acp::RpcError> {
+        let current = self.current_configuration().await?;
+        if current.mode != "plan" {
+            return Err(zuno_acp::RpcError::invalid_params(
+                "the deferred Work Agent can only be selected while Plan mode is active",
+            ));
+        }
+        if agent == "plan" {
+            return Ok(current);
+        }
+        if !current.agents.iter().any(|choice| choice.name == agent) {
+            let available = current
+                .agents
+                .iter()
+                .filter(|choice| choice.name != "plan")
+                .map(|choice| choice.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(zuno_acp::RpcError::invalid_params(format!(
+                "unknown Work Agent {agent}; available Agents: {available}"
+            )));
+        }
+        let mut identity = current.work_identity()?;
+        identity.agent = agent.to_owned();
+        zuno_session_control::SessionControlService::new(Arc::new(durable_pool()?))
+            .update_work_identity(&self.id, identity, zuno_db::message::now_millis())
+            .map_err(session_control_rpc_error)?;
+
+        let _mount = self.mount_gate.lock().await;
+        if let Some(dormant) = self.dormant.lock().await.as_mut() {
+            dormant.configuration.build_agent = agent.to_owned();
+            return Ok(dormant.configuration.clone());
+        }
+        let mut resources = self.resources.lock().await;
+        let resources = resources.as_mut().ok_or_else(|| self.closed_error())?;
+        resources.configuration.build_agent = agent.to_owned();
+        Ok(resources.configuration.clone())
+    }
+
     async fn defer_available_commands(
         &self,
         client: &zuno_acp::ClientConnection,
@@ -1984,10 +2059,10 @@ impl AcpSession {
     }
 
     async fn prompt(
-        &self,
+        self: &Arc<Self>,
         withdrawable: &WithdrawablePrompt<'_>,
         prompt: AcpPrompt,
-        state: &AcpState,
+        state: Arc<AcpState>,
         client: zuno_acp::ClientConnection,
     ) -> Result<Value, zuno_acp::RpcError> {
         let _in_flight = InFlightPrompt::enter(&self.prompts_in_flight);
@@ -1999,9 +2074,11 @@ impl AcpSession {
             && command.is_mode_control()
         {
             validate_session_command_arguments(command, &arguments)?;
-            return self.execute_mode_command(command, state, client).await;
+            return self
+                .execute_mode_command(command, &arguments, withdrawable.request(), state, client)
+                .await;
         }
-        let activated = self.ensure_active(state, client.clone()).await?;
+        let activated = self.ensure_active(state.as_ref(), client.clone()).await?;
         if activated {
             self.defer_available_commands(&client).await?;
         }
@@ -2408,7 +2485,17 @@ impl AcpSession {
         let drive = async {
             let mut resources = self.resources.lock().await;
             let resources = resources.as_mut().ok_or_else(|| self.closed_error())?;
-            let outcome = if drivable.content.is_empty() {
+            let outcome = if let Some(continuation) = drivable.start_work {
+                resources
+                    .host
+                    .drive_promoted_start_work_with_guard(
+                        &input_id,
+                        continuation,
+                        guard,
+                        events.clone(),
+                    )
+                    .await
+            } else if drivable.content.is_empty() {
                 resources
                     .host
                     .drive_promoted_with_guard(&drivable.text, &input_id, guard, events.clone())
@@ -2509,65 +2596,296 @@ impl AcpSession {
     }
 
     async fn execute_mode_command(
-        &self,
+        self: &Arc<Self>,
         command: SessionCommand,
-        state: &AcpState,
+        arguments: &str,
+        request: &zuno_acp::RequestId,
+        state: Arc<AcpState>,
         client: zuno_acp::ClientConnection,
     ) -> Result<Value, zuno_acp::RpcError> {
+        let activated = self.ensure_active(state.as_ref(), client.clone()).await?;
+        if activated {
+            self.defer_available_commands(&client).await?;
+        }
+        self.materialize_for_control().await?;
         let current = self.current_configuration().await?;
-        let target = match command {
-            SessionCommand::Plan if current.mode == "plan" => "build",
-            SessionCommand::Plan | SessionCommand::StartPlan => "plan",
-            SessionCommand::StartWork => "build",
+        match command {
+            SessionCommand::Plan | SessionCommand::StartPlan => {
+                if self.control.status() == SessionStatus::Busy {
+                    return Err(command_requires_idle_session(&self.id));
+                }
+                let work_identity = current.work_identity()?;
+                let was_plan = current.mode == "plan";
+                let configuration = if was_plan {
+                    current
+                } else {
+                    self.reconfigure_from_prompt(
+                        SessionReconfiguration::Mode("plan".to_owned()),
+                        state.as_ref(),
+                        client.clone(),
+                    )
+                    .await?
+                };
+                let service =
+                    zuno_session_control::SessionControlService::new(Arc::new(durable_pool()?));
+                if let Err(error) = service.enter_plan(zuno_session_control::EnterPlanRequest {
+                    session_id: &self.id,
+                    work_identity,
+                    at_ms: zuno_db::message::now_millis(),
+                }) {
+                    if configuration.mode == "plan" && !was_plan {
+                        let _rollback = self
+                            .reconfigure_from_prompt(
+                                SessionReconfiguration::Mode("build".to_owned()),
+                                state.as_ref(),
+                                client.clone(),
+                            )
+                            .await;
+                    }
+                    return Err(zuno_acp::RpcError::internal(error.to_string()));
+                }
+                publish_configuration_updates(&client, &self.id, &configuration).await?;
+                Ok(json!({
+                    "stopReason": "end_turn",
+                    "mode": "plan",
+                }))
+            }
+            SessionCommand::StartWork => {
+                let risk_reason = parse_start_work_risk(arguments)?;
+                let owner = self.claim_turn(request);
+                let session_busy = owner.is_none() || self.control.status() == SessionStatus::Busy;
+                let service =
+                    zuno_session_control::SessionControlService::new(Arc::new(durable_pool()?));
+                let outcome = service
+                    .start_work(zuno_session_control::StartWorkRequest {
+                        session_id: &self.id,
+                        expected_plan_revision: None,
+                        anchor_message_id: self.latest_user_anchor().await?,
+                        draft_review_risk_reason: risk_reason,
+                        session_busy,
+                        at_ms: zuno_db::message::now_millis(),
+                    })
+                    .map_err(session_control_rpc_error)?;
+                let response_fields = json!({
+                    "planId": outcome.plan.id,
+                    "planRevision": outcome.plan.revision,
+                    "cycleId": outcome.state.cycle_id,
+                    "started": match outcome.disposition {
+                        zuno_session_control::StartWorkDisposition::Started => "started",
+                        zuno_session_control::StartWorkDisposition::Queued => "queued",
+                    },
+                });
+                if session_busy {
+                    drop(owner);
+                    self.spawn_start_work_recovery(state, client);
+                    return Ok(json!({
+                        "stopReason": "end_turn",
+                        "planId": response_fields["planId"],
+                        "planRevision": response_fields["planRevision"],
+                        "cycleId": response_fields["cycleId"],
+                        "started": response_fields["started"],
+                    }));
+                }
+                let configuration = self
+                    .reconfigure_from_prompt(
+                        SessionReconfiguration::Mode("build".to_owned()),
+                        state.as_ref(),
+                        client.clone(),
+                    )
+                    .await?;
+                publish_configuration_updates(&client, &self.id, &configuration).await?;
+                let guard = self.begin_turn()?;
+                let Some((driven, projected)) = self
+                    .drive_next_durable_input(&client, &guard, DurableInputScope::Controls)
+                    .await?
+                else {
+                    return Err(zuno_acp::RpcError::internal(
+                        "Start Work authorization did not leave a pending control input",
+                    ));
+                };
+                drop(guard);
+                let mut response = self.settle_turn(driven, projected, false, &client).await?;
+                response["planId"] = response_fields["planId"].clone();
+                response["planRevision"] = response_fields["planRevision"].clone();
+                response["cycleId"] = response_fields["cycleId"].clone();
+                response["started"] = response_fields["started"].clone();
+                Ok(response)
+            }
             SessionCommand::Compact
             | SessionCommand::Goal
             | SessionCommand::Learn
-            | SessionCommand::Reflect => {
-                return Err(zuno_acp::RpcError::internal(format!(
-                    "/{} is not a mode control",
-                    command.name()
-                )));
+            | SessionCommand::Reflect => Err(zuno_acp::RpcError::internal(format!(
+                "/{} is not a mode control",
+                command.name()
+            ))),
+        }
+    }
+
+    async fn set_mode_selection(
+        self: &Arc<Self>,
+        mode_id: String,
+        state: Arc<AcpState>,
+        client: zuno_acp::ClientConnection,
+    ) -> Result<(), zuno_acp::RpcError> {
+        let activated = self.ensure_active(state.as_ref(), client.clone()).await?;
+        if activated {
+            self.defer_available_commands(&client).await?;
+        }
+        self.materialize_for_control().await?;
+        let current = self.current_configuration().await?;
+        match mode_id.as_str() {
+            "plan" => {
+                if self.control.status() == SessionStatus::Busy {
+                    return Err(zuno_acp::RpcError::session_busy(format!(
+                        "session {} is running a turn; Plan mode will not interrupt it",
+                        self.id
+                    )));
+                }
+                let work_identity = current.work_identity()?;
+                let configuration = if current.mode == "plan" {
+                    current
+                } else {
+                    self.reconfigure(
+                        SessionReconfiguration::Mode("plan".to_owned()),
+                        state.as_ref(),
+                        client.clone(),
+                    )
+                    .await?
+                };
+                zuno_session_control::SessionControlService::new(Arc::new(durable_pool()?))
+                    .enter_plan(zuno_session_control::EnterPlanRequest {
+                        session_id: &self.id,
+                        work_identity,
+                        at_ms: zuno_db::message::now_millis(),
+                    })
+                    .map_err(session_control_rpc_error)?;
+                publish_configuration_updates(&client, &self.id, &configuration).await
             }
-        };
-        if target == "build" && current.mode == "plan" && !self.has_durable_plan()? {
-            return Err(zuno_acp::RpcError::invalid_params(
-                "no durable plan is ready; run /start-plan and let the plan Agent create one",
-            ));
+            "build" => {
+                let session_busy = self.control.status() == SessionStatus::Busy
+                    || self
+                        .turn_owner
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_some();
+                zuno_session_control::SessionControlService::new(Arc::new(durable_pool()?))
+                    .start_work(zuno_session_control::StartWorkRequest {
+                        session_id: &self.id,
+                        expected_plan_revision: None,
+                        anchor_message_id: self.latest_user_anchor().await?,
+                        draft_review_risk_reason: None,
+                        session_busy,
+                        at_ms: zuno_db::message::now_millis(),
+                    })
+                    .map_err(session_control_rpc_error)?;
+                if session_busy {
+                    self.spawn_start_work_recovery(state, client);
+                    return Ok(());
+                }
+                let configuration = self
+                    .reconfigure(
+                        SessionReconfiguration::Mode("build".to_owned()),
+                        state.as_ref(),
+                        client.clone(),
+                    )
+                    .await?;
+                publish_configuration_updates(&client, &self.id, &configuration).await?;
+                let guard = self.begin_turn()?;
+                let next = self
+                    .drive_next_durable_input(&client, &guard, DurableInputScope::Controls)
+                    .await?;
+                drop(guard);
+                if let Some((driven, projected)) = next {
+                    let _response = self.settle_turn(driven, projected, false, &client).await?;
+                }
+                Ok(())
+            }
+            other => Err(zuno_acp::RpcError::invalid_params(format!(
+                "unknown ACP session mode {other}; expected build or plan"
+            ))),
+        }
+    }
+
+    async fn materialize_for_control(&self) -> Result<(), zuno_acp::RpcError> {
+        if self.durable_handles()?.identity.is_materialized() {
+            return Ok(());
+        }
+        let mut resources = self.resources.lock().await;
+        let resources = resources.as_mut().ok_or_else(|| self.closed_error())?;
+        resources
+            .host
+            .materialize_session()
+            .map_err(zuno_acp::RpcError::internal)?;
+        self.install_durable_handles(resources);
+        Ok(())
+    }
+
+    async fn latest_user_anchor(&self) -> Result<Option<String>, zuno_acp::RpcError> {
+        let resources = self.resources.lock().await;
+        let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
+        resources
+            .host
+            .resumed_history()
+            .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))
+            .map(|history| {
+                history
+                    .into_iter()
+                    .rev()
+                    .find(|message| {
+                        message.info.role == zuno_db::message::MessageRole::User
+                            && message.info.data.get("mode").and_then(Value::as_str)
+                                != Some("compaction")
+                    })
+                    .map(|message| message.info.id)
+            })
+    }
+
+    fn spawn_start_work_recovery(
+        self: &Arc<Self>,
+        state: Arc<AcpState>,
+        client: zuno_acp::ClientConnection,
+    ) {
+        let session = Arc::clone(self);
+        tokio::spawn(async move {
+            session.runs.wait_until_idle(&session.id).await;
+            if let Err(error) = session
+                .recover_queued_start_work(state.as_ref(), client)
+                .await
+            {
+                tracing::warn!(
+                    session_id = session.id,
+                    %error,
+                    "queued ACP Start Work recovery stopped"
+                );
+            }
+        });
+    }
+
+    async fn recover_queued_start_work(
+        &self,
+        state: &AcpState,
+        client: zuno_acp::ClientConnection,
+    ) -> Result<(), zuno_acp::RpcError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(());
         }
         let configuration = self
             .reconfigure_from_prompt(
-                SessionReconfiguration::Mode(target.to_owned()),
+                SessionReconfiguration::Mode("build".to_owned()),
                 state,
                 client.clone(),
             )
             .await?;
-        client
-            .session_update(
-                &self.id,
-                json!({
-                    "sessionUpdate": "current_mode_update",
-                    "currentModeId": configuration.mode,
-                }),
-            )
+        publish_configuration_updates(&client, &self.id, &configuration).await?;
+        let guard = self.begin_turn()?;
+        let next = self
+            .drive_next_durable_input(&client, &guard, DurableInputScope::Controls)
             .await?;
-        client
-            .session_update(
-                &self.id,
-                json!({
-                    "sessionUpdate": "config_option_update",
-                    "configOptions": configuration.config_options(),
-                }),
-            )
-            .await?;
-        Ok(json!({ "stopReason": "end_turn" }))
-    }
-
-    fn has_durable_plan(&self) -> Result<bool, zuno_acp::RpcError> {
-        let store = zuno_tools::WorkStateStore::new(Arc::new(durable_pool()?));
-        store
-            .plan(&self.id)
-            .map(|plan| plan.is_some())
-            .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))
+        drop(guard);
+        if let Some((driven, projected)) = next {
+            let _response = self.settle_turn(driven, projected, false, &client).await?;
+        }
+        Ok(())
     }
 
     async fn ensure_active(
@@ -3373,10 +3691,16 @@ impl SessionConfiguration {
                 ConfigurationPersistence::Agent
             }
             SessionReconfiguration::Agent(agent) => {
-                if !self.agents.iter().any(|choice| choice.name == agent) {
+                if agent == "plan"
+                    || !self
+                        .agents
+                        .iter()
+                        .any(|choice| choice.name == agent && choice.name != "plan")
+                {
                     let available = self
                         .agents
                         .iter()
+                        .filter(|choice| choice.name != "plan")
                         .map(|choice| choice.name.as_str())
                         .collect::<Vec<_>>()
                         .join(", ");
@@ -3465,6 +3789,26 @@ impl SessionConfiguration {
         }))
     }
 
+    fn work_identity(
+        &self,
+    ) -> Result<zuno_types::execution::TurnExecutionIdentity, zuno_acp::RpcError> {
+        let (provider_id, model_id) = self.model.split_once('/').ok_or_else(|| {
+            zuno_acp::RpcError::internal(format!(
+                "resolved ACP model `{}` is not provider/model",
+                self.model
+            ))
+        })?;
+        Ok(zuno_types::execution::TurnExecutionIdentity::new(
+            &self.build_agent,
+            provider_id,
+            model_id,
+        )
+        .with_reasoning(
+            self.effort_override
+                .map(|effort| effort.as_str().to_owned()),
+        ))
+    }
+
     fn lifecycle_response(&self) -> Value {
         json!({
             "modes": {
@@ -3505,8 +3849,12 @@ impl SessionConfiguration {
                 "name": "Agent",
                 "category": "_agent",
                 "type": "select",
-                "currentValue": self.active_agent,
-                "options": self.agents.iter().map(|agent| json!({
+                "currentValue": if self.mode == "plan" {
+                    &self.build_agent
+                } else {
+                    &self.active_agent
+                },
+                "options": self.agents.iter().filter(|agent| agent.name != "plan").map(|agent| json!({
                     "value": agent.name,
                     "name": agent.name,
                     "description": agent.description,
@@ -3590,6 +3938,71 @@ fn defer_configuration_updates(
             "configOptions": configuration.config_options(),
         }),
     )
+}
+
+async fn publish_configuration_updates(
+    client: &zuno_acp::ClientConnection,
+    session_id: &str,
+    configuration: &SessionConfiguration,
+) -> Result<(), zuno_acp::RpcError> {
+    client
+        .session_update(
+            session_id,
+            json!({
+                "sessionUpdate": "current_mode_update",
+                "currentModeId": configuration.mode,
+            }),
+        )
+        .await?;
+    client
+        .session_update(
+            session_id,
+            json!({
+                "sessionUpdate": "config_option_update",
+                "configOptions": configuration.config_options(),
+            }),
+        )
+        .await
+}
+
+fn parse_start_work_risk(arguments: &str) -> Result<Option<String>, zuno_acp::RpcError> {
+    let arguments = arguments.trim();
+    if arguments.is_empty() {
+        return Ok(None);
+    }
+    let Some(reason) = arguments.strip_prefix("--accept-draft-risk") else {
+        return Err(zuno_acp::RpcError::invalid_params(
+            "usage: /start-work [--accept-draft-risk <reason>]",
+        ));
+    };
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err(zuno_acp::RpcError::invalid_params(
+            "--accept-draft-risk requires a visible reason",
+        ));
+    }
+    Ok(Some(reason.to_owned()))
+}
+
+fn session_control_rpc_error(
+    error: zuno_session_control::SessionControlError,
+) -> zuno_acp::RpcError {
+    match error {
+        zuno_session_control::SessionControlError::NotInPlanMode { .. }
+        | zuno_session_control::SessionControlError::MissingPlan { .. }
+        | zuno_session_control::SessionControlError::PlanRevisionConflict { .. }
+        | zuno_session_control::SessionControlError::HandoffRequired { .. }
+        | zuno_session_control::SessionControlError::DraftReview { .. } => {
+            zuno_acp::RpcError::invalid_params(error.to_string())
+        }
+        zuno_session_control::SessionControlError::Database(_)
+        | zuno_session_control::SessionControlError::Goal(_)
+        | zuno_session_control::SessionControlError::Review(_)
+        | zuno_session_control::SessionControlError::WorkState(_)
+        | zuno_session_control::SessionControlError::CorruptState { .. } => {
+            zuno_acp::RpcError::internal(error.to_string())
+        }
+    }
 }
 
 const fn reasoning_effort_name(effort: zuno_llm::effort::ReasoningEffort) -> &'static str {
@@ -4284,6 +4697,7 @@ fn command_requires_idle_session(session_id: &str) -> zuno_acp::RpcError {
 struct AcpDurableInput {
     text: String,
     content: Vec<RequestContentBlock>,
+    start_work: Option<zuno_types::execution::ContinuationToken>,
 }
 
 /// Which pending durable rows one ACP drive is entitled to claim.
@@ -4297,6 +4711,8 @@ enum DurableInputScope {
     Answers,
     /// ACP prompts plus attributed peer-session messages this surface can drive.
     Prompts,
+    /// Host-owned collaboration controls admitted by ACP mode commands.
+    Controls,
 }
 
 impl DurableInputScope {
@@ -4306,6 +4722,20 @@ impl DurableInputScope {
     /// must not claim cannot be allowed to fail every later prompt in the session.
     fn admits(self, input: &zuno_db::inbox::SessionInput) -> Option<AcpDurableInput> {
         let kind = zuno_db::inbox::DurableInputKind::classify(&input.prompt)?;
+        if self == Self::Controls {
+            if kind != zuno_db::inbox::DurableInputKind::SessionControl
+                || input.prompt.get("control").and_then(Value::as_str) != Some("start_work")
+            {
+                return None;
+            }
+            let continuation =
+                serde_json::from_value(input.prompt.get("continuation")?.clone()).ok()?;
+            return Some(AcpDurableInput {
+                text: String::new(),
+                content: Vec::new(),
+                start_work: Some(continuation),
+            });
+        }
         let owned = match self {
             Self::Answers => kind == zuno_db::inbox::DurableInputKind::HumanRequestAnswer,
             Self::Prompts => matches!(
@@ -4313,6 +4743,7 @@ impl DurableInputScope {
                 zuno_db::inbox::DurableInputKind::AcpPrompt
                     | zuno_db::inbox::DurableInputKind::SessionMessage
             ),
+            Self::Controls => unreachable!("controls returned above"),
         };
         if !owned {
             return None;
@@ -4322,7 +4753,11 @@ impl DurableInputScope {
             Some(blocks) => serde_json::from_value(Value::Array(blocks.clone())).ok()?,
             None => Vec::new(),
         };
-        Some(AcpDurableInput { text, content })
+        Some(AcpDurableInput {
+            text,
+            content,
+            start_work: None,
+        })
     }
 }
 
@@ -4569,6 +5004,9 @@ mod tests {
             session_id: "ses_acp".to_owned(),
             prompt,
             delivery: zuno_db::inbox::InputDelivery::Queue,
+            source_key: None,
+            trigger_kind: zuno_types::execution::InputTriggerKind::Legacy,
+            cycle_id: None,
             state: zuno_db::inbox::SubmissionState::Queued,
             revision: 1,
             admitted_sequence: 1,
@@ -4655,7 +5093,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_selector_includes_plan_and_tracks_the_active_agent() {
+    fn agent_selector_in_plan_mode_tracks_the_deferred_work_agent() {
         let configuration = configuration();
         let agent = configuration
             .config_options()
@@ -4666,18 +5104,19 @@ mod tests {
         assert!(
             agent["options"]
                 .as_array()
-                .is_some_and(|options| { options.iter().any(|option| option["value"] == "plan") })
+                .is_some_and(|options| options.iter().all(|option| option["value"] != "plan")),
+            "Plan is a collaboration mode, not a selectable Work Agent"
         );
 
-        let prepared = configuration
-            .prepare_reconfiguration(
-                TurnOptions::default(),
-                configuration.effort_override,
-                SessionReconfiguration::Agent("plan".to_owned()),
-            )
-            .expect("select plan")
-            .expect("configuration changed");
-        assert_eq!(prepared.options.agent.as_deref(), Some("plan"));
+        let error = match configuration.prepare_reconfiguration(
+            TurnOptions::default(),
+            configuration.effort_override,
+            SessionReconfiguration::Agent("plan".to_owned()),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("Plan cannot be selected as a Work Agent"),
+        };
+        assert!(error.message.contains("unknown ACP Agent plan"));
 
         let mut plan = configuration;
         plan.mode = "plan";
@@ -4687,7 +5126,10 @@ mod tests {
             .into_iter()
             .find(|option| option["id"] == "agent")
             .expect("agent option");
-        assert_eq!(agent["currentValue"], "plan");
+        assert_eq!(
+            agent["currentValue"], "build",
+            "Plan mode keeps the host Agent internal and exposes the deferred Work Agent"
+        );
         let prepared = plan
             .prepare_reconfiguration(
                 TurnOptions::default(),

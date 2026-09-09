@@ -827,15 +827,20 @@ pub trait CommandRunner: Send + Sync {
     fn run(&self, argv: &[String], input: &str) -> Result<(), ExternalError>;
 }
 
-/// Maximum time the component path waits for a native clipboard worker result.
+/// Maximum time one native clipboard child may run after the worker starts it.
 ///
 /// Fifty milliseconds is long enough for the tiny local helpers in the ladder but
-/// short enough to present as one delayed keypress rather than a frozen TUI. Every child
-/// operation happens on a detached worker, so a failed kill, an inherited stdin pipe or
-/// a non-returning wait can outlive this deadline without retaining the UI-state lock or
-/// joining application shutdown. OSC 52 handles the normal interactive path without
-/// submitting any work.
+/// still bounds a hung helper tightly.
 const CLIPBOARD_COMMAND_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// Maximum time the component path waits for worker scheduling plus the child result.
+///
+/// The worker owns the strict 50 ms child deadline above. Giving the caller the same
+/// deadline made scheduler delay consume the child's entire allowance before the worker
+/// ran at all under a loaded Windows suite. The component deadline therefore includes
+/// scheduling headroom, but remains below the 250 ms hard-bound contract so an
+/// uninterruptible cleanup path cannot race that caller-visible deadline.
+const CLIPBOARD_COMPONENT_TIMEOUT: Duration = Duration::from_millis(150);
 const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 trait ClipboardChild {
@@ -1266,12 +1271,12 @@ impl NativeClipboardWorker {
             outcome: Arc::clone(&outcome),
         };
         sender.submit(job)?;
-        match outcome.wait(CLIPBOARD_COMMAND_TIMEOUT) {
+        match outcome.wait(CLIPBOARD_COMPONENT_TIMEOUT) {
             Some(result) => result,
             None => Err(ExternalError::Failed(format!(
                 "{} did not finish within {} ms; cleanup continues outside the UI event path",
                 argv.first().map_or("clipboard helper", String::as_str),
-                CLIPBOARD_COMMAND_TIMEOUT.as_millis()
+                CLIPBOARD_COMPONENT_TIMEOUT.as_millis()
             ))),
         }
     }

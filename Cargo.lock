@@ -7268,6 +7268,7 @@ dependencies = [
  "zuno-sandbox",
  "zuno-search",
  "zuno-server",
+ "zuno-session-control",
  "zuno-snapshot",
  "zuno-testkit",
  "zuno-tool",
@@ -7511,6 +7512,7 @@ dependencies = [
  "zuno-permission",
  "zuno-runtime",
  "zuno-tool",
+ "zuno-types",
 ]
 
 [[package]]
@@ -8053,6 +8055,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "zuno-session-control"
+version = "0.10.21"
+dependencies = [
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "uuid",
+ "zuno-db",
+ "zuno-error",
+ "zuno-goal",
+ "zuno-paths",
+ "zuno-review",
+ "zuno-tools",
+ "zuno-types",
+]
+
+[[package]]
 name = "zuno-snapshot"
 version = "0.10.21"
 dependencies = [
@@ -8223,6 +8243,7 @@ name = "zuno-types"
 version = "0.10.21"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]

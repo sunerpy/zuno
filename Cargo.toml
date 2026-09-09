@@ -80,6 +80,7 @@ zuno-pty = { version = "0.10.21", path = "crates/zuno-pty" } # x-release-please-
 zuno-runtime = { version = "0.10.21", path = "crates/zuno-runtime" } # x-release-please-version
 zuno-review = { version = "0.10.21", path = "crates/zuno-review" } # x-release-please-version
 zuno-search = { version = "0.10.21", path = "crates/zuno-search" } # x-release-please-version
+zuno-session-control = { version = "0.10.21", path = "crates/zuno-session-control" } # x-release-please-version
 zuno-sandbox = { version = "0.10.21", path = "crates/zuno-sandbox" } # x-release-please-version
 zuno-server = { version = "0.10.21", path = "crates/zuno-server" } # x-release-please-version
 zuno-snapshot = { version = "0.10.21", path = "crates/zuno-snapshot" } # x-release-please-version

@@ -122,8 +122,7 @@ evidence unless an explicit repository policy marks them optional.
 
 If durable Plan, Todo, or Job work remains while that remote observer is still
 running, reconciliation records `waiting_background` and ends the current turn
-without spending either ordinary reconciliation attempt or creating a
-`PlanUnreconciled` human request. An active Goal is not auto-driven again while
+without polling or creating a generic human request. An active Goal is not auto-driven again while
 the observer remains live. The existing process-owned completion watcher admits
 the terminal report and wakes the session, which then refreshes authoritative
 remote state and resumes normal reconciliation.
@@ -228,7 +227,7 @@ and a Plan mutation replaces the one-time Required instruction with Maintain.
 
 Machine execution state does not leak into the visible Plan. The
 `PlanReconciliationDriver` persists `idle`, `executing`, `reconciling`,
-`waiting_retry`, `waiting_background`, `waiting_human`, and `terminal` phase
+`waiting_retry`, `waiting_background`, `paused`, and `terminal` phase
 events in the existing session event log. Before a successful answer is
 delivered it evaluates only typed Plan, Todo, Job, Goal, background-observer,
 tool-result, and verification state:
@@ -242,10 +241,11 @@ tool-result, and verification state:
 - unfinished durable work with a live `remoteObserver` waits for its durable
   completion wake without consuming reconciliation attempts;
 - an active Goal owns the next durable continuation;
-- an ordinary session holding unreconciled durable work receives at most two
-  reconciliation continuations;
-- unresolved work then creates `WaitingForHuman::PlanUnreconciled` and cannot be
-  delivered as successful.
+- authorized ordinary Work continues from a durable `Recovery` token;
+- the driver hashes authoritative Plan, Todo, Job, and Goal revisions into a
+  progress fingerprint; three consecutive identical fingerprints pause with
+  typed `no_progress`;
+- no reconciliation branch manufactures a generic human confirmation request.
 
 Unreconciled work means durably recorded work. A Work-mode `Optional` decision
 is not recorded work, so a request that creates no Plan, Todo, or Job settles
@@ -1369,37 +1369,53 @@ context limit. It is replaced on each provider report rather than accumulated ac
 the session; cumulative disjoint token buckets remain available in the usage
 projection and sidebar.
 
+Compaction advances the durable `context_epoch`, recomputes the retained prompt
+window, and restarts the same execution cycle as `TurnStartKind::Recovery`.
+Recovery uses the frozen continuation identity and optional anchor instead of
+requiring a retained human message, so ACP receives the lower post-compaction
+usage update rather than remaining at 100% or failing with `NoUserMessage`.
+
+Terminal background commands, subagents, workflows, and product Agents publish a
+`CompletionEnvelope` with a deterministic `source_key`. Synchronous `bg wait`
+and asynchronous callback delivery compete for one durable `inline` or
+`callback` owner. The callback path wakes the parent automatically; a model-visible
+wait is capped at 60 seconds and is appropriate only when the current step
+synchronously depends on the result.
+
 A transcript revert (`revert_commit`) discards the projected `session_message` rows and the legacy `message` rows after the staged message's `(time_created, id)` boundary, clears the session's context epoch, and retires every `queued`, `steering`, or `promoted` inbox input through the ordinary cancellation transition, so each retired input logs its own `session.input.cancelled`; consumed inputs are immutable history and are never touched. Inbox rows are never deleted by a revert. The commit then appends one `session.reverted` event whose properties are: `sessionID` (string), `messageID` (string, the boundary message that remains the transcript tail), `marker` (object, the staged revert JSON exactly as stored, e.g. `{"messageID": "...", "files": []}`), `boundaryTimeCreated` (i64 ms), `removedMessageCount` (u64, projected rows deleted), `removedLegacyMessageCount` (u64, legacy rows deleted), `cancelledInputIDs` (string[] in admission order), `contextEpochCleared` (bool), `timeUpdated` (i64 ms). Every key is always present.
 
 ## Plan and Work transitions
 
-`/plan` is the interactive mode switch. In Work mode it opens a confirmation in
-the same keyboard- and mouse-capable dialog system used by other TUI choices. In
-Plan mode it becomes the handoff path to implementation: a durable plan must
-exist, and the confirmation names its title, revision, and completed-step count.
-`/start-plan` enters Plan mode directly; `/start-work` performs the same durable
-plan check and confirmation without first toggling through `/plan`.
+`/plan` and `/start-plan` enter Plan mode idempotently. `/plan` may use the TUI
+confirmation surface; neither command doubles as an exit. `/start-work` is the
+only Plan-to-Work authorization. It validates the exact current Plan revision and
+its handoff-ready record, and the confirmation names its title, revision, and
+completed-step count.
 
 For an active Goal, entering Plan and recording `paused(plan_mode)` are one
-transactional host transition. Re-entering Plan is idempotent. Start Work only
-clears that exact pause after the durable-plan gate succeeds; it cannot clear
-authentication, human-input, permission, user-interruption, or
-uncertain-side-effect pauses. The same checks run after restart, so
-Goal → Plan → restart → Work resumes at most once.
+transactional host transition. Re-entering Plan is idempotent. Agent selection
+does not change collaboration mode: while planning it updates the saved Work
+Agent used by a later handoff. Start Work atomically reads the Plan and bound
+review gate, restores the saved Agent/provider/model/reasoning identity, records
+the Work cycle, admits a `UserControl::StartWork` input, and resumes only the
+eligible Goal pause. A bound Draft review blocks by default; an explicit
+`--accept-draft-risk <reason>` persists the accepted review revision and reason.
+The same checks run after restart, so Goal → Plan → restart → Work resumes at most once.
 
-ACP publishes the same three names as native session commands. Because sending
-the slash prompt is already an explicit client action, ACP performs the
-transactional mode replacement directly, never sends the command to the model,
-and reports the result through standard `current_mode_update` and
-`config_option_update` notifications. Returning to Work still requires a
-durable plan.
+ACP publishes the same three names as native session commands.
+`session/set_mode(build)` and `/start-work` call the same Start Work operation.
+An idle session starts implementation immediately; a busy session persists the
+control and runs it at the next safe point. The command itself never becomes a
+user message, and the slash response identifies `planId`, `planRevision`,
+`cycleId`, and `started` or `queued`.
 
 Plan is enforced below the prompt by a deny-by-default capability overlay. It
 allows repository inspection, read-only LSP and search, questions, Skills, and
 typed Goal/Plan/Todo operations, while shell and file mutation remain denied.
-The model can recommend Start Work but cannot select it for the user. A confirmed
-selection is persisted as the session agent, so explicit resume and in-process
-session switching restore the collaboration mode without restarting the TUI.
+The model can recommend Start Work but cannot select it for the user.
+`session_execution_state` persists mode independently from Agent selection, so
+compaction, process recovery, and in-process session switching restore the exact
+boundary without inventing a user message.
 
 ## Native session commands, compaction, and hard interruption
 

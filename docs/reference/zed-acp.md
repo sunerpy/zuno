@@ -218,17 +218,16 @@ A new ACP session resolves Zuno's normal default Agent and model. Zuno then
 publishes these session controls to Zed:
 
 - **Mode**: Build or Plan;
-- **Agent**: `plan` plus the available implementation Agents;
+- **Agent**: the available implementation Agents;
 - **Model**: models from the resolved Zuno provider catalog;
 - **Reasoning**: `Configured default` plus the canonical levels supported by
   the selected model, such as Low, High, Extra High, or Maximum.
 
-The Agent selector includes `plan`. The selected Agent is the authoritative
-state: choosing `plan` switches Mode to Plan, while choosing `build`,
-`orchestrator`, `deep`, or another implementation Agent switches Mode to Build.
-Changing Mode performs the inverse mapping and Zuno sends both
-`current_mode_update` and `config_option_update` so the two Zed selectors stay
-synchronized.
+Mode is authoritative for the Plan/Work boundary. The Agent selector contains
+implementation Agents only. In Plan mode it selects the future Work Agent while
+the runtime keeps the read-only `plan` host active. Zuno sends
+`current_mode_update` and `config_option_update` after an accepted control so
+both selectors show the durable state.
 
 To use the directly selectable `deep` Agent:
 
@@ -238,10 +237,13 @@ To use the directly selectable `deep` Agent:
 4. choose the desired model if the current Zuno profile exposes more than one;
 5. choose a reasoning level when the selected model advertises reasoning.
 
-Plan mode activates the read-only `plan` Agent. Returning to Build restores the
-last selected implementation Agent. Agent and model changes are session-local
-and are rejected while the session has work in flight: a prompt request, a live
-turn, or a background continuation restored by `session/load`. An idle
+Plan mode activates the read-only `plan` Agent. Mode remains independent from
+the Agent selector: choosing an implementation Agent while planning updates the
+saved Work Agent and does not exit Plan. `/start-work` or
+`session/set_mode(build)` restores that Agent with the saved provider, model, and
+reasoning settings after validating the exact handoff-ready Plan revision. Agent
+and model changes are session-local and are rejected while the session has work
+in flight unless they are the durable Start Work control queued for a safe point. An idle
 configuration change still performs an atomic host replacement, but it reuses the connected
 session MCP runtime when the MCP server configuration and connection concurrency
 are unchanged. Editing those structural MCP inputs forces a fresh connection.
@@ -297,12 +299,13 @@ session error. A successful create or edit then advances the active Goal
 immediately. On a fresh session Zuno durably admits the objective as the first
 user turn anchor; the literal slash command never enters provider input.
 
-`/plan` toggles between Build and Plan. `/start-plan` enters the read-only Plan
-mode directly, while `/start-work` returns to Build. Leaving Plan requires a
-durable plan, so an early handoff fails explicitly instead of weakening the
-mode boundary. Successful changes emit ACP `current_mode_update` and
-`config_option_update` notifications, keeping Zed's selectors synchronized.
-None of these native commands is sent to the model.
+`/plan` and `/start-plan` enter the read-only Plan mode idempotently.
+`/start-work` is the only slash-command handoff to Build; it requires a durable
+Plan whose current revision has a handoff-ready record. A bound Draft review is
+refused unless the user supplies `--accept-draft-risk <reason>`. Successful
+changes emit ACP `current_mode_update` and `config_option_update`
+notifications, while the control itself starts a `UserControl` turn and never
+becomes a synthetic user message.
 
 ACP Plan updates are driven by durable work-state revisions, not by recognizing
 the `plan_update` tool name. Each session subscribes to the active host, reads

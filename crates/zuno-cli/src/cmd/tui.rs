@@ -2215,12 +2215,57 @@ async fn apply_selection(
     host: &mut TurnHost,
     rebuild: &TurnRebuild<'_>,
 ) -> SelectionOutcome {
+    let session_control = host.session_control_service();
+    let execution_before = match session_control.state(host.session_id()) {
+        Ok(state) => state,
+        Err(error) => {
+            let _reported = rebuild
+                .events
+                .publish(TurnEvent::Provider {
+                    step: 0,
+                    event: StreamEvent::StatusDetail {
+                        detail: format!("warning: collaboration state could not be read: {error}"),
+                    },
+                })
+                .await;
+            return SelectionOutcome::Unchanged;
+        }
+    };
+    if let zuno_tui::views::session::Selection::Agent(agent) = &selection
+        && execution_before
+            .as_ref()
+            .is_some_and(|state| state.mode == zuno_types::execution::CollaborationMode::Plan)
+        && agent != "plan"
+    {
+        let mut identity = execution_before
+            .as_ref()
+            .and_then(|state| state.work_identity.clone())
+            .unwrap_or_else(|| host.execution_identity_for("build"));
+        identity.agent = agent.clone();
+        let detail = match session_control.update_work_identity(
+            host.session_id(),
+            identity,
+            zuno_db::message::now_millis(),
+        ) {
+            Ok(_) => format!("Work Agent `{agent}` selected; Plan mode remains active"),
+            Err(error) => format!("warning: Work Agent selection was not saved: {error}"),
+        };
+        let _reported = rebuild
+            .events
+            .publish(TurnEvent::Provider {
+                step: 0,
+                event: StreamEvent::StatusDetail { detail },
+            })
+            .await;
+        return SelectionOutcome::Unchanged;
+    }
     let selected_agent = match &selection {
         zuno_tui::views::session::Selection::Agent(agent) if agent != host.agent_name() => {
             Some(agent.clone())
         }
         _ => None,
     };
+    let mut mode_agent_transition = false;
     let previous_model = host.persisted_model_reference();
     let mut next = rebuild.options.clone();
     next.session = host.rebuild_session_choice();
@@ -2238,6 +2283,86 @@ async fn apply_selection(
     match selection {
         zuno_tui::views::session::Selection::Model(model) => next.model = Some(model),
         zuno_tui::views::session::Selection::Agent(agent) => next.agent = Some(agent),
+        zuno_tui::views::session::Selection::StartPlan => {
+            if let Err(error) = host.materialize_session() {
+                return SelectionOutcome::Shutdown(format!(
+                    "Plan mode could not materialize the session: {error}"
+                ));
+            }
+            let work_identity = execution_before
+                .as_ref()
+                .and_then(|state| state.work_identity.clone())
+                .unwrap_or_else(|| host.execution_identity_for(host.agent_name()));
+            if let Err(error) = session_control.enter_plan(zuno_session_control::EnterPlanRequest {
+                session_id: host.session_id(),
+                work_identity,
+                at_ms: zuno_db::message::now_millis(),
+            }) {
+                let _reported = rebuild
+                    .events
+                    .publish(TurnEvent::Provider {
+                        step: 0,
+                        event: StreamEvent::StatusDetail {
+                            detail: format!("warning: Plan mode was not entered: {error}"),
+                        },
+                    })
+                    .await;
+                return SelectionOutcome::Unchanged;
+            }
+            next.agent = Some("plan".to_owned());
+            mode_agent_transition = true;
+        }
+        zuno_tui::views::session::Selection::StartWork => {
+            if let Err(error) = host.materialize_session() {
+                return SelectionOutcome::Shutdown(format!(
+                    "Start Work could not materialize the session: {error}"
+                ));
+            }
+            let outcome = match session_control.start_work(zuno_session_control::StartWorkRequest {
+                session_id: host.session_id(),
+                expected_plan_revision: None,
+                anchor_message_id: match host.latest_user_anchor_id() {
+                    Ok(anchor) => anchor,
+                    Err(error) => {
+                        return SelectionOutcome::Shutdown(format!(
+                            "Start Work could not read its user anchor: {error}"
+                        ));
+                    }
+                },
+                draft_review_risk_reason: None,
+                session_busy: false,
+                at_ms: zuno_db::message::now_millis(),
+            }) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let _reported = rebuild
+                        .events
+                        .publish(TurnEvent::Provider {
+                            step: 0,
+                            event: StreamEvent::StatusDetail {
+                                detail: format!("warning: Start Work was refused: {error}"),
+                            },
+                        })
+                        .await;
+                    return SelectionOutcome::Unchanged;
+                }
+            };
+            let continuation = outcome
+                .state
+                .continuation
+                .expect("Start Work always persists a continuation");
+            next.agent = Some(continuation.identity.agent);
+            next.model = Some(format!(
+                "{}/{}",
+                continuation.identity.provider_id, continuation.identity.model_id
+            ));
+            next.effort = continuation
+                .identity
+                .reasoning
+                .as_deref()
+                .and_then(|reasoning| reasoning.parse().ok());
+            mode_agent_transition = true;
+        }
         zuno_tui::views::session::Selection::Preset(preset) => {
             next.preset = Some(preset);
             next.model = None;
@@ -2623,7 +2748,7 @@ async fn apply_selection(
     .await
     {
         Ok(()) => {
-            if selected_agent.is_some()
+            if (selected_agent.is_some() || mode_agent_transition)
                 && let Err(error) = host.persist_active_agent()
             {
                 return SelectionOutcome::Shutdown(format!(
@@ -2638,6 +2763,24 @@ async fn apply_selection(
             {
                 return SelectionOutcome::Shutdown(format!(
                     "the model selection changed in memory but could not be persisted: {error}"
+                ));
+            }
+            if execution_before
+                .as_ref()
+                .is_some_and(|state| state.mode == zuno_types::execution::CollaborationMode::Plan)
+                && !mode_agent_transition
+                && let Some(work_agent) = execution_before
+                    .as_ref()
+                    .and_then(|state| state.work_identity.as_ref())
+                    .map(|identity| identity.agent.clone())
+                && let Err(error) = session_control.update_work_identity(
+                    host.session_id(),
+                    host.execution_identity_for(&work_agent),
+                    zuno_db::message::now_millis(),
+                )
+            {
+                return SelectionOutcome::Shutdown(format!(
+                    "the Plan-mode Work identity changed in memory but could not be persisted: {error}"
                 ));
             }
             SelectionOutcome::Rebuilt(rebuild.events.clone())
@@ -3064,6 +3207,21 @@ async fn drive_turns(
         } else {
             zuno_goal::QueuedUserInput::Present
         };
+        match driver.host.drive_pending_start_work(events.clone()).await {
+            Ok(true) => {
+                refresh_work_state(
+                    &mut driver.host,
+                    &driver.work_state,
+                    &driver.work_wake,
+                    &events,
+                )
+                .await;
+                work_changes.borrow_and_update();
+                continue;
+            }
+            Ok(false) => {}
+            Err(message) => report_turn_failure(&events, message).await,
+        }
         match driver
             .host
             .continue_goal_if_idle(queued, events.clone())
@@ -4459,6 +4617,9 @@ mod tests {
             session_id: "ses_decode".to_owned(),
             prompt,
             delivery: zuno_db::inbox::InputDelivery::Queue,
+            source_key: None,
+            trigger_kind: zuno_types::execution::InputTriggerKind::Legacy,
+            cycle_id: None,
             state: zuno_db::inbox::SubmissionState::Queued,
             revision: 1,
             admitted_sequence: 1,
