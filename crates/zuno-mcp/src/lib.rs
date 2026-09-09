@@ -21,8 +21,10 @@ pub use catalog::{
 };
 
 pub use lifecycle::{
-    McpConnectOutcome, McpConnection, McpConnector, McpLifecycleError, McpLifecycleOptions,
-    McpServerController, McpServerEvent, McpServerSnapshot, McpServerState,
+    MCP_TOOL_DIRECTORY_VERSION, McpConnectOutcome, McpConnection, McpConnectionIdentity,
+    McpConnector, McpLifecycleError, McpLifecycleOptions, McpReusableServer, McpRuntimeManager,
+    McpRuntimePublication, McpRuntimePublishError, McpServerController, McpServerEvent,
+    McpServerSnapshot, McpServerState, McpToolDirectory, PreparedMcpRuntime,
 };
 
 pub use remote::{AuthorizationRequest, RemoteClient, RemoteConnect, RemoteError, RemoteTransport};

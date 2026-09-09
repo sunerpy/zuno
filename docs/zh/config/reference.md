@@ -135,6 +135,36 @@ Schema 是从 Rust 类型生成的，因此它与运行时实际接受的内容�
 
 `concurrency` 控制同时运行的工作量上限。它约束的是编排层的并行度，而不是单次工具调用内部的并发。
 
+## ACP runtime 容量
+
+`acp.runtime` 控制单个 ACP 进程保留多少会话、同时激活多少套有资源的 runtime，以及空闲休眠和等待容量的时限：
+
+```json
+{
+  "acp": {
+    "runtime": {
+      "max_open_sessions": 32,
+      "max_active_runtimes": 8,
+      "idle_timeout_ms": 900000,
+      "activation_wait_timeout_ms": 30000
+    }
+  }
+}
+```
+
+| 字段 | 默认值 | 含义 |
+| --- | ---: | --- |
+| `max_open_sessions` | `32` | 单个 `zuno acp` 进程最多保留的持久 ACP session 条目数 |
+| `max_active_runtimes` | `8` | 可同时持有 TurnHost、MCP runtime、插件 host 与 watcher 的 session 数 |
+| `idle_timeout_ms` | `900000` | 满足休眠条件的 active runtime 在休眠前必须连续空闲的时间 |
+| `activation_wait_timeout_ms` | `30000` | 激活操作等待 active-runtime 容量的最长时间 |
+
+所有值都必须大于零，并且 `max_active_runtimes` 不得大于
+`max_open_sessions`。对象遵守常规递归分层合并规则，因此更高层可以只覆盖一个字段；Zuno
+会在完整合并后统一校验最终值。
+
+这是宿主拥有的 ACP 策略，由 CLI composition root 读取，不会复制到 provider options 或上游请求。
+
 ## Provider 重试恢复
 
 每个 provider 可以声明 Zuno 自己执行的同请求重试策略：

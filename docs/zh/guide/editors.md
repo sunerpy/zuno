@@ -170,7 +170,7 @@ load 后处理。child Agent 永远拿不到发送工具。
 4. 如果当前 Zuno profile 暴露了多个模型，选择想要的那个；
 5. 当所选模型公布了推理能力时，选择一个推理级别。
 
-Plan 模式总是激活只读的 `plan` Agent。回到 Build 模式会恢复所选的实现类 Agent。Agent 与模型的更改是会话本地的，并且在会话有工作在飞时会被拒绝：一个提示词请求、一个活跃回合，或由 `session/load` 恢复的后台续跑。
+Plan 模式为下一次活跃回合选择只读的 `plan` Agent；冷会话只切换持久模式，不会因此启动宿主、MCP 或插件进程。回到 Build 模式会恢复所选的实现类 Agent并执行 Start Work 授权。Agent 与模型的更改是会话本地的，并且在会话有工作在飞时会被拒绝：一个提示词请求、一个活跃回合，或由 active Goal 恢复的后台续跑。
 
 `zuno acp` 不接受 `--agent` 启动参数。Agent 选择是一个 ACP 会话配置操作，不是第二个进程级配置面。
 
@@ -326,11 +326,11 @@ Zuno 还支持经过评审的官方 `codex-acp` 适配器所使用的草案版�
 
 由子级发起的权限与提问只在原生模式下使用子会话 id。对于不支持原生子 Agent 的客户端，Zuno 会在已知的根会话上发送该请求，并在 `_meta.zuno.childSessionId` 中包含持久的子级 id；这既避免客户端收到一个未知的会话 id，又保留了归属信息。
 
-ACP 提供的 MCP 公布 stdio 与 Streamable HTTP，SSE 仍不支持。每次 new/load/resume 都必须提供完整列表。名称会被校验或稳定 slug 化；stdio command 必须是绝对路径并使用会话目录作为 cwd；HTTP header 会被严格校验。所有 server 都必须连接并完成 discovery，工具才会原子发布；部分启动按逆序清理。command、environment 值与 header 永不写入 SQLite 或日志。客户端文件系统 RPC 和终端 RPC 仍不公布；Zuno 通过自己的工具、权限策略和沙箱处理文件与 Shell 工作。
+ACP 提供的 MCP 公布 stdio 与 Streamable HTTP，SSE 仍不支持。每次 new/load/resume 都必须提供完整列表。名称会被校验或稳定 slug 化；stdio command 必须是绝对路径并使用会话目录作为 cwd；HTTP header 会被严格校验。load/resume 只校验并冻结该列表，不启动 transport。真正激活时，ACP 提供的 server 全部属于 required/eager 集合，必须连接并完成 discovery 才会原子发布；部分启动按逆序清理。宿主配置的 optional MCP 若命中完整连接身份一致的工具目录缓存，可以等到第一次真实工具调用再 singleflight 连接。command、environment 值与 header 永不写入 SQLite 或日志，也不会跨 session 共享 stdio 进程。客户端文件系统 RPC 和终端 RPC 仍不公布；Zuno 通过自己的工具、权限策略和沙箱处理文件与 Shell 工作。
 
-恢复线程时，`session/load` 与 `session/resume` 会在发布之前重建 `TurnHost` 以及完整的配置 MCP 和客户端 MCP 集合。后续 load/resume 只按新请求提供的完整列表重建进程资源，绝不复用旧的客户端 MCP 进程。完成重放与命令发布后，active 根 Goal 会通过 detached continuation 自动调度，不需要额外提示词；如果旧会话只有 active Goal 而没有 user message，会先把目标补成持久 user turn anchor。加载重放受这些上限约束：最新 512 条保留消息、16 MiB 的已存储 part 与总投影预算，以及每次更新 8 MiB 的帧上限。当历史超出这些边界时，Zuno 会发出一条省略通知。已存储的 part blob 会先在 SQLite 中测量大小，再做 JSON 水合，因此一个过大的工具输出不会先被加载进进程内存然后丢弃。
+恢复线程时，`session/load` 与 `session/resume` 默认执行冷恢复：恢复持久身份、配置、Plan 和客户端投影，但不启动 `TurnHost`、MCP、插件 host 或 watcher。同一 session id 的并发 load/resume 共享一个稳定 registry entry 与 activation gate。第一次 prompt、`/start-work`、`session/set_mode(build)`，或 active 根 Goal 恢复才会精确激活一次；active Goal 不需要额外提示词，也不会制造假的 user message。加载重放受这些上限约束：最新 512 条保留消息、16 MiB 的已存储 part 与总投影预算，以及每次更新 8 MiB 的帧上限。当历史超出这些边界时，Zuno 会发出一条省略通知。已存储的 part blob 会先在 SQLite 中测量大小，再做 JSON 水合，因此一个过大的工具输出不会先被加载进进程内存然后丢弃。
 
-历史文件引用不会仅因为它们是持久的就被信任。只有那些确实存在、且规范化后位于项目 worktree 内的普通文件，才仍然可作为 diff 路径、位置或本地资源链接使用。缺失的、外部的或通过符号链接逃逸的本地资源会显示为不可操作的说明文本。一个 ACP stdio 连接最多保留 32 个打开的会话；`session/close` 会释放该槽位，并关停任何已激活的宿主与 MCP 运行时。
+历史文件引用不会仅因为它们是持久的就被信任。只有那些确实存在、且规范化后位于项目 worktree 内的普通文件，才仍然可作为 diff 路径、位置或本地资源链接使用。缺失的、外部的或通过符号链接逃逸的本地资源会显示为不可操作的说明文本。默认一个 ACP stdio 连接最多保留 32 个打开的会话，其中最多 8 个同时持有有资源的 runtime。满足条件的 runtime 空闲 15 分钟后会释放 TurnHost、MCP、插件进程与 watcher，但保留持久会话；active turn/Goal、queued/running/uncertain Job、未消费的 report/input、human request 与后台命令都会阻止休眠。容量不足时先休眠最久未使用的 eligible runtime，否则最多等待 30 秒并返回 typed retryable capacity error。`session/close` 会释放 open slot，并关停任何仍然激活的资源。这些默认值可通过 `acp.runtime` 调整。
 
 ## 9. 排障
 
@@ -376,7 +376,7 @@ dev: open acp logs
 
 关闭或隐藏 Zed 的 Agent 面板并不一定会发送 `session/close`。Zed 可能在后台保持它的外部 Agent 进程与工作区线程选择存活。
 
-当前的 Zuno 版本会在每次显式 load/resume 时替换此前的进程内运行时、对重复的加载重放去重、限定对话记录重放、过滤过期的可操作文件路径，并把一个 ACP 连接的打开会话数限制在 32 个。active 持久 Goal 会在恢复后继续推进，因此此时出现 provider 或工具活动属于工作续跑，而不是面板渲染产生的副作用。
+当前的 Zuno 版本会为每个打开的 session 保留一个稳定进程内 entry；重复 load/resume 共享它，并且除非存在 active Goal，否则保持冷态。加载重放有界且显式，过期的可操作文件路径会被过滤；默认一个连接可打开 32 个 session，但只激活 8 套有资源的 runtime。恢复后立刻出现 provider 或工具活动表示 active Goal 在续跑，而不是面板渲染启动了宿主。
 
 如果问题仍然存在：
 
@@ -385,7 +385,7 @@ dev: open acp logs
 3. 如果 Zed 在重启后立刻又选中同一个已知有问题的线程，请在备份 Zed 状态之后，按所安装 Zed 版本的维护流程清除该工作区最后一个活跃的 Agent 线程关联；
 4. 单独检查 Zed 日志中反复出现的 worktree、watcher 或 `OpenBufferByPath` 活动。Zuno 不拥有也不移除由 Zed 创建的 worktree 与文件系统 watcher。
 
-一个已激活但空闲的 Zuno 会话会保持挂载，直到 Zed 关闭它或 ACP 进程退出。Zuno 目前不会按空闲计时器降级活跃会话。
+满足休眠条件的空闲 runtime 会自动休眠，但持久会话仍保持打开。若内存或子进程占用没有下降，请检查 active Goal、Job、pending inbox/human request 与后台命令；这些状态会有意阻止休眠。
 
 ### Agent 或模型选择器不见了
 

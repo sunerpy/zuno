@@ -1,17 +1,21 @@
+use std::collections::BTreeMap;
 use std::future::pending;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::sync::Notify;
+use zuno_config::schema::mcp::{LocalKind, McpLocal, McpRemote, McpServerConfig, RemoteKind};
 use zuno_error::McpError;
 use zuno_mcp::{
-    Catalog, ConnectedServer, McpConnectOutcome, McpConnection, McpConnector, McpLifecycleOptions,
-    McpServerController, McpServerEvent, McpServerState, PromptDefinition, ResourceContents,
+    Catalog, ConnectedServer, McpConnectOutcome, McpConnection, McpConnectionIdentity,
+    McpConnector, McpLifecycleError, McpLifecycleOptions, McpRuntimeManager, McpServerController,
+    McpServerEvent, McpServerState, McpToolDirectory, PromptDefinition, ResourceContents,
     ResourceDefinition, ResourceTemplate, ToolCallResult, ToolDefinition,
 };
+use zuno_tool::{AllowAll, NeverInterrupted, ToolContext};
 
 const SERVER: &str = "fake";
 
@@ -107,6 +111,7 @@ impl FakeConnection {
             server: Arc::new(FakeServer {
                 discovery,
                 calls: AtomicUsize::new(0),
+                tool_calls: AtomicUsize::new(0),
                 started: Notify::new(),
                 cancelled: Arc::new(AtomicBool::new(false)),
             }),
@@ -131,6 +136,7 @@ impl McpConnection for FakeConnection {
 struct FakeServer {
     discovery: DiscoveryBehavior,
     calls: AtomicUsize,
+    tool_calls: AtomicUsize,
     started: Notify,
     cancelled: Arc<AtomicBool>,
 }
@@ -169,16 +175,24 @@ impl ConnectedServer for FakeServer {
                 };
                 pending::<Result<Vec<ToolDefinition>, McpError>>().await
             }
-            DiscoveryBehavior::Immediate | DiscoveryBehavior::FailPrompts => Ok(Vec::new()),
+            DiscoveryBehavior::Immediate | DiscoveryBehavior::FailPrompts => {
+                Ok(vec![tool_definition()])
+            }
         }
     }
 
     async fn call_tool(
         &self,
-        _tool: &str,
+        tool: &str,
         _arguments: Map<String, Value>,
     ) -> Result<ToolCallResult, McpError> {
-        panic!("fake tool calls are outside lifecycle tests")
+        self.tool_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolCallResult {
+            content: vec![json!({"type": "text", "text": format!("called {tool}")})],
+            structured_content: None,
+            is_error: false,
+            extra: Map::new(),
+        })
     }
 
     async fn list_resources(&self) -> Result<Vec<ResourceDefinition>, McpError> {
@@ -207,6 +221,81 @@ fn discovery_error(message: &str) -> McpError {
         server: SERVER.to_owned(),
         source: Box::new(std::io::Error::other(message.to_owned())),
     }
+}
+
+fn tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "echo".to_owned(),
+        description: Some("Echo a value".to_owned()),
+        input_schema: json!({
+            "type": "object",
+            "properties": {"value": {"type": "string"}}
+        }),
+        output_schema: None,
+        extra: Map::new(),
+    }
+}
+
+fn connection_identity(command: &str) -> McpConnectionIdentity {
+    let config = McpServerConfig::Local(McpLocal {
+        kind: LocalKind::Local,
+        command: vec![command.to_owned()],
+        cwd: None,
+        environment: None,
+        enabled: Some(true),
+        timeout: None,
+    });
+    McpConnectionIdentity::from_config(SERVER, "/workspace", &config)
+}
+
+#[test]
+fn connection_identity_includes_internal_transport_policy() {
+    let mut remote = McpRemote {
+        kind: RemoteKind::Remote,
+        url: "https://mcp.example.test".to_owned(),
+        enabled: Some(true),
+        headers: None,
+        oauth: None,
+        timeout: None,
+        streamable_http_only: false,
+    };
+    let negotiated = McpConnectionIdentity::from_config(
+        SERVER,
+        "/workspace",
+        &McpServerConfig::Remote(remote.clone()),
+    );
+    remote.streamable_http_only = true;
+    let streamable_only =
+        McpConnectionIdentity::from_config(SERVER, "/workspace", &McpServerConfig::Remote(remote));
+
+    assert_ne!(negotiated, streamable_only);
+}
+
+fn controller_with_identity(
+    connector: Arc<FakeConnector>,
+    identity: McpConnectionIdentity,
+) -> McpServerController {
+    McpServerController::with_connector_and_identities(
+        Catalog::new([SERVER]),
+        [SERVER],
+        BTreeMap::from([(SERVER.to_owned(), identity)]),
+        connector,
+        McpLifecycleOptions {
+            connect_timeout: Duration::from_secs(1),
+            close_timeout: Duration::from_secs(1),
+        },
+    )
+}
+
+fn tool_context(call: &str) -> ToolContext {
+    ToolContext::new(
+        "session",
+        "message",
+        call,
+        "build",
+        Arc::new(AllowAll),
+        Arc::new(NeverInterrupted),
+    )
 }
 
 fn controller(connector: Arc<FakeConnector>, timeout: Duration) -> McpServerController {
@@ -453,6 +542,202 @@ async fn lagged_lifecycle_subscriber_recovers_latest_state_from_snapshots() {
             desired_enabled: false,
         }]
     );
+}
+
+#[tokio::test]
+async fn cached_tool_directory_is_visible_without_starting_the_server() {
+    let connector = FakeConnector::new(ConnectBehavior::Immediate);
+    let identity = connection_identity("server-v1");
+    let controller = controller_with_identity(connector.clone(), identity.clone());
+
+    controller
+        .install_cached_directory(McpToolDirectory::new(identity, vec![tool_definition()]))
+        .expect("matching directory");
+
+    assert_eq!(connector.calls.load(Ordering::SeqCst), 0);
+    assert!(controller.catalog().connected_servers().is_empty());
+    assert_eq!(controller.catalog().tool_ids(), vec!["fake_echo"]);
+    assert!(matches!(
+        controller.catalog().diagnostics()[0].status,
+        zuno_mcp::ServerStatus::Cached
+    ));
+}
+
+#[tokio::test]
+async fn concurrent_first_cached_tool_calls_share_one_connection_attempt() {
+    let connector = FakeConnector::new(ConnectBehavior::Immediate);
+    let identity = connection_identity("server-v1");
+    let controller = controller_with_identity(connector.clone(), identity.clone());
+    controller
+        .install_cached_directory(McpToolDirectory::new(identity, vec![tool_definition()]))
+        .expect("matching directory");
+    let tool = controller
+        .catalog()
+        .tools()
+        .into_iter()
+        .find(|tool| tool.id() == "fake_echo")
+        .expect("cached tool proxy");
+
+    let calls = (0..8)
+        .map(|index| {
+            let tool = Arc::clone(&tool);
+            tokio::spawn(async move {
+                tool.invoke(
+                    json!({"value": index.to_string()}),
+                    tool_context(&format!("call-{index}")),
+                )
+                .await
+            })
+        })
+        .collect::<Vec<_>>();
+    for call in calls {
+        call.await.expect("tool task").expect("tool result");
+    }
+
+    assert_eq!(connector.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        connector
+            .connection
+            .server
+            .tool_calls
+            .load(Ordering::SeqCst),
+        8
+    );
+    assert_eq!(controller.catalog().connected_servers(), vec![SERVER]);
+}
+
+#[tokio::test]
+async fn changed_connection_identity_rejects_cache_and_requires_eager_discovery() {
+    let connector = FakeConnector::new(ConnectBehavior::Immediate);
+    let controller = controller_with_identity(connector.clone(), connection_identity("server-v2"));
+
+    let error = controller
+        .install_cached_directory(McpToolDirectory::new(
+            connection_identity("server-v1"),
+            vec![tool_definition()],
+        ))
+        .expect_err("stale identity");
+
+    assert!(matches!(
+        error,
+        McpLifecycleError::ToolDirectoryIdentityMismatch { .. }
+    ));
+    assert!(controller.catalog().tool_ids().is_empty());
+    controller.enable(SERVER).await.expect("eager discovery");
+    assert_eq!(connector.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(controller.catalog().tool_ids(), vec!["fake_echo"]);
+}
+
+#[tokio::test]
+async fn runtime_manager_publishes_reuse_then_retired_shutdown_keeps_connection_alive() {
+    let identity = connection_identity("server-v1");
+    let old_connector = FakeConnector::new(ConnectBehavior::Immediate);
+    let old = controller_with_identity(old_connector.clone(), identity.clone());
+    old.enable(SERVER).await.expect("old runtime connect");
+    let manager = McpRuntimeManager::with_current(old);
+
+    let candidate_connector = FakeConnector::new(ConnectBehavior::Immediate);
+    let candidate = controller_with_identity(candidate_connector.clone(), identity);
+    let prepared = manager.prepare(Some(candidate)).await;
+    assert_eq!(
+        prepared.reused_server_names(),
+        std::iter::once(SERVER.to_owned()).collect()
+    );
+
+    let publication = manager.publish(prepared).await.expect("publish");
+    publication.shutdown_retired().await;
+
+    assert_eq!(candidate_connector.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        old_connector.connection.close_calls.load(Ordering::SeqCst),
+        0,
+        "retired snapshot relinquishes the connection before shutdown"
+    );
+    let current = publication.current().expect("current runtime");
+    assert_eq!(current.catalog().connected_servers(), vec![SERVER]);
+    current.shutdown().await;
+    assert_eq!(
+        old_connector.connection.close_calls.load(Ordering::SeqCst),
+        1,
+        "the new snapshot owns the final close"
+    );
+}
+
+#[tokio::test]
+async fn runtime_manager_rejects_reuse_when_source_changes_after_prepare() {
+    let identity = connection_identity("server-v1");
+    let old_connector = FakeConnector::new(ConnectBehavior::Immediate);
+    let old = controller_with_identity(old_connector.clone(), identity.clone());
+    old.enable(SERVER).await.expect("old runtime connect");
+    let manager = McpRuntimeManager::with_current(old.clone());
+    let candidate =
+        controller_with_identity(FakeConnector::new(ConnectBehavior::Immediate), identity);
+    let prepared = manager.prepare(Some(candidate)).await;
+    assert_eq!(prepared.reused_server_names().len(), 1);
+
+    old.disable(SERVER).await.expect("concurrent disable");
+    let error = manager
+        .publish(prepared)
+        .await
+        .expect_err("changed source must reject publication");
+
+    let candidate = error.candidate().expect("unpublished candidate");
+    assert!(candidate.catalog().connected_servers().is_empty());
+    let (_, current) = manager.current().await;
+    assert_eq!(
+        current
+            .expect("old runtime remains current")
+            .snapshot(SERVER)
+            .expect("old server")
+            .state,
+        McpServerState::Disabled
+    );
+    assert_eq!(
+        old_connector.connection.close_calls.load(Ordering::SeqCst),
+        1
+    );
+}
+
+#[tokio::test]
+async fn stale_runtime_publication_rolls_back_without_replacing_current_snapshot() {
+    let old_connector = FakeConnector::new(ConnectBehavior::Immediate);
+    let old = controller_with_identity(old_connector, connection_identity("server-v1"));
+    old.enable(SERVER).await.expect("old runtime connect");
+    let manager = McpRuntimeManager::with_current(old);
+
+    let stale = manager
+        .prepare(Some(controller_with_identity(
+            FakeConnector::new(ConnectBehavior::Immediate),
+            connection_identity("server-v1"),
+        )))
+        .await;
+    let replacement_connector = FakeConnector::new(ConnectBehavior::Immediate);
+    let replacement = controller_with_identity(
+        replacement_connector.clone(),
+        connection_identity("server-v2"),
+    );
+    replacement
+        .enable(SERVER)
+        .await
+        .expect("replacement connect");
+    let replacement = manager.prepare(Some(replacement)).await;
+    let publication = manager
+        .publish(replacement)
+        .await
+        .expect("replacement publish");
+
+    let error = manager.publish(stale).await.expect_err("stale publication");
+    assert!(error.candidate().is_some());
+    let (_, current) = manager.current().await;
+    assert_eq!(
+        current
+            .expect("current runtime")
+            .connection_identity(SERVER)
+            .expect("configured server"),
+        Some(connection_identity("server-v2"))
+    );
+    assert_eq!(replacement_connector.calls.load(Ordering::SeqCst), 1);
+    publication.shutdown_retired().await;
 }
 
 #[test]

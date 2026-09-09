@@ -14,6 +14,7 @@
 //!   captured keys are additionally swept into `options`, which is how
 //!   `reasoningEffort` and `thinking` reach the provider.
 
+pub mod acp;
 pub mod agent;
 pub mod formatter;
 pub mod lsp;
@@ -31,6 +32,7 @@ pub mod workflow;
 #[cfg(test)]
 mod tests;
 
+use crate::schema::acp::{AcpConfig, ResolvedAcpRuntimeConfig};
 use crate::schema::agent::AgentConfig;
 use crate::schema::formatter::FormatterConfig;
 use crate::schema::lsp::LspConfig;
@@ -60,6 +62,7 @@ pub type JsonMap = serde_json::Map<String, serde_json::Value>;
 ///
 pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "$schema",
+    "acp",
     "shell",
     "sandbox",
     "logLevel",
@@ -113,6 +116,9 @@ pub struct Config {
     /// JSON schema reference for editor validation.
     #[serde(rename = "$schema", skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
+    /// ACP process-local runtime capacity and lifecycle settings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acp: Option<AcpConfig>,
     /// Default shell for terminals and the model-facing Shell tool.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
@@ -253,6 +259,15 @@ pub struct SubagentModelSelectionConfig {
 }
 
 impl Config {
+    /// Resolve ACP runtime capacity and lifecycle settings with native defaults.
+    #[must_use]
+    pub fn resolved_acp_runtime(&self) -> ResolvedAcpRuntimeConfig {
+        self.acp.as_ref().map_or_else(
+            ResolvedAcpRuntimeConfig::default,
+            AcpConfig::resolved_runtime,
+        )
+    }
+
     /// Resolve the maximum Shell sandbox authority.
     #[must_use]
     pub fn sandbox_mode(&self) -> SandboxMode {

@@ -87,6 +87,12 @@ pub(crate) struct RequiredMcpServers {
     order: Vec<String>,
 }
 
+/// Session-owned tool directories keyed by configured server name.
+///
+/// A directory is accepted only when its embedded full connection identity matches
+/// the candidate runtime. The map itself carries no transport and is safe to persist.
+pub(crate) type McpToolDirectoryCache = BTreeMap<String, zuno_mcp::McpToolDirectory>;
+
 impl RequiredMcpServers {
     pub(crate) fn new(entries: Vec<(String, McpServerConfig)>) -> Self {
         let order = entries.iter().map(|(name, _)| name.clone()).collect();
@@ -99,7 +105,7 @@ impl RequiredMcpServers {
 pub(crate) struct McpRuntime {
     catalog: zuno_mcp::Catalog,
     controller: zuno_mcp::McpServerController,
-    enabled: Vec<String>,
+    eager: Vec<String>,
     required: Vec<String>,
     startup_order: Mutex<Vec<String>>,
     concurrency: NonZeroUsize,
@@ -112,16 +118,22 @@ impl McpRuntime {
     /// spawns no controller and pays nothing — and so the `mcp` argument the host
     /// takes stays `None` in exactly the case it always was.
     pub(crate) fn from_config(config: &Config, workspace: &Path) -> Option<Self> {
-        Self::from_config_with_required(config, workspace, RequiredMcpServers::default())
-            .expect("an empty required MCP set cannot collide with configuration")
+        Self::from_config_with_required_and_cache(
+            config,
+            workspace,
+            RequiredMcpServers::default(),
+            &McpToolDirectoryCache::new(),
+        )
+        .expect("an empty required MCP set cannot collide with configuration")
     }
 
-    /// Build a runtime that combines host configuration with session-local
-    /// declarations which must all connect and discover before publication.
-    pub(crate) fn from_config_with_required(
+    /// Builds a runtime whose host-configured optional servers may use a validated
+    /// lazy tool directory. Session-required ACP declarations always remain eager.
+    pub(crate) fn from_config_with_required_and_cache(
         config: &Config,
         workspace: &Path,
         required: RequiredMcpServers,
+        cache: &McpToolDirectoryCache,
     ) -> Result<Option<Self>, String> {
         let mut configs: BTreeMap<String, McpServerConfig> = config
             .mcp
@@ -142,11 +154,11 @@ impl McpRuntime {
         }
         let required_names = required.order;
         let required_set = required_names.iter().collect::<BTreeSet<_>>();
-        let enabled = configs
+        let optional_enabled = configs
             .iter()
             .filter(|(name, server)| self::enabled(server) && !required_set.contains(name))
             .map(|(name, _)| name.clone())
-            .collect();
+            .collect::<Vec<_>>();
         let catalog = zuno_mcp::Catalog::new_with_eager_servers(
             configs.keys().cloned(),
             required_names.iter().cloned(),
@@ -157,10 +169,20 @@ impl McpRuntime {
             configs,
             zuno_mcp::McpLifecycleOptions::default(),
         );
+        let mut eager = Vec::new();
+        for server in optional_enabled {
+            let lazy = cache
+                .get(&server)
+                .cloned()
+                .is_some_and(|directory| controller.install_cached_directory(directory).is_ok());
+            if !lazy {
+                eager.push(server);
+            }
+        }
         Ok(Some(Self {
             catalog,
             controller,
-            enabled,
+            eager,
             required: required_names,
             startup_order: Mutex::new(Vec::new()),
             concurrency: NonZeroUsize::new(usize::from(
@@ -173,7 +195,21 @@ impl McpRuntime {
     /// Connect every enabled server, returning one note per server that did not.
     ///
     pub(crate) async fn connect(&self) -> Vec<String> {
-        let results = stream::iter(self.enabled.iter().cloned().map(|server| {
+        self.connect_optional_except(&BTreeSet::new()).await
+    }
+
+    async fn connect_optional_except(&self, excluded: &BTreeSet<String>) -> Vec<String> {
+        // Materialize names before the first await. Retaining a borrowed filter
+        // closure inside the buffered stream makes this future lifetime-specific,
+        // which prevents ACP's async-trait request future from being `Send` for every
+        // request lifetime even though every value involved is thread-safe.
+        let eager = self
+            .eager
+            .iter()
+            .filter(|server| !excluded.contains(*server))
+            .cloned()
+            .collect::<Vec<_>>();
+        let results = stream::iter(eager.into_iter().map(|server| {
             let controller = self.controller.clone();
             async move {
                 let result = controller.set_enabled(&server, true).await;
@@ -211,8 +247,21 @@ impl McpRuntime {
     /// Connect all session-local servers strictly, then bring up host-configured
     /// servers with the existing best-effort diagnostics.
     pub(crate) async fn connect_required(&self) -> Result<Vec<String>, String> {
+        self.connect_for_publish(&BTreeSet::new()).await
+    }
+
+    /// Connects every startup server except exact-identity connections a prepared
+    /// session runtime will adopt atomically at publication.
+    pub(crate) async fn connect_for_publish(
+        &self,
+        reused: &BTreeSet<String>,
+    ) -> Result<Vec<String>, String> {
+        let reused = reused.clone();
         let mut connected = Vec::new();
         for server in &self.required {
+            if reused.contains(server) {
+                continue;
+            }
             let result = self.controller.set_enabled(server, true).await;
             let is_connected = result.as_ref().is_ok_and(|snapshot| {
                 matches!(snapshot.state, zuno_mcp::McpServerState::Connected)
@@ -229,12 +278,22 @@ impl McpRuntime {
                 "ACP MCP server `{server}` failed to connect and discover its tools"
             ));
         }
-        Ok(self.connect().await)
+        Ok(self.connect_optional_except(&reused).await)
     }
 
     /// The catalog to hand a host.
     pub(crate) fn catalog(&self) -> zuno_mcp::Catalog {
         self.catalog.clone()
+    }
+
+    /// Controller supplied to the session-local prepare/publish manager.
+    pub(crate) fn controller(&self) -> zuno_mcp::McpServerController {
+        self.controller.clone()
+    }
+
+    /// Exact cached or live tool directories suitable for the next cold activation.
+    pub(crate) fn tool_directory_cache(&self) -> McpToolDirectoryCache {
+        self.controller.tool_directories()
     }
 
     /// Snapshot the connected catalog and exact provider-visible tool schemas.
@@ -249,7 +308,13 @@ impl McpRuntime {
             .snapshots()
             .into_iter()
             .map(|snapshot| {
-                let (state, error) = state_diagnostic(&snapshot.state);
+                let (state, error) = if matches!(snapshot.state, zuno_mcp::McpServerState::Disabled)
+                    && self.controller.tool_directory(&snapshot.server).is_some()
+                {
+                    ("cached", None)
+                } else {
+                    state_diagnostic(&snapshot.state)
+                };
                 McpServerDiagnostic {
                     name: snapshot.server,
                     desired_enabled: snapshot.desired_enabled,
@@ -281,12 +346,12 @@ impl McpRuntime {
     /// server's HTTP session open on the far side, because only
     /// [`zuno_mcp::McpConnection::close`] deletes it. A headless surface has an exit
     /// it can await, so it awaits.
-    pub(crate) async fn shutdown(self) {
+    pub(crate) async fn shutdown(&self) {
         let _warnings = self.shutdown_with_diagnostics().await;
     }
 
     /// Close every transport and return any cleanup failures for diagnostics.
-    pub(crate) async fn shutdown_with_diagnostics(self) -> Vec<String> {
+    pub(crate) async fn shutdown_with_diagnostics(&self) -> Vec<String> {
         let connected = self
             .catalog
             .connected_servers()
@@ -359,5 +424,121 @@ fn state_diagnostic(state: &zuno_mcp::McpServerState) -> (&'static str, Option<S
         zuno_mcp::McpServerState::NeedsClientRegistration { error } => {
             ("needs-client-registration", Some(error.clone()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use serde_json::{Map, json};
+    use zuno_config::schema::mcp::{LocalKind, McpLocal};
+
+    use super::*;
+
+    fn local(command: &str) -> McpServerConfig {
+        McpServerConfig::Local(McpLocal {
+            kind: LocalKind::Local,
+            command: vec![command.to_owned()],
+            cwd: None,
+            environment: None,
+            enabled: Some(true),
+            timeout: None,
+        })
+    }
+
+    fn definition() -> zuno_mcp::ToolDefinition {
+        zuno_mcp::ToolDefinition {
+            name: "cached".to_owned(),
+            description: Some("Cached tool".to_owned()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            extra: Map::new(),
+        }
+    }
+
+    #[test]
+    fn required_acp_server_ignores_matching_optional_cache() {
+        let workspace = Path::new("/workspace");
+        let required_config = local("required-server");
+        let required =
+            RequiredMcpServers::new(vec![("required".to_owned(), required_config.clone())]);
+        let identity =
+            zuno_mcp::McpConnectionIdentity::from_config("required", workspace, &required_config);
+        let cache = BTreeMap::from([(
+            "required".to_owned(),
+            zuno_mcp::McpToolDirectory::new(identity, vec![definition()]),
+        )]);
+
+        let runtime = McpRuntime::from_config_with_required_and_cache(
+            &Config::default(),
+            workspace,
+            required,
+            &cache,
+        )
+        .expect("runtime")
+        .expect("required server creates a runtime");
+
+        assert_eq!(runtime.required, vec!["required"]);
+        assert!(runtime.eager.is_empty());
+        assert!(runtime.catalog().tool_ids().is_empty());
+        assert!(runtime.tool_directory_cache().is_empty());
+    }
+
+    struct FailingConnector {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl zuno_mcp::McpConnector for FailingConnector {
+        async fn connect(&self, _server: &str) -> Result<zuno_mcp::McpConnectOutcome, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err("fixture refused connection".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn required_failure_stops_before_optional_startup() {
+        let catalog =
+            zuno_mcp::Catalog::new_with_eager_servers(["optional", "required"], ["required"]);
+        let connector = Arc::new(FailingConnector {
+            calls: AtomicUsize::new(0),
+        });
+        let controller = zuno_mcp::McpServerController::with_connector(
+            catalog.clone(),
+            ["optional", "required"],
+            connector.clone(),
+            zuno_mcp::McpLifecycleOptions {
+                connect_timeout: Duration::from_secs(1),
+                close_timeout: Duration::from_secs(1),
+            },
+        );
+        let runtime = McpRuntime {
+            catalog,
+            controller,
+            eager: vec!["optional".to_owned()],
+            required: vec!["required".to_owned()],
+            startup_order: Mutex::new(Vec::new()),
+            concurrency: NonZeroUsize::new(2).expect("non-zero"),
+        };
+
+        let error = runtime
+            .connect_required()
+            .await
+            .expect_err("required failure blocks publication");
+
+        assert!(error.contains("ACP MCP server `required` failed"));
+        assert_eq!(connector.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            runtime
+                .controller()
+                .snapshot("optional")
+                .expect("optional snapshot")
+                .state,
+            zuno_mcp::McpServerState::Disabled
+        );
     }
 }

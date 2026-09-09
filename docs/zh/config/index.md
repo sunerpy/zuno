@@ -27,7 +27,7 @@ Zuno 读取 `zuno.json` 与 `zuno.jsonc`。所有可以告诉运行时的东西�
 
 ## 顶层结构
 
-一共有四十一个键。按它们决定什么来分组：
+一共有四十二个键。按它们决定什么来分组：
 
 | 分组 | 键 |
 | --- | --- |
@@ -37,7 +37,7 @@ Zuno 读取 `zuno.json` 与 `zuno.jsonc`。所有可以告诉运行时的东西�
 | 指令、Skill 与学习 | `instructions`、`skills`、`command`、`memory`、`learning` |
 | 上下文 | `compaction`、`continuity`、`tool_output`、`attachment`、`references` |
 | 集成 | `mcp`、`lsp`、`formatter`、`web_search`、`watcher` |
-| 运行时 | `concurrency`、`goal`、`runtime`、`snapshot`、`tools`、`navigation`、`logLevel` |
+| 运行时 | `acp`、`concurrency`、`goal`、`runtime`、`snapshot`、`tools`、`navigation`、`logLevel` |
 | 部署 | `server` |
 | 编辑器支持 | `$schema` |
 

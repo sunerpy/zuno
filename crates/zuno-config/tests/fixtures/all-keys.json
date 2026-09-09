@@ -1,5 +1,13 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  "acp": {
+    "runtime": {
+      "max_open_sessions": 32,
+      "max_active_runtimes": 8,
+      "idle_timeout_ms": 900000,
+      "activation_wait_timeout_ms": 30000
+    }
+  },
   "shell": "/bin/zsh",
   "sandbox": {
     "mode": "workspace-write",

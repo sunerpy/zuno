@@ -3,6 +3,7 @@
 //! Named `schema::tests::*` so `cargo test -p zuno-config schema` selects them.
 
 use super::*;
+use crate::schema::acp::ResolvedAcpRuntimeConfig;
 use crate::schema::agent::{
     AgentColor, AgentConfig, AgentMode, AgentReasoning, SWEEP_EXEMPT_KEYS, ThemeColor,
 };
@@ -2310,6 +2311,85 @@ fn the_false_literal_rejects_true() {
     assert_eq!(
         serde_json::to_value(False).expect("serializes"),
         json!(false)
+    );
+}
+
+#[test]
+fn acp_runtime_defaults_and_overrides_are_fully_resolved() {
+    assert_eq!(
+        Config::default().resolved_acp_runtime(),
+        ResolvedAcpRuntimeConfig {
+            max_open_sessions: 32,
+            max_active_runtimes: 8,
+            idle_timeout_ms: 900_000,
+            activation_wait_timeout_ms: 30_000,
+        }
+    );
+
+    let config = parse(
+        r#"{"acp":{"runtime":{"max_open_sessions":48,"max_active_runtimes":12,"idle_timeout_ms":600000,"activation_wait_timeout_ms":45000}}}"#,
+    )
+    .expect("positive ACP runtime limits parse");
+    let resolved = config.resolved_acp_runtime();
+    assert_eq!(
+        resolved,
+        ResolvedAcpRuntimeConfig {
+            max_open_sessions: 48,
+            max_active_runtimes: 12,
+            idle_timeout_ms: 600_000,
+            activation_wait_timeout_ms: 45_000,
+        }
+    );
+    assert_eq!(resolved.idle_timeout(), Duration::from_millis(600_000));
+    assert_eq!(
+        resolved.activation_wait_timeout(),
+        Duration::from_millis(45_000)
+    );
+}
+
+#[test]
+fn acp_runtime_rejects_zero_values_and_active_capacity_above_open_capacity() {
+    for field in [
+        "max_open_sessions",
+        "max_active_runtimes",
+        "idle_timeout_ms",
+        "activation_wait_timeout_ms",
+    ] {
+        let mut value = json!({"acp": {"runtime": {}}});
+        value["acp"]["runtime"][field] = json!(0);
+        let error = parse_value(value).expect_err("every ACP runtime value must be positive");
+        assert_eq!(issue_path(&error), format!("acp.runtime.{field}"));
+    }
+
+    let error = parse(r#"{"acp":{"runtime":{"max_open_sessions":4,"max_active_runtimes":5}}}"#)
+        .expect_err("active runtime capacity cannot exceed open session capacity");
+    assert_eq!(issue_path(&error), "acp.runtime.max_active_runtimes");
+    assert!(issue_detail(&error).contains("less than or equal"));
+}
+
+#[test]
+fn top_level_acp_runtime_settings_do_not_enter_provider_options() {
+    let config = parse(
+        r#"{
+          "acp": {"runtime": {"max_open_sessions": 32}},
+          "provider": {"example": {"options": {"baseURL": "https://example.invalid/v1"}}}
+        }"#,
+    )
+    .expect("host and provider configuration parse independently");
+    let options = config
+        .provider
+        .as_ref()
+        .and_then(|providers| providers.get("example"))
+        .and_then(|provider| provider.options.as_ref())
+        .expect("provider options");
+    assert!(
+        !options.extra.contains_key("acp"),
+        "host-owned ACP settings must not be captured as provider extensions"
+    );
+    let serialized = serde_json::to_value(options).expect("provider options serialize");
+    assert!(
+        serialized.get("acp").is_none(),
+        "top-level ACP settings must not be forwarded in provider options"
     );
 }
 

@@ -1,3 +1,4 @@
+use std::error::Error as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -7,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::json;
 use tempfile::tempdir;
-use tokio::sync::Notify;
+use tokio::sync::{Barrier, Notify};
 use zuno_extension::{
     API_VERSION, ExtensionRegistry, Package, Scope, StaticPackage, resolve_active, runtime_surface,
 };
@@ -117,6 +118,17 @@ fn context() -> ToolContext {
     context_with(Arc::new(NeverInterrupted))
 }
 
+fn context_for(call_id: &str) -> ToolContext {
+    ToolContext::new(
+        "ses_plugin",
+        "msg_plugin",
+        call_id,
+        "build",
+        Arc::new(AllowAll),
+        Arc::new(NeverInterrupted),
+    )
+}
+
 fn context_with(interrupt: Arc<dyn InterruptHandle>) -> ToolContext {
     ToolContext::new(
         "ses_plugin",
@@ -126,6 +138,337 @@ fn context_with(interrupt: Arc<dyn InterruptHandle>) -> ToolContext {
         Arc::new(AllowAll),
         interrupt,
     )
+}
+
+fn marker_lines(path: &Path) -> usize {
+    fs::read_to_string(path)
+        .map(|contents| contents.lines().count())
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn preparing_a_process_plugin_does_not_start_its_runtime_host() {
+    let Some(python) = python() else {
+        eprintln!("python is unavailable; process plugin fixture skipped");
+        return;
+    };
+    let fixture = tempdir().expect("fixture");
+    let package = write_process_package_with_script(
+        fixture.path(),
+        &python,
+        "lazy-prepare-process",
+        r#"
+import json
+import sys
+
+for raw in sys.stdin:
+    request = json.loads(raw)
+    method = request["method"]
+    if method == "initialize":
+        with open("started", "w", encoding="utf-8") as marker:
+            marker.write("1")
+        result = {"protocolVersion": "zuno.plugin/1"}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+    if method == "shutdown":
+        break
+"#,
+    );
+    let started = fixture.path().join("lazy-prepare-process").join("started");
+    let extensions = resolve_active(
+        &Scope::new(fixture.path()),
+        &[package],
+        &ExtensionRegistry::new(),
+    )
+    .expect("resolved package");
+    let mut surface = runtime_surface(&extensions, fixture.path()).expect("runtime surface");
+    let profile = HarnessProfile::new("lazy-prepare-plugin-test")
+        .with_bundle(surface.take_bundle().expect("runtime bundle"));
+    let runtime = HarnessRuntime::new("lazy-prepare-plugin-test");
+
+    runtime
+        .activate_profile(profile)
+        .await
+        .expect("static plugin tools publish without starting the runtime host");
+    assert!(
+        !started.exists(),
+        "profile preparation unexpectedly started the executable plugin host"
+    );
+
+    runtime
+        .shutdown()
+        .await
+        .expect("a dormant plugin slot closes without starting a host");
+    assert!(
+        !started.exists(),
+        "closing a dormant plugin slot unexpectedly started its host"
+    );
+}
+
+#[tokio::test]
+async fn first_process_tool_call_starts_once_and_shutdown_reclaims_the_host() {
+    let Some(python) = python() else {
+        eprintln!("python is unavailable; process plugin fixture skipped");
+        return;
+    };
+    let fixture = tempdir().expect("fixture");
+    let package = write_process_package_with_script(
+        fixture.path(),
+        &python,
+        "lazy-lifecycle-process",
+        r#"
+import json
+import sys
+
+for raw in sys.stdin:
+    request = json.loads(raw)
+    method = request["method"]
+    if method == "initialize":
+        with open("starts", "a", encoding="utf-8") as marker:
+            marker.write("started\n")
+        result = {"protocolVersion": "zuno.plugin/1"}
+    elif method == "tools/call":
+        result = {
+            "title": "lazy call",
+            "output": request["params"]["arguments"]["subject"],
+            "metadata": {}
+        }
+    else:
+        with open("stopped", "w", encoding="utf-8") as marker:
+            marker.write("1")
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+    if method == "shutdown":
+        break
+"#,
+    );
+    let package_root = fixture.path().join("lazy-lifecycle-process");
+    let starts = package_root.join("starts");
+    let stopped = package_root.join("stopped");
+    let extensions = resolve_active(
+        &Scope::new(fixture.path()),
+        &[package],
+        &ExtensionRegistry::new(),
+    )
+    .expect("resolved package");
+    let mut surface = runtime_surface(&extensions, fixture.path()).expect("runtime surface");
+    let tool = Arc::clone(&surface.tools()[0]);
+    let profile = HarnessProfile::new("lazy-lifecycle-plugin-test")
+        .with_bundle(surface.take_bundle().expect("runtime bundle"));
+    let runtime = HarnessRuntime::new("lazy-lifecycle-plugin-test");
+    runtime
+        .activate_profile(profile)
+        .await
+        .expect("lazy plugin slot publishes");
+    assert_eq!(
+        marker_lines(&starts),
+        0,
+        "prepare must leave the host dormant"
+    );
+
+    for subject in ["first", "second"] {
+        let output = tool
+            .invoke(json!({"subject": subject}), context())
+            .await
+            .expect("tool call succeeds");
+        assert_eq!(output.output, subject);
+    }
+    assert_eq!(
+        marker_lines(&starts),
+        1,
+        "later calls must reuse the active runtime host"
+    );
+
+    runtime.shutdown().await.expect("active plugin host stops");
+    assert!(
+        stopped.exists(),
+        "the started plugin did not receive lifecycle shutdown"
+    );
+    let error = tool
+        .invoke(json!({"subject": "after shutdown"}), context())
+        .await
+        .expect_err("a closed plugin slot rejects new calls");
+    let source = error
+        .source()
+        .expect("closed-host failure keeps its typed source")
+        .to_string();
+    assert!(source.contains("not active"), "{source}");
+}
+
+#[tokio::test]
+async fn concurrent_first_process_calls_share_one_startup() {
+    let Some(python) = python() else {
+        eprintln!("python is unavailable; process plugin fixture skipped");
+        return;
+    };
+    let fixture = tempdir().expect("fixture");
+    let package = write_process_package_with_script(
+        fixture.path(),
+        &python,
+        "lazy-singleflight-process",
+        r#"
+import json
+import sys
+import time
+
+for raw in sys.stdin:
+    request = json.loads(raw)
+    method = request["method"]
+    if method == "initialize":
+        with open("starts", "a", encoding="utf-8") as marker:
+            marker.write("started\n")
+        time.sleep(0.2)
+        result = {"protocolVersion": "zuno.plugin/1"}
+    elif method == "tools/call":
+        result = {
+            "title": "singleflight call",
+            "output": request["params"]["arguments"]["subject"],
+            "metadata": {}
+        }
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+    if method == "shutdown":
+        break
+"#,
+    );
+    let starts = fixture
+        .path()
+        .join("lazy-singleflight-process")
+        .join("starts");
+    let extensions = resolve_active(
+        &Scope::new(fixture.path()),
+        &[package],
+        &ExtensionRegistry::new(),
+    )
+    .expect("resolved package");
+    let mut surface = runtime_surface(&extensions, fixture.path()).expect("runtime surface");
+    let tool = Arc::clone(&surface.tools()[0]);
+    let profile = HarnessProfile::new("lazy-singleflight-plugin-test")
+        .with_bundle(surface.take_bundle().expect("runtime bundle"));
+    let runtime = HarnessRuntime::new("lazy-singleflight-plugin-test");
+    runtime
+        .activate_profile(profile)
+        .await
+        .expect("lazy plugin slot publishes");
+
+    const CALLS: usize = 8;
+    let barrier = Arc::new(Barrier::new(CALLS + 1));
+    let mut calls = Vec::with_capacity(CALLS);
+    for index in 0..CALLS {
+        let barrier = Arc::clone(&barrier);
+        let tool = Arc::clone(&tool);
+        calls.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let subject = format!("call-{index}");
+            tool.invoke(
+                json!({"subject": subject}),
+                context_for(&format!("call_plugin_{index}")),
+            )
+            .await
+            .map(|output| output.output)
+        }));
+    }
+    barrier.wait().await;
+    for (index, call) in calls.into_iter().enumerate() {
+        assert_eq!(
+            call.await
+                .expect("tool task joins")
+                .expect("concurrent tool call succeeds"),
+            format!("call-{index}")
+        );
+    }
+
+    assert_eq!(
+        marker_lines(&starts),
+        1,
+        "concurrent first calls must share exactly one runtime startup"
+    );
+    runtime.shutdown().await.expect("single host stops");
+}
+
+#[tokio::test]
+async fn a_failed_lazy_start_can_be_retried_by_a_later_call() {
+    let Some(python) = python() else {
+        eprintln!("python is unavailable; process plugin fixture skipped");
+        return;
+    };
+    let fixture = tempdir().expect("fixture");
+    let package = write_process_package_with_script(
+        fixture.path(),
+        &python,
+        "lazy-retry-process",
+        r#"
+import json
+import os
+import sys
+
+for raw in sys.stdin:
+    request = json.loads(raw)
+    method = request["method"]
+    if method == "initialize":
+        with open("attempts", "a", encoding="utf-8") as marker:
+            marker.write("attempt\n")
+        with open("attempts", "r", encoding="utf-8") as marker:
+            attempts = len(marker.readlines())
+        result = {
+            "protocolVersion": "wrong" if attempts == 1 else "zuno.plugin/1"
+        }
+    elif method == "tools/call":
+        result = {
+            "title": "retry call",
+            "output": request["params"]["arguments"]["subject"],
+            "metadata": {}
+        }
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+    if method == "shutdown":
+        break
+"#,
+    );
+    let attempts = fixture.path().join("lazy-retry-process").join("attempts");
+    let extensions = resolve_active(
+        &Scope::new(fixture.path()),
+        &[package],
+        &ExtensionRegistry::new(),
+    )
+    .expect("resolved package");
+    let mut surface = runtime_surface(&extensions, fixture.path()).expect("runtime surface");
+    let tool = Arc::clone(&surface.tools()[0]);
+    let profile = HarnessProfile::new("lazy-retry-plugin-test")
+        .with_bundle(surface.take_bundle().expect("runtime bundle"));
+    let runtime = HarnessRuntime::new("lazy-retry-plugin-test");
+    runtime
+        .activate_profile(profile)
+        .await
+        .expect("lazy plugin slot publishes");
+
+    let first = tool
+        .invoke(json!({"subject": "first"}), context())
+        .await
+        .expect_err("the first protocol negotiation is rejected");
+    let first_source = first
+        .source()
+        .expect("startup failure keeps its typed source")
+        .to_string();
+    assert!(
+        first_source.contains("protocol-incompatible"),
+        "{first_source}"
+    );
+
+    let second = tool
+        .invoke(json!({"subject": "second"}), context())
+        .await
+        .expect("a later call retries the dormant slot");
+    assert_eq!(second.output, "second");
+    assert_eq!(
+        marker_lines(&attempts),
+        2,
+        "the failed startup is not retained as an active host"
+    );
+    runtime.shutdown().await.expect("retried host stops");
 }
 
 #[tokio::test]
