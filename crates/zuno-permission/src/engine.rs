@@ -47,8 +47,8 @@ impl PermissionEngine {
     /// # Errors
     /// Returns [`ToolError::Denied`] as soon as any requested pattern evaluates
     /// to deny. A denied request is never inserted into pending state. The error
-    /// names only the tool; [`Self::authorize_explained`] keeps the rule and the
-    /// reason for a caller that has to say why.
+    /// retains the rule and resource; [`Self::authorize_explained`] exposes the
+    /// permission-specific explanation directly.
     pub fn authorize(
         &mut self,
         request: PermissionRequest,
@@ -163,6 +163,7 @@ impl PermissionEngine {
             .always
             .iter()
             .map(|pattern| Rule {
+                source: None,
                 permission: target.permission.clone(),
                 pattern: pattern.clone(),
                 action: PermissionAction::Allow,

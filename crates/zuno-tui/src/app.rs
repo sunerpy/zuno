@@ -263,6 +263,11 @@ pub trait Component: Send {
 
     /// Observe one application event.
     fn handle_event(&mut self, event: &AppEvent) -> EventResult;
+
+    /// Only a message-browsing focus may translate native wheel input to arrows.
+    fn alternate_scroll(&self) -> bool {
+        false
+    }
 }
 
 /// A vertical composition of independently renderable components.
@@ -335,11 +340,17 @@ pub trait TerminalLifecycle: Send + Sync + 'static {
 
     /// Whether the lifecycle currently considers the TUI active.
     fn is_active(&self) -> bool;
+
+    /// Apply the focused component's native-selection wheel policy.
+    fn set_alternate_scroll(&self, _enabled: bool) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Crossterm's real raw-mode and alternate-screen lifecycle.
 pub struct CrosstermLifecycle {
     mouse_capture: bool,
+    alternate_scroll: AtomicBool,
     active: AtomicBool,
     operation: Mutex<()>,
 }
@@ -350,6 +361,7 @@ impl CrosstermLifecycle {
     pub const fn new(mouse_capture: bool) -> Self {
         Self {
             mouse_capture,
+            alternate_scroll: AtomicBool::new(false),
             active: AtomicBool::new(false),
             operation: Mutex::new(()),
         }
@@ -411,8 +423,8 @@ impl crossterm::Command for NarrowMouseRelease {
 /// Ask the terminal to translate wheel notches into cursor keys on the alternate screen.
 ///
 /// Unlike mouse reporting, DEC mode 1007 leaves drag selection owned by the terminal.
-/// [`SessionScreen`](crate::views::session::SessionScreen) promotes its message scope
-/// while the composer is empty, so the translated keys scroll the transcript.
+/// This is enabled only while message browsing owns keyboard focus. A composer
+/// must never confuse the generated arrows with history navigation.
 struct AlternateScrollCapture;
 
 impl crossterm::Command for AlternateScrollCapture {
@@ -487,7 +499,7 @@ fn enter_terminal(output: &mut impl io::Write, mouse_capture: bool) -> io::Resul
         let _ = execute!(output, LeaveAlternateScreen);
         return Err(error);
     }
-    if !mouse_capture && let Err(error) = execute!(output, AlternateScrollCapture) {
+    if !mouse_capture && let Err(error) = execute!(output, AlternateScrollRelease) {
         let _ = execute!(output, DisableBracketedPaste);
         let _ = execute!(output, LeaveAlternateScreen);
         return Err(error);
@@ -577,6 +589,22 @@ fn drain_unread_input(input: &dyn TerminalInput) -> usize {
 }
 
 impl TerminalLifecycle for CrosstermLifecycle {
+    fn set_alternate_scroll(&self, enabled: bool) -> io::Result<()> {
+        let _operation = locked(&self.operation);
+        if self.mouse_capture || !self.active.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if self.alternate_scroll.load(Ordering::SeqCst) != enabled {
+            if enabled {
+                execute!(io::stdout(), AlternateScrollCapture)?;
+            } else {
+                execute!(io::stdout(), AlternateScrollRelease)?;
+            }
+            self.alternate_scroll.store(enabled, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
     fn enter(&self) -> io::Result<()> {
         let _operation = locked(&self.operation);
         if self.active.load(Ordering::SeqCst) {
@@ -589,6 +617,7 @@ impl TerminalLifecycle for CrosstermLifecycle {
             return Err(error);
         }
         self.active.store(true, Ordering::SeqCst);
+        self.alternate_scroll.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -760,6 +789,7 @@ impl DrawTarget for CrosstermDrawTarget {
 struct UiState {
     root: Box<dyn Component>,
     target: Box<dyn DrawTarget>,
+    lifecycle: Arc<dyn TerminalLifecycle>,
     /// Frame timing lives behind the same mutex that already serialises drawing, so
     /// every draw site is measured once without a second lock or a shared counter.
     frames: SlowFrameHistory,
@@ -767,6 +797,8 @@ struct UiState {
 
 impl UiState {
     fn draw(&mut self, cause: &'static str) -> io::Result<()> {
+        self.lifecycle
+            .set_alternate_scroll(self.root.alternate_scroll())?;
         // `std::time::Instant`, not the runtime clock: a frame's cost is real time, and
         // a paused test clock would measure every draw as free.
         let started = StdInstant::now();
@@ -1328,6 +1360,7 @@ impl App {
         engine_events: mpsc::Receiver<TurnEvent>,
     ) -> (Self, Arc<TerminalLeaseOwner>) {
         let ui = Arc::new(Mutex::new(UiState {
+            lifecycle: Arc::clone(&lifecycle),
             root,
             target,
             frames: SlowFrameHistory::from_environment(),

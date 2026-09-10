@@ -12,8 +12,9 @@ It depends on the selected sandbox mode:
   boundary.
 
 The two confined modes are OS-sandboxed only when the active platform backend
-passes its full capability probe. Otherwise, Shell registration fails closed by
-default. A trusted global, explicit, environment, CLI, or managed layer may set
+passes its full capability probe. Under `backend: auto`, unavailable confinement
+fails closed. Windows/macOS default to native without explicit confinement constraints,
+record `platform_native`, and keep the configured permission mode. A trusted layer may set
 `sandbox.onUnavailable` to `run-unconfined`; that allows only a write-capable
 Agent's `workspace-write` request to use the native backend for a typed platform,
 launcher-absence, or namespace/container-policy availability failure. Read-only
@@ -27,7 +28,7 @@ OS-enforced. Explicit `danger-full-access` skips confinement discovery and also
 sets effective permission mode to `allow_all`.
 
 A trusted layer may instead select the backend outright with `sandbox.backend`:
-`auto` (the default) discovers the confined backend as above, and `native` runs
+Explicit `auto` discovers the confined backend as above, and `native` runs
 every Agent's Shell, read-only Agents included, on the native process backend
 without probing anything, while the configured permission mode is kept. That is a
 host declaration rather than a fallback, and it is not confinement: the requested
@@ -87,8 +88,9 @@ denials remain terminal. Structured questions are not approvals and are exposed
 only in Plan; ordinary Work asks directly at the turn boundary only when no safe
 default exists.
 
-Confined macOS and Windows modes currently return a typed unsupported-platform
-error. They do not register Shell under the default `deny`; trusted
+Explicitly required confinement on macOS and Windows returns a typed unsupported-platform
+error. Without explicit constraints they default to native. Under `auto` plus `deny`,
+Shell is not registered; trusted
 `run-unconfined` may allow a write-capable Agent to proceed natively, a trusted
 `sandbox.backend: native` runs every Agent natively with the permission mode
 kept, and explicit `danger-full-access` remains available independently. The
@@ -100,15 +102,15 @@ Agent including a read-only one; `zuno --sandbox-on-unavailable run-unconfined`,
 trusted (global, managed, environment, or CLI) layer for a write-capable one; and
 `zuno --sandbox danger-full-access`. A project layer cannot enable any of them.
 
-An interactive `zuno` start on such a host asks once, before raw mode, whether to
+An interactive Linux `zuno` start without usable confinement may ask once, before raw mode, whether to
 run this session natively — for any request it cannot confine, read-only
-included, only when no layer set `sandbox.onUnavailable` or `sandbox.backend`,
+included, only when no layer set `sandbox.onUnavailable`, `sandbox.backend`, network denial or path constraints,
 and only when standard input and standard error are both terminals. `y` selects
 the native backend and resolves this process exactly as the flag does
 (`--sandbox-backend native`); `a` selects it and also saves
 `sandbox.backend: native` to your global configuration, so the question is
 answered for good; `n` exits with the refusal. A `y` answer covers this
-process only: on macOS the flag reaches nested Zuno processes through the
+process only: on Unix the flag reaches nested Zuno processes through the
 startup re-exec that exports it, and an answer given at the prompt does not, so
 set `ZUNO_SANDBOX_BACKEND=native` or a trusted `sandbox.backend` when a nested
 `zuno` needs the same answer — or answer `a` once and let the file carry it.

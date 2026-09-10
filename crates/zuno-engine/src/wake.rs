@@ -65,6 +65,29 @@ impl SessionWakeCoordinator {
         input_id: &str,
         message: SoftInterruptMessage,
     ) -> Result<WakeOutcome, String> {
+        self.deliver_with_mode(session_id, input_id, message, true)
+            .await
+    }
+
+    /// Drive queued user input only after the current lease ends, in durable FIFO
+    /// order. Unlike report wakes, ordinary queued prompts never steer implicitly.
+    pub async fn deliver_when_idle(
+        &self,
+        session_id: &str,
+        input_id: &str,
+        message: SoftInterruptMessage,
+    ) -> Result<WakeOutcome, String> {
+        self.deliver_with_mode(session_id, input_id, message, false)
+            .await
+    }
+
+    async fn deliver_with_mode(
+        &self,
+        session_id: &str,
+        input_id: &str,
+        message: SoftInterruptMessage,
+        steer_active: bool,
+    ) -> Result<WakeOutcome, String> {
         if message.input_id.as_deref() != Some(input_id) {
             return Err(format!(
                 "wake message input id does not match durable input `{input_id}`"
@@ -88,16 +111,28 @@ impl SessionWakeCoordinator {
             };
             match self.runs.begin_turn(session_id) {
                 Ok(guard) => {
+                    let input = if steer_active {
+                        input
+                    } else {
+                        pending
+                            .into_iter()
+                            .find(|input| input.delivery == zuno_db::inbox::InputDelivery::Queue)
+                            .unwrap_or(input)
+                    };
+                    let driven_id = input.id.clone();
                     self.driver.drive(input, guard).await?;
-                    if self.pending_input(session_id, input_id)?.is_some() {
+                    if self.pending_input(session_id, &driven_id)?.is_some() {
                         return Err(format!(
-                            "pending-input driver returned without claiming `{input_id}`"
+                            "pending-input driver returned without claiming `{driven_id}`"
                         ));
+                    }
+                    if driven_id != input_id {
+                        continue;
                     }
                     return Ok(WakeOutcome::Driven);
                 }
                 Err(_) => {
-                    if self.steer_batch(session_id, &pending, &input, &message) {
+                    if !steer_active || self.steer_batch(session_id, &pending, &input, &message) {
                         self.runs.wait_until_idle(session_id).await;
                     } else {
                         tokio::task::yield_now().await;
@@ -146,6 +181,10 @@ impl SessionWakeCoordinator {
                 }
             } else {
                 SoftInterruptMessage {
+                    revision: pending
+                        .iter()
+                        .find(|input| input.id == report.input_id)
+                        .map(|input| input.revision),
                     input_id: Some(report.input_id.clone()),
                     content: report.text.clone(),
                     images: Vec::new(),

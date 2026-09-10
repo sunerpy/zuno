@@ -17,12 +17,14 @@ fn rules_from_object(object: &PermissionObject) -> Vec<Rule> {
     for (permission, configured) in object.iter() {
         match configured {
             PermissionRule::Action(action) => rules.push(Rule {
+                source: None,
                 permission: permission.to_owned(),
                 pattern: "*".to_owned(),
                 action: *action,
             }),
             PermissionRule::Patterns(patterns) => {
                 rules.extend(patterns.iter().map(|(pattern, action)| Rule {
+                    source: None,
                     permission: permission.to_owned(),
                     pattern: expand_home(pattern),
                     action: *action,
@@ -71,9 +73,9 @@ impl Decision<'_> {
 /// A configured deny is terminal — no prompt follows and no runtime grant can cross
 /// it — so a refusal that names only the tool leaves the user guessing which rule
 /// and why, most of all when the reading is one this crate applies to a deny alone
-/// (a bare `$EDITOR` under `rm -rf*`). [`ToolError::Denied`] carries only the tool,
-/// so this converts into it losslessly for the error channel and keeps the account
-/// for whoever renders the refusal.
+/// (a bare `$EDITOR` under `rm -rf*`). Conversion to [`ToolError::Denied`] keeps the
+/// permission, resource, rule and origin, even when an auxiliary permission differs
+/// from the originating tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Denial {
     /// The permission key the request was made under.
@@ -98,11 +100,28 @@ impl fmt::Display for Denial {
 
 impl std::error::Error for Denial {}
 
+impl Denial {
+    /// Preserve the originating tool separately from the refused permission key.
+    #[must_use]
+    pub fn into_tool_error(self, tool: impl Into<String>) -> ToolError {
+        ToolError::Denied {
+            tool: tool.into(),
+            denial: Some(Box::new(zuno_error::ToolPermissionDenial {
+                permission: self.permission,
+                resource: self.resource,
+                rule_permission: self.rule.permission,
+                rule_pattern: self.rule.pattern,
+                rule_source: self.rule.source,
+                match_reason: self.reason.to_string(),
+            })),
+        }
+    }
+}
+
 impl From<Denial> for ToolError {
     fn from(denial: Denial) -> Self {
-        Self::Denied {
-            tool: denial.permission,
-        }
+        let tool = denial.permission.clone();
+        denial.into_tool_error(tool)
     }
 }
 

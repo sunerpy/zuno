@@ -880,6 +880,7 @@ fn require_review_agent(tool: &str, ctx: &ToolContext) -> Result<(), ToolError> 
         Ok(())
     } else {
         Err(ToolError::Denied {
+            denial: None,
             tool: tool.to_owned(),
         })
     }

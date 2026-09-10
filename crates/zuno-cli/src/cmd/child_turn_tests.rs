@@ -749,11 +749,14 @@ async fn interactive_child_input_targets_only_the_child_and_steers_an_active_tur
     let guard = runs
         .begin_turn("ses_child")
         .expect("the child turn is active");
+    let _turn = guard
+        .mark_turn_started("turn_child")
+        .expect("bind the displayed child turn");
     let driver = Arc::new(PromotingInputDriver::new(inbox.clone()));
     let input = InteractiveChildInput::with_driver(pool, runs, jobs.clone(), driver);
 
     let input_id = input
-        .submit_text(
+        .submit_input(
             "ses_child",
             serde_json::json!({
                 "kind": "tuiPrompt",
@@ -762,8 +765,9 @@ async fn interactive_child_input_targets_only_the_child_and_steers_an_active_tur
                     "data": {"kind": "text", "data": "change direction"}
                 }
             }),
-            "change direction".to_owned(),
+            zuno_engine::admission::SteeringContent::user("change direction"),
             zuno_db::inbox::InputDelivery::Steer,
+            Some("turn_child"),
         )
         .expect("admit interactive child input");
 
@@ -804,7 +808,7 @@ async fn interactive_child_input_reopens_an_idle_child_through_the_pending_drive
     let input = InteractiveChildInput::with_driver(pool, runs, jobs.clone(), driver.clone());
 
     let input_id = input
-        .submit_text(
+        .submit_input(
             "ses_child",
             serde_json::json!({
                 "kind": "tuiPrompt",
@@ -813,8 +817,9 @@ async fn interactive_child_input_reopens_an_idle_child_through_the_pending_drive
                     "data": {"kind": "text", "data": "continue from here"}
                 }
             }),
-            "continue from here".to_owned(),
+            zuno_engine::admission::SteeringContent::user("continue from here"),
             zuno_db::inbox::InputDelivery::Queue,
+            None,
         )
         .expect("admit idle child input");
     jobs.wait_all().await;
@@ -1009,6 +1014,67 @@ async fn a_fresh_delegation_creates_a_child_session_owned_by_its_parent() {
         1,
         "the row a delegation writes must be the row the depth guard then reads"
     );
+}
+
+#[tokio::test]
+async fn foreground_and_background_children_inherit_revised_parent_memory_policy() {
+    use zuno_db::session_memory_policy::{
+        SessionMemoryPolicyDefaults, SessionMemoryPolicyExclusion, SessionMemoryPolicyStore,
+        SessionMemoryPolicyWrite,
+    };
+    use zuno_types::SessionMemoryGeneration;
+
+    for background in [false, true] {
+        let mut fixture = Fixture::new();
+        fixture.session("ses_owner", None);
+        fixture.runner.complete_with(Ok("done"));
+        let policies = SessionMemoryPolicyStore::new(Arc::clone(&fixture.host.database));
+        let initial = policies
+            .seed(
+                "ses_owner",
+                true,
+                SessionMemoryGeneration::Enabled,
+                "parent defaults",
+                "configuration",
+                5,
+            )
+            .expect("persist parent");
+        // Exercise the production boundary: a host can be assembled from an
+        // already-persisted projection, whose revision is never a caller default.
+        fixture.host.parent_memory_defaults = SessionMemoryPolicyDefaults::from(&initial);
+        let SessionMemoryPolicyWrite::Applied(parent) = policies
+            .exclude(SessionMemoryPolicyExclusion {
+                session_id: "ses_owner".to_owned(),
+                use_memories: false,
+                reason: "parent opts out before delegation".to_owned(),
+                source: "tui".to_owned(),
+                expected_revision: initial.revision,
+                time_updated: 6,
+            })
+            .expect("parent revision two")
+        else {
+            panic!("parent update must commit");
+        };
+        let mut request = fixture.request("ses_owner");
+        request.background = background;
+        let response = fixture
+            .host
+            .dispatch(request, no_interrupt())
+            .await
+            .expect("revised policies must not block child scheduling");
+        let child = policies
+            .get(&response.session_id)
+            .expect("child policy")
+            .expect("child policy is durable with job admission");
+        assert!(!child.use_memories);
+        assert_eq!(child.generation, SessionMemoryGeneration::Excluded);
+        assert_eq!(child.revision, 1);
+        assert_eq!(child.source.as_deref(), Some("parent_session"));
+        assert_eq!(
+            policies.get("ses_owner").expect("parent unchanged"),
+            Some(parent.policy)
+        );
+    }
 }
 
 #[tokio::test]

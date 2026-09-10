@@ -233,6 +233,7 @@ impl PermissionAsker for DenyAll {
         _ask: PermissionAsk,
     ) -> Result<(), ToolError> {
         Err(ToolError::Denied {
+            denial: None,
             tool: tool.to_owned(),
         })
     }

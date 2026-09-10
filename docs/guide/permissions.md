@@ -17,6 +17,7 @@ model asks to run a command
         │
         ▼
   sandbox resolver
+        ├── native selected/default ──▶ host execution, no OS confinement
         ├── confined backend ready ──▶ command runs, confined
         ├── eligible unavailable error + trusted fallback
         │                              └──▶ warning, then native execution
@@ -54,17 +55,29 @@ contract still narrows it — see [Agents](/guide/agents).
 
 ### Choosing native execution
 
-There are three different ways to run without OS confinement. Choose the one whose
+Native execution may be a platform default or an explicit deployment choice. Choose the
 meaning matches the deployment:
 
 | Intent | Setting | What happens |
 | --- | --- | --- |
-| Require confinement | `workspace-write` plus `onUnavailable: "deny"` | The default. An unavailable backend stops Shell assembly. |
+| Use the platform default | Omit backend and confinement constraints | Native on Windows/macOS; automatic confinement discovery on Linux. |
+| Require confinement | `backend: "auto"` and `onUnavailable: "deny"` | An unavailable backend stops Shell assembly. |
 | Prefer confinement, but permit an unavailable-only fallback | `workspace-write` plus `onUnavailable: "run-unconfined"` | Zuno probes and verifies the confined backend first, then falls back only for an eligible typed availability failure of a write-capable request. |
 | Run every Agent natively and keep the permission mode | `backend: "native"` | Zuno skips confined-backend discovery and runs every Agent's Shell natively, read-only contracts included; the configured permission mode, rules, approvals and the risk gate stay, and the requested contract is recorded as unenforced. |
 | Always use the host process backend without approval prompts | `danger-full-access` | Zuno skips confined-backend discovery, runs natively on every supported platform, and makes the effective permission mode `allow_all`. |
 
-`backend: "native"` is the choice for a host that has no OS sandbox (macOS and
+On Windows and macOS, an omitted backend resolves to native only when no explicit
+`onUnavailable`, `network: "deny"`, non-empty `writableRoots`, or `protectedPaths`
+requests confinement. Explicit `backend: "auto"` and managed/project restrictions
+retain their authority; Zuno never converts an explicit confinement requirement into
+an implicit native fallback. Linux defaults are unchanged.
+
+The default is recorded as `resolutionKind: "platform_native"` and keeps the configured
+permission mode. It does not imply `allow_all`. The requested per-Agent contract
+remains recorded but is not enforced by the OS. Agent/Plan/Work switches preflight
+the target before changing durable collaboration state.
+
+`backend: "native"` is also an explicit choice for a host that has no OS sandbox (macOS and
 Windows today) when the permission layer should stay in force. It is a trusted
 host declaration, not a fallback: nothing is probed and nothing fails first. Under
 it a read-only Agent such as `plan` keeps its tool allowlist, its permission rules,
@@ -181,8 +194,9 @@ requested policy and diagnostics, but the host process backend cannot enforce th
 
 ## The sandbox fails closed by default
 
-`read-only` and `workspace-write` both **require a proved OS confinement backend**.
-With the default `onUnavailable: "deny"`, an unavailable backend stops Shell
+Under `backend: "auto"` (the Linux default or an explicit selection), `read-only`
+and `workspace-write` require a proved OS confinement backend. With
+`onUnavailable: "deny"`, an unavailable backend stops Shell
 assembly:
 
 ```
@@ -236,8 +250,8 @@ zuno debug sandbox
 ### Other platforms
 
 The OS confinement backend is implemented for Linux. macOS and Windows have no
-confined backend at all, so a restricted mode there fails closed rather than
-degrading quietly. The refusal is written to be acted on: it names the platform,
+confined backend at all. Their default is platform-native without explicit constraints;
+an explicit confined-backend requirement still fails closed. The refusal names the platform,
 says whether the trusted `run-unconfined` fallback applies to **this** request,
 lists every remedy together with the layer that may set it, and states that none
 of those remedies is confinement. It opens on the same typed cause earlier releases
@@ -266,17 +280,16 @@ backend, so the Shell tool cannot be registered under the requested
   says that `danger-full-access` additionally makes the effective permission mode
   `allow_all`.
 
-An interactive `zuno` start on such a host asks once, before the terminal enters
-raw mode, whether to run that session natively. It asks for any request the host
-cannot confine, a read-only Agent's included, only when no layer set
-`sandbox.onUnavailable` or `sandbox.backend`, and only when standard input and
+On Linux without usable confinement, an interactive `zuno` may ask once before raw mode
+whether to run natively. It can include a read-only Agent's request, only when no layer set
+`sandbox.onUnavailable`, `sandbox.backend`, network denial or path constraints, and standard input and
 standard error are both terminals. Answering yes resolves this process exactly as
 `--sandbox-backend native` does — `resolutionKind` `trusted_native` — for every
 later composition of it, a later switch to a read-only Agent included; answering
 no exits with the refusal above. `run`, `acp`, `serve`, and any start without a
-terminal never ask, and still need the flag, the variable, or a trusted layer.
+terminal never ask. Windows/macOS independently apply their platform defaults.
 
-The answer belongs to this process. On macOS the flag is exported into the real
+The answer belongs to this process. On Unix the flag is exported into the real
 environment by the one startup re-exec, so a nested `zuno` that a tool launches
 inherits it, while an answer typed at the prompt arrives after that re-exec and is
 not inherited. Set the environment variable or a trusted layer when nested Zuno
@@ -436,7 +449,26 @@ and any agent contract have been applied:
 
 ```sh
 zuno debug permissions
+zuno debug permissions --agent deep --permission external_directory --resource 'C:/Users/example/AppData/Local/Amazon/DCV/logs/*'
+zuno debug permissions --session ses_example
 ```
+
+This resolves current configuration for the selected Agent, including native, dynamic,
+global and per-Agent rule layers. `--session` reads the saved Agent/workspace without
+changing the database; it is not a historical live-host snapshot. Runtime approval
+grants and connected MCP tools are explicitly excluded. `decision` distinguishes the
+rule action from the effective action under `allow_all` and identifies the matched rule.
+
+Working native Agents, including `deep`, `general` and `fixer`, ask for
+`external_directory` by default. Allowing `read` alone does not authorize an outside
+directory. `allow_all` resolves an `ask`, but an effective explicit `deny` remains final,
+including against dynamic tool-output grants. A refusal now identifies the originating
+tool, actual permission, resource and matched rule/source rather than only saying
+`tool read was denied`.
+
+Use `zuno debug sandbox --agent deep --check-execution` to test whether its selected
+backend can execute. `--check` still tests requested confinement, so native execution
+may have `executionReady: true` and `ready: false` at the same time.
 
 Its output also states what a permissive mode still enforces, which is the fastest
 way to confirm the guarantees above rather than take them on trust:
@@ -505,10 +537,10 @@ them has real consequences.
 
 | Configuration | What actually happens |
 | --- | --- |
-| `allow_all` + `read-only` | No prompts, but writes still fail. The sandbox is unaffected by permission mode. |
+| `allow_all` + `read-only` + `backend: "auto"` | No prompts, but OS-confined writes still fail. Permission mode does not widen the sandbox. |
 | `standard` + `danger-full-access` | Effective permission becomes `allow_all`; ordinary prompts are skipped, while explicit denies and catastrophic hard refusals remain. |
 | `allow_all` + rule `"shell": "deny"` | Shell calls are refused. The explicit deny wins. |
-| `workspace-write` + default `deny`, no backend | Shell is not assembled. Nothing runs. |
+| `workspace-write` + `backend: "auto"` + `deny`, unavailable backend | Shell is not assembled. Nothing runs. |
 | `workspace-write` + trusted `run-unconfined`, eligible unavailable error | The command uses host authority; the configured permission mode and hard denials remain. |
 | `read-only` + `run-unconfined`, no backend | Shell is not assembled. Read-only execution never falls back. |
 | `read-only` + trusted `backend: "native"` | Shell runs natively with the permission mode kept. The read-only contract is a tool, permission and risk-gate boundary, not an OS boundary; the record says `trusted_native` and `requestedMode: read-only`. |
@@ -519,10 +551,9 @@ A read-only agent is pinned to `read-only` regardless of what configuration asks
 for. This direction is one-way by design: an agent contract can only reduce
 authority, so selecting a read-only agent is a guarantee rather than a default that
 configuration can quietly reverse. It also means a read-only Agent never uses
-`run-unconfined`. The one way its Shell runs natively is a trusted
-`sandbox.backend: native` selection, which is an explicit host declaration rather
-than a fallback and leaves the contract in force as a tool and permission
-boundary while removing the OS boundary.
+`run-unconfined`. Its Shell can use the Windows/macOS platform-native default or a
+trusted explicit `sandbox.backend: native` selection. Both retain the tool and
+permission boundary while recording that there is no OS boundary.
 
 An agent contract is deny-by-default, so a tool the contract does not name is *hidden*
 rather than merely unauthorized: the contract's leading `"*": "deny"` is the last rule
@@ -534,8 +565,8 @@ the delegating agent, because a Job resolves only for the session whose `task` c
 created it.
 
 ```sh
-# Shell cannot modify the workspace, whatever sandbox.mode says.
-zuno run --agent plan "audit the retry policy"
+# Require OS-enforced read-only Shell (fails if confinement is unavailable).
+zuno run --agent plan --sandbox-backend auto "audit the retry policy"
 ```
 
 Report publication is a separate `report_write` capability. It can be granted to a

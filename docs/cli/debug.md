@@ -24,7 +24,7 @@ zuno debug [OPTIONS] <COMMAND>
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | `auto` |
+| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | platform-dependent |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 ## Subcommands
@@ -56,7 +56,7 @@ zuno debug paths [OPTIONS]
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | `auto` |
+| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | platform-dependent |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 ### zuno debug config
@@ -72,7 +72,7 @@ zuno debug config [OPTIONS]
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | `auto` |
+| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | platform-dependent |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 ### zuno debug agent
@@ -92,7 +92,7 @@ zuno debug agent [OPTIONS] <NAME>
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | `auto` |
+| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | platform-dependent |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 ### zuno debug prompt
@@ -111,7 +111,7 @@ zuno debug prompt [OPTIONS]
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | `auto` |
+| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | platform-dependent |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 `--show-sensitive` prints instruction, AGENTS, skill, and memory content verbatim. Treat that
@@ -125,12 +125,16 @@ zuno debug permissions [OPTIONS]
 
 | Option | Description | Default |
 | --- | --- | --- |
+| `--agent <AGENT>` | Agent whose resolved rules should be shown | Saved/configured Agent |
+| `--session <ID>` | Read an existing session's Agent and workspace without database writes | |
+| `--permission <PERMISSION>` | Permission to explain; requires `--resource` | |
+| `--resource <RESOURCE>` | Resource to match; requires `--permission` | |
 | `-v`, `--version` | Show the Zuno package version | |
 | `--print-logs` | Print logs to stderr in addition to the structured local log store | |
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | `auto` |
+| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | platform-dependent |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 ### zuno debug skill
@@ -146,7 +150,7 @@ zuno debug skill [OPTIONS]
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | `auto` |
+| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | platform-dependent |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 ### zuno debug sandbox
@@ -157,21 +161,34 @@ zuno debug sandbox [OPTIONS]
 
 | Option | Description | Default |
 | --- | --- | --- |
-| `--mode <MODE>` | Sandbox policy to probe; restricted mode verifies bubblewrap deployment. Possible values: `read-only`, `workspace-write`, `danger-full-access` | `workspace-write` |
+| `--mode <MODE>` | Explicit policy probe; conflicts with `--agent`. Values: `read-only`, `workspace-write`, `danger-full-access` | Selected Agent's contract |
+| `--agent <AGENT>` | Resolve this Agent's configured sandbox contract | Configured Agent |
 | `-v`, `--version` | Show the Zuno package version | |
 | `--network <NETWORK>` | Network authority to verify. Defaults to deny for confined modes and allow for danger-full-access. Possible values: `deny`, `allow` | |
 | `--check` | Exit unsuccessfully when the requested policy is not deployable | |
+| `--check-execution` | Exit unsuccessfully when the effective execution backend is unavailable | |
 | `--print-logs` | Print logs to stderr in addition to the structured local log store | |
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Report fallback resolution under this trusted invocation policy. Possible values: `deny`, `run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | Report the resolution under this trusted backend selection; `native` skips confined-backend discovery and reports `trusted_native`. Possible values: `auto`, `native` | `auto` |
+| `--sandbox-backend <BACKEND>` | Report the resolution under this trusted backend selection; `native` skips confined-backend discovery and reports `trusted_native`. Possible values: `auto`, `native` | platform-dependent |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 The report distinguishes requested and effective mode/network authority, names
 the resolution kind, and includes fallback eligibility and a typed reason. The
 `ready` field and `--check` remain strict: fallback eligibility never makes the
 requested confinement deployment pass.
+
+Windows/macOS defaults can therefore report `platform_native`, `executionReady: true`,
+and `ready: false`. Explicit native selection reports `trusted_native`. Neither is
+OS confinement. Permissions diagnostics resolve current configuration (including Agent
+and dynamic path rules), not historical live approvals; connected MCP tools are excluded.
+
+```sh
+zuno debug permissions --agent deep --permission external_directory --resource 'C:/logs/*'
+zuno debug sandbox --agent deep --check-execution
+zuno debug sandbox --mode read-only --sandbox-backend auto --check
+```
 
 ### zuno debug rg
 
@@ -192,7 +209,7 @@ zuno debug rg [OPTIONS] <COMMAND>
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | `auto` |
+| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | platform-dependent |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 #### zuno debug rg files
@@ -211,7 +228,7 @@ zuno debug rg files [OPTIONS]
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | `auto` |
+| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | platform-dependent |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 #### zuno debug rg search
@@ -233,7 +250,7 @@ zuno debug rg search [OPTIONS] <PATTERN>
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | `auto` |
+| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | platform-dependent |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 ### zuno debug lsp
@@ -256,7 +273,7 @@ zuno debug lsp [OPTIONS] <COMMAND>
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | `auto` |
+| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | platform-dependent |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 #### zuno debug lsp diagnostics
@@ -276,7 +293,7 @@ zuno debug lsp diagnostics [OPTIONS] <FILE>
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | `auto` |
+| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | platform-dependent |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 #### zuno debug lsp symbols
@@ -296,7 +313,7 @@ zuno debug lsp symbols [OPTIONS] <QUERY>
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | `auto` |
+| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | platform-dependent |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 #### zuno debug lsp document-symbols
@@ -316,7 +333,7 @@ zuno debug lsp document-symbols [OPTIONS] <URI>
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | `auto` |
+| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | platform-dependent |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 ### zuno debug snapshot
@@ -339,7 +356,7 @@ zuno debug snapshot [OPTIONS] <COMMAND>
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | `auto` |
+| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | platform-dependent |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 #### zuno debug snapshot track
@@ -355,7 +372,7 @@ zuno debug snapshot track [OPTIONS]
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | `auto` |
+| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | platform-dependent |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 #### zuno debug snapshot patch
@@ -375,7 +392,7 @@ zuno debug snapshot patch [OPTIONS] <HASH>
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | `auto` |
+| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | platform-dependent |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 #### zuno debug snapshot diff
@@ -395,7 +412,7 @@ zuno debug snapshot diff [OPTIONS] <HASH>
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | `auto` |
+| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | platform-dependent |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 ## Examples

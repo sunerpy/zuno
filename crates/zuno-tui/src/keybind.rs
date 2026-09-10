@@ -47,6 +47,7 @@
 
 use crate::app::{AppEvent, Component, EventResult, TerminalEvent};
 use crate::config::{BindingValue, ResolvedTuiConfig};
+use crate::paste_burst::{NormalizedInput, PasteBurst};
 use crossterm::event::{
     Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers as CrosstermModifiers,
 };
@@ -56,6 +57,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::ops::BitOr;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 
 #[cfg(test)]
 #[path = "keybind_tests.rs"]
@@ -1134,6 +1136,21 @@ pub struct KeyDispatcher {
     keymap: Keymap,
     scopes: Vec<String>,
     inner: Box<dyn ActionComponent>,
+    paste: Option<PasteHandling>,
+}
+
+struct PasteHandling {
+    burst: PasteBurst,
+    wake: mpsc::Sender<TerminalEvent>,
+    timer: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for PasteHandling {
+    fn drop(&mut self) {
+        if let Some(timer) = self.timer.take() {
+            timer.abort();
+        }
+    }
 }
 
 impl KeyDispatcher {
@@ -1144,7 +1161,126 @@ impl KeyDispatcher {
             keymap,
             scopes,
             inner,
+            paste: None,
         }
+    }
+
+    /// Enable the legacy-key paste fallback on a real terminal composition.
+    #[must_use]
+    pub fn with_paste_burst(mut self, wake: mpsc::Sender<TerminalEvent>) -> Self {
+        self.paste = Some(PasteHandling {
+            burst: PasteBurst::new(cfg!(windows)),
+            wake,
+            timer: None,
+        });
+        self
+    }
+
+    fn dispatch_normalized(&mut self, input: NormalizedInput, now: Instant) -> EventResult {
+        match input {
+            NormalizedInput::Paste(text) => {
+                self.inner
+                    .handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+                        CrosstermEvent::Paste(text),
+                    )))
+            }
+            NormalizedInput::Key(key) => {
+                let result = self.dispatch_key(&key, now);
+                if result.handled {
+                    result
+                } else {
+                    result.merge(self.inner.handle_event(&AppEvent::Terminal(
+                        TerminalEvent::Input(CrosstermEvent::Key(key)),
+                    )))
+                }
+            }
+        }
+    }
+
+    pub(crate) fn handle_event_at(&mut self, event: &AppEvent, now: Instant) -> EventResult {
+        let mut accumulated = EventResult::IGNORED;
+        if let Some(mut paste) = self.paste.take() {
+            if matches!(event, AppEvent::Terminal(TerminalEvent::Wake))
+                && let Some(timer) = paste.timer.take()
+            {
+                timer.abort();
+            }
+            let focused = self.inner.focused_scopes();
+            let composer = matches!(
+                focused.first().copied(),
+                Some("input" | "history" | "prompt.autocomplete" | "session.child")
+            );
+            let mut output = paste.burst.flush_due(now);
+            let mut consumed = false;
+            match event {
+                AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Paste(_))) => {
+                    output.extend(paste.burst.flush());
+                    paste.burst.reset();
+                }
+                AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Key(key)))
+                    if composer && self.keymap.pending().is_empty() =>
+                {
+                    let (next, held) = paste.burst.key(*key, now);
+                    output.extend(next);
+                    consumed = held;
+                }
+                AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Key(_))) => {
+                    output.extend(paste.burst.flush());
+                    paste.burst.reset();
+                }
+                _ => {}
+            }
+            // A modal appearing while a first key was held must not turn that key
+            // into an approval or submit action in the new focus.
+            if !composer && !output.is_empty() {
+                let mut text = String::new();
+                for input in output.drain(..) {
+                    match input {
+                        NormalizedInput::Paste(paste) => text.push_str(&paste),
+                        NormalizedInput::Key(key) => match key.code {
+                            KeyCode::Char(ch) => text.push(ch),
+                            KeyCode::Enter => text.push('\n'),
+                            KeyCode::Tab => text.push('\t'),
+                            _ => {}
+                        },
+                    }
+                }
+                if !text.is_empty() {
+                    output.push(NormalizedInput::Paste(text));
+                }
+            }
+            for input in output {
+                accumulated = accumulated.merge(self.dispatch_normalized(input, now));
+            }
+            if let Some(deadline) = paste.burst.deadline()
+                && paste.timer.is_none()
+                && let Ok(runtime) = tokio::runtime::Handle::try_current()
+            {
+                let wake = paste.wake.clone();
+                let delay = deadline.saturating_duration_since(now);
+                paste.timer = Some(runtime.spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let _ = wake.send(TerminalEvent::Wake).await;
+                }));
+            }
+            self.paste = Some(paste);
+            if consumed {
+                return accumulated.merge(EventResult {
+                    handled: true,
+                    redraw: false,
+                });
+            }
+        }
+        if let AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Key(key))) = event
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        {
+            let result = self.dispatch_key(key, now);
+            accumulated = accumulated.merge(result);
+            if result.handled {
+                return accumulated;
+            }
+        }
+        accumulated.merge(self.inner.handle_event(event))
     }
 
     /// Replace the active scope chain when focus moves.
@@ -1200,20 +1336,16 @@ impl KeyDispatcher {
 }
 
 impl Component for KeyDispatcher {
+    fn alternate_scroll(&self) -> bool {
+        self.inner.focused_scopes().first() == Some(&"messages")
+    }
+
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
         self.inner.render(frame, area);
     }
 
     fn handle_event(&mut self, event: &AppEvent) -> EventResult {
-        if let AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Key(key))) = event
-            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-        {
-            let result = self.dispatch_key(key, Instant::now());
-            if result.handled {
-                return result;
-            }
-        }
-        self.inner.handle_event(event)
+        self.handle_event_at(event, tokio::time::Instant::now().into_std())
     }
 }
 
@@ -2719,7 +2851,7 @@ pub const LOCAL_DEFINITIONS: &[Definition] = &[
     Definition {
         name: "input_force_submit",
         scope: "input",
-        keys: "ctrl+return",
+        keys: "<leader>return,ctrl+return",
         command: "input.force_submit",
         prevent_default: None,
         description: "Steer the active turn immediately",

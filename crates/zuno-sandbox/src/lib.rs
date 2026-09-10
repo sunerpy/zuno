@@ -128,6 +128,15 @@ pub struct SandboxBackendRequest {
     pub on_unavailable: SandboxUnavailableAction,
     /// Explicit backend selection.
     pub backend: SandboxBackendSelection,
+    pub source: SandboxBackendSource,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxBackendSource {
+    #[default]
+    Explicit,
+    PlatformDefault,
 }
 
 impl SandboxBackendRequest {
@@ -140,6 +149,7 @@ impl SandboxBackendRequest {
         Self {
             on_unavailable,
             backend,
+            source: SandboxBackendSource::Explicit,
         }
     }
 
@@ -147,6 +157,15 @@ impl SandboxBackendRequest {
     #[must_use]
     pub const fn auto(on_unavailable: SandboxUnavailableAction) -> Self {
         Self::new(on_unavailable, SandboxBackendSelection::Auto)
+    }
+
+    #[must_use]
+    pub const fn platform_native() -> Self {
+        Self {
+            on_unavailable: SandboxUnavailableAction::Deny,
+            backend: SandboxBackendSelection::Native,
+            source: SandboxBackendSource::PlatformDefault,
+        }
     }
 }
 
@@ -165,6 +184,8 @@ pub enum SandboxResolutionKind {
     /// No discovery ran and nothing fell back: the requested authority is recorded
     /// but not OS-enforced, and the configured permission mode is kept.
     TrustedNative,
+    /// Native execution is the host platform default, not an explicit selection or fallback.
+    PlatformNative,
     /// A pre-v3 durable authority record without explicit resolution metadata.
     #[default]
     Legacy,
@@ -179,6 +200,7 @@ impl SandboxResolutionKind {
             Self::ExplicitNative => "explicit_native",
             Self::UnavailableFallback => "unavailable_fallback",
             Self::TrustedNative => "trusted_native",
+            Self::PlatformNative => "platform_native",
             Self::Legacy => "legacy",
         }
     }
@@ -548,12 +570,17 @@ pub struct SandboxDeploymentReport {
     pub on_unavailable: SandboxUnavailableAction,
     /// The trusted backend selection the report was probed under.
     pub backend_selection: SandboxBackendSelection,
+    #[serde(default)]
+    pub backend_source: SandboxBackendSource,
     pub effective_mode: Option<SandboxMode>,
     pub effective_network: Option<NetworkAccess>,
     pub resolution_kind: Option<SandboxResolutionKind>,
     pub fallback_eligible: bool,
     pub fallback_reason: Option<SandboxUnavailableCause>,
     pub ready: bool,
+    /// Whether the resolved execution backend is usable, independent of confinement.
+    #[serde(default)]
+    pub execution_ready: bool,
     pub native_execution_bypass: bool,
     pub capabilities: Option<SandboxCapabilities>,
     pub launcher: Option<SandboxExecutableIdentity>,
@@ -600,6 +627,7 @@ impl SandboxCapabilities {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutionAuthority {
+    #[serde(deserialize_with = "deserialize_authority_version")]
     pub schema_version: u32,
     pub backend: String,
     pub backend_executable: Option<PathBuf>,
@@ -627,6 +655,21 @@ pub struct ExecutionAuthority {
     pub environment_keys: Vec<String>,
     pub approval_mode: String,
     pub reviewer_policy_sha256: String,
+}
+
+pub const EXECUTION_AUTHORITY_VERSION: u32 = 4;
+
+fn deserialize_authority_version<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u32, D::Error> {
+    let version = u32::deserialize(deserializer)?;
+    if (2..=EXECUTION_AUTHORITY_VERSION).contains(&version) {
+        Ok(version)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "unsupported execution authority version {version}"
+        )))
+    }
 }
 
 impl ExecutionAuthority {
@@ -682,7 +725,7 @@ impl PreparedCommand {
         environment_keys.sort();
         environment_keys.dedup();
         let authority = ExecutionAuthority {
-            schema_version: 3,
+            schema_version: EXECUTION_AUTHORITY_VERSION,
             backend: backend.backend.clone(),
             backend_executable: backend.executable.clone(),
             workspace: request.policy.workspace.clone(),
@@ -835,6 +878,13 @@ impl SandboxResolution {
     /// is already native and keeps [`SandboxResolutionKind::ExplicitNative`]; it is
     /// refused here so the two kinds cannot be confused in a record.
     pub fn trusted_native(requested_policy: SandboxPolicy) -> Result<Self, SandboxError> {
+        Self::native_selection(requested_policy, SandboxBackendSource::Explicit)
+    }
+
+    fn native_selection(
+        requested_policy: SandboxPolicy,
+        source: SandboxBackendSource,
+    ) -> Result<Self, SandboxError> {
         if requested_policy.mode() == SandboxMode::DangerFullAccess {
             return Err(SandboxError::InvalidPolicy(
                 "danger-full-access is already an explicit native request and does not resolve \
@@ -842,7 +892,10 @@ impl SandboxResolution {
                     .to_owned(),
             ));
         }
-        let execution_policy = requested_policy.clone().into_trusted_native();
+        let mut execution_policy = requested_policy.clone().into_trusted_native();
+        if source == SandboxBackendSource::PlatformDefault {
+            execution_policy.resolution_kind = SandboxResolutionKind::PlatformNative;
+        }
         let backend: Arc<dyn SandboxBackend> =
             Arc::new(DangerFullAccessSandbox::new(requested_policy.workspace())?);
         Self::with_verified_backend(backend, requested_policy, execution_policy)
@@ -931,7 +984,7 @@ fn resolve_policy_with(
         return SandboxResolution::with_verified_backend(backend, policy.clone(), policy);
     }
     if request.backend == SandboxBackendSelection::Native {
-        return SandboxResolution::trusted_native(policy);
+        return SandboxResolution::native_selection(policy, request.source);
     }
 
     let resolution = discover(&policy).and_then(|backend| {
@@ -1144,12 +1197,14 @@ pub fn deployment_report_with_request(
         requested_network: network,
         on_unavailable: request.on_unavailable,
         backend_selection: request.backend,
+        backend_source: request.source,
         effective_mode: None,
         effective_network: None,
         resolution_kind: None,
         fallback_eligible: false,
         fallback_reason: None,
         ready: false,
+        execution_ready: false,
         native_execution_bypass: false,
         capabilities: None,
         launcher: None,
@@ -1264,6 +1319,7 @@ pub fn deployment_report_with_request(
                     )
                 });
             report.ready = true;
+            report.execution_ready = true;
             report.effective_mode = Some(mode);
             report.effective_network = Some(network);
             report.resolution_kind = Some(if mode == SandboxMode::DangerFullAccess {
@@ -1291,10 +1347,14 @@ pub fn deployment_report_with_request(
 /// never consulted. `ready` stays false and `error` names the reason, because the
 /// requested confinement is exactly what will not be deployed.
 fn record_trusted_native_selection(report: &mut SandboxDeploymentReport, policy: &SandboxPolicy) {
+    let selection = if report.backend_source == SandboxBackendSource::PlatformDefault {
+        "the host platform default"
+    } else {
+        "sandbox.backend: native"
+    };
     report.checks.push(SandboxDeploymentCheck::skipped(
         "launcher_trust",
-        "sandbox.backend: native selects the native backend explicitly; no confinement \
-         launcher is probed",
+        format!("{selection} selects native execution; no confinement launcher is probed"),
     ));
     match DangerFullAccessSandbox::new(policy.workspace()) {
         Ok(backend) => {
@@ -1302,7 +1362,7 @@ fn record_trusted_native_selection(report: &mut SandboxDeploymentReport, policy:
             report.checks.push(SandboxDeploymentCheck::skipped(
                 "backend_discovery",
                 format!(
-                    "sandbox.backend: native bypasses discovery of the confined backend and \
+                    "{selection} bypasses discovery of the confined backend and \
                      selects `{}`",
                     backend.capabilities().backend
                 ),
@@ -1323,11 +1383,18 @@ fn record_trusted_native_selection(report: &mut SandboxDeploymentReport, policy:
     ));
     report.effective_mode = Some(SandboxMode::DangerFullAccess);
     report.effective_network = Some(NetworkAccess::Allowed);
-    report.resolution_kind = Some(SandboxResolutionKind::TrustedNative);
+    report.resolution_kind = Some(
+        if report.backend_source == SandboxBackendSource::PlatformDefault {
+            SandboxResolutionKind::PlatformNative
+        } else {
+            SandboxResolutionKind::TrustedNative
+        },
+    );
+    report.execution_ready = true;
     report.native_execution_bypass = true;
     report.fallback_eligible = false;
     report.error = Some(format!(
-        "sandbox.backend: native runs the requested `{}` authority on the native backend; the \
+        "{selection} runs the requested `{}` authority on the native backend; the \
          requested confinement is recorded but not deployed, and it is not confinement",
         policy.mode().as_str()
     ));
@@ -1342,6 +1409,7 @@ fn record_deployment_failure(report: &mut SandboxDeploymentReport, error: &Sandb
     report.fallback_eligible = report.on_unavailable == SandboxUnavailableAction::RunUnconfined
         && report.requested_mode == SandboxMode::WorkspaceWrite;
     if report.fallback_eligible {
+        report.execution_ready = true;
         report.effective_mode = Some(SandboxMode::DangerFullAccess);
         report.effective_network = Some(NetworkAccess::Allowed);
         report.resolution_kind = Some(SandboxResolutionKind::UnavailableFallback);
@@ -1612,7 +1680,10 @@ mod tests {
         assert_eq!(prepared.authority().environment_keys, ["SECRET_TOKEN"]);
         assert!(!encoded.contains("do-not-persist"));
         assert_eq!(prepared.authority().command_sha256.len(), 64);
-        assert_eq!(prepared.authority().schema_version, 3);
+        assert_eq!(
+            prepared.authority().schema_version,
+            EXECUTION_AUTHORITY_VERSION
+        );
         assert_eq!(
             prepared.authority().requested_mode(),
             SandboxMode::WorkspaceWrite
@@ -1669,6 +1740,61 @@ mod tests {
         assert_eq!(legacy.requested_network(), legacy.network);
         assert_eq!(legacy.resolution_kind, SandboxResolutionKind::Legacy);
         assert!(legacy.fallback_reason.is_none());
+    }
+
+    #[test]
+    fn platform_native_is_distinct_from_explicit_choice_and_preserves_approval() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        for mode in [SandboxMode::ReadOnly, SandboxMode::WorkspaceWrite] {
+            let policy = SandboxPolicy::new(workspace.path(), mode, NetworkAccess::Denied)
+                .expect("policy")
+                .with_approval_context("strict", "rules-digest");
+            let resolved =
+                resolve_policy_with(policy, SandboxBackendRequest::platform_native(), |_| {
+                    panic!("a platform native default must not discover a confined backend")
+                })
+                .expect("native default");
+            assert_eq!(resolved.kind(), SandboxResolutionKind::PlatformNative);
+            assert_eq!(resolved.requested_policy().mode(), mode);
+            assert_eq!(
+                resolved.execution_policy().mode(),
+                SandboxMode::DangerFullAccess
+            );
+            assert_eq!(resolved.execution_policy().approval_mode(), "strict");
+            let prepared = resolved
+                .backend()
+                .prepare(PrepareRequest {
+                    policy: resolved.execution_policy().clone(),
+                    program: OsString::from("echo"),
+                    arguments: vec![OsString::from("native")],
+                    cwd: workspace.path().to_path_buf(),
+                    environment: BTreeMap::new(),
+                })
+                .expect("prepare");
+            let value = serde_json::to_value(prepared.authority()).expect("serialize");
+            assert_eq!(value["schemaVersion"], EXECUTION_AUTHORITY_VERSION);
+            assert_eq!(value["resolutionKind"], "platform_native");
+            assert!(serde_json::from_value::<ExecutionAuthority>(value.clone()).is_ok());
+            let mut future = value;
+            future["schemaVersion"] = serde_json::json!(EXECUTION_AUTHORITY_VERSION + 1);
+            assert!(serde_json::from_value::<ExecutionAuthority>(future).is_err());
+        }
+        let report = deployment_report_with_request(
+            workspace.path(),
+            SandboxMode::ReadOnly,
+            NetworkAccess::Denied,
+            SandboxBackendRequest::platform_native(),
+        );
+        assert!(report.execution_ready);
+        assert!(
+            !report.ready,
+            "native execution must not claim OS read-only enforcement"
+        );
+        assert_eq!(
+            report.resolution_kind,
+            Some(SandboxResolutionKind::PlatformNative)
+        );
+        assert!(report.fallback_reason.is_none());
     }
 
     #[test]
@@ -1991,12 +2117,14 @@ mod tests {
             requested_network: NetworkAccess::Denied,
             on_unavailable: SandboxUnavailableAction::RunUnconfined,
             backend_selection: SandboxBackendSelection::Auto,
+            backend_source: SandboxBackendSource::Explicit,
             effective_mode: None,
             effective_network: None,
             resolution_kind: None,
             fallback_eligible: false,
             fallback_reason: None,
             ready: false,
+            execution_ready: false,
             native_execution_bypass: false,
             capabilities: None,
             launcher: None,

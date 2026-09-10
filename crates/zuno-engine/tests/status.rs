@@ -326,6 +326,7 @@ fn status_soft_interrupt_injects_at_safe_point_without_cancelling() {
     let control = registry.control(SESSION_ID);
     let turn = registry.begin_turn(SESSION_ID).expect("active turn");
     let message = SoftInterruptMessage {
+        revision: None,
         input_id: None,
         content: "Please include the latest benchmark.".to_owned(),
         images: vec![("image/png".to_owned(), "aW1hZ2U=".to_owned())],
@@ -376,6 +377,7 @@ fn status_expected_turn_steering_never_crosses_a_turn_handoff() {
         Some("turn_current")
     );
     let message = SoftInterruptMessage {
+        revision: None,
         input_id: Some("msg_exact".to_owned()),
         content: "exact turn only".to_owned(),
         images: Vec::new(),
@@ -417,6 +419,7 @@ fn status_expected_turn_steering_never_crosses_a_turn_handoff() {
                 SESSION_ID,
                 "turn_current",
                 SoftInterruptMessage {
+                    revision: None,
                     input_id: None,
                     content: "late".to_owned(),
                     images: Vec::new(),
@@ -438,6 +441,7 @@ fn status_cancel_soft_interrupt_removes_only_the_named_durable_input() {
     for (id, content) in [("msg_drop", "drop"), ("msg_keep", "keep")] {
         control
             .queue_soft_interrupt(SoftInterruptMessage {
+                revision: None,
                 input_id: Some(id.to_owned()),
                 content: content.to_owned(),
                 images: Vec::new(),
@@ -471,6 +475,7 @@ fn status_urgent_soft_interrupt_skips_remaining_tools_in_event_sequence() {
     emit_tool_events(&mut emitted, "call-1", "first");
     control
         .queue_soft_interrupt(SoftInterruptMessage {
+            revision: None,
             input_id: None,
             content: "Stop the remaining tools and use this correction.".to_owned(),
             images: Vec::new(),

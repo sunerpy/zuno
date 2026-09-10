@@ -465,7 +465,8 @@ fn sandbox_docs_pin_the_trusted_unavailable_fallback_contract() {
             "沙箱模式与后端不可用策略",
             "ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined",
             "fallbackReason",
-            "| `backend` | `auto`、`native` | `auto` |",
+            "| `backend` | `auto`、`native` |",
+            "platform_native",
             "\"backend\": \"native\"",
             "ZUNO_SANDBOX_BACKEND=native",
             "`trusted_native`",
@@ -688,7 +689,7 @@ fn unsupported_platform_docs_pin_the_refusal_the_prompt_and_its_process_scope() 
     for (relative, read_only, accepts) in [
         (
             "docs/guide/permissions.md",
-            "a read-only Agent's included",
+            "a read-only Agent's request",
             "exactly as\n`--sandbox-backend native` does",
         ),
         (
@@ -708,7 +709,7 @@ fn unsupported_platform_docs_pin_the_refusal_the_prompt_and_its_process_scope() 
         ),
         (
             "docs/zh/config/reference.md",
-            "只读请求\n也包括在内",
+            "只读请求也包括在内",
             "`--sandbox-backend native` 完全一致",
         ),
         (
@@ -2736,27 +2737,60 @@ fn clipboard_docs_name_the_ladder_and_the_stdin_contract() {
     contains_all(
         "docs/guide/tui.md",
         &[
-            "Copy prefers OSC 52",
+            "Local Windows prefers a native clipboard write",
+            "Remote SSH terminals prefer OSC 52",
             "`pbcopy` on macOS",
             "`wl-copy`, `xclip`, or `xsel` on Linux",
             "`Set-Clipboard` through PowerShell on Windows",
-            "reports that no clipboard is\navailable instead of appearing to copy",
+            "only after the helper completes",
+            "`pwsh.exe`",
             "never as a script to run",
         ],
     );
     contains_all(
         "docs/zh/guide/tui.md",
         &[
-            "复制优先使用 OSC 52",
+            "Windows 本地优先使用原生剪贴板",
+            "SSH 远端优先使用 OSC 52",
             "macOS 上是 `pbcopy`",
             "Linux 上是 `wl-copy`、`xclip` 或 `xsel`",
             "Windows 上是通过 PowerShell 的 `Set-Clipboard`",
-            "报告没有可用剪贴板",
+            "不会伪装成复制成功",
             "绝不当作要执行的脚本",
         ],
     );
 }
 
+#[test]
+fn native_defaults_and_mcp_exposure_are_documented_in_both_languages() {
+    for page in ["docs/guide/permissions.md", "docs/zh/guide/permissions.md"] {
+        contains_all(
+            page,
+            &[
+                "platform_native",
+                "--check-execution",
+                "protectedPaths",
+                "writableRoots",
+            ],
+        );
+    }
+    for page in ["docs/guide/mcp.md", "docs/zh/guide/mcp.md"] {
+        contains_all(
+            page,
+            &[
+                "mcp_tool_exposure",
+                "auto_tool_limit",
+                "auto_schema_bytes",
+                "small_server_tool_limit",
+                "aws-knowledge-mcp-server",
+                "eager",
+                "deferred",
+                "tool_search",
+                "schemaExposure",
+            ],
+        );
+    }
+}
 /// A remote `index.json` is untrusted input, and its entry `name` decides a directory that
 /// a versioned refresh renames aside and then deletes. The single-segment rule is what keeps
 /// that directory inside the download cache instead of anywhere the index chooses, so both

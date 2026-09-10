@@ -2810,6 +2810,12 @@ fn debug_agent_evaluates_live_mcp_tools_and_exact_parent_schema_authority() {
         }],
         connected_servers: vec!["codegraph".to_owned()],
         tools: vec![tool],
+        schema_metadata: vec![crate::cmd::mcp_exposure::McpSchemaMetadata {
+            id: "known_mcp_tool".to_owned(),
+            server: Some("codegraph".to_owned()),
+            schema_bytes: 300,
+        }],
+        eager_tool_ids: Vec::new(),
         warnings: Vec::new(),
         cleanup_warnings: Vec::new(),
     };
@@ -2852,6 +2858,8 @@ fn debug_agent_live_root_mcp_does_not_claim_parent_attempt_authority() {
         }],
         connected_servers: vec!["codegraph".to_owned()],
         tools: Vec::new(),
+        schema_metadata: Vec::new(),
+        eager_tool_ids: Vec::new(),
         warnings: Vec::new(),
         cleanup_warnings: Vec::new(),
     };
@@ -2866,8 +2874,8 @@ fn debug_agent_live_root_mcp_does_not_claim_parent_attempt_authority() {
 }
 
 #[test]
-fn debug_agent_reports_progressive_root_mcp_schema_exposure() {
-    let plan = plan("/tmp", SessionChoice::New);
+fn debug_agent_reports_the_same_auto_and_explicit_mcp_exposure_policy_as_runtime() {
+    let mut plan = plan("/tmp", SessionChoice::New);
     let diagnostics = crate::cmd::mcp_runtime::McpRuntimeDiagnostics {
         discovery_status: "ready".to_owned(),
         servers: vec![crate::cmd::mcp_runtime::McpServerDiagnostic {
@@ -2884,12 +2892,29 @@ fn debug_agent_reports_progressive_root_mcp_schema_exposure() {
             replay_schema_sha256: None,
             ui_intent: "generic".to_owned(),
         }],
+        schema_metadata: vec![crate::cmd::mcp_exposure::McpSchemaMetadata {
+            id: "codegraph_query".to_owned(),
+            server: Some("codegraph".to_owned()),
+            schema_bytes: 300,
+        }],
+        eager_tool_ids: Vec::new(),
         warnings: Vec::new(),
         cleanup_warnings: Vec::new(),
     };
 
     let snapshot = plan.debug_agent_snapshot_with_mcp(Some(&diagnostics));
 
+    assert_eq!(snapshot["mcp"]["schemaExposure"]["mode"], "eager");
+    assert_eq!(
+        snapshot["mcp"]["schemaExposure"]["eagerTools"],
+        serde_json::json!(["codegraph_query"])
+    );
+    assert!(snapshot["mcp"]["schemaExposure"]["discoveryTool"].is_null());
+    plan.config.mcp_tool_exposure = Some(zuno_config::schema::mcp::McpToolExposureConfig {
+        mode: zuno_config::schema::mcp::McpToolExposureMode::Deferred,
+        ..Default::default()
+    });
+    let snapshot = plan.debug_agent_snapshot_with_mcp(Some(&diagnostics));
     assert_eq!(snapshot["mcp"]["schemaExposure"]["mode"], "progressive");
     assert_eq!(
         snapshot["mcp"]["schemaExposure"]["discoveryTool"],
@@ -7148,7 +7173,10 @@ async fn unavailable_fallback_is_visible_and_keeps_managed_shell_guards_and_auth
         panic!("background command did not settle within the test deadline");
     }
     let settled = settled.info;
-    assert_eq!(settled.authority.schema_version, 3);
+    assert_eq!(
+        settled.authority.schema_version,
+        zuno_sandbox::EXECUTION_AUTHORITY_VERSION
+    );
     assert_eq!(settled.authority.approval_mode, "strict");
     assert_eq!(
         settled.authority.requested_mode(),
@@ -7173,21 +7201,25 @@ fn read_only_agent_refuses_unavailable_fallback_even_when_trusted_config_allows_
     .expect("trusted fallback config");
     let rules = vec![
         zuno_permission::Rule {
+            source: None,
             permission: "*".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Allow,
         },
         zuno_permission::Rule {
+            source: None,
             permission: "apply_patch".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Deny,
         },
         zuno_permission::Rule {
+            source: None,
             permission: "write".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Deny,
         },
         zuno_permission::Rule {
+            source: None,
             permission: "edit".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Deny,
@@ -7298,21 +7330,25 @@ async fn a_read_only_agent_contract_narrows_a_full_access_invocation() {
     .expect("full-access config");
     let rules = vec![
         zuno_permission::Rule {
+            source: None,
             permission: "*".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Allow,
         },
         zuno_permission::Rule {
+            source: None,
             permission: "apply_patch".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Deny,
         },
         zuno_permission::Rule {
+            source: None,
             permission: "write".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Deny,
         },
         zuno_permission::Rule {
+            source: None,
             permission: "edit".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Deny,
@@ -7488,11 +7524,13 @@ fn production_registry_uses_the_frozen_profile_rules() {
         agent("build"),
         vec![
             zuno_permission::Rule {
+                source: None,
                 permission: "*".to_owned(),
                 pattern: "*".to_owned(),
                 action: zuno_config::schema::permission::PermissionAction::Allow,
             },
             zuno_permission::Rule {
+                source: None,
                 permission: "read".to_owned(),
                 pattern: "*".to_owned(),
                 action: zuno_config::schema::permission::PermissionAction::Deny,
@@ -9328,12 +9366,18 @@ mod production_registry {
     }
 
     #[test]
-    fn root_turns_defer_unpinned_mcp_schemas_behind_tool_search() {
+    fn root_turns_can_explicitly_defer_unpinned_mcp_schemas_behind_tool_search() {
         let tool = dynamic_tool("query the indexed code graph");
         let fixture = try_assemble_for_agent_runtime(
             "orchestrator",
             zuno_catalog::skill::Skills::default(),
-            zuno_config::schema::Config::default(),
+            zuno_config::schema::Config {
+                mcp_tool_exposure: Some(zuno_config::schema::mcp::McpToolExposureConfig {
+                    mode: zuno_config::schema::mcp::McpToolExposureMode::Deferred,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             Some(Arc::new(FixedMcpLoader(vec![tool]))),
             None,
         )
@@ -9341,6 +9385,30 @@ mod production_registry {
 
         assert!(fixture.ids.iter().any(|id| id == DYNAMIC_TOOL_ID));
         assert_eq!(fixture.deferred_ids, [DYNAMIC_TOOL_ID]);
+    }
+
+    #[test]
+    fn small_mcp_catalogs_are_visible_in_the_first_request_for_working_roots() {
+        for agent in ["orchestrator", "deep"] {
+            let fixture = try_assemble_for_agent_runtime(
+                agent,
+                zuno_catalog::skill::Skills::default(),
+                zuno_config::schema::Config::default(),
+                Some(Arc::new(FixedMcpLoader(vec![dynamic_tool(
+                    "search official AWS documentation",
+                )]))),
+                None,
+            )
+            .expect("root registry");
+            assert!(
+                fixture.ids.iter().any(|id| id == DYNAMIC_TOOL_ID),
+                "{agent}"
+            );
+            assert!(
+                fixture.deferred_ids.is_empty(),
+                "{agent} should not need a search to load one MCP tool"
+            );
+        }
     }
 
     #[test]
@@ -12781,6 +12849,7 @@ fn read_only_shell_profile() -> zuno_agent::profile::AgentProfile {
     use zuno_config::schema::permission::PermissionAction;
 
     let rules = std::iter::once(zuno_permission::Rule {
+        source: None,
         permission: "*".to_owned(),
         pattern: "*".to_owned(),
         action: PermissionAction::Allow,
@@ -12789,6 +12858,7 @@ fn read_only_shell_profile() -> zuno_agent::profile::AgentProfile {
         ["apply_patch", "write", "edit"]
             .into_iter()
             .map(|permission| zuno_permission::Rule {
+                source: None,
                 permission: permission.to_owned(),
                 pattern: "*".to_owned(),
                 action: PermissionAction::Deny,
@@ -13134,22 +13204,27 @@ fn unsupported_platform_decision_covers_every_branch() {
         ConfiguredNativeChoices {
             on_unavailable: Some(Configured::Deny),
             backend: None,
+            requires_confinement: false,
         },
         ConfiguredNativeChoices {
             on_unavailable: Some(Configured::RunUnconfined),
             backend: None,
+            requires_confinement: false,
         },
         ConfiguredNativeChoices {
             on_unavailable: None,
             backend: Some(Backend::Auto),
+            requires_confinement: false,
         },
         ConfiguredNativeChoices {
             on_unavailable: None,
             backend: Some(Backend::Native),
+            requires_confinement: false,
         },
         ConfiguredNativeChoices {
             on_unavailable: Some(Configured::Deny),
             backend: Some(Backend::Auto),
+            requires_confinement: false,
         },
     ];
     let write = SandboxUnavailableRefusal {

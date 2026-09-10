@@ -24,13 +24,13 @@ from running.
 | Platform | Confined `read-only` / `workspace-write` | Native execution |
 | --- | --- | --- |
 | Linux | Requires trusted bubblewrap 0.8.0 or newer | Explicit `danger-full-access`, trusted `sandbox.backend: native` for every Agent, or eligible trusted `workspace-write` fallback with `run-unconfined` |
-| macOS | Not implemented | Explicit `danger-full-access`, trusted `sandbox.backend: native` for every Agent, or eligible trusted `workspace-write` fallback with `run-unconfined` |
-| Windows | Not implemented | Explicit `danger-full-access`, trusted `sandbox.backend: native` for every Agent, or eligible trusted `workspace-write` fallback with `run-unconfined` |
+| macOS | Not implemented | Defaults to native without explicit confinement constraints; explicit native/full-access and eligible trusted fallback remain available |
+| Windows | Not implemented | Defaults to native without explicit confinement constraints; explicit native/full-access and eligible trusted fallback remain available |
 
 `run-unconfined` is not a general “ignore the sandbox” switch. It applies only when a
 write-capable `workspace-write` request encounters a typed, eligible backend-availability
-failure. `read-only` never falls back and continues to fail closed; the one native route
-for a read-only Agent is the explicit trusted `sandbox.backend: native` selection
+failure. `read-only` never falls back through this path; it can use a platform-native
+default or the explicit trusted `sandbox.backend: native` selection
 (`--sandbox-backend native`), which keeps the permission mode and records the contract as
 unenforced. See [Permissions and sandboxing](/guide/permissions).
 

@@ -17,7 +17,7 @@ use zuno_llm::cache::McpToolStatus;
 use zuno_observability::span;
 use zuno_observability::tool::ToolLifecycle;
 use zuno_permission::visibility::{is_tool_visible, permission_key};
-use zuno_permission::{PermissionAction, Rule, evaluate};
+use zuno_permission::{PermissionAction, Rule, decide};
 use zuno_tool::{
     ACCEPT_LARGE_OUTPUT_KEY, INTENT_KEY, METADATA_MUTATION_CONFLICT_KEY,
     MutationConflictPresentation, PermissionAsk, PermissionAsker, PermissionOrigin, Tool,
@@ -173,7 +173,11 @@ impl ToolRegistryDispatcher {
     #[must_use]
     pub fn with_deferred_tools(mut self, ids: impl IntoIterator<Item = String>) -> Self {
         let ids = ids.into_iter().collect::<BTreeSet<_>>();
-        if ids.is_empty() || self.tools.iter().any(|tool| tool.id() == TOOL_SEARCH_ID) {
+        if ids.is_empty()
+            || self.tools.iter().any(|tool| tool.id() == TOOL_SEARCH_ID)
+            || !is_tool_visible(TOOL_SEARCH_ID, &self.rules)
+        {
+            // Do not strand authorized tools behind an unreachable discovery gate.
             return self;
         }
         let candidates = self
@@ -182,7 +186,12 @@ impl ToolRegistryDispatcher {
             .filter(|tool| ids.contains(tool.id()) && is_tool_visible(tool.id(), &self.rules))
             .map(|tool| tool.definition())
             .collect();
-        let Some(catalog) = DeferredToolCatalog::new(candidates) else {
+        let sources = self
+            .tools
+            .iter()
+            .filter_map(|tool| tool.source().map(|source| (tool.id().to_owned(), source)))
+            .collect();
+        let Some(catalog) = DeferredToolCatalog::new(candidates, sources) else {
             return self;
         };
         self.tools.push(catalog.search_tool());
@@ -566,7 +575,7 @@ struct RulePermissionAsker {
 /// What the configured rules decided about one ask, before anyone is prompted.
 enum RuleOutcome {
     Permitted,
-    Denied,
+    Denied(Box<zuno_permission::Denial>),
     Pending(Vec<String>),
 }
 
@@ -593,9 +602,16 @@ impl RulePermissionAsker {
             .contains(&ask.permission);
         let mut pending = Vec::new();
         for pattern in &ask.patterns {
-            match evaluate(&ask.permission, pattern, &self.rules) {
+            let decision = decide(&ask.permission, pattern, &self.rules);
+            match decision.action {
                 PermissionAction::Allow => {}
-                PermissionAction::Deny => return RuleOutcome::Denied,
+                PermissionAction::Deny => {
+                    return RuleOutcome::Denied(Box::new(
+                        decision
+                            .denial(&ask.permission, pattern)
+                            .expect("a deny decision always names its matched rule"),
+                    ));
+                }
                 PermissionAction::Ask => {
                     let approved = self
                         .approved_once
@@ -631,9 +647,7 @@ impl RulePermissionAsker {
         normalize_patterns(&mut ask);
         let outcome = self.evaluate_patterns(&ask);
         match outcome {
-            RuleOutcome::Denied => Err(zuno_error::ToolError::Denied {
-                tool: tool.to_owned(),
-            }),
+            RuleOutcome::Denied(denial) => Err(denial.into_tool_error(tool)),
             _ if self.authorization.is_allow_all() => Ok(()),
             _ if self.requires_manual(&ask) => self.prompt_manual(origin, tool, ask).await,
             RuleOutcome::Permitted => Ok(()),
@@ -704,9 +718,7 @@ impl PermissionAsker for RulePermissionAsker {
         normalize_patterns(&mut ask);
         let outcome = self.evaluate_patterns(&ask);
         match outcome {
-            RuleOutcome::Denied => Err(zuno_error::ToolError::Denied {
-                tool: tool.to_owned(),
-            }),
+            RuleOutcome::Denied(denial) => Err(denial.into_tool_error(tool)),
             _ if self.authorization.is_allow_all() => Ok(()),
             _ if self.requires_manual(&ask) => self.prompt_manual(origin, tool, ask).await,
             RuleOutcome::Permitted => Ok(()),

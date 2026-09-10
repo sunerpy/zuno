@@ -98,13 +98,13 @@ confinement even when the invocation selected `workspace-write` or
 `danger-full-access`:
 
 ```sh
-# Shell cannot modify the workspace, whatever sandbox.mode says.
-zuno run --agent plan "audit the retry policy"
+# Require OS read-only confinement; refuse if unavailable.
+zuno run --agent plan --sandbox-backend auto "audit the retry policy"
 ```
 
 That guarantee is OS-enforced only where a confined backend runs. Under a trusted
-`sandbox.backend: native` selection — the one native route a read-only Agent has on
-macOS and Windows — the same `read-only` request is recorded but not OS-enforced, and
+`sandbox.backend: native` selection or the Windows/macOS platform-native default,
+the same `read-only` request is recorded but not OS-enforced, and
 "read-only" is then a role boundary made of the tool allowlist, the permission rules,
 and the Shell risk gate rather than an OS boundary.
 

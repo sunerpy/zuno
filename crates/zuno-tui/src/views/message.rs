@@ -35,7 +35,10 @@
 //! honours it and a test asserts the discard.
 
 use crate::app::{AppEvent, Component, EventResult};
-use crate::views::selection::{TextPoint, TextSelection, slice_columns};
+use crate::views::selection::{
+    CopyRow, TextPoint, TextSelection, copy_projections, covered_columns, semantic_width,
+    slice_columns,
+};
 use crate::views::{ViewContext, display_width, fill, padded, truncate};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -713,6 +716,7 @@ pub struct Transcript {
     streaming: Option<usize>,
     /// Whether the turn is still running, for the fixed live footer.
     running: bool,
+    active_turn_id: Option<String>,
     /// Whether this live turn already emitted its session-owned interruption marker.
     ///
     /// Terminal delivery can be repeated across a client boundary. The marker describes
@@ -835,6 +839,13 @@ impl Transcript {
     #[must_use]
     pub const fn is_running(&self) -> bool {
         self.running
+    }
+
+    #[must_use]
+    pub fn active_turn_id(&self) -> Option<&str> {
+        self.running
+            .then_some(self.active_turn_id.as_deref())
+            .flatten()
     }
 
     /// Mark an accepted submission live before the engine publishes `TurnStarted`.
@@ -1059,12 +1070,42 @@ impl Transcript {
                 ));
                 true
             }
-            TurnEvent::TurnStarted { .. } => {
+            TurnEvent::TurnStarted { turn_id, .. } => {
                 self.mark_running();
+                self.active_turn_id = Some(turn_id.clone());
+                true
+            }
+            TurnEvent::InputConsumed {
+                input_id,
+                text,
+                attachments,
+                source,
+            } => {
+                if *source != zuno_engine::interrupt::SoftInterruptSource::User
+                    || self
+                        .messages
+                        .iter()
+                        .any(|message| message.id.as_deref() == Some(input_id))
+                {
+                    return false;
+                }
+                let mut message = Message::user(text.clone());
+                message.id = Some(input_id.clone());
+                for attachment in attachments {
+                    message.attach(
+                        attachment
+                            .filename
+                            .clone()
+                            .unwrap_or_else(|| "image".to_owned()),
+                        Some(attachment.media_type.clone()),
+                    );
+                }
+                self.messages.push(message);
                 true
             }
             TurnEvent::SessionCommandStarted { .. } => {
                 self.mark_running();
+                self.active_turn_id = None;
                 true
             }
             TurnEvent::SessionCommandOutput { content, .. } => {
@@ -1513,17 +1554,6 @@ struct MessageRows {
     copy: Vec<Option<CopyRow>>,
 }
 
-/// One visual row's semantic clipboard projection.
-///
-/// `text` is a slice of the durable source, not the padded terminal row. Consecutive
-/// rows therefore concatenate back to the exact source: visual wrapping contributes
-/// no newline, while explicit source newlines remain embedded in `text`.
-#[derive(Debug, Clone)]
-struct CopyRow {
-    content_start: u16,
-    text: String,
-}
-
 /// Stable identity of one reasoning part in the append-only transcript.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct ReasoningKey {
@@ -1581,6 +1611,9 @@ pub struct TranscriptView {
     line_tools: Vec<Option<String>>,
     /// Which reasoning header produced each row of the last measured line list.
     line_reasoning: Vec<Option<ReasoningKey>>,
+    /// Copy mapping from the exact layout painted, not a fresh layout at mouse-up.
+    line_copy: Vec<Option<CopyRow>>,
+    rendered_offset: usize,
     /// Where each message was drawn in the frame that **was drawn**.
     ///
     /// Absolute screen rows, recorded by [`Component::render`] from the same slice it paints,
@@ -1621,6 +1654,8 @@ impl TranscriptView {
             line_owners: Vec::new(),
             line_tools: Vec::new(),
             line_reasoning: Vec::new(),
+            line_copy: Vec::new(),
+            rendered_offset: 0,
             hits: Vec::new(),
             tool_hits: Vec::new(),
             reasoning_hits: Vec::new(),
@@ -1808,6 +1843,7 @@ impl TranscriptView {
             anchor: point,
             head: point,
         });
+        self.following = false;
         true
     }
 
@@ -1842,7 +1878,7 @@ impl TranscriptView {
         if area.width == 0 {
             return None;
         }
-        let rows = self.selection_rows(area.width);
+        let rows = &self.line_copy;
         let (start, end) = selection.ordered();
         if start.row >= rows.len() {
             return None;
@@ -1865,15 +1901,14 @@ impl TranscriptView {
                 }
                 continue;
             };
-            let content_width =
-                u16::try_from(semantic_display_width(&copy.text)).unwrap_or(u16::MAX);
+            let content_width = u16::try_from(semantic_width(&copy.text)).unwrap_or(u16::MAX);
             let content_end = copy.content_start.saturating_add(content_width);
             let selected_left = left.max(copy.content_start);
             let selected_right = right.min(content_end);
             let slice = if copy.text == "\n" && left <= copy.content_start {
                 String::from("\n")
             } else if selected_left < selected_right {
-                slice_semantic_columns(
+                slice_columns(
                     &copy.text,
                     selected_left.saturating_sub(copy.content_start),
                     selected_right.saturating_sub(copy.content_start),
@@ -1886,6 +1921,8 @@ impl TranscriptView {
             }
             if boundary && !selected.ends_with('\n') {
                 selected.push('\n');
+            } else if !selected.is_empty() && row > start.row {
+                selected.push_str(&copy.join_before);
             }
             boundary = false;
             selected.push_str(&slice);
@@ -1909,7 +1946,9 @@ impl TranscriptView {
         let column = column.clamp(area.left(), area.right().saturating_sub(1)) - area.left();
         let visible_row = row.clamp(area.top(), area.bottom().saturating_sub(1)) - area.top();
         Some(TextPoint {
-            row: self.offset.saturating_add(usize::from(visible_row)),
+            row: self
+                .rendered_offset
+                .saturating_add(usize::from(visible_row)),
             column,
         })
     }
@@ -2027,20 +2066,6 @@ impl TranscriptView {
         lines
     }
 
-    fn selection_rows(&self, width: u16) -> Vec<Option<CopyRow>> {
-        let mut rows = Vec::new();
-        let mut previous: Option<Role> = None;
-        for (index, message) in self.transcript.messages.iter().enumerate() {
-            let message_rows = self.message_rows(index, message, previous, width);
-            rows.extend(message_rows.copy);
-            previous = Some(message.role);
-        }
-        if previous.is_some() {
-            rows.push(None);
-        }
-        rows
-    }
-
     /// One message's rows: a quiet separator, then each of its parts.
     ///
     /// Factored out of [`Self::lines`] rather than duplicated into the cached path,
@@ -2058,6 +2083,7 @@ impl TranscriptView {
         let mut lines = Vec::new();
         let mut tools = Vec::new();
         let mut reasoning = Vec::new();
+        let mut text_copy = Vec::new();
         let rule = self.rule_style(message.role);
         // The message surface and gutter marker already state the speaker. A single
         // base-background row is enough separation for both a new speaker and another
@@ -2099,6 +2125,42 @@ impl TranscriptView {
                 }
                 continue;
             }
+            if let MessagePart::Text { text } = part
+                && message.role != Role::System
+            {
+                let gutter = RowFrame {
+                    role: message.role,
+                    rule,
+                    width,
+                }
+                .gutter("");
+                let rendered = crate::views::markdown::render_with_copy(
+                    text,
+                    width.saturating_sub(gutter),
+                    &self.context.palette(),
+                );
+                let start = lines.len();
+                for row in rendered.rows {
+                    lines.push(self.ruled_spans(
+                        message.role,
+                        rule,
+                        self.neutral_markdown_row(row),
+                        width,
+                    ));
+                }
+                let copy = rendered
+                    .copy
+                    .into_iter()
+                    .map(|copy| {
+                        copy.map(|mut copy| {
+                            copy.content_start = copy.content_start.saturating_add(gutter);
+                            copy
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                text_copy.push((start, copy));
+                continue;
+            }
             if let MessagePart::Tool { call_id, .. } = part {
                 tools.push((lines.len(), call_id.clone()));
             }
@@ -2118,7 +2180,12 @@ impl TranscriptView {
                 &mut lines,
             );
         }
-        let copy = self.copy_rows(message, previous, width, &lines);
+        let mut copy = self.copy_rows(message, previous, width, &lines);
+        for (start, rows) in text_copy {
+            for (index, row) in rows.into_iter().enumerate() {
+                copy[start + index] = row;
+            }
+        }
         MessageRows {
             lines,
             tools,
@@ -2166,20 +2233,16 @@ impl TranscriptView {
             })
             .collect::<Option<Vec<_>>>()
             .map(|parts| parts.join("\n"));
-        let semantic = source.map_or_else(
-            || rendered.clone(),
-            |source| partition_semantic_source(&source, &rendered),
-        );
-        for ((index, text), rendered) in content_indices.into_iter().zip(semantic).zip(rendered) {
-            let text = if text.is_empty() && rendered.is_empty() {
-                String::from("\n")
-            } else {
-                text
-            };
-            copy[index] = Some(CopyRow {
-                content_start: gutter,
-                text,
-            });
+        let projected = if message.role == Role::System {
+            source.map(|source| copy_projections(&source, &rendered))
+        } else {
+            None
+        };
+        let projected =
+            projected.unwrap_or_else(|| rendered.into_iter().map(CopyRow::visible).collect());
+        for (index, mut row) in content_indices.into_iter().zip(projected) {
+            row.content_start = gutter;
+            copy[index] = Some(row);
         }
         copy
     }
@@ -2350,6 +2413,7 @@ impl TranscriptView {
         self.line_owners.clear();
         self.line_tools.clear();
         self.line_reasoning.clear();
+        self.line_copy.clear();
         let mut previous: Option<Role> = None;
         for index in 0..self.transcript.messages.len() {
             let message = &self.transcript.messages[index];
@@ -2381,6 +2445,7 @@ impl TranscriptView {
                     }
                 }
                 self.line_reasoning.extend(reasoning);
+                self.line_copy.extend(rows.copy.iter().cloned());
                 lines.extend(rows.lines.iter().cloned());
                 continue;
             }
@@ -2402,6 +2467,7 @@ impl TranscriptView {
                 }
             }
             self.line_reasoning.extend(reasoning);
+            self.line_copy.extend(rows.copy.iter().cloned());
             lines.extend(rows.lines.iter().cloned());
             if is_recallable(&self.transcript.messages[index]) {
                 self.cache.put(index, key, Arc::clone(&theme), rows);
@@ -2417,6 +2483,7 @@ impl TranscriptView {
         self.line_owners.resize(lines.len(), None);
         self.line_tools.resize(lines.len(), None);
         self.line_reasoning.resize(lines.len(), None);
+        self.line_copy.resize(lines.len(), None);
         lines
     }
 
@@ -3390,6 +3457,7 @@ impl RowFrame {
 
 impl Component for TranscriptView {
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let previous_selection = self.selected_text();
         fill(frame.buffer_mut(), area, self.context.surface());
         if self
             .area
@@ -3407,6 +3475,10 @@ impl Component for TranscriptView {
         self.tool_hits.clear();
         self.reasoning_hits.clear();
         let lines = self.cached_lines(area.width);
+        if self.selection.is_some() && previous_selection != self.selected_text() {
+            // A changed Markdown layout must not reinterpret old cell coordinates.
+            self.selection = None;
+        }
         self.content_height = lines.len();
         self.viewport_height = usize::from(area.height);
         let max = self.content_height.saturating_sub(self.viewport_height);
@@ -3426,6 +3498,7 @@ impl Component for TranscriptView {
         if self.following || self.offset > max {
             self.offset = max;
         }
+        self.rendered_offset = self.offset;
         // Recorded from the same `skip`/`take` window the rows below are drawn through, so a
         // scrolled transcript's targets move with it and a row below the fold has none. Gated
         // on the mouse setting for the reason the sidebar gates its own: with reporting off no
@@ -3508,6 +3581,18 @@ impl Component for TranscriptView {
                 let Some((left, right)) = selection.columns(content_row, area.width) else {
                     continue;
                 };
+                let Some(Some(copy)) = self.line_copy.get(content_row) else {
+                    continue;
+                };
+                let Some((left, right)) = covered_columns(
+                    &copy.text,
+                    left.saturating_sub(copy.content_start),
+                    right.saturating_sub(copy.content_start),
+                ) else {
+                    continue;
+                };
+                let left = left.saturating_add(copy.content_start).min(area.width);
+                let right = right.saturating_add(copy.content_start).min(area.width);
                 for column in left..right {
                     frame.buffer_mut()[(area.x + column, area.y + visible_row)].set_style(selected);
                 }
@@ -3968,104 +4053,6 @@ pub fn summary(text: &str) -> Option<String> {
                 line.to_owned()
             }
         })
-}
-
-/// Partition durable source across visual content rows without inventing separators.
-///
-/// The widths come from the rendered rows, but the returned chunks are byte-for-byte
-/// slices of `source`. A soft terminal wrap therefore rejoins to the original space,
-/// while a source newline remains a newline. Newlines count as one layout column here
-/// because CommonMark renders an ordinary line ending as a space; they still remain the
-/// original `\n` in the clipboard chunk.
-fn partition_semantic_source(source: &str, rendered: &[String]) -> Vec<String> {
-    if rendered.is_empty() {
-        return Vec::new();
-    }
-    if rendered.len() == 1 {
-        return vec![source.to_owned()];
-    }
-    let mut chunks = Vec::with_capacity(rendered.len());
-    let mut offset = 0usize;
-    for (index, row) in rendered.iter().enumerate() {
-        if index + 1 == rendered.len() {
-            chunks.push(source[offset..].to_owned());
-            break;
-        }
-        let target = display_width(row);
-        let mut used = 0usize;
-        let mut end = offset;
-        for (relative, character) in source[offset..].char_indices() {
-            let cost = if character == '\n' {
-                1
-            } else {
-                unicode_width::UnicodeWidthChar::width(character).unwrap_or(0)
-            };
-            if used >= target && cost > 0 {
-                break;
-            }
-            if used.saturating_add(cost) > target && used > 0 {
-                break;
-            }
-            used = used.saturating_add(cost);
-            end = offset
-                .saturating_add(relative)
-                .saturating_add(character.len_utf8());
-        }
-        if end == offset && offset < source.len() {
-            let character = source[offset..]
-                .chars()
-                .next()
-                .expect("non-empty source tail has a first character");
-            end = offset.saturating_add(character.len_utf8());
-        }
-        chunks.push(source[offset..end].to_owned());
-        offset = end;
-    }
-    chunks.resize(rendered.len(), String::new());
-    chunks
-}
-
-fn semantic_display_width(text: &str) -> usize {
-    text.chars()
-        .map(|character| {
-            if character == '\n' {
-                1
-            } else {
-                unicode_width::UnicodeWidthChar::width(character).unwrap_or(0)
-            }
-        })
-        .sum()
-}
-
-fn slice_semantic_columns(text: &str, left: u16, right: u16) -> String {
-    let left = usize::from(left);
-    let right = usize::from(right);
-    let mut column = 0usize;
-    let mut out = String::new();
-    let mut selected_previous = false;
-    for character in text.chars() {
-        let width = if character == '\n' {
-            1
-        } else {
-            unicode_width::UnicodeWidthChar::width(character).unwrap_or(0)
-        };
-        if width == 0 {
-            if selected_previous {
-                out.push(character);
-            }
-            continue;
-        }
-        let end = column.saturating_add(width);
-        selected_previous = column < right && end > left;
-        if selected_previous {
-            out.push(character);
-        }
-        column = end;
-        if column >= right {
-            break;
-        }
-    }
-    out
 }
 
 /// Break `text` into rows no wider than `width` **columns**, on word boundaries where

@@ -166,9 +166,9 @@ fn the_engine_reports_the_configured_rule_that_refused_the_request() {
     let error = engine
         .authorize(request("shell", "$EDITOR"), &rules)
         .expect_err("the same request is still refused through `authorize`");
-    assert!(matches!(error, zuno_error::ToolError::Denied { ref tool } if tool == "shell"));
+    assert!(matches!(error, zuno_error::ToolError::Denied { ref tool, .. } if tool == "shell"));
     let converted: zuno_error::ToolError = denial.into();
-    assert!(matches!(converted, zuno_error::ToolError::Denied { ref tool } if tool == "shell"));
+    assert!(matches!(converted, zuno_error::ToolError::Denied { ref tool, .. } if tool == "shell"));
 
     assert_eq!(
         engine

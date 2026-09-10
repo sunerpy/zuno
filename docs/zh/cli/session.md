@@ -22,7 +22,7 @@ zuno session [OPTIONS] <COMMAND>
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | 随平台解析 |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 ## 子命令
@@ -52,7 +52,7 @@ zuno session list [OPTIONS]
 | `--no-roots` | 包含默认被隐藏的子 session | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | 随平台解析 |
 | `--sort <SORT>` | 按最后活动时间或创建时间排序。可选值：`updated`（`time_updated`，最后活动；上游 `listGlobal` 的顺序）、`created`（`time_created`） | `updated` |
 | `-n`, `--limit <LIMIT>` | 限制为 N 个 session，最近的在前。默认为 100。别名：`--max-count` | |
 | `--format <FORMAT>` | 输出格式。可选值：`table`、`json` | `table` |
@@ -78,7 +78,7 @@ zuno session prune [OPTIONS] --older-than <DAYS>
 | `--archive` | | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | 随平台解析 |
 | `--delete` | | |
 | `--include-shared` | | |
 | `--include-recent` | | |
@@ -109,7 +109,7 @@ zuno session delete [OPTIONS] <SESSION_ID>
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | 随平台解析 |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 ## 示例

@@ -7,7 +7,8 @@ use zuno_db::job::{
     NewAgentJob, ReportDelivery,
 };
 use zuno_db::session_memory_policy::{
-    SessionMemoryPolicyStore, SessionMemoryPolicyUpdate, SessionMemoryPolicyWrite,
+    SessionMemoryPolicyDefaults, SessionMemoryPolicyStore, SessionMemoryPolicyUpdate,
+    SessionMemoryPolicyWrite,
 };
 use zuno_db::{Pool, migration, session};
 use zuno_orchestration::AttemptSnapshot;
@@ -859,7 +860,7 @@ fn fresh_child_and_logical_job_admission_are_one_transaction() {
             )
             .with_logical_key("logical-review")
             .with_evidence_start_rowid(17),
-            zuno_types::SessionMemoryPolicyProjection::default(),
+            SessionMemoryPolicyDefaults::default(),
         )
         .expect_err("the existing logical task blocks the fresh child and job");
     assert!(
@@ -900,7 +901,7 @@ fn fresh_child_and_logical_job_admission_are_one_transaction() {
             )
             .with_logical_key("logical-review")
             .with_evidence_start_rowid(17),
-            zuno_types::SessionMemoryPolicyProjection::default(),
+            SessionMemoryPolicyDefaults::default(),
         )
         .expect("reconciled logical task admits the child and job atomically");
     assert_eq!(admitted.evidence_start_rowid, 17);

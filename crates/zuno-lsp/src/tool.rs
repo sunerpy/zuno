@@ -917,6 +917,7 @@ mod tests {
                 .push(ask.permission.clone());
             if ask.permission == "external_directory" {
                 return Err(ToolError::Denied {
+                    denial: None,
                     tool: tool.to_owned(),
                 });
             }
@@ -1095,7 +1096,7 @@ mod tests {
             .expect_err("a refused escalation must deny the call");
 
         assert!(
-            matches!(error, ToolError::Denied { ref tool } if tool == "lsp"),
+            matches!(error, ToolError::Denied { ref tool, .. } if tool == "lsp"),
             "expected a denial, got {error:?}"
         );
         assert_eq!(

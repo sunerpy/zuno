@@ -89,6 +89,7 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "provider",
     "productAgent",
     "mcp",
+    "mcp_tool_exposure",
     "formatter",
     "lsp",
     "instructions",
@@ -198,6 +199,9 @@ pub struct Config {
     /// MCP servers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp: Option<OrderedMap<McpServerConfig>>,
+    /// MCP schema exposure, independent from server startup and tool authorization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_tool_exposure: Option<mcp::McpToolExposureConfig>,
     /// Formatters: a switch, or per-formatter overrides.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub formatter: Option<FormatterConfig>,
@@ -302,9 +306,14 @@ impl Config {
     /// `danger-full-access` implies `allow_all`.
     #[must_use]
     pub fn sandbox_backend(&self) -> SandboxBackendSelection {
-        self.sandbox.as_ref().map_or(
-            SandboxBackendSelection::Auto,
-            SandboxConfig::resolved_backend,
+        self.resolved_sandbox_backend().selection
+    }
+
+    #[must_use]
+    pub fn resolved_sandbox_backend(&self) -> sandbox::ResolvedSandboxBackend {
+        self.sandbox.as_ref().map_or_else(
+            || SandboxConfig::default().resolve_backend_for(std::env::consts::OS),
+            |sandbox| sandbox.resolve_backend_for(std::env::consts::OS),
         )
     }
 

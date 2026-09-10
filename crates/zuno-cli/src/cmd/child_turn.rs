@@ -908,7 +908,7 @@ pub(crate) struct ChildSessionContext {
     pub(crate) parent_agent: String,
     pub(crate) parent_model: String,
     pub(crate) parent_effort: Option<zuno_llm::effort::ReasoningEffort>,
-    pub(crate) parent_memory_policy: zuno_types::SessionMemoryPolicyProjection,
+    pub(crate) parent_memory_defaults: zuno_db::session_memory_policy::SessionMemoryPolicyDefaults,
     pub(crate) delegation_limiter: DelegationLimiter,
     pub(crate) supervisor: BackgroundJobSupervisor,
 }
@@ -925,6 +925,7 @@ pub(crate) struct InteractiveChildInputContext {
     pub(crate) observer: Option<Arc<dyn ChildTurnObserver>>,
     pub(crate) detached_observer: Option<Arc<dyn DetachedTurnObserver>>,
     pub(crate) supervisor: BackgroundJobSupervisor,
+    pub(crate) attachments: Arc<zuno_attachment::AttachmentStore>,
 }
 
 #[derive(Debug)]
@@ -944,7 +945,7 @@ pub(crate) struct ChildSessionHost {
     supervisor: BackgroundJobSupervisor,
     job_store: AgentJobStore,
     inbox: SessionInbox,
-    parent_memory_policy: zuno_types::SessionMemoryPolicyProjection,
+    parent_memory_defaults: zuno_db::session_memory_policy::SessionMemoryPolicyDefaults,
 }
 
 impl ChildSessionHost {
@@ -989,7 +990,7 @@ impl ChildSessionHost {
             supervisor: context.supervisor,
             job_store: AgentJobStore::new(context.database),
             inbox,
-            parent_memory_policy: context.parent_memory_policy,
+            parent_memory_defaults: context.parent_memory_defaults,
         })
     }
 
@@ -1010,7 +1011,8 @@ impl ChildSessionHost {
             supervisor,
             job_store: AgentJobStore::new(Arc::clone(&pool)),
             inbox: SessionInbox::new(pool),
-            parent_memory_policy: zuno_types::SessionMemoryPolicyProjection::default(),
+            parent_memory_defaults:
+                zuno_db::session_memory_policy::SessionMemoryPolicyDefaults::default(),
         })
     }
 
@@ -1269,7 +1271,7 @@ impl ChildSessionHost {
             Some(child) => self.job_store.create_child_session_if_reconciled(
                 child,
                 job,
-                self.parent_memory_policy.clone(),
+                self.parent_memory_defaults,
             ),
             None => self.job_store.create_child_if_reconciled(job),
         }
@@ -1731,6 +1733,7 @@ pub(crate) struct InteractiveChildInput {
     coordinator: SessionWakeCoordinator,
     supervisor: BackgroundJobSupervisor,
     observer: Option<Arc<dyn ChildTurnObserver>>,
+    attachments: Option<Arc<zuno_attachment::AttachmentStore>>,
 }
 
 impl InteractiveChildInput {
@@ -1757,6 +1760,7 @@ impl InteractiveChildInput {
             coordinator,
             supervisor: context.supervisor,
             observer: context.observer,
+            attachments: Some(context.attachments),
         }
     }
 
@@ -1776,18 +1780,24 @@ impl InteractiveChildInput {
             coordinator,
             supervisor,
             observer: None,
+            attachments: None,
         }
     }
 
-    /// Admit one plain-text user message and arrange active steering or idle continuation.
-    pub(crate) fn submit_text(
+    pub(crate) fn attachment_store(&self) -> Option<&zuno_attachment::AttachmentStore> {
+        self.attachments.as_deref()
+    }
+
+    /// Admit one child message through exact-turn steering or an idle FIFO wake.
+    pub(crate) fn submit_input(
         &self,
         session_id: &str,
         mut prompt: Value,
-        text: String,
+        content: zuno_engine::admission::SteeringContent,
         delivery: InputDelivery,
+        expected_turn_id: Option<&str>,
     ) -> Result<String, String> {
-        if text.trim().is_empty() {
+        if content.content.trim().is_empty() && content.attachments.is_empty() {
             return Err("interactive child input cannot be empty".to_owned());
         }
         let connection = self.database.open_connection().map_err(to_string)?;
@@ -1800,19 +1810,29 @@ impl InteractiveChildInput {
         let object = prompt.as_object_mut().ok_or_else(|| {
             "interactive child input must persist a structured prompt object".to_owned()
         })?;
-        object.insert("text".to_owned(), Value::String(text.clone()));
+        object.insert("text".to_owned(), Value::String(content.content.clone()));
         let input_id = format!("msg_{}", Uuid::new_v4().simple());
-        let input = self
-            .inbox
-            .admit(NewSessionInput::new(
-                input_id.clone(),
-                session_id,
-                prompt,
-                delivery,
-                zuno_db::message::now_millis(),
-            ))
-            .map_err(to_string)?;
-        self.schedule_delivery(input.clone(), text, SoftInterruptSource::User);
+        let input = NewSessionInput::new(
+            input_id.clone(),
+            session_id,
+            prompt,
+            delivery,
+            zuno_db::message::now_millis(),
+        );
+        let input = if delivery == InputDelivery::Steer {
+            let expected =
+                expected_turn_id.ok_or("child steering requires the displayed turn id")?;
+            zuno_engine::admission::SessionInputAdmission::new(
+                self.inbox.clone(),
+                self.runs.clone(),
+            )
+            .admit_steer(input, expected, content)
+            .map_err(to_string)?
+        } else {
+            let input = self.inbox.admit(input).map_err(to_string)?;
+            self.schedule_delivery(input.clone(), content.content, SoftInterruptSource::User);
+            input
+        };
         Ok(input.id)
     }
 
@@ -1879,18 +1899,27 @@ impl InteractiveChildInput {
             input.session_id,
             cancellation,
             async move {
-                let delivery = coordinator.deliver(
-                    &task_session_id,
-                    &task_input_id,
-                    SoftInterruptMessage {
-                        input_id: Some(task_input_id.clone()),
-                        content: text,
-                        images: Vec::new(),
-                        attachments: Vec::new(),
-                        urgent: false,
-                        source,
-                    },
-                );
+                let message = SoftInterruptMessage {
+                    revision: Some(input.revision),
+                    input_id: Some(task_input_id.clone()),
+                    content: text,
+                    images: Vec::new(),
+                    attachments: Vec::new(),
+                    urgent: false,
+                    source,
+                };
+                let delivery = async {
+                    if input.delivery == InputDelivery::Queue && source == SoftInterruptSource::User
+                    {
+                        coordinator
+                            .deliver_when_idle(&task_session_id, &task_input_id, message)
+                            .await
+                    } else {
+                        coordinator
+                            .deliver(&task_session_id, &task_input_id, message)
+                            .await
+                    }
+                };
                 tokio::pin!(delivery);
                 let outcome = tokio::select! {
                     biased;
@@ -2193,6 +2222,7 @@ impl ParentReportWake for CoordinatedParentWake {
                 &report.session_id,
                 &report.id,
                 SoftInterruptMessage {
+                    revision: None,
                     input_id: Some(report.id.clone()),
                     content,
                     images: Vec::new(),

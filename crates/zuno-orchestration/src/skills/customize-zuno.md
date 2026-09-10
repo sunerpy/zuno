@@ -4,6 +4,14 @@ Use this Skill when the user asks to inspect or change Zuno configuration,
 providers, authentication, permissions, Agents, workflows, Skills, MCP servers,
 or extension manifests.
 
+Do not load this Skill merely to use an already-configured service. For an AWS,
+Microsoft, code-intelligence, or other domain question, use the relevant visible MCP
+tools directly. If schemas are deferred, use `tool_search` and its service catalog.
+Deferred does not mean disconnected; configuration `enabled` does not prove connected.
+Do not use extension/resource listing as tool discovery or hand-write MCP HTTP requests
+in Shell to work around discovery. Transport probes belong only to an explicit request
+to develop or debug that transport.
+
 1. Inspect the matching checkout's generated schema and current configuration
    before proposing an edit. Zuno rejects unknown or malformed fields.
 2. Resolve scope explicitly: project configuration is `zuno.json` or

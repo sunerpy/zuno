@@ -1387,6 +1387,7 @@ mod tests {
 
     fn rule(pattern: &str, action: PermissionAction) -> Rule {
         Rule {
+            source: None,
             permission: "shell".to_owned(),
             pattern: pattern.to_owned(),
             action,
@@ -1395,6 +1396,7 @@ mod tests {
 
     fn path_rule(pattern: &str, action: PermissionAction) -> Rule {
         Rule {
+            source: None,
             permission: "read".to_owned(),
             pattern: pattern.to_owned(),
             action,

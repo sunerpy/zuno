@@ -825,6 +825,7 @@ async fn a_next_step_tool_yields_without_spending_a_second_provider_request() {
     let dispatcher = ToolRegistryDispatcher::new(
         vec![Arc::new(YieldingTaskTool)],
         vec![Rule {
+            source: None,
             permission: "*".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Allow,
@@ -878,6 +879,7 @@ async fn a_human_request_stops_after_its_result_is_durable() {
     let dispatcher = ToolRegistryDispatcher::new(
         vec![Arc::new(WaitingForHumanTool)],
         vec![Rule {
+            source: None,
             permission: "*".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Allow,
@@ -948,6 +950,7 @@ async fn typed_result_presentation_precedes_the_completed_dispatch_event() {
     let dispatcher = ToolRegistryDispatcher::new(
         vec![Arc::new(PresentedResultTool)],
         vec![Rule {
+            source: None,
             permission: "*".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Allow,
@@ -1022,6 +1025,7 @@ async fn dispatch_loop_runs_three_calls_sequentially_with_complete_transitions()
         "turn-dispatch-happy",
         &calls,
         vec![Rule {
+            source: None,
             permission: "*".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Allow,
@@ -1080,6 +1084,7 @@ async fn parallel_safe_calls_overlap_but_persist_and_emit_in_model_order() {
             state: Arc::clone(&state),
         })],
         vec![Rule {
+            source: None,
             permission: "*".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Allow,
@@ -1165,6 +1170,7 @@ async fn parallel_safe_calls_never_exceed_the_configured_execution_bound() {
             state: Arc::clone(&state),
         })],
         vec![Rule {
+            source: None,
             permission: "*".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Allow,
@@ -1234,6 +1240,7 @@ async fn exclusive_calls_barrier_parallel_safe_and_isolated_background_groups() 
             }),
         ],
         vec![Rule {
+            source: None,
             permission: "*".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Allow,
@@ -1307,11 +1314,13 @@ async fn dispatch_loop_appends_denial_and_continues_to_the_next_call() {
         &calls,
         vec![
             Rule {
+                source: None,
                 permission: "*".to_owned(),
                 pattern: "*".to_owned(),
                 action: PermissionAction::Allow,
             },
             Rule {
+                source: None,
                 permission: "shell".to_owned(),
                 pattern: "rm -rf /".to_owned(),
                 action: PermissionAction::Deny,
@@ -1353,6 +1362,7 @@ async fn dispatch_loop_rejects_namespaced_or_historical_tool_aliases() {
             order: Arc::clone(&order),
         })],
         vec![Rule {
+            source: None,
             permission: "*".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Allow,
@@ -1427,6 +1437,7 @@ async fn dispatch_loop_reports_a_tool_timeout_without_replaying_the_call() {
             calls: Arc::clone(&calls),
         })],
         vec![Rule {
+            source: None,
             permission: "*".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Allow,
@@ -1517,6 +1528,7 @@ async fn dispatch_loop_keeps_only_the_latest_failure_recovery_for_each_tool() {
             calls: Arc::clone(&calls),
         })],
         vec![Rule {
+            source: None,
             permission: "*".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Allow,
@@ -1582,6 +1594,7 @@ async fn dispatch_loop_pauses_after_three_identical_plan_reads_with_different_in
             stable: true,
         })],
         vec![Rule {
+            source: None,
             permission: "*".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Allow,
@@ -1644,6 +1657,7 @@ async fn dispatch_loop_allows_repeated_plan_reads_when_the_result_changes() {
             stable: false,
         })],
         vec![Rule {
+            source: None,
             permission: "*".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Allow,
@@ -1682,6 +1696,7 @@ async fn dispatch_loop_refreshes_dynamic_context_after_a_plan_mutation() {
     let dispatcher = ToolRegistryDispatcher::new(
         vec![Arc::new(PlanMutationTool)],
         vec![Rule {
+            source: None,
             permission: "*".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Allow,
@@ -1798,6 +1813,7 @@ async fn dispatch_loop_carries_every_written_path_from_the_tool_onto_the_event()
     let dispatcher = ToolRegistryDispatcher::new(
         vec![Arc::new(PatchingTool)],
         vec![Rule {
+            source: None,
             permission: "*".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Allow,

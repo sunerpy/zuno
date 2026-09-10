@@ -9,8 +9,9 @@
 - `danger-full-access` 刻意以 Zuno 用户身份使用原生 shell，拥有宿主文件系统、进程、
   凭据和网络。它不是一道操作系统安全边界。
 
-两种受约束模式只有在当前平台后端通过完整能力探测时才真正受操作系统沙箱约束。否则
-Shell 默认失败即拒绝。受信的全局、显式配置、环境、CLI 或受管层可以把
+两种受约束模式只有在当前平台后端通过能力探测时才有 OS 约束。`backend: auto` 下不可用时
+拒绝。Windows/macOS 没有显式约束时默认原生执行，记录 `platform_native` 并保留权限模式。
+受信的全局、显式配置、环境、CLI 或受管层可以把
 `sandbox.onUnavailable` 设为 `run-unconfined`；它只允许具备写能力的 Agent 所请求的
 `workspace-write`，在平台不支持、缺少受信启动器或命名空间/容器策略不可用等类型化错误下
 使用原生后端。只读 Agent、不受信启动器、无效策略/路径、helper/内部错误和命令执行错误
@@ -20,7 +21,7 @@ Shell 默认失败即拒绝。受信的全局、显式配置、环境、CLI 或�
 灾难性命令硬拒绝，同时记录请求的文件系统和网络限制没有得到 OS 强制执行。
 显式 `danger-full-access` 会跳过受限后端发现，并把生效权限模式设为 `allow_all`。
 
-受信层也可以用 `sandbox.backend` 直接选定后端：`auto`（默认）按上文发现受约束后端；
+受信层也可以用 `sandbox.backend` 直接选定后端：显式 `auto` 按上文发现受约束后端；
 `native` 让每一个 Agent 的 Shell——包括只读 Agent——都在原生进程后端上运行，不做任何
 探测，同时保留已配置的权限模式。这是一项主机声明而不是降级，也不是沙箱隔离：请求的权限
 会被记录（`resolutionKind: trusted_native`）但不由 OS 强制执行，因此只读 Agent 的契约变成
@@ -67,8 +68,8 @@ TUI `--auto` 仍然更窄，无法满足只能由人类回答的请求。选择 
 server 或 headless 界面上弹出准入卡片。显式的权限拒绝以及 Shell 风险门禁的灾难性硬拒绝
 仍然是终态；它们直接失败，而不是询问。结构化的用户提问不是准入，仍然可能被展示。
 
-macOS 与 Windows 的受约束模式目前返回一个带类型的不支持平台错误。在默认 `deny` 下不会
-注册 Shell；受信的 `run-unconfined` 可以让具备写能力的 Agent 原生继续，受信的
+macOS 与 Windows 在显式要求约束时返回带类型的不支持平台错误；没有显式约束则默认原生执行。
+`auto` 加 `deny` 不会注册无约束 Shell；受信的 `run-unconfined` 可以让具备写能力的 Agent 原生继续，受信的
 `sandbox.backend: native` 让每个 Agent 都原生运行并保留权限模式，而显式的
 `danger-full-access` 始终可以独立使用原生进程后端。拒绝信息会点明平台、说明降级是否适用于
 本次请求，并列出全部补救方式：对任何 Agent（包括只读 Agent）适用的
@@ -77,12 +78,12 @@ macOS 与 Windows 的受约束模式目前返回一个带类型的不支持平�
 `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined` 或受信层（全局、受管、环境、CLI）里的
 `sandbox.onUnavailable`；以及 `zuno --sandbox danger-full-access`。项目层无法启用其中任何一项。
 
-在这类主机上交互式启动 `zuno` 时，会在进入 raw mode 之前询问一次是否以原生方式运行本次会话
+Linux 没有可用约束后端时，交互式 `zuno` 可在 raw mode 之前询问是否原生执行
 ——只要请求无法被约束就会询问，只读请求也包括在内，前提是没有任何层设置过
-`sandbox.onUnavailable` 或 `sandbox.backend`，且标准输入与标准错误都是终端。回答 `y` 时选择
+`sandbox.onUnavailable`、`sandbox.backend`、网络拒绝或路径约束，且标准输入与标准错误都是终端。回答 `y` 时选择
 原生后端，本进程的解析结果与命令行标志 `--sandbox-backend native` 完全一致；回答 `a` 同样选择
 原生后端，并把 `sandbox.backend: native` 写入全局配置，从此不再询问；回答 `n` 则以该
-拒绝信息退出。`y` 这个回答只对当前进程生效：在 macOS 上，命令行标志会
+拒绝信息退出。`y` 这个回答只对当前进程生效：在 Unix 上，命令行标志会
 通过启动时的 re-exec 写入真实环境变量，从而被嵌套的 Zuno 进程继承，而提示里的回答不会；
 如果嵌套的 `zuno` 也需要同样的答案，请设置 `ZUNO_SANDBOX_BACKEND=native` 或在受信层设置
 `sandbox.backend`，或者直接回答一次 `a` 让配置文件承担它。

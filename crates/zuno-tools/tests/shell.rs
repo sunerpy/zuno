@@ -1156,11 +1156,13 @@ fn shell_compound_command_extracts_each_permission_resource_and_matches_real_rul
 
     let rules = [
         Rule {
+            source: None,
             permission: "shell".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Deny,
         },
         Rule {
+            source: None,
             permission: "shell".to_owned(),
             pattern: "git push*".to_owned(),
             action: PermissionAction::Ask,

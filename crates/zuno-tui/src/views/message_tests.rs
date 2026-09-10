@@ -214,14 +214,61 @@ fn transcript_copy_preserves_only_explicit_source_newlines_and_cjk_width() {
 }
 
 #[test]
-fn semantic_source_partition_rejoins_exactly_after_visual_wrapping() {
-    let source = "alpha beta\n界面 gamma";
-    let rows = vec![
-        String::from("alpha"),
-        String::from("beta 界"),
-        String::from("面 gamma"),
-    ];
-    assert_eq!(partition_semantic_source(source, &rows).concat(), source);
+fn partial_selection_copies_rendered_markdown_instead_of_source_punctuation() {
+    let mut view = view();
+    view.transcript_mut().push(Message::user("**bold** after"));
+    draw(&mut view, 30, 6);
+    assert!(view.begin_selection(2, 0));
+    assert!(view.update_selection(5, 0));
+    assert_eq!(view.selected_text().as_deref(), Some("bold"));
+    assert!(view.begin_selection(7, 0));
+    assert!(view.update_selection(11, 0));
+    assert_eq!(view.selected_text().as_deref(), Some("after"));
+}
+
+#[test]
+fn partial_selection_of_a_wrapped_row_has_no_invisible_leading_space() {
+    let mut view = view();
+    view.transcript_mut()
+        .push(Message::user("alpha beta gamma delta"));
+    draw(&mut view, 12, 10);
+    assert!(view.begin_selection(2, 1));
+    assert!(view.update_selection(6, 1));
+    assert_eq!(view.selected_text().as_deref(), Some("gamma"));
+}
+
+#[test]
+fn copy_retains_complete_graphemes_and_uses_the_painted_snapshot() {
+    let mut view = view();
+    view.transcript_mut().push(Message::user("👩‍💻 e\u{301} 中"));
+    draw(&mut view, 30, 6);
+    assert!(view.begin_selection(2, 0));
+    assert!(view.update_selection(3, 0));
+    assert_eq!(view.selected_text().as_deref(), Some("👩‍💻"));
+    view.transcript_mut().messages[0].parts = vec![MessagePart::Text {
+        text: "replaced".to_owned(),
+    }];
+    assert_eq!(
+        view.selected_text().as_deref(),
+        Some("👩‍💻"),
+        "copy the painted frame until it is replaced"
+    );
+    draw(&mut view, 30, 6);
+    assert!(
+        view.selected_text().is_none(),
+        "a new layout cannot reinterpret old coordinates"
+    );
+}
+
+#[test]
+fn copying_a_fence_omits_the_frame_and_retains_code_newlines() {
+    let mut view = view();
+    view.transcript_mut()
+        .push(Message::user("```text\nhello\n  world\n```"));
+    draw(&mut view, 30, 12);
+    assert!(view.begin_selection(0, 0));
+    assert!(view.update_selection(29, 11));
+    assert_eq!(view.selected_text().as_deref(), Some("hello\n  world"));
 }
 
 // ---------------------------------------------------------------------------

@@ -2670,6 +2670,7 @@ async fn loop_injects_a_durable_background_report_at_the_tool_safe_point() {
         .queue_soft_interrupt(
             SESSION_ID,
             SoftInterruptMessage {
+                revision: None,
                 input_id: Some("msg_steer".to_owned()),
                 content: "include benchmark".to_owned(),
                 images: Vec::new(),
@@ -2762,6 +2763,7 @@ async fn live_input_persistence_failure_rolls_back_without_losing_the_promoted_i
         .queue_soft_interrupt(
             SESSION_ID,
             SoftInterruptMessage {
+                revision: None,
                 input_id: Some("msg_atomic_steer".to_owned()),
                 content: "recover this input".to_owned(),
                 images: Vec::new(),
@@ -2823,25 +2825,34 @@ async fn collect_and_steer_hanging_provider(
                 } if text == "partial before steer"
             )
         {
-            inbox
-                .admit(NewSessionInput::new(
-                    "msg_live_steer",
-                    SESSION_ID,
-                    json!({"kind": "user", "prompt": {"text": "change direction now"}}),
-                    InputDelivery::Steer,
-                    11,
-                ))
-                .expect("admit live steer");
+            for (id, text) in [
+                ("msg_queue_a", "leave first queued"),
+                ("msg_live_steer", "change direction now"),
+                ("msg_queue_c", "leave third queued"),
+            ] {
+                inbox
+                    .admit(NewSessionInput::new(
+                        id,
+                        SESSION_ID,
+                        json!({"kind": "user", "prompt": {"text": text}}),
+                        InputDelivery::Queue,
+                        11,
+                    ))
+                    .expect("admit queued input");
+            }
             control
-                .queue_soft_interrupt(SoftInterruptMessage {
-                    input_id: Some("msg_live_steer".to_owned()),
-                    content: "change direction now".to_owned(),
-                    images: Vec::new(),
-                    attachments: Vec::new(),
-                    urgent: false,
-                    source: SoftInterruptSource::User,
-                })
-                .expect("wake the active turn");
+                .send_queued(
+                    inbox.clone(),
+                    zuno_engine::admission::QueuedSendRequest {
+                        session_id: SESSION_ID.to_owned(),
+                        input_id: "msg_live_steer".to_owned(),
+                        expected_revision: 1,
+                        expected_turn_id: control.active_turn_id(),
+                        request_id: "send-selected-b".to_owned(),
+                    },
+                    zuno_engine::admission::SteeringContent::user("change direction now"),
+                )
+                .expect("send only the selected second queue item");
             steered = true;
         }
         events.push(event);
@@ -2851,7 +2862,7 @@ async fn collect_and_steer_hanging_provider(
 }
 
 #[tokio::test]
-async fn loop_live_steer_wakes_a_hanging_provider_and_restarts_with_the_new_input() {
+async fn loop_selected_queue_input_wakes_a_hanging_provider_in_the_same_turn() {
     let pool = Arc::new(
         Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared in-memory loop pool"),
     );
@@ -2917,7 +2928,50 @@ async fn loop_live_steer_wakes_a_hanging_provider_and_restarts_with_the_new_inpu
         events.last(),
         Some(TurnEvent::TurnCompleted { steps: 2, .. })
     ));
-    assert!(inbox.pending(SESSION_ID).expect("pending inbox").is_empty());
+    assert_eq!(
+        inbox
+            .pending(SESSION_ID)
+            .expect("pending inbox")
+            .iter()
+            .map(|input| input.id.as_str())
+            .collect::<Vec<_>>(),
+        ["msg_queue_a", "msg_queue_c"],
+        "sending B must leave A and C in their original queue order",
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, TurnEvent::TurnStarted { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            TurnEvent::TurnInterrupted { .. }
+                | TurnEvent::AssistantCheckpointed {
+                    interrupted: true,
+                    ..
+                }
+        )),
+        "steering is not a session restart or interruption"
+    );
+    let consumed = events
+        .iter()
+        .position(|event| {
+            matches!(event,
+                TurnEvent::InputConsumed { input_id, .. } if input_id == "msg_live_steer"
+            )
+        })
+        .expect("a committed consumption receipt is projected");
+    let resumed = events
+        .iter()
+        .position(|event| matches!(event, TurnEvent::ProviderRequestStarted { step: 2, .. }))
+        .expect("next model step");
+    assert!(
+        consumed < resumed,
+        "the new input commits before the next request"
+    );
     assert_eq!(provider.requests().len(), 2);
 
     let hydrated = MessageStore::new(&connection)
@@ -3002,6 +3056,7 @@ async fn loop_live_steer_waits_for_a_running_tool_instead_of_cancelling_it() {
                     .expect("admit tool-safe steer");
                 control
                     .queue_soft_interrupt(SoftInterruptMessage {
+                        revision: None,
                         input_id: Some("msg_tool_steer".to_owned()),
                         content: "keep the result, then continue".to_owned(),
                         images: Vec::new(),
@@ -3157,6 +3212,7 @@ async fn collect_and_steer_retry_backoff(
             fired = true;
             control
                 .queue_soft_interrupt(SoftInterruptMessage {
+                    revision: None,
                     input_id: Some("msg_retry_steer".to_owned()),
                     content: "do this instead".to_owned(),
                     images: Vec::new(),
@@ -4477,6 +4533,7 @@ async fn loop_repairs_a_dispatched_call_into_a_durable_inspection_obligation() {
             dispatched: Arc::clone(&dispatched),
         })],
         vec![zuno_permission::Rule {
+            source: None,
             permission: "*".to_owned(),
             pattern: "*".to_owned(),
             action: zuno_permission::PermissionAction::Allow,
@@ -4777,6 +4834,7 @@ async fn loop_separates_a_killed_dispatched_call_from_its_undispatched_sibling()
             dispatched: Arc::clone(&dispatched),
         })],
         vec![zuno_permission::Rule {
+            source: None,
             permission: "*".to_owned(),
             pattern: "*".to_owned(),
             action: zuno_permission::PermissionAction::Allow,
@@ -4928,6 +4986,7 @@ async fn loop_records_an_obligation_for_a_dispatched_call_the_provider_left_unna
             dispatched: Arc::clone(&dispatched),
         })],
         vec![zuno_permission::Rule {
+            source: None,
             permission: "*".to_owned(),
             pattern: "*".to_owned(),
             action: zuno_permission::PermissionAction::Allow,
@@ -7648,6 +7707,7 @@ async fn loop_publishes_the_cancellation_verdict_the_tool_claimed_not_the_mode()
             started: Arc::clone(&started),
         })],
         vec![zuno_permission::Rule {
+            source: None,
             permission: "*".to_owned(),
             pattern: "*".to_owned(),
             action: zuno_permission::PermissionAction::Allow,

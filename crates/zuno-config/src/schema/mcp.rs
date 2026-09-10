@@ -12,6 +12,46 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 use std::num::{NonZeroU16, NonZeroU32};
 
+/// Provider-schema exposure is independent from MCP connection/startup policy.
+#[derive(JsonSchema, Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpToolExposureMode {
+    /// Keep small service catalogs directly visible within the automatic schema budget.
+    #[default]
+    Auto,
+    /// Include authorized tools directly on the first model request.
+    Eager,
+    /// Reveal schemas through the model's tool-search entrypoint.
+    Deferred,
+}
+
+/// Model-facing MCP discovery policy. This never grants tools or changes a connection.
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpToolExposureConfig {
+    pub mode: McpToolExposureMode,
+    /// Per configured server overrides; exact session/Agent pins remain eager.
+    pub servers: BTreeMap<String, McpToolExposureMode>,
+    /// Maximum automatically exposed tool count across small service catalogs.
+    pub auto_tool_limit: NonZeroU16,
+    /// Maximum automatically exposed JSON-schema bytes, excluding explicit pins.
+    pub auto_schema_bytes: NonZeroU32,
+    /// Automatic exposure keeps a small service whole instead of hiding random methods.
+    pub small_server_tool_limit: NonZeroU16,
+}
+
+impl Default for McpToolExposureConfig {
+    fn default() -> Self {
+        Self {
+            mode: McpToolExposureMode::Auto,
+            servers: BTreeMap::new(),
+            auto_tool_limit: NonZeroU16::new(32).expect("nonzero"),
+            auto_schema_bytes: NonZeroU32::new(65_536).expect("nonzero"),
+            small_server_tool_limit: NonZeroU16::new(8).expect("nonzero"),
+        }
+    }
+}
+
 /// The `type: "local"` discriminator.
 #[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

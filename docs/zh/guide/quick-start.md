@@ -153,8 +153,10 @@ zuno run --agent plan "summarize how configuration precedence works in this repo
 无关。在约束后端可用的宿主上，它是端到端确认整条路径能走通的最安全方式。只读 Agent
 刻意不会使用 `run-unconfined`。
 
-在 macOS 或 Windows 上，需要 Shell 的受信首个任务必须显式选择原生路径。`plan` 也可以走
-这条路径，权限模式保持不变：
+在 macOS 或 Windows 上，没有显式后端、降级、网络拒绝或路径约束时默认原生执行；
+`plan` 也可以走这条路径，权限模式保持不变。也可以显式选择：
+
+可在受信配置中设置 `sandbox.backend`，或使用下方命令行覆盖。
 
 ```powershell
 zuno run --agent plan `
@@ -183,9 +185,9 @@ zuno
 | 现象 | 原因 | 修复 |
 | --- | --- | --- |
 | `rg` 缺失或版本过旧 | `glob` / `grep` 后端不可用 | 安装 ripgrep 14 或更新版本；Zuno 启动和无关核心功能仍可使用，且正在运行的会话会在五秒内识别到新装的版本，无需重启 |
-| `no trusted system bubblewrap executable was found` | 没有约束后端 | 安装 bubblewrap 0.8.0 或更新版本、显式使用 `danger-full-access`，或为具备写能力的 Agent 启用受信的不可用降级。交互式启动时会给出与 macOS、Windows 相同的原生执行询问，因为缺少可用 bubblewrap 的主机同样无法约束 |
+| `no trusted system bubblewrap executable was found` | Linux 没有约束后端 | 安装 bubblewrap 0.8.0 或更新版本、显式选择受信原生执行，或启用合格的受信降级。没有显式约束时，Linux 交互启动可以询问是否原生执行 |
 | `OS sandbox is not implemented for platform` | 在 macOS 或 Windows 上使用受约束模式 | 拒绝信息会点明平台，并列出对该次请求适用的补救方式：对任何 Agent 都适用且保留权限模式的受信 `--sandbox-backend native`、为具备写能力的 Agent 启用受信的 `run-unconfined` 降级、显式使用 `danger-full-access`，或在 Linux 上运行 |
-| 直接运行 `zuno` 时被问 `Run this session natively without OS confinement?` | 请求无法被这台主机约束（macOS、Windows，或缺少可用 bubblewrap 的 Linux 主机；只读 Agent 也包括在内），且没有任何配置层设置过 `sandbox.onUnavailable` 或 `sandbox.backend` | 回答 `y` 以原生方式运行本次会话（权限模式保持不变），回答 `a` 把 `sandbox.backend: native` 写入全局配置，从此不再询问，回答 `n` 则以该拒绝信息退出。想提前决定，可用 `--sandbox-backend native`、`ZUNO_SANDBOX_BACKEND=native`，或在受信层设置 `sandbox.backend` |
+| 直接运行 `zuno` 时被问 `Run this session natively without OS confinement?` | Linux 无法约束请求且没有显式限制；相同缺省条件下 Windows/macOS 已默认原生执行 | 回答 `y` 仅作用本次，`a` 保存受信 `sandbox.backend: native`，`n` 拒绝。原生执行保留权限模式，但不是 OS 隔离 |
 | 校验错误指出某个被拒绝的顶层键 | 仅 TUI 使用的键（如 `theme`）写进了 `zuno.json` | 把它移到 `tui.json`。参见[配置文件与优先级](/zh/config/files) |
 | 切换构建后会话列表为空 | 源码构建与发布构建打开的是不同的数据库文件 | 参见[数据库生命周期](/zh/operate/migration) |
 | 找不到某个模型 id | 目录在该 provider 添加之前就已缓存 | `zuno models --refresh` |

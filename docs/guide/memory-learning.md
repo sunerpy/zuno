@@ -61,6 +61,12 @@ revisioned policy when it is materialized:
 future prompt assembly; it does not delete files, Experience, candidates, or audit
 records. Existing sessions do not inherit a later configuration-default change.
 
+A new child copies the latest durable parent policy in the same transaction that
+creates its session and job. A parent at revision 1 or later is valid; fallback values
+are a separate, unversioned input used only for legacy parents with no policy row.
+The child starts its own revision 1, preserves disabled/excluded choices, and is not
+rewritten when the parent later changes. No database rebuild or revision reset is needed.
+
 HTTP clients can read and update the policy through
 `GET|PUT /api/session/{sessionID}/memory-policy`. Updates include
 `expectedRevision`; a stale revision returns `409`. A client may request only

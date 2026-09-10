@@ -6,7 +6,8 @@ use serde_json::json;
 use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox, SubmissionState};
 use zuno_db::{Pool, migration, session};
 use zuno_engine::admission::{
-    InputAdmission, SessionInputAdmission, SteerAdmissionError, SteeringContent, TurnLease,
+    InputAdmission, QueuedSendAdmission, QueuedSendError, QueuedSendRequest, SessionInputAdmission,
+    SteerAdmissionError, SteeringContent, TurnLease,
 };
 use zuno_engine::status::{ExpectedTurnError, SessionRunRegistry};
 use zuno_paths::DbLocation;
@@ -55,6 +56,124 @@ fn prompt(id: &str, text: &str) -> NewSessionInput {
         InputDelivery::Steer,
         10,
     )
+}
+
+fn queued_request(id: &str, revision: i64, turn: Option<&str>) -> QueuedSendRequest {
+    QueuedSendRequest {
+        session_id: SESSION_ID.to_owned(),
+        input_id: id.to_owned(),
+        expected_revision: revision,
+        expected_turn_id: turn.map(str::to_owned),
+        request_id: format!("send-{id}"),
+    }
+}
+
+#[test]
+fn selected_queue_item_steers_once_without_reordering_other_items_or_aborting() {
+    let inbox = SessionInbox::new(initialized());
+    let runs = SessionRunRegistry::new();
+    let admission = SessionInputAdmission::new(inbox.clone(), runs.clone());
+    let running = runs.begin_turn(SESSION_ID).expect("turn");
+    let _identity = running.mark_turn_started("turn-live").expect("identity");
+    for id in ["A", "B", "C"] {
+        let mut input = prompt(id, id);
+        input.delivery = InputDelivery::Queue;
+        inbox.admit(input).expect("queue");
+    }
+    let before = inbox.get(SESSION_ID, "B").expect("get").expect("B");
+    let request = queued_request("B", before.revision, Some("turn-live"));
+    let outcome = admission
+        .send_queued(request.clone(), SteeringContent::user("B"))
+        .expect("steer B");
+    assert!(matches!(outcome, QueuedSendAdmission::Steered(ref input)
+        if input.id == "B" && input.admitted_sequence == before.admitted_sequence));
+    assert!(matches!(
+        admission
+            .send_queued(request, SteeringContent::user("B"))
+            .expect("repeat"),
+        QueuedSendAdmission::AlreadyAccepted(_)
+    ));
+    assert!(!running.interrupt_signal().is_set());
+    assert!(
+        !running.try_finish_inputs(),
+        "accepted input prevents closing the turn"
+    );
+    let delivery = running.take_soft_interrupts_at_safe_point();
+    assert_eq!(delivery.messages.len(), 1);
+    assert_eq!(delivery.messages[0].input_id.as_deref(), Some("B"));
+    let revision = delivery.messages[0].revision.expect("pinned revision");
+    inbox
+        .promote_revision(SESSION_ID, "B", revision)
+        .expect("promote");
+    assert_eq!(
+        inbox
+            .pending(SESSION_ID)
+            .expect("pending")
+            .iter()
+            .map(|input| input.id.as_str())
+            .collect::<Vec<_>>(),
+        ["A", "C"]
+    );
+    assert!(running.try_finish_inputs());
+    let a = inbox.get(SESSION_ID, "A").expect("get").expect("A");
+    assert!(matches!(
+        admission.send_queued(
+            queued_request("A", a.revision, Some("turn-live")),
+            SteeringContent::user("A")
+        ),
+        Err(QueuedSendError::Turn(ExpectedTurnError::Closing { .. }))
+    ));
+    assert_eq!(inbox.get(SESSION_ID, "A").expect("get"), Some(a));
+}
+
+#[test]
+fn selecting_an_idle_queue_item_reserves_its_lease_and_preserves_other_rows() {
+    let inbox = SessionInbox::new(initialized());
+    let runs = SessionRunRegistry::new();
+    let admission = SessionInputAdmission::new(inbox.clone(), runs.clone());
+    for id in ["A", "B"] {
+        let mut input = prompt(id, id);
+        input.delivery = InputDelivery::Queue;
+        inbox.admit(input).expect("queue");
+    }
+    let input = inbox.get(SESSION_ID, "B").expect("get").expect("B");
+    let outcome = admission
+        .send_queued(
+            queued_request("B", input.revision, None),
+            SteeringContent::user("B"),
+        )
+        .expect("reserve");
+    let QueuedSendAdmission::Drive { input, guard } = outcome else {
+        panic!("idle lease");
+    };
+    assert_eq!(input.id, "B");
+    assert_eq!(input.state, SubmissionState::Promoted);
+    assert!(runs.begin_turn(SESSION_ID).is_err());
+    assert_eq!(inbox.pending(SESSION_ID).expect("pending")[0].id, "A");
+    drop(guard);
+    assert!(runs.begin_turn(SESSION_ID).is_ok());
+}
+
+#[test]
+fn a_stale_steer_revision_cannot_consume_edited_content() {
+    let inbox = SessionInbox::new(initialized());
+    let input = inbox.admit(prompt("edited", "before")).expect("input");
+    let edited = inbox
+        .edit_pending(
+            SESSION_ID,
+            &input.id,
+            input.revision,
+            json!({"text":"after"}),
+            20,
+        )
+        .expect("edit");
+    assert!(
+        inbox
+            .promote_revision(SESSION_ID, &input.id, input.revision)
+            .expect("stale")
+            .is_none()
+    );
+    assert_eq!(inbox.get(SESSION_ID, &input.id).expect("get"), Some(edited));
 }
 
 #[test]

@@ -16,6 +16,8 @@ pub mod app;
 pub mod attention;
 pub mod config;
 pub mod keybind;
+mod paste_burst;
+mod prompt_recovery;
 pub mod theme;
 pub mod views;
 

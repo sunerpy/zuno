@@ -63,10 +63,10 @@ native backend for every agent with `sandbox.backend: native` while keeping the
 permission mode, or allow `workspace-write` to fall back only for eligible
 sandbox-availability failures. Read-only agents never use that fallback.
 
-The confined backend is not yet implemented on macOS or Windows. Every agent can use an
-explicit trusted native-execution choice on those platforms; for a read-only agent that
-choice is `sandbox.backend: native`, under which its read-only contract is a
-role boundary rather than an OS boundary.
+The confined backend is not yet implemented on macOS or Windows. Without explicit
+confinement constraints those platforms default to native; a trusted
+`sandbox.backend: native` is also available. A read-only Agent then retains a
+role boundary, not an OS boundary. Explicit confinement is never silently bypassed.
 
 See [Permissions and sandboxing](/guide/permissions).
 

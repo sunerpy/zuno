@@ -54,9 +54,9 @@ Shell 请求依次经过工具参数校验、权限策略、命令风险检查�
 权限模式，也可以只在符合条件的沙箱不可用错误下允许 `workspace-write` 降级。只读 Agent
 不使用该降级。
 
-macOS 与 Windows 尚未实现受限后端；每个 Agent 都可以在这些平台显式选择受信的原生执行。
-对只读 Agent 来说，这个选择就是 `sandbox.backend: native`，在它之下只读契约是一道
-角色边界，而不是 OS 边界。
+macOS 与 Windows 尚未实现受限后端，没有显式约束时默认原生执行，也可显式选择受信的
+`sandbox.backend: native`。此时只读 Agent 的契约是角色边界，不是 OS 边界；
+显式约束不会被静默绕过。
 
 参见[权限与沙箱](/zh/guide/permissions)。
 

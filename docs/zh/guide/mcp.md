@@ -125,7 +125,7 @@ ACP 客户端可以在 new/load/resume 时提供完整的 session-local `mcpServ
 
 注册不等于授权。要让模型调用一个 MCP 工具，四件事必须同时成立：
 
-1. 该 server 已启用，并且连接成功。
+1. 该 server 已启用且连接成功，或已有通过连接身份校验的工具目录，由会话代理在首次调用时连接成功。
 2. 在配置了 Agent 确切 `tools` 允许列表的情况下，该工具的 wire id 在其中存活。
 3. 没有显式权限规则拒绝它。
 4. 对于被委派的回合，那个确切的 schema 在父级 Attempt 中可见。
@@ -146,20 +146,54 @@ ACP 客户端可以在 new/load/resume 时提供完整的 session-local `mcpServ
 
 MCP 与扩展工具不会自动对每个只读 Agent 可用。具备工作能力的角色可以选择自动继承，只读 Agent 也可以在自己的规则中被显式授予一个经过审计的工具 id，但父级 schema 上限与确切 schema 校验仍然生效。参见 [Agent](/zh/guide/agents)。
 
-### 渐进式 schema 发现
+### 直接可见与渐进式 schema 发现
 
 通过上述四道门禁意味着 MCP 工具可执行，并不意味着 Zuno 必须在每次 provider 请求中
-注入所有已连接 schema。对于没有 Agent 确切 `tools` 允许列表的根回合，匹配的 MCP
-schema 默认隐藏在 `tool_search` 后。该工具搜索 id、显示名称与描述；匹配项会累积加入
+注入所有已连接 schema。默认 `auto` 把小型服务的整个工具集放入首个请求：每个服务不超过
+8 个工具，共享自动预算为 32 个工具、65,536 字节的 schema／描述。较大工具集才延迟展开；
+`tool_search` 显示原始服务名和有界能力摘要。Agent 会主动按任务选择相关 MCP，不需要用户
+先点名 server。
+
+`tool_search` 搜索工具 id、服务名、显示名称和描述；匹配项会累积加入
 下一次 provider step，不能在发现它们的同一批 assistant 工具调用中立即调用。
 
 这只改变提示词暴露，不改变授权：搜索无法恢复被权限拒绝或被能力过滤移除的工具。Agent
 确切 `tools` 允许列表被视为有意选择 schema，其中点名的 MCP 工具保持立即可见。被委派
 的子级只接收父级 Attempt 已记录的确切 schema，不能通过搜索获得更大的目录。
 
+工具可见性与连接配置分离，调整下列策略不改变连接身份、不丢弃已校验目录缓存，也不建立
+全局 MCP 进程池：
+
+```json
+{
+  "mcp_tool_exposure": {
+    "mode": "auto",
+    "auto_tool_limit": 32,
+    "auto_schema_bytes": 65536,
+    "small_server_tool_limit": 8,
+    "servers": {
+      "aws-knowledge-mcp-server": "eager",
+      "figma": "deferred"
+    }
+  }
+}
+```
+
+`eager` 使已授权的工具定义首轮直接可见，`deferred` 经发现入口展开；服务设置覆盖全局 mode。
+会话／Agent 精确指定的工具仍立即可见，不受自动预算限制；强制全部 eager 会增加上下文开销。
+可见性不等于授权，不能放行原本被拒绝的工具。
+
+工作 Agent 的默认规则明确允许发现入口，用户覆盖仍最后生效。若 `tool_search` 被禁用或
+拒绝，其他已获授权的 MCP schema 保持直接可见，不会被困在不可达的加载器之后；
+MCP 工具本身的显式拒绝仍有效。
+
+延迟展开不等于断开连接，`enabled: true` 也不等于已连接。普通任务直接使用可见 MCP 工具，
+大型延迟工具才用 `tool_search`。资源列表、扩展列表及 `customize-zuno` 不是使用 MCP 的前置
+步骤；不应通过 Shell 手写 MCP HTTP 绕开发现。明确要求开发／调试传输时另当别论。
+
 ACP session-local `mcpServers` 同样属于客户端显式契约。严格连接门禁成功后，它们的
-schema 会出现在第一次 provider 请求中；同一会话里的宿主配置 MCP server 仍采用渐进式
-发现。该区分会随会话传递到子回合与后台续跑。
+schema 会出现在第一次 provider 请求中；同一会话里的宿主配置 MCP server 采用上述可见性
+策略。该区分会随会话传递到子回合与后台续跑。
 
 provider 请求快照记录搜索后的确切工具 schema；搜索结果也会把匹配 id 与单调递增的
 目录 revision 写入持久工具结果。后台唤醒、进程重启或客户端重新挂载同一会话时，这些成功
@@ -171,6 +205,10 @@ provider 请求快照记录搜索后的确切工具 schema；搜索结果也会�
 配对，因此未知或被拒绝的调用可以回送协议完整的 tool result。Zuno 发出 warning，持久原记录
 保持不变。如果另一个已注册工具已经定义了 `tool_search`，Zuno 不会遮蔽它：该回合保持 schema
 立即可见，并由宿主发出警告。
+
+TUI 在下一个回合边界接纳目录变化，不在工具执行中途替换传输或工具快照。
+`debug agent` 的 `schemaExposure` 展示 eager／deferred id、策略、来源元数据与发现入口状态。
+它使用独立诊断 runtime；当前 TUI 的实际连接状态请看 `/mcp`。
 
 ## 并发与超时
 

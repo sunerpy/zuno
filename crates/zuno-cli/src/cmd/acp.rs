@@ -2627,7 +2627,8 @@ impl AcpSession {
                         None,
                         "the active turn ended before steering was committed",
                     ),
-                    ExpectedTurnError::ActiveTurnNotIdentified { .. } => steer_rejected(
+                    ExpectedTurnError::ActiveTurnNotIdentified { .. }
+                    | ExpectedTurnError::Closing { .. } => steer_rejected(
                         &self.id,
                         "activeTurnNotSteerable",
                         expected_turn_id,
@@ -3219,6 +3220,7 @@ impl AcpSession {
                     zuno_session_control::SessionControlService::new(Arc::new(durable_pool()?));
                 let outcome = service
                     .start_work(zuno_session_control::StartWorkRequest {
+                        expected_execution_revision: None,
                         session_id: &self.id,
                         expected_plan_revision: None,
                         anchor_message_id: self.latest_user_anchor().await?,
@@ -3336,6 +3338,7 @@ impl AcpSession {
                         .is_some();
                 zuno_session_control::SessionControlService::new(Arc::new(durable_pool()?))
                     .start_work(zuno_session_control::StartWorkRequest {
+                        expected_execution_revision: None,
                         session_id: &self.id,
                         expected_plan_revision: None,
                         anchor_message_id: self.latest_user_anchor().await?,
@@ -4587,6 +4590,7 @@ fn session_control_rpc_error(
         zuno_session_control::SessionControlError::NotInPlanMode { .. }
         | zuno_session_control::SessionControlError::MissingPlan { .. }
         | zuno_session_control::SessionControlError::PlanRevisionConflict { .. }
+        | zuno_session_control::SessionControlError::ExecutionRevisionConflict { .. }
         | zuno_session_control::SessionControlError::HandoffRequired { .. }
         | zuno_session_control::SessionControlError::DraftReview { .. } => {
             zuno_acp::RpcError::invalid_params(error.to_string())

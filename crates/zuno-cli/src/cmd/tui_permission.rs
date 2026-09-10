@@ -381,6 +381,7 @@ impl PermissionAsker for PermissionBroker {
             let mut parked = locked(&self.parked);
             if parked.surfaces == 0 {
                 return Err(ToolError::Denied {
+                    denial: None,
                     tool: tool.to_owned(),
                 });
             }
@@ -429,6 +430,7 @@ impl PermissionAsker for PermissionBroker {
         match reply {
             ReplyKind::Once | ReplyKind::Always => Ok(()),
             ReplyKind::Reject => Err(ToolError::Denied {
+                denial: None,
                 tool: tool.to_owned(),
             }),
         }
@@ -454,6 +456,7 @@ impl PermissionAsker for AutoApproval {
     ) -> Result<(), ToolError> {
         if ask.manual {
             Err(ToolError::Denied {
+                denial: None,
                 tool: tool.to_owned(),
             })
         } else {

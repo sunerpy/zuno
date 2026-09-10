@@ -1423,6 +1423,68 @@
       ],
       "type": "object"
     },
+    "McpToolExposureConfig": {
+      "additionalProperties": false,
+      "description": "Model-facing MCP discovery policy. This never grants tools or changes a connection.",
+      "properties": {
+        "auto_schema_bytes": {
+          "default": 65536,
+          "description": "Maximum automatically exposed JSON-schema bytes, excluding explicit pins.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "auto_tool_limit": {
+          "default": 32,
+          "description": "Maximum automatically exposed tool count across small service catalogs.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "mode": {
+          "$ref": "#/$defs/McpToolExposureMode",
+          "default": "auto"
+        },
+        "servers": {
+          "additionalProperties": {
+            "$ref": "#/$defs/McpToolExposureMode"
+          },
+          "default": {},
+          "description": "Per configured server overrides; exact session/Agent pins remain eager.",
+          "type": "object"
+        },
+        "small_server_tool_limit": {
+          "default": 8,
+          "description": "Automatic exposure keeps a small service whole instead of hiding random methods.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "McpToolExposureMode": {
+      "description": "Provider-schema exposure is independent from MCP connection/startup policy.",
+      "oneOf": [
+        {
+          "const": "auto",
+          "description": "Keep small service catalogs directly visible within the automatic schema budget.",
+          "type": "string"
+        },
+        {
+          "const": "eager",
+          "description": "Include authorized tools directly on the first model request.",
+          "type": "string"
+        },
+        {
+          "const": "deferred",
+          "description": "Reveal schemas through the model's tool-search entrypoint.",
+          "type": "string"
+        }
+      ]
+    },
     "MemoryConfidence": {
       "description": "A validated probability used by memory promotion.",
       "format": "double",
@@ -2782,7 +2844,7 @@
               "type": "null"
             }
           ],
-          "description": "Backend selection. `auto` (default) discovers the platform's confined\nbackend and applies `onUnavailable`. `native` runs every Agent's Shell,\nread-only contracts included, on the native process backend with the\nconfigured permission mode kept; the requested authority is recorded but\nnot OS-enforced. Accepted only from a trusted configuration layer."
+          "description": "Backend selection. Explicit `auto` discovers the platform's confined\nbackend and applies `onUnavailable`. `native` runs every Agent's Shell,\nread-only contracts included, on the native process backend with the\nconfigured permission mode kept; the requested authority is recorded but\nnot OS-enforced. An absent selection uses native on Windows/macOS unless\nexplicit confinement constraints require discovery. Accepted only from a trusted layer."
         },
         "mode": {
           "anyOf": [
@@ -3467,6 +3529,17 @@
         }
       ],
       "description": "MCP servers."
+    },
+    "mcp_tool_exposure": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/McpToolExposureConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "MCP schema exposure, independent from server startup and tool authorization."
     },
     "memory": {
       "anyOf": [

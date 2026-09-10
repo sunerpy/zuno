@@ -230,6 +230,13 @@
       }
     }
   },
+  "mcp_tool_exposure": {
+    "mode": "auto",
+    "servers": {"remote-one": "eager"},
+    "auto_tool_limit": 32,
+    "auto_schema_bytes": 65536,
+    "small_server_tool_limit": 8
+  },
   "mcp": {
     "local-one": {
       "type": "local",

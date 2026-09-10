@@ -316,6 +316,19 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
             "history.repaired",
             object(json!({"repairedToolResults": repaired_tool_results})),
         ),
+        TurnEvent::InputConsumed {
+            input_id,
+            text,
+            attachments,
+            source,
+        } => (
+            // The inbox already committed session.input.consumed. This is the
+            // turn's display projection, not another authoritative transition.
+            "turn.input.consumed",
+            object(
+                json!({"inputID":input_id,"text":text,"attachments":attachments,"source":source}),
+            ),
+        ),
         TurnEvent::AgentResolved { step, agent } => (
             "agent.resolved",
             object(json!({"step": step, "agent": agent})),
@@ -769,6 +782,19 @@ mod tests {
     use zuno_engine::interrupt::{HardInterruptReason, HardInterruptRequest, HardInterruptSource};
     use zuno_engine::r#loop::TurnEvent;
     use zuno_engine::session_command::SessionCommand;
+
+    #[test]
+    fn input_consumption_projection_does_not_duplicate_the_inbox_transition() {
+        let event = turn_event(&TurnEvent::InputConsumed {
+            input_id: "input".to_owned(),
+            text: "steer".to_owned(),
+            attachments: Vec::new(),
+            source: zuno_engine::interrupt::SoftInterruptSource::User,
+        });
+        assert_eq!(event.event_type, "turn.input.consumed");
+        assert_eq!(event.properties["inputID"], "input");
+        assert_eq!(event.properties["source"], "user");
+    }
 
     #[test]
     fn native_session_command_lifecycle_has_stable_durable_event_names() {

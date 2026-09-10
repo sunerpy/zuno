@@ -592,7 +592,7 @@ impl AgentJobStore {
         &self,
         child: session::SessionCreate,
         job: NewAgentJob,
-        parent_memory_policy_default: zuno_types::SessionMemoryPolicyProjection,
+        parent_memory_policy_default: crate::session_memory_policy::SessionMemoryPolicyDefaults,
     ) -> Result<AgentJob, DbError> {
         validate_new_job(&job)?;
         let JobSubject::ChildSession { session_id } = &job.subject else {

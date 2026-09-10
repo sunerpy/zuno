@@ -368,6 +368,7 @@ fn background_and_job_authority_match_between_the_roster_and_the_enforced_overla
 /// tool id: the common `"*": allow` default, then the catalog's native overlay.
 fn enforced_rules(name: &str) -> Vec<zuno_permission::Rule> {
     let mut rules = vec![zuno_permission::Rule {
+        source: None,
         permission: "*".to_owned(),
         pattern: "*".to_owned(),
         action: PermissionAction::Allow,

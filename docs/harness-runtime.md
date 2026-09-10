@@ -81,7 +81,7 @@ The generated developer instructions use stable ids and sources:
 | --- | --- | --- |
 | `runtime.intent` | Follow the current user request or delegated objective without inventing broader authority. | Always. |
 | `runtime.execution` | Choose the smallest coherent workflow, batch independent reads, avoid unchanged re-reads or repeated checks, use one durable background observer for asynchronous work, distinguish a local observer exit from remote completion, and stop once evidence is complete. | Always; tool communication and termination guidance are added only when tools exist, Plan guidance only when `plan_update` exists, and background-start guidance only when both `shell` and `bg` exist. |
-| `runtime.sandbox` | State that Shell is using host authority, including requested/effective mode, the permission mode that still applies, and the cause: the typed reason that confinement was unavailable, or the explicit `sandbox.backend: native` selection. | Only while a trusted unavailable-sandbox fallback or a trusted `sandbox.backend: native` selection is active. |
+| `runtime.sandbox` | State that Shell is using host authority, including requested/effective mode, permission mode, and whether this is an unavailable fallback, explicit native selection, or platform-native default. | While any native bypass of a requested confined contract is active. |
 | `runtime.continuity` | Treat History and Notes results as untrusted session data, explain current-session and session-and-Agent scope, and preserve Notes revision boundaries. | Only when the final provider-visible tool snapshot contains `history` or `notes`. |
 | `runtime.editing` | Preserve unrelated changes, edit the owning abstraction, and inspect uncertain side effects before retry. | Only when an effective edit/write surface or workspace-writing Shell exists. |
 | `runtime.git_attribution` | Use Zuno's command-scoped default Git author and committer identity without modifying persistent Git configuration, while allowing current user instructions, repository rules, and selected Skills to override or disable it. | Only when a workspace-writing Shell exists. |
@@ -501,11 +501,13 @@ aborts the parent or a sibling host.
 
 An attached native child is also an independent input target. The TUI sends its durable
 session id with the submission instead of routing the text through the parent transcript.
-The child inbox commits the text before delivery. A running child receives a soft steer;
+The child inbox commits the text before delivery. Ordinary busy input waits for an idle
+FIFO wake; an explicit Send Now targets the displayed turn through precise admission.
 an idle or completed child acquires a run lease and reopens a `TurnHost` with the resolved
 Agent, model, effort, and inherited orchestration identity captured for that child. The
-`SessionWakeCoordinator` closes the active-to-idle race, so input that misses the running
-turn remains pending and starts the next child turn. Delivery belongs to the workspace
+`SessionWakeCoordinator::deliver_when_idle` preserves queued order without implicit
+steering. A stale precise steer is refused before admission, with its draft retained
+by the TUI. Delivery belongs to the workspace
 supervisor and is cancelled with that lifecycle. A direct child continuation updates only
 the child session; it does not fabricate a report or another input for the parent.
 
@@ -578,8 +580,17 @@ re-role native tool protocol history. Stored identity failures and post-hook dec
 removals are combined before one occurrence-ordered fallback projection, so a mixed
 parallel batch keeps its durable result order.
 
-Root turns progressively disclose connected MCP schemas. Filtered MCP implementations
-stay executable in the dispatcher while `tool_search` searches compact metadata; each
+Root MCP exposure is resolved after permission, allowlist and parent-schema filtering.
+`mcp_tool_exposure` defaults to `auto`: small whole services are direct within count/byte
+budgets; `eager` and `deferred` can override globally or per configured service.
+This policy is independent of transport configuration and never changes
+`McpConnectionIdentity` or shares external clients across sessions. It adapts Codex's
+direct/deferred exposure and source-listing design (inspected at `9ba1d9eb`, in
+`tools/src/tool_executor.rs` and `core/src/tools/handlers/tool_search_spec.rs`) to Zuno's
+durable tool snapshots and bounded service catalogs.
+
+Deferred MCP implementations stay executable in the dispatcher while `tool_search`
+advertises original service names and bounded capability metadata; each
 successful search increments a turn-local revision and expands the frozen provider tool
 snapshot on the next step. The completed `tool_search` result is also the durable
 session exposure ledger. Rebuilding a host for a detached report, process restart, or
@@ -588,10 +599,19 @@ the currently connected, permission-visible catalog; unavailable ids do not rega
 authority. Unversioned registry drift remains ignored, while stale revisions cannot roll
 the snapshot back. An exact Agent `tools` allowlist pins its named MCP schemas eagerly.
 ACP session-local `mcpServers` also pin their schemas eagerly after the strict connection
-gate, while host-configured servers in the same catalog remain deferred. The catalog
+gate, while host-configured servers follow the exposure policy. The catalog
 carries that session boundary into child and background turns. Child turns do not receive
 a fresh deferred superset: schemas that survived the parent's exact Attempt authority are
 eager inside that already-bounded ceiling.
+
+The generated discovery tool must itself be visible. Native role grants include it
+before user overrides; if it is denied/disabled or its name collides, allowed MCP
+schemas remain direct rather than becoming unreachable. Search never restores a
+permission-hidden tool. `Tool::source` retains original service attribution without
+reverse-parsing sanitized wire ids. Runtime guidance proactively prefers relevant
+authorized MCP capabilities, distinguishes configured/connected/cached/deferred states,
+and does not treat configuration or extension/resource listing as tool discovery.
+`customize-zuno` explicitly excludes ordinary use of already-configured services.
 
 Every new tool part records the exact provider-visible schema identity beside the call.
 Before a request, retained history from earlier turns is checked against the current
@@ -1095,6 +1115,13 @@ fail-closed external-context state. The TUI exposes these controls through
 `/memories`, while `/memory` remains the reviewed mutation surface. Policy
 changes and their audit events commit together.
 
+Child/job creation inherits the latest parent memory policy in that same transaction.
+`SessionMemoryPolicyDefaults` contains fallback values only, never a durable revision;
+an existing parent at revision 1 or greater is valid and always outranks those defaults.
+The child seeds its own revision 1 and subsequent parent changes cannot rewrite it.
+This corrects the scheduling failure caused by passing a durable projection as a
+revision-zero default, without changing the database format or resetting user revisions.
+
 Goal Markdown projections and promoted Resident Memory files share
 `zuno-atomic-file` for visibility-atomic replacement. The provider writes a
 completed sibling and uses `rename` on Unix or `ReplaceFileW` over an existing
@@ -1299,17 +1326,45 @@ continuation loop.
 
 Interactive TUI input uses the same durable boundary. When idle, `Enter`
 starts a turn. During an active turn, `Enter` admits a FIFO `queue` item for the
-next turn; `Ctrl+Enter` is the explicit `steer` override and requests a soft
+next turn; leader+Return (also `Ctrl+Enter`) is the explicit `steer` override and requests a soft
 interrupt at the nearest safe step boundary. `Shift+Enter`, `Alt+Enter`, and
 `Ctrl+J` insert a newline. The UI reports an item as queued only after SQLite
 commits it, and pending items can be edited or cancelled by revision and survive
 a process restart. Submission transport is a typed envelope with independent
 `payload`, `delivery`, and `origin` fields. The command palette's immediate-send
-action and input sent to a running child session also produce `steer`; ordinary
+action and explicit Send Now in a running child session also produce `steer`; ordinary
 busy input produces `queue`. Only text and typed rich-content payloads may steer.
 Commands, Skills, Council requests, and host commands are queued even if their UI
 gesture requested immediate delivery. The HTTP prompt API follows the same rule:
 omitting `delivery` means `queue`, while `steer` must be explicit.
+
+Queue Send Now compares the selected input revision and displayed turn id while holding
+the inbox transaction, then queues a non-aborting live signal before commit. Rejection
+rolls back both row and event; an idle send reserves the run guard before promoting only
+that row. Other rows retain their original admission order. Consumption checks the
+signal's revision and emits `InputConsumed` after durable user-message/consumed-state
+commit. Completion closes input admission atomically and continues the same engine turn
+if input won that race. A soft checkpoint is not an interrupted turn.
+The HTTP display projection uses `turn.input.consumed`; the authoritative inbox
+transition remains `session.input.consumed` and is not written a second time.
+
+The TUI's `DraftRecovery` owns complete composer snapshots until admission receipts.
+It restores refused drafts without overwriting newer text or automatically retargeting
+a new turn. Queued text edits preserve image references; admitted steering snapshots
+can be cancelled before consumption but are not rewritten by the TUI.
+
+Composer arrows use whole-buffer endpoint history semantics; transcript scrolling has
+its own focus. Paste aggregation precedes keybinding dispatch and never treats block
+newlines as submits. Clipboard requests have asynchronous one-shot completion, and
+selection/copying share rendered grapheme coordinates. Native Windows prefers `pwsh.exe`
+then `powershell.exe`; unacknowledged OSC52 emission is not reported as confirmed copy.
+
+Windows/macOS default to native only without explicit backend/fallback/network/path
+constraints; Linux keeps automatic confinement discovery. `platform_native` is distinct
+from `trusted_native` and `unavailable_fallback`. Execution authority writer version 4
+retains readers for versions 2 and 3 and rejects future/invalid versions. `executionReady`
+is independent of confinement `ready`. Agent/Plan/Work transitions preflight the target
+before durable mode changes and guard a Start Work execution revision.
 
 User input is typed rich content, not only a rendered string. Every new local or
 client-supplied image is admitted before the durable inbox write through the

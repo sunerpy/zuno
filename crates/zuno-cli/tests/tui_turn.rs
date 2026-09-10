@@ -297,6 +297,18 @@ fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_zuno"))
 }
 
+/// These scenarios exercise typing, not legacy paste. Sending a whole line plus
+/// CR in one PTY write is a paste burst and must no longer submit accidentally.
+fn type_keys(writer: &mut impl std::io::Write, text: &str) -> std::io::Result<()> {
+    for character in text.chars() {
+        let mut encoded = [0; 4];
+        writer.write_all(character.encode_utf8(&mut encoded).as_bytes())?;
+        writer.flush()?;
+        std::thread::sleep(Duration::from_millis(35));
+    }
+    Ok(())
+}
+
 /// A config naming one OpenAI-compatible provider pointed at the mock.
 ///
 /// `permission` is unset on purpose, exactly as in `tool_turn.rs`: the turn must be
@@ -531,7 +543,7 @@ fn run_under_pty(
             let stdin = child.stdin.as_mut().ok_or_else(|| {
                 std::io::Error::other("the launcher's stdin was not piped, so nothing can be typed")
             })?;
-            stdin.write_all(format!("{PROMPT}\r").as_bytes())?;
+            type_keys(stdin, &format!("{PROMPT}\r"))?;
             stdin.flush()?;
             typed = true;
         }
@@ -764,7 +776,9 @@ fn run_parallel_delegation_under_pty(
                 .stdin
                 .as_mut()
                 .ok_or_else(|| std::io::Error::other("parallel delegation stdin was not piped"))?;
-            stdin.write_all(format!("{CHILD_STEER_PROMPT}\r").as_bytes())?;
+            type_keys(stdin, CHILD_STEER_PROMPT)?;
+            // Enter now queues. Explicit Send Now steers this same child turn.
+            stdin.write_all(b"\x18\r")?;
             stdin.flush()?;
             child_message_sent = true;
         } else if child_message_sent
@@ -1107,7 +1121,7 @@ fn run_direct_goal_under_pty(env: &ScriptedEnv) -> Result<Transcript, std::io::E
             .as_mut()
             .ok_or_else(|| std::io::Error::other("goal-command stdin was not piped"))?;
         if command_typed_at.is_none() && text.contains("ask anything, or / for commands") {
-            stdin.write_all(format!("/goal {DIRECT_GOAL_OBJECTIVE}\r").as_bytes())?;
+            type_keys(stdin, &format!("/goal {DIRECT_GOAL_OBJECTIVE}\r"))?;
             stdin.flush()?;
             command_typed_at = Some(Instant::now());
         } else if !objective_seen
@@ -1220,7 +1234,7 @@ fn run_new_session_under_pty(env: &ScriptedEnv) -> Result<Transcript, std::io::E
             .as_mut()
             .ok_or_else(|| std::io::Error::other("new-session stdin was not piped"))?;
         if !command_typed && text.contains("ask anything, or / for commands") {
-            stdin.write_all(b"/new\r")?;
+            type_keys(stdin, "/new\r")?;
             stdin.flush()?;
             command_typed = true;
             command_typed_at = Some(Instant::now());
@@ -1242,7 +1256,7 @@ fn run_new_session_under_pty(env: &ScriptedEnv) -> Result<Transcript, std::io::E
             if count != initial_count {
                 break;
             }
-            stdin.write_all(b"first prompt in a fresh session\r")?;
+            type_keys(stdin, "first prompt in a fresh session\r")?;
             stdin.flush()?;
             prompt_sent = true;
         } else if materialized && exit_sent_at.is_none() {
@@ -1338,7 +1352,7 @@ fn run_session_picker_under_pty(env: &ScriptedEnv) -> Result<Transcript, std::io
                 .stdin
                 .as_mut()
                 .ok_or_else(|| std::io::Error::other("picker stdin was not piped"))?;
-            stdin.write_all(b"/session\r")?;
+            type_keys(stdin, "/session\r")?;
             stdin.flush()?;
             command_sent = true;
             submit_sent_at = Some(Instant::now());
@@ -1465,7 +1479,7 @@ fn run_session_picker_action_under_pty(
                 .stdin
                 .as_mut()
                 .ok_or_else(|| std::io::Error::other("picker stdin was not piped"))?;
-            stdin.write_all(b"/session\r")?;
+            type_keys(stdin, "/session\r")?;
             stdin.flush()?;
             command_sent = true;
             command_sent_at = Some(Instant::now());
@@ -1633,7 +1647,7 @@ fn run_consecutive_session_deletes_under_pty(
             .as_mut()
             .ok_or_else(|| std::io::Error::other("picker stdin was not piped"))?;
         if !command_sent && text.contains("ask anything, or / for commands") {
-            stdin.write_all(b"/session\r")?;
+            type_keys(stdin, "/session\r")?;
             stdin.flush()?;
             command_sent = true;
             command_sent_at = Some(Instant::now());
@@ -1848,7 +1862,7 @@ async fn parallel_foreground_children_remain_live_and_navigable_in_the_real_tui(
     );
     assert!(
         transcript.provider_received_child_message,
-        "the direct child message did not interrupt and restart the real child provider request\n\
+        "explicit Send Now did not reach the next provider step in the running child turn\n\
          transcript:\n{}",
         transcript.text
     );
@@ -2263,7 +2277,7 @@ fn run_session_resume_under_pty(env: &ScriptedEnv) -> Result<ResumeTranscript, s
                 if !saw_launch {
                     break;
                 }
-                stdin.write_all(b"/session\r")?;
+                type_keys(stdin, "/session\r")?;
                 stdin.flush()?;
                 session_command_sent_at = Some(Instant::now());
             }
@@ -2288,7 +2302,7 @@ fn run_session_resume_under_pty(env: &ScriptedEnv) -> Result<ResumeTranscript, s
                 && since_switch.contains("orchestrator")
             {
                 saw_switch = true;
-                stdin.write_all(b"/model\r")?;
+                type_keys(stdin, "/model\r")?;
                 stdin.flush()?;
                 model_command_sent_at = Some(Instant::now());
             }

@@ -43,6 +43,8 @@ pub struct EnterPlanRequest<'a> {
 #[derive(Debug, Clone)]
 pub struct StartWorkRequest<'a> {
     pub session_id: &'a str,
+    /// Freeze the Work identity inspected by a client's execution preflight.
+    pub expected_execution_revision: Option<i64>,
     pub expected_plan_revision: Option<i64>,
     pub anchor_message_id: Option<String>,
     pub draft_review_risk_reason: Option<String>,
@@ -80,6 +82,14 @@ pub enum SessionControlError {
     )]
     PlanRevisionConflict {
         plan_id: String,
+        expected: i64,
+        actual: i64,
+    },
+    #[error(
+        "session `{session_id}` execution state changed during preflight: expected revision {expected}, found {actual}"
+    )]
+    ExecutionRevisionConflict {
+        session_id: String,
         expected: i64,
         actual: i64,
     },
@@ -247,6 +257,15 @@ impl SessionControlService {
                 session_id: request.session_id.to_owned(),
             }
         })?;
+        if let Some(expected) = request.expected_execution_revision
+            && expected != state.revision
+        {
+            return Err(SessionControlError::ExecutionRevisionConflict {
+                session_id: request.session_id.to_owned(),
+                expected,
+                actual: state.revision,
+            });
+        }
         let already_authorized = state.mode == CollaborationMode::Work
             && state.authorized_plan_id.as_deref() == Some(plan.id.as_str())
             && state.authorized_plan_revision == Some(plan.revision)

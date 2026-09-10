@@ -283,7 +283,7 @@ fn production_wrappers_preserve_the_screens_focused_scope() {
     let dialogs = DialogHost::new(context.clone(), Box::new(screen));
     let bridge = PermissionBridge::new(context, broker, dialogs);
 
-    assert_eq!(bridge.focused_scopes(), ["history"]);
+    assert_eq!(bridge.focused_scopes(), ["history", "input"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

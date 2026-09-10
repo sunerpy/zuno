@@ -1,5 +1,14 @@
 # 配置项参考
 
+## MCP 工具可见性
+
+`mcp_tool_exposure` 不改变连接或权限。默认 `auto` 在预算内直接展示小型服务整个工具集：
+每个服务最多 8 个工具，共享自动预算 32 个工具、65,536 字节 schema／描述。
+可用正数 `small_server_tool_limit`、`auto_tool_limit`、`auto_schema_bytes` 调整；
+`servers` 按配置中的精确服务名覆盖为 `auto`、`eager` 或 `deferred`。
+Agent／ACP 会话精确指定的工具始终立即可见，不受自动预算限制。
+详见 [MCP server](/zh/guide/mcp)。
+
 ## 配置文件
 
 Zuno 只读取 `zuno.json` 与 `zuno.jsonc`。全局文件位于 `$XDG_CONFIG_HOME/zuno`（通常是 `~/.config/zuno`）；项目层是从 worktree 根目录到当前目录的裸 `zuno.json[c]` 文件，以及 `.zuno/` 下的文件。`ZUNO_CONFIG` 追加一个显式文件，`ZUNO_CONFIG_DIR` 追加一个目录，`ZUNO_CONFIG_CONTENT` 提供最后一层环境配置。
@@ -423,7 +432,7 @@ tools "edit" is false and tools "write" is true, but both are governed by permis
 | `mode` | `read-only`、`workspace-write`、`danger-full-access` | `workspace-write` |
 | `network` | `deny`、`allow` | 受限模式为 `deny`，`danger-full-access` 使用宿主网络 |
 | `onUnavailable` | `deny`、`run-unconfined` | `deny` |
-| `backend` | `auto`、`native` | `auto` |
+| `backend` | `auto`、`native` | 随平台解析；显式约束优先 |
 | `writableRoots` | 额外的现有可写目录数组 | 空 |
 | `protectedPaths` | 重新施加只读保护的路径数组，每一项在构建沙箱策略时必须已存在且不能是符号链接 | 空 |
 
@@ -467,10 +476,10 @@ bubblewrap 参数的那一刻已存在时才被施加；策略构建之后才消
 
 降级时仍保留 `standard`、`strict` 或 `allow_all` 权限模式、显式拒绝、灾难性命令硬拒绝、
 后台执行、超时与取消链路；但请求的网络拒绝、可写根目录和受保护路径不会由 OS 强制执行。
-只读 Agent 永远不会通过这条降级无沙箱运行；它唯一的原生执行路径是下面显式受信的
+只读 Agent 不会通过这条降级无沙箱运行；其原生执行可以来自平台默认值，或下面显式受信的
 `sandbox.backend: native`。
 
-`backend` 独立于 `mode` 所授予的权限，单独选择执行后端。`auto`（默认）发现平台的受约束
+`backend` 独立于 `mode` 所授予的权限，单独选择执行后端。显式 `auto` 发现平台的受约束
 后端，无法部署时再应用 `onUnavailable`；`native` 让每一个 Agent 的 Shell——包括契约为
 只读的 Agent——都直接在原生进程后端上运行，完全不探测受约束后端，而已配置的 `standard`、
 `strict` 或 `allow_all` 权限模式原样保留（只有 `danger-full-access` 才隐含 `allow_all`）：
@@ -512,6 +521,16 @@ describe shell execution as sandboxed.
 `fallbackEligible: false`，并且对受约束的请求模式保持 `ready: false`，所以 `--check` 依然是
 严格的部署门禁。
 
+缺省后端按平台解析：Windows/macOS 默认原生执行（`platform_native`），Linux 默认 `auto`。
+这只在没有显式 `onUnavailable`、`network: "deny"`、非空 `writableRoots` 或
+`protectedPaths` 时成立；显式 `backend: "auto"` 与各配置层的限制不会被覆盖。
+默认原生执行保留原权限模式，不隐含 `allow_all`，请求的只读／网络约束不由 OS 强制执行。
+
+`zuno debug sandbox --agent deep --check-execution` 通过 `executionReady` 检查能否执行；
+`--check` 仍严格检查 OS 约束。`backendResolutionSource` 区分显式选择、显式约束与平台默认。
+Agent／Plan／Work 切换先检查目标后端，再修改协作状态；Start Work 还会核对预检时的
+execution revision，防止使用已变化的执行身份。
+
 项目 `zuno.json[c]` 与 `.zuno` 配置只能把 `onUnavailable` 设为 `deny`、把 `backend` 设为
 `auto`。只有受信的全局、显式配置、环境、CLI 或受管层可以启用 `run-unconfined` 或选择
 `native`，受管策略仍拥有最终否决权：
@@ -528,16 +547,16 @@ ZUNO_SANDBOX_BACKEND=native zuno
 和 `fallbackReason`。`--check` 仍严格检查请求的约束是否可部署，不会因为允许降级或选择了
 原生后端而成功。
 
-macOS 与 Windows 目前没有受约束的沙箱后端，默认失败关闭；拒绝信息会点明平台、说明受信降级
-是否适用于本次请求，并列出上述全部补救方式。在这类平台上交互式启动 `zuno` 时，会在终端进入
-raw mode 之前询问一次，且只在以下条件同时成立时才询问：请求在这台主机上无法被约束（只读请求
-也包括在内）、没有任何层设置过 `sandbox.onUnavailable` 或 `sandbox.backend`、标准输入**与**
+macOS 与 Windows 没有显式约束时默认原生执行，不需要可用性询问；显式要求约束时仍会明确拒绝。
+Linux 缺少可用约束后端时，交互式启动可在 raw mode 之前询问一次，且仅当以下条件同时成立：
+请求无法被约束（只读请求也包括在内），没有任何层设置过 `sandbox.onUnavailable`、
+`sandbox.backend`、网络拒绝或路径约束，标准输入**与**
 标准错误都是终端。回答 yes 时，本进程的解析结果与传入 `--sandbox-backend native` 完全一致
 ——同一条覆盖路径、`resolutionKind` 为 `trusted_native`、同样的持久化记录与原生执行警告——
 并对该进程之后的每一次组合都生效，包括之后切换到只读 Agent；回答 no 则以该拒绝信息退出。
 任何层显式选择了 `deny`、`run-unconfined`、`auto` 或 `native` 时按原样生效，不会询问；
-非终端下同样不会询问。`run`、`acp` 与 `serve` 永远不会询问，只打印同样带补救方式的拒绝信息，
-headless 调用仍然需要标志、环境变量或受信配置层。接受询问不是沙箱隔离，而是以 Zuno 进程
+非终端下同样不会询问。`run`、`acp` 与 `serve` 不询问，但同样采用 Windows/macOS 平台默认；
+Linux 无法提供约束时仍需选择受信覆盖。接受询问不是沙箱隔离，而是以 Zuno 进程
 用户的权限原生执行。
 
 这个回答不会被子进程继承，命令行标志与交互式提示在这一点上并不相同。在 Unix 上，解析出的

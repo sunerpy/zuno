@@ -6,6 +6,7 @@ use zuno_permission::{
 
 fn rule(permission: &str, pattern: &str, action: PermissionAction) -> Rule {
     Rule {
+        source: None,
         permission: permission.to_owned(),
         pattern: pattern.to_owned(),
         action,
@@ -33,7 +34,7 @@ fn deny_returns_a_typed_error_without_creating_a_pending() {
         .authorize(request("per_deny", "ses_a"), &rules)
         .expect_err("deny must stop authorization");
 
-    assert!(matches!(error, ToolError::Denied { ref tool } if tool == "shell"));
+    assert!(matches!(error, ToolError::Denied { ref tool, .. } if tool == "shell"));
     assert!(engine.pending().is_empty());
 }
 
@@ -51,7 +52,7 @@ fn later_denied_pattern_prevents_an_earlier_ask_from_becoming_pending() {
         .authorize(input, &rules)
         .expect_err("a deny on any pattern must stop authorization");
 
-    assert!(matches!(error, ToolError::Denied { ref tool } if tool == "shell"));
+    assert!(matches!(error, ToolError::Denied { ref tool, .. } if tool == "shell"));
     assert!(engine.pending().is_empty());
 }
 
@@ -278,7 +279,7 @@ fn a_runtime_always_grant_cannot_override_a_configured_deny() {
         .authorize(request("per_after_deny", "ses_a"), &configured)
         .expect_err("a configured deny outranks a runtime grant");
 
-    assert!(matches!(error, ToolError::Denied { ref tool } if tool == "shell"));
+    assert!(matches!(error, ToolError::Denied { ref tool, .. } if tool == "shell"));
     assert!(engine.pending().is_empty());
     assert_eq!(
         engine.approved_rules(),
@@ -340,7 +341,7 @@ fn a_request_naming_no_pattern_still_obeys_configuration() {
     let error = denying
         .authorize(input, &[rule("shell", "*", PermissionAction::Deny)])
         .expect_err("a catch-all deny covers a request that names nothing");
-    assert!(matches!(error, ToolError::Denied { ref tool } if tool == "shell"));
+    assert!(matches!(error, ToolError::Denied { ref tool, .. } if tool == "shell"));
     assert!(denying.pending().is_empty());
 
     let mut allowing = PermissionEngine::new();

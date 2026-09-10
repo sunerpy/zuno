@@ -48,6 +48,8 @@ impl HardInterruptRequest {
 pub struct SoftInterruptMessage {
     /// Durable inbox id, when this message was admitted before wake-up.
     pub input_id: Option<String>,
+    /// Revision offered to the engine, when backed by an editable durable input.
+    pub revision: Option<i64>,
     pub content: String,
     /// Legacy inline image payloads admitted by non-object-aware callers.
     pub images: Vec<(String, String)>,
@@ -58,8 +60,17 @@ pub struct SoftInterruptMessage {
     pub source: SoftInterruptSource,
 }
 
+impl SoftInterruptMessage {
+    #[must_use]
+    pub fn with_revision(mut self, revision: i64) -> Self {
+        self.revision = Some(revision);
+        self
+    }
+}
+
 /// The producer of a soft interruption.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SoftInterruptSource {
     User,
     System,
