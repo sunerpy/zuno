@@ -1,6 +1,6 @@
 //! Canonical permission configuration.
 //!
-//! Zuno is unreleased, so the public shape has one representation only:
+//! The public shape has one representation:
 //! `permission.mode` selects cross-cutting HITL behavior and
 //! `permission.rules` carries ordered per-tool rules.
 
@@ -186,6 +186,11 @@ impl<'de> Deserialize<'de> for PermissionObject {
 }
 
 fn validate_rule<E: de::Error>(key: &str, rule: &PermissionRule) -> Result<(), E> {
+    if key == "memory_propose" {
+        return Err(de::Error::custom(
+            "memory_propose was replaced by memory_update; rename this permission rule so the existing allow/ask/deny is not silently lost",
+        ));
+    }
     if ACTION_ONLY_KEYS.contains(&key) && matches!(rule, PermissionRule::Patterns(_)) {
         return Err(de::Error::custom(format!(
             "permission {key:?} takes a bare action, not per-pattern rules"

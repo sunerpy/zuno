@@ -117,6 +117,39 @@ fn request() -> ExtractionRequest {
 }
 
 #[tokio::test]
+async fn memory_consolidation_uses_the_audited_no_tools_provider_path() {
+    use zuno_learning::{MemoryConsolidationRequest, MemoryConsolidator};
+    let (client, requests) = client(vec![answer(r#"{"updates":[]}"#)]);
+    let result = client
+        .consolidate_memory(MemoryConsolidationRequest {
+            project_id: "p".to_owned(),
+            session_id: "s".to_owned(),
+            scopes: vec![json!({"scope":"project","revision":1,"entries":[]})],
+            experiences: vec![json!({"id":"evidence","summary":"Prefer concise reports."})],
+            user_changes: Vec::new(),
+            correction: None,
+        })
+        .await
+        .expect("no-op consolidation");
+    assert!(result.updates.is_empty());
+    let requests = requests.lock().expect("requests");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].tools.is_empty());
+    let events = client
+        .events
+        .read_after("s", None)
+        .expect("durable request/outcome");
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].properties["tools"], json!([]));
+    assert!(
+        events[0].properties["request"]
+            .to_string()
+            .contains("Prefer concise reports.")
+    );
+    assert_eq!(events[1].properties["output"], r#"{"updates":[]}"#);
+}
+
+#[tokio::test]
 async fn extraction_bounds_legacy_input_repairs_once_and_audits_the_real_requests() {
     let (mut client, requests) = client(vec![
         answer("invalid JSON"),
@@ -422,6 +455,7 @@ async fn startup_catchup_is_idempotent_and_project_work_outlives_the_registering
         experiences: ExperienceService::new(pool.clone(), None),
         patterns: PatternMiner::new(pool.clone(), settings.clone()),
         skills: zuno_learning::SkillCandidateService::new(pool.clone(), settings),
+        memory: None,
         project_id: "p".to_owned(),
         project_root: std::path::PathBuf::from("/work"),
     };

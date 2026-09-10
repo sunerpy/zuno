@@ -21,6 +21,35 @@ fn native(name: &str) -> agent::Agent {
 }
 
 #[test]
+fn native_memory_tools_follow_role_and_later_user_denies() {
+    for name in [
+        "build",
+        "orchestrator",
+        "deep",
+        "general",
+        "fixer",
+        "explorer",
+    ] {
+        let role = zuno_agent::builtin::get(name, false).expect("role");
+        let rules = role.rules();
+        assert!(!is_tool_hidden("memory_read", &rules), "{name}");
+        assert!(!is_tool_hidden("experience_search", &rules), "{name}");
+        let can_write = matches!(
+            name,
+            "build" | "orchestrator" | "deep" | "general" | "fixer"
+        );
+        assert_eq!(
+            !is_tool_hidden("memory_update", &rules),
+            can_write,
+            "{name}"
+        );
+        let mut denied = rules;
+        denied.push(rule("memory_update", PermissionAction::Deny));
+        assert!(is_tool_hidden("memory_update", &denied));
+    }
+}
+
+#[test]
 fn one_profile_snapshots_definition_rules_and_delegation_targets() {
     let mut entry = native("orchestrator");
     entry.model = Some("example/reasoner".to_owned());

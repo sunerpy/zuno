@@ -1101,11 +1101,15 @@ completes normally.
 
 ## Resident memory and user learning
 
-Resident Memory has one model-visible mutation boundary: `memory_propose`. It
+Resident Memory has one model-visible mutation boundary: `memory_update`. It
 validates add/replace/remove operations and inserts a durable `MemoryCandidate`;
 it never edits the resident file directly. Candidates retain scope, action,
 reason, confidence, source session/message, timestamps, diagnostics, and exact
-before/after snapshots.
+before/after snapshots. `memory_read` exposes bounded current entries and revisions.
+`memory_update` uses `ToolEffect::ManagedMemory`: generic strict side-effect
+approval is unnecessary for this native data-only capability, while explicit
+deny/ask and session generation policy still apply. It cannot modify permissions,
+arbitrary files, MCP configuration or Skills.
 
 Each durable session also owns a revisioned `session_memory_policy`.
 `use_memories=false` removes resident Memory and retrieved Experience sections
@@ -1133,9 +1137,9 @@ not hide permissions or other durable failures. This boundary is separate from
 crash durability; authoritative session state remains in SQLite, and each caller
 owns any stronger sync policy.
 
-The default Memory promotion policy is `review`. `high_confidence` applies
-candidates at or above the configured threshold, while `automatic` applies every
-validated candidate. New applications and undo commit resident entries, revision
+The default Memory promotion policy is `automatic`; explicit `review` remains
+available. `high_confidence` applies candidates at or above the configured threshold.
+New applications and undo commit resident entries, revision
 history, exact candidate snapshots and terminal state in one SQLite transaction:
 
 ```text
@@ -1183,6 +1187,23 @@ concurrency, and propagates cancellation with bounded shutdown. Startup catches
 missed admission; each claim has a fresh token, and periodic heartbeats recheck
 policy. Token checks fence Memory/pattern commits.
 
+Raw extraction only stores Experience and hints. `MemoryMaintainer` schedules
+separate `project_aggregation` work with `purpose: memory`, without the Skill
+aggregation evidence-count/interval gate. `MemoryConsolidator` has no tools and
+returns at most 32 typed operations over bounded current memory and verified
+evidence. `MemoryMaintenanceStore` atomically checks both scope revisions, lease
+ownership, source content and generation policy, then commits candidate rows,
+resident versions, provenance, job completion and a no-op watermark.
+There is at most one semantic repair; unchanged successful inputs are not rerun.
+
+`resident_memory_provenance` keeps independent support separate from direct
+user-owned memory. Invalid sources cause immediate recall suppression; explicit
+source forgetting and managed retractions are atomic. Retraction cannot restore
+superseded old text or erase a user's reaffirmed note. Explicit forget/undo
+decisions fence future automatic rewrites. Recall is fallible data, not an
+authorization or an enforced instruction. Format 12 adds this state through the
+guarded migration of formats 5–11; no database rebuild is required.
+
 Automatic extraction itself is background idle work. Its default six-hour
 deadline, 60-second poll, and two-job wake cap are configurable under
 `learning.post_turn`. The claim transaction checks session activity, pending
@@ -1218,7 +1239,7 @@ snapshots without replaying an uncertain write.
 `/memory` remains the resident Memory review surface. `/memories` controls
 session use and generation. `/learn` and `/reflect`
 manage experience, feedback, patterns, Skill candidates, evaluation, and
-reviewed revocation. See the user-facing [Memory and learning](guide/memory-learning.md)
+automatic Memory maintenance and separately reviewed Skill revocation. See the user-facing [Memory and learning](guide/memory-learning.md)
 guide, [resident Memory](design/memory-learning.md), and the
 [user learning flywheel](design/user-learning-flywheel.md).
 

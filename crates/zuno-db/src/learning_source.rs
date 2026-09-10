@@ -377,6 +377,16 @@ impl LearningSourceStore {
         session_id: &str,
         source: &LearningSource,
     ) -> Result<bool, DbError> {
+        let connection = self.pool.get()?;
+        Self::source_is_current_on(&connection, session_id, source)
+    }
+
+    /// Reuse source validation inside the transaction that commits derived memory.
+    pub(crate) fn source_is_current_on(
+        connection: &rusqlite::Connection,
+        session_id: &str,
+        source: &LearningSource,
+    ) -> Result<bool, DbError> {
         if source.content.len() > MAX_SOURCE_BYTES
             || source.reference_id.len() > 512
             || source.source_id.len() > 256
@@ -386,9 +396,7 @@ impl LearningSourceStore {
         }
         if source.field == LearningSourceField::Feedback {
             use rusqlite::OptionalExtension as _;
-            let row = self
-                .pool
-                .get()?
+            let row = connection
                 .query_row(
                     "SELECT revision,json_object('rating',rating,'note',note,'revision',revision)
                  FROM message_feedback WHERE message_id=?1 AND session_id=?2
@@ -416,7 +424,6 @@ impl LearningSourceStore {
             }
             LearningSourceField::Feedback => unreachable!("feedback checked above"),
         };
-        let connection = self.pool.get()?;
         let mut statement = connection
             .prepare(&format!(
                 "SELECT {selector},

@@ -441,6 +441,16 @@ impl LearningJobStore {
                     "SELECT learning_job.id FROM learning_job
                      WHERE learning_job.status = 'queued'
                        AND learning_job.scheduled_at <= ?1
+                       AND (
+                         COALESCE(json_extract(learning_job.payload,'$.purpose'),'') <> 'memory'
+                         OR NOT EXISTS (
+                           SELECT 1 FROM learning_job running_memory
+                           WHERE running_memory.project_id=learning_job.project_id
+                             AND running_memory.kind='project_aggregation'
+                             AND json_extract(running_memory.payload,'$.purpose')='memory'
+                             AND running_memory.status='running' AND running_memory.lease_expires>?1
+                         )
+                       )
                        AND learning_job.kind IN (
                          'extraction','project_aggregation','global_aggregation'
                        )

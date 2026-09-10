@@ -637,7 +637,10 @@ Shell 门禁会穿过命令行前面的包装程序来阅读它——`sudo`、`d
 
 ## 严格 HITL 授权
 
-`strict` 模式要求每个有副作用的调用都获得一次新的人工决策。这适用于不希望任何写操作在无人确认下发生的场景。
+`strict` 模式要求普通执行、文件和外部副作用调用获得一次新的人工决策。
+原生 `memory_update` 是受限记忆数据的明确例外，不触发通用 strict 审批；显式工具 deny/ask、
+会话 generation policy 和主动配置的 `memory.promotion: review` 仍然生效。
+它不能写任意文件、权限、配置或 Skill；MCP／扩展元数据不能声明这个例外。
 
 ## Skill 发现
 
@@ -671,7 +674,14 @@ Shell 门禁会穿过命令行前面的包装程序来阅读它——`sudo`、`d
 
 ## Memory 与用户学习
 
-`memory` 配置持久候选、反思、评审、提升与撤销。记忆写入是提议而非直接生效：候选进入待评审状态，由人决定是否提升为常驻记忆。
+`memory.promotion` 默认 `automatic`：有效的普通记忆修改自动提交，仍保留候选日志和版本。
+已有的显式 `review` 配置继续要求复核；`high_confidence` 使用 `auto_confidence`（默认 `0.9`）。
+`memory.tool` 暴露受限的 `memory_read` 与 `memory_update`，不赋予任意文件写入权限。
+替换／移除应携带读取到的 `expected_revision`；省略时必须提供完整、精确的旧条目。
+后台先提取经验与原始建议，再由独立、无工具权限的任务去重、更正和合并记忆，遵守同一 promotion 策略。
+Global 自动记忆必须引用明确的用户证据。来源失效会立即停止加载失去全部支持的派生记忆。
+普通记忆更新不触发 strict 通用副作用审批，但显式 `deny`/`ask`、会话 use/generation policy 仍生效；
+Skill 的复核、评估和应用边界不变。`memory.resident` 在每个回合边界捕获当前版本用于 Prompt。
 
 `learning` 将“使用已有 Experience”与“生成新学习”分开控制：
 

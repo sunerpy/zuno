@@ -2507,6 +2507,7 @@ struct LearningRuntime {
 
 struct LearningGenerationRuntime {
     consolidator: Arc<dyn zuno_learning::PatternConsolidator>,
+    memory: Option<Arc<zuno_learning::MemoryMaintainer>>,
     extractor: Arc<dyn LearningExtractor>,
     evaluation: SkillEvaluationRuntime,
     owner_id: String,
@@ -3635,10 +3636,16 @@ impl TurnHost {
             } else {
                 None
             };
-            let memory_tool = memory
+            let memory_tools = memory
                 .as_ref()
                 .filter(|_| memory_settings.tool)
-                .map(|service| erase(zuno_tools::MemoryTool::new(Arc::clone(service))));
+                .map(|service| {
+                    vec![
+                        erase(zuno_tools::MemoryReadTool::new(Arc::clone(service))),
+                        erase(zuno_tools::MemoryTool::new(Arc::clone(service))),
+                    ]
+                })
+                .unwrap_or_default();
             let learning_projection =
                 zuno_learning::LearningProjectionService::new(Arc::clone(&database));
             let mut notes = plan.notes;
@@ -3690,6 +3697,15 @@ impl TurnHost {
                                 let extractor: Arc<dyn LearningExtractor> = client.clone();
                                 scheduler = scheduler.with_extractor_version(extractor.version());
                                 Some(LearningGenerationRuntime {
+                                    memory: memory.as_ref().map(|memory| {
+                                        Arc::new(zuno_learning::MemoryMaintainer::new(
+                                            Arc::clone(&database),
+                                            Arc::clone(memory),
+                                            client.clone(),
+                                            project_id.clone(),
+                                            prepared.identity.id().to_owned(),
+                                        ))
+                                    }),
                                     consolidator: client,
                                     extractor,
                                     evaluation: SkillEvaluationRuntime {
@@ -3922,7 +3938,7 @@ impl TurnHost {
                     workflows: Arc::new(workflow_host.clone()),
                     councils: Arc::new(workflow_host.clone()),
                     job_controller: Arc::new(background_jobs.clone()),
-                    memory: memory_tool,
+                    memory: memory_tools,
                     experience_search: experience_search_tool,
                     tool_authority: plan.tool_authority.clone(),
                 },
@@ -5612,6 +5628,11 @@ impl TurnHost {
             experiences,
             patterns,
             skills,
+            memory: self
+                .learning
+                .as_ref()
+                .and_then(|learning| learning.generation.as_ref())
+                .and_then(|generation| generation.memory.clone()),
             project_id: self.project_id.clone(),
             project_root: self.project_root.clone(),
         }
@@ -5627,16 +5648,8 @@ impl TurnHost {
                 .iter()
                 .map(experience_value)
                 .collect::<Vec<_>>(),
-            "memoryPromotions": persisted
-                .memory_promotions
-                .iter()
-                .map(|promotion| json!({
-                    "experienceID": promotion.experience_id,
-                    "candidateID": promotion.candidate.as_ref().map(|candidate| &candidate.id),
-                    "automaticallyApplied": promotion.automatically_applied,
-                    "rejectedReason": promotion.rejected_reason,
-                }))
-                .collect::<Vec<_>>(),
+            "memoryHints": persisted.memory_hints,
+            "memoryMaintenance": "scheduled when eligible",
             "refusedItems": extraction_refusals_value(&persisted),
         }))
     }
@@ -5903,6 +5916,7 @@ impl TurnHost {
                     experiences: learning.experiences.clone(),
                     patterns: learning.patterns.clone(),
                     skills: learning.skills.clone(),
+                    memory: generation.memory.clone(),
                     project_id: self.project_id.clone(),
                     project_root: self.project_root.clone(),
                 },
@@ -8155,13 +8169,12 @@ impl TurnHost {
         if self.memory_policy.use_memories
             && let Some(memory) = &self.memory
         {
-            for scope in Scope::ALL {
-                let snapshot = memory.snapshot(scope).map_err(TurnFailure::memory)?;
+            for snapshot in memory.snapshots().map_err(TurnFailure::memory)? {
                 resolver
                     .upsert_prompt_section(
-                        match scope {
-                            Scope::Global => "memory.global",
-                            Scope::Project => "memory.project",
+                        match snapshot.scope {
+                            zuno_types::MemoryScope::Global => "memory.global",
+                            zuno_types::MemoryScope::Project => "memory.project",
                         },
                         snapshot.source,
                         snapshot.content,

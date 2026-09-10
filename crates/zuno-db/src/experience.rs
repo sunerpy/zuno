@@ -424,23 +424,8 @@ impl ExperienceStore {
     /// Hide an exact set of experiences in one transaction. The rows remain
     /// durable because pending Memory and Skill revocations still cite them.
     pub fn forget_many(&self, ids: &[String], now: i64) -> Result<Vec<String>, DbError> {
-        let ids = ids
-            .iter()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
-        self.pool.transaction(|transaction| {
-            for id in &ids {
-                let changed = transaction
-                    .execute(
-                        "UPDATE experience_record SET status = 'forgotten', time_updated = ?2
-                         WHERE id = ?1 AND status <> 'forgotten'",
-                        params![id, now],
-                    )
-                    .map_err(open::map_error)?;
-                require_changed(changed, id)?;
-            }
-            Ok(ids.into_iter().collect())
-        })
+        self.pool
+            .transaction(|transaction| forget_many_on(transaction, ids, now))
     }
 
     /// Hide every experience derived from one source session while preserving
@@ -556,6 +541,28 @@ fn validate_batch(experiences: &[NewExperience]) -> Result<(), DbError> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn forget_many_on(
+    connection: &rusqlite::Connection,
+    ids: &[String],
+    now: i64,
+) -> Result<Vec<String>, DbError> {
+    let ids = ids
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    for id in &ids {
+        read_required(connection, id)?;
+        connection
+            .execute(
+                "UPDATE experience_record SET status='forgotten',time_updated=?2
+             WHERE id=?1 AND status<>'forgotten'",
+                params![id, now],
+            )
+            .map_err(open::map_error)?;
+    }
+    Ok(ids.into_iter().collect())
 }
 
 fn validate_new(experience: &NewExperience) -> Result<(), DbError> {
@@ -835,7 +842,10 @@ where
         .collect()
 }
 
-fn read_required(connection: &rusqlite::Connection, id: &str) -> Result<ExperienceRecord, DbError> {
+pub(crate) fn read_required(
+    connection: &rusqlite::Connection,
+    id: &str,
+) -> Result<ExperienceRecord, DbError> {
     let mut record = connection
         .query_row(
             &format!("SELECT {COLUMNS} FROM experience_record WHERE id = ?1"),

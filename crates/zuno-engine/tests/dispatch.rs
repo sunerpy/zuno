@@ -674,6 +674,38 @@ async fn strict_authorization_does_not_add_prompts_to_read_only_tools() {
 }
 
 #[tokio::test]
+async fn managed_memory_skips_generic_strict_approval_but_preserves_explicit_deny() {
+    for denied in [false, true] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let approver = Arc::new(RecordingApprover::default());
+        let mut tool = RecordingTool::new("memory_update", calls.clone());
+        tool.effect = ToolEffect::ManagedMemory;
+        let mut rules = vec![allow_all_rule()];
+        if denied {
+            rules.push(deny_rule("memory_update", "*"));
+        }
+        let dispatcher = ToolRegistryDispatcher::new(
+            vec![Arc::new(tool)],
+            rules,
+            approver.clone(),
+            zuno_engine::dispatch::AuthorizationPolicy::Strict,
+            McpToolStatus::Ready,
+        );
+        let result = dispatcher
+            .dispatch(request(
+                &dispatcher,
+                "memory-call",
+                "memory_update",
+                json!({"command":"remember","intent":"save recall data"}),
+            ))
+            .await;
+        assert_eq!(result.is_error, denied, "{}", result.output.output);
+        assert_eq!(calls.load(Ordering::SeqCst), usize::from(!denied));
+        assert!(approver.asks().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn allow_all_skips_hitl_for_side_effecting_tools() {
     let calls = Arc::new(AtomicUsize::new(0));
     let approver = Arc::new(RecordingApprover::default());

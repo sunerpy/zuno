@@ -1,5 +1,9 @@
 //! Durable candidate workflow for resident memory.
 
+#[path = "maintenance.rs"]
+mod maintenance;
+pub use maintenance::{MemoryMaintenanceContext, MemoryMaintenanceUpdate};
+
 use crate::{MemoryError, MemoryStore, Operation, Scope, ScopeLimits};
 use sha2::{Digest as _, Sha256};
 use std::path::{Path, PathBuf};
@@ -8,7 +12,8 @@ use uuid::Uuid;
 use zuno_db::Pool;
 use zuno_db::memory_candidate::{MemoryCandidateRecord, MemoryCandidateStore, NewMemoryCandidate};
 use zuno_db::resident_memory::{
-    ResidentMemoryCommit, ResidentMemoryDocument, ResidentMemoryOperation, ResidentMemoryStore,
+    ResidentMemoryAuthority, ResidentMemoryCommit, ResidentMemoryDocument, ResidentMemoryOperation,
+    ResidentMemoryStore, ResidentMemoryView,
 };
 use zuno_error::DbError;
 use zuno_types::{
@@ -100,6 +105,7 @@ pub struct MemorySnapshot {
     pub digest: String,
     pub projected_revision: i64,
     pub projection_error: Option<String>,
+    pub withheld_entries: usize,
 }
 
 /// Candidate or resident-store failure.
@@ -130,6 +136,7 @@ impl MemoryServiceError {
 pub struct MemoryService {
     store: MemoryCandidateStore,
     documents: ResidentMemoryStore,
+    maintenance: zuno_db::memory_maintenance::MemoryMaintenanceStore,
     paths: ScopePaths,
     limits: ScopeLimits,
     promotion: PromotionPolicy,
@@ -146,7 +153,8 @@ impl MemoryService {
     ) -> Self {
         Self {
             store: MemoryCandidateStore::new(Arc::clone(&pool)),
-            documents: ResidentMemoryStore::new(pool),
+            documents: ResidentMemoryStore::new(Arc::clone(&pool)),
+            maintenance: zuno_db::memory_maintenance::MemoryMaintenanceStore::new(pool),
             paths,
             limits,
             promotion,
@@ -165,34 +173,71 @@ impl MemoryService {
         &self.paths
     }
 
+    pub fn scope_limit(&self, scope: MemoryScope) -> usize {
+        self.limits.for_scope(Scope::from(scope))
+    }
+
     pub fn propose(
         &self,
         proposal: MemoryProposal,
     ) -> Result<MemoryCandidateRecord, MemoryServiceError> {
-        self.propose_with_policy(proposal, true)
+        self.propose_with_policy(proposal, true, None, ResidentMemoryAuthority::Host)
     }
 
-    /// Insert a validated candidate while deliberately bypassing automatic
-    /// promotion. Cleanup and revocation flows use this because removing learned
-    /// state must remain an explicit human review even when ordinary additions
-    /// may auto-promote.
+    /// Model-visible maintenance is data-only, revision-aware and policy-fenced.
+    pub fn update_from_model(
+        &self,
+        proposal: MemoryProposal,
+        mut expected_revision: Option<i64>,
+        session_id: &str,
+    ) -> Result<MemoryCandidateRecord, MemoryServiceError> {
+        if expected_revision.is_none()
+            && matches!(
+                proposal.action,
+                MemoryAction::Replace | MemoryAction::Remove
+            )
+        {
+            let current = self.document(Scope::from(proposal.scope))?;
+            let exact = proposal.old_text.as_deref().unwrap_or_default().trim();
+            if !current.entries.iter().any(|entry| entry == exact) {
+                return Err(MemoryServiceError::Invalid(
+                    "replace/remove need expected_revision from memory_read, or the exact full old entry"
+                        .to_owned(),
+                ));
+            }
+            expected_revision = Some(current.revision);
+        }
+        self.propose_with_policy(
+            proposal,
+            true,
+            expected_revision,
+            ResidentMemoryAuthority::Model { session_id },
+        )
+    }
+
+    /// Explicitly stage a candidate for a caller that requested review.
+    /// Ordinary updates and source retractions do not use this path.
     pub fn propose_for_review(
         &self,
         proposal: MemoryProposal,
     ) -> Result<MemoryCandidateRecord, MemoryServiceError> {
-        self.propose_with_policy(proposal, false)
+        self.propose_with_policy(proposal, false, None, ResidentMemoryAuthority::Host)
     }
 
     fn propose_with_policy(
         &self,
-        proposal: MemoryProposal,
+        mut proposal: MemoryProposal,
         allow_automatic_promotion: bool,
+        expected_revision: Option<i64>,
+        authority: ResidentMemoryAuthority<'_>,
     ) -> Result<MemoryCandidateRecord, MemoryServiceError> {
+        proposal.content = proposal.content.map(|content| content.trim().to_owned());
+        proposal.old_text = proposal.old_text.map(|text| text.trim().to_owned());
         let confidence = confidence_basis_points(proposal.confidence)?;
         let reason = proposal.reason.trim();
-        if reason.is_empty() {
+        if reason.is_empty() || reason.len() > 2_048 {
             return Err(MemoryServiceError::Invalid(
-                "reason must not be empty".to_owned(),
+                "reason must be non-empty and at most 2048 bytes".to_owned(),
             ));
         }
         let operation = operation(
@@ -203,6 +248,12 @@ impl MemoryService {
         let fingerprint = proposal_fingerprint(&proposal)?;
         let scope = Scope::from(proposal.scope);
         let resident = self.document(scope)?;
+        if expected_revision.is_some_and(|revision| revision != resident.revision) {
+            return Err(MemoryServiceError::Invalid(format!(
+                "memory revision changed: expected {expected_revision:?}, current {}; read the current memory and retry",
+                resident.revision
+            )));
+        }
         crate::store::preview_entries(
             scope,
             self.limits.for_scope(scope),
@@ -211,10 +262,10 @@ impl MemoryService {
         )?;
 
         let now = zuno_db::message::now_millis();
-        let insert = self.store.create_or_get(NewMemoryCandidate {
+        let candidate = NewMemoryCandidate {
             id: format!("mem_{}", Uuid::new_v4().simple()),
             target: proposal.scope,
-            target_path: self.paths.wire_path(scope),
+            target_path: resident.path,
             action: proposal.action,
             content: proposal.content,
             old_text: proposal.old_text,
@@ -224,15 +275,23 @@ impl MemoryService {
             source_session_id: proposal.source_session_id,
             source_message_id: proposal.source_message_id,
             fingerprint,
+            base_revision: Some(resident.revision),
+            evidence: None,
             time_created: now,
-        })?;
+        };
+        let insert = match authority {
+            ResidentMemoryAuthority::Model { session_id } => {
+                self.store.create_for_model(candidate, session_id)?
+            }
+            _ => self.store.create_or_get(candidate)?,
+        };
         let candidate = insert.record;
         if !insert.inserted {
             return Ok(candidate);
         }
         self.notify();
         if allow_automatic_promotion && self.promotion.applies(confidence) {
-            return self.apply(candidate.id());
+            return self.apply_with_authority(candidate.id(), authority, now);
         }
         Ok(candidate)
     }
@@ -242,7 +301,11 @@ impl MemoryService {
     }
 
     pub fn apply(&self, id: &str) -> Result<MemoryCandidateRecord, MemoryServiceError> {
-        self.apply_with_authority(id, None, zuno_db::message::now_millis())
+        self.apply_with_authority(
+            id,
+            ResidentMemoryAuthority::Host,
+            zuno_db::message::now_millis(),
+        )
     }
 
     pub fn apply_from_learning(
@@ -252,13 +315,13 @@ impl MemoryService {
         lease: &zuno_db::learning_job::LearningLease,
         now: i64,
     ) -> Result<MemoryCandidateRecord, MemoryServiceError> {
-        self.apply_with_authority(id, Some((job_id, lease)), now)
+        self.apply_with_authority(id, ResidentMemoryAuthority::Learning { job_id, lease }, now)
     }
 
     fn apply_with_authority(
         &self,
         id: &str,
-        learning_authority: Option<(&str, &zuno_db::learning_job::LearningLease)>,
+        authority: ResidentMemoryAuthority<'_>,
         now: i64,
     ) -> Result<MemoryCandidateRecord, MemoryServiceError> {
         let candidate = self.store.get(id)?;
@@ -306,7 +369,7 @@ impl MemoryService {
             candidate_id: id,
             operation: ResidentMemoryOperation::Apply,
             now,
-            learning_authority,
+            authority,
         })?;
         self.project_document(&committed)?;
         let record = self.store.get(id)?;
@@ -364,14 +427,17 @@ impl MemoryService {
             &resident.entries,
             std::slice::from_ref(&operation),
         )?;
-        let record = self.store.edit_pending(
-            id,
-            content.as_deref(),
-            old_text.as_deref(),
-            reason,
-            confidence,
-            zuno_db::message::now_millis(),
-        )?;
+        let record = self
+            .store
+            .edit_pending(zuno_db::memory_candidate::MemoryCandidateEdit {
+                id,
+                content: content.as_deref(),
+                old_text: old_text.as_deref(),
+                reason,
+                confidence,
+                base_revision: resident.revision,
+                time_updated: zuno_db::message::now_millis(),
+            })?;
         self.notify();
         Ok(record)
     }
@@ -400,7 +466,7 @@ impl MemoryService {
             candidate_id: id,
             operation: ResidentMemoryOperation::Undo,
             now: zuno_db::message::now_millis(),
-            learning_authority: None,
+            authority: ResidentMemoryAuthority::Host,
         })?;
         self.project_document(&committed)?;
         let record = self.store.get(id)?;
@@ -443,17 +509,12 @@ impl MemoryService {
 
     pub fn entries(&self) -> Result<Vec<MemoryEntryProjection>, MemoryServiceError> {
         let mut entries = Vec::new();
-        for scope in Scope::ALL {
-            if self.import_required(scope)? {
-                continue;
-            }
-            let resident = self.document(scope)?;
+        for view in self.read_views()? {
             entries.extend(
-                resident
-                    .entries
+                view.entries
                     .into_iter()
                     .map(|content| MemoryEntryProjection {
-                        scope: scope.into(),
+                        scope: view.document.scope,
                         content,
                     }),
             );
@@ -474,28 +535,96 @@ impl MemoryService {
                     "An unresolved legacy write requires inspection and explicit import."
                         .to_owned(),
                 ),
+                withheld_entries: 0,
             });
         }
         let document = self.document(scope)?;
-        let content =
-            crate::render_block_with_limit(scope, &document.entries, self.limits.for_scope(scope));
-        Ok(MemorySnapshot {
+        let view = self
+            .documents
+            .views(&[document.path])?
+            .into_iter()
+            .next()
+            .expect("one requested memory view");
+        Ok(self.snapshot_from_view(view))
+    }
+
+    /// Freeze both scopes from one SQLite read transaction, not from two moments.
+    pub fn snapshots(&self) -> Result<Vec<MemorySnapshot>, MemoryServiceError> {
+        let mut snapshots = self
+            .read_views()?
+            .into_iter()
+            .map(|view| self.snapshot_from_view(view))
+            .collect::<Vec<_>>();
+        for scope in Scope::ALL {
+            if !snapshots
+                .iter()
+                .any(|snapshot| snapshot.scope == scope.into())
+            {
+                snapshots.push(self.snapshot(scope)?);
+            }
+        }
+        snapshots.sort_by_key(|snapshot| snapshot.scope.as_str());
+        Ok(snapshots)
+    }
+
+    /// Canonical entries plus source status for the bounded maintenance planner.
+    pub fn read_views(&self) -> Result<Vec<ResidentMemoryView>, MemoryServiceError> {
+        let mut paths = Vec::new();
+        for scope in Scope::ALL {
+            if !self.import_required(scope)? {
+                paths.push(self.document(scope)?.path);
+            }
+        }
+        self.documents.views(&paths).map_err(Into::into)
+    }
+
+    pub fn read_for_model(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<ResidentMemoryView>, MemoryServiceError> {
+        self.documents.require_model_use(session_id)?;
+        self.read_views()
+    }
+
+    fn snapshot_from_view(&self, view: ResidentMemoryView) -> MemorySnapshot {
+        let document = view.document;
+        let scope = Scope::from(document.scope);
+        let block =
+            crate::render_block_with_limit(scope, &view.entries, self.limits.for_scope(scope));
+        let content = if block.is_empty() {
+            block
+        } else {
+            format!(
+                "Memory scope: {}; revision: {}\n{block}",
+                document.scope.as_str(),
+                document.revision
+            )
+        };
+        let digest = hex::encode(Sha256::digest(content.as_bytes()));
+        MemorySnapshot {
             scope: document.scope,
             revision: document.revision,
-            source: format!("{}#revision={}", document.path, document.revision),
-            digest: hex::encode(Sha256::digest(content.as_bytes())),
+            source: format!(
+                "{}#revision={}&recall={digest}",
+                document.path, document.revision
+            ),
             content,
+            digest,
             projected_revision: document.projected_revision,
             projection_error: document.projection_error,
-        })
+            withheld_entries: view.suppressed.len(),
+        }
     }
 
     /// Reconcile process loss around apply or undo without replaying a write.
     pub fn reconcile(&self) -> Result<(), MemoryServiceError> {
         let mut changed = false;
-        let global = self.paths.wire_path(Scope::Global);
-        let project = self.paths.wire_path(Scope::Project);
-        for candidate in self.store.list_inflight_for_paths(&global, &project)? {
+        for candidate in self.records()?.into_iter().filter(|candidate| {
+            matches!(
+                candidate.projection.status,
+                MemoryCandidateStatus::Applying | MemoryCandidateStatus::Undoing
+            )
+        }) {
             changed = true;
             let Some(before) = candidate.before_entries.as_deref() else {
                 self.settle_reconciled(
@@ -577,10 +706,22 @@ impl MemoryService {
     }
 
     fn records(&self) -> Result<Vec<MemoryCandidateRecord>, MemoryServiceError> {
-        Ok(self.store.list_for_paths(
-            &self.paths.wire_path(Scope::Global),
-            &self.paths.wire_path(Scope::Project),
-        )?)
+        let global = self.paths.wire_path(Scope::Global);
+        let project = self.paths.wire_path(Scope::Project);
+        let mut records = self.store.list_for_paths(&global, &project)?;
+        let canonical_global = self.resolved_path(Scope::Global)?;
+        let canonical_project = self.resolved_path(Scope::Project)?;
+        if global != canonical_global || project != canonical_project {
+            records.extend(
+                self.store
+                    .list_for_paths(&canonical_global, &canonical_project)?,
+            );
+            records.sort_by_key(|record| {
+                std::cmp::Reverse((record.projection.time_created, record.projection.id.clone()))
+            });
+            records.dedup_by(|left, right| left.projection.id == right.projection.id);
+        }
+        Ok(records)
     }
 
     fn open(&self, scope: Scope) -> Result<MemoryStore, MemoryError> {
@@ -595,10 +736,16 @@ impl MemoryService {
         &self,
         candidate: &MemoryCandidateRecord,
     ) -> Result<(), MemoryServiceError> {
-        let expected = self
-            .paths
-            .wire_path(Scope::from(candidate.projection.scope));
-        if candidate.target_path != expected {
+        let expected = self.resolved_path(Scope::from(candidate.projection.scope))?;
+        let candidate_path = zuno_atomic_file::canonical_destination(Path::new(
+            &candidate.target_path,
+        ))
+        .map_err(|source| MemoryError::Io {
+            operation: "resolve memory candidate identity",
+            path: PathBuf::from(&candidate.target_path),
+            source,
+        })?;
+        if candidate_path.to_string_lossy() != expected {
             return Err(MemoryServiceError::Invalid(format!(
                 "candidate {} belongs to {}, not {}",
                 candidate.id(),
@@ -609,7 +756,7 @@ impl MemoryService {
         Ok(())
     }
 
-    fn document(&self, scope: Scope) -> Result<ResidentMemoryDocument, MemoryServiceError> {
+    fn resolved_path(&self, scope: Scope) -> Result<String, MemoryServiceError> {
         let path = zuno_atomic_file::canonical_destination(self.paths.for_scope(scope)).map_err(
             |source| MemoryError::Io {
                 operation: "resolve resident memory identity",
@@ -617,10 +764,14 @@ impl MemoryService {
                 source,
             },
         )?;
-        let key = path.to_str().ok_or_else(|| {
+        path.to_str().map(str::to_owned).ok_or_else(|| {
             MemoryServiceError::Invalid("resident memory path must be valid Unicode".to_owned())
-        })?;
-        if let Some(document) = self.documents.get(key)? {
+        })
+    }
+
+    fn document(&self, scope: Scope) -> Result<ResidentMemoryDocument, MemoryServiceError> {
+        let key = self.resolved_path(scope)?;
+        if let Some(document) = self.documents.get(&key)? {
             return Ok(document);
         }
         if self.records()?.iter().any(|candidate| {
@@ -638,7 +789,7 @@ impl MemoryService {
         }
         let resident = self.open(scope)?;
         Ok(self.documents.adopt(
-            key,
+            &key,
             scope.into(),
             resident.entries(),
             zuno_db::message::now_millis(),

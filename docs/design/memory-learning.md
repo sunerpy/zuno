@@ -1,4 +1,4 @@
-# Resident memory and reviewed promotion
+# Automatic resident memory
 
 Resident Memory carries small global preferences and project rules across
 sessions. It is distinct from the user learning flywheel:
@@ -22,7 +22,13 @@ retrieval, pattern mining, and Skill evolution.
   projections.
 - `MemoryService` owns validation, durable candidates, promotion, apply, undo,
   and restart reconciliation.
-- `memory_propose` is the only model-visible mutation entry point.
+- `MemoryMaintainer` owns bounded no-tools consolidation, separate from raw
+  extraction and executable Skill evolution.
+- `MemoryEvidenceStore` revalidates source manifests/bytes for writes and reads.
+- `MemoryMaintenanceStore` commits changes, provenance, job completion and the
+  no-op watermark together.
+- `memory_update` is the only model-visible mutation entry point.
+- `memory_read` exposes current bounded entries and revisions without arbitrary paths.
 - `WorkStateProjection` exposes current candidates and resident entries to every
   client.
 
@@ -66,6 +72,7 @@ A `MemoryCandidate` records:
 - reason and confidence in basis points;
 - user, foreground tool, or learning-extraction source;
 - source session and message;
+- base revision and content-addressed evidence references;
 - status, timestamps, and diagnostic;
 - exact before and after entry snapshots once application starts.
 
@@ -85,13 +92,29 @@ its source revision in the prompt receipt.
 | `high_confidence` | Apply proposals at or above `auto_confidence`; retain the rest for review. |
 | `automatic` | Apply every proposal that passes the same validation and safety checks. |
 
-The default is `review`; `auto_confidence` defaults to `0.9`.
+The default is `automatic`; explicitly configured `review` and `high_confidence`
+remain effective. `auto_confidence` defaults to `0.9`.
 
-Learning extraction deliberately uses a narrower automatic path: only
-project-scoped Memory with confidence at or above `0.9`, validated source citations,
-and authoritative successful execution evidence can auto-apply. Global
-and lower-confidence learning proposals remain pending regardless of the general
-Memory promotion setting.
+Extraction never applies memory. It stores verified Experience and raw hints.
+After successful extraction and during periodic maintenance, the project worker
+admits a `project_aggregation` job with typed `purpose: memory`. This purpose is
+independent of pattern aggregation's interval/evidence-count gates. Unknown purposes
+fail closed. The no-tools model sees capped current memory, up to 64 recent verified
+experiences, and explicit correction/forget/undo signals. It returns up to 32
+typed operations. Empty output is a valid success; invalid semantics get one repair.
+
+Automatic updates require current successful tool evidence or verified user
+corrections/preferences. Global changes additionally require explicit user evidence.
+Unresolved and unverified observations cannot support automatic memory. Memory/read
+search tool results cannot feed back as new proof. The semantic input digest includes
+actual source content, not just cached fingerprints; use counts and promotion
+bookkeeping do not trigger another consolidation.
+
+The service validates exact managed-entry locators, budgets and threats before the
+store atomically checks both scope revisions, the lease, generation policy and
+every cited source. Only then can the batch, ordinary candidate rows, provenance,
+job completion and maintenance watermark commit. CAS/source drift rejects the entire
+plan. Projection happens afterward. No-op watermarks survive restarts.
 
 ## At-most-once apply and undo
 
@@ -133,8 +156,27 @@ guesses, task narration, and secrets.
 approve, edit and approve, reject, undo, or remove an entry. Removing an applied
 entry is itself an audited candidate operation.
 
-Deleting learning evidence never silently removes applied Memory. Zuno creates a
-pending-review inverse candidate and retains the evidence needed to review it.
+Deleting learning evidence does not blindly reverse earlier writes. Zuno creates a
+source-linked retraction only for entries with no independent current support.
+Explicit source forgetting and retractions share a transaction; source edits or
+deletion make the read path withhold unsupported entries before maintenance runs.
+Never invert a replacement to resurrect obsolete content. Direct user/imported
+notes are not automatically overwritten. A direct reaffirmation removes automatic
+source ownership. Explicit forget/undo decisions also fence later model proposals.
+Disabling generation retains usable existing memory; it is not source revocation.
+
+`ToolEffect::ManagedMemory` exempts only native bounded memory data updates from
+generic strict side-effect approval. It is not an extension/MCP effect declaration.
+Explicit tool deny/ask, read/use policy and generation policy remain enforced.
+Read-only roles do not gain `memory_update`. Memory text is fallible recall, never
+permission, tool authority or an enforced Agent/configuration instruction.
+
+Format 12 adds candidate revision/evidence columns, `resident_memory_provenance`
+and `memory_maintenance_state`. Formats 5–11 migrate forward atomically with the
+marker last. The exact format-11 release fixture preserves resident revisions,
+session, message and Experience values, and tests rollback on the final DDL step.
+Existing linked automatic provenance is backfilled without rewriting old candidate
+history; newer explicit user edits stay user-owned. Future/corrupt schemas fail closed.
 
 The retired `memory.reflection` and `memory.nudge_interval` configuration fields
 are rejected. Post-task extraction belongs to the default-enabled `learning`
@@ -161,3 +203,16 @@ Codex supplies design references for staged memory extraction, consolidation,
 source attribution and ownership fencing. Zuno's reviewed Skill-candidate and
 cassette-evaluation pipeline is a native Zuno capability, not an imported Codex
 Skill-evaluation feature.
+
+Reference audit: local `../codex` at
+`9ba1d9eb5bbbd87ba2fc528d91ad239eea975ee9`, particularly
+`codex-rs/memories/write/src/{start,phase1,phase2,workspace}.rs`,
+`codex-rs/core/src/context/memory.rs` and
+`codex-rs/ext/memories/src/tools/ad_hoc_note.rs`. Codex's background consolidation
+uses `AskForApproval::Never` with managed write scope, no MCP/recursive delegation,
+lease ownership and completed-work watermarks. Zuno adapts those boundaries as a
+no-tools typed service and SQLite transaction, not a child shell agent. Codex's
+feature enablement is distinct from per-memory approval. Claude Code's
+[auto-memory design](https://code.claude.com/docs/en/memory) similarly separates
+automatic recall from enforced project instructions. Neither reference implies
+that all tools or external imports should bypass permission checks.

@@ -24,7 +24,7 @@ impl MemoryProbe {
 #[async_trait]
 impl Tool for MemoryProbe {
     fn id(&self) -> &str {
-        "memory_propose"
+        "memory_update"
     }
 
     fn description(&self) -> &str {
@@ -63,7 +63,7 @@ impl ReflectionRunner for WritingRunner {
         tools
             .dispatch(ReflectionToolCall::new(
                 "reflection-memory-call",
-                "memory_propose",
+                "memory_update",
                 json!({
                     "target": "project",
                     "action": "add",

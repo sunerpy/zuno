@@ -1,12 +1,11 @@
 # Memory and learning
 
-Zuno keeps reusable information in three different forms. They have different
-review and deletion rules; treating them as one store makes it easy to approve the
-wrong thing.
+Zuno automatically extracts and maintains useful recall data. Ordinary Memory
+does not require per-entry approval; executable Skill changes still do.
 
 | Kind | What it holds | Where it appears | Who can apply it |
 | --- | --- | --- | --- |
-| Resident Memory | A small global preference or project rule | Stable `memory.global` and `memory.project` prompt sections | A reviewed or policy-approved `MemoryCandidate` |
+| Resident Memory | A small global preference or project rule | Versioned `memory.global` and `memory.project` prompt sections | Automatic by default, with an auditable `MemoryCandidate` |
 | Experience | Evidence from one outcome, correction, failure, or verified procedure | Retrieved `learning.experiences` prompt section and `/learn` | The learning service writes evidence; it does not edit Memory directly |
 | Skill candidate | A proposed reusable method with complete `SKILL.md`, diff, and evidence | `/learn` review state | A user, after review and a passing offline evaluation |
 
@@ -76,24 +75,34 @@ When `learning.post_turn.disable_on_external_context` is enabled, a completed tu
 that consumed a successful Web or MCP result moves the session to `excluded`.
 Zuno reads durable tool metadata for that decision, not text in the transcript.
 
-## Propose and review resident Memory
+## Automatic resident Memory
 
-The model-visible mutation tool is `memory_propose`. It accepts:
+The old tool id `memory_propose` is replaced by `memory_update`. Existing permission
+rules, tool switches or Agent allowlists using the old id fail configuration
+validation with a rename instruction; an old deny or disable choice is never
+silently dropped.
+
+The model-visible mutation tool is `memory_update`. It accepts:
 
 - `target`: `global` or `project`;
 - `action`: `add`, `replace`, or `remove`;
 - the proposed full entry in `content` for add/replace;
 - a unique `old_text` locator for replace/remove;
+- `expected_revision` from `memory_read` or the current prompt; without it,
+  replace/remove must copy the exact full existing entry;
 - a durable reason and confidence value.
 
-The tool creates an audited `MemoryCandidate`; it cannot write the resident file.
+The tool commits an audited `MemoryCandidate` through the managed memory service,
+not through arbitrary file writes. `memory_read` returns current global/project
+entries and revisions, with optional `target`, `query`, and `limit` filters.
+It also reports how many unsupported derived entries were withheld.
 Validation rejects malformed or ambiguous operations, over-budget output,
 prompt-injection patterns, known credential literals, unreadable files, and drift
 from the version that was reviewed. Temporary failures, unresolved guesses,
 secrets, and task narration are not suitable Memory.
 
-The default promotion policy is `review`. Two optional policies change when a
-valid proposal applies:
+The default promotion policy is `automatic`. An explicit existing `review` or
+`high_confidence` setting remains effective:
 
 | `memory.promotion` | Behavior |
 | --- | --- |
@@ -101,10 +110,25 @@ valid proposal applies:
 | `high_confidence` | Apply proposals at or above `memory.auto_confidence`; retain the rest |
 | `automatic` | Apply every proposal that passes the same validation and safety checks |
 
-`memory.auto_confidence` defaults to `0.9`. Learning-generated proposals use a
-narrower rule regardless of that setting: only project Memory at confidence
-`>= 0.9` may apply automatically. Global and lower-confidence proposals stay
-pending.
+`memory.auto_confidence` defaults to `0.9` and is used only by `high_confidence`.
+Foreground and background changes obey the same promotion choice. Global
+automatic memory needs explicit user evidence and is reserved for cross-project
+preferences; repository knowledge stays project-scoped.
+
+Memory updates are a narrow native data capability. They do not trigger generic
+strict side-effect approval, but an explicit tool `deny`/`ask` and the session
+generation policy still apply. Memory never grants Shell, filesystem, MCP or
+Skill authority. `build`, `deep`, `general`, `fixer` and the orchestrator can use
+`memory_update`; read-only roles receive recall tools without the update grant.
+
+Background learning has two stages: extraction records source-linked Experience
+and raw memory hints; a separate no-tools maintenance job deduplicates, corrects
+and consolidates them with current memory and explicit user changes. It consumes
+at most 64 recent validated experiences within the configured input budget and
+commits at most 32 changes atomically. A successful no-op advances its durable
+watermark, so unchanged input is not sent to the model on every poll.
+One semantic repair is allowed for an invalid plan. Stale revisions, lost leases
+or source-policy changes cannot commit a stale plan.
 
 ### Apply and undo recovery
 
@@ -184,9 +208,11 @@ Settlement stores accepted Experience and evidence in one transaction. A bad ite
 with an unresolvable model-visible encoding is refused without discarding clean
 siblings; the job result records each `refusedItems` entry. Citations must match a
 supplied source address and an exact excerpt, and the source is rechecked before
-storage. High model confidence alone never authorizes automatic Memory: project
-promotion also requires verified evidence and an authoritative success receipt
-(or an explicit user record). Unsupported citations remain unverified observations.
+storage. High confidence alone never authorizes automatic Memory. Maintenance
+revalidates source bytes and requires authoritative successful tool evidence or
+verified user corrections/preferences, including explicit user records.
+Unsupported citations remain unverified observations. Memory-tool results are
+not recycled as independent evidence.
 Each claimed attempt has a unique lease token and a heartbeat; lost authority or
 session exclusion prevents automatic Memory commits.
 
@@ -266,14 +292,22 @@ Feedback targets a persisted assistant Message and uses an expected revision.
 Revision `0` means no feedback may exist; later writes must match the current
 revision. A stale write returns a conflict instead of replacing a newer opinion.
 
-`/learn forget <experience-id>` marks evidence forgotten. Removing source evidence
-does not silently remove applied Memory or Skills. Zuno creates reviewable inverse
-or revocation candidates and keeps enough evidence for the audit trail.
+`/learn forget <experience-id>` marks evidence forgotten and atomically retracts
+resident entries that lose all their sources. It does not restore the old side
+of a corrected entry. Other independent support, imported notes and direct user
+reaffirmations are preserved. Explicit forget/undo decisions cannot be
+automatically resurrected from unchanged evidence.
+
+Source edits/deletion also invalidate derived recall immediately, even before
+maintenance cleans up its projection. Disabling future generation does not
+invalidate existing memory. Skill revocations remain separately reviewed because
+they change executable methods.
 
 Transcript retention removes session-owned feedback and pending learning jobs when
 it deletes that transcript. Project Experience, Memory, patterns, evaluation
-results, and Skill candidates survive unless the user explicitly chooses derived
-learning cleanup. See [Session retention](/session-retention) before destructive
+results, and Skill candidates retain their audit rows unless the user explicitly
+chooses derived learning cleanup; automatic Memory whose original sources are
+gone is withheld from recall. See [Session retention](/session-retention) before destructive
 maintenance.
 
 ## Configuration entry point
@@ -285,7 +319,7 @@ A minimal override can separate use from generation:
 ```json
 {
   "memory": {
-    "promotion": "review"
+    "promotion": "automatic"
   },
   "learning": {
     "use": true,
@@ -306,7 +340,7 @@ Post-turn extraction belongs to `learning`.
 
 `zuno debug paths` prints both resolved paths and marks a store `(absent)` when it does
 not exist yet. Absent is the ordinary state, not a fault: a store is created by its
-first approved write and never at startup, so a fresh install has no `memory/`
+first accepted write and never at startup, so a fresh install has no `memory/`
 directory and an empty scope adds no bytes to the prompt.
 
 Both caps are configurable, as `memory.global_char_limit` and

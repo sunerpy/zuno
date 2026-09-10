@@ -94,7 +94,7 @@ impl ReflectionRunner for CorrectionRunner {
         tools
             .dispatch(ReflectionToolCall::new(
                 "reflection-memory-call",
-                "memory_propose",
+                "memory_update",
                 json!({
                     "target": "project",
                     "action": "add",

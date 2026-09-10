@@ -2879,7 +2879,7 @@ fn views_tool_row_of_each_tool_is_distinguishable_from_the_others() {
             r#"{"changes":[{"action":"add","id":"todo_ship","subject":"ship it","description":"ship it","status":"pending","priority":"high"}]}"#,
         ),
         (
-            "memory_propose",
+            "memory_update",
             r#"{"target":"project","action":"add","content":"run cargo fmt"}"#,
         ),
     ]
@@ -2914,7 +2914,7 @@ fn views_tool_row_of_each_tool_is_distinguishable_from_the_others() {
         "$ cargo build",
         "web_search ratatui spans",
         "todo_update 1 changes · ship it",
-        "memory_propose add project: run cargo fmt",
+        "memory_update add project: run cargo fmt",
     ] {
         assert!(
             rendered.iter().any(|row| row.contains(expected)),

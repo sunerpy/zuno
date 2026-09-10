@@ -259,8 +259,39 @@ fn memory_false_dominates_every_enabled_default() {
     assert!(!memory.tool);
     assert_eq!(memory.global_char_limit, 2_200);
     assert_eq!(memory.project_char_limit, 3_000);
-    assert_eq!(memory.promotion, MemoryPromotion::Review);
+    assert_eq!(memory.promotion, MemoryPromotion::Automatic);
     assert_eq!(memory.auto_confidence, 0.9);
+}
+
+#[test]
+fn memory_is_automatic_by_default_but_explicit_review_is_preserved() {
+    assert_eq!(
+        Config::default().resolved_memory().promotion,
+        MemoryPromotion::Automatic
+    );
+    assert_eq!(
+        parse(r#"{"memory":{"promotion":"review"}}"#)
+            .expect("review opt-in")
+            .resolved_memory()
+            .promotion,
+        MemoryPromotion::Review
+    );
+}
+
+#[test]
+fn retired_memory_tool_rules_and_switches_fail_closed_instead_of_losing_user_choices() {
+    for input in [
+        r#"{"permission":{"rules":{"memory_propose":"deny"}}}"#,
+        r#"{"permission":{"rules":{"memory_propose":"ask"}}}"#,
+        r#"{"tools":{"memory_propose":false}}"#,
+        r#"{"agents":{"deep":{"tools":["read","memory_propose"]}}}"#,
+        r#"{"agents":{"deep":{"permission":{"rules":{"memory_propose":"deny"}}}}}"#,
+    ] {
+        let error = parse(input).expect_err("retired key must not silently lose authority");
+        assert!(issue_detail(&error).contains("memory_update"), "{error:?}");
+    }
+    parse(r#"{"permission":{"rules":{"memory_update":"deny"}},"tools":{"memory_read":true}}"#)
+        .expect("native memory controls");
 }
 
 #[test]

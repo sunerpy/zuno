@@ -1,4 +1,4 @@
-//! `memory_propose` records an auditable resident-memory candidate.
+//! `memory_update` records an auditable resident-memory candidate.
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -7,14 +7,14 @@ use serde_json::json;
 use std::sync::Arc;
 use zuno_error::ToolError;
 use zuno_memory::{MemoryProposal, MemoryService};
-use zuno_tool::{ToolContext, ToolOutput, ToolReplayPolicy, TypedTool};
+use zuno_tool::{ToolContext, ToolEffect, ToolOutput, ToolReplayPolicy, TypedTool};
 use zuno_types::MemorySource;
 
 /// The only model-visible memory mutation entry point.
-pub const MEMORY_TOOL_ID: &str = "memory_propose";
+pub const MEMORY_TOOL_ID: &str = "memory_update";
 
 /// Prompt-visible guidance for candidate creation.
-pub const DESCRIPTION: &str = include_str!("description/memory-propose.txt");
+pub const DESCRIPTION: &str = include_str!("description/memory-update.txt");
 
 /// Which resident store the candidate targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -66,6 +66,11 @@ pub struct MemoryParams {
     /// Unique substring locating an existing entry. Required for replace and remove.
     #[serde(default)]
     pub old_text: Option<String>,
+    /// Scope revision from memory_read or the current prompt. A replace/remove
+    /// without this field must identify the exact full old entry, not a substring.
+    #[serde(default)]
+    #[schemars(range(min = 1))]
+    pub expected_revision: Option<i64>,
     /// Why this fact is durable and reusable.
     pub reason: String,
     /// Confidence from 0 to 1.
@@ -119,20 +124,40 @@ impl TypedTool for MemoryTool {
         ToolReplayPolicy::Never
     }
 
+    fn effect(&self, _args: &serde_json::Value) -> ToolEffect {
+        ToolEffect::ManagedMemory
+    }
+
     async fn run(&self, params: MemoryParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        if params
+            .expected_revision
+            .is_some_and(|revision| revision < 1)
+        {
+            return Err(ToolError::InvalidArgs {
+                tool: MEMORY_TOOL_ID.to_owned(),
+                source: Box::new(std::io::Error::other(
+                    "expected_revision must be a positive memory revision",
+                )),
+            });
+        }
+        let session_id = ctx.session_id;
         let candidate = self
             .service
-            .propose(MemoryProposal {
-                scope: params.target.into(),
-                action: params.action.into(),
-                content: params.content,
-                old_text: params.old_text,
-                reason: params.reason,
-                confidence: params.confidence,
-                source: self.source,
-                source_session_id: Some(ctx.session_id),
-                source_message_id: Some(ctx.message_id),
-            })
+            .update_from_model(
+                MemoryProposal {
+                    scope: params.target.into(),
+                    action: params.action.into(),
+                    content: params.content,
+                    old_text: params.old_text,
+                    reason: params.reason,
+                    confidence: params.confidence,
+                    source: self.source,
+                    source_session_id: Some(session_id.clone()),
+                    source_message_id: Some(ctx.message_id),
+                },
+                params.expected_revision,
+                &session_id,
+            )
             .map_err(|source| {
                 if source.is_model_correctable() {
                     ToolError::InvalidArgs {
@@ -146,15 +171,36 @@ impl TypedTool for MemoryTool {
                     }
                 }
             })?;
+        let revision = (candidate.projection.status == zuno_types::MemoryCandidateStatus::Applied)
+            .then(|| {
+                candidate.base_revision.map(|revision| {
+                    revision + i64::from(candidate.before_entries != candidate.after_entries)
+                })
+            })
+            .flatten();
         let proposal = candidate.projection;
+        let applied = proposal.status == zuno_types::MemoryCandidateStatus::Applied;
         Ok(ToolOutput::text(
-            format!("Memory candidate {}", proposal.id),
             format!(
-                "{} {} candidate is {}; review it with /memory",
-                proposal.scope.as_str(),
-                proposal.action.as_str(),
-                proposal.status.as_str()
+                "Memory {} {}",
+                if applied { "updated" } else { "change" },
+                proposal.id
             ),
+            if applied {
+                format!(
+                    "{} {} applied at revision {}; later memory snapshots will use it.",
+                    proposal.scope.as_str(),
+                    proposal.action.as_str(),
+                    revision.map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+                )
+            } else {
+                format!(
+                    "{} {} is {}; the configured review policy requires /memory.",
+                    proposal.scope.as_str(),
+                    proposal.action.as_str(),
+                    proposal.status.as_str(),
+                )
+            },
         )
         .with_metadata(
             "memory_candidate",
@@ -164,6 +210,7 @@ impl TypedTool for MemoryTool {
                 "action": proposal.action.as_str(),
                 "status": proposal.status.as_str(),
                 "confidence": proposal.confidence,
+                "revision": revision,
             }),
         ))
     }

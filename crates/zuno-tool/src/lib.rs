@@ -190,6 +190,10 @@ pub enum ToolEffect {
     UserMediated,
     /// The tool only dispatches child tools, which are authorized independently.
     Delegating,
+    /// A native, bounded update to application-owned recall data. It cannot edit
+    /// arbitrary files, install Skills or change execution permissions. Memory
+    /// generation policy and explicit permission rules still apply.
+    ManagedMemory,
     /// Filesystem, process, durable-state, remote, or otherwise uncertain mutation.
     #[default]
     SideEffecting,

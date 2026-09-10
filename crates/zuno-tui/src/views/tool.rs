@@ -170,7 +170,7 @@ pub const SUMMARISED: [&str; 36] = [
     "lsp",
     "plan_exit",
     // Built-ins registered outside the slot table: memory, goal, plan, and todo state.
-    "memory_propose",
+    "memory_update",
     "goal_get",
     "goal_propose",
     "goal_request_input",
@@ -377,7 +377,7 @@ pub fn summary(name: &str, arguments: &str) -> Option<Summary> {
         "invalid" => text("tool").map(Summary::tail),
         // `<action> <target>: <entry>`, e.g. `add project: run cargo fmt`. The action and
         // target identify the mutation while the entry distinguishes concurrent proposals.
-        "memory_propose" => {
+        "memory_update" => {
             let target = text("target").unwrap_or_else(|| String::from("memory"));
             let action = text("action").or_else(|| {
                 value

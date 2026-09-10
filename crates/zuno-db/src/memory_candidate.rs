@@ -1,5 +1,6 @@
 //! Durable proposals for resident-memory changes.
 
+use crate::memory_evidence::MemoryEvidenceReference;
 use crate::{Pool, open};
 use rusqlite::{OptionalExtension as _, Row, params};
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use zuno_types::{
 const TABLE: &str = "memory_candidate";
 const COLUMNS: &str = "id, target, target_path, action, content, old_text, reason, confidence, \
     source_kind, source_session_id, source_message_id, fingerprint, status, before_entries, \
-    after_entries, error, time_created, time_updated, time_applied";
+    after_entries, error, time_created, time_updated, time_applied, base_revision, evidence";
 
 /// A validated candidate waiting to be inserted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +29,8 @@ pub struct NewMemoryCandidate {
     pub source_session_id: Option<String>,
     pub source_message_id: Option<String>,
     pub fingerprint: Option<String>,
+    pub base_revision: Option<i64>,
+    pub evidence: Option<Vec<MemoryEvidenceReference>>,
     pub time_created: i64,
 }
 
@@ -40,6 +43,8 @@ pub struct MemoryCandidateRecord {
     pub before_entries: Option<Vec<String>>,
     pub after_entries: Option<Vec<String>>,
     pub time_applied: Option<i64>,
+    pub base_revision: Option<i64>,
+    pub evidence: Option<Vec<MemoryEvidenceReference>>,
 }
 
 impl MemoryCandidateRecord {
@@ -54,6 +59,16 @@ impl MemoryCandidateRecord {
 pub struct MemoryCandidateInsert {
     pub record: MemoryCandidateRecord,
     pub inserted: bool,
+}
+
+pub struct MemoryCandidateEdit<'a> {
+    pub id: &'a str,
+    pub content: Option<&'a str>,
+    pub old_text: Option<&'a str>,
+    pub reason: &'a str,
+    pub confidence: u16,
+    pub base_revision: i64,
+    pub time_updated: i64,
 }
 
 /// Candidate access over the initialized session database.
@@ -76,57 +91,23 @@ impl MemoryCandidateStore {
         &self,
         candidate: NewMemoryCandidate,
     ) -> Result<MemoryCandidateInsert, DbError> {
+        self.pool
+            .transaction(|transaction| create_on(transaction, &candidate))
+    }
+
+    pub fn create_for_model(
+        &self,
+        candidate: NewMemoryCandidate,
+        session_id: &str,
+    ) -> Result<MemoryCandidateInsert, DbError> {
         self.pool.transaction(|transaction| {
-            let changed = transaction
-                .execute(
-                    "INSERT INTO memory_candidate (
-                        id, target, target_path, action, content, old_text, reason, confidence,
-                        source_kind, source_session_id, source_message_id, fingerprint, status,
-                        time_created, time_updated
-                     ) VALUES (
-                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                        'pending', ?13, ?13
-                     )
-                     ON CONFLICT (source_session_id, source_message_id, fingerprint)
-                     WHERE source_kind = 'reflection' AND fingerprint IS NOT NULL
-                     DO NOTHING",
-                    params![
-                        candidate.id,
-                        candidate.target.as_str(),
-                        candidate.target_path,
-                        candidate.action.as_str(),
-                        candidate.content,
-                        candidate.old_text,
-                        candidate.reason,
-                        i64::from(candidate.confidence),
-                        candidate.source.as_str(),
-                        candidate.source_session_id,
-                        candidate.source_message_id,
-                        candidate.fingerprint,
-                        candidate.time_created,
-                    ],
-                )
-                .map_err(open::map_error)?;
-            if changed == 1 {
-                return Ok(MemoryCandidateInsert {
-                    record: read_required(transaction, &candidate.id)?,
-                    inserted: true,
-                });
+            crate::resident_memory::require_model_generation(transaction, session_id)?;
+            if candidate.source_session_id.as_deref() != Some(session_id) {
+                return Err(query_error(std::io::Error::other(
+                    "model memory change belongs to another session",
+                )));
             }
-            let fingerprint = candidate.fingerprint.as_deref().ok_or_else(|| {
-                query_error(std::io::Error::other(
-                    "memory candidate insert changed no rows without an idempotency fingerprint",
-                ))
-            })?;
-            Ok(MemoryCandidateInsert {
-                record: read_by_fingerprint(
-                    transaction,
-                    candidate.source_session_id.as_deref(),
-                    candidate.source_message_id.as_deref(),
-                    fingerprint,
-                )?,
-                inserted: false,
-            })
+            create_on(transaction, &candidate)
         })
     }
 
@@ -184,19 +165,24 @@ impl MemoryCandidateStore {
 
     pub fn edit_pending(
         &self,
-        id: &str,
-        content: Option<&str>,
-        old_text: Option<&str>,
-        reason: &str,
-        confidence: u16,
-        time_updated: i64,
+        input: MemoryCandidateEdit<'_>,
     ) -> Result<MemoryCandidateRecord, DbError> {
+        let MemoryCandidateEdit {
+            id,
+            content,
+            old_text,
+            reason,
+            confidence,
+            base_revision,
+            time_updated,
+        } = input;
         self.pool.transaction(|transaction| {
             let changed = transaction
                 .execute(
                     "UPDATE memory_candidate
                      SET content = ?2, old_text = ?3, reason = ?4, confidence = ?5,
-                         fingerprint = NULL, error = NULL, time_updated = ?6
+                         fingerprint = NULL, evidence = NULL, source_kind = 'user',
+                         base_revision = ?7, error = NULL, time_updated = ?6
                      WHERE id = ?1 AND status IN ('pending','failed')",
                     params![
                         id,
@@ -204,7 +190,8 @@ impl MemoryCandidateStore {
                         old_text,
                         reason,
                         i64::from(confidence),
-                        time_updated
+                        time_updated,
+                        base_revision,
                     ],
                 )
                 .map_err(open::map_error)?;
@@ -320,6 +307,68 @@ impl MemoryCandidateStore {
 }
 
 /// States an edit or `begin_apply` may start from.
+pub(crate) fn create_on(
+    connection: &rusqlite::Connection,
+    candidate: &NewMemoryCandidate,
+) -> Result<MemoryCandidateInsert, DbError> {
+    let evidence = candidate
+        .evidence
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(query_error)?;
+    let changed = connection
+        .execute(
+            "INSERT INTO memory_candidate (
+               id,target,target_path,action,content,old_text,reason,confidence,
+               source_kind,source_session_id,source_message_id,fingerprint,status,
+               time_created,time_updated,base_revision,evidence
+             ) VALUES (
+               ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'pending',?13,?13,?14,?15
+             )
+             ON CONFLICT (source_session_id,source_message_id,fingerprint)
+               WHERE source_kind='reflection' AND fingerprint IS NOT NULL DO NOTHING",
+            params![
+                candidate.id,
+                candidate.target.as_str(),
+                candidate.target_path,
+                candidate.action.as_str(),
+                candidate.content,
+                candidate.old_text,
+                candidate.reason,
+                i64::from(candidate.confidence),
+                candidate.source.as_str(),
+                candidate.source_session_id,
+                candidate.source_message_id,
+                candidate.fingerprint,
+                candidate.time_created,
+                candidate.base_revision,
+                evidence,
+            ],
+        )
+        .map_err(open::map_error)?;
+    if changed == 1 {
+        return Ok(MemoryCandidateInsert {
+            record: read_required(connection, &candidate.id)?,
+            inserted: true,
+        });
+    }
+    let fingerprint = candidate.fingerprint.as_deref().ok_or_else(|| {
+        query_error(std::io::Error::other(
+            "memory candidate insertion has no idempotency fingerprint",
+        ))
+    })?;
+    Ok(MemoryCandidateInsert {
+        record: read_by_fingerprint(
+            connection,
+            candidate.source_session_id.as_deref(),
+            candidate.source_message_id.as_deref(),
+            fingerprint,
+        )?,
+        inserted: false,
+    })
+}
+
 const EDITABLE: &[MemoryCandidateStatus] = &[
     MemoryCandidateStatus::Pending,
     MemoryCandidateStatus::Failed,
@@ -380,7 +429,7 @@ fn guard_failure(
     }
 }
 
-fn read_required(
+pub(crate) fn read_required(
     connection: &rusqlite::Connection,
     id: &str,
 ) -> Result<MemoryCandidateRecord, DbError> {
@@ -451,6 +500,8 @@ type StoredRow = (
     i64,
     i64,
     Option<i64>,
+    Option<i64>,
+    Option<String>,
 );
 
 fn decode_row(row: &Row<'_>) -> rusqlite::Result<StoredRow> {
@@ -474,6 +525,8 @@ fn decode_row(row: &Row<'_>) -> rusqlite::Result<StoredRow> {
         row.get(16)?,
         row.get(17)?,
         row.get(18)?,
+        row.get(19)?,
+        row.get(20)?,
     ))
 }
 
@@ -498,6 +551,8 @@ fn decode_record(row: StoredRow) -> Result<MemoryCandidateRecord, DbError> {
         time_created,
         time_updated,
         time_applied,
+        base_revision,
+        evidence,
     ) = row;
     let target = MemoryScope::parse(&target)
         .ok_or_else(|| query_error(std::io::Error::other("unknown memory target")))?;
@@ -511,6 +566,11 @@ fn decode_record(row: StoredRow) -> Result<MemoryCandidateRecord, DbError> {
         .ok()
         .filter(|value| *value <= 10_000)
         .ok_or_else(|| query_error(std::io::Error::other("invalid memory confidence")))?;
+    if base_revision.is_some_and(|revision| revision < 1) {
+        return Err(query_error(std::io::Error::other(
+            "invalid memory candidate base revision",
+        )));
+    }
     Ok(MemoryCandidateRecord {
         projection: MemoryCandidateProjection {
             id,
@@ -533,6 +593,10 @@ fn decode_record(row: StoredRow) -> Result<MemoryCandidateRecord, DbError> {
         before_entries: decode_entries(before_entries)?,
         after_entries: decode_entries(after_entries)?,
         time_applied,
+        base_revision,
+        evidence: evidence
+            .map(|value| serde_json::from_str(&value).map_err(query_error))
+            .transpose()?,
     })
 }
 

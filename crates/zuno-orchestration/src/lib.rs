@@ -281,13 +281,13 @@ pub const SKILLS: [BuiltinSkillDescriptor; 11] = [
     },
     BuiltinSkillDescriptor {
         name: "reflect",
-        description: "Extract bounded, reviewable memory candidates from confirmed outcomes without silently changing code or prompts.",
+        description: "Save bounded, source-grounded memory from confirmed outcomes without changing code, permissions or executable Skills.",
         content: include_str!("skills/reflect.md"),
         source_id: pack_source_id!("skill/reflect"),
         location: pack_location!("reflect"),
         allowed_profiles: REFLECT_PROFILES,
         required_tools: &["read"],
-        content_sha256: "fc492f59ae4d699a855f5f6372eb4822293abfefae4f4c6812f86deec12b8d84",
+        content_sha256: "1bee515066800afcd32c48940563a352830f3e718e805f53994328c704bc7ac1",
         provenance: NATIVE_PROVENANCE,
     },
     BuiltinSkillDescriptor {

@@ -198,6 +198,25 @@ impl LearningScheduler {
         })
     }
 
+    pub fn enqueue_memory(&self, job: NewLearningJob) -> Result<LearningScheduleOutcome> {
+        if !self.config.generate {
+            return Ok(LearningScheduleOutcome::Disabled);
+        }
+        if job.kind != LearningJobKind::ProjectAggregation
+            || job
+                .payload
+                .as_ref()
+                .and_then(|value| value.get("purpose"))
+                .and_then(serde_json::Value::as_str)
+                != Some(zuno_db::memory_maintenance::MEMORY_MAINTENANCE_PURPOSE)
+        {
+            return Err(crate::model::invalid(
+                "invalid memory maintenance admission",
+            ));
+        }
+        self.enqueue(job)
+    }
+
     pub fn schedule_global_aggregation(
         &self,
         evidence_digest: &str,

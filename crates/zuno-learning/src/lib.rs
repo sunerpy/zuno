@@ -1,9 +1,9 @@
 //! User-learning flywheel for Zuno.
 //!
-//! Fast extraction records concrete experiences. Slow aggregation proposes
-//! patterns and complete Skill candidates. Only resident project memories may
-//! auto-promote at high confidence; Skill changes always pass explicit review,
-//! offline evaluation, and source-digest CAS.
+//! Source-validated extraction records concrete experiences and raw memory hints.
+//! Independent bounded maintenance updates resident recall automatically; slower
+//! aggregation proposes patterns and complete Skill candidates. Skill changes
+//! always pass explicit review, offline evaluation, and source-digest CAS.
 
 mod consolidation;
 mod evaluator;
@@ -12,6 +12,7 @@ mod experience;
 mod extraction;
 mod feedback;
 mod ingestion;
+mod memory;
 mod model;
 mod pattern;
 mod projection;
@@ -29,7 +30,7 @@ pub use crate::consolidation::{
 pub use crate::evaluator::ProviderSkillEvaluator;
 pub use crate::execution::{LearningAttempt, ManualReflectionGuard, run_claimed_extraction};
 pub use crate::experience::{
-    ExperienceService, ExtractionPersistence, ManualExperienceRequest, MemoryPromotionResult,
+    ExperienceService, ExtractionPersistence, ManualExperienceRequest, MemoryHintResult,
     SessionExperienceCleanup,
 };
 pub use crate::extraction::{
@@ -40,6 +41,10 @@ pub use crate::extraction::{
 };
 pub use crate::feedback::FeedbackService;
 pub use crate::ingestion::LearningIngestion;
+pub use crate::memory::{
+    MemoryConsolidation, MemoryConsolidationRequest, MemoryConsolidationUpdate, MemoryConsolidator,
+    MemoryJobInput, MemoryMaintainer,
+};
 pub use crate::model::{LEARNING_EXTRACTOR_VERSION, LearningModel, LearningModelClient};
 pub use crate::pattern::PatternMiner;
 pub use crate::projection::LearningProjectionService;

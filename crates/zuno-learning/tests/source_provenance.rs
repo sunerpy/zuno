@@ -112,7 +112,13 @@ fn verified_source_and_exact_excerpt_can_support_automatic_project_memory() {
         )
         .expect("verified extraction");
     assert!(result.experiences[0].verified_sources());
-    assert!(result.memory_promotions[0].automatically_applied);
+    assert!(result.memory_hints[0].hint.is_some());
+    assert!(
+        zuno_db::memory_evidence::MemoryEvidenceStore::new(pool)
+            .get(&result.experiences[0].projection.id)
+            .expect("current source")
+            .is_some()
+    );
 }
 
 #[test]
@@ -127,7 +133,12 @@ fn fabricated_addresses_and_quotes_remain_unverified_and_never_auto_apply() {
             .persist_extraction("job", &lease, extraction(reference, excerpt), 20)
             .expect("retain unverified observation");
         assert!(!result.experiences[0].verified_sources());
-        assert!(!result.memory_promotions[0].automatically_applied);
+        assert!(
+            zuno_db::memory_evidence::MemoryEvidenceStore::new(pool)
+                .get(&result.experiences[0].projection.id)
+                .expect("source validation")
+                .is_none()
+        );
     }
 }
 
@@ -154,7 +165,12 @@ fn source_drift_and_revoked_success_proofs_invalidate_automatic_promotion() {
             )
             .expect("record observation");
         assert!(!result.experiences[0].verified_sources());
-        assert!(!result.memory_promotions[0].automatically_applied);
+        assert!(
+            zuno_db::memory_evidence::MemoryEvidenceStore::new(pool)
+                .get(&result.experiences[0].projection.id)
+                .expect("source validation")
+                .is_none()
+        );
     }
 }
 
@@ -162,11 +178,11 @@ fn source_drift_and_revoked_success_proofs_invalidate_automatic_promotion() {
 fn revoked_lease_between_extraction_and_promotion_cannot_commit_memory() {
     let (_directory, pool, experiences, sources) = fixture();
     let lease = claim(&pool, &sources);
-    // The proposal transaction is the last boundary before automatic authority commit.
+    // A completed extraction is the admission boundary for memory consolidation.
     pool.get()
         .expect("connection")
         .execute_batch(
-            "CREATE TRIGGER revoke_learning_attempt AFTER INSERT ON memory_candidate
+            "CREATE TRIGGER revoke_learning_attempt AFTER INSERT ON experience_record
          BEGIN UPDATE learning_job SET lease_token='new-attempt' WHERE id='job'; END;",
         )
         .expect("concurrent authority change");
@@ -364,5 +380,10 @@ fn legacy_source_less_jobs_cannot_auto_apply_self_reported_confidence() {
             20,
         )
         .expect("legacy observation");
-    assert!(!result.memory_promotions[0].automatically_applied);
+    assert!(
+        zuno_db::memory_evidence::MemoryEvidenceStore::new(pool)
+            .get(&result.experiences[0].projection.id)
+            .expect("source validation")
+            .is_none()
+    );
 }

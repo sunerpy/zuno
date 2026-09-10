@@ -58,6 +58,8 @@ pub mod learning_pattern;
 pub mod learning_source;
 pub mod learning_status;
 pub mod memory_candidate;
+pub mod memory_evidence;
+pub mod memory_maintenance;
 pub mod memory_reflection;
 pub mod message;
 pub mod migration;

@@ -274,6 +274,7 @@ pub use zuno_review::{
 };
 
 pub mod memory;
+pub mod memory_read;
 pub mod skill;
 pub mod task;
 
@@ -299,6 +300,7 @@ pub use crate::memory::{
     DESCRIPTION as MEMORY_DESCRIPTION, MEMORY_TOOL_ID, MemoryAction, MemoryParams, MemoryTarget,
     MemoryTool,
 };
+pub use crate::memory_read::{MEMORY_READ_TOOL_ID, MemoryReadParams, MemoryReadTool};
 
 #[cfg(test)]
 mod replay_policy_tests {

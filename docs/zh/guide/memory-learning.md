@@ -1,11 +1,11 @@
 # Memory 与学习
 
-Zuno 用三种不同形式保存可复用信息。它们的复核和删除规则不同；把它们当成一个存储，容易
-批准错误的内容。
+Zuno 自动提取并维护可复用记忆。普通 Memory 默认不需要逐条 approval；
+会改变执行方法的 Skill 仍需复核、评估和显式应用。
 
 | 类型 | 保存什么 | 出现在哪里 | 谁能应用 |
 | --- | --- | --- | --- |
-| 常驻 Memory | 一条简短的全局偏好或项目规则 | 稳定的 `memory.global`、`memory.project` Prompt section | 经过复核或 policy 批准的 `MemoryCandidate` |
+| 常驻 Memory | 一条简短的全局偏好或项目规则 | 带版本的 `memory.global`、`memory.project` Prompt section | 默认自动应用，保留可审计的 `MemoryCandidate` |
 | Experience | 一次结果、纠正、失败或已验证流程的证据 | 检索得到的 `learning.experiences` section 与 `/learn` | Learning 服务写入证据，不直接修改 Memory |
 | Skill candidate | 带完整 `SKILL.md`、diff 与证据的可复用方法提案 | `/learn` 复核状态 | 用户复核且离线 evaluation 通过后才能应用 |
 
@@ -68,21 +68,29 @@ HTTP client 通过 `GET|PUT /api/session/{sessionID}/memory-policy` 读写 polic
 启用 `learning.post_turn.disable_on_external_context` 后，如果已完成回合使用了成功的 Web 或
 MCP 结果，该 Session 会进入 `excluded`。Zuno 按持久工具元数据判断，不扫描 transcript 文本。
 
-## 提议并复核常驻 Memory
+## 自动维护常驻 Memory
 
-模型可见的 mutation 工具是 `memory_propose`。它接受：
+旧工具名 `memory_propose` 已替换为 `memory_update`。权限规则、工具开关或 Agent 工具名单
+仍使用旧名时，配置校验会要求改名，不会静默丢弃原来的 deny／禁用选择。
+
+模型可见的 mutation 工具是 `memory_update`。它接受：
 
 - `target`：`global` 或 `project`；
 - `action`：`add`、`replace` 或 `remove`；
 - add/replace 使用的完整 `content`；
 - replace/remove 使用的唯一 `old_text` locator；
+- 从 `memory_read` 或当前 Prompt 获取的 `expected_revision`；不传 revision 时，
+  replace/remove 必须完整复制现有条目，不能只提供子串；
 - 可长期复用的 reason 与 confidence。
 
-工具只创建可审计的 `MemoryCandidate`，不能直接写常驻文件。校验会拒绝格式错误或有歧义的
+工具通过受限 Memory 服务提交可审计的 `MemoryCandidate`，不获得任意文件写入权限。
+只读 `memory_read` 返回当前 global/project 条目和 revision，支持 `target`、`query`、
+`limit`，并报告因来源失效而隐藏的条目数。校验会拒绝格式错误或有歧义的
 操作、超出容量的结果、Prompt injection 模式、已知凭据字面量、不可读文件，以及与已复核版本
 不一致的外部漂移。临时环境故障、未解决猜测、秘密和任务过程叙述都不应写入 Memory。
 
-默认 promotion policy 是 `review`。另外两种 policy 改变有效提案的应用时机：
+默认 promotion policy 是 `automatic`。已有配置显式指定的 `review` 或 `high_confidence`
+仍然生效：
 
 | `memory.promotion` | 行为 |
 | --- | --- |
@@ -90,8 +98,18 @@ MCP 结果，该 Session 会进入 `excluded`。Zuno 按持久工具元数据判
 | `high_confidence` | 应用达到 `memory.auto_confidence` 的提案，其余保留 |
 | `automatic` | 应用所有通过同一校验与安全检查的提案 |
 
-`memory.auto_confidence` 默认 `0.9`。Learning 生成的提案始终使用更窄规则：只有 confidence
-`>= 0.9` 的 project Memory 可以自动应用。Global 或低 confidence 提案仍保持 pending。
+`memory.auto_confidence` 默认 `0.9`，仅用于 `high_confidence`。前台和后台使用同一 promotion
+策略。Global 自动记忆必须引用明确的用户证据，且只保存跨项目偏好；仓库知识留在 project。
+
+Memory 是原生的受限数据能力，不触发 strict 模式通用的副作用审批；显式工具 `deny`/`ask`
+和会话 generation policy 仍然生效。记忆不会授权 Shell、文件、MCP、Skill 或更改权限。
+`build`、`deep`、`general`、`fixer`、orchestrator 可调用 `memory_update`；
+只读角色只获得记忆读取与检索能力。
+
+后台采用两阶段流程：先提取带来源的 Experience 与原始记忆建议，再由独立、无工具权限的
+维护任务结合当前记忆和用户更正进行去重、更新与合并。每次最多选择 64 条近期有效经验，
+仍受配置的输入预算限制；最多 32 项修改在一个事务中提交。无变化也保存处理水位，避免每次轮询
+都重复付费调用。无效方案最多进行一次语义修复；版本冲突、租约失效或来源策略变化时，不提交旧方案。
 
 ### Apply 与 undo 恢复
 
@@ -151,8 +169,9 @@ Extractor：
 Settlement 在一个 transaction 中保存可接受的 Experience 与 evidence。某一项含有无法解析成
 模型可见文本的编码时，只拒绝该项，不丢弃同批干净条目；job 结果用 `refusedItems` 记录原因。
 引用必须匹配提供的来源地址与原文片段，存储前还会核验来源是否变化。模型自报高置信度不再足以
-自动写入 Memory：项目级自动提升还需要已验证证据和权威成功回执，或用户显式记录。
-不受支持的引用保留为未验证观察。每次领取任务都使用独立租约令牌和心跳；租约失效或会话被排除后，
+自动写入 Memory：维护任务重新验证来源字节，需要权威工具成功回执，或已验证的用户纠正／偏好，
+包括用户显式记录。记忆工具的结果不能循环充当新证据。不受支持的引用保留为未验证观察。
+每次领取任务都使用独立租约令牌和心跳；租约失效或会话被排除后，
 自动 Memory 提交会被拒绝。
 
 自动检索优先当前 project，默认最多五条，渲染后 context budget 为 1,200 token。每条插入项都
@@ -209,12 +228,17 @@ project companion。
 反馈只指向已持久化的 assistant Message，并要求 expected revision。Revision `0` 表示此前不能
 已有反馈；之后每次写入必须匹配当前 revision。过期写入返回 conflict，不覆盖较新的意见。
 
-`/learn forget <experience-id>` 把证据标记为 forgotten。移除 source evidence 不会静默删除已应用
-Memory 或 Skill。Zuno 创建待复核的 inverse/revocation candidate，并保留审计所需证据。
+`/learn forget <experience-id>` 把证据标记为 forgotten，并在同一事务中撤回失去全部来源支持的
+派生 Memory，不再生成必须审批才能生效的记忆撤回。不会恢复更正前的旧文本；仍有独立来源的条目、
+导入内容和用户主动再次确认的内容会保留。显式遗忘或 undo 的内容，不能从未变化的旧证据重新写回。
+
+来源被修改／删除时，相关记忆在维护任务运行前就停止加载；关闭未来生成则不会遗忘已有记忆。
+Skill 撤回仍单独复核，因为它改变可执行的方法。
 
 Transcript retention 删除对话时，会移除 Session-owned feedback 与待处理 learning job。
-Project Experience、Memory、pattern、evaluation result 与 Skill candidate 默认继续保留，除非用户
-显式选择清理派生学习。执行破坏性维护前阅读 [Session 保留](/zh/operate/session-retention)。
+Project Experience、Memory、pattern、evaluation result 与 Skill candidate 默认保留审计记录，
+除非用户显式选择清理派生学习；自动记忆的原始来源已经丢失时，不再加载该记忆。
+执行破坏性维护前阅读 [Session 保留](/zh/operate/session-retention)。
 
 ## 配置入口
 
@@ -224,7 +248,7 @@ Project Experience、Memory、pattern、evaluation result 与 Skill candidate �
 ```json
 {
   "memory": {
-    "promotion": "review"
+    "promotion": "automatic"
   },
   "learning": {
     "use": true,
