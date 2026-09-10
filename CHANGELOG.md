@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.28](https://github.com/sunerpy/zuno/compare/v0.10.27...v0.10.28) (2026-09-10)
+
+
+### Bug Fixes
+
+* **runtime:** 修复跨平台权限与终端交互及 MCP 发现 ([287236e](https://github.com/sunerpy/zuno/commit/287236e5d44ca08a5a34a14b6a99c52c15b061d0))
+
 ## [0.10.27](https://github.com/sunerpy/zuno/compare/v0.10.26...v0.10.27) (2026-09-10)
 
 
