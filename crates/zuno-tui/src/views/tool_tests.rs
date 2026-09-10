@@ -264,6 +264,11 @@ fn tool_summary_understands_runtime_activity_aliases_and_common_argument_shapes(
             "cargo test -p zuno-tui",
         ),
         (
+            "report_write",
+            r#"{"name":"audit.md","content":"complete report"}"#,
+            "audit.md",
+        ),
+        (
             "read",
             r#"{"path":"crates/zuno-tui/src/views/message.rs","offset":1884,"limit":48}"#,
             "crates/zuno-tui/src/views/message.rs [offset=1884,limit=48]",

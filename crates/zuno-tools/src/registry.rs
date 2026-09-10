@@ -77,6 +77,7 @@ pub enum BuiltinSlot {
     Grep,
     Edit,
     Write,
+    ReportWrite,
     Task,
     Job,
     Fetch,
@@ -102,6 +103,7 @@ impl BuiltinSlot {
             Self::Grep => "grep",
             Self::Edit => "edit",
             Self::Write => "write",
+            Self::ReportWrite => "report_write",
             Self::Task => "task",
             Self::Job => "job",
             Self::Fetch => "webfetch",
@@ -130,7 +132,7 @@ impl BuiltinSlot {
 }
 
 /// The exact built-in order used before custom and MCP tools are appended.
-pub const BUILTIN_ORDER: [BuiltinSlot; 18] = [
+pub const BUILTIN_ORDER: [BuiltinSlot; 19] = [
     BuiltinSlot::Invalid,
     BuiltinSlot::Question,
     BuiltinSlot::Shell,
@@ -140,6 +142,7 @@ pub const BUILTIN_ORDER: [BuiltinSlot; 18] = [
     BuiltinSlot::Grep,
     BuiltinSlot::Edit,
     BuiltinSlot::Write,
+    BuiltinSlot::ReportWrite,
     BuiltinSlot::Task,
     BuiltinSlot::Job,
     BuiltinSlot::Fetch,
@@ -158,7 +161,7 @@ pub const BUILTIN_ORDER: [BuiltinSlot; 18] = [
 /// host collaborator. `edit` remains registered for explicitly constructed internal
 /// profiles, but the default model surface has one structured editing path:
 /// `apply_patch`, plus `write` for new files or intentional full replacement.
-pub const DEFAULT_BUILTINS: [BuiltinSlot; 14] = [
+pub const DEFAULT_BUILTINS: [BuiltinSlot; 15] = [
     BuiltinSlot::Invalid,
     BuiltinSlot::Question,
     BuiltinSlot::Shell,
@@ -167,6 +170,7 @@ pub const DEFAULT_BUILTINS: [BuiltinSlot; 14] = [
     BuiltinSlot::Glob,
     BuiltinSlot::Grep,
     BuiltinSlot::Write,
+    BuiltinSlot::ReportWrite,
     BuiltinSlot::Task,
     BuiltinSlot::Job,
     BuiltinSlot::Fetch,
@@ -400,6 +404,15 @@ impl ToolRegistryBuilder {
                                     &mut sourced_tools,
                                     &mut diagnostics,
                                     Arc::clone(tool),
+                                    source,
+                                );
+                            } else if slot == BuiltinSlot::ReportWrite {
+                                insert_tool(
+                                    &mut sourced_tools,
+                                    &mut diagnostics,
+                                    erase(crate::report_write::ReportWriteTool::new(
+                                        generated_root.clone(),
+                                    )),
                                     source,
                                 );
                             } else if slot == BuiltinSlot::Execute {

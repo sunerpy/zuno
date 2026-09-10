@@ -47,7 +47,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use zuno_engine::r#loop::{INTERRUPTED_TURN_NOTICE, NoticeSeverity, TurnEvent};
 use zuno_engine::session_command::SessionCommand;
-use zuno_llm::event::StreamEvent;
+use zuno_llm::event::{PromptAccounting, StreamEvent};
 pub use zuno_types::TokenUsage;
 use zuno_types::UsageSnapshot;
 
@@ -157,6 +157,7 @@ pub fn tool_affordance(name: &str) -> (&'static str, &'static str) {
         "grep" => ("✱", "Searching content..."),
         "read" => ("→", "Reading file..."),
         "write" | "edit" => ("→", "Preparing write..."),
+        "report_write" => ("→", "Publishing report..."),
         "webfetch" | "web_fetch" => ("%", "Fetching from the web..."),
         "web_search" | "google_search" => ("◈", "Searching web..."),
         "task" => ("#", "Delegating..."),
@@ -655,6 +656,55 @@ impl AwaitingUser {
     }
 }
 
+/// One request's raw usage snapshots and the cumulative state before that request.
+#[derive(Debug, Clone)]
+struct RequestUsage {
+    before: TokenUsage,
+    before_prompt: Option<u64>,
+    before_estimate: Option<u64>,
+    before_state: UsageState,
+    input: u64,
+    output: u64,
+    reasoning: u64,
+    cache_read: u64,
+    cache_write: u64,
+}
+
+impl RequestUsage {
+    fn update(
+        &mut self,
+        input: Option<u64>,
+        output: Option<u64>,
+        reasoning: Option<u64>,
+        cache_read: Option<u64>,
+        cache_write: Option<u64>,
+    ) {
+        for (slot, value) in [
+            (&mut self.input, input),
+            (&mut self.output, output),
+            (&mut self.reasoning, reasoning),
+            (&mut self.cache_read, cache_read),
+            (&mut self.cache_write, cache_write),
+        ] {
+            if let Some(value) = value {
+                *slot = value;
+            }
+        }
+    }
+
+    fn cumulative(&self, accounting: PromptAccounting) -> TokenUsage {
+        let mut total = self.before;
+        total.add(
+            accounting.uncached_input(self.input, self.cache_read, self.cache_write),
+            self.output.saturating_sub(self.reasoning),
+            self.reasoning,
+            self.cache_read,
+            self.cache_write,
+        );
+        total
+    }
+}
+
 /// The transcript: every message, folded from engine events.
 #[derive(Debug, Clone, Default)]
 pub struct Transcript {
@@ -675,6 +725,8 @@ pub struct Transcript {
     /// running total free to disagree with the transcript's, and two token figures on one
     /// screen that differ is worse than either alone.
     tokens: TokenUsage,
+    /// Multiple reports in one stream replace that request's snapshot.
+    request_usage: Option<RequestUsage>,
     /// Whether cumulative usage is known, unavailable, or not reported yet.
     usage_state: UsageState,
     /// Durable count of turns that ended in failure rather than completion or cancellation.
@@ -808,6 +860,7 @@ impl Transcript {
 
     /// Restore durable usage before replaying an existing session.
     pub fn restore_usage(&mut self, snapshot: UsageSnapshot) {
+        self.request_usage = None;
         self.tokens = snapshot.confirmed;
         self.last_prompt_tokens = snapshot.last_prompt_tokens;
         self.estimated_pending_prompt_tokens = snapshot.estimated_pending_prompt_tokens;
@@ -1046,10 +1099,12 @@ impl Transcript {
                 estimated_prompt_tokens,
                 ..
             } => {
+                self.request_usage = None;
                 self.estimated_pending_prompt_tokens = Some(*estimated_prompt_tokens);
                 true
             }
             TurnEvent::AssistantMessageCreated { message_id, .. } => {
+                self.request_usage = None;
                 self.messages.push(Message {
                     role: Role::Assistant,
                     id: Some(message_id.clone()),
@@ -1343,24 +1398,38 @@ impl Transcript {
                 cache_write_input_tokens,
                 accounting,
             } => {
+                let usage = self.request_usage.get_or_insert(RequestUsage {
+                    before: self.tokens,
+                    before_prompt: self.last_prompt_tokens,
+                    before_estimate: self.estimated_pending_prompt_tokens,
+                    before_state: self.usage_state,
+                    input: 0,
+                    output: 0,
+                    reasoning: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                });
+                usage.update(
+                    *input_tokens,
+                    *output_tokens,
+                    *reasoning_tokens,
+                    *cache_read_input_tokens,
+                    *cache_write_input_tokens,
+                );
+                self.tokens = usage.cumulative(*accounting);
+                self.last_prompt_tokens =
+                    Some(accounting.prompt_total(usage.input, usage.cache_read, usage.cache_write));
                 self.usage_state = UsageState::Known;
                 self.estimated_pending_prompt_tokens = None;
-                let input = input_tokens.unwrap_or_default();
-                let cache_read = cache_read_input_tokens.unwrap_or_default();
-                let cache_write = cache_write_input_tokens.unwrap_or_default();
-                // Replaced, not added: this is the window's current occupancy.
-                self.last_prompt_tokens =
-                    Some(accounting.prompt_total(input, cache_read, cache_write));
-                self.tokens.add(
-                    accounting.uncached_input(input, cache_read, cache_write),
-                    output_tokens.unwrap_or_default(),
-                    reasoning_tokens.unwrap_or_default(),
-                    cache_read,
-                    cache_write,
-                );
                 true
             }
             StreamEvent::RetryRollback { attempt, max } => {
+                if let Some(usage) = self.request_usage.take() {
+                    self.tokens = usage.before;
+                    self.last_prompt_tokens = usage.before_prompt;
+                    self.estimated_pending_prompt_tokens = usage.before_estimate;
+                    self.usage_state = usage.before_state;
+                }
                 // The provider will replay from the beginning. Discarding is not an
                 // optimisation: keeping the parts would render the answer twice.
                 if let Some(index) = self.streaming {

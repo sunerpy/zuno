@@ -3727,6 +3727,58 @@ async fn loop_rejects_a_completed_assistant_message_with_zero_parts() {
 }
 
 #[tokio::test]
+async fn a_filtered_empty_response_keeps_usage_and_is_not_retried_as_an_empty_answer() {
+    let mut connection = seeded();
+    put_user(&connection, "msg_filtered_user", 10, "inspect the response");
+    let provider = Arc::new(FakeProvider::new(vec![ScriptedResponse::complete(vec![
+        StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::ContentFilter),
+        },
+        StreamEvent::TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(1),
+            reasoning_tokens: None,
+            cache_read_input_tokens: Some(4209),
+            cache_write_input_tokens: Some(0),
+            accounting: PromptAccounting::CacheBesideInput,
+        },
+    ])]));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+    let turn = run_turn(
+        request("turn-filtered-assistant"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, _) = tokio::join!(turn, collect_events(receiver));
+    let error = outcome.expect_err("content filtering is a terminal provider refusal");
+    assert!(matches!(
+        &error,
+        TurnError::Provider(zuno_error::ProviderError::Refused { .. })
+    ));
+    assert!(!matches!(
+        error.recovery(),
+        zuno_engine::r#loop::TurnRecovery::Retry { .. }
+    ));
+    let assistant = MessageStore::new(&connection)
+        .message("msg_turn-filtered-assistant_0001")
+        .expect("usage checkpoint");
+    assert_eq!(assistant.data["tokens"]["input"], 10);
+    assert_eq!(assistant.data["tokens"]["cache"]["read"], 4209);
+    assert_eq!(assistant.data["tokens"]["output"], 1);
+    assert_eq!(assistant.data["tokens"]["accounting"], "cache-beside-input");
+}
+
+#[tokio::test]
 async fn loop_accepts_a_tool_only_assistant_step_as_non_empty() {
     let mut connection = seeded();
     put_user(&connection, "msg_tool_only_user", 10, "use the echo tool");

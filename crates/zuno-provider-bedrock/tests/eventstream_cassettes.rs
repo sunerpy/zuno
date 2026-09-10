@@ -58,7 +58,7 @@ fn recorded_stream_decodes_identically_when_split_at_every_byte_offset() {
                 reasoning_tokens: None,
                 cache_read_input_tokens: None,
                 cache_write_input_tokens: None,
-                accounting: PromptAccounting::CacheInsideInput,
+                accounting: PromptAccounting::CacheBesideInput,
             },
         ]
     );

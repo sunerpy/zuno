@@ -534,9 +534,15 @@ the delegating agent, because a Job resolves only for the session whose `task` c
 created it.
 
 ```sh
-# Cannot write, whatever sandbox.mode says.
+# Shell cannot modify the workspace, whatever sandbox.mode says.
 zuno run --agent plan "audit the retry policy"
 ```
+
+Report publication is a separate `report_write` capability. It can be granted to a
+read-only investigator without enabling `edit`, Shell writes, or arbitrary `.zuno`
+paths. The host publishes only immutable files under `.zuno/reports/`; parent-attempt
+authority, tool allowlists, and `report_write` permission rules still apply. Strict
+mode treats each publication as a side effect.
 
 ## See also
 

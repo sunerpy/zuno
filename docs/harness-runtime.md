@@ -1695,6 +1695,18 @@ stored assistant rows without a reliable accounting mode remain explicitly unava
 being reported as zero. The projection stores cumulative disjoint token buckets, the latest whole prompt,
 the context limit, and the latest accounting mode.
 
+Bedrock Converse and Anthropic Invoke use disjoint prompt buckets; OpenAI Responses
+cache details remain inside its input count. Invoke's start and delta usage events
+update one request snapshot, and an explicit thinking breakdown remains a subset of
+output. A content-filtered empty response checkpoints its reported usage and becomes
+a typed permanent provider refusal, never a retryable empty-answer failure.
+
+The TUI keeps a request baseline and one replaceable usage snapshot. Partial usage
+events preserve fields not re-reported; raw output is split into visible output and
+reasoning before contributing to cumulative disjoint buckets. Request boundaries start
+a fresh snapshot, retry rollback restores the baseline, and durable session restoration
+clears the provisional accumulator.
+
 ## Durable goal recovery
 
 An active goal uses two recovery layers. The provider request layer retries a bounded sequence in place and rolls back unpublished partial output before another request. Its recovery window starts only after the original request returns its first retryable failure. The original request remains governed by transport and stream-idle limits and does not consume that window, while rollback, locally jittered backoff, and every replacement attempt must finish before the resulting absolute deadline; expiry cancels an active replay and persists its attempt as a typed deadline failure. Before every wait Zuno commits a `provider_retry_backoff` checkpoint with the request id, turn id, failed and next attempt, typed reason, selected delay, and wait deadline. Its in-place backoff is interruptible by both hard cancellation and durable live steering; waking it does not replay the stale provider request. After a process restart, Zuno waits out any remaining checkpoint deadline and starts a new turn and provider request instead of attempting to revive the old transport. If the bounded sequence still ends in a recoverable error, the goal controller writes a `goal_retry` row before waiting and starts a fresh agent turn when its persisted deadline arrives. There is no cross-turn retry-count ceiling for recoverable failures: the delay grows exponentially, reaches the configured cap, and the goal remains active until it completes, is paused, reaches its token budget, or encounters a permanent failure.
@@ -2347,7 +2359,7 @@ Enabled `productAgent` instances register independent static tools backed by a h
 For every native child, the host generates `TaskReportMetadata`; the child model
 supplies only final prose. The metadata records schema version, optional job id,
 optional host-captured Plan `workContext`, child and parent session ids, Agent,
-terminal status, final text, usage,
+terminal status, final text, usage, host-published report artifacts,
 typed-written paths, typed verification records, uncertain side effects, and
 evidence collection errors. Changed paths and verification records are derived
 only from durable tool metadata, never parsed from prose or arbitrary Shell
@@ -2365,6 +2377,20 @@ have to fall back to raw tool JSON. TUI database replay carries the same object
 as non-rendered replay data, allowing the subagent view to restore status, final
 text, changed paths, verification records, uncertain side effects, and evidence
 errors without parsing presentation strings.
+
+`report_write` is a native output capability independent of workspace editing.
+Its host writer accepts a bounded report and a portable filename, selects an immutable
+path under `.zuno/reports/`, and uses the anchored file writer to refuse symlink escapes
+and replacement of an earlier artifact. It grants no Shell or source-write authority.
+The `runtime.reports` prompt section is generated only when the final tool snapshot
+exposes the capability. `runtime.read_only` explains the attempt's Shell contract
+without treating it as evidence of the host disk's mount mode.
+
+Task report metadata schema 3 carries an `artifacts` array reconstructed from successful
+`report_write` receipts after the Job's evidence boundary, with child ownership checked.
+The same metadata flows through foreground results, background Job settlement, parent
+inbox delivery, and client replay. Report files are retained as deliverables and are
+not automatically deleted by session pruning.
 
 Job settlement and `nextStep` inbox admission share one SQLite transaction.
 Wake occurs only after commit. If a process exits after settlement or after an

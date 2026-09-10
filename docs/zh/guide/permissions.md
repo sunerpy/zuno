@@ -379,9 +379,14 @@ Windows 的逐字 `\\?\` 前缀 —— 是 `C:/build-cache/*`，绝不是 `\\?\C
 Agent 契约默认拒绝，因此契约没有点名的工具是被**隐藏**，而不只是未获授权：对一个未被点名的工具 id 来说，契约开头那条 `"*": "deny"` 就是最后一条匹配规则，模型根本不会被提供这个工具。默认授予里有两条正是由此而来。凡是授予 `shell` 的地方都会一并授予 `bg`，只读角色也不例外，因为后台执行由 `shell` 启动、只能通过 `bg` 读回——大到无法完整返回的结果也是如此。`job` 只授予可以委派的 Agent，因为一个 Job 只对创建它的那次 `task` 所属的会话才能解析出来。
 
 ```sh
-# Cannot write, whatever sandbox.mode says.
+# Shell cannot modify the workspace, whatever sandbox.mode says.
 zuno run --agent plan "audit the retry policy"
 ```
+
+报告发布使用独立的 `report_write` 能力。只读调查 Agent 可以获得它，而无需开放
+`edit`、Shell 写入或任意 `.zuno` 路径。宿主只在 `.zuno/reports/` 发布不可覆盖的
+文件；父 Attempt 权威、工具白名单和 `report_write` 权限规则仍然生效。strict 模式
+把每次发布视为副作用。
 
 ## 参见
 

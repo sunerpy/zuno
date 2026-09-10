@@ -403,7 +403,7 @@ impl Builtin {
     /// than inheriting it from the common defaults.
     #[must_use]
     pub fn permission_overlay(&self) -> Option<PermissionConfig> {
-        let rules: Vec<(&str, PermissionRule)> = match self.name {
+        let mut rules: Vec<(&str, PermissionRule)> = match self.name {
             "orchestrator" => vec![
                 ("plan_enter", allow()),
                 ("task", allow()),
@@ -556,6 +556,11 @@ impl Builtin {
             "compaction" | "title" | "summary" | "council-synth" => vec![("*", deny())],
             _ => return None,
         };
+        // Reporting is a separate host-managed capability. It does not grant edit
+        // tools or change the role's Shell filesystem contract.
+        if !self.hidden {
+            rules.push(("report_write", allow()));
+        }
         let mut object = OrderedMap::new();
         for (key, rule) in rules {
             object.insert(key, rule);

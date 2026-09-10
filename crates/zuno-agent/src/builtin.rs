@@ -97,13 +97,14 @@ use zuno_permission::Rule;
 /// other way — see the note in this crate's `Cargo.toml`. The cross-crate
 /// assertion that these ids still match the registry belongs in `zuno-tools`, where
 /// todo 65's `task` tool already sees both crates.
-pub const GOVERNED_TOOL_IDS: [&str; 19] = [
+pub const GOVERNED_TOOL_IDS: [&str; 20] = [
     "shell",
     "bg",
     "read",
     "glob",
     "grep",
     "edit",
+    "report_write",
     "task",
     "job",
     "webfetch",
@@ -460,7 +461,16 @@ const READ_ONLY_DENIED: &[&str] = &[
 /// action a read-only agent needs is an inspection, and the only side-effecting one,
 /// `cancel`, can only reach an execution this session started.
 const READ_ONLY_ALLOWED: &[&str] = &[
-    "read", "glob", "grep", "lsp", "shell", "bg", "plan_get", "todo_get", "skill",
+    "read",
+    "glob",
+    "grep",
+    "lsp",
+    "shell",
+    "bg",
+    "plan_get",
+    "todo_get",
+    "skill",
+    "report_write",
 ];
 
 /// The default primary coordinator and the only Agent that may delegate.
@@ -484,6 +494,7 @@ pub const ORCHESTRATOR: Agent = Agent {
         denied: &["plan_exit"],
         allowed: &[
             "read",
+            "report_write",
             "glob",
             "grep",
             "lsp",
@@ -529,6 +540,7 @@ pub const BUILD: Agent = Agent {
         denied: &["task", "job", "plan_exit"],
         allowed: &[
             "read",
+            "report_write",
             "glob",
             "grep",
             "lsp",
@@ -573,6 +585,7 @@ pub const DEEP: Agent = Agent {
         denied: &["task", "job", "plan_exit"],
         allowed: &[
             "read",
+            "report_write",
             "glob",
             "grep",
             "lsp",
@@ -653,6 +666,7 @@ pub const LIBRARIAN: Agent = Agent {
         ],
         allowed: &[
             "read",
+            "report_write",
             "glob",
             "grep",
             "lsp",
@@ -730,7 +744,17 @@ pub const FIXER: Agent = Agent {
             "plan_exit",
         ],
         allowed: &[
-            "read", "glob", "grep", "lsp", "edit", "shell", "bg", "plan_get", "todo_get", "skill",
+            "read",
+            "glob",
+            "grep",
+            "lsp",
+            "edit",
+            "shell",
+            "bg",
+            "plan_get",
+            "todo_get",
+            "skill",
+            "report_write",
         ],
         extension_tools: ExtensionTools::Excluded,
     },
@@ -760,6 +784,7 @@ pub const GENERAL: Agent = Agent {
         denied: &["task", "job", "question", "plan_exit"],
         allowed: &[
             "read",
+            "report_write",
             "glob",
             "grep",
             "lsp",

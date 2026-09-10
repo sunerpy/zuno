@@ -148,8 +148,8 @@ impl Summary {
 /// disciplines.
 /// Runtime aliases such as `exec_command` and `google_search` reuse those rules but stay
 /// out of this registry-wire-id list, because the stale-rule half of that test is exact.
-pub const SUMMARISED: [&str; 35] = [
-    // The 18 `BuiltinSlot` positions, in `BUILTIN_ORDER`.
+pub const SUMMARISED: [&str; 36] = [
+    // The `BuiltinSlot` positions, in `BUILTIN_ORDER`.
     "invalid",
     "question",
     "shell",
@@ -159,6 +159,7 @@ pub const SUMMARISED: [&str; 35] = [
     "grep",
     "edit",
     "write",
+    "report_write",
     "task",
     "job",
     "webfetch",
@@ -245,6 +246,7 @@ pub fn summary(name: &str, arguments: &str) -> Option<Summary> {
             Summary::head(path).detail(window)
         }),
         "write" | "edit" => first_text(&["filePath", "path"]).map(Summary::head),
+        "report_write" => text("name").map(Summary::head),
         // `apply_patch` carries no path field at all — the paths are inside the patch
         // envelope, one per file. Reading the first one is what makes this row say the
         // same kind of thing `edit` says, instead of `apply_patch` twice.

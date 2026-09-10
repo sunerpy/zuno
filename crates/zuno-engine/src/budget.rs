@@ -21,9 +21,9 @@ use zuno_llm::event::PromptAccounting;
 /// sum. That invariant is the whole point of the type: providers disagree about
 /// whether their prompt figure already contains their cache figures, the numbers
 /// look identical either way, and a policy reading them cannot tell. OpenAI,
-/// OpenAI-compatible endpoints, Gemini and Bedrock Converse report a prompt total
+/// OpenAI-compatible endpoints and Gemini report a prompt total
 /// that *includes* the cache figures ([`PromptAccounting::CacheInsideInput`]);
-/// Anthropic reports one that excludes them. Summing four raw buckets under the
+/// Anthropic and Bedrock Converse report one that excludes them. Summing four raw buckets under the
 /// first convention charges the cached prompt twice, and a budget that overcharges
 /// stops a turn that had allowance left.
 ///

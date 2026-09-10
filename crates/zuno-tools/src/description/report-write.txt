@@ -1,0 +1,6 @@
+Save a research report, audit, inventory, or other text deliverable as a host-managed file.
+Available independently of source editing: a read-only investigator can publish reports without using Shell, write, or apply_patch.
+
+Supply a plain filename (for example audit.md or inventory.txt) and the complete UTF-8 content, up to 1 MiB. The host chooses an immutable path under the worktree's .zuno/reports/ directory and returns its exact path, byte count, and SHA-256. Always cite that returned path; do not invent an output path or claim that another requested destination was written.
+
+This tool cannot edit source files, configuration, extensions, existing reports, or arbitrary destinations. To revise a report, publish its complete new contents in a new call. A parent with suitable edit permission can integrate or copy the returned artifact to another requested destination.

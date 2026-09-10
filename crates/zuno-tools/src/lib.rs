@@ -118,6 +118,7 @@ pub mod format;
 pub mod navigation;
 pub mod output_policy;
 pub mod read;
+pub mod report_write;
 pub mod risk;
 pub mod session_message;
 pub mod shell;
