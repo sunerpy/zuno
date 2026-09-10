@@ -72,11 +72,13 @@ Shell 可用时，GitHub 操作优先使用已经安装的 `gh`，仓库搜索�
 沙箱遵循同一条单向规则。即使调用时选择了 `workspace-write` 或 `danger-full-access`，只读 Agent 仍然获得 `read-only` 约束：
 
 ```sh
-# Shell cannot modify the workspace, whatever sandbox.mode says.
-zuno run --agent plan "audit the retry policy"
+# 显式要求 OS 只读约束，不可用时拒绝。
+zuno run --agent plan --sandbox-backend auto "audit the retry policy"
 ```
 
-这项保证只有在受约束后端真正运行的地方才由 OS 强制执行。在受信的 `sandbox.backend: native` 选择之下——那是只读 Agent 在 macOS 与 Windows 上唯一的原生路径——同样的 `read-only` 请求会被记录但不由 OS 强制执行，此时“只读”是一道由工具白名单、权限规则与 Shell 风险门禁构成的角色边界，而不是 OS 边界。
+这项保证只在受约束后端真正运行时由 OS 强制执行。受信的 `sandbox.backend: native` 或
+Windows/macOS 平台默认原生执行会记录相同的 `read-only` 请求，但不由 OS 强制执行；
+此时“只读”是工具白名单、权限规则与 Shell 风险门禁构成的角色边界，不是 OS 边界。
 
 ## 只读是角色边界，不只是沙箱模式
 

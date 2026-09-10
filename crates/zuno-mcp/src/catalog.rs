@@ -985,6 +985,7 @@ impl McpToolLoader for CatalogLoader {
 /// One server tool, exposed under its namespaced id.
 struct McpToolProxy {
     id: String,
+    source_name: String,
     tool: String,
     description: String,
     schema: Value,
@@ -999,6 +1000,7 @@ impl McpToolProxy {
     ) -> Self {
         Self {
             id: tool_name(server_name, &definition.name),
+            source_name: server_name.to_owned(),
             tool: definition.name.clone(),
             description: definition.description.clone().unwrap_or_default(),
             schema: object_schema(definition.input_schema.clone()),
@@ -1015,6 +1017,13 @@ impl Tool for McpToolProxy {
 
     fn description(&self) -> &str {
         &self.description
+    }
+
+    fn source(&self) -> Option<zuno_tool::ToolSource> {
+        Some(zuno_tool::ToolSource {
+            name: self.source_name.clone(),
+            description: None,
+        })
     }
 
     fn raw_parameters_schema(&self) -> Value {

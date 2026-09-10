@@ -60,6 +60,7 @@ fn admit(inbox: &SessionInbox, id: &str) {
 
 fn message(id: &str) -> SoftInterruptMessage {
     SoftInterruptMessage {
+        revision: None,
         input_id: Some(id.to_owned()),
         content: format!("report {id}"),
         images: Vec::new(),
@@ -98,6 +99,33 @@ impl PendingInputDriver for RecordingDriver {
         self.calls.lock().expect("calls lock").push(input.id);
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn queued_input_wakes_wait_for_idle_and_preserve_fifo_without_steering() {
+    let (_pool, inbox) = initialized();
+    let runs = SessionRunRegistry::new();
+    let active = runs.begin_turn(SESSION).expect("active turn");
+    admit(&inbox, "first");
+    admit(&inbox, "second");
+    let driver = Arc::new(RecordingDriver::new(inbox.clone()));
+    let coordinator = SessionWakeCoordinator::new(inbox.clone(), runs, driver.clone());
+    let wake = tokio::spawn(async move {
+        coordinator
+            .deliver_when_idle(SESSION, "second", message("second"))
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(driver.calls().is_empty());
+    assert!(!active.soft_interrupt_signal().is_set());
+    assert!(!active.interrupt_signal().is_set());
+    drop(active);
+    tokio::time::timeout(Duration::from_secs(1), wake)
+        .await
+        .expect("idle wake")
+        .expect("task")
+        .expect("delivery");
+    assert_eq!(driver.calls(), ["first", "second"]);
 }
 
 #[tokio::test]

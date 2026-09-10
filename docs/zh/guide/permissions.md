@@ -14,6 +14,7 @@ model asks to run a command
         │
         ▼
   sandbox resolver
+        ├── native selected/default ──▶ host execution, no OS confinement
         ├── confined backend ready ──▶ command runs, confined
         ├── eligible unavailable error + trusted fallback
         │                              └──▶ warning, then native execution
@@ -48,16 +49,25 @@ model asks to run a command
 
 ### 如何选择无沙箱执行
 
-无 OS 约束执行有三种不同含义。请按部署意图选择：
+原生执行可以来自平台默认值或显式部署选择，请按意图选择：
 
 | 意图 | 设置 | 实际行为 |
 | --- | --- | --- |
-| 必须有沙箱 | `workspace-write` 加 `onUnavailable: "deny"` | 默认行为。后端不可用时停止组装 Shell。 |
+| 使用平台默认值 | 不设置后端及显式约束 | Windows/macOS 原生执行，Linux 自动发现约束后端。 |
+| 必须有沙箱 | `backend: "auto"` 加 `onUnavailable: "deny"` | 后端不可用时停止组装 Shell。 |
 | 优先使用沙箱，仅在不可用时允许降级 | `workspace-write` 加 `onUnavailable: "run-unconfined"` | Zuno 先探测并验证受限后端，只在具备写能力的请求遇到符合条件的类型化不可用错误时才降级。 |
 | 让每个 Agent 都原生运行，同时保留权限模式 | `backend: "native"` | Zuno 跳过受限后端发现，让每个 Agent 的 Shell（包括只读契约）原生运行；已配置的权限模式、规则、审批与风险门禁全部保留，请求的契约被记录为未强制执行。 |
 | 始终使用宿主进程后端且不弹审批提示 | `danger-full-access` | Zuno 跳过受限后端发现，在所有受支持平台上直接原生执行，并把生效权限模式设为 `allow_all`。 |
 
-`backend: "native"` 是为没有 OS 沙箱的主机（今天的 macOS 与 Windows）而准备的选择，用于
+Windows、macOS 在没有显式 `backend`、`onUnavailable`、`network: "deny"`、
+非空 `writableRoots` 或 `protectedPaths` 时默认使用原生后端。显式的 `backend: "auto"`、
+项目限制和受管策略仍然有效，不会被平台默认值覆盖；Linux 默认行为不变。
+
+默认原生执行记录为 `resolutionKind: "platform_native"`，保留原有权限模式，不自动切成
+`allow_all`。各 Agent 请求的契约仍记录在案，但没有 OS 强制隔离。
+Agent／Plan／Work 切换会先检查目标执行后端，再修改持久协作状态。
+
+`backend: "native"` 也可作为没有 OS 沙箱的主机（今天的 macOS 与 Windows）的显式选择，用于
 权限层必须继续生效的场景。它是一项受信的主机声明，而不是降级：没有任何探测，也没有任何
 失败在先。在它之下，像 `plan` 这样的只读 Agent 仍保留工具白名单、权限规则与 Shell 风险
 门禁，而“只读”此时的含义正是这一点——一道角色边界，而不是 OS 边界。可以在受信层设置，
@@ -151,7 +161,8 @@ ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined zuno run "run the local build"
 
 ## 沙箱默认失败即拒绝
 
-`read-only` 与 `workspace-write` 都**要求一个已验证的 OS 约束后端**。当后端不可用时，Zuno 不会退回到以无约束方式运行你的命令 —— 它拒绝启动会话：
+在 `backend: auto` 下（Linux 默认，或显式选择），`read-only` 与 `workspace-write` 都要求
+已验证的 OS 约束后端。不可用且策略为 `deny` 时拒绝组装 Shell：
 
 ```
 no trusted system bubblewrap executable was found
@@ -217,15 +228,15 @@ backend, so the Shell tool cannot be registered under the requested
 - 具备写能力的请求的拒绝信息会在降级方式旁边一并列出原生后端，并说明 `danger-full-access`
   还会额外把生效权限模式设为 `allow_all`。
 
-在这类主机上交互式启动 `zuno` 时，会在终端进入 raw mode 之前询问一次，是否以原生方式运行
-本次会话。只要请求在这台主机上无法被约束就会询问——只读 Agent 的请求也包括在内——但前提是
-没有任何配置层设置过 `sandbox.onUnavailable` 或 `sandbox.backend`，并且标准输入与
+Linux 没有可用约束后端时，交互式 `zuno` 可在 raw mode 之前询问是否原生执行。
+只读 Agent 的请求也包括在内，但前提是没有任何配置层设置过 `sandbox.onUnavailable`、
+`sandbox.backend`、网络拒绝或路径约束，并且标准输入与
 标准错误都是终端。回答 yes 时，本进程的解析结果与传入 `--sandbox-backend native` 完全一致（`resolutionKind`
 为 `trusted_native`），并对该进程之后的每一次组合都生效，包括之后切换到只读 Agent；回答 no
-则以上面那条拒绝信息退出。`run`、`acp`、`serve` 以及任何没有终端的启动都不会询问，仍然需要
-命令行标志、环境变量或受信配置层。
+则以拒绝信息退出。`run`、`acp`、`serve` 及非终端启动不会询问；Windows/macOS 同样独立采用
+平台默认值，显式约束不被覆盖。
 
-这个回答只属于当前这个进程。在 macOS 上，命令行标志会由启动时那一次 re-exec 写入真实环境
+这个回答只属于当前这个进程。在 Unix 上，命令行标志会由启动时那一次 re-exec 写入真实环境
 变量，因此工具启动的嵌套 `zuno` 会继承它；而在提示里输入的回答发生在那次 re-exec 之后，
 不会被继承。如果嵌套的 Zuno 进程也需要同样的答案，请设置环境变量或受信配置层。参见
 [沙箱模式与后端不可用策略](/zh/config/reference#沙箱模式与后端不可用策略)。
@@ -308,7 +319,23 @@ tools "edit" is false and tools "write" is true, but both are governed by permis
 
 ```sh
 zuno debug permissions
+zuno debug permissions --agent deep --permission external_directory --resource 'C:/Users/example/AppData/Local/Amazon/DCV/logs/*'
+zuno debug permissions --session ses_example
 ```
+
+诊断会解析指定 Agent 当前配置中的原生、动态路径、全局和 Agent 专属规则。
+`--session` 只读已有会话的 Agent 与工作区，不修改数据库，也不冒充历史运行宿主快照；
+运行期审批和已连接 MCP 工具明确不在此输出内。`decision` 分开显示规则动作与 `allow_all`
+作用后的动作，并指出命中的规则。
+
+`deep`、`general`、`fixer` 等工作 Agent 默认对 `external_directory` 使用 `ask`。
+只允许 `read` 不等于允许工作区外目录；`allow_all` 能解决 `ask`，但不能跨过最终的显式
+`deny`，动态工具输出目录授权也不能覆盖用户拒绝。错误会保留工具名、实际权限、路径及
+命中规则／来源，不再只有 `tool read was denied`。
+
+用 `zuno debug sandbox --agent deep --check-execution` 检查所选后端能否执行；
+`--check` 仍检查请求的 OS 约束。原生模式可以同时是 `executionReady: true`、
+`ready: false`，两者不是同一个结论。
 
 它的输出还会说明一个宽松模式仍然强制执行了什么，这是确认上述保证、而不是凭信任接受它们的最快方式：
 
@@ -364,23 +391,26 @@ Windows 的逐字 `\\?\` 前缀 —— 是 `C:/build-cache/*`，绝不是 `\\?\C
 
 | 配置 | 实际会发生什么 |
 | --- | --- |
-| `allow_all` + `read-only` | 不再询问，但写入仍然失败。沙箱不受权限模式影响。 |
+| `allow_all` + `read-only` + `backend: auto` | 不再询问，但 OS 约束下的写入仍失败；权限模式不放宽沙箱。 |
 | `standard` + `danger-full-access` | 生效权限变为 `allow_all`；跳过普通提示，但显式拒绝与灾难性硬拒绝仍然有效。 |
 | `allow_all` + 规则 `"shell": "deny"` | Shell 调用被拒绝。显式拒绝优先。 |
-| `workspace-write` + 默认 `deny`，且没有后端 | Shell 不会被组装。什么都不会运行。 |
+| `workspace-write` + `backend: auto` + `deny`，且后端不可用 | Shell 不会被组装。什么都不会运行。 |
 | `workspace-write` + 受信的 `run-unconfined`，且发生可降级不可用错误 | 命令使用宿主权限；已配置权限模式和硬拒绝仍然保留。 |
 | `read-only` + `run-unconfined`，且没有后端 | Shell 不会被组装。只读执行绝不降级。 |
 | `read-only` + 受信的 `backend: "native"` | Shell 原生运行，权限模式保持不变。只读契约是工具、权限与风险门禁边界，不是 OS 边界；记录中写明 `trusted_native` 与 `requestedMode: read-only`。 |
 
 ## Agent 契约只收窄，绝不放宽
 
-无论配置要求什么，只读 Agent 都被钉在 `read-only`。这个方向按设计是单向的：Agent 契约只能削减权限，因此选择一个只读 Agent 是一项保证，而不是一个可被配置悄悄反转的默认值。这也意味着只读 Agent 永远不会使用 `run-unconfined`。它的 Shell 唯一的原生运行方式是受信的 `sandbox.backend: native` 选择：那是一项显式的主机声明而非降级，契约作为工具与权限边界继续生效，只是不再有 OS 边界。
+只读 Agent 请求的契约始终是 `read-only`，不会通过 `run-unconfined` 降级。其 Shell 可使用
+Windows/macOS 平台默认原生执行，或受信的显式 `sandbox.backend: native`；两者都保留工具与
+权限边界，同时记录没有 OS 边界。要强制 OS 只读，请显式设置 `backend: auto`，不可用时拒绝。
+只读 Agent 永远不会使用 `run-unconfined`。
 
 Agent 契约默认拒绝，因此契约没有点名的工具是被**隐藏**，而不只是未获授权：对一个未被点名的工具 id 来说，契约开头那条 `"*": "deny"` 就是最后一条匹配规则，模型根本不会被提供这个工具。默认授予里有两条正是由此而来。凡是授予 `shell` 的地方都会一并授予 `bg`，只读角色也不例外，因为后台执行由 `shell` 启动、只能通过 `bg` 读回——大到无法完整返回的结果也是如此。`job` 只授予可以委派的 Agent，因为一个 Job 只对创建它的那次 `task` 所属的会话才能解析出来。
 
 ```sh
-# Shell cannot modify the workspace, whatever sandbox.mode says.
-zuno run --agent plan "audit the retry policy"
+# 显式要求 OS 只读约束，不可用时拒绝。
+zuno run --agent plan --sandbox-backend auto "audit the retry policy"
 ```
 
 报告发布使用独立的 `report_write` 能力。只读调查 Agent 可以获得它，而无需开放

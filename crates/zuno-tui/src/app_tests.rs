@@ -271,7 +271,18 @@ fn app_every_mode_entering_the_terminal_enables_is_disabled_on_the_way_out() {
         let end = rest.find("\n}\n").expect("a top-level function body ends");
         rest[..end].to_owned()
     };
-    let entering = body("enter_terminal");
+    let lifecycle = source
+        .split("impl TerminalLifecycle for CrosstermLifecycle")
+        .nth(1)
+        .expect("the native lifecycle exists");
+    let policy = lifecycle
+        .split("fn set_alternate_scroll(")
+        .nth(1)
+        .expect("focus-controlled alternate scroll exists")
+        .split("\n    }\n")
+        .next()
+        .expect("method");
+    let entering = format!("{}\n{policy}", body("enter_terminal"));
     let leaving = body("restore_terminal");
 
     let enabled: Vec<&str> = [
@@ -374,8 +385,8 @@ fn app_mouse_reporting_asks_only_for_the_events_a_screen_consumes() {
          the user who opted out: {without:?}"
     );
     assert!(
-        without.contains("\u{1b}[?1007h"),
-        "native-selection mode did not ask the terminal to translate wheel notches: {without:?}"
+        without.contains("\u{1b}[?1007l"),
+        "native-selection mode must start with wheel-to-arrow translation disabled: {without:?}"
     );
     let mut restored = Vec::new();
     assert!(restore_terminal(&mut restored, RecordingInput::new([]).as_ref(), false).is_none());
@@ -919,6 +930,11 @@ fn app_force_reclaim_surfaces_the_brokers_diagnostic_and_repaints() {
         .expect("the elapsed lease is reclaimed");
 
     assert_eq!(forced.requester, "kiro");
+    // The deadline worker can win reclamation while the explicit reclaim call
+    // observes its result. Wait for the terminal owner, not merely the deadline row.
+    runtime.block_on(wait_until(|| {
+        lifecycle.is_active() && locked(&screen).draws == 1
+    }));
     assert!(lifecycle.is_active());
     assert_eq!(locked(&screen).draws, 1);
     let diagnostics = owner.diagnostics();

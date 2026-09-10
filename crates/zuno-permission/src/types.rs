@@ -6,6 +6,17 @@ pub struct Rule {
     pub permission: String,
     pub pattern: String,
     pub action: PermissionAction,
+    /// Diagnostic origin only; matching and precedence never depend on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+impl Rule {
+    #[must_use]
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

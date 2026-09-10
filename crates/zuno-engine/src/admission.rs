@@ -11,7 +11,7 @@ use zuno_db::inbox::{NewSessionInput, SessionInbox, SessionInput};
 use zuno_error::DbError;
 
 use crate::interrupt::{SoftInterruptMessage, SoftInterruptSource};
-use crate::status::{ExpectedTurnError, SessionRunGuard, SessionRunRegistry};
+use crate::status::{ExpectedTurnError, SessionBusy, SessionRunGuard, SessionRunRegistry};
 
 /// Whether the admitting caller wants to own the turn that runs this input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +73,7 @@ impl SteeringContent {
     #[must_use]
     pub fn into_message(self, input_id: &str) -> SoftInterruptMessage {
         SoftInterruptMessage {
+            revision: None,
             input_id: Some(input_id.to_owned()),
             content: self.content,
             images: Vec::new(),
@@ -90,6 +91,35 @@ pub enum SteerAdmissionError {
     Database(#[from] DbError),
     #[error(transparent)]
     Turn(#[from] ExpectedTurnError),
+}
+
+#[derive(Debug, Clone)]
+pub struct QueuedSendRequest {
+    pub session_id: String,
+    pub input_id: String,
+    pub expected_revision: i64,
+    pub expected_turn_id: Option<String>,
+    pub request_id: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum QueuedSendError {
+    #[error(transparent)]
+    Database(#[from] DbError),
+    #[error(transparent)]
+    Turn(#[from] ExpectedTurnError),
+    #[error(transparent)]
+    Busy(#[from] SessionBusy),
+}
+
+#[derive(Debug)]
+pub enum QueuedSendAdmission {
+    Steered(SessionInput),
+    Drive {
+        input: SessionInput,
+        guard: SessionRunGuard,
+    },
+    AlreadyAccepted(SessionInput),
 }
 
 /// What a caller must do with an input that is already durable.
@@ -185,10 +215,19 @@ impl SessionInputAdmission {
     /// a pending durable input. A failed commit also retires its process-local signal.
     pub fn admit_steer(
         &self,
-        input: NewSessionInput,
+        mut input: NewSessionInput,
         expected_turn_id: &str,
         steering: SteeringContent,
     ) -> Result<SessionInput, SteerAdmissionError> {
+        if let Some(prompt) = input.prompt.as_object_mut() {
+            prompt.insert(
+                "deliveryContext".to_owned(),
+                serde_json::json!({
+                    "requestId": input.id,
+                    "expectedTurnId": expected_turn_id,
+                }),
+            );
+        }
         let session_id = input.session_id.clone();
         let input_id = input.id.clone();
         let mut queued = false;
@@ -196,7 +235,9 @@ impl SessionInputAdmission {
             self.runs.queue_soft_interrupt_for_turn(
                 &session_id,
                 expected_turn_id,
-                steering.into_message(&input.id),
+                steering
+                    .into_message(&input.id)
+                    .with_revision(input.revision),
             )?;
             queued = true;
             Ok::<(), SteerAdmissionError>(())
@@ -205,6 +246,61 @@ impl SessionInputAdmission {
             let _retired = self.runs.cancel_soft_interrupt(&session_id, &input_id);
         }
         admitted
+    }
+
+    /// Send exactly one existing queue row, without changing its admission identity.
+    /// The database writer is acquired before the live-turn registry, matching
+    /// precise new-input steering and preventing a turn handoff during a DB wait.
+    pub fn send_queued(
+        &self,
+        request: QueuedSendRequest,
+        steering: SteeringContent,
+    ) -> Result<QueuedSendAdmission, QueuedSendError> {
+        if request.request_id.is_empty() {
+            return Err(DbError::Conflict {
+                table: "session_input".to_owned(),
+                id: request.input_id,
+                detail: "send request id must not be empty".to_owned(),
+            }
+            .into());
+        }
+        let mut queued = false;
+        let mut reserved = None;
+        let result = self.inbox.send_pending_with(
+            &request.session_id,
+            &request.input_id,
+            request.expected_revision,
+            request.expected_turn_id.as_deref(),
+            &request.request_id,
+            |input| {
+                if let Some(turn_id) = request.expected_turn_id.as_deref() {
+                    self.runs.queue_soft_interrupt_for_turn(
+                        &request.session_id,
+                        turn_id,
+                        steering
+                            .into_message(&input.id)
+                            .with_revision(input.revision),
+                    )?;
+                    queued = true;
+                } else {
+                    reserved = Some(self.runs.begin_turn(request.session_id.clone())?);
+                }
+                Ok::<(), QueuedSendError>(())
+            },
+        );
+        if result.is_err() && queued {
+            let _ = self
+                .runs
+                .cancel_soft_interrupt(&request.session_id, &request.input_id);
+        }
+        let (input, changed) = result?;
+        if !changed {
+            return Ok(QueuedSendAdmission::AlreadyAccepted(input));
+        }
+        Ok(match reserved {
+            Some(guard) => QueuedSendAdmission::Drive { input, guard },
+            None => QueuedSendAdmission::Steered(input),
+        })
     }
 
     /// Resolve turn ownership for an input a caller already committed durably.
@@ -219,7 +315,11 @@ impl SessionInputAdmission {
         steering: Option<SteeringContent>,
     ) -> InputAdmission {
         let session_id = input.session_id.clone();
-        let message = steering.map(|steering| steering.into_message(&input.id));
+        let message = steering.map(|steering| {
+            steering
+                .into_message(&input.id)
+                .with_revision(input.revision)
+        });
 
         if lease == TurnLease::Deferred {
             return match message {

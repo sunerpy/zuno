@@ -225,6 +225,32 @@ struct InternallyGatedTool {
     manual: bool,
 }
 
+struct ExternalDirectoryRead;
+
+#[async_trait]
+impl Tool for ExternalDirectoryRead {
+    fn id(&self) -> &str {
+        "read"
+    }
+    fn description(&self) -> &str {
+        "Read only after the auxiliary directory gate."
+    }
+    fn raw_parameters_schema(&self) -> Value {
+        json!({"type": "object", "properties": {}, "additionalProperties": false})
+    }
+    async fn execute(&self, _args: Value, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        ctx.ask(
+            "read",
+            PermissionAsk::new(
+                "external_directory",
+                "C:/Users/example/AppData/Local/Amazon/DCV/logs/*",
+            ),
+        )
+        .await?;
+        Ok(ToolOutput::text("read", "authorized"))
+    }
+}
+
 #[async_trait]
 impl Tool for InternallyGatedTool {
     fn id(&self) -> &str {
@@ -439,6 +465,7 @@ impl Tool for IgnoringInterruptTool {
 
 fn allow_all_rule() -> Rule {
     Rule {
+        source: None,
         permission: "*".to_owned(),
         pattern: "*".to_owned(),
         action: PermissionAction::Allow,
@@ -447,6 +474,7 @@ fn allow_all_rule() -> Rule {
 
 fn deny_rule(permission: &str, pattern: &str) -> Rule {
     Rule {
+        source: None,
         permission: permission.to_owned(),
         pattern: pattern.to_owned(),
         action: PermissionAction::Deny,
@@ -763,6 +791,44 @@ async fn allow_all_keeps_explicit_denies_terminal() {
     );
     assert!(approver.asks().is_empty());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn auxiliary_directory_denial_keeps_the_tool_permission_path_and_rule_source() {
+    let approver = Arc::new(RecordingApprover::default());
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(ExternalDirectoryRead)],
+        vec![
+            allow_all_rule(),
+            deny_rule("external_directory", "*").with_source("configuration.permission"),
+        ],
+        approver.clone(),
+        zuno_engine::dispatch::AuthorizationPolicy::AllowAll,
+        McpToolStatus::Ready,
+    );
+    let result = dispatcher
+        .dispatch(request(&dispatcher, "external-read", "read", json!({})))
+        .await;
+    assert_eq!(
+        result.blocked,
+        Some(zuno_engine::r#loop::ToolBlockKind::Denied)
+    );
+    for expected in [
+        "tool read",
+        "external_directory",
+        "Amazon/DCV/logs",
+        "configuration.permission",
+    ] {
+        assert!(
+            result.output.output.contains(expected),
+            "missing {expected}: {}",
+            result.output.output
+        );
+    }
+    assert!(
+        approver.asks().is_empty(),
+        "allow_all never crosses explicit deny"
+    );
 }
 
 #[tokio::test]
@@ -1764,6 +1830,28 @@ async fn deferred_tools_are_discovered_monotonically_before_they_become_callable
             .map(|definition| definition.id.as_str())
             .collect::<Vec<_>>(),
         ["read", "mcp_docs_search", "mcp_issue_lookup", "tool_search"]
+    );
+}
+
+#[test]
+fn denied_discovery_does_not_orphan_an_authorized_connected_tool() {
+    let dispatcher = dispatcher(
+        vec![Arc::new(RecordingTool::read_only(
+            "mcp_docs_search",
+            Arc::new(AtomicUsize::new(0)),
+        ))],
+        vec![allow_all_rule(), deny_rule("tool_search", "*")],
+        Arc::new(RecordingApprover::default()),
+    )
+    .with_deferred_tools(["mcp_docs_search".to_owned()]);
+    assert_eq!(
+        dispatcher
+            .available_tools()
+            .definitions
+            .iter()
+            .map(|tool| tool.id.as_str())
+            .collect::<Vec<_>>(),
+        ["mcp_docs_search"],
     );
 }
 

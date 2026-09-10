@@ -314,6 +314,7 @@ mod tests {
     fn every_tool_error_variant_has_a_distinct_discriminant() {
         let errors = [
             ToolError::Denied {
+                denial: None,
                 tool: "shell".to_owned(),
             },
             ToolError::InvalidArgs {

@@ -190,6 +190,15 @@ fn turn_event_payloads() -> Vec<VariantPayload> {
             size_of::<(NoticeAudience, NoticeSeverity, String, String)>(),
         ),
         payload("TurnStarted", size_of::<(String, String)>()),
+        payload(
+            "InputConsumed",
+            size_of::<(
+                String,
+                String,
+                Vec<RequestContentBlock>,
+                zuno_engine::interrupt::SoftInterruptSource,
+            )>(),
+        ),
         payload("HistoryRepaired", size_of::<(usize,)>()),
         payload("AgentResolved", size_of::<(u32, String)>()),
         payload("ModelResolved", size_of::<(u32, String, String)>()),
@@ -265,6 +274,7 @@ fn turn_event_variant_name(event: &TurnEvent) -> &'static str {
         TurnEvent::SkillLoaded { .. } => "SkillLoaded",
         TurnEvent::Notice { .. } => "Notice",
         TurnEvent::TurnStarted { .. } => "TurnStarted",
+        TurnEvent::InputConsumed { .. } => "InputConsumed",
         TurnEvent::HistoryRepaired { .. } => "HistoryRepaired",
         TurnEvent::AgentResolved { .. } => "AgentResolved",
         TurnEvent::ModelResolved { .. } => "ModelResolved",

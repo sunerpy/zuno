@@ -149,6 +149,7 @@ impl PermissionAsker for DenyNamed {
     ) -> Result<(), ToolError> {
         if tool == self.0 {
             Err(ToolError::Denied {
+                denial: None,
                 tool: tool.to_owned(),
             })
         } else {

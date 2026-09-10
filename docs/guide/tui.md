@@ -78,22 +78,56 @@ session; cumulative token buckets live in the usage projection and sidebar.
 | Key | While idle | During a turn |
 | --- | --- | --- |
 | `Enter` | Start a turn | Admit a FIFO queue item for the next turn |
-| `Ctrl+Enter` | — | Steer: soft interrupt at the nearest safe step boundary |
+| `Ctrl+X`, then `Enter` (also `Ctrl+Enter` where supported) | Send the draft, or choose a queued item when empty | Send the draft or selected queue item into the current turn |
 | `Shift+Enter`, `Alt+Enter`, `Ctrl+J` | Newline | Newline |
 | `Escape` | — | Interrupt; a second press confirms |
 
 An item is reported as queued only after SQLite commits it. The oldest entries stay fixed
 in a dock directly above the composer, labelled `next` or `steer` in durable FIFO order.
 The dock shows the effective `input_force_submit` binding rather than assuming the default
-`Ctrl+Enter`, and also shows the queue-manager binding. Pending items can be edited or
-cancelled by revision and survive a process restart. Promotion moves an entry into
-transcript history; cancellation removes it without presenting it as sent.
+`Ctrl+Enter`, and also shows the queue-manager binding. Open `/queue`, select any row
+with Up/Down or a mouse click, then use the displayed Send Now binding or the
+**Send selected now** button. Selection sends that row, not the composer draft or
+necessarily the first row. Other entries retain their order.
+
+Queued drafts can be edited or cancelled by revision and survive a process restart;
+text editing preserves already-admitted image attachments. After a row is accepted as
+steering its content is immutable, but it can still be cancelled before consumption.
+Promotion moves an entry into transcript history; cancellation never presents it as sent.
+Actions bind the displayed row revision. An edit by another client disarms an old
+cancellation confirmation rather than cancelling changed content without a new confirmation.
 
 Steering can wake a provider stream or a retry delay: Zuno checkpoints partial assistant
-output, promotes the durable input, and starts the next model step. An executing tool is
+output, promotes the durable input, and starts the next model step in the **same turn**,
+without Stop, hard cancellation, or a new session. An executing tool is
 not abandoned to steer, so its result reaches the next safe point first. If the turn ends
 before a steer is consumed, the admitted item stays pending and is promoted in FIFO order
-next turn. It is never lost or duplicated.
+next turn. If the displayed turn ends or changes **before admission**, Send Now is
+refused: an existing queue row keeps its original revision/order, and a new draft is
+restored with its paste and image data. A newer composer draft is never overwritten;
+the rejected draft is restored when that composer becomes empty. It is not automatically
+retried against a different turn. A separate consumption receipt confirms that the
+running model input actually received the message.
+
+## Composer history and paste
+
+With the composer focused, Up/Down never scroll the transcript. At either end of the
+entire text buffer, both arrows browse submitted input history; at an interior position
+they move the caret. Returning past the newest entry restores the complete draft,
+including its caret, selection, undo state, paste blocks and image ownership. Dialog
+arrows still navigate their own options; use the wheel, Page Up/Down or transcript view
+to scroll conversation content.
+
+A multiline paste is one text block. CRLF and CR are normalized to LF, including a
+trailing newline; no newline inside the paste submits a prompt. Bracketed paste is
+authoritative, and rapid legacy key bursts are grouped before shortcut dispatch.
+Submit only with a later explicit Enter or Send Now gesture. Long pastes may display
+a compact placeholder, but the complete text is sent.
+
+On local Windows, clipboard reads and writes run asynchronously through PowerShell 7
+(`pwsh.exe`) when available, otherwise `powershell.exe`. A paste stays pending until
+the whole block arrives; submitting a partial paste is prevented. If its composer,
+cursor, or session changes while reading, the result is not inserted into the new target.
 
 ## Default keys
 
@@ -156,8 +190,9 @@ child as a complete session surface rather than a detail popup.
 | `session_child_cycle_reverse` | `<leader>left` | Previous sibling |
 | `session_parent` | `<leader>up` | Return to the parent |
 
-Each child keeps its own composer draft. Pressing Enter in a running child admits text to
-that child's durable inbox and steers its active turn; pressing Enter after it settles
+Each child keeps its own composer draft. Pressing Enter in a running child queues text in
+that child's durable inbox; explicit Send Now steers its displayed active turn.
+Pressing Enter after it settles
 wakes the same child identity with its resolved agent, model, effort, permissions, and
 lineage. Child text is literal, so `/help` typed in a child is sent to the child rather
 than executed as a root command.
@@ -275,17 +310,23 @@ resolves the tool as a typed denial and never fabricates an answer.
 
 With `mouse` absent or `true`, Zuno captures button, drag, release, and wheel events.
 Releasing a drag copies the selection through the configured clipboard and leaves the
-highlight visible. Copy prefers OSC 52, so the text reaches the terminal you are actually
-looking at even over SSH or inside a multiplexer; when that write fails Zuno falls back to
+highlight visible. Local Windows prefers a native clipboard write and reports success
+only after the helper completes. Remote SSH terminals prefer OSC 52; because that
+protocol has no success acknowledgement, the UI says that a copy request was sent.
+When the terminal write fails Zuno falls back to
 one local helper — `pbcopy` on macOS, `wl-copy`, `xclip`, or `xsel` on Linux, and
-`Set-Clipboard` through PowerShell on Windows — and reports both failures together rather
-than only the first. A host with no helper installed reports that no clipboard is
-available instead of appearing to copy.
+`Set-Clipboard` through PowerShell on Windows. A host with no working mechanism reports
+the failure instead of appearing to copy.
+One serialized clipboard provider survives session switches. A failed newer copy attempt
+invalidates older success notifications, so a late receipt cannot claim the current
+selection was copied.
 
 Every helper receives the selection on its
 standard input as clipboard data, never as a script to run, so a copy can never execute
-what the transcript contained. Transcript copy uses semantic message content: speaker labels, borders,
-padding, and terminal soft wraps are omitted; only explicit source newlines become
+what the transcript contained. Transcript selection and copying share the last painted
+row/grapheme mapping, including Chinese, combining characters and emoji. Visible Markdown
+text is copied, not source punctuation. Speaker labels, borders,
+padding, and terminal soft wraps are omitted; explicit content newlines become
 clipboard newlines. Selection stays clamped rather than crossing into the sidebar,
 disclosure rows are clickable, and an overflowing conversation mounts a draggable scrollbar.
 
@@ -294,7 +335,9 @@ accelerates. `scroll_speed` selects a constant multiplier instead;
 `scroll_acceleration.enabled` explicitly chooses velocity acceleration and wins when both
 are present.
 
-Set `"mouse": false` in `tui.json` to return drag selection to the terminal.
+Set `"mouse": false` in `tui.json` to return drag selection to the terminal. Alternate
+scroll mode is enabled only while transcript scrolling owns the arrows, not while the
+composer or a dialog is focused.
 
 Quitting releases the capture modes it enabled, then discards the input it never read, so a
 click or wheel notch that arrived while the session was shutting down cannot reach the shell

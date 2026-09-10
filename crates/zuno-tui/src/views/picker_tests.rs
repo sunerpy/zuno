@@ -220,7 +220,7 @@ fn views_queued_input_dialog_opens_when_empty_and_explains_commit_visibility() {
 }
 
 #[test]
-fn views_queued_input_dialog_supports_keyboard_and_mouse_edit() {
+fn views_queued_input_dialog_edits_by_keyboard_and_selects_by_mouse() {
     let projection = QueuedInputProjection::new(queued_inputs());
     let mut dialog = queued_input_dialog(ViewContext::defaults(), projection);
     let expected = DialogStep::Emitted(DialogOutcome::QueuedInput(QueuedInputDialogAction::Edit {
@@ -242,7 +242,75 @@ fn views_queued_input_dialog_supports_keyboard_and_mouse_edit() {
             },
             Rect::new(0, 0, 76, 8),
         ),
-        expected
+        DialogStep::Redraw
+    );
+}
+
+#[test]
+fn views_queued_input_send_button_sends_the_selected_row_revision() {
+    let mut inputs = queued_inputs();
+    inputs[1].text = "second queued request".to_owned();
+    inputs[1].editable = true;
+    let projection = QueuedInputProjection::new(inputs);
+    let mut dialog = queued_input_dialog(ViewContext::defaults(), projection);
+    dialog.handle_action(action("dialog.select.next"), &press(KeyCode::Down));
+    let lines = dialog.lines(76);
+    let row = lines
+        .iter()
+        .position(|line| line.to_string().contains("Send selected now"))
+        .expect("send button");
+    let mouse = |kind| MouseEvent {
+        kind,
+        column: 2,
+        row: row as u16,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert_eq!(
+        dialog.handle_mouse(
+            &mouse(MouseEventKind::Down(MouseButton::Left)),
+            Rect::new(0, 0, 76, 10),
+        ),
+        DialogStep::Redraw
+    );
+    assert_eq!(
+        dialog.handle_mouse(
+            &mouse(MouseEventKind::Up(MouseButton::Left)),
+            Rect::new(0, 0, 76, 10),
+        ),
+        DialogStep::Emitted(DialogOutcome::QueuedInput(
+            QueuedInputDialogAction::SendNow {
+                id: "msg_2".to_owned(),
+                expected_revision: 2,
+            }
+        ))
+    );
+}
+
+#[test]
+fn queued_actions_bind_the_shown_revision_and_edits_disarm_cancel_confirmation() {
+    let projection = QueuedInputProjection::new(queued_inputs());
+    let mut dialog = queued_input_dialog(ViewContext::defaults(), projection.clone());
+    dialog.lines(76);
+    let mut changed = queued_inputs();
+    changed[0].revision = 3;
+    changed[0].text = "edited by another client".to_owned();
+    projection.replace(changed);
+    assert_eq!(
+        dialog.handle_action(action("input_force_submit"), &press(KeyCode::Enter)),
+        DialogStep::Emitted(DialogOutcome::QueuedInput(
+            QueuedInputDialogAction::SendNow {
+                id: "msg_1".to_owned(),
+                expected_revision: 1,
+            }
+        )),
+        "a key must not silently send an unseen edit",
+    );
+    dialog.handle_action(action("session_delete"), &press(KeyCode::Char('d')));
+    dialog.lines(76);
+    assert_eq!(
+        dialog.handle_action(action("session_delete"), &press(KeyCode::Char('d'))),
+        DialogStep::Redraw,
+        "an edited row needs a new cancellation confirmation",
     );
 }
 

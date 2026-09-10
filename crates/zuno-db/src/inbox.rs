@@ -426,6 +426,81 @@ impl SessionInbox {
         })
     }
 
+    /// Promote only the revision offered to the live turn. A concurrent edit or
+    /// cancellation must never consume a stale process-local steering payload.
+    pub fn promote_revision(
+        &self,
+        session_id: &str,
+        input_id: &str,
+        revision: i64,
+    ) -> Result<Option<SessionInput>, DbError> {
+        self.pool.transaction(|transaction| {
+            let input = select_by_id(transaction, session_id, input_id)?
+                .filter(|input| input.state.is_pending() && input.revision == revision);
+            promote_selected(transaction, session_id, input)
+        })
+    }
+
+    /// Change one queued input's delivery without deleting/re-admitting it.
+    /// The callback binds a live turn or reserves an idle lease before commit.
+    /// Returning an error rolls back the row and its event.
+    pub fn send_pending_with<E>(
+        &self,
+        session_id: &str,
+        input_id: &str,
+        expected_revision: i64,
+        expected_turn_id: Option<&str>,
+        request_id: &str,
+        before_commit: impl FnOnce(&SessionInput) -> Result<(), E>,
+    ) -> Result<(SessionInput, bool), E>
+    where
+        E: From<DbError>,
+    {
+        self.pool.try_transaction(|transaction| {
+            let current = select_by_id(transaction, session_id, input_id).map_err(E::from)?
+                .ok_or_else(|| E::from(conflict(input_id, "queued input no longer exists")))?;
+            if current.prompt.pointer("/deliveryContext/requestId").and_then(Value::as_str) == Some(request_id) {
+                if current.prompt.pointer("/deliveryContext/expectedTurnId").and_then(Value::as_str) != expected_turn_id {
+                    return Err(E::from(conflict(input_id, "send request id belongs to another turn")));
+                }
+                return Ok((current, false));
+            }
+            let mut input = require_pending_revision(transaction, session_id, input_id, expected_revision)
+                .map_err(E::from)?;
+            if input.state != SubmissionState::Queued {
+                return Err(E::from(conflict(input_id, "input has already been offered to a turn")));
+            }
+            let object = input.prompt.as_object_mut()
+                .ok_or_else(|| E::from(conflict(input_id, "queued input is not an object")))?;
+            object.insert("deliveryContext".to_owned(), serde_json::json!({
+                "requestId": request_id, "expectedTurnId": expected_turn_id,
+            }));
+            input.revision = input.revision.checked_add(1)
+                .ok_or_else(|| E::from(conflict(input_id, "input revision exhausted")))?;
+            input.time_updated = crate::message::now_millis().max(input.time_updated);
+            if expected_turn_id.is_some() {
+                input.delivery = InputDelivery::Steer;
+                input.state = SubmissionState::Steering;
+            }
+            let encoded = serde_json::to_string(&input.prompt).map_err(query_error).map_err(E::from)?;
+            transaction.execute(
+                "UPDATE session_input SET prompt=?1, delivery=?2, state=?3, revision=?4, time_updated=?5
+                 WHERE session_id=?6 AND id=?7 AND revision=?8 AND state='queued'",
+                params![encoded, input.delivery.as_str(), input.state.as_str(), input.revision,
+                    input.time_updated, session_id, input_id, expected_revision],
+            ).map_err(open::map_error).and_then(|changed| require_changed(input_id, changed)).map_err(E::from)?;
+            append_in(transaction, session_id,
+                NewSessionEvent::new("session.input.delivery_changed", event_properties(&input, true))
+                    .map_err(E::from)?).map_err(E::from)?;
+            before_commit(&input)?;
+            if expected_turn_id.is_none() {
+                input = promote_selected(transaction, session_id, Some(input)).map_err(E::from)?
+                    .ok_or_else(|| E::from(conflict(input_id, "selected input could not be promoted")))?;
+            }
+            Ok((input, true))
+        })
+    }
+
     /// Promote every pending asynchronous report in one transaction, in FIFO order.
     ///
     /// The idle wake path drives a session's settled reports as one batch instead of

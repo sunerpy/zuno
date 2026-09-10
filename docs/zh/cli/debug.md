@@ -22,7 +22,7 @@ zuno debug [OPTIONS] <COMMAND>
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | 随平台解析 |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 ## 子命令
@@ -54,7 +54,7 @@ zuno debug paths [OPTIONS]
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | 随平台解析 |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 ### zuno debug config
@@ -70,7 +70,7 @@ zuno debug config [OPTIONS]
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | 随平台解析 |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 ### zuno debug agent
@@ -90,7 +90,7 @@ zuno debug agent [OPTIONS] <NAME>
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | 随平台解析 |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 ### zuno debug prompt
@@ -109,7 +109,7 @@ zuno debug prompt [OPTIONS]
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | 随平台解析 |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 `--show-sensitive` 会原样打印指令、AGENTS、Skill 与记忆内容。把那份输出粘贴进工单之前，
@@ -123,12 +123,16 @@ zuno debug permissions [OPTIONS]
 
 | 选项 | 说明 | 默认值 |
 | --- | --- | --- |
+| `--agent <AGENT>` | 查看指定 Agent 解析后的权限规则 | 会话保存／配置的 Agent |
+| `--session <ID>` | 只读已有会话的 Agent 与工作区，不写数据库 | |
+| `--permission <PERMISSION>` | 要解释的权限；必须同时提供 `--resource` | |
+| `--resource <RESOURCE>` | 要匹配的资源；必须同时提供 `--permission` | |
 | `-v`, `--version` | 显示 Zuno 包版本 | |
 | `--print-logs` | 除结构化本地日志存储之外，同时把日志打印到 stderr | |
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | 随平台解析 |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 ### zuno debug skill
@@ -144,7 +148,7 @@ zuno debug skill [OPTIONS]
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | 随平台解析 |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 ### zuno debug sandbox
@@ -155,19 +159,31 @@ zuno debug sandbox [OPTIONS]
 
 | 选项 | 说明 | 默认值 |
 | --- | --- | --- |
-| `--mode <MODE>` | 要探测的沙箱策略；受限模式会验证 bubblewrap 的部署情况。可选值：`read-only`、`workspace-write`、`danger-full-access` | `workspace-write` |
+| `--mode <MODE>` | 显式探测策略，与 `--agent` 互斥。可选值：`read-only`、`workspace-write`、`danger-full-access` | 所选 Agent 的契约 |
+| `--agent <AGENT>` | 解析此 Agent 当前配置的沙箱契约 | 配置的 Agent |
 | `-v`, `--version` | 显示 Zuno 包版本 | |
 | `--network <NETWORK>` | 要验证的网络权限。受约束模式默认为 deny，danger-full-access 默认为 allow。可选值：`deny`、`allow` | |
 | `--check` | 当所请求的策略不可部署时以失败状态退出 | |
+| `--check-execution` | 实际执行后端不可用时以失败状态退出 | |
 | `--print-logs` | 除结构化本地日志存储之外，同时把日志打印到 stderr | |
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 在这次受信调用策略下报告降级解析。可选值：`deny`、`run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | 在这次受信后端选择下报告解析结果；`native` 跳过受限后端发现并报告 `trusted_native`。可选值：`auto`、`native` | `auto` |
+| `--sandbox-backend <BACKEND>` | 在这次受信后端选择下报告解析结果；`native` 跳过受限后端发现并报告 `trusted_native`。可选值：`auto`、`native` | 随平台解析 |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 报告会区分请求与实际的模式/网络权限，给出解析类型、降级资格和类型化原因。`ready` 字段与
 `--check` 始终保持严格：具备降级资格不会让请求的约束部署通过。
+
+Windows/macOS 平台默认原生执行可同时报告 `platform_native`、`executionReady: true`、
+`ready: false`。显式选择原生后端报告 `trusted_native`，两者都不是 OS 隔离。
+权限诊断解析当前配置、Agent 与动态路径规则，不冒充历史宿主审批快照，也不包含已连接 MCP 工具。
+
+```sh
+zuno debug permissions --agent deep --permission external_directory --resource 'C:/logs/*'
+zuno debug sandbox --agent deep --check-execution
+zuno debug sandbox --mode read-only --sandbox-backend auto --check
+```
 
 ### zuno debug rg
 
@@ -188,7 +204,7 @@ zuno debug rg [OPTIONS] <COMMAND>
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | 随平台解析 |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 #### zuno debug rg files
@@ -207,7 +223,7 @@ zuno debug rg files [OPTIONS]
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | 随平台解析 |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 #### zuno debug rg search
@@ -229,7 +245,7 @@ zuno debug rg search [OPTIONS] <PATTERN>
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | 随平台解析 |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 ### zuno debug lsp
@@ -252,7 +268,7 @@ zuno debug lsp [OPTIONS] <COMMAND>
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | 随平台解析 |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 #### zuno debug lsp diagnostics
@@ -272,7 +288,7 @@ zuno debug lsp diagnostics [OPTIONS] <FILE>
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | 随平台解析 |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 #### zuno debug lsp symbols
@@ -292,7 +308,7 @@ zuno debug lsp symbols [OPTIONS] <QUERY>
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | 随平台解析 |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 #### zuno debug lsp document-symbols
@@ -312,7 +328,7 @@ zuno debug lsp document-symbols [OPTIONS] <URI>
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | 随平台解析 |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 ### zuno debug snapshot
@@ -335,7 +351,7 @@ zuno debug snapshot [OPTIONS] <COMMAND>
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | 随平台解析 |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 #### zuno debug snapshot track
@@ -351,7 +367,7 @@ zuno debug snapshot track [OPTIONS]
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | 随平台解析 |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 #### zuno debug snapshot patch
@@ -371,7 +387,7 @@ zuno debug snapshot patch [OPTIONS] <HASH>
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | 随平台解析 |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 #### zuno debug snapshot diff
@@ -391,7 +407,7 @@ zuno debug snapshot diff [OPTIONS] <HASH>
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | 随平台解析 |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 ## 示例

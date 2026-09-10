@@ -11,6 +11,7 @@ mod debug;
 mod delegation;
 mod export;
 mod mcp;
+mod mcp_exposure;
 mod mcp_runtime;
 mod models;
 mod plugin;

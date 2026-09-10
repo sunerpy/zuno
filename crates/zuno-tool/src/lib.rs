@@ -142,6 +142,13 @@ impl ToolDefinition {
     }
 }
 
+/// Capability-discovery attribution, not a transport address or an authorization grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolSource {
+    pub name: String,
+    pub description: Option<String>,
+}
+
 /// How a historical invocation behaves when its exact declaration is unavailable.
 ///
 /// This is independent from [`ToolReplayPolicy`]: history projection never executes a
@@ -250,6 +257,11 @@ pub trait Tool: Send + Sync {
 
     /// The description the model reads.
     fn description(&self) -> &str;
+
+    /// Keep a connected tool's original service identity without parsing its wire id.
+    fn source(&self) -> Option<ToolSource> {
+        None
+    }
 
     /// Whether an identical call may be retried after a typed transient failure.
     fn replay_policy(&self) -> ToolReplayPolicy {
@@ -437,6 +449,11 @@ pub trait TypedTool: Send + Sync + 'static {
     /// The description the model reads.
     fn description(&self) -> &str;
 
+    /// Optional capability-discovery attribution.
+    fn source(&self) -> Option<ToolSource> {
+        None
+    }
+
     /// Whether an identical call may be retried after a typed transient failure.
     fn replay_policy(&self) -> ToolReplayPolicy {
         ToolReplayPolicy::Never
@@ -493,6 +510,10 @@ impl<T: TypedTool> Tool for Typed<T> {
 
     fn description(&self) -> &str {
         self.0.description()
+    }
+
+    fn source(&self) -> Option<ToolSource> {
+        self.0.source()
     }
 
     fn replay_policy(&self) -> ToolReplayPolicy {

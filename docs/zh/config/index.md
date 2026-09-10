@@ -27,7 +27,7 @@ Zuno 读取 `zuno.json` 与 `zuno.jsonc`。所有可以告诉运行时的东西�
 
 ## 顶层结构
 
-一共有四十二个键。按它们决定什么来分组：
+一共有四十三个键。按它们决定什么来分组：
 
 | 分组 | 键 |
 | --- | --- |
@@ -36,7 +36,7 @@ Zuno 读取 `zuno.json` 与 `zuno.jsonc`。所有可以告诉运行时的东西�
 | 权限 | `permission`、`sandbox`、`shell`、`trust` |
 | 指令、Skill 与学习 | `instructions`、`skills`、`command`、`memory`、`learning` |
 | 上下文 | `compaction`、`continuity`、`tool_output`、`attachment`、`references` |
-| 集成 | `mcp`、`lsp`、`formatter`、`web_search`、`watcher` |
+| 集成 | `mcp`、`mcp_tool_exposure`、`lsp`、`formatter`、`web_search`、`watcher` |
 | 运行时 | `acp`、`concurrency`、`goal`、`runtime`、`snapshot`、`tools`、`navigation`、`logLevel` |
 | 部署 | `server` |
 | 编辑器支持 | `$schema` |
@@ -88,8 +88,9 @@ Zuno 读取 `zuno.json` 与 `zuno.jsonc`。所有可以告诉运行时的东西�
 
 ## 选择无沙箱行为
 
-默认仍然失败即拒绝：`workspace-write` 加 `onUnavailable: "deny"` 要求请求的约束后端
-确实可部署。
+Linux 默认自动发现约束后端；Windows/macOS 仅在没有显式后端、降级、网络拒绝或路径约束时
+默认原生执行，并保留权限模式。显式 `backend: "auto"` 加 `onUnavailable: "deny"` 在所有平台
+都要求约束后端可部署，不可用时拒绝。
 
 如果要始终使用宿主原生进程后端，请选择显式模式：
 

@@ -85,6 +85,7 @@ fn anonymous_exa_is_exposed_by_default_and_explicit_false_hides_it() {
 fn a_full_deny_hides_search_but_a_narrow_rule_keeps_it_visible() {
     let search = WebSearchTool::with_config(config(&[(ENV_ENABLE_EXA, "true")]));
     let denied = [Rule {
+        source: None,
         permission: ID.to_owned(),
         pattern: "*".to_owned(),
         action: PermissionAction::Deny,
@@ -93,6 +94,7 @@ fn a_full_deny_hides_search_but_a_narrow_rule_keeps_it_visible() {
     assert_eq!(resolve_tool_ids(&search, &denied), vec!["webfetch"]);
 
     let narrow = [Rule {
+        source: None,
         permission: ID.to_owned(),
         pattern: "site:internal.test *".to_owned(),
         action: PermissionAction::Deny,

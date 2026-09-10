@@ -285,6 +285,7 @@ impl PermissionAsker for AcpPermissionAsker {
             }
             PermissionResolution::Denied | PermissionResolution::Cancelled => {
                 Err(ToolError::Denied {
+                    denial: None,
                     tool: tool.to_owned(),
                 })
             }

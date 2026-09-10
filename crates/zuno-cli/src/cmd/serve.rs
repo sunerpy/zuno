@@ -296,6 +296,7 @@ impl PermissionAsker for ServerPermissionAsker {
         match self.requests.ask_permission(request).await {
             ReplyKind::Once | ReplyKind::Always => Ok(()),
             ReplyKind::Reject => Err(ToolError::Denied {
+                denial: None,
                 tool: tool.to_owned(),
             }),
         }

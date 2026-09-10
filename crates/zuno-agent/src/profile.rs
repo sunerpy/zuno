@@ -183,6 +183,7 @@ impl AgentProfile {
             .copied()
             .filter(|tool| self.capabilities.within_tool_authority(tool))
             .map(|tool| Rule {
+                source: Some("extension_tool".to_owned()),
                 permission: tool.to_owned(),
                 pattern: "*".to_owned(),
                 action: PermissionAction::Allow,

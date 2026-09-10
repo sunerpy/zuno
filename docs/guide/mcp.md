@@ -151,7 +151,8 @@ are never stored in the session database or logs. See [zuno acp](/cli/acp).
 
 Registration is not authorization. Four things must hold for a model to call an MCP tool:
 
-1. The server is enabled and its connection succeeded.
+1. The server is enabled and connected, or has a validated cached tool directory whose
+   session-owned proxy connects successfully on first use.
 2. The tool's wire id survives the agent's exact `tools` allowlist, when one is configured.
 3. No explicit permission rule denies it.
 4. For a delegated turn, the exact schema was visible in the parent Attempt.
@@ -176,12 +177,17 @@ work-capable role may opt into automatic inheritance, and a read-only agent can 
 one audited tool id explicitly in its own rules, but the parent schema ceiling and the
 exact-schema check still apply. See [Agents](/guide/agents).
 
-### Progressive schema discovery
+### Direct and progressive schema exposure
 
 Passing the four gates above makes an MCP tool executable; it does not require Zuno to
-inject every connected schema into every provider request. For a root turn without an
-exact Agent `tools` allowlist, matching MCP schemas are deferred behind `tool_search`.
-That tool searches ids, display names, and descriptions. Matches are added cumulatively
+inject every connected schema into every provider request. Default `auto` keeps small
+whole service catalogs visible on the first request: at most eight tools per service,
+within a shared automatic budget of 32 tools and 65,536 schema/description bytes.
+Larger catalogs stay behind `tool_search`, which advertises original service names and
+bounded capability summaries. The agent is instructed to choose relevant MCP tools
+proactively, without the user first naming a server.
+
+`tool_search` searches ids, service names, display names, and descriptions. Matches are added cumulatively
 to the next provider step and cannot be called from the same assistant tool-call batch
 that discovered them.
 
@@ -191,10 +197,43 @@ intentional schema selection, so the MCP tools named there remain eagerly visibl
 delegated child receives only exact schemas recorded in the parent Attempt and does not
 gain a broader catalog by searching.
 
+Exposure is separate from connection configuration; changing it does not alter a
+transport identity, discard a validated directory cache, or create a global process pool:
+
+```json
+{
+  "mcp_tool_exposure": {
+    "mode": "auto",
+    "auto_tool_limit": 32,
+    "auto_schema_bytes": 65536,
+    "small_server_tool_limit": 8,
+    "servers": {
+      "aws-knowledge-mcp-server": "eager",
+      "figma": "deferred"
+    }
+  }
+}
+```
+
+`eager` makes authorized schemas immediately visible; `deferred` uses discovery.
+Per-server values override the global mode. Explicit session/Agent pins remain eager
+outside the automatic budget; forcing everything eager can consume substantial context.
+Visibility never grants a forbidden tool.
+
+Working native roles explicitly permit discovery before user overrides. If `tool_search`
+is disabled or denied, otherwise-authorized schemas stay direct rather than being hidden
+behind an unreachable loader. MCP denies still win.
+
+Deferred does not mean disconnected, and `enabled: true` alone does not prove connected.
+Use visible tools directly and `tool_search` for deferred tools. Resource listing,
+extension listing and `customize-zuno` are not ordinary MCP-use prerequisites. Do not
+hand-write MCP HTTP in Shell to bypass discovery; explicit transport development or
+debugging is a separate task.
+
 ACP session-local `mcpServers` are also an explicit client contract. Their schemas are
 present in the first provider request after the session's strict connection gate
-succeeds; host-configured MCP servers in the same session remain progressively
-discoverable. This distinction follows the session across child and background turns.
+succeeds; host-configured MCP servers in the same session follow the exposure policy.
+This distinction follows the session across child and background turns.
 
 The provider-request snapshot records the exact post-search tool schemas. Search results
 also record matched ids and the monotonic catalog revision in the durable tool result.
@@ -212,6 +251,11 @@ dispatcher refuses an unknown call. Zuno emits a warning notice and keeps the du
 unchanged. If another registered tool already defines
 `tool_search`, Zuno does not shadow it: schemas stay eager for that turn and the host
 emits a warning.
+
+The TUI adopts connected catalog changes at the next turn boundary, not mid-tool-call.
+`debug agent` reports `schemaExposure` with eager/deferred ids, policy, source metadata
+and discovery availability. It uses a separate diagnostic runtime; `/mcp` shows the
+mounted TUI's connection state.
 
 ## Concurrency and timeouts
 

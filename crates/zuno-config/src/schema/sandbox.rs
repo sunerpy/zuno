@@ -106,6 +106,22 @@ pub enum SandboxBackendSelection {
     Native,
 }
 
+/// Why a backend was selected; an absent field is not an explicit `auto`.
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxBackendSource {
+    Explicit,
+    ExplicitConstraints,
+    PlatformDefault,
+}
+
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedSandboxBackend {
+    pub selection: SandboxBackendSelection,
+    pub source: SandboxBackendSource,
+}
+
 impl SandboxBackendSelection {
     /// Stable configuration, CLI, and environment spelling.
     #[must_use]
@@ -145,11 +161,12 @@ pub struct SandboxConfig {
     /// `run-unconfined` is accepted only from a trusted configuration layer.
     #[serde(rename = "onUnavailable", skip_serializing_if = "Option::is_none")]
     pub on_unavailable: Option<SandboxUnavailableAction>,
-    /// Backend selection. `auto` (default) discovers the platform's confined
+    /// Backend selection. Explicit `auto` discovers the platform's confined
     /// backend and applies `onUnavailable`. `native` runs every Agent's Shell,
     /// read-only contracts included, on the native process backend with the
     /// configured permission mode kept; the requested authority is recorded but
-    /// not OS-enforced. Accepted only from a trusted configuration layer.
+    /// not OS-enforced. An absent selection uses native on Windows/macOS unless
+    /// explicit confinement constraints require discovery. Accepted only from a trusted layer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend: Option<SandboxBackendSelection>,
     /// Existing directories writable in addition to the workspace for write-capable Agents.
@@ -197,9 +214,100 @@ impl SandboxConfig {
         self.on_unavailable.unwrap_or_default()
     }
 
-    /// Resolve the backend selection; absence discovers the confined backend.
+    /// Resolve the backend for the actual host, preserving explicit restrictions.
     #[must_use]
     pub fn resolved_backend(&self) -> SandboxBackendSelection {
-        self.backend.unwrap_or_default()
+        self.resolve_backend_for(std::env::consts::OS).selection
+    }
+
+    /// The platform is injected for policy tests, never read from project configuration.
+    #[must_use]
+    pub fn resolve_backend_for(&self, platform: &str) -> ResolvedSandboxBackend {
+        if let Some(selection) = self.backend {
+            return ResolvedSandboxBackend {
+                selection,
+                source: SandboxBackendSource::Explicit,
+            };
+        }
+        if self.on_unavailable.is_some()
+            || self.network == Some(SandboxNetworkMode::Deny)
+            || self
+                .protected_paths
+                .as_ref()
+                .is_some_and(|paths| !paths.is_empty())
+            || self
+                .writable_roots
+                .as_ref()
+                .is_some_and(|paths| !paths.is_empty())
+        {
+            return ResolvedSandboxBackend {
+                selection: SandboxBackendSelection::Auto,
+                source: SandboxBackendSource::ExplicitConstraints,
+            };
+        }
+        ResolvedSandboxBackend {
+            selection: if matches!(platform, "windows" | "macos") {
+                SandboxBackendSelection::Native
+            } else {
+                SandboxBackendSelection::Auto
+            },
+            source: SandboxBackendSource::PlatformDefault,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn platform_defaults_do_not_overwrite_explicit_confinement() {
+        for platform in ["windows", "macos"] {
+            for mode in [
+                SandboxMode::ReadOnly,
+                SandboxMode::WorkspaceWrite,
+                SandboxMode::DangerFullAccess,
+            ] {
+                let config = SandboxConfig {
+                    mode: Some(mode),
+                    ..SandboxConfig::default()
+                };
+                assert_eq!(
+                    config.resolve_backend_for(platform).selection,
+                    SandboxBackendSelection::Native
+                );
+            }
+            for json in [
+                r#"{"backend":"auto"}"#,
+                r#"{"onUnavailable":"deny"}"#,
+                r#"{"onUnavailable":"run-unconfined"}"#,
+                r#"{"network":"deny"}"#,
+                r#"{"protectedPaths":["private"]}"#,
+                r#"{"writableRoots":["cache"]}"#,
+            ] {
+                let config: SandboxConfig = serde_json::from_str(json).expect("config");
+                assert_eq!(
+                    config.resolve_backend_for(platform).selection,
+                    SandboxBackendSelection::Auto,
+                    "{json}"
+                );
+            }
+            let explicit: SandboxConfig = serde_json::from_str(
+                r#"{"backend":"native","network":"deny","protectedPaths":["private"]}"#,
+            )
+            .expect("explicit native contract");
+            assert_eq!(
+                explicit.resolve_backend_for(platform).source,
+                SandboxBackendSource::Explicit
+            );
+        }
+        for platform in ["linux", "freebsd", "unknown"] {
+            assert_eq!(
+                SandboxConfig::default()
+                    .resolve_backend_for(platform)
+                    .selection,
+                SandboxBackendSelection::Auto
+            );
+        }
     }
 }

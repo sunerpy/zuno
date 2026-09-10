@@ -30,6 +30,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 similar = { workspace = true }
 terminal-colorsaurus = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tree-sitter = { workspace = true }
@@ -52,6 +53,7 @@ tree-sitter-yaml = { workspace = true }
 unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
 url = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }
@@ -64,7 +66,6 @@ tokio = { workspace = true, features = ["test-util"] }
 # The configuration-discovery tests write real files, because the failure this
 # module has to get right — a missing layer versus an unreadable one — is a
 # filesystem distinction that an in-memory fixture cannot reproduce.
-tempfile = { workspace = true }
 zuno-sandbox = { workspace = true }
 
 [lints]

@@ -39,6 +39,7 @@ use serde::Serialize;
 use zuno_config::schema::Config;
 use zuno_config::schema::mcp::McpServerConfig;
 use zuno_orchestration::ToolSchemaIdentity;
+use zuno_tools::registry::McpToolLoader as _;
 
 /// One configured MCP server after an active diagnostic connection attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -63,6 +64,8 @@ pub(crate) struct McpRuntimeDiagnostics {
     pub(crate) servers: Vec<McpServerDiagnostic>,
     pub(crate) connected_servers: Vec<String>,
     pub(crate) tools: Vec<ToolSchemaIdentity>,
+    pub(crate) schema_metadata: Vec<super::mcp_exposure::McpSchemaMetadata>,
+    pub(crate) eager_tool_ids: Vec<String>,
     pub(crate) warnings: Vec<String>,
     pub(crate) cleanup_warnings: Vec<String>,
 }
@@ -323,17 +326,24 @@ impl McpRuntime {
                 }
             })
             .collect();
-        let tools = self
-            .catalog
-            .tools()
-            .into_iter()
+        let snapshot = self.catalog.loader().snapshot();
+        let tools = snapshot
+            .tools
+            .iter()
             .map(|tool| tool.definition().schema_identity())
+            .collect();
+        let schema_metadata = snapshot
+            .tools
+            .iter()
+            .map(|tool| super::mcp_exposure::McpSchemaMetadata::of(tool.as_ref()))
             .collect();
         McpRuntimeDiagnostics {
             discovery_status,
             servers,
             connected_servers: self.catalog.connected_servers(),
             tools,
+            schema_metadata,
+            eager_tool_ids: snapshot.eager_tool_ids,
             warnings,
             cleanup_warnings: Vec::new(),
         }

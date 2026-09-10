@@ -180,7 +180,10 @@ async fn cancellation_terminates_the_complete_process_group() {
         .info;
 
     assert_eq!(settled.status, BackgroundExecutionStatus::Cancelled);
-    assert_eq!(settled.authority.schema_version, 3);
+    assert_eq!(
+        settled.authority.schema_version,
+        zuno_sandbox::EXECUTION_AUTHORITY_VERSION
+    );
     assert_eq!(
         settled.authority.requested_mode(),
         SandboxMode::WorkspaceWrite
@@ -214,7 +217,10 @@ async fn hard_ceiling_is_terminal_and_never_replays_the_command() {
     assert!(marker.exists());
     assert_eq!(settled.status, BackgroundExecutionStatus::Failed);
     assert!(settled.timed_out);
-    assert_eq!(settled.authority.schema_version, 3);
+    assert_eq!(
+        settled.authority.schema_version,
+        zuno_sandbox::EXECUTION_AUTHORITY_VERSION
+    );
     assert_eq!(
         settled.authority.requested_network(),
         NetworkAccess::Allowed
@@ -488,7 +494,10 @@ fn persisted_running_state_reconciles_to_uncertain_without_replay() {
         BackgroundExecutionPurpose::Command,
         "older format-3 rows without purpose must retain ordinary command semantics"
     );
-    assert_eq!(info.authority.schema_version, 3);
+    assert_eq!(
+        info.authority.schema_version,
+        zuno_sandbox::EXECUTION_AUTHORITY_VERSION
+    );
     assert_eq!(info.authority.requested_mode(), SandboxMode::WorkspaceWrite);
     assert_eq!(info.output_file, output_file);
     assert_eq!(info.status_file, status_file);

@@ -559,6 +559,15 @@ impl Builtin {
         // Reporting is a separate host-managed capability. It does not grant edit
         // tools or change the role's Shell filesystem contract.
         if !self.hidden {
+            // Leaving the workspace is an auxiliary permission, not another tool.
+            // A deny-by-default role must name it even when it already allows read
+            // or shell. Ask follows the configured approval mode; it is never a
+            // blanket grant over a later user or per-Agent deny.
+            rules.push((
+                "external_directory",
+                PermissionRule::Action(PermissionAction::Ask),
+            ));
+            rules.push(("tool_search", allow()));
             rules.push(("report_write", allow()));
         }
         let mut object = OrderedMap::new();
@@ -571,13 +580,10 @@ impl Builtin {
         })
     }
 
-    /// Whether the composition root must add runtime path rules.
+    /// Whether this working Agent needs the shared runtime directory rules.
     #[must_use]
-    pub fn permission_overlay_is_partial(&self) -> bool {
-        matches!(
-            self.name,
-            "plan" | "review" | "explorer" | "librarian" | "oracle" | "looker"
-        )
+    pub fn uses_external_directories(&self) -> bool {
+        !self.hidden
     }
 
     /// Skills this native loads at the start of every turn.
@@ -802,6 +808,7 @@ mod tests {
     /// The two rule layers that decide whether a tool id reaches the model.
     fn effective_rules(builtin: &Builtin) -> Vec<Rule> {
         let mut rules = vec![Rule {
+            source: None,
             permission: "*".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Allow,

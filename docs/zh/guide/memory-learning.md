@@ -56,6 +56,11 @@ HTTP projection 是 `GET /api/session/{sessionID}/learning`。ACP 在
 `/memories` 修改当前 Session policy。关闭使用只影响后续 Prompt 组装，不删除文件、Experience、
 candidate 或审计记录。配置默认值之后发生变化，也不会重写已有 Session。
 
+新子会话在创建 Session 和 job 的同一事务中读取父会话最新持久 policy。父策略 revision
+为 1 或更大完全合法；没有 revision 的默认值是独立类型，仅在旧父会话没有 policy 行时使用。
+子会话从自己的 revision 1 开始，继承 disabled／excluded 等选择；之后父策略改变也不会重写
+已委派的子会话。不需要重建数据库或把父策略 revision 重置为零。
+
 HTTP client 通过 `GET|PUT /api/session/{sessionID}/memory-policy` 读写 policy。更新必须带
 `expectedRevision`；revision 过期返回 `409`。Client 只能请求 `enabled` 或 `disabled`，
 `excluded` 由宿主设置。

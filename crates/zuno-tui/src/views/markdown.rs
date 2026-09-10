@@ -63,6 +63,7 @@
 //! tree-sitter adapter for styled spans, then applies the same hard-break path used by
 //! the plain fallback. The frame, label and width arithmetic remain outside the seam.
 
+use super::selection::{CopyRow, copy_projections};
 use super::{display_width, highlight};
 use crate::theme::Palette;
 use pulldown_cmark::{
@@ -74,6 +75,11 @@ use unicode_segmentation::UnicodeSegmentation;
 
 /// One rendered row: the spans that fill it, left to right.
 pub type Row = Vec<Span<'static>>;
+
+pub(crate) struct RenderedMarkdown {
+    pub rows: Vec<Row>,
+    pub copy: Vec<Option<CopyRow>>,
+}
 
 /// The narrowest content column this module will lay text into.
 ///
@@ -104,6 +110,10 @@ const MIN_TABLE_COLUMN: usize = 3;
 /// plan §7.1's element table and §11.5's semantic assignment.
 #[must_use]
 pub fn render(source: &str, width: u16, palette: &Palette) -> Vec<Row> {
+    render_with_copy(source, width, palette).rows
+}
+
+pub(crate) fn render_with_copy(source: &str, width: u16, palette: &Palette) -> RenderedMarkdown {
     let mut builder = Builder::new(width, palette);
     let mut options = Options::empty();
     // Five extensions, each because models emit the syntax unprompted and the
@@ -271,6 +281,7 @@ fn split_code_row(spans: Row, width: usize) -> (Row, Row) {
 enum Token {
     Word { text: String, style: Style },
     Space,
+    SoftBreak,
     HardBreak,
 }
 
@@ -319,6 +330,7 @@ struct Builder<'palette> {
     width: usize,
     palette: &'palette Palette,
     rows: Vec<Row>,
+    copy: Vec<Option<CopyRow>>,
     /// Inline tokens accumulated for the block currently open.
     inline: Vec<Token>,
     /// The style stack: emphasis, strong, code, link and strikethrough compose.
@@ -343,6 +355,7 @@ impl<'palette> Builder<'palette> {
             width: usize::from(width),
             palette,
             rows: Vec::new(),
+            copy: Vec::new(),
             inline: Vec::new(),
             styles: Vec::new(),
             lists: Vec::new(),
@@ -555,14 +568,21 @@ impl<'palette> Builder<'palette> {
         let rest_prefix = self.prefix(false);
         let content = self.content_width(row_width(&first_prefix).max(row_width(&rest_prefix)));
         let laid_out = lay_out(&tokens, content);
-        for (index, mut row) in laid_out.into_iter().enumerate() {
+        let shown: Vec<String> = laid_out
+            .iter()
+            .map(|row| row.iter().map(|span| span.content.as_ref()).collect())
+            .collect();
+        let projections = copy_projections(&inline_copy_text(&tokens), &shown);
+        for (index, (mut row, mut copy)) in laid_out.into_iter().zip(projections).enumerate() {
             let mut line = if index == 0 {
                 first_prefix.clone()
             } else {
                 rest_prefix.clone()
             };
+            copy.content_start = u16::try_from(row_width(&line)).unwrap_or(u16::MAX);
             line.append(&mut row);
             self.push_row(line);
+            *self.copy.last_mut().expect("pushed row") = Some(copy);
         }
         self.consume_marker();
     }
@@ -574,7 +594,11 @@ impl<'palette> Builder<'palette> {
     /// clips after the layout above already counted it — which is the exact shape of
     /// the bug §11.5 records against `chars().count()`.
     fn push_row(&mut self, row: Row) {
-        self.rows.push(truncate_row(row, self.width));
+        let row = truncate_row(row, self.width);
+        self.copy.push(Some(CopyRow::visible(
+            row.iter().map(|span| span.content.as_ref()).collect(),
+        )));
+        self.rows.push(row);
     }
 
     /// A blank row, used as the gap after a block.
@@ -589,6 +613,11 @@ impl<'palette> Builder<'palette> {
             return;
         }
         self.rows.push(Vec::new());
+        self.copy.push(Some(CopyRow {
+            content_start: 0,
+            text: "\n".to_owned(),
+            join_before: String::new(),
+        }));
     }
 
     // -- blocks -------------------------------------------------------------
@@ -731,10 +760,14 @@ impl<'palette> Builder<'palette> {
         // fence rendering `╭││││││╰` with none of its contents. Unframed code in a
         // two-column terminal is still the code.
         if content < MIN_TABLE_COLUMN {
-            for chunk in self.code_rows(fence.language.as_deref(), source, content.max(1)) {
+            for (chunk, mut copy) in
+                self.code_rows(fence.language.as_deref(), source, content.max(1))
+            {
                 let mut row = self.prefix(false);
+                copy.content_start = u16::try_from(row_width(&row)).unwrap_or(u16::MAX);
                 row.extend(chunk);
                 self.push_row(row);
+                *self.copy.last_mut().expect("code row") = Some(copy);
             }
             self.consume_marker();
             self.blank();
@@ -763,13 +796,16 @@ impl<'palette> Builder<'palette> {
         };
         top.push(Span::styled(opener, frame_style));
         self.push_row(top);
+        *self.copy.last_mut().expect("frame") = None;
         self.consume_marker();
 
-        for chunk in self.code_rows(fence.language.as_deref(), source, body) {
+        for (chunk, mut copy) in self.code_rows(fence.language.as_deref(), source, body) {
             let mut row = self.prefix(false);
             row.push(Span::styled(String::from("│ "), frame_style));
+            copy.content_start = u16::try_from(row_width(&row)).unwrap_or(u16::MAX);
             row.extend(chunk);
             self.push_row(row);
+            *self.copy.last_mut().expect("code row") = Some(copy);
         }
 
         let mut bottom = self.prefix(false);
@@ -778,6 +814,7 @@ impl<'palette> Builder<'palette> {
             frame_style,
         ));
         self.push_row(bottom);
+        *self.copy.last_mut().expect("frame") = None;
         self.blank();
     }
 
@@ -790,7 +827,7 @@ impl<'palette> Builder<'palette> {
     /// Code is broken, never reflowed: indentation is meaning in most languages, and a
     /// word-wrapped `if` is a different program to read. The break lands on cluster
     /// boundaries so a wide glyph inside a string literal stays whole.
-    fn code_rows(&self, language: Option<&str>, source: &str, width: usize) -> Vec<Row> {
+    fn code_rows(&self, language: Option<&str>, source: &str, width: usize) -> Vec<(Row, CopyRow)> {
         let rows = highlight::spans(language, source, self.palette).unwrap_or_else(|| {
             let style = self.tinted(self.palette.markdown_code_block);
             source
@@ -804,9 +841,16 @@ impl<'palette> Builder<'palette> {
                 })
                 .collect()
         });
-        rows.into_iter()
+        let rows: Vec<Row> = rows
+            .into_iter()
             .flat_map(|row| break_code_row(row, width))
-            .collect()
+            .collect();
+        let shown: Vec<String> = rows
+            .iter()
+            .map(|row| row.iter().map(|span| span.content.as_ref()).collect())
+            .collect();
+        let copy = copy_projections(source, &shown);
+        rows.into_iter().zip(copy).collect()
     }
 
     // -- tables -------------------------------------------------------------
@@ -1022,7 +1066,7 @@ impl<'palette> Builder<'palette> {
                 let style = self.tinted(self.palette.markdown_link);
                 self.push_atom(format!("[^{label}]"), style);
             }
-            Event::SoftBreak => self.inline.push(Token::Space),
+            Event::SoftBreak => self.inline.push(Token::SoftBreak),
             Event::HardBreak => self.inline.push(Token::HardBreak),
             Event::Rule => {
                 self.flush_inline();
@@ -1214,7 +1258,7 @@ impl<'palette> Builder<'palette> {
     /// A truncated document is the normal case while a reply streams, so the tail is
     /// closed here rather than treated as malformed: an unclosed fence is framed, an
     /// unclosed table is drawn, and a bare paragraph is emitted.
-    fn finish(mut self) -> Vec<Row> {
+    fn finish(mut self) -> RenderedMarkdown {
         if self.fence.is_some() {
             self.close_fence();
         }
@@ -1224,8 +1268,12 @@ impl<'palette> Builder<'palette> {
         self.flush_inline();
         while self.rows.last().is_some_and(|row| row_width(row) == 0) {
             self.rows.pop();
+            self.copy.pop();
         }
-        self.rows
+        RenderedMarkdown {
+            rows: self.rows,
+            copy: self.copy,
+        }
     }
 }
 
@@ -1236,7 +1284,7 @@ fn flatten(cell: &Cell) -> Row {
         match token {
             Token::Word { text, style } => out.push(Span::styled(text.clone(), *style)),
             // A cell is one line by construction, so both separators are a space.
-            Token::Space | Token::HardBreak => {
+            Token::Space | Token::SoftBreak | Token::HardBreak => {
                 if !out.is_empty() {
                     out.push(Span::raw(String::from(" ")));
                 }
@@ -1262,6 +1310,33 @@ fn flatten(cell: &Cell) -> Row {
 /// * When the row cannot hold even one cluster the cluster is emitted anyway. One
 ///   column of overflow is an artefact the terminal absorbs; consuming zero bytes is a
 ///   hung TUI, which is the trade already made and documented in `wrap`.
+fn inline_copy_text(tokens: &[Token]) -> String {
+    let mut text = String::new();
+    let mut separator = "";
+    for token in tokens {
+        match token {
+            Token::Word { text: word, .. } => {
+                if !text.is_empty() {
+                    text.push_str(separator);
+                }
+                text.push_str(word);
+                separator = "";
+            }
+            Token::Space => {
+                if separator.is_empty() {
+                    separator = " ";
+                }
+            }
+            Token::SoftBreak => separator = "\n",
+            Token::HardBreak => {
+                text.push('\n');
+                separator = "";
+            }
+        }
+    }
+    text
+}
+
 fn lay_out(tokens: &[Token], width: usize) -> Vec<Row> {
     let width = width.max(1);
     let mut rows: Vec<Row> = Vec::new();
@@ -1276,7 +1351,7 @@ fn lay_out(tokens: &[Token], width: usize) -> Vec<Row> {
                 used = 0;
                 pending_space = false;
             }
-            Token::Space => {
+            Token::Space | Token::SoftBreak => {
                 if !row.is_empty() {
                     pending_space = true;
                 }

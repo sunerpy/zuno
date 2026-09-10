@@ -185,6 +185,7 @@ fn status_codes_classify_without_a_substring_search() {
 #[test]
 fn tool_failures_identify_their_tool_and_their_next_step() {
     let denied = ToolError::Denied {
+        denial: None,
         tool: "write".to_owned(),
     };
     let invalid = ToolError::InvalidArgs {

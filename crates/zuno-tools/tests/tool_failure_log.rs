@@ -220,6 +220,7 @@ impl Tool for Denied {
 
     async fn execute(&self, _args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
         Err(ToolError::Denied {
+            denial: None,
             tool: self.0.to_owned(),
         })
     }

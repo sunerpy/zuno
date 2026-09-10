@@ -257,7 +257,7 @@ fn session_screen_a_submission_during_work_is_queued_for_the_next_turn() {
         "the committed FIFO entry is not fixed above the composer:\n{rendered}"
     );
     assert!(
-        rendered.contains("ctrl+return send now"),
+        rendered.contains("ctrl+x return choose queued input"),
         "the queue dock does not show the effective force-submit binding:\n{rendered}"
     );
     assert_eq!(
@@ -333,7 +333,7 @@ fn session_screen_queue_dock_keeps_fifo_order_and_uses_a_rebound_send_now_key() 
         "the dock changed durable FIFO order:\n{rendered}"
     );
     assert!(
-        rendered.contains("alt+enter send now"),
+        rendered.contains("alt+enter choose queued input"),
         "the dock used a hard-coded shortcut instead of the resolved keymap:\n{rendered}"
     );
 }
@@ -421,18 +421,30 @@ fn session_screen_ctrl_enter_marks_a_busy_submission_as_an_explicit_steer() {
     let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
         .with_prompt_sink(prompts)
         .with_queued_inputs(projection.clone(), mutations);
-    screen.status.mark_running();
+    screen.handle_event(&AppEvent::Engine(TurnEvent::TurnStarted {
+        session_id: "test".to_owned(),
+        turn_id: "turn-live".to_owned(),
+    }));
     screen.editor.set_text("change direction now");
 
     screen.handle_action(action("input_force_submit"), &press_none());
 
+    let mut sent = submitted.try_recv().expect("steer envelope");
+    assert!(
+        sent.prompt.request_id.take().is_some(),
+        "steering owns an admission receipt"
+    );
     assert_eq!(
-        submitted.try_recv(),
-        Ok(root_prompt_with(
-            PromptSubmission::Text(String::from("change direction now")),
-            PromptDelivery::Steer,
-            PromptOrigin::TuiForceSubmit,
-        ))
+        Ok::<_, mpsc::error::TryRecvError>(sent),
+        Ok({
+            let mut prompt = root_prompt_with(
+                PromptSubmission::Text(String::from("change direction now")),
+                PromptDelivery::Steer,
+                PromptOrigin::TuiForceSubmit,
+            );
+            prompt.prompt.expected_turn_id = Some("turn-live".to_owned());
+            prompt
+        })
     );
     assert!(
         ActionComponent::drain_toasts(&mut screen).is_empty(),
@@ -471,7 +483,10 @@ fn session_screen_force_submit_uses_typed_steer_without_requesting_cancellation(
     let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
         .with_prompt_sink(prompts)
         .with_cancel_sink(cancels);
-    screen.status.mark_running();
+    screen.handle_event(&AppEvent::Engine(TurnEvent::TurnStarted {
+        session_id: "test".to_owned(),
+        turn_id: "turn-live".to_owned(),
+    }));
     screen.editor.set_text("steer without stopping the task");
 
     screen.handle_action(action("input_force_submit"), &press_none());
@@ -500,7 +515,10 @@ fn session_screen_palette_force_submit_preserves_palette_origin_without_cancelli
     let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
         .with_prompt_sink(prompts)
         .with_cancel_sink(cancels);
-    screen.status.mark_running();
+    screen.handle_event(&AppEvent::Engine(TurnEvent::TurnStarted {
+        session_id: "test".to_owned(),
+        turn_id: "turn-live".to_owned(),
+    }));
     screen.editor.set_text("palette steer");
 
     screen.dispatch_action("input_force_submit");
@@ -518,6 +536,281 @@ fn session_screen_palette_force_submit_preserves_palette_origin_without_cancelli
         cancellation_requests.try_recv(),
         Err(mpsc::error::TryRecvError::Empty),
         "the command palette must not translate force submit into hard cancellation"
+    );
+}
+
+#[test]
+fn queue_send_now_routes_the_selected_second_row_through_the_real_key_dispatcher() {
+    use crate::views::picker::{QueuedInputDelivery, QueuedInputEntry, QueuedInputProjection};
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let context = ViewContext::defaults();
+    let (wake, _wakes) = terminal_event_channel();
+    let (prompts, mut prompt_source) = mpsc::channel(2);
+    let (mutations, mut mutation_source) = mpsc::channel(2);
+    let projection = QueuedInputProjection::new(
+        (1..=3)
+            .map(|n| QueuedInputEntry {
+                id: format!("input-{n}"),
+                text: format!("queued {n}"),
+                delivery: QueuedInputDelivery::Queue,
+                revision: n,
+                editable: true,
+            })
+            .collect(),
+    );
+    let mut screen = SessionScreen::new(context.clone(), wake.clone())
+        .with_prompt_sink(prompts)
+        .with_queued_inputs(projection.clone(), mutations);
+    screen.handle_event(&AppEvent::Engine(TurnEvent::TurnStarted {
+        session_id: "session".to_owned(),
+        turn_id: "turn-live".to_owned(),
+    }));
+    screen.editor.set_text("this newer draft must not be sent");
+    let mut dialogs = DialogHost::new(context.clone(), Box::new(screen));
+    dialogs.open(Box::new(crate::views::picker::queued_input_dialog(
+        context, projection,
+    )));
+    let mut dispatcher = KeyDispatcher::new(
+        Keymap::defaults().expect("keys"),
+        scopes(),
+        Box::new(dialogs),
+    )
+    .with_paste_burst(wake);
+    for (code, modifiers) in [
+        (KeyCode::Down, KeyModifiers::NONE),
+        (KeyCode::Char('x'), KeyModifiers::CONTROL),
+        (KeyCode::Enter, KeyModifiers::NONE),
+    ] {
+        dispatcher.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+            CrosstermEvent::Key(KeyEvent::new(code, modifiers)),
+        )));
+    }
+    let mutation = mutation_source
+        .try_recv()
+        .expect("the displayed leader chord must work");
+    assert!(matches!(mutation, QueuedInputMutation::SendNow {
+        id, expected_revision: 2, expected_turn_id: Some(turn), request_id,
+    } if id == "input-2" && turn == "turn-live" && !request_id.is_empty()));
+    assert!(
+        prompt_source.try_recv().is_err(),
+        "queue selection never submits the composer draft"
+    );
+}
+
+#[test]
+fn rejected_steering_restores_the_whole_paste_without_sending_it_to_a_new_turn() {
+    let (wake, _wakes) = terminal_event_channel();
+    let (prompts, mut prompt_source) = mpsc::channel(2);
+    let projection = crate::views::picker::QueuedInputProjection::default();
+    let (mutations, _mutations) = mpsc::channel(2);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), wake)
+        .with_prompt_sink(prompts)
+        .with_queued_inputs(projection.clone(), mutations);
+    screen.handle_event(&AppEvent::Engine(TurnEvent::TurnStarted {
+        session_id: "session".to_owned(),
+        turn_id: "old-turn".to_owned(),
+    }));
+    let text = (0..30)
+        .map(|n| format!("中文第 {n} 行 👨‍👩‍👧‍👦\n"))
+        .collect::<String>();
+    screen.paste(&text);
+    screen.handle_action(action("input_force_submit"), &press_none());
+    let sent = prompt_source.try_recv().expect("submit attempt");
+    assert_eq!(sent.prompt.expected_turn_id.as_deref(), Some("old-turn"));
+    assert!(screen.editor.is_empty());
+    projection.acknowledge_prompt(
+        sent.prompt.request_id.expect("receipt id"),
+        Some("turn ended".to_owned()),
+    );
+    screen.handle_event(&AppEvent::Terminal(TerminalEvent::Wake));
+    assert_eq!(screen.editor.submission_text(), text);
+    assert!(
+        prompt_source.try_recv().is_err(),
+        "restoration is not an automatic retry"
+    );
+}
+
+#[test]
+fn failed_steering_does_not_overwrite_a_newer_draft() {
+    let (wake, _wakes) = terminal_event_channel();
+    let (prompts, mut prompt_source) = mpsc::channel(2);
+    let projection = crate::views::picker::QueuedInputProjection::default();
+    let (mutations, _mutations) = mpsc::channel(2);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), wake)
+        .with_prompt_sink(prompts)
+        .with_queued_inputs(projection.clone(), mutations);
+    screen.handle_event(&AppEvent::Engine(TurnEvent::TurnStarted {
+        session_id: "session".to_owned(),
+        turn_id: "turn-live".to_owned(),
+    }));
+    screen.editor.set_text("original steer");
+    screen.handle_action(action("input_force_submit"), &press_none());
+    let sent = prompt_source.try_recv().expect("submit attempt");
+    screen.editor.set_text("newer draft");
+    projection.acknowledge_prompt(
+        sent.prompt.request_id.expect("receipt"),
+        Some("stale".to_owned()),
+    );
+    screen.handle_event(&AppEvent::Terminal(TerminalEvent::Wake));
+    assert_eq!(screen.editor.text(), "newer draft");
+    screen.handle_action(action("input_submit"), &press_none());
+    assert_eq!(
+        prompt_source
+            .try_recv()
+            .expect("only newer draft sent")
+            .prompt
+            .payload,
+        PromptSubmission::Text("newer draft".to_owned())
+    );
+    assert_eq!(
+        screen.editor.text(),
+        "original steer",
+        "the rejected draft remains recoverable"
+    );
+    assert!(prompt_source.try_recv().is_err());
+}
+
+#[derive(Default)]
+struct DeferredClipboard {
+    completion: std::sync::Mutex<Option<crate::views::external::ClipboardCompletion>>,
+}
+
+impl DeferredClipboard {
+    fn request(&self) -> crate::views::external::ClipboardRequest {
+        let (request, completion) = crate::views::external::ClipboardRequest::pending(true);
+        *self.completion.lock().expect("completion") = Some(completion);
+        request
+    }
+
+    fn complete(&self, content: Option<crate::views::external::ClipboardContent>) {
+        self.completion
+            .lock()
+            .expect("completion")
+            .take()
+            .expect("a request is pending")
+            .complete(Ok(content));
+    }
+}
+
+impl crate::views::external::Clipboard for DeferredClipboard {
+    fn read(&self) -> Result<Option<crate::views::external::ClipboardContent>, ExternalError> {
+        panic!("the TUI must never invoke blocking clipboard reads");
+    }
+    fn write(&self, _text: &str) -> Result<(), ExternalError> {
+        panic!("the TUI must never invoke blocking clipboard writes");
+    }
+    fn request_read(&self) -> Result<crate::views::external::ClipboardRequest, ExternalError> {
+        Ok(self.request())
+    }
+    fn request_write(
+        &self,
+        _text: &str,
+    ) -> Result<crate::views::external::ClipboardRequest, ExternalError> {
+        Ok(self.request())
+    }
+}
+
+#[test]
+fn clipboard_paste_waits_for_the_whole_async_block_before_allowing_submit() {
+    let (wake, _wakes) = terminal_event_channel();
+    let (prompts, mut prompt_source) = mpsc::channel(2);
+    let clipboard = Arc::new(DeferredClipboard::default());
+    let mut screen = SessionScreen::new(ViewContext::defaults(), wake)
+        .with_clipboard(clipboard.clone())
+        .with_prompt_sink(prompts);
+    screen.paste_from_clipboard();
+    assert!(screen.editor.is_empty());
+    screen.handle_action(action("input_submit"), &press_none());
+    assert!(
+        prompt_source.try_recv().is_err(),
+        "pending paste must not submit a partial draft"
+    );
+    clipboard.complete(Some(crate::views::external::ClipboardContent::text(
+        "first\r\n第二行\r\n",
+    )));
+    screen.handle_event(&AppEvent::Terminal(TerminalEvent::Wake));
+    assert_eq!(screen.editor.submission_text(), "first\n第二行\n");
+    assert!(prompt_source.try_recv().is_err());
+    screen.handle_action(action("input_submit"), &press_none());
+    assert_eq!(
+        prompt_source
+            .try_recv()
+            .expect("one later explicit send")
+            .prompt
+            .payload,
+        PromptSubmission::Text("first\n第二行\n".to_owned())
+    );
+    assert!(prompt_source.try_recv().is_err());
+}
+
+#[test]
+fn async_clipboard_result_cannot_overwrite_a_changed_paste_target() {
+    let (wake, _wakes) = terminal_event_channel();
+    let clipboard = Arc::new(DeferredClipboard::default());
+    let mut screen =
+        SessionScreen::new(ViewContext::defaults(), wake).with_clipboard(clipboard.clone());
+    screen.paste_from_clipboard();
+    screen
+        .editor
+        .insert_text("typed while clipboard was loading");
+    clipboard.complete(Some(crate::views::external::ClipboardContent::text(
+        "old clipboard",
+    )));
+    screen.handle_event(&AppEvent::Terminal(TerminalEvent::Wake));
+    assert_eq!(screen.editor.text(), "typed while clipboard was loading");
+    assert!(
+        screen
+            .toasts
+            .iter()
+            .any(|toast| toast.text().contains("paste target changed"))
+    );
+}
+
+#[test]
+fn async_native_copy_reports_success_only_after_completion() {
+    let (wake, _wakes) = terminal_event_channel();
+    let clipboard = Arc::new(DeferredClipboard::default());
+    let mut screen =
+        SessionScreen::new(ViewContext::defaults(), wake).with_clipboard(clipboard.clone());
+    screen.copy("exact selected text".to_owned());
+    assert!(
+        screen.toasts.is_empty(),
+        "request submission is not successful copying"
+    );
+    screen.editor.insert_text("the composer remains usable");
+    clipboard.complete(None);
+    screen.handle_event(&AppEvent::Terminal(TerminalEvent::Wake));
+    assert!(
+        screen
+            .toasts
+            .iter()
+            .any(|toast| toast.text().contains("copied 19 characters"))
+    );
+    assert_eq!(screen.editor.text(), "the composer remains usable");
+}
+
+#[test]
+fn rejected_copy_does_not_allow_an_older_completion_to_report_success() {
+    let (wake, _wakes) = terminal_event_channel();
+    let clipboard = Arc::new(DeferredClipboard::default());
+    let mut screen =
+        SessionScreen::new_with_clipboard(ViewContext::defaults(), wake, clipboard.clone());
+    screen.copy("first".to_owned());
+    screen.copy("second".to_owned());
+    screen.copy("latest selection".to_owned());
+    clipboard.complete(None);
+    screen.handle_event(&AppEvent::Terminal(TerminalEvent::Wake));
+    assert!(
+        screen
+            .toasts
+            .iter()
+            .any(|toast| toast.text().contains("clipboard is busy"))
+    );
+    assert!(
+        !screen
+            .toasts
+            .iter()
+            .any(|toast| toast.text().starts_with("copied "))
     );
 }
 
@@ -595,6 +888,68 @@ fn session_screen_a_large_paste_shows_a_summary_but_submits_the_whole_text() {
         [pasted],
         "the transcript recorded the summary rather than what was sent"
     );
+}
+
+#[test]
+fn legacy_key_paste_is_one_block_and_requires_a_later_explicit_submit() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let (sender, _shutdown) = terminal_event_channel();
+    let (prompts, mut submitted) = mpsc::channel(4);
+    let screen =
+        SessionScreen::new(ViewContext::defaults(), sender.clone()).with_prompt_sink(prompts);
+    let mut dispatcher = KeyDispatcher::new(
+        Keymap::defaults().expect("keys"),
+        scopes(),
+        Box::new(screen),
+    )
+    .with_paste_burst(sender);
+    let start = Instant::now();
+    for (index, code) in [
+        KeyCode::Char('a'),
+        KeyCode::Enter,
+        KeyCode::Char('b'),
+        KeyCode::Enter,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        dispatcher.handle_event_at(
+            &AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Key(KeyEvent::new(
+                code,
+                KeyModifiers::NONE,
+            )))),
+            start + std::time::Duration::from_millis(index as u64),
+        );
+        assert!(
+            submitted.try_recv().is_err(),
+            "a paste newline submitted input"
+        );
+    }
+    dispatcher.handle_event_at(
+        &AppEvent::Terminal(TerminalEvent::Wake),
+        start + std::time::Duration::from_millis(70),
+    );
+    assert!(
+        submitted.try_recv().is_err(),
+        "flushing a paste submitted input"
+    );
+    dispatcher.handle_event_at(
+        &AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))),
+        start + std::time::Duration::from_millis(300),
+    );
+    dispatcher.handle_event_at(
+        &AppEvent::Terminal(TerminalEvent::Wake),
+        start + std::time::Duration::from_millis(320),
+    );
+    let sent = submitted.try_recv().expect("explicit submit");
+    assert_eq!(
+        sent.prompt.payload,
+        PromptSubmission::Text("a\nb\n".to_owned())
+    );
+    assert!(submitted.try_recv().is_err());
 }
 
 #[test]
@@ -718,9 +1073,10 @@ fn session_screen_refuses_a_paste_while_a_modal_owns_the_keyboard() {
 #[test]
 fn session_screen_the_paste_binding_reports_that_it_could_not_read_the_clipboard() {
     // `EditorSignal::Paste` used to fall into a bare redraw, so the binding did nothing
-    // and said nothing. The host clipboard still refuses to read — see
-    // `external::SystemClipboard::read` — and the point is that the refusal is now shown.
-    let (mut screen, _shutdown) = screen();
+    // and said nothing. Inject the unavailable provider: a real Windows clipboard
+    // can read asynchronously and must not make this failure-path test host-dependent.
+    let (screen, _shutdown) = screen();
+    let mut screen = screen.with_clipboard(broken_clipboard());
     let result = screen.handle_action(action("input_paste"), &press_none());
 
     assert!(result.redraw);
@@ -1410,7 +1766,10 @@ fn session_screen_reference_autocomplete_uses_the_host_source_without_growing_th
 #[test]
 fn session_screen_exposes_the_autocomplete_scope_only_while_it_is_open() {
     let (mut screen, _shutdown) = screen();
-    assert_eq!(ActionComponent::focused_scopes(&screen), ["history"]);
+    assert_eq!(
+        ActionComponent::focused_scopes(&screen),
+        ["history", "input"]
+    );
 
     screen.editor.set_text("/mo");
     screen.refresh_autocomplete();
@@ -1421,7 +1780,10 @@ fn session_screen_exposes_the_autocomplete_scope_only_while_it_is_open() {
 
     screen.editor.set_text("ordinary prompt");
     screen.refresh_autocomplete();
-    assert_eq!(ActionComponent::focused_scopes(&screen), ["history"]);
+    assert_eq!(
+        ActionComponent::focused_scopes(&screen),
+        ["history", "input"]
+    );
 }
 
 #[test]
@@ -3371,18 +3733,24 @@ fn session_up_on_an_empty_prompt_recalls_the_newest_persisted_prompt() {
 }
 
 #[test]
-fn session_up_on_an_empty_prompt_scrolls_a_long_transcript() {
+fn session_arrows_on_an_empty_prompt_never_scroll_a_long_transcript() {
     let (mut screen, _shutdown) = scrollable(scroll_config(None, None));
     let bottom = screen.transcript.content_height() - screen.transcript.viewport_height();
     assert!(bottom > 0, "fixture is not scrollable");
     screen.transcript.set_offset(bottom);
 
-    let (resolved, result) = dispatch_to_screen(&mut screen, "up");
-
-    assert_eq!(resolved, "messages_line_up");
-    assert!(result.redraw);
-    assert_eq!(screen.transcript.offset(), bottom - 1);
-    assert!(screen.editor.is_empty());
+    for (key, expected) in [("up", "history_previous"), ("down", "history_next")] {
+        let (resolved, result) = dispatch_to_screen(&mut screen, key);
+        assert_eq!(resolved, expected);
+        assert!(result.handled);
+        assert_eq!(screen.transcript.offset(), bottom);
+        assert!(screen.editor.is_empty());
+    }
+    screen.editor.load_history(vec!["old\ninput".to_owned()]);
+    let (_, result) = dispatch_to_screen(&mut screen, "up");
+    assert!(result.handled);
+    assert_eq!(screen.editor.text(), "old\ninput");
+    assert_eq!(screen.transcript.offset(), bottom);
 }
 
 #[test]
@@ -3424,12 +3792,13 @@ fn session_down_above_the_last_line_moves_within_the_multi_line_prompt() {
     let (mut screen, _shutdown) = screen();
     screen.editor.set_text("one\ntwo\nthree");
     screen.editor.handle_action(action("input_buffer_home"));
+    screen.editor.handle_action(action("input_move_right"));
 
     let (resolved, result) = dispatch_to_screen(&mut screen, "down");
 
-    assert_eq!(resolved, "history_next");
+    assert_eq!(resolved, "input_move_down");
     assert!(result.redraw);
-    assert_eq!(screen.editor.cursor(), Position { line: 1, column: 0 });
+    assert_eq!(screen.editor.cursor(), Position { line: 1, column: 1 });
     assert_eq!(screen.editor.text(), "one\ntwo\nthree");
 }
 
@@ -8895,7 +9264,7 @@ fn leader_down_enters_a_restored_completed_child_after_tui_restart() {
 }
 
 #[test]
-fn live_running_child_enter_submits_plain_text_as_a_targeted_steer() {
+fn live_running_child_enter_queues_without_implicitly_steering() {
     let (sender, _shutdown) = terminal_event_channel();
     let (prompts, mut submitted) = mpsc::channel(2);
     let sessions = crate::views::live_session::LiveSessions::default();
@@ -8925,17 +9294,19 @@ fn live_running_child_enter_submits_plain_text_as_a_targeted_steer() {
     );
     screen.handle_action(action("input_submit"), &press_none());
 
+    let mut sent = submitted.try_recv().expect("child queue submission");
+    assert!(sent.prompt.request_id.take().is_some());
     assert_eq!(
-        submitted.try_recv(),
+        Ok::<_, mpsc::error::TryRecvError>(sent),
         Ok(TargetedPromptSubmission {
             target: PromptTarget::Session(String::from("ses_child")),
             prompt: PromptEnvelope::new(
                 PromptSubmission::Text(String::from("/help must stay text")),
-                PromptDelivery::Steer,
+                PromptDelivery::Queue,
                 PromptOrigin::TuiChild,
             ),
         }),
-        "ordinary Enter on a running child must steer that child without slash dispatch"
+        "ordinary Enter queues for the child; only explicit Send Now steers"
     );
 }
 
@@ -8986,8 +9357,10 @@ fn live_completed_child_enter_submits_a_targeted_continuation() {
     type_into_screen(&mut screen, "continue with refresh handling");
     screen.handle_action(action("input_submit"), &press_none());
 
+    let mut sent = submitted.try_recv().expect("child direct submission");
+    assert!(sent.prompt.request_id.take().is_some());
     assert_eq!(
-        submitted.try_recv(),
+        Ok::<_, mpsc::error::TryRecvError>(sent),
         Ok(TargetedPromptSubmission {
             target: PromptTarget::Session(String::from("ses_child")),
             prompt: PromptEnvelope::new(

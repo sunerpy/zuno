@@ -68,6 +68,31 @@ pub struct SessionMemoryPolicyStore {
     pool: Arc<Pool>,
 }
 
+/// Fallback settings for inheritance when a legacy parent has no durable policy.
+///
+/// These are values, not a versioned database row. Keeping revisions out of this
+/// type prevents a persisted parent projection from masquerading as revision zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionMemoryPolicyDefaults {
+    pub use_memories: bool,
+    pub generation: SessionMemoryGeneration,
+}
+
+impl From<&SessionMemoryPolicyProjection> for SessionMemoryPolicyDefaults {
+    fn from(policy: &SessionMemoryPolicyProjection) -> Self {
+        Self {
+            use_memories: policy.use_memories,
+            generation: policy.generation,
+        }
+    }
+}
+
+impl Default for SessionMemoryPolicyDefaults {
+    fn default() -> Self {
+        Self::from(&SessionMemoryPolicyProjection::default())
+    }
+}
+
 /// Freeze one new session's caller default in the transaction that creates it.
 ///
 /// An existing row wins so a retried materialization cannot overwrite a policy
@@ -119,23 +144,21 @@ pub fn seed_in(
 
 /// Copy the parent's effective durable policy into a newly created child session.
 ///
-/// A released parent with no policy row keeps the pre-policy behavior: memory use
-/// and generation are enabled. The child receives its own revisioned row so later
-/// parent changes cannot silently widen or narrow delegated work.
+/// Read the parent's latest row in the child-admission transaction. Only a legacy
+/// parent with no row uses the caller's fallback settings. The child receives its
+/// own revisioned row so later parent changes cannot silently widen or narrow
+/// already delegated work.
 pub fn inherit_in(
     transaction: &Transaction<'_>,
     parent_session_id: &str,
     child_session_id: &str,
-    parent_default: SessionMemoryPolicyProjection,
+    parent_default: SessionMemoryPolicyDefaults,
     now: i64,
 ) -> Result<SessionMemoryPolicyProjection, DbError> {
     ensure_session(transaction, parent_session_id)?;
-    if parent_default.revision != 0 {
-        return Err(query_error(std::io::Error::other(
-            "a parent session memory-policy default must have revision zero",
-        )));
-    }
-    let parent = read_optional(transaction, parent_session_id)?.unwrap_or(parent_default);
+    let parent = read_optional(transaction, parent_session_id)?
+        .as_ref()
+        .map_or(parent_default, SessionMemoryPolicyDefaults::from);
     seed_in(
         transaction,
         child_session_id,
@@ -687,13 +710,9 @@ mod tests {
                 transaction,
                 "session-1",
                 "session-2",
-                SessionMemoryPolicyProjection {
+                SessionMemoryPolicyDefaults {
                     use_memories: false,
                     generation: SessionMemoryGeneration::Disabled,
-                    reason: None,
-                    source: None,
-                    time: None,
-                    revision: 0,
                 },
                 9,
             )
@@ -708,6 +727,67 @@ mod tests {
         assert!(!child.use_memories);
         assert_eq!(child.generation, SessionMemoryGeneration::Disabled);
         assert_eq!(child.source.as_deref(), Some("parent_session"));
+    }
+
+    #[test]
+    fn child_inheritance_reads_latest_parent_revision_and_never_rewrites_either_policy() {
+        let (pool, store) = fixture();
+        let initial = store
+            .seed(
+                "session-1",
+                true,
+                SessionMemoryGeneration::Enabled,
+                "initial parent policy",
+                "configuration",
+                5,
+            )
+            .expect("persist parent revision one");
+        let fallback = SessionMemoryPolicyDefaults::from(&initial);
+        let SessionMemoryPolicyWrite::Applied(changed) = store
+            .set(SessionMemoryPolicyUpdate {
+                session_id: "session-1".to_owned(),
+                use_memories: false,
+                generation: SessionMemoryGeneration::Disabled,
+                reason: "disable delegated generation too".to_owned(),
+                source: "tui".to_owned(),
+                expected_revision: initial.revision,
+                time_updated: 6,
+            })
+            .expect("update parent after host construction")
+        else {
+            panic!("parent policy update should commit");
+        };
+        assert_eq!(changed.policy.revision, 2);
+
+        let child = pool
+            .transaction(|transaction| {
+                inherit_in(transaction, "session-1", "session-2", fallback, 7)
+            })
+            .expect("inherit a persisted, revised parent");
+        assert!(!child.use_memories);
+        assert_eq!(child.generation, SessionMemoryGeneration::Disabled);
+        assert_eq!(child.revision, 1, "the child owns its own revision");
+        assert_eq!(
+            store.get("session-1").expect("parent"),
+            Some(changed.policy)
+        );
+
+        store
+            .set(update(2, SessionMemoryGeneration::Enabled))
+            .expect("change the parent after delegation");
+        let retried = pool
+            .transaction(|transaction| {
+                inherit_in(transaction, "session-1", "session-2", fallback, 14)
+            })
+            .expect("retry child materialization");
+        assert_eq!(
+            retried, child,
+            "a retry never rewrites the child's snapshot"
+        );
+        let events = crate::event_log::SessionEventLog::new(pool)
+            .read_after("session-2", None)
+            .expect("child audit");
+        assert_eq!(events.len(), 1, "inheritance is audited exactly once");
     }
 
     #[test]

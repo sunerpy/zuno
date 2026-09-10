@@ -713,7 +713,7 @@ pub enum DebugCommand {
     Config,
     Agent(DebugAgentArgs),
     Prompt(DebugPromptArgs),
-    Permissions,
+    Permissions(DebugPermissionsArgs),
     Skill,
     Sandbox(DebugSandboxArgs),
     Rg(DebugRgArgs),
@@ -726,11 +726,30 @@ pub struct DebugAgentArgs {
     pub name: String,
 }
 
+#[derive(Debug, Clone, Default, Args)]
+pub struct DebugPermissionsArgs {
+    /// Resolve this Agent's rules; otherwise use the session or configured Agent.
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// Read the saved Agent and workspace from an existing session (no writes).
+    #[arg(long = "session", value_name = "ID")]
+    pub session_id: Option<String>,
+    /// Permission key to explain, such as external_directory or read.
+    #[arg(long, requires = "resource")]
+    pub permission: Option<String>,
+    /// Resource to match against the resolved rules.
+    #[arg(long, requires = "permission")]
+    pub resource: Option<String>,
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct DebugSandboxArgs {
-    /// Sandbox policy to probe; restricted mode verifies bubblewrap deployment.
-    #[arg(long, value_enum, default_value_t = CliSandboxMode::WorkspaceWrite)]
-    pub mode: CliSandboxMode,
+    /// Sandbox policy to probe; otherwise resolve the selected Agent's contract.
+    #[arg(long, value_enum, conflicts_with = "agent")]
+    pub mode: Option<CliSandboxMode>,
+    /// Resolve this Agent's sandbox contract with the active configuration.
+    #[arg(long)]
+    pub agent: Option<String>,
     /// Network authority to verify. Defaults to deny for confined modes and allow
     /// for danger-full-access.
     #[arg(long, value_enum)]
@@ -738,6 +757,9 @@ pub struct DebugSandboxArgs {
     /// Exit unsuccessfully when the requested policy is not deployable.
     #[arg(long)]
     pub check: bool,
+    /// Exit unsuccessfully when execution cannot start; native is not confinement.
+    #[arg(long)]
+    pub check_execution: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1633,7 +1655,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_sandbox_defaults_to_restricted_network_denied_deployment_check() {
+    fn debug_sandbox_defaults_to_the_agent_contract_and_accepts_explicit_probes() {
         let cli = Cli::try_parse_from(["zuno", "debug", "sandbox"]).expect("debug sandbox parses");
         let Some(Command::Debug(DebugArgs {
             command: Some(DebugCommand::Sandbox(args)),
@@ -1641,7 +1663,7 @@ mod tests {
         else {
             panic!("expected debug sandbox");
         };
-        assert_eq!(args.mode, CliSandboxMode::WorkspaceWrite);
+        assert_eq!(args.mode, None);
         assert_eq!(args.network, None);
         assert!(!args.check);
 
@@ -1662,7 +1684,7 @@ mod tests {
         else {
             panic!("expected explicit debug sandbox");
         };
-        assert_eq!(args.mode, CliSandboxMode::ReadOnly);
+        assert_eq!(args.mode, Some(CliSandboxMode::ReadOnly));
         assert_eq!(args.network, Some(DebugSandboxNetwork::Allow));
         assert!(args.check);
 
@@ -1674,7 +1696,7 @@ mod tests {
         else {
             panic!("expected full access debug sandbox");
         };
-        assert_eq!(args.mode, CliSandboxMode::DangerFullAccess);
+        assert_eq!(args.mode, Some(CliSandboxMode::DangerFullAccess));
         assert_eq!(args.network, None);
     }
 

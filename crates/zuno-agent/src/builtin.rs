@@ -305,6 +305,7 @@ impl Permissions {
 
 fn rule(permission: &str, action: PermissionAction) -> Rule {
     Rule {
+        source: None,
         permission: permission.to_owned(),
         pattern: "*".to_owned(),
         action,

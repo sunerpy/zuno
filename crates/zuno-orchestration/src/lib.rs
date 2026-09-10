@@ -220,13 +220,13 @@ macro_rules! pack_location {
 pub const SKILLS: [BuiltinSkillDescriptor; 11] = [
     BuiltinSkillDescriptor {
         name: "customize-zuno",
-        description: "Inspect or change Zuno configuration, providers, authentication, permissions, Agents, workflows, Skills, MCP servers, or extensions.",
+        description: "Inspect or change Zuno configuration, providers, authentication, permissions, Agents, workflows, Skills, MCP server connections, or extensions. Not for ordinary use of an already-configured MCP service.",
         content: include_str!("skills/customize-zuno.md"),
         source_id: pack_source_id!("skill/customize-zuno"),
         location: pack_location!("customize-zuno"),
         allowed_profiles: USER_FACING_PROFILES,
         required_tools: &["read", "glob", "grep"],
-        content_sha256: "2d95bcf802d8d49e9c5a0c46a6105d234977a45a1fa6ef4eb025f33b83d46360",
+        content_sha256: "78578beddb4afc61299cf645a81ce404648abc61d606881f050413b041650335",
         provenance: NATIVE_PROVENANCE,
     },
     BuiltinSkillDescriptor {

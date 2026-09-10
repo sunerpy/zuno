@@ -67,6 +67,38 @@ impl ToolMutationConflict {
     }
 }
 
+/// The actual permission resource and configured rule behind a tool refusal.
+///
+/// A tool such as `read` can ask for `external_directory`; keeping the two names
+/// separate makes auxiliary denials actionable without changing their recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolPermissionDenial {
+    pub permission: String,
+    pub resource: String,
+    pub rule_permission: String,
+    pub rule_pattern: String,
+    pub rule_source: Option<String>,
+    pub match_reason: String,
+}
+
+impl std::fmt::Display for ToolPermissionDenial {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} {:?} matched deny rule {} {:?}",
+            self.permission, self.resource, self.rule_permission, self.rule_pattern,
+        )?;
+        if let Some(source) = &self.rule_source {
+            write!(formatter, " from {source}")?;
+        }
+        write!(formatter, " ({})", self.match_reason)
+    }
+}
+
+fn denial_suffix(denial: Option<&ToolPermissionDenial>) -> String {
+    denial.map_or_else(String::new, |denial| format!(": {denial}"))
+}
+
 /// A failure from executing a tool.
 ///
 /// Every variant names the tool, because a tool failure is always reported
@@ -80,8 +112,14 @@ pub enum ToolError {
     /// change before this call can proceed. How the refusal is surfaced — fed
     /// back to the model, or raised to the user — belongs to the agent layer, not
     /// here.
-    #[error("tool {tool} was denied by the permission layer")]
-    Denied { tool: String },
+    #[error(
+        "tool {tool} was denied by the permission layer{}",
+        denial_suffix(.denial.as_deref())
+    )]
+    Denied {
+        tool: String,
+        denial: Option<Box<ToolPermissionDenial>>,
+    },
 
     /// The arguments failed validation before the tool ran.
     ///
@@ -169,7 +207,7 @@ impl ToolError {
     #[must_use]
     pub fn tool(&self) -> &str {
         match self {
-            Self::Denied { tool }
+            Self::Denied { tool, .. }
             | Self::InvalidArgs { tool, .. }
             | Self::MutationConflict { tool, .. }
             | Self::Timeout { tool, .. }
@@ -299,6 +337,7 @@ mod tests {
     fn every_variant() -> Vec<ToolError> {
         vec![
             ToolError::Denied {
+                denial: None,
                 tool: "shell".to_owned(),
             },
             ToolError::InvalidArgs {
@@ -425,6 +464,7 @@ mod tests {
     #[test]
     fn denial_is_neither_retryable_nor_model_correctable() {
         let e = ToolError::Denied {
+            denial: None,
             tool: "write".to_owned(),
         };
         assert!(!e.is_retryable());

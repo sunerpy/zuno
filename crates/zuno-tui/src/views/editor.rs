@@ -78,6 +78,7 @@ use ratatui::widgets::{Paragraph, Widget};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio::sync::mpsc;
+use unicode_segmentation::UnicodeSegmentation;
 
 #[cfg(test)]
 #[path = "editor_tests.rs"]
@@ -253,6 +254,13 @@ pub struct Position {
     pub column: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DraftStamp {
+    revision: u64,
+    cursor: Position,
+    anchor: Option<Position>,
+}
+
 /// What the editor asks its host to do after an action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorSignal {
@@ -276,9 +284,24 @@ struct Snapshot {
     cursor: Position,
 }
 
+/// A history excursion borrows the composer, including non-visible paste payloads.
+/// Restoring only the text loses the original caret/selection and can expand a
+/// recalled literal placeholder using an unrelated draft's paste.
+#[derive(Clone)]
+pub(crate) struct HistoryDraft {
+    lines: Vec<String>,
+    cursor: Position,
+    anchor: Option<Position>,
+    pastes: Vec<Paste>,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    offset: usize,
+}
+
 /// The prompt editor.
 pub struct InputEditor {
     context: ViewContext,
+    revision: u64,
     lines: Vec<String>,
     cursor: Position,
     /// Selection anchor, set by the `input_select_*` family.
@@ -295,7 +318,7 @@ pub struct InputEditor {
     /// prompt rather than the frame the user is waiting for.
     history_sink: Option<mpsc::Sender<String>>,
     /// What was being typed before history was entered.
-    stashed: Option<Vec<String>>,
+    stashed: Option<HistoryDraft>,
     /// Pastes standing behind a placeholder, oldest first.
     pastes: Vec<Paste>,
     /// How many pastes this editor has summarised.
@@ -326,11 +349,37 @@ pub struct InputEditor {
 }
 
 impl InputEditor {
+    pub(crate) fn save_draft(&self) -> HistoryDraft {
+        HistoryDraft {
+            lines: self.lines.clone(),
+            cursor: self.cursor,
+            anchor: self.anchor,
+            pastes: self.pastes.clone(),
+            undo: self.undo.clone(),
+            redo: self.redo.clone(),
+            offset: self.offset,
+        }
+    }
+
+    pub(crate) fn restore_draft(&mut self, draft: HistoryDraft) {
+        self.lines = draft.lines;
+        self.cursor = draft.cursor;
+        self.anchor = draft.anchor;
+        self.pastes = draft.pastes;
+        self.undo = draft.undo;
+        self.redo = draft.redo;
+        self.offset = draft.offset;
+        self.history_index = None;
+        self.stashed = None;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
     /// An empty editor.
     #[must_use]
     pub fn new(context: ViewContext) -> Self {
         Self {
             context,
+            revision: 0,
             lines: vec![String::new()],
             cursor: Position::default(),
             anchor: None,
@@ -408,6 +457,7 @@ impl InputEditor {
 
     /// Replace the buffer, putting the cursor at the end.
     pub fn set_text(&mut self, text: &str) {
+        self.revision = self.revision.wrapping_add(1);
         self.snapshot();
         self.lines = split(text);
         self.cursor = self.end();
@@ -455,6 +505,27 @@ impl InputEditor {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.lines.iter().all(String::is_empty)
+    }
+
+    /// Either endpoint of the whole buffer, not merely its first/last visual row.
+    #[must_use]
+    pub fn at_history_boundary(&self) -> bool {
+        self.cursor == self.buffer_home() || self.cursor == self.end()
+    }
+
+    #[must_use]
+    pub(crate) const fn history_position(&self) -> Option<usize> {
+        self.history_index
+    }
+
+    /// The editor owns arrows even when no history entry can be recalled.
+    #[must_use]
+    pub(crate) fn focused_scopes(&self) -> Vec<&'static str> {
+        if self.at_history_boundary() {
+            vec!["history", "input"]
+        } else {
+            vec!["input"]
+        }
     }
 
     /// Rows the buffer occupies.
@@ -608,10 +679,7 @@ impl InputEditor {
     /// Above [`PASTE_SUMMARY_LINES`]/[`PASTE_SUMMARY_CHARS`] the buffer gets a
     /// placeholder and the text is kept for [`Self::submission_text`].
     pub fn insert_paste(&mut self, text: &str) -> EditorSignal {
-        // A single line pasted from a terminal carries the newline the copy ended
-        // with; inserting it would open an empty line under the cursor and leave the
-        // cursor on it. A multi-line paste keeps its trailing newline, because there
-        // the line structure is the user's.
+        // Newlines belong to this text block, never to keybinding dispatch.
         let content = normalize_prompt_content(text);
         if content.is_empty() {
             return EditorSignal::None;
@@ -624,13 +692,14 @@ impl InputEditor {
         // deliberate: it says the leading slash is literal, and deleting one character
         // restores command intent.
         let escape = self.insertion_point() == Position::default() && content.starts_with('/');
+        let lines = content.split('\n').count();
+        let small = lines < PASTE_SUMMARY_LINES && content.chars().count() <= PASTE_SUMMARY_CHARS;
         let escaped = if escape {
             format!("/{content}")
         } else {
-            content.to_owned()
+            content
         };
-        let lines = content.split('\n').count();
-        if lines < PASTE_SUMMARY_LINES && content.chars().count() <= PASTE_SUMMARY_CHARS {
+        if small {
             return self.insert_text(&escaped);
         }
         self.paste_counter += 1;
@@ -669,7 +738,11 @@ impl InputEditor {
 
     /// Act on one resolved binding.
     pub fn handle_action(&mut self, action: &'static Definition) -> EditorSignal {
-        self.handle_action_recording(action, true)
+        let signal = self.handle_action_recording(action, true);
+        if !matches!(signal, EditorSignal::None) {
+            self.revision = self.revision.wrapping_add(1);
+        }
+        signal
     }
 
     /// Act on one resolved binding without adding a submitted prompt to text history.
@@ -678,7 +751,11 @@ impl InputEditor {
     /// `[Image #N]` token would create a history entry that cannot reconstruct the
     /// corresponding bytes, so attachment owners use this path for that submission.
     pub fn handle_action_without_history(&mut self, action: &'static Definition) -> EditorSignal {
-        self.handle_action_recording(action, false)
+        let signal = self.handle_action_recording(action, false);
+        if !matches!(signal, EditorSignal::None) {
+            self.revision = self.revision.wrapping_add(1);
+        }
+        signal
     }
 
     #[allow(
@@ -700,6 +777,8 @@ impl InputEditor {
                 if record_submission {
                     self.remember(&text);
                 }
+                self.history_index = None;
+                self.stashed = None;
                 self.lines = vec![String::new()];
                 self.cursor = Position::default();
                 self.anchor = None;
@@ -757,9 +836,12 @@ impl InputEditor {
                     return EditorSignal::Changed;
                 }
                 if self.cursor.column > 0 {
-                    let index = byte_index(&self.lines[self.cursor.line], self.cursor.column - 1);
-                    self.lines[self.cursor.line].remove(index);
-                    self.cursor.column -= 1;
+                    let column =
+                        previous_cluster_column(&self.lines[self.cursor.line], self.cursor.column);
+                    let start = byte_index(&self.lines[self.cursor.line], column);
+                    let end = byte_index(&self.lines[self.cursor.line], self.cursor.column);
+                    self.lines[self.cursor.line].replace_range(start..end, "");
+                    self.cursor.column = column;
                 } else if self.cursor.line > 0 {
                     let removed = self.lines.remove(self.cursor.line);
                     self.cursor.line -= 1;
@@ -776,7 +858,11 @@ impl InputEditor {
                 let width = chars(&self.lines[self.cursor.line]);
                 if self.cursor.column < width {
                     let index = byte_index(&self.lines[self.cursor.line], self.cursor.column);
-                    self.lines[self.cursor.line].remove(index);
+                    let end = byte_index(
+                        &self.lines[self.cursor.line],
+                        next_cluster_column(&self.lines[self.cursor.line], self.cursor.column),
+                    );
+                    self.lines[self.cursor.line].replace_range(index..end, "");
                 } else if self.cursor.line + 1 < self.lines.len() {
                     let next = self.lines.remove(self.cursor.line + 1);
                     self.lines[self.cursor.line].push_str(&next);
@@ -827,6 +913,9 @@ impl InputEditor {
                 self.lines = vec![String::new()];
                 self.cursor = Position::default();
                 self.anchor = None;
+                self.history_index = None;
+                self.stashed = None;
+                self.pastes.clear();
                 EditorSignal::Changed
             }
 
@@ -883,26 +972,21 @@ impl InputEditor {
         }
     }
 
-    /// Move vertically inside a multi-line prompt before crossing into history.
-    ///
-    /// `history` temporarily outranks `input` at either vertical edge, so both arrow
-    /// actions arrive here there. Moving toward the buffer must remain ordinary cursor
-    /// movement; only moving outward from the first/last line walks history. This is what
-    /// keeps a pasted block editable without making an empty one-line prompt unable to
-    /// recall earlier submissions.
+    /// Both buffer endpoints browse history in both directions. Interior positions
+    /// retain ordinary cursor movement, including a single-line prompt's interior.
     fn previous_line_or_history(&mut self) -> EditorSignal {
-        if self.cursor.line > 0 {
-            self.moved(false, Self::up)
-        } else {
+        if self.at_history_boundary() {
             self.walk_history(1)
+        } else {
+            self.moved(false, Self::up)
         }
     }
 
     fn next_line_or_history(&mut self) -> EditorSignal {
-        if self.cursor.line + 1 < self.lines.len() {
-            self.moved(false, Self::down)
-        } else {
+        if self.at_history_boundary() {
             self.walk_history(-1)
+        } else {
+            self.moved(false, Self::down)
         }
     }
 
@@ -918,8 +1002,15 @@ impl InputEditor {
                 // Stepping forward past the newest entry restores what was being
                 // typed, which is why it was stashed.
                 self.history_index = None;
-                self.lines = self.stashed.take().unwrap_or_else(|| vec![String::new()]);
-                self.cursor = self.end();
+                if let Some(draft) = self.stashed.take() {
+                    self.lines = draft.lines;
+                    self.cursor = draft.cursor;
+                    self.anchor = draft.anchor;
+                    self.pastes = draft.pastes;
+                    self.undo = draft.undo;
+                    self.redo = draft.redo;
+                    self.offset = draft.offset;
+                }
                 return EditorSignal::Changed;
             }
             (Some(index), _) => Some(index - 1),
@@ -927,14 +1018,29 @@ impl InputEditor {
         let Some(index) = next else {
             return EditorSignal::None;
         };
+        if self.history_index == Some(index) {
+            return EditorSignal::None;
+        }
         if self.history_index.is_none() {
-            self.stashed = Some(self.lines.clone());
+            self.stashed = Some(HistoryDraft {
+                lines: self.lines.clone(),
+                cursor: self.cursor,
+                anchor: self.anchor,
+                pastes: std::mem::take(&mut self.pastes),
+                undo: std::mem::take(&mut self.undo),
+                redo: std::mem::take(&mut self.redo),
+                offset: self.offset,
+            });
         }
         self.history_index = Some(index);
         let entry = &self.history[self.history.len() - 1 - index];
         self.lines = split(entry);
         self.cursor = self.end();
         self.anchor = None;
+        self.pastes.clear();
+        self.undo.clear();
+        self.redo.clear();
+        self.offset = 0;
         EditorSignal::Changed
     }
 
@@ -947,6 +1053,8 @@ impl InputEditor {
             self.anchor = None;
         }
         self.cursor = next(self);
+        self.cursor.column =
+            cluster_column_at_or_after(&self.lines[self.cursor.line], self.cursor.column);
         EditorSignal::Changed
     }
 
@@ -954,7 +1062,7 @@ impl InputEditor {
         if self.cursor.column > 0 {
             return Position {
                 line: self.cursor.line,
-                column: self.cursor.column - 1,
+                column: previous_cluster_column(&self.lines[self.cursor.line], self.cursor.column),
             };
         }
         if self.cursor.line > 0 {
@@ -970,7 +1078,7 @@ impl InputEditor {
         if self.cursor.column < chars(&self.lines[self.cursor.line]) {
             return Position {
                 line: self.cursor.line,
-                column: self.cursor.column + 1,
+                column: next_cluster_column(&self.lines[self.cursor.line], self.cursor.column),
             };
         }
         if self.cursor.line + 1 < self.lines.len() {
@@ -1119,6 +1227,7 @@ impl InputEditor {
     }
 
     fn snapshot(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
         self.undo.push(Snapshot {
             lines: self.lines.clone(),
             cursor: self.cursor,
@@ -1127,6 +1236,14 @@ impl InputEditor {
             self.undo.remove(0);
         }
         self.redo.clear();
+    }
+
+    pub(crate) fn draft_stamp(&self) -> DraftStamp {
+        DraftStamp {
+            revision: self.revision,
+            cursor: self.cursor,
+            anchor: self.anchor,
+        }
     }
 
     /// The rendered rows, cursor and selection included.
@@ -1138,8 +1255,12 @@ impl InputEditor {
             .enumerate()
             .map(|(index, text)| {
                 let mut spans = Vec::new();
-                let characters: Vec<char> = text.chars().collect();
-                for (column, character) in characters.iter().enumerate() {
+                let mut column = 0;
+                let mut caret_index = None;
+                for cluster in text.graphemes(true) {
+                    if caret_index.is_none() && self.cursor.column <= column {
+                        caret_index = Some(spans.len());
+                    }
                     let selected = selection.is_some_and(|(start, end)| {
                         let here = Position {
                             line: index,
@@ -1152,14 +1273,15 @@ impl InputEditor {
                     } else {
                         self.context.on_element(self.context.text())
                     };
-                    spans.push(Span::styled(character.to_string(), style));
+                    spans.push(Span::styled(cluster.to_owned(), style));
+                    column += chars(cluster);
                 }
                 if index == self.cursor.line {
                     // Keep the long-standing glyph because layout assertions and copied
                     // screenshots use it to prove the caret remains inside the prompt band.
                     // Reverse video makes the entire cell visible instead of relying on a
                     // one-pixel-looking stroke, while all colours still come from theme roles.
-                    let at = self.cursor.column.min(spans.len());
+                    let at = caret_index.unwrap_or(spans.len());
                     spans.insert(
                         at,
                         Span::styled(
@@ -1187,7 +1309,7 @@ impl InputEditor {
                     }
                 }
                 let rendered: String = spans.iter().map(|span| span.content.as_ref()).collect();
-                let pad = usize::from(width).saturating_sub(rendered.chars().count());
+                let pad = usize::from(width).saturating_sub(crate::views::display_width(&rendered));
                 if pad > 0 {
                     // The row's own tail, and it is the widest span on the line — painting it in
                     // `text` put the transcript's surface across most of the composer and was
@@ -1314,22 +1436,55 @@ fn chars(text: &str) -> usize {
 /// all three cases aligned.
 fn character_column_at_cell(text: &str, caret: Option<usize>, target: usize) -> usize {
     let length = chars(text);
-    let caret = caret.map(|column| column.min(length));
+    let caret = caret.map(|column| cluster_column_at_or_after(text, column.min(length)));
     let mut cell = 0usize;
-    for (column, character) in text.chars().enumerate() {
+    let mut column = 0usize;
+    for cluster in text.graphemes(true) {
         if caret == Some(column) {
             if target == cell {
                 return column;
             }
             cell = cell.saturating_add(1);
         }
-        let width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+        let width = crate::views::display_width(cluster);
         if target < cell.saturating_add(width) {
             return column;
         }
         cell = cell.saturating_add(width);
+        column += chars(cluster);
     }
     length
+}
+
+fn previous_cluster_column(text: &str, column: usize) -> usize {
+    let byte = byte_index(text, column);
+    let previous = text
+        .grapheme_indices(true)
+        .map(|(index, _)| index)
+        .take_while(|index| *index < byte)
+        .last()
+        .unwrap_or(0);
+    chars(&text[..previous])
+}
+
+fn next_cluster_column(text: &str, column: usize) -> usize {
+    let byte = byte_index(text, column);
+    let next = text
+        .grapheme_indices(true)
+        .map(|(index, _)| index)
+        .find(|index| *index > byte)
+        .unwrap_or(text.len());
+    chars(&text[..next])
+}
+
+fn cluster_column_at_or_after(text: &str, column: usize) -> usize {
+    let byte = byte_index(text, column);
+    let next = text
+        .grapheme_indices(true)
+        .map(|(index, _)| index)
+        .find(|index| *index >= byte)
+        .unwrap_or(text.len());
+    chars(&text[..next])
 }
 
 fn byte_index(text: &str, column: usize) -> usize {
@@ -1345,25 +1500,12 @@ fn slice(text: &str, from: usize, to: usize) -> String {
         .collect()
 }
 
-/// Strip a trailing newline a paste added, when the content is a single line.
-///
-/// Verbatim from `packages/tui/src/editor.ts:12-24`. The condition matters: a
-/// multi-line paste keeps its trailing newline, because the user's line structure is
-/// meaningful, while a single line pasted from a terminal picks up a `\n` that would
-/// submit the prompt.
+/// Normalize terminal line endings without trimming any part of a pasted block.
 #[must_use]
-pub fn normalize_prompt_content(content: &str) -> &str {
-    if let Some(body) = content.strip_suffix("\r\n")
-        && !body.contains('\n')
-        && !body.contains('\r')
-    {
-        return body;
+pub fn normalize_prompt_content(content: &str) -> String {
+    if content.contains('\r') {
+        content.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        content.to_owned()
     }
-    if let Some(body) = content.strip_suffix('\n')
-        && !body.contains('\n')
-        && !body.contains('\r')
-    {
-        return body;
-    }
-    content
 }

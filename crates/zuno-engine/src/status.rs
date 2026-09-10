@@ -82,6 +82,8 @@ pub enum ExpectedTurnError {
     NoActiveTurn { session_id: String },
     #[error("session `{session_id}` has an active lease that has not entered a steerable turn")]
     ActiveTurnNotIdentified { session_id: String },
+    #[error("session `{session_id}` turn `{turn_id}` is already finishing")]
+    Closing { session_id: String, turn_id: String },
     #[error(
         "session `{session_id}` is running turn `{actual_turn_id}`, not expected turn `{expected_turn_id}`"
     )]
@@ -133,6 +135,7 @@ pub struct DiagnosticNoticeKey {
 struct ActiveSession {
     token: u64,
     turn_id: Option<String>,
+    accepting_input: bool,
     interrupt: HardInterruptSignal,
     soft_interrupt: InterruptSignal,
     soft_interrupts: VecDeque<SoftInterruptMessage>,
@@ -176,6 +179,7 @@ impl SessionRunRegistry {
             ActiveSession {
                 token,
                 turn_id: None,
+                accepting_input: true,
                 interrupt: interrupt.clone(),
                 soft_interrupt: soft_interrupt.clone(),
                 soft_interrupts: VecDeque::new(),
@@ -341,6 +345,11 @@ impl SessionRunRegistry {
             .ok_or_else(|| SessionNotActive {
                 session_id: session_id.to_owned(),
             })?;
+        if !active.accepting_input {
+            return Err(SessionNotActive {
+                session_id: session_id.to_owned(),
+            });
+        }
         active.soft_interrupts.push_back(message);
         active.soft_interrupt.fire();
         Ok(())
@@ -373,6 +382,12 @@ impl SessionRunRegistry {
                 actual_turn_id: actual_turn_id.to_owned(),
             });
         }
+        if !active.accepting_input {
+            return Err(ExpectedTurnError::Closing {
+                session_id: session_id.to_owned(),
+                turn_id: actual_turn_id.to_owned(),
+            });
+        }
         active.soft_interrupts.push_back(message);
         active.soft_interrupt.fire();
         Ok(())
@@ -387,6 +402,22 @@ impl SessionRunRegistry {
             return false;
         }
         active.turn_id = Some(turn_id.to_owned());
+        active.accepting_input = true;
+        true
+    }
+
+    fn try_finish_inputs(&self, session_id: &str, token: u64) -> bool {
+        let mut state = self.lock_state();
+        let Some(active) = state.active.get_mut(session_id) else {
+            return true;
+        };
+        if active.token != token {
+            return true;
+        }
+        if !active.soft_interrupts.is_empty() {
+            return false;
+        }
+        active.accepting_input = false;
         true
     }
 
@@ -503,6 +534,11 @@ impl SessionControl {
         self.registry.status(&self.session_id)
     }
 
+    #[must_use]
+    pub fn active_turn_id(&self) -> Option<String> {
+        self.registry.active_turn_id(&self.session_id)
+    }
+
     /// Aborts whichever turn is live now, not the turn that created this handle.
     pub fn abort(&self, request: HardInterruptRequest) -> AbortDisposition {
         self.registry.abort(&self.session_id, request)
@@ -534,6 +570,33 @@ impl SessionControl {
     ) -> Result<(), SessionNotActive> {
         self.registry
             .queue_soft_interrupt(&self.session_id, message)
+    }
+
+    pub fn queue_soft_interrupt_for_turn(
+        &self,
+        expected_turn_id: &str,
+        message: SoftInterruptMessage,
+    ) -> Result<(), ExpectedTurnError> {
+        self.registry
+            .queue_soft_interrupt_for_turn(&self.session_id, expected_turn_id, message)
+    }
+
+    pub fn send_queued(
+        &self,
+        inbox: zuno_db::inbox::SessionInbox,
+        request: crate::admission::QueuedSendRequest,
+        steering: crate::admission::SteeringContent,
+    ) -> Result<crate::admission::QueuedSendAdmission, crate::admission::QueuedSendError> {
+        if request.session_id != self.session_id {
+            return Err(zuno_error::DbError::Conflict {
+                table: "session_input".to_owned(),
+                id: request.input_id,
+                detail: "queued input belongs to another session control".to_owned(),
+            }
+            .into());
+        }
+        crate::admission::SessionInputAdmission::new(inbox, self.registry.clone())
+            .send_queued(request, steering)
     }
 
     /// Cancels one not-yet-delivered soft interrupt by durable input id.
@@ -595,6 +658,13 @@ impl SessionRunGuard {
                 token: self.token,
                 turn_id: turn_id.to_owned(),
             })
+    }
+
+    /// Atomically close admission only when no successfully accepted input remains.
+    #[must_use]
+    pub fn try_finish_inputs(&self) -> bool {
+        self.registry
+            .try_finish_inputs(&self.session_id, self.token)
     }
 
     /// Drains messages queued before this safe point in FIFO order.

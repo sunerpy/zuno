@@ -411,6 +411,7 @@ impl PermissionAsker for RecordingDenial {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(ask);
         Err(ToolError::Denied {
+            denial: None,
             tool: tool.to_owned(),
         })
     }

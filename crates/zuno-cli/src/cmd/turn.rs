@@ -1236,6 +1236,11 @@ impl TurnPlan {
         &self.agent
     }
 
+    pub(crate) fn execution_identity(&self) -> TurnExecutionIdentity {
+        TurnExecutionIdentity::new(self.agent.name(), &self.provider_id, &self.model_id)
+            .with_reasoning(self.effort.map(|effort| effort.as_str().to_owned()))
+    }
+
     /// Every resolved agent, including active static and process extensions.
     pub(crate) fn agents(&self) -> &[zuno_catalog::agent::Agent] {
         &self.agents
@@ -1721,23 +1726,53 @@ impl TurnPlan {
             .collect::<Vec<_>>();
         let tool_search_conflict =
             policy_visible_ids.contains(zuno_engine::dispatch::TOOL_SEARCH_ID);
-        let progressive_schema_discovery = self.tool_authority.is_none()
-            && allowlist.is_none()
-            && !tool_search_conflict
-            && !connected_policy_visible.is_empty();
-        let deferred_connected_tools = if progressive_schema_discovery {
-            connected_policy_visible.clone()
-        } else {
-            Vec::new()
-        };
+        let schema_metadata = mcp
+            .into_iter()
+            .flat_map(|mcp| mcp.schema_metadata.iter())
+            .filter(|tool| policy_visible_ids.contains(tool.id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut pins = mcp
+            .into_iter()
+            .flat_map(|mcp| mcp.eager_tool_ids.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        pins.extend(
+            schema_metadata
+                .iter()
+                .filter(|tool| {
+                    self.tool_authority.is_some()
+                        || allowlist
+                            .as_ref()
+                            .is_some_and(|allowlist| allowlist.contains(tool.id.as_str()))
+                })
+                .map(|tool| tool.id.clone()),
+        );
+        let search_available = !tool_search_conflict
+            && zuno_permission::visibility::is_tool_visible(
+                zuno_engine::dispatch::TOOL_SEARCH_ID,
+                &rules,
+            )
+            && self.config.tools.as_ref().is_none_or(|tools| {
+                tools.get(zuno_engine::dispatch::TOOL_SEARCH_ID) != Some(&false)
+            });
+        let exposure = super::mcp_exposure::resolve(
+            &self.config.mcp_tool_exposure.clone().unwrap_or_default(),
+            &schema_metadata,
+            &pins,
+            search_available,
+        );
+        let progressive_schema_discovery = !exposure.deferred.is_empty();
+        let deferred_connected_tools = &exposure.deferred;
         let schema_exposure_mode = if mcp.is_none() {
             "not-connected"
         } else if mcp_tool_identities.is_empty() {
             "no-tools"
         } else if connected_policy_visible.is_empty() {
             "filtered"
-        } else if progressive_schema_discovery {
+        } else if progressive_schema_discovery && exposure.eager.is_empty() {
             "progressive"
+        } else if progressive_schema_discovery {
+            "mixed"
         } else if tool_search_conflict {
             "eager-name-conflict"
         } else {
@@ -1813,6 +1848,10 @@ impl TurnPlan {
                     "discoveryTool": progressive_schema_discovery
                         .then_some(zuno_engine::dispatch::TOOL_SEARCH_ID),
                     "deferredTools": deferred_connected_tools,
+                    "eagerTools": exposure.eager,
+                    "discoveryAvailable": search_available,
+                    "policy": self.config.mcp_tool_exposure.clone().unwrap_or_default(),
+                    "schemaMetadata": schema_metadata,
                     "toolSearchNameConflict": tool_search_conflict,
                 },
             },
@@ -3778,7 +3817,10 @@ impl TurnHost {
                     parent_agent: plan.agent.name().to_owned(),
                     parent_model: format!("{}/{}", plan.provider_id, plan.model_id),
                     parent_effort: plan.effort,
-                    parent_memory_policy: memory_policy.clone(),
+                    parent_memory_defaults:
+                        zuno_db::session_memory_policy::SessionMemoryPolicyDefaults::from(
+                            &memory_policy,
+                        ),
                     delegation_limiter: delegation_limiter.clone(),
                     supervisor: background_jobs.clone(),
                 })?;

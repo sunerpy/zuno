@@ -158,6 +158,7 @@ fn plan_handoff_and_start_work_commit_goal_authority_and_control_input_together(
     let outcome = fixture
         .control
         .start_work(StartWorkRequest {
+            expected_execution_revision: None,
             session_id: SESSION,
             expected_plan_revision: Some(plan.revision),
             anchor_message_id: None,
@@ -189,6 +190,7 @@ fn plan_handoff_and_start_work_commit_goal_authority_and_control_input_together(
     let repeated = fixture
         .control
         .start_work(StartWorkRequest {
+            expected_execution_revision: None,
             session_id: SESSION,
             expected_plan_revision: Some(plan.revision),
             anchor_message_id: None,
@@ -231,6 +233,7 @@ fn start_work_requires_the_exact_current_handoff_revision() {
     let error = fixture
         .control
         .start_work(StartWorkRequest {
+            expected_execution_revision: None,
             session_id: SESSION,
             expected_plan_revision: Some(changed.revision),
             anchor_message_id: None,
@@ -246,6 +249,51 @@ fn start_work_requires_the_exact_current_handoff_revision() {
             ..
         } if plan_revision == changed.revision
     ));
+}
+
+#[test]
+fn start_work_rejects_an_identity_changed_after_execution_preflight_without_mutation() {
+    let fixture = Fixture::new();
+    let plan = fixture.plan();
+    fixture.enter_plan();
+    let before = fixture
+        .control
+        .mark_plan_handoff(SESSION, 20)
+        .expect("handoff");
+    let changed = fixture
+        .control
+        .update_work_identity(
+            SESSION,
+            TurnExecutionIdentity::new("deep", "other-provider", "other-model"),
+            21,
+        )
+        .expect("another surface changed the Work identity");
+    let error = fixture
+        .control
+        .start_work(StartWorkRequest {
+            session_id: SESSION,
+            expected_execution_revision: Some(before.revision),
+            expected_plan_revision: Some(plan.revision),
+            anchor_message_id: None,
+            draft_review_risk_reason: None,
+            session_busy: false,
+            at_ms: 22,
+        })
+        .expect_err("a different identity has not passed the caller's preflight");
+    assert!(matches!(
+        error,
+        SessionControlError::ExecutionRevisionConflict { .. }
+    ));
+    assert_eq!(
+        fixture.control.state(SESSION).expect("state"),
+        Some(changed)
+    );
+    assert!(
+        zuno_db::inbox::SessionInbox::new(fixture.pool)
+            .pending(SESSION)
+            .expect("inbox")
+            .is_empty()
+    );
 }
 
 #[test]
@@ -271,6 +319,7 @@ fn a_bound_draft_review_blocks_by_default_and_persists_explicit_risk_acceptance(
     let error = fixture
         .control
         .start_work(StartWorkRequest {
+            expected_execution_revision: None,
             session_id: SESSION,
             expected_plan_revision: Some(plan.revision),
             anchor_message_id: None,
@@ -290,6 +339,7 @@ fn a_bound_draft_review_blocks_by_default_and_persists_explicit_risk_acceptance(
     let accepted = fixture
         .control
         .start_work(StartWorkRequest {
+            expected_execution_revision: None,
             session_id: SESSION,
             expected_plan_revision: Some(plan.revision),
             anchor_message_id: Some("msg_anchor".to_owned()),

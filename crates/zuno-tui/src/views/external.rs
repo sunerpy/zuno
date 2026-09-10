@@ -97,7 +97,7 @@
 //! X session happens to be around — during a test run, the author's own.
 
 use std::fs::OpenOptions;
-use std::io::{self, IsTerminal, Write as _};
+use std::io::{self, IsTerminal, Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -668,6 +668,82 @@ pub trait Clipboard: Send + Sync {
     ///
     /// [`ExternalError`] when every mechanism failed.
     fn write(&self, text: &str) -> Result<(), ExternalError>;
+
+    fn request_read(&self) -> Result<ClipboardRequest, ExternalError> {
+        Ok(ClipboardRequest::ready(self.read(), true))
+    }
+
+    fn request_write(&self, text: &str) -> Result<ClipboardRequest, ExternalError> {
+        Ok(ClipboardRequest::ready(
+            self.write(text).map(|()| None),
+            true,
+        ))
+    }
+}
+
+/// Completion receipt; submitting native work is not a successful clipboard write.
+pub struct ClipboardRequest {
+    outcome: Arc<ClipboardOutcome>,
+    confirmed: bool,
+}
+
+/// One-shot completion owned by an asynchronous clipboard provider.
+pub struct ClipboardCompletion(Option<Arc<ClipboardOutcome>>);
+
+impl ClipboardCompletion {
+    pub fn complete(mut self, result: Result<Option<ClipboardContent>, ExternalError>) {
+        if let Some(outcome) = self.0.take() {
+            outcome.finish(result);
+        }
+    }
+}
+
+impl Drop for ClipboardCompletion {
+    fn drop(&mut self) {
+        if let Some(outcome) = self.0.take() {
+            outcome.finish(Err(ExternalError::Failed(
+                "clipboard provider stopped before completing the request".to_owned(),
+            )));
+        }
+    }
+}
+
+impl ClipboardRequest {
+    #[must_use]
+    pub fn pending(confirmed: bool) -> (Self, ClipboardCompletion) {
+        let outcome = Arc::new(ClipboardOutcome::default());
+        (
+            Self {
+                outcome: Arc::clone(&outcome),
+                confirmed,
+            },
+            ClipboardCompletion(Some(outcome)),
+        )
+    }
+
+    fn ready(result: Result<Option<ClipboardContent>, ExternalError>, confirmed: bool) -> Self {
+        let outcome = Arc::new(ClipboardOutcome::default());
+        outcome.finish(result);
+        Self { outcome, confirmed }
+    }
+
+    pub(crate) fn poll(&self) -> Option<Result<Option<ClipboardContent>, ExternalError>> {
+        locked(&self.outcome.result).take()
+    }
+
+    pub(crate) const fn confirmed(&self) -> bool {
+        self.confirmed
+    }
+
+    pub(crate) fn notify_on_ready(
+        &self,
+        wake: tokio::sync::mpsc::Sender<crate::app::TerminalEvent>,
+    ) {
+        *locked(&self.outcome.wake) = Some(wake.clone());
+        if locked(&self.outcome.result).is_some() {
+            let _ = wake.try_send(crate::app::TerminalEvent::Wake);
+        }
+    }
 }
 
 /// An in-memory clipboard.
@@ -825,21 +901,20 @@ pub trait CommandRunner: Send + Sync {
     /// missing, the write to its stdin fails, it exits non-zero, or it exceeds the
     /// runner's deadline.
     fn run(&self, argv: &[String], input: &str) -> Result<(), ExternalError>;
+
+    fn capture(&self, _argv: &[String]) -> Result<String, ExternalError> {
+        Err(ExternalError::NoClipboard)
+    }
 }
 
 /// Maximum time one native clipboard child may run after the worker starts it.
 ///
-/// Fifty milliseconds is long enough for the tiny local helpers in the ladder but
-/// still bounds a hung helper tightly.
-const CLIPBOARD_COMMAND_TIMEOUT: Duration = Duration::from_millis(50);
+/// PowerShell cold startup is not a tiny Unix helper. This deadline belongs to the
+/// worker; asynchronous TUI receipts never wait for it on the event loop.
+const CLIPBOARD_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Maximum time the component path waits for worker scheduling plus the child result.
-///
-/// The worker owns the strict 50 ms child deadline above. Giving the caller the same
-/// deadline made scheduler delay consume the child's entire allowance before the worker
-/// ran at all under a loaded Windows suite. The component deadline therefore includes
-/// scheduling headroom, but remains below the 250 ms hard-bound contract so an
-/// uninterruptible cleanup path cannot race that caller-visible deadline.
+/// Bounded wait retained for synchronous, non-TUI Clipboard consumers. The TUI uses
+/// receipts exclusively and never waits for PowerShell startup on its event loop.
 const CLIPBOARD_COMPONENT_TIMEOUT: Duration = Duration::from_millis(150);
 const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
@@ -879,6 +954,68 @@ impl ClipboardChild for std::process::Child {
 pub struct ChildProcessRunner;
 
 impl CommandRunner for ChildProcessRunner {
+    fn capture(&self, argv: &[String]) -> Result<String, ExternalError> {
+        let Some((program, arguments)) = argv.split_first() else {
+            return Err(ExternalError::NoClipboard);
+        };
+        if !Path::new(program).is_absolute() {
+            return Err(ExternalError::Failed(
+                "clipboard read requires a resolved executable".to_owned(),
+            ));
+        }
+        // Anonymous files avoid pipe-reader threads outliving a timed-out helper.
+        let mut output = tempfile::tempfile()?;
+        let mut errors = tempfile::tempfile()?;
+        let mut child = Command::new(program)
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(output.try_clone()?))
+            .stderr(Stdio::from(errors.try_clone()?))
+            .spawn()?;
+        let result = (|| -> Result<String, ExternalError> {
+            const MAX_BYTES: u64 = 8 * 1024 * 1024;
+            let start = Instant::now();
+            let status = loop {
+                if output.metadata()?.len() > MAX_BYTES {
+                    return Err(ExternalError::Failed(
+                        "clipboard text exceeds 8 MiB".to_owned(),
+                    ));
+                }
+                if let Some(status) = child.try_wait()? {
+                    break status;
+                }
+                if start.elapsed() >= CLIPBOARD_COMMAND_TIMEOUT {
+                    return Err(ExternalError::Failed("clipboard read timed out".to_owned()));
+                }
+                thread::sleep(Duration::from_millis(5));
+            };
+            if !status.success() {
+                errors.rewind()?;
+                let mut detail = String::new();
+                errors.take(4096).read_to_string(&mut detail)?;
+                return Err(ExternalError::Failed(format!(
+                    "clipboard read failed: {detail}"
+                )));
+            }
+            output.rewind()?;
+            let mut bytes = Vec::new();
+            output.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+            if bytes.len() > MAX_BYTES as usize {
+                return Err(ExternalError::Failed(
+                    "clipboard text exceeds 8 MiB".to_owned(),
+                ));
+            }
+            String::from_utf8(bytes).map_err(|error| {
+                ExternalError::Failed(format!("clipboard returned invalid UTF-8: {error}"))
+            })
+        })();
+        if result.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        result
+    }
+
     fn run(&self, argv: &[String], input: &str) -> Result<(), ExternalError> {
         let Some((program, arguments)) = argv.split_first() else {
             return Err(ExternalError::Failed(String::from(
@@ -1158,22 +1295,27 @@ impl CommandRunner for ScriptedRunner {
 struct ClipboardJob {
     argv: Vec<String>,
     input: String,
-    outcome: Arc<ClipboardOutcome>,
+    read: bool,
+    outcome: ClipboardCompletion,
 }
 
 #[derive(Default)]
 struct ClipboardOutcome {
-    result: Mutex<Option<Result<(), ExternalError>>>,
+    result: Mutex<Option<Result<Option<ClipboardContent>, ExternalError>>>,
     ready: Condvar,
+    wake: Mutex<Option<tokio::sync::mpsc::Sender<crate::app::TerminalEvent>>>,
 }
 
 impl ClipboardOutcome {
-    fn finish(&self, result: Result<(), ExternalError>) {
+    fn finish(&self, result: Result<Option<ClipboardContent>, ExternalError>) {
         *locked(&self.result) = Some(result);
         self.ready.notify_one();
+        if let Some(wake) = locked(&self.wake).as_ref() {
+            let _ = wake.try_send(crate::app::TerminalEvent::Wake);
+        }
     }
 
-    fn wait(&self, timeout: Duration) -> Option<Result<(), ExternalError>> {
+    fn wait(&self, timeout: Duration) -> Option<Result<Option<ClipboardContent>, ExternalError>> {
         let result = locked(&self.result);
         let (mut result, _) = self
             .ready
@@ -1247,8 +1389,14 @@ impl NativeClipboardWorker {
             .name(String::from("zuno-clipboard-native"))
             .spawn(move || {
                 while let Some(job) = source.receive() {
-                    let result = runner.run(&job.argv, &job.input);
-                    job.outcome.finish(result);
+                    let result = if job.read {
+                        runner
+                            .capture(&job.argv)
+                            .map(|text| (!text.is_empty()).then(|| ClipboardContent::text(text)))
+                    } else {
+                        runner.run(&job.argv, &job.input).map(|()| None)
+                    };
+                    job.outcome.complete(result);
                 }
             }) {
             Ok(_worker) => Self::Ready(mailbox),
@@ -1259,26 +1407,37 @@ impl NativeClipboardWorker {
     }
 
     fn run(&self, argv: &[String], input: &str) -> Result<(), ExternalError> {
-        let sender = match self {
-            Self::Absent => return Err(ExternalError::NoClipboard),
-            Self::Ready(sender) => sender,
-            Self::Failed(message) => return Err(ExternalError::Failed(message.clone())),
-        };
-        let outcome = Arc::new(ClipboardOutcome::default());
-        let job = ClipboardJob {
-            argv: argv.to_vec(),
-            input: input.to_owned(),
-            outcome: Arc::clone(&outcome),
-        };
-        sender.submit(job)?;
-        match outcome.wait(CLIPBOARD_COMPONENT_TIMEOUT) {
-            Some(result) => result,
+        let request = self.request(argv, input, false)?;
+        match request.outcome.wait(CLIPBOARD_COMPONENT_TIMEOUT) {
+            Some(result) => result.map(|_| ()),
             None => Err(ExternalError::Failed(format!(
                 "{} did not finish within {} ms; cleanup continues outside the UI event path",
                 argv.first().map_or("clipboard helper", String::as_str),
                 CLIPBOARD_COMPONENT_TIMEOUT.as_millis()
             ))),
         }
+    }
+
+    fn request(
+        &self,
+        argv: &[String],
+        input: &str,
+        read: bool,
+    ) -> Result<ClipboardRequest, ExternalError> {
+        let sender = match self {
+            Self::Absent => return Err(ExternalError::NoClipboard),
+            Self::Ready(sender) => sender,
+            Self::Failed(message) => return Err(ExternalError::Failed(message.clone())),
+        };
+        let (request, completion) = ClipboardRequest::pending(true);
+        let job = ClipboardJob {
+            argv: argv.to_vec(),
+            input: input.to_owned(),
+            read,
+            outcome: completion,
+        };
+        sender.submit(job)?;
+        Ok(request)
     }
 }
 
@@ -1330,7 +1489,8 @@ impl Platform {
 /// has no native fallback at all rather than one that runs the payload.
 ///
 /// The order within a platform is a preference, not a fallback for a broken arm:
-/// Wayland before X11 on Linux, and `xclip` before `xsel`.
+/// Wayland before X11 on Linux, `xclip` before `xsel`, and PowerShell 7's `pwsh.exe`
+/// before Windows PowerShell's `powershell.exe`.
 ///
 /// # `argv[0]` is the path `resolve` proved, not the name it was asked about
 ///
@@ -1360,15 +1520,19 @@ pub fn copy_command(
         Platform::Linux if let Some(program) = resolve("xsel") => {
             resolved_argv(&program, &["--clipboard", "--input"])
         }
-        Platform::Windows if let Some(program) = resolve("powershell.exe") => resolved_argv(
-            &program,
-            &[
-                "-NonInteractive",
-                "-NoProfile",
-                "-Command",
-                "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())",
-            ],
-        ),
+        Platform::Windows
+            if let Some(program) = resolve("pwsh.exe").or_else(|| resolve("powershell.exe")) =>
+        {
+            resolved_argv(
+                &program,
+                &[
+                    "-NonInteractive",
+                    "-NoProfile",
+                    "-Command",
+                    "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+                ],
+            )
+        }
         _ => None,
     }
 }
@@ -1481,7 +1645,7 @@ pub fn is_resolved_program(candidate: &Path) -> bool {
     candidate.is_absolute() && candidate.is_file()
 }
 
-/// The clipboard a real host has: OSC 52 first, then the native fallback.
+/// Local Windows uses confirmed native writes; remote terminals prefer OSC 52.
 ///
 /// # Why OSC 52 goes first
 ///
@@ -1501,6 +1665,8 @@ pub struct SystemClipboard {
     /// Absent when no clipboard program is installed.
     command: Option<Vec<String>>,
     native: NativeClipboardWorker,
+    read_command: Option<Vec<String>>,
+    native_first: bool,
 }
 
 impl SystemClipboard {
@@ -1521,6 +1687,8 @@ impl SystemClipboard {
             multiplexed,
             command,
             native,
+            read_command: None,
+            native_first: false,
         }
     }
 
@@ -1563,7 +1731,22 @@ impl SystemClipboard {
                 .into_iter()
                 .find(|candidate| is_resolved_program(candidate))
         });
-        Self::new(sink, is_multiplexed(&environment), command, runner)
+        let remote = ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
+            .iter()
+            .any(|name| environment(name).is_some_and(|value| !value.is_empty()));
+        let read_command = if platform == Platform::Windows && !remote {
+            command.as_ref().and_then(|command| command.first()).map(|program| vec![
+                program.clone(), "-NonInteractive".to_owned(), "-NoProfile".to_owned(),
+                "-Command".to_owned(),
+                "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $text = Get-Clipboard -Raw; if ($null -ne $text) { [Console]::Out.Write($text) }".to_owned(),
+            ])
+        } else {
+            None
+        };
+        let mut clipboard = Self::new(sink, is_multiplexed(&environment), command, runner);
+        clipboard.read_command = read_command;
+        clipboard.native_first = platform == Platform::Windows && !remote;
+        clipboard
     }
 
     /// Whether this clipboard has any mechanism at all.
@@ -1574,7 +1757,41 @@ impl SystemClipboard {
 }
 
 impl Clipboard for SystemClipboard {
+    fn request_read(&self) -> Result<ClipboardRequest, ExternalError> {
+        let command = self
+            .read_command
+            .as_ref()
+            .ok_or(ExternalError::NoClipboard)?;
+        self.native.request(command, "", true)
+    }
+
+    fn request_write(&self, text: &str) -> Result<ClipboardRequest, ExternalError> {
+        if self.native_first
+            && let Some(command) = self.command.as_ref()
+        {
+            return self.native.request(command, text, false);
+        }
+        if let Some(sink) = self.sink.as_ref()
+            && sink.emit(&osc52(text, self.multiplexed)).is_ok()
+        {
+            return Ok(ClipboardRequest::ready(Ok(None), false));
+        }
+        let command = self.command.as_ref().ok_or(ExternalError::NoClipboard)?;
+        self.native.request(command, text, false)
+    }
+
     fn read(&self) -> Result<Option<ClipboardContent>, ExternalError> {
+        if self.read_command.is_some() {
+            let request = self.request_read()?;
+            return request
+                .outcome
+                .wait(CLIPBOARD_COMPONENT_TIMEOUT)
+                .unwrap_or_else(|| {
+                    Err(ExternalError::Failed(
+                        "clipboard read is still running; use the asynchronous receipt".to_owned(),
+                    ))
+                });
+        }
         // Deliberately not `Ok(None)`. An empty answer would read as "the clipboard is
         // empty", which is precisely the silent no-op this type exists to stop happening
         // on the write side — and this error is now *shown*: `EditorSignal::Paste` is
@@ -1592,6 +1809,11 @@ impl Clipboard for SystemClipboard {
     }
 
     fn write(&self, text: &str) -> Result<(), ExternalError> {
+        if self.native_first
+            && let Some(command) = self.command.as_ref()
+        {
+            return self.native.run(command, text);
+        }
         if !self.is_available() {
             return Err(ExternalError::NoClipboard);
         }

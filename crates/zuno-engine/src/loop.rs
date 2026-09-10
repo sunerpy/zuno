@@ -351,6 +351,13 @@ pub enum TurnEvent {
         session_id: String,
         turn_id: String,
     },
+    /// Emitted only after the live input and its consumed state commit together.
+    InputConsumed {
+        input_id: String,
+        text: String,
+        attachments: Vec<zuno_attachment::ImageAttachmentRef>,
+        source: crate::interrupt::SoftInterruptSource,
+    },
     HistoryRepaired {
         repaired_tool_results: usize,
     },
@@ -2180,7 +2187,11 @@ async fn run_turn_in_span(
             crate::compaction::checkpoint::latest_checkpoint(&history).is_some();
         apply_legacy_tool_schema_identities(&mut history, &legacy_tool_schema_snapshots);
         let requested = requested_turn(&request.session_id, &history, &request.start)?;
-        if inject_live_inputs(&mut context, &request, &requested)?.count > 0 {
+        if inject_live_inputs(&mut context, &request, &requested, &events)
+            .await?
+            .count
+            > 0
+        {
             continue;
         }
         resolve_history_attachments(
@@ -3097,10 +3108,10 @@ async fn run_turn_in_span(
                 .send(TurnEvent::AssistantCheckpointed {
                     step,
                     message_id: assistant_id,
-                    interrupted: true,
+                    interrupted: false,
                 })
                 .await?;
-            let _injected = inject_live_inputs(&mut context, &request, &requested)?;
+            let _injected = inject_live_inputs(&mut context, &request, &requested, &events).await?;
             events
                 .send(TurnEvent::StepCompleted {
                     step,
@@ -3263,7 +3274,7 @@ async fn run_turn_in_span(
                 });
             }
         }
-        let mut injected = inject_live_inputs(&mut context, &request, &requested)?;
+        let mut injected = inject_live_inputs(&mut context, &request, &requested, &events).await?;
         let mut yield_until_input = false;
         let mut waiting_for_human = None;
         let mut work_state_read = None;
@@ -3538,14 +3549,16 @@ async fn run_turn_in_span(
                     if waiting_for_human.is_some() {
                         injected.skip_remaining_tools = true;
                     } else {
-                        injected.merge(inject_live_inputs(&mut context, &request, &requested)?);
+                        injected.merge(
+                            inject_live_inputs(&mut context, &request, &requested, &events).await?,
+                        );
                     }
                 }
                 next_call = group_end;
             }
         }
         if waiting_for_human.is_none() {
-            injected.merge(inject_live_inputs(&mut context, &request, &requested)?);
+            injected.merge(inject_live_inputs(&mut context, &request, &requested, &events).await?);
         }
 
         events
@@ -3609,6 +3622,17 @@ async fn run_turn_in_span(
         }
 
         if injected.count > 0 {
+            continue;
+        }
+
+        if (yield_until_input || calls.is_empty())
+            && context
+                .live_inputs
+                .as_ref()
+                .is_some_and(|live| !live.guard.try_finish_inputs())
+        {
+            // A steer won the closing race. It belongs to this turn, so another
+            // safe point must consume it before any completion event is published.
             continue;
         }
 
@@ -3769,10 +3793,11 @@ impl InjectedLiveInputs {
     }
 }
 
-fn inject_live_inputs(
+async fn inject_live_inputs(
     context: &mut TurnContext<'_>,
     request: &RunTurnRequest,
     requested: &RequestedTurn,
+    events: &TurnEventSender,
 ) -> Result<InjectedLiveInputs, TurnError> {
     let Some(live) = context.live_inputs.as_ref() else {
         return Ok(InjectedLiveInputs::default());
@@ -3780,13 +3805,17 @@ fn inject_live_inputs(
     let delivery = live.guard.take_soft_interrupts_at_safe_point();
     let mut injected = InjectedLiveInputs::default();
     for message in delivery.messages {
-        if let Some(input_id) = message.input_id.as_deref()
-            && live
-                .inbox
-                .promote_id(&request.session_id, input_id)?
-                .is_none()
-        {
-            continue;
+        if let Some(input_id) = message.input_id.as_deref() {
+            let promoted = match message.revision {
+                Some(revision) => {
+                    live.inbox
+                        .promote_revision(&request.session_id, input_id, revision)?
+                }
+                None => live.inbox.promote_id(&request.session_id, input_id)?,
+            };
+            if promoted.is_none() {
+                continue;
+            }
         }
         persist_live_input(
             context.connection,
@@ -3795,6 +3824,16 @@ fn inject_live_inputs(
             &message,
             context.attachments.as_deref(),
         )?;
+        if let Some(input_id) = message.input_id.as_ref() {
+            events
+                .send(TurnEvent::InputConsumed {
+                    input_id: input_id.clone(),
+                    text: message.content.clone(),
+                    attachments: message.attachments.clone(),
+                    source: message.source,
+                })
+                .await?;
+        }
         injected.count = injected.count.saturating_add(1);
         injected.skip_remaining_tools |= message.urgent;
     }

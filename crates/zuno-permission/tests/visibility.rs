@@ -46,6 +46,7 @@ fn rules(json: &str) -> Vec<Rule> {
 
 fn rule(permission: &str, pattern: &str, action: PermissionAction) -> Rule {
     Rule {
+        source: None,
         permission: permission.to_owned(),
         pattern: pattern.to_owned(),
         action,
@@ -161,7 +162,7 @@ fn visibility_a_narrower_deny_pattern_keeps_the_tool_visible_and_refuses_only_ma
     let error = engine
         .authorize(request("shell", &["rm -rf /tmp/build"]), &ruleset)
         .expect_err("a matching invocation is refused at call time");
-    assert!(matches!(error, ToolError::Denied { ref tool } if tool == "shell"));
+    assert!(matches!(error, ToolError::Denied { ref tool, .. } if tool == "shell"));
 
     let authorization = engine
         .authorize(request("shell", &["git status"]), &ruleset)

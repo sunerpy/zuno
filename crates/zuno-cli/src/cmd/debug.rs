@@ -11,8 +11,8 @@ use zuno_search::{GlobRequest, GrepRequest, NeverCancelled, Ripgrep};
 use zuno_snapshot::{Location, Store};
 
 use crate::command::{
-    CliSandboxMode, DebugAgentArgs, DebugArgs, DebugCommand, DebugLspCommand, DebugPromptArgs,
-    DebugRgCommand, DebugSandboxArgs, DebugSandboxNetwork, DebugSnapshotCommand,
+    CliSandboxMode, DebugAgentArgs, DebugArgs, DebugCommand, DebugLspCommand, DebugPermissionsArgs,
+    DebugPromptArgs, DebugRgCommand, DebugSandboxArgs, DebugSandboxNetwork, DebugSnapshotCommand,
 };
 use crate::environment::StartupEnvironment;
 
@@ -32,17 +32,14 @@ pub(super) fn execute(args: &DebugArgs, environment: &StartupEnvironment) -> Res
             agent(args, &context, environment)
         }
         DebugCommand::Prompt(args) => prompt(args),
-        DebugCommand::Permissions => {
-            let context = Context::resolve(environment)?;
-            permissions(&context)
-        }
+        DebugCommand::Permissions(args) => permissions(args, environment),
         DebugCommand::Skill => {
             let context = Context::resolve(environment)?;
             skill(&context)
         }
         DebugCommand::Sandbox(args) => {
             let context = Context::resolve(environment)?;
-            sandbox(args, &context)
+            sandbox(args, &context, environment)
         }
         DebugCommand::Rg(args) => {
             let context = Context::resolve(environment)?;
@@ -133,17 +130,79 @@ fn normalize_json_numbers(value: &mut serde_json::Value) {
     }
 }
 
-fn permissions(context: &Context) -> Result<(), String> {
-    let rules = context
-        .config
+fn permissions(
+    args: &DebugPermissionsArgs,
+    environment: &StartupEnvironment,
+) -> Result<(), String> {
+    let saved = args
+        .session_id
+        .as_deref()
+        .map(|session_id| {
+            let location = zuno_paths::Layout::resolve(environment.resolved()).db_path();
+            let path = location
+                .as_path()
+                .ok_or("an in-memory database has no saved session to inspect")?;
+            let connection = rusqlite::Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .map_err(to_string)?;
+            zuno_db::session::get(&connection, session_id).map_err(to_string)
+        })
+        .transpose()?;
+    let context = match &saved {
+        Some(session) => Context::resolve_at(PathBuf::from(&session.directory), environment)?,
+        None => Context::resolve(environment)?,
+    };
+    let requested_agent = args
+        .agent
+        .as_deref()
+        .or_else(|| saved.as_ref().and_then(|session| session.agent.as_deref()));
+    let profile = diagnostic_profile(&context, requested_agent, environment)?;
+    print_json(&permissions_output(&context, &profile, args))
+}
+
+fn permissions_output(
+    context: &Context,
+    profile: &zuno_agent::profile::AgentProfile,
+    args: &DebugPermissionsArgs,
+) -> serde_json::Value {
+    let rules = profile.capabilities().rules();
+    let decision = args
         .permission
-        .as_ref()
-        .map(|permission| permission.rules.clone())
-        .unwrap_or_default();
-    print_json(&serde_json::json!({
+        .as_deref()
+        .zip(args.resource.as_deref())
+        .map(|(permission, resource)| {
+            let decision = zuno_permission::decide(permission, resource, rules);
+            let effective = match decision.action {
+                zuno_permission::PermissionAction::Ask
+                    if context.config.effective_permission_mode()
+                        == zuno_config::schema::permission::PermissionMode::AllowAll =>
+                {
+                    zuno_permission::PermissionAction::Allow
+                }
+                action => action,
+            };
+            serde_json::json!({
+                "permission": permission,
+                "resource": resource,
+                "ruleAction": decision.action,
+                "effectiveAction": effective,
+                "matchedRule": decision.matched.as_ref().map(|matched| matched.rule),
+                "matchReason": decision.matched.as_ref().map(|matched| matched.reason.to_string()),
+            })
+        });
+    serde_json::json!({
+        "agent": profile.name(),
+        "sessionId": args.session_id,
+        "workspace": context.directory,
+        "resolution": "current_configuration",
+        "liveRuntimeApprovalsIncluded": false,
+        "connectedMcpToolsIncluded": false,
         "configuredMode": context.config.permission_mode(),
         "mode": context.config.effective_permission_mode(),
         "rules": rules,
+        "decision": decision,
         "strictSideEffectsRequireApproval": context.config.strict_authorization(),
         "allowAllStillEnforces": [
             "explicit deny",
@@ -151,7 +210,53 @@ fn permissions(context: &Context) -> Result<(), String> {
             "sandbox authority",
             "argument validation"
         ],
-    }))
+    })
+}
+
+/// Resolve the Agent layer without credentials, provider startup, database writes,
+/// or MCP connections. The same profile composer supplies runtime permission rules.
+fn diagnostic_profile(
+    context: &Context,
+    requested_agent: Option<&str>,
+    environment: &StartupEnvironment,
+) -> Result<zuno_agent::profile::AgentProfile, String> {
+    let loaded = zuno_catalog::agent::load_map(
+        &context.directory,
+        context.worktree.as_deref(),
+        &context.env,
+    )
+    .map_err(to_string)?;
+    let scope =
+        zuno_extension::Scope::new(context.worktree.as_deref().unwrap_or(&context.directory));
+    let discovered = zuno_extension::discover_static(
+        &context.directory,
+        context.worktree.as_deref(),
+        &context.env,
+    )
+    .map_err(to_string)?;
+    let extensions = zuno_extension::resolve_active(&scope, &discovered, environment.extensions())
+        .map_err(to_string)?;
+    let merged = zuno_catalog::agent::merge_agent_maps(&loaded.agents, extensions.agents())
+        .map_err(to_string)?;
+    let name = requested_agent
+        .or(context.config.default_agent.as_deref())
+        .unwrap_or(super::turn::DEFAULT_AGENT);
+    let entry = zuno_catalog::agent::list(&merged, &loaded.origins)
+        .into_iter()
+        .find(|entry| entry.name == name)
+        .ok_or_else(|| format!("Agent not found: {name}"))?;
+    let dynamic = super::agent::DynamicRules::resolve(
+        &context.directory,
+        context.worktree.as_deref(),
+        &context.env,
+        &context.config,
+    );
+    Ok(super::agent::resolved_profile(
+        entry,
+        &context.config,
+        &dynamic,
+        true,
+    ))
 }
 
 fn prompt(args: &DebugPromptArgs) -> Result<(), String> {
@@ -408,6 +513,10 @@ struct Context {
 impl Context {
     fn resolve(environment: &StartupEnvironment) -> Result<Self, String> {
         let directory = std::env::current_dir().map_err(to_string)?;
+        Self::resolve_at(directory, environment)
+    }
+
+    fn resolve_at(directory: PathBuf, environment: &StartupEnvironment) -> Result<Self, String> {
         let project = zuno_paths::project::resolve_project(&directory);
         let worktree = project.vcs.as_ref().map(|_| project.directory.clone());
         let env = environment.resolved().clone();
@@ -560,24 +669,57 @@ fn skill(context: &Context) -> Result<(), String> {
     print_json(&output)
 }
 
-fn sandbox(args: &DebugSandboxArgs, context: &Context) -> Result<(), String> {
+fn sandbox(
+    args: &DebugSandboxArgs,
+    context: &Context,
+    environment: &StartupEnvironment,
+) -> Result<(), String> {
+    let profile = diagnostic_profile(context, args.agent.as_deref(), environment)?;
+    let mut config = context.config.clone();
+    if let Some(network) = args.network {
+        config.sandbox.get_or_insert_with(Default::default).network = Some(match network {
+            DebugSandboxNetwork::Deny => zuno_config::schema::sandbox::SandboxNetworkMode::Deny,
+            DebugSandboxNetwork::Allow => zuno_config::schema::sandbox::SandboxNetworkMode::Allow,
+        });
+    }
+    let policy = super::tool_runtime::sandbox_policy(
+        &context.directory,
+        &config,
+        &profile,
+        profile.capabilities().rules(),
+    )?;
     let mode = match args.mode {
-        CliSandboxMode::ReadOnly => zuno_sandbox::SandboxMode::ReadOnly,
-        CliSandboxMode::WorkspaceWrite => zuno_sandbox::SandboxMode::WorkspaceWrite,
-        CliSandboxMode::DangerFullAccess => zuno_sandbox::SandboxMode::DangerFullAccess,
+        Some(CliSandboxMode::ReadOnly) => zuno_sandbox::SandboxMode::ReadOnly,
+        Some(CliSandboxMode::WorkspaceWrite) => zuno_sandbox::SandboxMode::WorkspaceWrite,
+        Some(CliSandboxMode::DangerFullAccess) => zuno_sandbox::SandboxMode::DangerFullAccess,
+        None => policy.mode(),
     };
-    let network = sandbox_network(mode, args.network);
+    let network = if args.mode.is_some() || args.network.is_some() {
+        sandbox_network(mode, args.network)
+    } else {
+        policy.network()
+    };
     let report = zuno_sandbox::deployment_report_with_request(
         &context.directory,
         mode,
         network,
-        super::tool_runtime::sandbox_backend_request(&context.config),
+        super::tool_runtime::sandbox_backend_request(&config),
     );
-    print_json(&report)?;
+    let mut output = serde_json::to_value(&report).map_err(to_string)?;
+    output["agent"] = serde_json::json!(profile.name());
+    output["configuredBackend"] =
+        serde_json::json!(config.sandbox.as_ref().and_then(|sandbox| sandbox.backend));
+    output["backendResolutionSource"] = serde_json::json!(config.resolved_sandbox_backend().source);
+    print_json(&output)?;
     if args.check && !report.ready {
         return Err(report
             .error
             .unwrap_or_else(|| "requested sandbox policy is not deployable".to_owned()));
+    }
+    if args.check_execution && !report.execution_ready {
+        return Err(report
+            .error
+            .unwrap_or_else(|| "requested execution backend is not available".to_owned()));
     }
     Ok(())
 }
@@ -740,6 +882,52 @@ fn to_string(error: impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_debug_resolves_agent_auxiliary_rules_without_a_provider() {
+        let root = tempfile::tempdir().expect("workspace");
+        let env = zuno_paths::Env::empty();
+        let environment =
+            StartupEnvironment::resolve(&env, &crate::command::GlobalOptions::default());
+        let mut context = Context {
+            directory: root.path().to_owned(),
+            worktree: None,
+            env,
+            config: serde_json::from_value(serde_json::json!({
+                "default_agent": "deep",
+                "permission": {"mode": "allow_all"}
+            }))
+            .expect("config"),
+        };
+        let args = DebugPermissionsArgs {
+            permission: Some("external_directory".to_owned()),
+            resource: Some("C:/Users/example/AppData/Local/Amazon/DCV/logs/*".to_owned()),
+            ..DebugPermissionsArgs::default()
+        };
+        let profile = diagnostic_profile(&context, None, &environment).expect("offline profile");
+        let output = permissions_output(&context, &profile, &args);
+        assert_eq!(output["agent"], "deep");
+        assert_eq!(output["decision"]["ruleAction"], "ask");
+        assert_eq!(output["decision"]["effectiveAction"], "allow");
+        assert_eq!(
+            output["decision"]["matchedRule"]["source"],
+            "native_agent:deep"
+        );
+        context.config.permission = Some(
+            serde_json::from_value(serde_json::json!({
+                "mode": "allow_all", "rules": {"external_directory": "deny"}
+            }))
+            .expect("explicit deny"),
+        );
+        let profile = diagnostic_profile(&context, None, &environment).expect("offline profile");
+        let output = permissions_output(&context, &profile, &args);
+        assert_eq!(output["decision"]["effectiveAction"], "deny");
+        assert_eq!(
+            output["decision"]["matchedRule"]["source"],
+            "configuration.permission"
+        );
+        assert_eq!(output["liveRuntimeApprovalsIncluded"], false);
+    }
 
     #[test]
     fn multiple_search_globs_become_one_brace_expression() {

@@ -1260,6 +1260,7 @@ pub enum QueuedInputNoticeKind {
     Admitted(QueuedInputDelivery),
     /// The durable inbox promoted this row into the next model turn.
     Promoted,
+    Consumed,
     Edited,
     Cancelled,
     Failed(String),
@@ -1276,6 +1277,7 @@ struct ProjectedQueuedInputs {
     generation: u64,
     inputs: Vec<QueuedInputEntry>,
     notice: Option<QueuedInputNotice>,
+    prompt_receipts: Vec<(String, Option<String>)>,
 }
 
 /// Shared durable queue projection. Rendering and row actions perform no database I/O.
@@ -1283,17 +1285,41 @@ struct ProjectedQueuedInputs {
 pub struct QueuedInputProjection(Arc<RwLock<ProjectedQueuedInputs>>);
 
 impl QueuedInputProjection {
+    /// Apply a committed consumption event without querying SQLite on the UI thread.
+    pub fn consumed(&self, input_id: &str) {
+        let mut state = self.0.write().unwrap_or_else(PoisonError::into_inner);
+        state.inputs.retain(|input| input.id != input_id);
+        state.notice = Some(QueuedInputNotice {
+            input_id: input_id.to_owned(),
+            kind: QueuedInputNoticeKind::Consumed,
+        });
+        state.generation = state.generation.wrapping_add(1);
+    }
+
     #[must_use]
     pub fn new(inputs: Vec<QueuedInputEntry>) -> Self {
         Self(Arc::new(RwLock::new(ProjectedQueuedInputs {
             generation: 0,
             inputs,
             notice: None,
+            prompt_receipts: Vec::new(),
         })))
     }
 
     pub fn replace(&self, inputs: Vec<QueuedInputEntry>) {
         self.publish(inputs, None);
+    }
+
+    /// UI draft ownership ends only at the durable admission result, not at channel send.
+    pub fn acknowledge_prompt(&self, request_id: String, error: Option<String>) {
+        let mut projected = self.0.write().unwrap_or_else(PoisonError::into_inner);
+        projected.prompt_receipts.push((request_id, error));
+        projected.generation = projected.generation.wrapping_add(1);
+    }
+
+    pub(crate) fn take_prompt_receipts(&self) -> Vec<(String, Option<String>)> {
+        let mut projected = self.0.write().unwrap_or_else(PoisonError::into_inner);
+        std::mem::take(&mut projected.prompt_receipts)
     }
 
     /// Publish rows and an optional post-commit acknowledgement.
@@ -1338,6 +1364,10 @@ impl QueuedInputProjection {
 /// Typed operation emitted by the durable queue dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueuedInputDialogAction {
+    SendNow {
+        id: String,
+        expected_revision: i64,
+    },
     Edit {
         id: String,
         expected_revision: i64,
@@ -1353,11 +1383,17 @@ pub enum QueuedInputDialogAction {
 pub struct QueuedInputDialog {
     select: SelectDialog,
     projection: QueuedInputProjection,
-    cancel_confirmation: Option<String>,
+    shown_inputs: Vec<QueuedInputEntry>,
+    cancel_confirmation: Option<(String, i64)>,
+    send_hint: Option<String>,
+    send_row: Option<usize>,
+    send_target: Option<(String, i64)>,
+    send_pressed: Option<(String, i64)>,
 }
 
 impl QueuedInputDialog {
     fn new(context: ViewContext, projection: QueuedInputProjection) -> Self {
+        let send_hint = crate::views::pressable_label("input_force_submit", &context);
         let mut dialog = Self {
             select: SelectDialog::new(
                 QUEUED_INPUT_DIALOG_ID,
@@ -1366,7 +1402,12 @@ impl QueuedInputDialog {
                 Vec::new(),
             ),
             projection,
+            shown_inputs: Vec::new(),
             cancel_confirmation: None,
+            send_hint,
+            send_row: None,
+            send_target: None,
+            send_pressed: None,
         };
         dialog.sync();
         dialog
@@ -1390,18 +1431,23 @@ impl QueuedInputDialog {
         if self
             .cancel_confirmation
             .as_ref()
-            .is_some_and(|id| !inputs.iter().any(|input| &input.id == id))
+            .is_some_and(|(id, revision)| {
+                !inputs
+                    .iter()
+                    .any(|input| &input.id == id && input.revision == *revision)
+            })
         {
             self.cancel_confirmation = None;
         }
+        self.shown_inputs = inputs;
     }
 
     fn selected_entry(&self) -> Option<QueuedInputEntry> {
         let id = &self.select.selected()?.value;
-        self.projection
-            .snapshot()
-            .into_iter()
+        self.shown_inputs
+            .iter()
             .find(|input| &input.id == id)
+            .cloned()
     }
 
     fn edit_step(&self) -> DialogStep {
@@ -1413,6 +1459,21 @@ impl QueuedInputDialog {
             expected_revision: input.revision,
             text: input.text,
         }))
+    }
+
+    fn send_step(&self) -> DialogStep {
+        let Some(input) = self
+            .selected_entry()
+            .filter(|input| input.editable && input.delivery == QueuedInputDelivery::Queue)
+        else {
+            return DialogStep::Redraw;
+        };
+        DialogStep::Emitted(DialogOutcome::QueuedInput(
+            QueuedInputDialogAction::SendNow {
+                id: input.id,
+                expected_revision: input.revision,
+            },
+        ))
     }
 
     fn map_selection_to_edit(&self, step: DialogStep) -> DialogStep {
@@ -1436,8 +1497,16 @@ impl Dialog for QueuedInputDialog {
         format!("Queued prompts ({})", self.projection.snapshot().len())
     }
 
+    fn focused_scopes(&self) -> Vec<&'static str> {
+        // Dialog arrows/Enter retain selection/edit precedence; the input scope
+        // contributes the user's actual Send Now binding, including leader chords.
+        vec!["dialog.select", "dialog.prompt", "input"]
+    }
+
     fn lines(&mut self, width: u16) -> Vec<Line<'static>> {
         self.sync();
+        self.send_row = None;
+        self.send_target = None;
         if self.projection.snapshot().is_empty() {
             return vec![padded(
                 " No queued prompts. Messages sent while working appear here after commit.",
@@ -1445,7 +1514,7 @@ impl Dialog for QueuedInputDialog {
                 self.select.context.muted(),
             )];
         }
-        let armed = self.cancel_confirmation.as_deref();
+        let armed = self.cancel_confirmation.as_ref().map(|(id, _)| id.as_str());
         let selected = self.select.selected().map(|item| item.value.as_str());
         let selected_row = (armed == selected && armed.is_some()).then(|| {
             self.select
@@ -1461,6 +1530,18 @@ impl Dialog for QueuedInputDialog {
                 width,
                 self.select.context.selected(),
             );
+        }
+        if let Some(input) = self
+            .selected_entry()
+            .filter(|input| input.editable && input.delivery == QueuedInputDelivery::Queue)
+        {
+            self.send_row = Some(lines.len());
+            self.send_target = Some((input.id, input.revision));
+            let label = self.send_hint.as_ref().map_or_else(
+                || " Send selected now".to_owned(),
+                |keys| format!(" Send selected now · {keys}"),
+            );
+            lines.push(padded(&label, width, self.select.context.selected()));
         }
         lines
     }
@@ -1480,8 +1561,11 @@ impl Dialog for QueuedInputDialog {
     }
 
     fn handle_action(&mut self, action: &'static Definition, event: &KeyEvent) -> DialogStep {
-        self.sync();
         match action.name {
+            "input_force_submit" => {
+                self.cancel_confirmation = None;
+                self.send_step()
+            }
             "session_rename" | "dialog.select.submit" | "dialog.prompt.submit" => {
                 self.cancel_confirmation = None;
                 self.edit_step()
@@ -1491,7 +1575,7 @@ impl Dialog for QueuedInputDialog {
                     self.cancel_confirmation = None;
                     return DialogStep::Ignored;
                 };
-                if self.cancel_confirmation.as_deref() == Some(input.id.as_str()) {
+                if self.cancel_confirmation.as_ref() == Some(&(input.id.clone(), input.revision)) {
                     self.cancel_confirmation = None;
                     DialogStep::Emitted(DialogOutcome::QueuedInput(
                         QueuedInputDialogAction::Cancel {
@@ -1500,7 +1584,7 @@ impl Dialog for QueuedInputDialog {
                         },
                     ))
                 } else {
-                    self.cancel_confirmation = Some(input.id);
+                    self.cancel_confirmation = Some((input.id, input.revision));
                     DialogStep::Redraw
                 }
             }
@@ -1513,14 +1597,50 @@ impl Dialog for QueuedInputDialog {
     }
 
     fn handle_mouse(&mut self, event: &MouseEvent, body: Rect) -> DialogStep {
-        self.sync();
+        let on_send = self.send_row.is_some_and(|row| {
+            event.row >= body.y
+                && usize::from(event.row - body.y) == row
+                && event.row < body.bottom()
+                && event.column >= body.x
+                && event.column < body.right()
+        });
+        if matches!(
+            event.kind,
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+        ) && on_send
+        {
+            self.send_pressed = self.send_target.clone();
+            return DialogStep::Redraw;
+        }
+        if matches!(
+            event.kind,
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)
+        ) && let Some((id, expected_revision)) = self.send_pressed.take()
+        {
+            return if on_send {
+                DialogStep::Emitted(DialogOutcome::QueuedInput(
+                    QueuedInputDialogAction::SendNow {
+                        id,
+                        expected_revision,
+                    },
+                ))
+            } else {
+                DialogStep::Redraw
+            };
+        }
         self.cancel_confirmation = None;
         let step = self.select.handle_mouse(event, body);
-        self.map_selection_to_edit(step)
+        match step {
+            DialogStep::Resolved(DialogOutcome::Selected { dialog, .. })
+                if dialog == QUEUED_INPUT_DIALOG_ID =>
+            {
+                DialogStep::Redraw
+            }
+            other => other,
+        }
     }
 
     fn handle_typed(&mut self, key: &KeyEvent) -> DialogStep {
-        self.sync();
         self.cancel_confirmation = None;
         self.select.handle_typed(key)
     }

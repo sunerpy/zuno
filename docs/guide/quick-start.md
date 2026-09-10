@@ -171,8 +171,11 @@ zuno run --agent plan "summarize how configuration precedence works in this repo
 works end to end on a host with working confinement. A read-only Agent deliberately does
 not use `run-unconfined`.
 
-On macOS or Windows, a trusted first task that needs Shell must explicitly choose a
-native path. `plan` can take it too, with the permission mode kept:
+On macOS or Windows, Shell defaults to native when no explicit backend/fallback,
+denied-network or path constraints require confinement. `plan` can use it too, with
+the permission mode kept. To make the native choice explicit:
+
+Use `sandbox.backend` in trusted configuration or the command-line override below.
 
 ```powershell
 zuno run --agent plan `
@@ -202,9 +205,9 @@ zuno
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | `rg` is missing or too old | `glob` / `grep` backend is unavailable | Install ripgrep 14 or newer; Zuno startup and unrelated core features remain usable, and the running session picks the new install up within five seconds without a restart |
-| `no trusted system bubblewrap executable was found` | No confinement backend | Install bubblewrap 0.8.0 or newer, use explicit `danger-full-access`, or enable trusted unavailable fallback for a write-capable Agent. An interactive start offers the same native-execution question macOS and Windows get, because a host with no usable bubblewrap also cannot confine |
+| `no trusted system bubblewrap executable was found` | No Linux confinement backend | Install bubblewrap 0.8.0 or newer, use trusted native execution, or enable eligible trusted fallback. A Linux interactive start may offer native execution when no explicit constraint requires confinement |
 | `OS sandbox is not implemented for platform` | Confined mode on macOS or Windows | The refusal names the platform and lists the remedies that apply to that request: trusted `--sandbox-backend native` for any Agent with the permission mode kept, trusted `run-unconfined` fallback for a write-capable Agent, explicit `danger-full-access`, or run on Linux |
-| `Run this session natively without OS confinement?` on a bare `zuno` start | A host that cannot confine the request (macOS, Windows, or a Linux host with no usable bubblewrap; read-only Agents included), and no layer set `sandbox.onUnavailable` or `sandbox.backend` | Answer `y` to run this session natively with your permission mode kept, `a` to save `sandbox.backend: native` to your global configuration so the question is never asked again, or `n` to exit with the refusal. Decide it up front with `--sandbox-backend native`, `ZUNO_SANDBOX_BACKEND=native`, or `sandbox.backend` in a trusted layer |
+| `Run this session natively without OS confinement?` on a bare `zuno` start | A Linux host cannot confine the request and no explicit constraint requires confinement; Windows/macOS already default to native under the same absence conditions | Answer `y` for this session, `a` to save trusted `sandbox.backend: native`, or `n` to refuse. Native execution keeps permission mode and is not OS isolation |
 | A validation error naming a rejected top-level key | TUI-only key such as `theme` in `zuno.json` | Move it to `tui.json`. See [Files and precedence](/config/files) |
 | Empty session list after switching builds | Source and release builds open different database files | See [Database lifecycle](/migration) |
 | A model id is not found | Catalog cached before the provider was added | `zuno models --refresh` |

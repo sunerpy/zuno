@@ -671,33 +671,37 @@ fn views_input_history_stashes_a_half_written_prompt() {
 }
 
 #[test]
-fn views_input_history_actions_move_within_a_multi_line_buffer_before_walking_history() {
+fn views_input_history_actions_move_only_at_interior_text_positions() {
     let mut editor = editor();
     editor.load_history(vec![String::from("remembered")]);
     editor.set_text("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
 
-    assert_eq!(editor.cursor(), Position { line: 7, column: 5 });
+    act(&mut editor, &["input_move_left"]);
+    assert_eq!(editor.cursor(), Position { line: 7, column: 4 });
     act(&mut editor, &["history_previous"]);
     assert_eq!(
         editor.cursor(),
-        Position { line: 6, column: 5 },
-        "Up from the last line walked history instead of keeping the pasted block editable"
+        Position { line: 6, column: 4 },
+        "an interior text position must retain vertical editing"
     );
     assert_eq!(
         editor.text(),
         "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight"
     );
 
-    act(&mut editor, &["input_buffer_home", "history_next"]);
+    act(
+        &mut editor,
+        &["input_buffer_home", "input_move_right", "history_next"],
+    );
     assert_eq!(
         editor.cursor(),
-        Position { line: 1, column: 0 },
-        "Down from the first line walked history instead of moving into the buffer"
+        Position { line: 1, column: 1 },
+        "the first line's interior is not a history boundary"
     );
 }
 
 #[test]
-fn views_input_history_actions_walk_only_beyond_the_vertical_edges() {
+fn views_input_history_actions_walk_at_both_buffer_endpoints() {
     let mut editor = editor();
     editor.load_history(vec![String::from("older"), String::from("newest")]);
     editor.set_text("draft one\ndraft two\ndraft three");
@@ -714,6 +718,59 @@ fn views_input_history_actions_walk_only_beyond_the_vertical_edges() {
         "draft one\ndraft two\ndraft three",
         "Down past the newest history entry did not restore the in-progress draft"
     );
+    assert_eq!(
+        editor.cursor(),
+        Position::default(),
+        "restore the original cursor"
+    );
+    act(
+        &mut editor,
+        &["input_buffer_end", "history_previous", "history_previous"],
+    );
+    assert_eq!(editor.text(), "older");
+    act(&mut editor, &["input_buffer_home", "history_next"]);
+    assert_eq!(
+        editor.text(),
+        "newest",
+        "Down also browses at the buffer start"
+    );
+}
+
+#[test]
+fn history_restores_the_paste_payload_selection_and_does_not_expand_recalled_literals() {
+    let mut editor = editor();
+    let pasted = "pasted line\n".repeat(PASTE_SUMMARY_LINES + 2);
+    editor.insert_paste(&pasted);
+    let visible = editor.text();
+    let expanded = editor.submission_text();
+    editor.load_history(vec![visible.clone()]);
+    act(&mut editor, &["input_select_buffer_home"]);
+    let cursor = editor.cursor();
+    let selection = editor.selection();
+    act(&mut editor, &["history_previous"]);
+    assert_eq!(
+        editor.submission_text(),
+        visible,
+        "a recalled literal is not the draft's paste"
+    );
+    act(&mut editor, &["history_next"]);
+    assert_eq!(editor.submission_text(), expanded);
+    assert_eq!(editor.cursor(), cursor);
+    assert_eq!(editor.selection(), selection);
+}
+
+#[test]
+fn submitting_a_duplicate_history_entry_finishes_the_history_excursion() {
+    let mut editor = editor();
+    editor.load_history(vec!["same".to_owned()]);
+    editor.set_text("unsent draft");
+    act(
+        &mut editor,
+        &["history_previous", "input_submit", "history_next"],
+    );
+    assert!(editor.is_empty());
+    assert_eq!(editor.history_position(), None);
+    assert_eq!(editor.history(), ["same"]);
 }
 
 #[test]
@@ -1133,8 +1190,13 @@ fn views_input_a_slash_pasted_mid_prompt_is_left_alone() {
 fn views_input_an_empty_paste_changes_nothing() {
     let mut editor = typing("draft");
     assert_eq!(editor.insert_paste(""), EditorSignal::None);
-    assert_eq!(editor.insert_paste("\n"), EditorSignal::None);
     assert_eq!(editor.text(), "draft");
+    assert_eq!(editor.insert_paste("\n"), EditorSignal::Changed);
+    assert_eq!(
+        editor.text(),
+        "draft\n",
+        "a newline is text, not an empty paste or submit"
+    );
 }
 
 #[test]
@@ -1156,9 +1218,10 @@ fn views_input_setting_the_text_drops_a_held_paste() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn views_input_normalize_prompt_content_matches_the_oracle_rule() {
-    assert_eq!(normalize_prompt_content("one line\n"), "one line");
-    assert_eq!(normalize_prompt_content("one line\r\n"), "one line");
+fn views_input_normalize_preserves_the_whole_pasted_block() {
+    assert_eq!(normalize_prompt_content("one line\n"), "one line\n");
+    assert_eq!(normalize_prompt_content("one line\r\n"), "one line\n");
+    assert_eq!(normalize_prompt_content("a\r\n\r\n\tb\r"), "a\n\n\tb\n");
     assert_eq!(
         normalize_prompt_content("two\nlines\n"),
         "two\nlines\n",

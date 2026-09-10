@@ -251,6 +251,7 @@ impl TypedTool for PlanExitTool {
             QuestionOutcome::Answered(answers) => answers,
             QuestionOutcome::Cancelled => {
                 return Err(ToolError::Denied {
+                    denial: None,
                     tool: WIRE_ID.to_owned(),
                 });
             }
@@ -280,6 +281,7 @@ impl TypedTool for PlanExitTool {
             .is_some_and(|label| label == DECLINE_LABEL)
         {
             return Err(ToolError::Denied {
+                denial: None,
                 tool: WIRE_ID.to_owned(),
             });
         }

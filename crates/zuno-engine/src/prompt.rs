@@ -165,8 +165,7 @@ impl RuntimePromptPolicy {
             .any(has);
 
         let mut execution = String::from(
-            "Choose the smallest coherent workflow. Batch independent reads; do not re-read \
-             unchanged state or rerun checks unless inputs changed.",
+            "Use the smallest workflow. Batch reads; do not re-read or recheck unchanged state.",
         );
         if !tools.is_empty() {
             execution.push_str(
@@ -174,13 +173,15 @@ impl RuntimePromptPolicy {
                  milestones. When complete, stop calling tools and answer. If no tool can \
                  materially advance the objective, report the blocker. On unavailable, \
                  rate-limited, or transient failure, do not repeat unchanged or widen permissions; \
-                 preserve evidence.",
+                 preserve evidence. Proactively prefer relevant authorized MCP tools. \
+                 Configured is not connected; deferred is not unavailable. Do not hand-write \
+                 MCP HTTP in Shell to bypass discovery, except for explicit transport debugging.",
             );
         }
         if has("tool_search") {
             execution.push_str(
-                " With `tool_search`, find authorized alternatives such as connected \
-                 `google_search`.",
+                " Use `tool_search` and its service catalog before claiming a tool absent; \
+                 resource or extension listing is not tool discovery.",
             );
         }
         if has("shell") {
@@ -219,12 +220,10 @@ impl RuntimePromptPolicy {
         let mut sections = vec![
             RuntimePromptSection::new(
                 "runtime.intent",
-                "Use the current user request or delegated objective as the authority for this \
-                 turn. Re-evaluate intent when new input arrives. Do not infer permission for a \
-                 materially different action, and do not add ceremony to one clear isolated task. \
-                 Treat an explicit user- or delegation-supplied scope as closed: inspect outside it \
-                 only when required evidence cannot be obtained inside it, and explain that \
-                 expansion.",
+                "Follow the current user or delegated objective; re-evaluate on new input. \
+                 Never infer authority for a materially different action or add ceremony to \
+                 isolated work. Treat an explicit user- or delegation-supplied scope as closed: \
+                 leave it only when required evidence is unavailable inside; explain the expansion.",
             ),
             RuntimePromptSection::new("runtime.execution", execution),
         ];
@@ -276,9 +275,8 @@ impl RuntimePromptPolicy {
         if can_edit {
             sections.push(RuntimePromptSection::new(
                 "runtime.editing",
-                "Preserve unrelated changes. Modify the owning abstraction with the exposed \
-                 native editing surface, keep the patch scoped, and inspect authoritative state \
-                 before retrying any side effect whose outcome is uncertain.",
+                "Preserve unrelated changes. Use the owning abstraction and native editing tools. \
+                 Keep scope narrow; inspect authoritative state before retrying uncertain side effects.",
             ));
         }
         if self.shell_workspace_write && has("shell") {
@@ -297,10 +295,9 @@ impl RuntimePromptPolicy {
             "Do not declare completion from intent or plausibility. Report the evidence you \
                  could inspect, identify what remains unverified, and state any blocker explicitly."
         } else {
-            "Do not declare completion from intent, a patch, one narrow check, or another \
-                 Agent's claim. Verify the requested behavior and recovery path. Evidence applies \
-                 only to the exact artifact and inputs inspected; if they change, append a Plan \
-                 gate and verify again. State blockers."
+            "Verify behavior and recovery, not intent, patches, narrow checks or peer claims. \
+                 Evidence applies only to the exact artifact and inputs inspected; changed \
+                 inputs need a new Plan gate and verification. State blockers."
         });
         if has("shell") {
             verification.push_str(
@@ -1084,7 +1081,9 @@ mod tests {
         assert!(!text.contains("web_search"));
         assert!(text.contains("unavailable, rate-limited, or transient failure"));
         assert!(text.contains("do not repeat unchanged or widen permissions"));
-        assert!(text.contains("connected `google_search`"));
+        assert!(text.contains("Proactively prefer relevant authorized MCP tools"));
+        assert!(text.contains("`tool_search` and its service catalog"));
+        assert!(text.contains("deferred is not unavailable"));
         assert!(text.contains("available `gh` for GitHub"));
         assert!(text.contains("`rg` for repo search"));
         assert!(text.contains("over `curl`"));
@@ -1211,7 +1210,7 @@ mod tests {
             .join("\n");
         assert!(!read_only_text.contains("backgroundPurpose"));
         assert!(!read_only_text.contains("absent required children"));
-        assert!(!read_only_text.contains("connected `google_search`"));
+        assert!(!read_only_text.contains("Use `tool_search`"));
         assert!(!read_only_text.contains("use `gh` for GitHub"));
 
         let plan_without_reader = policy.sections(["plan_update"], true);

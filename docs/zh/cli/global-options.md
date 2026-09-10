@@ -27,7 +27,7 @@ zuno [OPTIONS] [COMMAND]
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`（最详尽的追踪细节）、`DEBUG`（详细诊断事件）、`INFO`（常规运行事件）、`WARN`（警告与错误）、`ERROR`（仅错误） | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
-| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | 随平台解析 |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 ## 根调用选项

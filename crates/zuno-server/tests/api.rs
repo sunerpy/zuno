@@ -4493,7 +4493,7 @@ async fn api_skill_reports_every_first_party_location_and_description() {
         "agents",
         "workflows",
         "skills",
-        "mcp servers",
+        "mcp server connections",
     ] {
         assert!(
             description.contains(surface),
@@ -4501,6 +4501,7 @@ async fn api_skill_reports_every_first_party_location_and_description() {
         );
     }
     assert!(!description.contains("opencode"));
+    assert!(description.contains("not for ordinary use"));
 }
 
 #[tokio::test]

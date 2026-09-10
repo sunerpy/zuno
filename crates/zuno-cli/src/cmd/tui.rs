@@ -279,9 +279,20 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
     // execution, and that answer has to hold for every later composition of this
     // process exactly as `--sandbox-on-unavailable run-unconfined` would.
     let mut environment = environment.clone();
+    // One physical terminal owns one serialized clipboard worker across session
+    // remounts, so a slow old copy cannot overtake a newer session's copy.
+    let clipboard: Arc<dyn zuno_tui::views::external::Clipboard> =
+        Arc::new(zuno_tui::views::external::SystemClipboard::host());
 
     loop {
-        match execute_once(args, &mut environment, &runtime, request, &mut terminal) {
+        match execute_once(
+            args,
+            &mut environment,
+            &runtime,
+            request,
+            &mut terminal,
+            &clipboard,
+        ) {
             Err(error) => {
                 drop(terminal.take());
                 return match shutdown_tui_background_jobs(&runtime, &environment) {
@@ -454,6 +465,7 @@ fn execute_once(
     runtime: &tokio::runtime::Runtime,
     request: RemountRequest,
     terminal: &mut Option<MountedTerminal>,
+    clipboard: &Arc<dyn zuno_tui::views::external::Clipboard>,
 ) -> Result<TuiRunOutcome, String> {
     let RemountRequest {
         options,
@@ -695,6 +707,7 @@ fn execute_once(
         observer: continuity.child_observer(),
         detached_observer: continuity.detached_observer(),
         supervisor: environment.background_jobs(&reference_root),
+        attachments: host.attachment_store(),
     });
     let work_state = WorkState::new(host.work_state()?);
     let work_observer: Arc<dyn zuno_tools::WorkStateObserver> = Arc::new(TuiWorkObserver {
@@ -752,27 +765,31 @@ fn execute_once(
         lsp_workspace.as_path(),
         terminal_sender.clone(),
     );
-    let mut screen = SessionScreen::new(context.clone(), terminal_sender.clone())
-        .with_prompt_sink(prompt_sender)
-        .with_slash_projection(slash_projection.clone())
-        .with_reference_source(Box::new(reference_source))
-        .with_cancel_sink(cancel_sender)
-        .with_selection_sink(selection_sender)
-        .with_mcp_control(mcp_projection.clone(), mcp_toggle_sender)
-        .with_queued_inputs(queued_inputs.clone(), queue_mutation_sender)
-        .with_session_title(session_title)
-        .with_work_state(work_state.clone())
-        .with_live_sessions(live_sessions)
-        .with_catalog(catalog)
-        .with_diagnostics_source(report_receiver)
-        .with_edit_sink(pending_edits)
-        .with_prompt_history(history.into_entries(), history_sender)
-        .with_external_editor(editor_sender, editor_result_receiver)
-        .with_background_executions(background_executions, background_session)
-        // A clone rather than a borrow: `KeyDispatcher` takes the keymap by value below,
-        // and the keybinding reference has to list what the *user's* keymap resolved
-        // rather than the shipped defaults.
-        .with_keymap(keymap.clone());
+    let mut screen = SessionScreen::new_with_clipboard(
+        context.clone(),
+        terminal_sender.clone(),
+        Arc::clone(clipboard),
+    )
+    .with_prompt_sink(prompt_sender)
+    .with_slash_projection(slash_projection.clone())
+    .with_reference_source(Box::new(reference_source))
+    .with_cancel_sink(cancel_sender)
+    .with_selection_sink(selection_sender)
+    .with_mcp_control(mcp_projection.clone(), mcp_toggle_sender)
+    .with_queued_inputs(queued_inputs.clone(), queue_mutation_sender)
+    .with_session_title(session_title)
+    .with_work_state(work_state.clone())
+    .with_live_sessions(live_sessions)
+    .with_catalog(catalog)
+    .with_diagnostics_source(report_receiver)
+    .with_edit_sink(pending_edits)
+    .with_prompt_history(history.into_entries(), history_sender)
+    .with_external_editor(editor_sender, editor_result_receiver)
+    .with_background_executions(background_executions, background_session)
+    // A clone rather than a borrow: `KeyDispatcher` takes the keymap by value below,
+    // and the keybinding reference has to list what the *user's* keymap resolved
+    // rather than the shipped defaults.
+    .with_keymap(keymap.clone());
     if !show_welcome {
         screen = screen.without_welcome();
     }
@@ -871,7 +888,8 @@ fn execute_once(
     }
     let bridge = PermissionBridge::new(context.clone(), broker, dialogs)
         .with_question(QuestionBridge::new(context, question_broker));
-    let root = KeyDispatcher::new(keymap, scopes(), Box::new(bridge));
+    let root = KeyDispatcher::new(keymap, scopes(), Box::new(bridge))
+        .with_paste_burst(terminal_sender.clone());
 
     // Mouse capture is terminal-scoped rather than session-scoped. Session switching is
     // admitted only inside the same exact directory, so every remount resolves the same
@@ -919,6 +937,7 @@ fn execute_once(
         ));
         let mut turns = tokio::spawn(drive_turns(
             TurnDriver {
+                ready_inputs: VecDeque::new(),
                 host,
                 options: driver_options,
                 approval: driver_approval,
@@ -2239,16 +2258,33 @@ async fn apply_selection(
             .is_some_and(|state| state.mode == zuno_types::execution::CollaborationMode::Plan)
         && agent != "plan"
     {
-        let mut identity = execution_before
+        let identity = execution_before
             .as_ref()
             .and_then(|state| state.work_identity.clone())
             .unwrap_or_else(|| host.execution_identity_for("build"));
-        identity.agent = agent.clone();
-        let detail = match session_control.update_work_identity(
-            host.session_id(),
-            identity,
-            zuno_db::message::now_millis(),
-        ) {
+        let mut candidate = rebuild.options.clone();
+        candidate.session = host.rebuild_session_choice();
+        candidate.agent = Some(agent.clone());
+        candidate.model = Some(format!("{}/{}", identity.provider_id, identity.model_id));
+        candidate.effort = identity
+            .reasoning
+            .as_deref()
+            .and_then(|value| value.parse().ok());
+        let validated = match TurnPlan::resolve(&candidate, rebuild.environment).await {
+            Ok(plan) => super::tool_runtime::execution_preflight(
+                plan.directory(),
+                plan.config(),
+                plan.agent_profile(),
+            )
+            .map(|()| plan.execution_identity()),
+            Err(error) => Err(error),
+        };
+        let saved = validated.and_then(|identity| {
+            session_control
+                .update_work_identity(host.session_id(), identity, zuno_db::message::now_millis())
+                .map_err(|error| error.to_string())
+        });
+        let detail = match saved {
             Ok(_) => format!("Work Agent `{agent}` selected; Plan mode remains active"),
             Err(error) => format!("warning: Work Agent selection was not saved: {error}"),
         };
@@ -2268,6 +2304,9 @@ async fn apply_selection(
         _ => None,
     };
     let mut mode_agent_transition = false;
+    let enter_plan = matches!(&selection, zuno_tui::views::session::Selection::StartPlan);
+    let start_work = matches!(&selection, zuno_tui::views::session::Selection::StartWork);
+    let mut work_anchor = None;
     let previous_model = host.persisted_model_reference();
     let mut next = rebuild.options.clone();
     next.session = host.rebuild_session_choice();
@@ -2286,80 +2325,37 @@ async fn apply_selection(
         zuno_tui::views::session::Selection::Model(model) => next.model = Some(model),
         zuno_tui::views::session::Selection::Agent(agent) => next.agent = Some(agent),
         zuno_tui::views::session::Selection::StartPlan => {
-            if let Err(error) = host.materialize_session() {
-                return SelectionOutcome::Shutdown(format!(
-                    "Plan mode could not materialize the session: {error}"
-                ));
-            }
-            let work_identity = execution_before
+            next.agent = Some("plan".to_owned());
+            mode_agent_transition = true;
+        }
+        zuno_tui::views::session::Selection::StartWork => {
+            let Some(identity) = execution_before
                 .as_ref()
-                .and_then(|state| state.work_identity.clone())
-                .unwrap_or_else(|| host.execution_identity_for(host.agent_name()));
-            if let Err(error) = session_control.enter_plan(zuno_session_control::EnterPlanRequest {
-                session_id: host.session_id(),
-                work_identity,
-                at_ms: zuno_db::message::now_millis(),
-            }) {
+                .and_then(|state| state.work_identity.as_ref())
+            else {
                 let _reported = rebuild
                     .events
                     .publish(TurnEvent::Provider {
                         step: 0,
                         event: StreamEvent::StatusDetail {
-                            detail: format!("warning: Plan mode was not entered: {error}"),
+                            detail: "warning: Start Work requires a saved Plan-mode Work identity"
+                                .to_owned(),
                         },
                     })
                     .await;
                 return SelectionOutcome::Unchanged;
-            }
-            next.agent = Some("plan".to_owned());
-            mode_agent_transition = true;
-        }
-        zuno_tui::views::session::Selection::StartWork => {
-            if let Err(error) = host.materialize_session() {
-                return SelectionOutcome::Shutdown(format!(
-                    "Start Work could not materialize the session: {error}"
-                ));
-            }
-            let outcome = match session_control.start_work(zuno_session_control::StartWorkRequest {
-                session_id: host.session_id(),
-                expected_plan_revision: None,
-                anchor_message_id: match host.latest_user_anchor_id() {
-                    Ok(anchor) => anchor,
-                    Err(error) => {
-                        return SelectionOutcome::Shutdown(format!(
-                            "Start Work could not read its user anchor: {error}"
-                        ));
-                    }
-                },
-                draft_review_risk_reason: None,
-                session_busy: false,
-                at_ms: zuno_db::message::now_millis(),
-            }) {
-                Ok(outcome) => outcome,
+            };
+            work_anchor = match host.latest_user_anchor_id() {
+                Ok(anchor) => anchor,
                 Err(error) => {
-                    let _reported = rebuild
-                        .events
-                        .publish(TurnEvent::Provider {
-                            step: 0,
-                            event: StreamEvent::StatusDetail {
-                                detail: format!("warning: Start Work was refused: {error}"),
-                            },
-                        })
-                        .await;
-                    return SelectionOutcome::Unchanged;
+                    return SelectionOutcome::Shutdown(format!(
+                        "Start Work could not read its user anchor: {error}"
+                    ));
                 }
             };
-            let continuation = outcome
-                .state
-                .continuation
-                .expect("Start Work always persists a continuation");
-            next.agent = Some(continuation.identity.agent);
-            next.model = Some(format!(
-                "{}/{}",
-                continuation.identity.provider_id, continuation.identity.model_id
-            ));
-            next.effort = continuation
-                .identity
+            next.agent = Some(identity.agent.clone());
+            next.model = Some(format!("{}/{}", identity.provider_id, identity.model_id));
+            next.effort = identity
                 .reasoning
                 .as_deref()
                 .and_then(|reasoning| reasoning.parse().ok());
@@ -2735,6 +2731,79 @@ async fn apply_selection(
     // switch keeps its host and says why. `replace_host_unless_refused` owns the
     // ordering, because the refusal has to arrive before the current host is stopped.
     let decision = sandbox_decision(&plan, false);
+    let preflight = match &decision {
+        SandboxUnavailableDecision::Refuse { message } => Err(message.clone()),
+        _ => super::tool_runtime::execution_preflight(
+            plan.directory(),
+            plan.config(),
+            plan.agent_profile(),
+        ),
+    };
+    if let Err(message) = preflight {
+        let _reported = rebuild
+            .events
+            .publish(TurnEvent::Provider {
+                step: 0,
+                event: StreamEvent::StatusDetail {
+                    detail: format!("warning: keeping the current turn host: {message}"),
+                },
+            })
+            .await;
+        return SelectionOutcome::Unchanged;
+    }
+    // Target resolution and complete execution preflight have succeeded. Only now
+    // may Plan/Work change durable state or admit a continuation control.
+    if mode_agent_transition {
+        if let Err(error) = host.materialize_session() {
+            return SelectionOutcome::Shutdown(format!(
+                "the collaboration switch could not materialize the session: {error}"
+            ));
+        }
+        let changed = if enter_plan {
+            session_control
+                .enter_plan(zuno_session_control::EnterPlanRequest {
+                    session_id: host.session_id(),
+                    work_identity: execution_before
+                        .as_ref()
+                        .and_then(|state| state.work_identity.clone())
+                        .unwrap_or_else(|| host.execution_identity_for(host.agent_name())),
+                    at_ms: zuno_db::message::now_millis(),
+                })
+                .map(|_| ())
+        } else if start_work {
+            session_control
+                .start_work(zuno_session_control::StartWorkRequest {
+                    session_id: host.session_id(),
+                    expected_execution_revision: execution_before
+                        .as_ref()
+                        .map(|state| state.revision),
+                    expected_plan_revision: execution_before.as_ref().and_then(|state| {
+                        state
+                            .handoff_plan_revision
+                            .or(state.authorized_plan_revision)
+                    }),
+                    anchor_message_id: work_anchor,
+                    draft_review_risk_reason: None,
+                    session_busy: false,
+                    at_ms: zuno_db::message::now_millis(),
+                })
+                .map(|_| ())
+        } else {
+            unreachable!("mode transition is Plan or Work");
+        };
+        if let Err(error) = changed {
+            let _reported = rebuild
+                .events
+                .publish(TurnEvent::Provider {
+                    step: 0,
+                    event: StreamEvent::StatusDetail {
+                        detail: format!("warning: collaboration switch was refused: {error}"),
+                    },
+                })
+                .await;
+            return SelectionOutcome::Unchanged;
+        }
+    }
     let continuity = rebuild.continuity.clone();
     match replace_host_unless_refused(host, decision, || async move {
         continuity
@@ -2818,7 +2887,13 @@ async fn remount_preflight(next: &TurnOptions, rebuild: &TurnRebuild<'_>) -> Res
     match sandbox_decision(&plan, false) {
         SandboxUnavailableDecision::Refuse { message } => Err(message),
         SandboxUnavailableDecision::Proceed
-        | SandboxUnavailableDecision::OfferNativeExecution { .. } => Ok(()),
+        | SandboxUnavailableDecision::OfferNativeExecution { .. } => {
+            super::tool_runtime::execution_preflight(
+                plan.directory(),
+                plan.config(),
+                plan.agent_profile(),
+            )
+        }
     }
 }
 
@@ -2840,6 +2915,7 @@ async fn report_memory_action(
 }
 
 struct TurnDriver {
+    ready_inputs: VecDeque<DriverPrompt>,
     host: TurnHost,
     options: TurnOptions,
     approval: Arc<dyn PermissionAsker>,
@@ -2898,6 +2974,7 @@ impl SnapshotHistory {
 struct DriverPrompt {
     submission: PromptSubmission,
     promoted_message_id: Option<String>,
+    reserved_guard: Option<zuno_engine::status::SessionRunGuard>,
 }
 
 impl DriverPrompt {
@@ -2905,6 +2982,7 @@ impl DriverPrompt {
         Self {
             submission,
             promoted_message_id: None,
+            reserved_guard: None,
         }
     }
 
@@ -2912,6 +2990,19 @@ impl DriverPrompt {
         Self {
             submission,
             promoted_message_id: Some(input_id),
+            reserved_guard: None,
+        }
+    }
+
+    fn reserved(
+        input_id: String,
+        submission: PromptSubmission,
+        guard: zuno_engine::status::SessionRunGuard,
+    ) -> Self {
+        Self {
+            submission,
+            promoted_message_id: Some(input_id),
+            reserved_guard: Some(guard),
         }
     }
 }
@@ -2928,25 +3019,38 @@ enum PersistedTuiInput {
 fn dispatch_child_prompt(
     children: &InteractiveChildInput,
     session_id: &str,
-    prompt: PromptEnvelope,
+    mut prompt: PromptEnvelope,
+    receipts: &QueuedInputProjection,
+    wake: &mpsc::Sender<TerminalEvent>,
 ) -> Result<(), String> {
-    let text = match &prompt.payload {
-        PromptSubmission::Text(text) | PromptSubmission::Content { text, .. } => text.clone(),
-        _ => {
-            return Err("an attached child session accepts text and image input only".to_owned());
-        }
-    };
-    let delivery = match prompt.delivery {
-        PromptDelivery::Steer => zuno_db::inbox::InputDelivery::Steer,
-        PromptDelivery::Direct | PromptDelivery::Queue => zuno_db::inbox::InputDelivery::Queue,
-    };
-    let persisted = serde_json::to_value(PersistedTuiInput::TuiPrompt {
-        submission: prompt.payload,
-        origin: prompt.origin,
-    })
-    .map_err(to_string)?;
-    children.submit_text(session_id, persisted, text, delivery)?;
-    Ok(())
+    let request_id = prompt.request_id.clone();
+    let result = (|| {
+        admit_submission_images(children.attachment_store(), &mut prompt.payload)?;
+        let content = steering_content(zuno_db::inbox::InputDelivery::Steer, &prompt.payload)
+            .ok_or("an attached child session accepts text and image input only")?;
+        let delivery = match prompt.delivery {
+            PromptDelivery::Steer => zuno_db::inbox::InputDelivery::Steer,
+            PromptDelivery::Direct | PromptDelivery::Queue => zuno_db::inbox::InputDelivery::Queue,
+        };
+        let persisted = serde_json::to_value(PersistedTuiInput::TuiPrompt {
+            submission: prompt.payload,
+            origin: prompt.origin,
+        })
+        .map_err(to_string)?;
+        children.submit_input(
+            session_id,
+            persisted,
+            content,
+            delivery,
+            prompt.expected_turn_id.as_deref(),
+        )?;
+        Ok(())
+    })();
+    if let Some(request_id) = request_id {
+        receipts.acknowledge_prompt(request_id, result.as_ref().err().cloned());
+        let _nudged = wake.try_send(TerminalEvent::Wake);
+    }
+    result
 }
 
 fn report_child_prompt_failure(
@@ -2957,10 +3061,11 @@ fn report_child_prompt_failure(
     if let Some(observer) = observer {
         observer.event(
             session_id,
-            &TurnEvent::TurnFailed {
-                assistant_message_id: None,
-                steps: 0,
-                message: format!("input was not admitted: {message}"),
+            &TurnEvent::Notice {
+                audience: zuno_engine::r#loop::NoticeAudience::User,
+                severity: zuno_engine::r#loop::NoticeSeverity::Warning,
+                code: "input_not_admitted".to_owned(),
+                detail: format!("input was not admitted: {message}"),
             },
         );
     }
@@ -2971,11 +3076,15 @@ fn route_targeted_prompt(
     observer: Option<Arc<dyn ChildTurnObserver>>,
     prompt: TargetedPromptSubmission,
     root: &mut VecDeque<PromptEnvelope>,
+    receipts: &QueuedInputProjection,
+    wake: &mpsc::Sender<TerminalEvent>,
 ) {
     match prompt.target {
         PromptTarget::Root => root.push_back(prompt.prompt),
         PromptTarget::Session(session_id) => {
-            if let Err(error) = dispatch_child_prompt(children, &session_id, prompt.prompt) {
+            if let Err(error) =
+                dispatch_child_prompt(children, &session_id, prompt.prompt, receipts, wake)
+            {
                 report_child_prompt_failure(observer, &session_id, error);
             }
         }
@@ -3002,7 +3111,7 @@ fn project_queued_inputs(
                 zuno_db::inbox::InputDelivery::Steer => QueuedInputDelivery::Steer,
             },
             revision: input.revision,
-            editable,
+            editable: editable && input.delivery == zuno_db::inbox::InputDelivery::Queue,
         });
     }
     Ok(projected)
@@ -3072,6 +3181,29 @@ fn refresh_queued_input_projection(
     let _nudged = wake.try_send(TerminalEvent::Wake);
 }
 
+/// A queue text edit does not discard the durable image objects already admitted
+/// with it. Project references are resolved afresh from the edited text.
+fn queue_edit_submission(previous: PromptSubmission, text: String) -> PromptSubmission {
+    let PromptSubmission::Content { content, .. } = previous else {
+        return PromptSubmission::Text(text);
+    };
+    let images = content
+        .into_iter()
+        .filter(|block| {
+            matches!(
+                block,
+                zuno_llm::event::RequestContentBlock::ImageAttachment { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    if images.is_empty() {
+        return PromptSubmission::Text(text);
+    }
+    let mut content = vec![zuno_llm::event::RequestContentBlock::Text { text: text.clone() }];
+    content.extend(images);
+    PromptSubmission::Content { text, content }
+}
+
 async fn apply_queued_input_mutation(
     inbox: zuno_db::inbox::SessionInbox,
     control: zuno_engine::status::SessionControl,
@@ -3080,8 +3212,64 @@ async fn apply_queued_input_mutation(
     projection: QueuedInputProjection,
     wake: mpsc::Sender<TerminalEvent>,
     mutation: QueuedInputMutation,
-) {
+) -> Option<DriverPrompt> {
+    let mut ready = None;
     let (input_id, outcome) = match mutation {
+        QueuedInputMutation::SendNow {
+            id,
+            expected_revision,
+            expected_turn_id,
+            request_id,
+        } => {
+            let outcome = (|| -> Result<QueuedInputNoticeKind, String> {
+                let current = inbox
+                    .get(&session_id, &id)
+                    .map_err(to_string)?
+                    .ok_or_else(|| "queued input no longer exists".to_owned())?;
+                let PersistedTuiInput::TuiPrompt { submission, .. } =
+                    serde_json::from_value(current.prompt).map_err(to_string)?;
+                let content = steering_content(zuno_db::inbox::InputDelivery::Steer, &submission)
+                    .ok_or_else(|| {
+                    "this command requires its own turn and cannot be steered".to_owned()
+                })?;
+                use zuno_engine::admission::{QueuedSendAdmission, QueuedSendRequest};
+                match control
+                    .send_queued(
+                        inbox.clone(),
+                        QueuedSendRequest {
+                            session_id: session_id.clone(),
+                            input_id: id.clone(),
+                            expected_revision,
+                            expected_turn_id,
+                            request_id,
+                        },
+                        content,
+                    )
+                    .map_err(to_string)?
+                {
+                    QueuedSendAdmission::Drive { input, guard } => {
+                        ready = Some(DriverPrompt::reserved(input.id, submission, guard));
+                        Ok(QueuedInputNoticeKind::Promoted)
+                    }
+                    QueuedSendAdmission::Steered(_) => {
+                        Ok(QueuedInputNoticeKind::Admitted(QueuedInputDelivery::Steer))
+                    }
+                    QueuedSendAdmission::AlreadyAccepted(input) => Ok(match input.state {
+                        zuno_db::inbox::SubmissionState::Consumed => {
+                            QueuedInputNoticeKind::Consumed
+                        }
+                        zuno_db::inbox::SubmissionState::Cancelled => {
+                            QueuedInputNoticeKind::Cancelled
+                        }
+                        zuno_db::inbox::SubmissionState::Promoted => {
+                            QueuedInputNoticeKind::Promoted
+                        }
+                        _ => QueuedInputNoticeKind::Admitted(QueuedInputDelivery::Steer),
+                    }),
+                }
+            })();
+            (id, outcome)
+        }
         QueuedInputMutation::Edit {
             id,
             expected_revision,
@@ -3092,12 +3280,16 @@ async fn apply_queued_input_mutation(
                     .get(&session_id, &id)
                     .map_err(to_string)?
                     .ok_or_else(|| format!("queued input `{id}` no longer exists"))?;
-                let delivery = current.delivery;
-                let PersistedTuiInput::TuiPrompt { origin, .. } =
+                if current.delivery == zuno_db::inbox::InputDelivery::Steer {
+                    return Err(
+                        "input is already admitted to a turn; cancel it before consumption to replace it".to_owned()
+                    );
+                }
+                let PersistedTuiInput::TuiPrompt { origin, submission: previous } =
                     serde_json::from_value(current.prompt).map_err(to_string)?;
                 let submission = super::tui_reference::resolve_submission(
                     &reference_root,
-                    PromptSubmission::Text(text),
+                    queue_edit_submission(previous, text),
                 )
                 .await?;
                 inbox
@@ -3113,12 +3305,6 @@ async fn apply_queued_input_mutation(
                         zuno_db::message::now_millis(),
                     )
                     .map_err(to_string)?;
-                if delivery == zuno_db::inbox::InputDelivery::Steer {
-                    let _removed = control.cancel_soft_interrupt(&id);
-                    if let Some(steering) = steering_content(delivery, &submission) {
-                        let _queued = control.queue_soft_interrupt(steering.into_message(&id));
-                    }
-                }
                 Ok(QueuedInputNoticeKind::Edited)
             }
             .await;
@@ -3157,6 +3343,7 @@ async fn apply_queued_input_mutation(
         &wake,
         Some(QueuedInputNotice { input_id, kind }),
     );
+    ready
 }
 
 async fn drive_turns(
@@ -3181,21 +3368,25 @@ async fn drive_turns(
                 driver.continuity.child_observer(),
                 prompt,
                 &mut root_prompts,
+                &driver.queued_inputs,
+                &driver.queue_wake,
             );
         }
         loop {
             match queue_mutations.try_recv() {
                 Ok(mutation) => {
-                    apply_queued_input_mutation(
-                        driver.host.session_inbox(),
-                        driver.host.control(),
-                        driver.host.session_id().to_owned(),
-                        driver.reference_root.clone(),
-                        driver.queued_inputs.clone(),
-                        driver.queue_wake.clone(),
-                        mutation,
-                    )
-                    .await;
+                    driver.ready_inputs.extend(
+                        apply_queued_input_mutation(
+                            driver.host.session_inbox(),
+                            driver.host.control(),
+                            driver.host.session_id().to_owned(),
+                            driver.reference_root.clone(),
+                            driver.queued_inputs.clone(),
+                            driver.queue_wake.clone(),
+                            mutation,
+                        )
+                        .await,
+                    );
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -3204,48 +3395,53 @@ async fn drive_turns(
                 }
             }
         }
-        let queued = if root_prompts.is_empty() && selections.is_empty() {
-            zuno_goal::QueuedUserInput::Absent
+        let queued =
+            if root_prompts.is_empty() && selections.is_empty() && driver.ready_inputs.is_empty() {
+                zuno_goal::QueuedUserInput::Absent
+            } else {
+                zuno_goal::QueuedUserInput::Present
+            };
+        if driver.ready_inputs.is_empty() {
+            match driver.host.drive_pending_start_work(events.clone()).await {
+                Ok(true) => {
+                    refresh_work_state(
+                        &mut driver.host,
+                        &driver.work_state,
+                        &driver.work_wake,
+                        &events,
+                    )
+                    .await;
+                    work_changes.borrow_and_update();
+                    continue;
+                }
+                Ok(false) => {}
+                Err(message) => report_turn_failure(&events, message).await,
+            }
+            match driver
+                .host
+                .continue_goal_if_idle(queued, events.clone())
+                .await
+            {
+                Ok(true) => {
+                    refresh_work_state(
+                        &mut driver.host,
+                        &driver.work_state,
+                        &driver.work_wake,
+                        &events,
+                    )
+                    .await;
+                    work_changes.borrow_and_update();
+                    continue;
+                }
+                Ok(false) => {}
+                Err(message) => {
+                    report_turn_failure(&events, message).await;
+                }
+            }
+        }
+        let pending = if let Some(ready) = driver.ready_inputs.pop_front() {
+            Some(ready)
         } else {
-            zuno_goal::QueuedUserInput::Present
-        };
-        match driver.host.drive_pending_start_work(events.clone()).await {
-            Ok(true) => {
-                refresh_work_state(
-                    &mut driver.host,
-                    &driver.work_state,
-                    &driver.work_wake,
-                    &events,
-                )
-                .await;
-                work_changes.borrow_and_update();
-                continue;
-            }
-            Ok(false) => {}
-            Err(message) => report_turn_failure(&events, message).await,
-        }
-        match driver
-            .host
-            .continue_goal_if_idle(queued, events.clone())
-            .await
-        {
-            Ok(true) => {
-                refresh_work_state(
-                    &mut driver.host,
-                    &driver.work_state,
-                    &driver.work_wake,
-                    &events,
-                )
-                .await;
-                work_changes.borrow_and_update();
-                continue;
-            }
-            Ok(false) => {}
-            Err(message) => {
-                report_turn_failure(&events, message).await;
-            }
-        }
-        let pending =
             match promote_pending_prompt(&driver.host, &driver.queued_inputs, &driver.queue_wake) {
                 Ok(pending) => pending,
                 Err(message) => {
@@ -3258,7 +3454,8 @@ async fn drive_turns(
                         )),
                     };
                 }
-            };
+            }
+        };
         // A selection is taken only between turns, never during one: rebuilding the host
         // mid-turn would drop the stream the loop is still reading.
         let prompt = match pending {
@@ -3318,6 +3515,8 @@ async fn drive_turns(
                             &driver.interactive_children,
                             &session_id,
                             prompt,
+                            &driver.queued_inputs,
+                            &driver.queue_wake,
                         ) {
                             report_child_prompt_failure(
                                 driver.continuity.child_observer(),
@@ -3331,7 +3530,7 @@ async fn drive_turns(
                 },
                 mutation = queue_mutations.recv(), if queue_mutations_open => {
                     match mutation {
-                        Some(mutation) => apply_queued_input_mutation(
+                        Some(mutation) => driver.ready_inputs.extend(apply_queued_input_mutation(
                             driver.host.session_inbox(),
                             driver.host.control(),
                             driver.host.session_id().to_owned(),
@@ -3339,7 +3538,7 @@ async fn drive_turns(
                             driver.queued_inputs.clone(),
                             driver.queue_wake.clone(),
                             mutation,
-                        ).await,
+                        ).await),
                         None => queue_mutations_open = false,
                     }
                     continue;
@@ -3789,6 +3988,7 @@ async fn drive_one(
         queued_inputs,
         queue_wake,
         snapshots,
+        ready_inputs,
         ..
     } = driver;
     {
@@ -3800,6 +4000,7 @@ async fn drive_one(
             let DriverPrompt {
                 submission,
                 promoted_message_id,
+                reserved_guard,
             } = prompt;
             let prompt =
                 super::tui_reference::resolve_submission(reference_root, submission).await?;
@@ -3835,6 +4036,7 @@ async fn drive_one(
                 host,
                 prompt,
                 promoted_message_id.as_deref(),
+                reserved_guard.as_ref(),
                 events.clone(),
             ));
             let turn_outcome = loop {
@@ -3848,7 +4050,7 @@ async fn drive_one(
                     }
                     mutation = queue_mutations.recv(), if *queue_mutations_open => {
                         match mutation {
-                            Some(mutation) => apply_queued_input_mutation(
+                            Some(mutation) => ready_inputs.extend(apply_queued_input_mutation(
                                 inbox.clone(),
                                 control.clone(),
                                 control.session_id().to_owned(),
@@ -3856,7 +4058,7 @@ async fn drive_one(
                                 queued_inputs.clone(),
                                 queue_wake.clone(),
                                 mutation,
-                            ).await,
+                            ).await),
                             None => *queue_mutations_open = false,
                         }
                     }
@@ -3882,6 +4084,8 @@ async fn drive_one(
                                     &interactive_children,
                                     &session_id,
                                     prompt,
+                                    queued_inputs,
+                                    queue_wake,
                                 ) {
                                     report_child_prompt_failure(
                                         child_observer.as_ref().map(Arc::clone),
@@ -3933,6 +4137,8 @@ async fn drive_one(
                             &interactive_children,
                             &session_id,
                             followup.prompt,
+                            queued_inputs,
+                            queue_wake,
                         ) {
                             report_child_prompt_failure(
                                 child_observer.as_ref().map(Arc::clone),
@@ -3949,16 +4155,18 @@ async fn drive_one(
                 }
             }
             while let Ok(mutation) = queue_mutations.try_recv() {
-                apply_queued_input_mutation(
-                    inbox.clone(),
-                    control.clone(),
-                    control.session_id().to_owned(),
-                    admission_root.clone(),
-                    queued_inputs.clone(),
-                    queue_wake.clone(),
-                    mutation,
-                )
-                .await;
+                ready_inputs.extend(
+                    apply_queued_input_mutation(
+                        inbox.clone(),
+                        control.clone(),
+                        control.session_id().to_owned(),
+                        admission_root.clone(),
+                        queued_inputs.clone(),
+                        queue_wake.clone(),
+                        mutation,
+                    )
+                    .await,
+                );
             }
             refresh_queued_input_projection(
                 &inbox,
@@ -4006,67 +4214,83 @@ async fn drive_submission(
     host: &mut TurnHost,
     prompt: PromptSubmission,
     promoted_message_id: Option<&str>,
+    reserved_guard: Option<&zuno_engine::status::SessionRunGuard>,
     events: TurnEventSender,
 ) -> Result<(), String> {
-    let result = match (prompt, promoted_message_id) {
-        (PromptSubmission::Text(prompt), None) => host.drive(&prompt, events).await,
-        (PromptSubmission::Text(prompt), Some(message_id)) => {
-            host.drive_promoted(&prompt, message_id, events).await
+    let result = if let Some(guard) = reserved_guard {
+        let message_id = promoted_message_id.ok_or("reserved input has no durable id")?;
+        match prompt {
+            PromptSubmission::Text(text) => {
+                host.drive_promoted_with_guard(&text, message_id, guard, events)
+                    .await
+            }
+            PromptSubmission::Content { text, content } => {
+                host.drive_promoted_content_with_guard(&text, &content, message_id, guard, events)
+                    .await
+            }
+            _ => Err("only text and image input can be sent from the queue immediately".to_owned()),
         }
-        (PromptSubmission::Content { text, content }, None) => {
-            host.drive_content(&text, &content, events).await
-        }
-        (PromptSubmission::Content { text, content }, Some(message_id)) => {
-            host.drive_promoted_content(&text, &content, message_id, events)
-                .await
-        }
-        (PromptSubmission::Command { name, arguments }, None) => {
-            host.drive_command(&name, &arguments, events).await
-        }
-        (PromptSubmission::Command { name, arguments }, Some(message_id)) => {
-            host.drive_promoted_command(&name, &arguments, message_id, events)
-                .await
-        }
-        (
-            PromptSubmission::Skill {
-                name,
-                source,
-                arguments,
-            },
-            None,
-        ) => host.drive_skill(&name, &source, &arguments, events).await,
-        (
-            PromptSubmission::Skill {
-                name,
-                source,
-                arguments,
-            },
-            Some(message_id),
-        ) => {
-            host.drive_promoted_skill(&name, &source, &arguments, message_id, events)
-                .await
-        }
-        (
-            PromptSubmission::Council {
-                text,
-                preset,
-                question,
-            },
-            None,
-        ) => host.drive_council(&text, &preset, &question, events).await,
-        (
-            PromptSubmission::Council {
-                text,
-                preset,
-                question,
-            },
-            Some(message_id),
-        ) => {
-            host.drive_promoted_council(&text, &preset, &question, message_id, events)
-                .await
-        }
-        (PromptSubmission::Host(_), _) => {
-            unreachable!("host submissions are handled before a turn is started")
+    } else {
+        match (prompt, promoted_message_id) {
+            (PromptSubmission::Text(prompt), None) => host.drive(&prompt, events).await,
+            (PromptSubmission::Text(prompt), Some(message_id)) => {
+                host.drive_promoted(&prompt, message_id, events).await
+            }
+            (PromptSubmission::Content { text, content }, None) => {
+                host.drive_content(&text, &content, events).await
+            }
+            (PromptSubmission::Content { text, content }, Some(message_id)) => {
+                host.drive_promoted_content(&text, &content, message_id, events)
+                    .await
+            }
+            (PromptSubmission::Command { name, arguments }, None) => {
+                host.drive_command(&name, &arguments, events).await
+            }
+            (PromptSubmission::Command { name, arguments }, Some(message_id)) => {
+                host.drive_promoted_command(&name, &arguments, message_id, events)
+                    .await
+            }
+            (
+                PromptSubmission::Skill {
+                    name,
+                    source,
+                    arguments,
+                },
+                None,
+            ) => host.drive_skill(&name, &source, &arguments, events).await,
+            (
+                PromptSubmission::Skill {
+                    name,
+                    source,
+                    arguments,
+                },
+                Some(message_id),
+            ) => {
+                host.drive_promoted_skill(&name, &source, &arguments, message_id, events)
+                    .await
+            }
+            (
+                PromptSubmission::Council {
+                    text,
+                    preset,
+                    question,
+                },
+                None,
+            ) => host.drive_council(&text, &preset, &question, events).await,
+            (
+                PromptSubmission::Council {
+                    text,
+                    preset,
+                    question,
+                },
+                Some(message_id),
+            ) => {
+                host.drive_promoted_council(&text, &preset, &question, message_id, events)
+                    .await
+            }
+            (PromptSubmission::Host(_), _) => {
+                unreachable!("host submissions are handled before a turn is started")
+            }
         }
     };
     if let (Err(error), Some(message_id)) = (&result, promoted_message_id) {
@@ -4148,29 +4372,69 @@ async fn admit_followup(
     queue_wake: mpsc::Sender<TerminalEvent>,
     prompt: PromptEnvelope,
 ) -> Result<(), String> {
+    let request_id = prompt.request_id.clone();
+    let result = admit_followup_inner(
+        admission,
+        control,
+        reference_root,
+        attachments,
+        queued_inputs.clone(),
+        queue_wake.clone(),
+        prompt,
+    )
+    .await;
+    if let Some(request_id) = request_id {
+        queued_inputs.acknowledge_prompt(request_id, result.as_ref().err().cloned());
+        let _nudged = queue_wake.try_send(TerminalEvent::Wake);
+    }
+    result
+}
+
+async fn admit_followup_inner(
+    admission: zuno_engine::admission::SessionInputAdmission,
+    control: zuno_engine::status::SessionControl,
+    reference_root: PathBuf,
+    attachments: Option<Arc<zuno_attachment::AttachmentStore>>,
+    queued_inputs: QueuedInputProjection,
+    queue_wake: mpsc::Sender<TerminalEvent>,
+    prompt: PromptEnvelope,
+) -> Result<(), String> {
     let origin = prompt.origin;
     let delivery = followup_delivery(&prompt);
+    let expected_turn_id = prompt.expected_turn_id.clone();
     let mut prompt =
         super::tui_reference::resolve_submission(&reference_root, prompt.payload).await?;
     admit_submission_images(attachments.as_deref(), &mut prompt)?;
-    let admitted = admission
-        .admit(
-            zuno_db::inbox::NewSessionInput::new(
-                format!("msg_{}", uuid::Uuid::new_v4().simple()),
-                control.session_id(),
-                serde_json::to_value(PersistedTuiInput::TuiPrompt {
-                    submission: prompt.clone(),
-                    origin,
-                })
+    let input = zuno_db::inbox::NewSessionInput::new(
+        format!("msg_{}", uuid::Uuid::new_v4().simple()),
+        control.session_id(),
+        serde_json::to_value(PersistedTuiInput::TuiPrompt {
+            submission: prompt.clone(),
+            origin,
+        })
+        .map_err(to_string)?,
+        delivery,
+        zuno_db::message::now_millis(),
+    );
+    let (input, steered) = if delivery == zuno_db::inbox::InputDelivery::Steer {
+        let expected = expected_turn_id.ok_or_else(|| {
+            "current-turn steering requires a turn id; input was not sent".to_owned()
+        })?;
+        let content = steering_content(delivery, &prompt)
+            .ok_or_else(|| "input is not steerable".to_owned())?;
+        (
+            admission
+                .admit_steer(input, &expected, content)
                 .map_err(to_string)?,
-                delivery,
-                zuno_db::message::now_millis(),
-            ),
-            zuno_engine::admission::TurnLease::Deferred,
-            steering_content(delivery, &prompt),
+            true,
         )
-        .map_err(to_string)?;
-    let input_id = admitted.input().id.clone();
+    } else {
+        let admitted = admission
+            .admit(input, zuno_engine::admission::TurnLease::Deferred, None)
+            .map_err(to_string)?;
+        (admitted.input().clone(), admitted.steered())
+    };
+    let input_id = input.id.clone();
     refresh_queued_input_projection(
         admission.inbox(),
         control.session_id(),
@@ -4184,7 +4448,7 @@ async fn admit_followup(
             }),
         }),
     );
-    if admitted.steered() {
+    if steered {
         tracing::debug!(
             target: "zuno::tui::steering",
             session_id = %control.session_id(),
@@ -4333,6 +4597,7 @@ fn steer_pending_session_messages(
             .to_owned();
         if control
             .queue_soft_interrupt(SoftInterruptMessage {
+                revision: None,
                 input_id: Some(input.id.clone()),
                 content: text,
                 images: Vec::new(),
@@ -4351,12 +4616,11 @@ fn steer_pending_session_messages(
 
 async fn report_input_failure(events: &TurnEventSender, message: String) {
     let _reported = events
-        .publish(TurnEvent::Provider {
-            step: 0,
-            event: StreamEvent::Error {
-                message: format!("input was not admitted: {message}"),
-                retry_after: None,
-            },
+        .publish(TurnEvent::Notice {
+            audience: zuno_engine::r#loop::NoticeAudience::User,
+            severity: zuno_engine::r#loop::NoticeSeverity::Warning,
+            code: "input_not_admitted".to_owned(),
+            detail: format!("input was not admitted: {message}"),
         })
         .await;
 }
@@ -5234,6 +5498,9 @@ mod tests {
         let guard = registry
             .begin_turn("ses_tui_steer")
             .expect("fixture owns the live turn");
+        let _turn = guard
+            .mark_turn_started("turn-live")
+            .expect("identify the live turn");
         let reference_root = tempfile::tempdir().expect("reference root");
         let projection = QueuedInputProjection::default();
         let (wake, _wake_source) = zuno_tui::app::terminal_event_channel();
@@ -5249,7 +5516,8 @@ mod tests {
                 PromptSubmission::Text("change direction now".to_owned()),
                 PromptDelivery::Steer,
                 PromptOrigin::TuiForceSubmit,
-            ),
+            )
+            .with_expected_turn(Some("turn-live".to_owned())),
         )
         .await
         .expect("admit follow-up");
@@ -5288,7 +5556,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tui_steer_that_loses_the_active_turn_race_remains_pending() {
+    async fn tui_steer_that_loses_the_active_turn_race_is_not_retargeted() {
         let pool = Arc::new(
             zuno_db::pool::Pool::open(&zuno_paths::DbLocation::Memory)
                 .expect("open shared in-memory inbox"),
@@ -5315,7 +5583,7 @@ mod tests {
         let projection = QueuedInputProjection::default();
         let (wake, _wake_source) = zuno_tui::app::terminal_event_channel();
 
-        admit_followup(
+        let refused = admit_followup(
             zuno_engine::admission::SessionInputAdmission::new(inbox.clone(), registry.clone()),
             registry.control("ses_tui_steer_race"),
             reference_root.path().to_path_buf(),
@@ -5326,40 +5594,31 @@ mod tests {
                 PromptSubmission::Text("arrived after completion".to_owned()),
                 PromptDelivery::Steer,
                 PromptOrigin::TuiForceSubmit,
-            ),
+            )
+            .with_expected_turn(Some("turn-already-finished".to_owned())),
         )
         .await
-        .expect("durable admission survives an idle target");
+        .expect_err("a stale target does not admit input for a later turn");
+        assert!(refused.contains("no active turn"), "{refused}");
 
         let pending = inbox
             .pending("ses_tui_steer_race")
             .expect("read durable inbox");
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].delivery, zuno_db::inbox::InputDelivery::Steer);
+        assert!(
+            pending.is_empty(),
+            "the rejected draft belongs to the TUI, not a later turn"
+        );
         assert_eq!(
             registry.status("ses_tui_steer_race"),
             zuno_engine::status::SessionStatus::Idle,
             "steering an already-finished turn must not manufacture a live turn"
         );
-        let promoted = inbox
-            .promote_next("ses_tui_steer_race", None)
-            .expect("next turn promotes the preserved input")
-            .expect("the preserved input remains available");
-        assert_eq!(promoted.id, pending[0].id);
-        assert_eq!(
-            inbox
-                .mark_consumed("ses_tui_steer_race", &promoted.id)
-                .expect("consume preserved input")
-                .expect("input reaches consumed state")
-                .state,
-            zuno_db::inbox::SubmissionState::Consumed
-        );
         assert!(
             inbox
                 .promote_next("ses_tui_steer_race", None)
-                .expect("inspect queue after consumption")
+                .expect("inspect queue after rejection")
                 .is_none(),
-            "the race-lost steer was delivered more than once"
+            "a rejected steer must never be promoted into a new turn"
         );
     }
 
@@ -5455,7 +5714,12 @@ mod tests {
             .expect("admitted content can steer")
             .into_message("msg_image");
         assert!(message.images.is_empty());
-        assert_eq!(message.attachments, vec![reference]);
+        assert_eq!(message.attachments, vec![reference.clone()]);
+        let edited = queue_edit_submission(submission, "edited caption".to_owned());
+        let edited = steering_content(zuno_db::inbox::InputDelivery::Steer, &edited)
+            .expect("the edited queued image stays steerable");
+        assert_eq!(edited.content, "edited caption");
+        assert_eq!(edited.attachments, vec![reference]);
     }
 
     #[test]

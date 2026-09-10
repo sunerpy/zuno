@@ -3,6 +3,7 @@ use zuno_permission::{PermissionAction, Rule, evaluate, rules_from_config};
 
 fn rule(permission: &str, pattern: &str, action: PermissionAction) -> Rule {
     Rule {
+        source: None,
         permission: permission.to_owned(),
         pattern: pattern.to_owned(),
         action,

@@ -42,15 +42,26 @@ Agent 具有显式的正向职责、负向委派边界、权限以及结构化�
 优先使用 `rg`，而不是先写原始 `curl` 或手工遍历。不存在的能力不会出现在指导中，降级也
 不能扩大权限。
 
-根回合对已连接 MCP schema 使用渐进式披露：调度器保留可执行实现，`tool_search`
-只搜索紧凑元数据，匹配项从下一次 provider step 起按单调 revision 扩展确切工具快照。
+根回合在权限、允许列表、父级 schema 过滤后解析 `mcp_tool_exposure`。默认 `auto` 在数量／
+字节预算内直接展示小型服务整个工具集；可全局或逐服务覆盖为 `eager`／`deferred`。
+策略独立于传输配置，不改变 `McpConnectionIdentity`，不跨会话共享外部进程。
+设计参考 Codex `9ba1d9eb` 的 direct/deferred 与来源列表机制，再适配 Zuno 的持久工具快照。
+
+延迟工具的实现仍保留在调度器中，`tool_search` 公布原始服务名称和有界能力摘要；
+匹配项从下一次 provider step 起按单调 revision 扩展确切工具快照。
 成功的 `tool_search` 结果同时是会话的持久暴露账本。后台报告重建宿主、进程重启或客户端
 重新挂载时，会在第一次 provider 请求之前恢复这些 id，并与当前仍连接、权限仍可见的目录
 取交集；已经移除的能力不会因此重新获得权限。
 Agent 的确切 `tools` 允许列表会立即公开其中点名的 MCP schema；子级仍受父级 Attempt
 中已持久化的确切 schema 上限约束，不能搜索出更大的权限面。ACP session-local
-`mcpServers` 在严格连接门禁后也立即公开，但同一目录中的宿主配置 server 仍延迟发现；
+`mcpServers` 在严格连接门禁后也立即公开，同一目录中的宿主配置 server 采用上述可见性策略；
 Catalog 会把这个会话边界传递到子回合与后台续跑。
+
+发现工具本身必须可见：原生角色在用户覆盖之前授予 `tool_search`；若用户禁用／拒绝它，
+或发生同名冲突，其他已授权 MCP schema 保持直接可见，不会藏到不可达入口之后。
+`Tool::source` 保留原始服务归属，不反向拆解已规范化的 wire id。运行时指导 Agent 主动选择
+相关已授权 MCP，区分配置、连接、缓存和延迟状态；普通服务调用不先加载 `customize-zuno`，
+也不把扩展／资源列表当作工具发现。
 
 每个新工具 part 还会保存准入该调用的 provider-visible schema identity。组装下一次请求时，
 只对更早 turn 的保留历史与当前 hook 后的工具定义对账；当前 turn 刚产生的调用始终保留原生
@@ -153,6 +164,24 @@ TUI 保存请求前基线及当前请求的可替换用量快照。分批事件�
 ## 持久输入
 
 用户提示词、steering 以及子 Agent 报告在执行前进入持久 FIFO 收件箱。`reportDelivery: nextStep` 必须完成子结果结算、准许父级输入并唤醒父级，且不存在轮询竞态。
+
+队列立即发送在同一准入事务中比较选中行的 revision 与界面显示的 turn id；失败则回滚行和事件，
+不改投新回合。空闲时先持有 run guard 再提升选中行，其他条目保持原准入顺序。消费时校验信号
+revision，用户消息和 consumed 状态提交后才发出 `InputConsumed`。完成边界会原子关闭准入；
+若输入先赢得竞争，则继续同一 engine turn。普通根／子会话 Enter 排队，显式立即发送才 steer，
+不调用 Stop，也不会把软检查点报告为硬中断。
+HTTP 显示投影使用 `turn.input.consumed`；权威 inbox 迁移仍是 `session.input.consumed`，
+不会用相同事件类型再写一次。
+
+TUI 的 `DraftRecovery` 在准入回执之前保管文本、光标、选区、粘贴块和图片；拒绝时不覆盖
+更新的草稿，也不自动重发。队列文字编辑保留图片；已准入的 steering 快照在消费前可取消，
+但不再由 TUI 改写。输入框上下键在整个缓冲区两个端点浏览历史，内部移动光标，不滚动对话。
+粘贴聚合先于快捷键分发，块内换行不是提交。选区和复制共用最后一帧的字素坐标映射。
+Windows 剪贴板异步读写，优先 `pwsh.exe`，其次 `powershell.exe`；OSC52 仅报告请求已发送。
+
+子会话和 job 创建在同一事务中继承父会话最新持久 memory policy。
+`SessionMemoryPolicyDefaults` 只含默认值，不携带 revision；父策略 revision ≥ 1 合法，
+子会话从自己的 revision 1 开始。不会重置父版本，也不需要改变数据库格式或重建数据库。
 
 准入不与活跃回合租约竞争。同一个准入服务先提交 `session_input` 行，再决定它如何到达模型，因此每个界面（TUI、ACP、HTTP 与 `run` 宿主）对一条**已经持久**的输入只报告三种结果之一：调用方拿到独占回合租约并自己驱动该行；某个正在运行的回合以软中断接纳该行，并在下一个安全点提升它；或者该行保持待决，等下一次 FIFO 提升。先抢租约、抢不到就提前返回，正是那种「提示词丢失且没有任何持久痕迹」的做法，所以会话忙碌是准入的一种结果，而不是准入的失败。若调用方自己的驱动循环本就拥有该会话的每个回合，它根本不申请租约，只会收到 steered 或待决结果。
 
@@ -479,7 +508,13 @@ Zuno 不监听 `~/.zuno` 或远端 Skill 缓存；缓存只在配置远端索引
 标准共享根 `~/.agents/skills` 只在启动时已经存在时监听，其他共享目录需要通过
 `skills.paths` 显式配置以支持运行中安装。
 
-Shell 执行受 OS 沙箱约束。`read-only` 与 `workspace-write` 都要求一个已验证的约束后端，默认在不可用时拒绝启动而非降级；受信层可以用 `sandbox.onUnavailable: run-unconfined` 让具备写能力的请求在符合条件的不可用错误下降级，或用 `sandbox.backend: native` 让每个 Agent（包括只读 Agent）显式走原生后端并保留权限模式，持久化记录中的 `resolutionKind` 为 `trusted_native`。两者都不是沙箱隔离。详见 [权限与沙箱](/zh/guide/permissions)。
+Shell 的约束取决于所选后端。没有显式后端、降级、网络拒绝或路径约束时，Windows/macOS
+默认原生执行（`platform_native`），Linux 默认自动发现约束后端。显式 `backend: auto`
+仍要求兑现 `read-only`／`workspace-write`，不可用时拒绝；受信 `run-unconfined` 仍仅适用于
+具备写能力的合格不可用错误。显式 `sandbox.backend: native` 记录为 `trusted_native`。
+各类原生执行均保留权限模式，但不是 OS 隔离。执行权限记录写版本 4，读取兼容版本 2、3，
+未来或非法版本拒绝；`executionReady` 与约束 `ready` 分开。Agent／Plan／Work 切换先预检目标，
+再改持久状态；Start Work 校验预检的 execution revision。详见 [权限与沙箱](/zh/guide/permissions)。
 
 Linux bubblewrap 后端的发现结果按进程缓存，键为规范化 workspace 加 helper 可执行文件；每次命中前重新校验可信 launcher、可信 `true` 与 helper 在磁盘上的身份，校验失败即逐出并重新探测；发现失败绝不缓存，缓存也不跨进程持久化。`zuno debug sandbox` 与部署报告绕过缓存，始终重新探测。
 

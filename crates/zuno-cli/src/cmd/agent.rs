@@ -66,8 +66,7 @@ fn list(environment: &StartupEnvironment) -> Result<(), String> {
 /// permission set that a user can read with `agent list` but that the turn loop
 /// does not actually enforce would be worse than having no listing at all.
 pub(crate) struct DynamicRules {
-    readonly_external: Vec<Rule>,
-    truncate_glob: String,
+    external: Vec<Rule>,
 }
 
 impl DynamicRules {
@@ -78,8 +77,7 @@ impl DynamicRules {
         config: &Config,
     ) -> Self {
         let layout = zuno_paths::Layout::resolve(env);
-        let truncate_glob = glob(&layout.tool_output());
-        let mut whitelisted = vec![truncate_glob.clone(), glob(layout.temp())];
+        let mut whitelisted = vec![glob(&layout.tool_output()), glob(layout.temp())];
 
         let skills =
             SkillSources::discover(&SkillOptions::from_config(directory, worktree, env, config));
@@ -90,17 +88,13 @@ impl DynamicRules {
                 .map(|path| glob(path)),
         );
 
-        let mut readonly_external = vec![rule("external_directory", "*", PermissionAction::Ask)];
-        readonly_external.extend(
-            whitelisted
-                .into_iter()
-                .map(|pattern| rule("external_directory", &pattern, PermissionAction::Allow)),
-        );
+        let mut external = vec![rule("external_directory", "*", PermissionAction::Ask)];
+        external.extend(whitelisted.into_iter().map(|pattern| {
+            rule("external_directory", &pattern, PermissionAction::Allow)
+                .with_source("dynamic:external_directory")
+        }));
 
-        Self {
-            readonly_external,
-            truncate_glob,
-        }
+        Self { external }
     }
 }
 
@@ -120,12 +114,13 @@ fn resolved_rule_set(
         && let Some(builtin) = agent::builtin::get(&entry.name)
         && let Some(overlay) = builtin.permission_overlay()
     {
-        rules.extend(rules_from_config(&overlay));
-        match entry.name.as_str() {
-            "plan" | "review" | "explorer" | "librarian" | "oracle" | "looker" => {
-                rules.extend(dynamic.readonly_external.clone())
-            }
-            _ => {}
+        rules.extend(
+            rules_from_config(&overlay)
+                .into_iter()
+                .map(|rule| rule.with_source(format!("native_agent:{}", entry.name))),
+        );
+        if builtin.uses_external_directories() {
+            rules.extend(dynamic.external.iter().skip(1).cloned());
         }
     }
 
@@ -133,24 +128,20 @@ fn resolved_rule_set(
     // follow this boundary and therefore retain final authority to deny them.
     let extension_rule_index = rules.len();
     if let Some(user) = &config.permission {
-        rules.extend(rules_from_config(user));
+        rules.extend(
+            rules_from_config(user)
+                .into_iter()
+                .map(|rule| rule.with_source("configuration.permission")),
+        );
     }
     if let Some(agent_rules) = &entry.permission {
-        rules.extend(rules_from_config(agent_rules));
+        rules.extend(
+            rules_from_config(agent_rules)
+                .into_iter()
+                .map(|rule| rule.with_source(format!("agent:{}.permission", entry.name))),
+        );
     }
 
-    let truncate_explicitly_denied = rules.iter().any(|candidate| {
-        candidate.permission == "external_directory"
-            && candidate.pattern == dynamic.truncate_glob
-            && candidate.action == PermissionAction::Deny
-    });
-    if !truncate_explicitly_denied {
-        rules.push(rule(
-            "external_directory",
-            &dynamic.truncate_glob,
-            PermissionAction::Allow,
-        ));
-    }
     ResolvedRules {
         rules,
         extension_rule_index,
@@ -179,7 +170,7 @@ fn default_rules(dynamic: &DynamicRules) -> Vec<Rule> {
         rule("doom_loop", "*", PermissionAction::Ask),
         rule("external_directory", "*", PermissionAction::Ask),
     ];
-    rules.extend(dynamic.readonly_external.iter().skip(1).cloned());
+    rules.extend(dynamic.external.iter().skip(1).cloned());
     rules.extend([
         rule("question", "*", PermissionAction::Deny),
         rule("plan_enter", "*", PermissionAction::Deny),
@@ -216,6 +207,7 @@ fn glob(path: &Path) -> String {
 
 fn rule(permission: &str, pattern: &str, action: PermissionAction) -> Rule {
     Rule {
+        source: Some("default".to_owned()),
         permission: permission.to_owned(),
         pattern: pattern.to_owned(),
         action,
@@ -227,9 +219,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn working_agents_ask_for_external_paths_and_user_denies_remain_authoritative() {
+        let dynamic = DynamicRules {
+            external: vec![
+                rule("external_directory", "*", PermissionAction::Ask),
+                rule(
+                    "external_directory",
+                    "C:/cache/tool-output/*",
+                    PermissionAction::Allow,
+                ),
+            ],
+        };
+        let roster = agent::list(&zuno_config::schema::ordered::OrderedMap::new(), &[]);
+        let denied: Config = serde_json::from_value(serde_json::json!({
+            "permission": {
+                "mode": "allow_all",
+                "rules": {"external_directory": {"*": "deny"}}
+            }
+        }))
+        .expect("valid permission configuration");
+        for name in ["build", "orchestrator", "deep", "general", "fixer", "plan"] {
+            let entry = roster
+                .iter()
+                .find(|agent| agent.name == name)
+                .expect("native");
+            let rules = resolved_rule_set(entry, &Config::default(), &dynamic).rules;
+            assert_eq!(
+                zuno_permission::evaluate(
+                    "external_directory",
+                    "C:/Users/0791/AppData/Local/Amazon/DCV/logs/*",
+                    &rules,
+                ),
+                PermissionAction::Ask,
+                "{name} must not deny an auxiliary permission its file tools need",
+            );
+            assert_eq!(
+                zuno_permission::evaluate(
+                    "external_directory",
+                    "C:/cache/tool-output/result.txt",
+                    &rules,
+                ),
+                PermissionAction::Allow,
+            );
+            let rules = resolved_rule_set(entry, &denied, &dynamic).rules;
+            assert_eq!(
+                zuno_permission::evaluate(
+                    "external_directory",
+                    "C:/cache/tool-output/result.txt",
+                    &rules,
+                ),
+                PermissionAction::Deny,
+                "{name}'s dynamic output grant must not override the user",
+            );
+            if name == "plan" {
+                assert_eq!(
+                    zuno_permission::evaluate("edit", "C:/work/file.txt", &rules),
+                    PermissionAction::Deny,
+                );
+            }
+        }
+    }
+
+    #[test]
     fn default_rules_preserve_find_last_order() {
         let dynamic = DynamicRules {
-            readonly_external: vec![
+            external: vec![
                 rule("external_directory", "*", PermissionAction::Ask),
                 rule(
                     "external_directory",
@@ -237,7 +291,6 @@ mod tests {
                     PermissionAction::Allow,
                 ),
             ],
-            truncate_glob: "/data/tool-output/*".to_owned(),
         };
         let rules = default_rules(&dynamic);
         assert_eq!(rules[0].permission, "*");
@@ -268,7 +321,7 @@ mod tests {
 
         let config = Config::default();
         let dynamic = DynamicRules {
-            readonly_external: vec![
+            external: vec![
                 rule("external_directory", "*", PermissionAction::Ask),
                 rule(
                     "external_directory",
@@ -276,7 +329,6 @@ mod tests {
                     PermissionAction::Allow,
                 ),
             ],
-            truncate_glob: "/tmp/zuno-factory-default/tool-output/*".to_owned(),
         };
         // The roster with no user configuration folded over it.
         let roster = agent::list(&OrderedMap::new(), &[]);

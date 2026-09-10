@@ -57,7 +57,9 @@ use crate::keybind::{APP_EXIT, ActionComponent, Chord, Definition, is_exit_reque
 use crate::views::ViewContext;
 use crate::views::autocomplete::{AutocompleteStep, AutocompleteView, SlashSource};
 use crate::views::editor::{EditorSignal, InputEditor};
-use crate::views::external::{Clipboard, EditorRequest, ExternalError, SystemClipboard};
+use crate::views::external::{
+    Clipboard, ClipboardContent, ClipboardRequest, EditorRequest, ExternalError, SystemClipboard,
+};
 use crate::views::message::{Message, ScrollbarView, StatusView, TranscriptView};
 use crate::views::permission::typed_character;
 use crate::views::scroll::Scroller;
@@ -601,6 +603,7 @@ pub struct SessionScreen {
     /// user's text at the same durable boundary instead of painting an uncommitted
     /// submission as ordinary history.
     queued_input_snapshot: Vec<crate::views::picker::QueuedInputEntry>,
+    draft_recovery: crate::prompt_recovery::DraftRecovery,
     queue_mutations: Option<mpsc::Sender<QueuedInputMutation>>,
     work: crate::views::ambient::WorkState,
     work_generation: u64,
@@ -737,8 +740,26 @@ pub struct SessionScreen {
     /// order-dependent across the suite, which is the reason every other collaborator
     /// here is a field too.
     clipboard: Arc<dyn Clipboard>,
+    clipboard_pending: Vec<PendingClipboard>,
+    copy_sequence: u64,
     editor_requests: Option<mpsc::Sender<EditorRequest>>,
     editor_results: Option<mpsc::Receiver<Result<Option<String>, ExternalError>>>,
+}
+
+struct PendingClipboard {
+    request: ClipboardRequest,
+    purpose: ClipboardPurpose,
+}
+
+enum ClipboardPurpose {
+    Copy {
+        characters: usize,
+        sequence: u64,
+    },
+    Paste {
+        session: Option<String>,
+        stamp: crate::views::editor::DraftStamp,
+    },
 }
 
 /// One choice the user made in a picker.
@@ -793,6 +814,12 @@ pub enum Selection {
 /// A durable queued-input mutation that must be acknowledged after SQLite commits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueuedInputMutation {
+    SendNow {
+        id: String,
+        expected_revision: i64,
+        expected_turn_id: Option<String>,
+        request_id: String,
+    },
     Edit {
         id: String,
         expected_revision: i64,
@@ -872,6 +899,10 @@ pub struct PromptEnvelope {
     pub payload: PromptSubmission,
     pub delivery: PromptDelivery,
     pub origin: PromptOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 impl PromptEnvelope {
@@ -885,7 +916,21 @@ impl PromptEnvelope {
             payload,
             delivery,
             origin,
+            expected_turn_id: None,
+            request_id: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_expected_turn(mut self, turn_id: Option<String>) -> Self {
+        self.expected_turn_id = turn_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_request_id(mut self, request_id: String) -> Self {
+        self.request_id = Some(request_id);
+        self
     }
 }
 
@@ -996,6 +1041,16 @@ impl SessionScreen {
     /// A screen that requests shutdown through `shutdown` when `app_exit` resolves.
     #[must_use]
     pub fn new(context: ViewContext, shutdown: mpsc::Sender<TerminalEvent>) -> Self {
+        Self::new_with_clipboard(context, shutdown, Arc::new(SystemClipboard::host()))
+    }
+
+    /// A clipboard provider can outlive session remounts while drafts remain view-owned.
+    #[must_use]
+    pub fn new_with_clipboard(
+        context: ViewContext,
+        shutdown: mpsc::Sender<TerminalEvent>,
+        clipboard: Arc<dyn Clipboard>,
+    ) -> Self {
         let slash = SlashRouter::default();
         let mut transcript = TranscriptView::new(context.clone());
         transcript.set_activity_display(crate::views::message::ActivityDisplay::Summary);
@@ -1032,6 +1087,7 @@ impl SessionScreen {
             queued_inputs: crate::views::picker::QueuedInputProjection::default(),
             queued_input_generation: 0,
             queued_input_snapshot: Vec::new(),
+            draft_recovery: crate::prompt_recovery::DraftRecovery::default(),
             queue_mutations: None,
             work: crate::views::ambient::WorkState::default(),
             work_generation: 0,
@@ -1067,13 +1123,11 @@ impl SessionScreen {
             modal: None,
             scroller: Scroller::new(&context.config),
             started: Instant::now(),
-            // The real host clipboard, so a copy works in production without the CLI
-            // constructing anything: `SystemClipboard::host` resolves the platform, the
-            // installed programs and whether stdout is a terminal, and yields a
-            // clipboard with no mechanisms when there is no terminal — which is also
-            // what keeps the suite from spawning `xclip` or painting escape sequences
-            // into captured test output. `with_clipboard` replaces it.
-            clipboard: Arc::new(SystemClipboard::host()),
+            // The terminal owns this provider across session remounts; standalone
+            // screens use SystemClipboard::host through the default constructor.
+            clipboard,
+            clipboard_pending: Vec::new(),
+            copy_sequence: 0,
             editor_requests: None,
             editor_results: None,
             // Last, because the two fields above borrow it and a struct literal
@@ -1936,6 +1990,9 @@ impl SessionScreen {
             self.transcript.transcript_mut().push(message);
         }
         if let Some(prompts) = self.prompts.as_ref() {
+            let request_id = (delivery != PromptDelivery::Direct
+                && self.draft_recovery.prepared.is_some())
+            .then(|| format!("tui_{}", uuid::Uuid::new_v4().simple()));
             let tracks_model_turn = matches!(
                 submission,
                 PromptSubmission::Text(_)
@@ -1944,15 +2001,31 @@ impl SessionScreen {
                     | PromptSubmission::Skill { .. }
                     | PromptSubmission::Council { .. }
             );
-            match prompts.try_send(TargetedPromptSubmission::root_with(PromptEnvelope::new(
-                submission, delivery, origin,
-            ))) {
+            let mut envelope = PromptEnvelope::new(submission, delivery, origin)
+                .with_expected_turn(
+                    (delivery == PromptDelivery::Steer)
+                        .then(|| {
+                            self.transcript
+                                .transcript()
+                                .active_turn_id()
+                                .map(str::to_owned)
+                        })
+                        .flatten(),
+                );
+            envelope.request_id = request_id.clone();
+            match prompts.try_send(TargetedPromptSubmission::root_with(envelope)) {
                 Ok(()) => {
+                    if let Some(request_id) = request_id {
+                        self.draft_recovery.sent(&request_id);
+                    } else {
+                        self.draft_recovery.prepared = None;
+                    }
                     if tracks_model_turn {
                         self.mark_turn_accepted();
                     }
                 }
                 Err(error) => {
+                    self.draft_recovery.rejected_before_send();
                     let reason = match error {
                         mpsc::error::TrySendError::Full(_) => "the durable input queue is full",
                         mpsc::error::TrySendError::Closed(_) => "the turn driver has stopped",
@@ -1964,9 +2037,10 @@ impl SessionScreen {
             }
         }
         self.submissions.push(shown);
+        self.recover_rejected_drafts();
     }
 
-    fn submit_live_to_driver(&mut self, shown: String) -> EventResult {
+    fn submit_live_to_driver(&mut self, shown: String, force: bool) -> EventResult {
         let Some(live) = self.live_session.as_mut() else {
             return EventResult::IGNORED;
         };
@@ -1984,20 +2058,34 @@ impl SessionScreen {
                 )
             },
         );
-        let delivery = if live.is_running() {
+        let delivery = if live.is_running() && force {
             PromptDelivery::Steer
+        } else if live.is_running() {
+            PromptDelivery::Queue
         } else {
             PromptDelivery::Direct
         };
-        live.push_user_submission_with_attachments(shown.clone(), &attachments);
+        let expected_turn = (delivery == PromptDelivery::Steer)
+            .then(|| live.transcript().active_turn_id().map(str::to_owned))
+            .flatten();
+        if delivery == PromptDelivery::Direct {
+            live.push_user_submission_with_attachments(shown.clone(), &attachments);
+        }
 
         if let Some(prompts) = self.prompts.as_ref() {
+            let request_id = format!("tui_{}", uuid::Uuid::new_v4().simple());
             match prompts.try_send(TargetedPromptSubmission::session_with(
                 session_id,
-                PromptEnvelope::new(submission, delivery, PromptOrigin::TuiChild),
+                PromptEnvelope::new(submission, delivery, PromptOrigin::TuiChild)
+                    .with_expected_turn(expected_turn)
+                    .with_request_id(request_id.clone()),
             )) {
-                Ok(()) => live.mark_turn_accepted(),
+                Ok(()) => {
+                    self.draft_recovery.sent(&request_id);
+                    live.mark_turn_accepted();
+                }
                 Err(error) => {
+                    self.draft_recovery.rejected_before_send();
                     let reason = match error {
                         mpsc::error::TrySendError::Full(_) => "the durable input queue is full",
                         mpsc::error::TrySendError::Closed(_) => "the turn driver has stopped",
@@ -2007,42 +2095,49 @@ impl SessionScreen {
             }
         }
         self.submissions.push(shown);
+        self.recover_rejected_drafts();
         EventResult::REDRAW
     }
 
-    fn paste_into_live_from_clipboard(&mut self) -> EventResult {
-        let (level, notice) = match self.clipboard.read() {
-            Ok(Some(content)) if content.is_image() => {
-                let Some(live) = self.live_session.as_mut() else {
-                    return EventResult::IGNORED;
-                };
-                return match live.attach_clipboard_image(&content.mime, &content.data) {
-                    Ok(()) => EventResult::REDRAW,
-                    Err(error) => {
-                        self.toasts.push(Toast::error(error));
-                        EventResult::REDRAW
+    fn recover_rejected_drafts(&mut self) -> EventResult {
+        for (request_id, error) in self.queued_inputs.take_prompt_receipts() {
+            if let Some(error) = self.draft_recovery.acknowledge(&request_id, error) {
+                self.toasts.push(Toast::warning(format!(
+                    "input was not sent; draft kept: {error}"
+                )));
+            }
+        }
+        let mut restored = false;
+        for draft in std::mem::take(&mut self.draft_recovery.rejected) {
+            let result = match &draft.target {
+                PromptTarget::Root => draft.restore(&mut self.editor, &mut self.attachments),
+                PromptTarget::Session(id) => {
+                    let live = self
+                        .live_session
+                        .as_mut()
+                        .filter(|live| live.session_id() == id)
+                        .or_else(|| self.live_session_cache.get_mut(id));
+                    match live {
+                        Some(live) => live.restore_draft(draft),
+                        None => Some(draft),
                     }
-                };
+                }
+            };
+            match result {
+                None => restored = true,
+                Some(draft) => self.draft_recovery.rejected.push(draft),
             }
-            Ok(Some(content)) => {
-                return self
-                    .live_session
-                    .as_mut()
-                    .map_or(EventResult::IGNORED, |live| {
-                        // Child input is always literal text. `InputEditor::insert_paste` escapes a
-                        // leading slash for the root slash router, so this path intentionally uses
-                        // `insert_text` and never introduces command syntax.
-                        live.insert_text(&content.data)
-                    });
-            }
-            Ok(None) => (
-                ToastLevel::Warning,
-                String::from("nothing to paste: the clipboard is empty"),
-            ),
-            Err(error) => (ToastLevel::Error, format!("paste failed: {error}")),
-        };
-        self.toasts.push(Toast::new(level, notice));
-        EventResult::REDRAW
+        }
+        if restored {
+            self.autocomplete.hide();
+            EventResult::REDRAW
+        } else {
+            EventResult::IGNORED
+        }
+    }
+
+    fn paste_into_live_from_clipboard(&mut self) -> EventResult {
+        self.paste_from_clipboard()
     }
 
     fn refresh_autocomplete(&mut self) {
@@ -2130,40 +2225,29 @@ impl SessionScreen {
     /// [`Clipboard::read`]'s deliberate error worth returning: the binding used to fall
     /// into a bare redraw, so pressing it did nothing and said nothing.
     fn paste_from_clipboard(&mut self) -> EventResult {
-        // The three outcomes are not one grade: an unsupported kind and an empty clipboard
-        // are refusals the user can act on, while a clipboard that errored is a failure —
-        // `§11.5` gives those different colours, and the copy path beside this one already
-        // makes exactly that distinction with its toasts.
-        let (level, notice) = match self.clipboard.read() {
-            Ok(Some(content)) if content.is_image() => {
-                return match self
-                    .attachments
-                    .attach_clipboard_image(&content.mime, &content.data)
-                {
-                    Ok(placeholder) => {
-                        self.editor.insert_text(&placeholder);
-                        self.refresh_autocomplete();
-                        EventResult::REDRAW
-                    }
-                    Err(error) => {
-                        self.transcript
-                            .transcript_mut()
-                            .push(Message::noticed(ToastLevel::Error, error));
-                        EventResult::REDRAW
-                    }
-                };
+        if self.clipboard_pending.len() >= 2
+            || self
+                .clipboard_pending
+                .iter()
+                .any(|pending| matches!(pending.purpose, ClipboardPurpose::Paste { .. }))
+        {
+            self.toasts
+                .push(Toast::info("clipboard operation is still running"));
+            return EventResult::REDRAW;
+        }
+        let (session, stamp) = self.clipboard_paste_target();
+        match self.clipboard.request_read() {
+            Ok(request) => {
+                self.track_clipboard(request, ClipboardPurpose::Paste { session, stamp })
             }
-            Ok(Some(content)) => return self.paste(&content.data),
-            Ok(None) => (
-                ToastLevel::Warning,
-                String::from("nothing to paste: the clipboard is empty"),
-            ),
-            Err(error) => (ToastLevel::Error, format!("paste failed: {error}")),
-        };
-        self.transcript
-            .transcript_mut()
-            .push(Message::noticed(level, notice));
-        EventResult::REDRAW
+            Err(error) => {
+                self.transcript.transcript_mut().push(Message::noticed(
+                    ToastLevel::Error,
+                    format!("paste failed: {error}"),
+                ));
+                EventResult::REDRAW
+            }
+        }
     }
 
     /// Put `text` on the clipboard, and raise a toast saying what happened.
@@ -2185,22 +2269,148 @@ impl SessionScreen {
     /// Not the reply identity or footer either: neither is durable notification history,
     /// and a notice pinned there would still be claiming a copy minutes later.
     fn copy(&mut self, text: String) -> EventResult {
-        // An empty buffer with nothing selected is not a copy, and writing the empty
-        // string would destroy whatever the user already had on their clipboard.
-        self.toasts.push(if text.is_empty() {
-            // `warning`, not `error`: nothing failed, and there is something the user can
-            // do about it. `§11.5` reserves `error` for a failure.
-            Toast::warning("nothing to copy: the prompt is empty and no text is selected")
-        } else {
-            match self.clipboard.write(&text) {
-                Ok(()) => Toast::success(format!(
-                    "copied {} characters to the clipboard",
-                    text.chars().count()
-                )),
-                Err(error) => Toast::error(format!("copy failed: {error}")),
+        self.copy_sequence = self.copy_sequence.wrapping_add(1);
+        if text.is_empty() {
+            self.toasts.push(Toast::warning(
+                "nothing to copy: the prompt is empty and no text is selected",
+            ));
+            return EventResult::REDRAW;
+        }
+        if self.clipboard_pending.len() >= 2 {
+            self.toasts.push(Toast::warning(
+                "clipboard is busy; selection was not copied",
+            ));
+            return EventResult::REDRAW;
+        }
+        match self.clipboard.request_write(&text) {
+            Ok(request) => self.track_clipboard(
+                request,
+                ClipboardPurpose::Copy {
+                    characters: text.chars().count(),
+                    sequence: self.copy_sequence,
+                },
+            ),
+            Err(error) => {
+                self.toasts
+                    .push(Toast::error(format!("copy failed: {error}")));
+                EventResult::REDRAW
             }
-        });
+        }
+    }
+
+    fn clipboard_paste_target(&self) -> (Option<String>, crate::views::editor::DraftStamp) {
+        self.live_session.as_ref().map_or_else(
+            || (None, self.editor.draft_stamp()),
+            |live| (Some(live.session_id().to_owned()), live.draft_stamp()),
+        )
+    }
+
+    fn track_clipboard(
+        &mut self,
+        request: ClipboardRequest,
+        purpose: ClipboardPurpose,
+    ) -> EventResult {
+        if let Some(result) = request.poll() {
+            self.finish_clipboard(purpose, result, request.confirmed());
+        } else {
+            request.notify_on_ready(self.shutdown.clone());
+            self.clipboard_pending
+                .push(PendingClipboard { request, purpose });
+        }
         EventResult::REDRAW
+    }
+
+    fn drain_clipboard(&mut self) -> EventResult {
+        let mut changed = false;
+        for pending in std::mem::take(&mut self.clipboard_pending) {
+            if let Some(result) = pending.request.poll() {
+                self.finish_clipboard(pending.purpose, result, pending.request.confirmed());
+                changed = true;
+            } else {
+                self.clipboard_pending.push(pending);
+            }
+        }
+        if changed {
+            EventResult::REDRAW
+        } else {
+            EventResult::IGNORED
+        }
+    }
+
+    fn finish_clipboard(
+        &mut self,
+        purpose: ClipboardPurpose,
+        result: Result<Option<ClipboardContent>, ExternalError>,
+        confirmed: bool,
+    ) {
+        match purpose {
+            ClipboardPurpose::Copy {
+                characters,
+                sequence,
+            } => {
+                if sequence != self.copy_sequence {
+                    return;
+                }
+                self.toasts.push(match result {
+                    Ok(_) if confirmed => {
+                        Toast::success(format!("copied {characters} characters to the clipboard"))
+                    }
+                    Ok(_) => Toast::info("copy request sent to the terminal"),
+                    Err(error) => Toast::error(format!("copy failed: {error}")),
+                });
+            }
+            ClipboardPurpose::Paste { session, stamp } => {
+                if self.modal.is_some() || self.clipboard_paste_target() != (session, stamp) {
+                    self.toasts.push(Toast::warning(
+                        "paste target changed; clipboard text was not inserted",
+                    ));
+                    return;
+                }
+                let content = match result {
+                    Ok(Some(content)) => content,
+                    Ok(None) => {
+                        self.transcript.transcript_mut().push(Message::noticed(
+                            ToastLevel::Warning,
+                            "nothing to paste: the clipboard is empty",
+                        ));
+                        return;
+                    }
+                    Err(error) => {
+                        self.transcript.transcript_mut().push(Message::noticed(
+                            ToastLevel::Error,
+                            format!("paste failed: {error}"),
+                        ));
+                        return;
+                    }
+                };
+                if let Some(live) = self.live_session.as_mut() {
+                    if content.is_image() {
+                        if let Err(error) =
+                            live.attach_clipboard_image(&content.mime, &content.data)
+                        {
+                            self.toasts.push(Toast::error(error));
+                        }
+                    } else {
+                        live.insert_text(&crate::views::editor::normalize_prompt_content(
+                            &content.data,
+                        ));
+                    }
+                } else if content.is_image() {
+                    match self
+                        .attachments
+                        .attach_clipboard_image(&content.mime, &content.data)
+                    {
+                        Ok(placeholder) => {
+                            self.editor.insert_text(&placeholder);
+                            self.refresh_autocomplete();
+                        }
+                        Err(error) => self.toasts.push(Toast::error(error)),
+                    }
+                } else {
+                    self.paste(&content.data);
+                }
+            }
+        }
     }
 }
 
@@ -2491,6 +2701,13 @@ impl Component for SessionScreen {
     }
 
     fn handle_event(&mut self, event: &AppEvent) -> EventResult {
+        let clipboard = self.drain_clipboard().merge(self.recover_rejected_drafts());
+        if let AppEvent::Engine(zuno_engine::r#loop::TurnEvent::InputConsumed {
+            input_id, ..
+        }) = event
+        {
+            self.queued_inputs.consumed(input_id);
+        }
         // A bracketed paste is one event carrying the whole block, so it goes straight
         // to the editor and resolves to no action at all. That is the point: before
         // bracketed paste was enabled the same paste arrived as individual keys, and
@@ -2567,6 +2784,7 @@ impl Component for SessionScreen {
             .as_mut()
             .map_or(EventResult::IGNORED, |live| live.handle_event(event));
         projections
+            .merge(clipboard)
             .merge(self.transcript.handle_event(event))
             .merge(self.status.handle_event(event))
             .merge(live)
@@ -2621,7 +2839,17 @@ impl SessionScreen {
             .collect::<Vec<_>>();
         let hidden = inputs.len().saturating_sub(item_rows);
         let force = crate::views::pressable_label("input_force_submit", &self.context)
-            .unwrap_or_else(|| String::from("ctrl+enter"));
+            .map(|keys| {
+                format!(
+                    " · {keys} {}",
+                    if self.editor.is_empty() {
+                        "choose queued input"
+                    } else {
+                        "send draft now"
+                    }
+                )
+            })
+            .unwrap_or_default();
         let manage = crate::views::pressable_label("session_queued_prompts", &self.context)
             .map_or_else(|| String::from("/queue"), |key| format!("{key} manage"));
         let count = if hidden == 0 {
@@ -2630,7 +2858,7 @@ impl SessionScreen {
             format!("{} queued · +{hidden} hidden", inputs.len())
         };
         lines.push(crate::views::padded(
-            &format!("  {count} · {force} send now · {manage}"),
+            &format!("  {count}{force} · {manage}"),
             area.width,
             self.context.secondary(),
         ));
@@ -3321,6 +3549,7 @@ impl SessionScreen {
             matches!(
                 notice.kind,
                 crate::views::picker::QueuedInputNoticeKind::Cancelled
+                    | crate::views::picker::QueuedInputNoticeKind::Consumed
                     | crate::views::picker::QueuedInputNoticeKind::Failed(_)
             )
             .then_some(notice.input_id.as_str())
@@ -3347,6 +3576,9 @@ impl SessionScreen {
                 ) => Toast::info("message queued; it will steer at the next safe point"),
                 QueuedInputNoticeKind::Promoted => {
                     Toast::info("queued request started in the next turn")
+                }
+                QueuedInputNoticeKind::Consumed => {
+                    Toast::info("message added to the current turn input")
                 }
                 QueuedInputNoticeKind::Edited => {
                     Toast::success(format!("updated queued input {}", notice.input_id))
@@ -4616,33 +4848,13 @@ impl ActionComponent for SessionScreen {
 
     fn focused_scopes(&self) -> Vec<&'static str> {
         if let Some(live) = self.live_session.as_ref() {
-            if live.composer_is_empty() {
-                vec!["session.child"]
-            } else {
-                Vec::new()
-            }
+            live.composer_scopes()
+        } else if self.transcript_full {
+            vec!["messages"]
         } else if self.autocomplete.is_open() {
             vec!["prompt.autocomplete"]
-        } else if self.editor.is_empty()
-            && self.transcript.content_height() > self.transcript.viewport_height()
-        {
-            // In native-selection mode, terminal alternate-scroll converts wheel notches
-            // to Up/Down keys. Promoting `messages` only for an empty composer makes those
-            // keys scroll the transcript without stealing vertical editing or history
-            // traversal from a prompt the user is actively composing.
-            vec!["messages"]
-        } else if self.editor.cursor().line == 0
-            || self.editor.cursor().line + 1 == self.editor.height()
-        {
-            // Scope ordering cannot vary by chord, so both history arrows are promoted at
-            // either vertical edge. `InputEditor` then applies the directional half of the
-            // rule: an arrow pointing into a multi-line buffer still moves the cursor, while
-            // one pointing out past its first/last line walks history. Promoting everywhere
-            // would shadow `input_move_up/down` throughout pasted blocks; never promoting is
-            // the original bug that made persisted history unreachable.
-            vec!["history"]
         } else {
-            Vec::new()
+            self.editor.focused_scopes()
         }
     }
 
@@ -4660,6 +4872,30 @@ impl ActionComponent for SessionScreen {
         outcome: &crate::views::dialog::DialogOutcome,
     ) -> EventResult {
         match outcome {
+            crate::views::dialog::DialogOutcome::QueuedInput(
+                crate::views::picker::QueuedInputDialogAction::SendNow {
+                    id,
+                    expected_revision,
+                },
+            ) => {
+                let turn_id = self
+                    .transcript
+                    .transcript()
+                    .active_turn_id()
+                    .map(str::to_owned);
+                if self.status.is_running() && turn_id.is_none() {
+                    self.toasts.push(Toast::warning(
+                        "the active turn is not ready for steering; queued input was kept",
+                    ));
+                    return EventResult::REDRAW;
+                }
+                self.send_queue_mutation(QueuedInputMutation::SendNow {
+                    id: id.clone(),
+                    expected_revision: *expected_revision,
+                    expected_turn_id: turn_id,
+                    request_id: format!("send:{id}:{expected_revision}"),
+                })
+            }
             crate::views::dialog::DialogOutcome::QueuedInput(
                 crate::views::picker::QueuedInputDialogAction::Edit {
                     id,
@@ -4992,6 +5228,46 @@ impl ActionComponent for SessionScreen {
     }
 
     fn handle_action(&mut self, action: &'static Definition, event: &KeyEvent) -> EventResult {
+        if self.modal.is_none()
+            && matches!(
+                action.name,
+                "input_submit" | "input_force_submit" | "prompt_submit"
+            )
+            && self
+                .clipboard_pending
+                .iter()
+                .any(|pending| matches!(pending.purpose, ClipboardPurpose::Paste { .. }))
+        {
+            self.toasts.push(Toast::info(
+                "paste is still loading; submit after the complete block appears",
+            ));
+            return EventResult::REDRAW;
+        }
+        if action.name == "input_force_submit"
+            && self.live_session.is_none()
+            && self.modal.is_none()
+        {
+            if self.editor.is_empty() && !self.queued_inputs.snapshot().is_empty() {
+                return self.request(self.queued_input_view());
+            }
+            if self.status.is_running() && self.transcript.transcript().active_turn_id().is_none() {
+                self.toasts.push(Toast::warning(
+                    "the active turn is not ready for steering; draft was kept",
+                ));
+                return EventResult::REDRAW;
+            }
+        }
+        if action.name == "input_force_submit"
+            && self.modal.is_none()
+            && self.live_session.as_ref().is_some_and(|live| {
+                live.is_running() && live.transcript().active_turn_id().is_none()
+            })
+        {
+            self.toasts.push(Toast::warning(
+                "the child's active turn is not ready for steering; draft was kept",
+            ));
+            return EventResult::REDRAW;
+        }
         if action.name == "session_interrupt" && self.modal.is_some() {
             return self.request_interrupt_at(self.now_ms());
         }
@@ -5022,6 +5298,12 @@ impl ActionComponent for SessionScreen {
             if transcript.handled {
                 return transcript;
             }
+            let draft = matches!(
+                action.name,
+                "input_submit" | "input_force_submit" | "prompt_submit"
+            )
+            .then(|| self.live_session.as_ref().map(|live| live.save_draft()))
+            .flatten();
             let signal = self
                 .live_session
                 .as_mut()
@@ -5029,8 +5311,19 @@ impl ActionComponent for SessionScreen {
                     live.handle_composer_action(action)
                 });
             return match signal {
+                EditorSignal::None
+                    if matches!(action.name, "history_previous" | "history_next") =>
+                {
+                    EventResult {
+                        handled: true,
+                        redraw: false,
+                    }
+                }
                 EditorSignal::None => EventResult::IGNORED,
-                EditorSignal::Submit(text) => self.submit_live_to_driver(text),
+                EditorSignal::Submit(text) => {
+                    self.draft_recovery.prepared = draft;
+                    self.submit_live_to_driver(text, action.name == "input_force_submit")
+                }
                 EditorSignal::Copy(text) => self.copy(text),
                 EditorSignal::OpenExternalEditor => {
                     self.toasts.push(Toast::warning(
@@ -5098,20 +5391,30 @@ impl ActionComponent for SessionScreen {
         if self.handle_view_action(action).handled {
             return EventResult::REDRAW;
         }
-        let attached_submission = matches!(
+        let draft = matches!(
             action.name,
             "input_submit" | "input_force_submit" | "prompt_submit"
-        ) && self
+        )
+        .then(|| {
+            crate::prompt_recovery::SavedDraft::capture(
+                PromptTarget::Root,
+                &self.editor,
+                &self.attachments,
+            )
+        });
+        let signal = self
             .attachments
-            .has_attached_prompt(&self.editor.submission_text());
-        let signal = if attached_submission {
-            self.editor.handle_action_without_history(action)
-        } else {
-            self.editor.handle_action(action)
-        };
+            .handle_editor_action(&mut self.editor, action);
         match signal {
+            EditorSignal::None if matches!(action.name, "history_previous" | "history_next") => {
+                EventResult {
+                    handled: true,
+                    redraw: false,
+                }
+            }
             EditorSignal::None => EventResult::IGNORED,
             EditorSignal::Submit(text) => {
+                self.draft_recovery.prepared = draft;
                 let origin = self.submission_origin_override.unwrap_or_else(|| {
                     if action.name == "input_force_submit" {
                         PromptOrigin::TuiForceSubmit
@@ -5120,13 +5423,18 @@ impl ActionComponent for SessionScreen {
                     }
                 });
                 self.submit(text, action.name == "input_force_submit", origin);
+                self.draft_recovery.prepared = None;
                 self.autocomplete.hide();
                 EventResult::REDRAW
             }
             EditorSignal::Copy(text) => self.copy(text),
             EditorSignal::OpenExternalEditor => self.request_external_editor(),
             EditorSignal::Changed => {
-                self.refresh_autocomplete();
+                if matches!(action.name, "history_previous" | "history_next") {
+                    self.autocomplete.hide();
+                } else {
+                    self.refresh_autocomplete();
+                }
                 EventResult::REDRAW
             }
             EditorSignal::Paste => self.paste_from_clipboard(),

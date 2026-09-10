@@ -349,6 +349,23 @@ Instances inherit the Zuno process environment, working directory, and the produ
 
 Dangerous modes `dangerouslyBypassApprovals` and `bypassPermissions` are accepted only when written explicitly. Tool names must be unique and cannot collide with native tools. See [Codex and Claude Code product agents](../design/product-agents.md) for protocol, job, cancellation, and TUI behavior.
 
+## MCP tool exposure
+
+`mcp_tool_exposure` controls schema visibility, not transport startup or permissions.
+Default `mode: "auto"` exposes small whole services: up to 8 tools per service under
+32 automatically exposed tools and 65,536 schema/description bytes. The positive
+`small_server_tool_limit`, `auto_tool_limit`, and `auto_schema_bytes` fields tune those
+budgets. `servers` maps exact configured server names to `auto`, `eager`, or `deferred`.
+An exact Agent or ACP-session pin remains eager outside the automatic budget.
+
+```json
+{"mcp_tool_exposure":{"mode":"auto","servers":{"aws-knowledge-mcp-server":"eager"}}}
+```
+
+Larger/deferred services remain advertised by name and capability through `tool_search`;
+discovery being disabled/denied never strands otherwise-authorized MCP tools.
+See [MCP servers](/guide/mcp) for lifecycle, authorization and diagnostic distinctions.
+
 ## Concurrency
 
 Independent runtime work has four bounded controls:
@@ -1017,7 +1034,7 @@ launcher capabilities, and namespace/container-policy unavailability are
 eligible. An untrusted launcher, invalid policy/path, seccomp/helper/internal
 failure, generic process error, and command preparation or execution error never
 trigger fallback. A read-only Agent never runs unconfined through this fallback;
-the one native route for it is the explicit `sandbox.backend: native` selection
+native execution for it uses a platform default or explicit `sandbox.backend: native` selection
 described next.
 
 ### Native backend
@@ -1025,7 +1042,11 @@ described next.
 `sandbox.backend` selects the execution backend independently of the authority
 that `mode` grants:
 
-- `auto` is the default: discover the platform's confined backend and apply
+- An omitted backend defaults to native on Windows/macOS, and `auto` on Linux,
+  only when no explicit `onUnavailable`, `network: "deny"`, non-empty `writableRoots`,
+  or `protectedPaths` requests confinement. This is recorded as `platform_native`;
+  it keeps the configured permission mode and never implies `allow_all`.
+- Explicit `auto` discovers the platform's confined backend and applies
   `onUnavailable` when it cannot be deployed.
 - `native` runs every Agent's Shell, read-only contracts included, on the native
   process backend without probing a confined backend at all. The configured
@@ -1075,6 +1096,13 @@ rather than a platform detection; `zuno debug sandbox` reports
 `nativeExecutionBypass: true`, `fallbackEligible: false`, and keeps `ready: false`
 for a confined requested mode so `--check` remains a strict deployment gate.
 
+`zuno debug sandbox --agent deep --check-execution` checks execution readiness
+separately (`executionReady`). `--check` still requires the requested confinement.
+`backendResolutionSource` distinguishes explicit selection, explicit constraints,
+and the platform default. Agent/Plan/Work switching validates the target backend
+before persisting a collaboration change; Start Work also guards the preflighted
+execution revision.
+
 Relative paths resolve from the active workspace. `writableRoots` entries must
 already be directories and are considered only in `workspace-write`.
 `protectedPaths` are reapplied read-only after writable mounts. Each configured
@@ -1108,10 +1136,11 @@ The environment equivalents are `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined` and
 `ZUNO_SANDBOX_BACKEND=native`. Managed policy has later precedence and may still
 replace those overrides with `deny` and `auto`.
 
-On a platform with no confined backend (macOS and Windows today), an interactive
-`zuno` start asks once before the terminal enters raw mode, and only when every
-guard holds: the request cannot be confined there (a read-only request included),
-no layer set `sandbox.onUnavailable` or `sandbox.backend` at all, and
+Windows/macOS use the platform-native default without an availability question when
+no explicit constraint requires confinement. A Linux interactive
+`zuno` start may ask once before raw mode when every guard holds:
+the request cannot be confined there (a read-only request included),
+no layer set `sandbox.onUnavailable`, `sandbox.backend`, network denial or path constraints, and
 standard input **and** standard error are both terminals. Answering yes
 resolves this process exactly as `--sandbox-backend native` would — same
 override path, `resolutionKind` `trusted_native`, the same durable record and
@@ -1121,9 +1150,9 @@ no exits with the refusal. The prompt does not appear when any layer chose
 `deny`, `run-unconfined`, `auto`, or `native`, each of which is honoured as
 written, or off a terminal.
 
-`run`, `acp`, and `serve` never ask: they print the same refusal with the
-remedies, and a headless invocation still needs the flag, the environment
-variable, or a trusted configuration layer. Accepting the prompt is not
+`run`, `acp`, and `serve` never ask. Their Windows/macOS defaults are also native;
+an explicit confinement requirement is still refused when unavailable. On a Linux
+host without confinement, choose an appropriate trusted override. Accepting the prompt is not
 confinement; it is native execution with the Zuno process user's authority.
 
 The answer is not inherited by child processes, and there the flag and the prompt
@@ -1131,9 +1160,9 @@ differ. On Unix the resolved overrides are exported into the real environment by
 the one startup re-exec that hands the command process its bootstrap environment,
 so `--sandbox-backend native` and `--sandbox-on-unavailable run-unconfined` are
 visible to a nested `zuno` that a tool launches; the prompt is answered after that
-re-exec, so its answer is not. On macOS, where the prompt is reachable, a nested
-`zuno run` therefore meets the refusal again even though this process runs
-natively. Windows performs no such re-exec, so neither route is inherited there.
+re-exec, so its answer is not. Windows performs no such re-exec, so neither route
+is inherited there. A nested Windows/macOS process independently resolves its platform
+default; explicit restrictions still require their own trusted override.
 Set `ZUNO_SANDBOX_BACKEND=native` (or `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`)
 in the environment, or `sandbox.backend` (or `sandbox.onUnavailable`) in a trusted
 layer, when nested Zuno processes need the same answer.
@@ -1154,19 +1183,20 @@ On Linux, confined Shell registration requires a trusted system bubblewrap plus
 successful user, mount, PID, UTS, IPC, seccomp, and—when `network` is
 `deny`—network namespace probes. A failed probe stops tool assembly unless it is
 an eligible typed availability failure and trusted policy selected
-`run-unconfined`. Confined macOS and Windows backends are not yet implemented
-and fail closed by default; the refusal names the platform, says whether the
+`run-unconfined`. Confined macOS and Windows backends are not yet implemented;
+an explicit confinement requirement fails closed, while an unconstrained backend
+selection defaults to native. The refusal names the platform, says whether the
 trusted fallback would apply to the request, and lists every remedy. Trusted
 fallback may run a write-capable Agent natively, an explicit `danger-full-access`
 invocation always uses the native process backend on all supported platforms, and
 a trusted `sandbox.backend: native` selection runs every Agent natively with the
-permission mode kept — an interactive TUI start offers that selection once, before
-raw mode, when nobody configured `sandbox.onUnavailable` or `sandbox.backend` (see
+permission mode kept. A Linux interactive TUI may offer that selection once before
+raw mode when nobody explicitly required confinement (see
 [unavailable confinement](#unavailable-confinement) and
 [native backend](#native-backend)).
 
-A read-only request is never run natively by
-the first two routes; the native backend selection is its only one. See the
+A read-only request never uses unavailable fallback; it can use the platform-native
+default or trusted native selection. See the
 [sandbox FAQ](../faq.md) for the security boundary, Ubuntu AppArmor setup, and
 nested-sandbox diagnosis.
 

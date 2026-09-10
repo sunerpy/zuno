@@ -43,13 +43,46 @@ struct PendingImage {
 }
 
 /// Images attached to one composer draft.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct AttachmentDraft {
     next_image: usize,
     images: Vec<PendingImage>,
+    history_images: Option<Vec<PendingImage>>,
 }
 
 impl AttachmentDraft {
+    /// Keep rich draft ownership aligned with the editor's history excursion.
+    pub(crate) fn handle_editor_action(
+        &mut self,
+        editor: &mut crate::views::editor::InputEditor,
+        action: &'static crate::keybind::Definition,
+    ) -> crate::views::editor::EditorSignal {
+        use crate::views::editor::EditorSignal;
+        let before = editor.history_position();
+        let submitting = matches!(
+            action.name,
+            "input_submit" | "input_force_submit" | "prompt_submit"
+        );
+        let signal = if submitting && self.has_attached_prompt(&editor.submission_text()) {
+            editor.handle_action_without_history(action)
+        } else {
+            editor.handle_action(action)
+        };
+        let after = editor.history_position();
+        if matches!(action.name, "history_previous" | "history_next") && before != after {
+            match (before, after) {
+                (None, Some(_)) => self.history_images = Some(std::mem::take(&mut self.images)),
+                (Some(_), Some(_)) => self.images.clear(),
+                (Some(_), None) => self.images = self.history_images.take().unwrap_or_default(),
+                (None, None) => {}
+            }
+        }
+        if matches!(signal, EditorSignal::Submit(_)) || action.name == "input_clear" {
+            self.history_images = None;
+        }
+        signal
+    }
+
     /// Whether the visible draft still contains at least one owned image token.
     pub(crate) fn has_attached_prompt(&self, text: &str) -> bool {
         self.images

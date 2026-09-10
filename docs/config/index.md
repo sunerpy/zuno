@@ -39,7 +39,7 @@ true of `delegates`, `requiredSkills`, `writableRoots`, and `instructions`.
 
 ## The top-level shape
 
-Forty-two keys exist. Grouped by what they decide:
+Forty-three keys exist. Grouped by what they decide:
 
 | Group | Keys |
 | --- | --- |
@@ -48,7 +48,7 @@ Forty-two keys exist. Grouped by what they decide:
 | Authority | `permission`, `sandbox`, `shell`, `trust` |
 | Instructions, Skills, and learning | `instructions`, `skills`, `command`, `memory`, `learning` |
 | Context | `compaction`, `continuity`, `tool_output`, `attachment`, `references` |
-| Integrations | `mcp`, `lsp`, `formatter`, `web_search`, `watcher` |
+| Integrations | `mcp`, `mcp_tool_exposure`, `lsp`, `formatter`, `web_search`, `watcher` |
 | Runtime | `acp`, `concurrency`, `goal`, `runtime`, `snapshot`, `tools`, `navigation`, `logLevel` |
 | Deployment | `server` |
 | Editor support | `$schema` |
@@ -103,8 +103,10 @@ silently choosing something.
 
 ## Choosing no-sandbox behavior
 
-The default remains fail-closed: `workspace-write` plus `onUnavailable: "deny"` requires
-the requested confinement backend to be deployable.
+Linux defaults to automatic confinement discovery. Windows/macOS default to native only
+without explicit backend/fallback, denied-network or path constraints. Explicit
+`backend: "auto"` plus `onUnavailable: "deny"` requires deployable confinement on every
+platform. Native defaults preserve the configured permission mode.
 
 To always use the native host process backend, select the explicit mode:
 

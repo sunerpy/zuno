@@ -256,6 +256,33 @@ impl LiveSessionView {
         self.composer.is_empty()
     }
 
+    pub(crate) fn draft_stamp(&self) -> crate::views::editor::DraftStamp {
+        self.composer.draft_stamp()
+    }
+
+    pub(crate) fn save_draft(&self) -> crate::prompt_recovery::SavedDraft {
+        crate::prompt_recovery::SavedDraft::capture(
+            super::session::PromptTarget::Session(self.session_id.clone()),
+            &self.composer,
+            &self.attachments,
+        )
+    }
+
+    pub(crate) fn restore_draft(
+        &mut self,
+        draft: crate::prompt_recovery::SavedDraft,
+    ) -> Option<crate::prompt_recovery::SavedDraft> {
+        draft.restore(&mut self.composer, &mut self.attachments)
+    }
+
+    pub(crate) fn composer_scopes(&self) -> Vec<&'static str> {
+        let mut scopes = self.composer.focused_scopes();
+        if self.composer.is_empty() {
+            scopes.insert(0, "session.child");
+        }
+        scopes
+    }
+
     #[must_use]
     pub fn scroll_offset(&self) -> usize {
         self.transcript.offset()
@@ -298,17 +325,8 @@ impl LiveSessionView {
     }
 
     pub fn handle_composer_action(&mut self, action: &'static Definition) -> EditorSignal {
-        let attached_submission = matches!(
-            action.name,
-            "input_submit" | "input_force_submit" | "prompt_submit"
-        ) && self
-            .attachments
-            .has_attached_prompt(&self.composer.submission_text());
-        if attached_submission {
-            self.composer.handle_action_without_history(action)
-        } else {
-            self.composer.handle_action(action)
-        }
+        self.attachments
+            .handle_editor_action(&mut self.composer, action)
     }
 
     /// Route a pointer gesture into the attached child's own composer.

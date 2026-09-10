@@ -657,36 +657,59 @@ pub(crate) fn assemble(
             authority.iter().any(|expected| expected == &identity)
         });
     }
-    let mut deferred_tool_ids = if selection.tool_authority.is_some() {
-        Vec::new()
-    } else {
-        tools
+    let mcp_schemas = tools
+        .iter()
+        .filter(|tool| {
+            let identity = tool.definition().schema_identity();
+            mcp_tool_identities
+                .iter()
+                .any(|candidate| candidate == &identity)
+        })
+        .map(|tool| super::mcp_exposure::McpSchemaMetadata::of(tool.as_ref()))
+        .collect::<Vec<_>>();
+    let mut pinned = eager_mcp_tool_ids;
+    pinned.extend(
+        mcp_schemas
             .iter()
             .filter(|tool| {
-                let identity = tool.definition().schema_identity();
-                mcp_tool_identities
-                    .iter()
-                    .any(|candidate| candidate == &identity)
-                    && explicit_tool_allowlist
+                selection.tool_authority.is_some()
+                    || explicit_tool_allowlist
                         .as_ref()
-                        .is_none_or(|allowlist| !allowlist.contains(tool.id()))
-                    && !eager_mcp_tool_ids.contains(tool.id())
+                        .is_some_and(|allowlist| allowlist.contains(tool.id.as_str()))
             })
-            .map(|tool| tool.id().to_owned())
-            .collect::<Vec<_>>()
-    };
-    if !deferred_tool_ids.is_empty()
-        && tools
-            .iter()
-            .any(|tool| tool.id() == zuno_engine::dispatch::TOOL_SEARCH_ID)
-    {
-        deferred_tool_ids.clear();
+            .map(|tool| tool.id.clone()),
+    );
+    let conflict = tools
+        .iter()
+        .any(|tool| tool.id() == zuno_engine::dispatch::TOOL_SEARCH_ID);
+    let search_available = !conflict
+        && zuno_permission::visibility::is_tool_visible(
+            zuno_engine::dispatch::TOOL_SEARCH_ID,
+            &rules,
+        )
+        && config
+            .tools
+            .as_ref()
+            .is_none_or(|tools| tools.get(zuno_engine::dispatch::TOOL_SEARCH_ID) != Some(&false));
+    let exposure = super::mcp_exposure::resolve(
+        &config.mcp_tool_exposure.clone().unwrap_or_default(),
+        &mcp_schemas,
+        &pinned,
+        search_available,
+    );
+    if conflict && !mcp_schemas.is_empty() {
         suppressions.push(format!(
             "registered tool `{}` conflicts with Zuno's progressive-discovery tool; \
              connected tool schemas remain eagerly visible for this turn",
             zuno_engine::dispatch::TOOL_SEARCH_ID
         ));
+    } else if !search_available && !mcp_schemas.is_empty() {
+        suppressions.push(
+            "tool_search is disabled or denied; authorized MCP schemas remain directly visible"
+                .to_owned(),
+        );
     }
+    let deferred_tool_ids = exposure.deferred;
     Ok(ToolRuntime {
         tools,
         deferred_tool_ids,
@@ -715,6 +738,12 @@ pub(crate) fn sandbox_backend_selection(config: &Config) -> SandboxBackendSelect
 /// Both come from `config`, which discovery has already narrowed to what trusted
 /// layers may say: a project layer cannot select `native` or `run-unconfined`.
 pub(crate) fn sandbox_backend_request(config: &Config) -> SandboxBackendRequest {
+    let resolved = config.resolved_sandbox_backend();
+    if resolved.selection == ConfigSandboxBackendSelection::Native
+        && resolved.source == zuno_config::schema::sandbox::SandboxBackendSource::PlatformDefault
+    {
+        return SandboxBackendRequest::platform_native();
+    }
     SandboxBackendRequest::new(
         sandbox_unavailable_action(config),
         sandbox_backend_selection(config),
@@ -744,6 +773,12 @@ fn native_notice(resolution: &SandboxResolution) -> Option<String> {
         }
         SandboxResolutionKind::TrustedNative => {
             "The native Shell backend was selected explicitly (sandbox.backend: native).".to_owned()
+        }
+        SandboxResolutionKind::PlatformNative => {
+            format!(
+                "The {} platform uses native Shell execution by default.",
+                std::env::consts::OS
+            )
         }
         SandboxResolutionKind::Confined
         | SandboxResolutionKind::ExplicitNative
@@ -919,6 +954,8 @@ pub(crate) enum SandboxUnavailableDecision {
 pub(crate) struct ConfiguredNativeChoices {
     pub(crate) on_unavailable: Option<ConfigSandboxUnavailableAction>,
     pub(crate) backend: Option<ConfigSandboxBackendSelection>,
+    /// Explicit network/protected-path constraints must not become a native offer.
+    pub(crate) requires_confinement: bool,
 }
 
 impl ConfiguredNativeChoices {
@@ -927,11 +964,13 @@ impl ConfiguredNativeChoices {
         Self {
             on_unavailable: sandbox.and_then(|sandbox| sandbox.on_unavailable),
             backend: sandbox.and_then(|sandbox| sandbox.backend),
+            requires_confinement: config.resolved_sandbox_backend().source
+                == zuno_config::schema::sandbox::SandboxBackendSource::ExplicitConstraints,
         }
     }
 
     fn any(self) -> bool {
-        self.on_unavailable.is_some() || self.backend.is_some()
+        self.on_unavailable.is_some() || self.backend.is_some() || self.requires_confinement
     }
 }
 
@@ -969,6 +1008,35 @@ pub(crate) fn decide_sandbox_unavailable(
 /// composition that follows a preflight does not probe the host twice.
 pub(crate) fn system_sandbox_probe(policy: &SandboxPolicy) -> Result<(), SandboxError> {
     zuno_sandbox::system_backend(policy.workspace(), policy.mode()).map(drop)
+}
+
+/// Validate the complete execution choice before a client commits a mode switch.
+///
+/// Unlike the optional unavailable-backend offer, this also preserves hard errors
+/// from invalid policies, untrusted helpers and unsupported requested constraints.
+pub(crate) fn execution_preflight(
+    directory: &Path,
+    config: &Config,
+    selected_profile: &AgentProfile,
+) -> Result<(), String> {
+    if !shell_visible(
+        selected_profile,
+        selected_profile.definition(),
+        &zuno_harness::ToolManifest::standard(),
+    ) {
+        return Ok(());
+    }
+    let policy = sandbox_policy(
+        directory,
+        config,
+        selected_profile,
+        selected_profile.capabilities().rules(),
+    )?;
+    let requested_mode = policy.mode();
+    Arc::new(SystemSandboxResolver)
+        .resolve(policy, sandbox_backend_request(config))
+        .map(drop)
+        .map_err(|error| render_sandbox_error(error, requested_mode))
 }
 
 /// Whether assembling `selected_profile` would refuse Shell for want of a confined backend.
@@ -1169,6 +1237,7 @@ impl PermissionAsker for HeadlessApproval {
             );
         }
         Err(ToolError::Denied {
+            denial: None,
             tool: tool.to_owned(),
         })
     }

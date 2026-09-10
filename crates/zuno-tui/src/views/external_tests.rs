@@ -211,8 +211,13 @@ fn views_external_copy_command_ladder_picks_one_program_per_host() {
     let windows = copy_command(Platform::Windows, false, everything).expect("powershell");
     assert_eq!(
         windows[0],
-        resolved_argv0("powershell.exe"),
+        resolved_argv0("pwsh.exe"),
         "Windows named the interpreter instead of the file the probe proved"
+    );
+    assert_eq!(
+        copy_command(Platform::Windows, false, only("powershell.exe"))
+            .expect("Windows PowerShell remains usable")[0],
+        resolved_argv0("powershell.exe"),
     );
     assert_eq!(
         windows[1..4],

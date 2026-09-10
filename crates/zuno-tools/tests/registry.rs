@@ -104,6 +104,7 @@ fn ids(tools: &[Arc<dyn Tool>]) -> Vec<&str> {
 
 fn deny(permission: &str, pattern: &str) -> Rule {
     Rule {
+        source: None,
         permission: permission.to_owned(),
         pattern: pattern.to_owned(),
         action: PermissionAction::Deny,

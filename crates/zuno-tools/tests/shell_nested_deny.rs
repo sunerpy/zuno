@@ -30,6 +30,7 @@ impl RuleAsker {
             rules: rules
                 .iter()
                 .map(|(pattern, action)| Rule {
+                    source: None,
                     permission: "shell".to_owned(),
                     pattern: (*pattern).to_owned(),
                     action: *action,
@@ -65,6 +66,7 @@ impl PermissionAsker for RuleAsker {
         for pattern in &ask.patterns {
             if evaluate(&ask.permission, pattern, &self.rules) == PermissionAction::Deny {
                 return Err(ToolError::Denied {
+                    denial: None,
                     tool: tool.to_owned(),
                 });
             }
