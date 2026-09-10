@@ -134,6 +134,11 @@ worktrees leaves other paths' queued jobs and attempt budgets intact.
 
 ### Apply and undo recovery
 
+Managed memory files and their immediate directories must be regular paths,
+not symbolic links or Windows junctions. This is checked before importing or
+reading files and again before publishing a projection. Keep actual memory in
+the managed location; use ordinary approved file tools for other files.
+
 Resident entries now have an authoritative SQLite revision. Applying a candidate
 commits its exact before/after snapshots, the new entries, revision history, and
 the `applied` state in one transaction. Undo advances the revision and records

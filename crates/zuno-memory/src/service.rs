@@ -731,6 +731,7 @@ impl MemoryService {
     }
 
     fn open(&self, scope: Scope) -> Result<MemoryStore, MemoryError> {
+        validate_managed_path(self.paths.for_scope(scope))?;
         MemoryStore::open_with_limit(
             scope,
             self.paths.for_scope(scope).to_path_buf(),
@@ -763,6 +764,7 @@ impl MemoryService {
     }
 
     fn resolved_path(&self, scope: Scope) -> Result<String, MemoryServiceError> {
+        validate_managed_path(self.paths.for_scope(scope))?;
         let path = zuno_atomic_file::canonical_destination(self.paths.for_scope(scope)).map_err(
             |source| MemoryError::Io {
                 operation: "resolve resident memory identity",
@@ -814,6 +816,8 @@ impl MemoryService {
         };
         let scope = Scope::from(document.scope);
         let projection = (|| -> Result<(), MemoryError> {
+            validate_managed_path(self.paths.for_scope(scope))?;
+            validate_managed_path(Path::new(&document.path))?;
             let mut file = MemoryStore::open_with_limit(
                 scope,
                 PathBuf::from(&document.path),
@@ -898,6 +902,40 @@ impl MemoryService {
             observer.changed();
         }
     }
+}
+
+/// Memory has a fixed, application-owned file and its immediate managed
+/// directory. A repository-controlled link must not turn the managed-data
+/// approval exemption into arbitrary filesystem access. The selected worktree
+/// and config-root prefixes may still have ordinary user-selected aliases.
+///
+/// On the pinned Rust toolchain, FileType::is_symlink also rejects Windows
+/// name-surrogate reparse points (including junctions), not cloud placeholders.
+fn validate_managed_path(path: &Path) -> Result<(), MemoryError> {
+    for candidate in std::iter::once(path).chain(path.parent()) {
+        let metadata = match std::fs::symlink_metadata(candidate) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(MemoryError::Io {
+                    operation: "inspect managed memory path",
+                    path: candidate.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(MemoryError::Io {
+                operation: "validate managed memory path",
+                path: candidate.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "managed memory files and directories must not be symbolic links or junctions",
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn operation(

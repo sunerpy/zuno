@@ -115,6 +115,10 @@ Memory 是原生的受限数据能力，不触发 strict 模式通用的副作�
 
 ### Apply 与 undo 恢复
 
+记忆文件及其直接管理目录必须是普通文件／目录，不能是符号链接或 Windows junction。
+导入、读取以及发布文件投影前都会检查，避免仓库中的 `.zuno` 或 `RULES.md` 链接把免审批
+记忆操作转向其他文件。记忆应放在受管理的位置；其他文件仍通过原有权限控制的文件工具操作。
+
 常驻条目现在由 SQLite revision 保存权威状态。应用 candidate 时，精确的 before/after
 快照、新条目、版本历史与 `applied` 终态在同一事务中提交。Undo 同样在一个事务中推进
 revision 并记录 `undone`。两个写入者不能同时替换同一个旧版本。

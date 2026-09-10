@@ -174,6 +174,11 @@ generic strict side-effect approval. It is not an extension/MCP effect declarati
 Explicit tool deny/ask, read/use policy and generation policy remain enforced.
 Read-only roles do not gain `memory_update`. Memory text is fallible recall, never
 permission, tool authority or an enforced Agent/configuration instruction.
+Before adoption/read and again before projection, the service rejects a linked
+memory file or immediate managed directory, including Windows junctions. A
+repository-controlled `.zuno/RULES.md` or `.zuno` link therefore cannot redirect
+the no-approval capability to another file. Ordinary aliases in the selected
+worktree/config-root prefix remain supported.
 
 Format 12 adds candidate revision/evidence columns, `resident_memory_provenance`
 and `memory_maintenance_state`. Formats 5–11 migrate forward atomically with the
