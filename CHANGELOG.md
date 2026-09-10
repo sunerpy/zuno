@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.27](https://github.com/sunerpy/zuno/compare/v0.10.26...v0.10.27) (2026-09-10)
+
+
+### Bug Fixes
+
+* **runtime:** 校正模型用量并支持只读报告交付 ([cbe4576](https://github.com/sunerpy/zuno/commit/cbe45767dfa09b707ddb308a262593aed5d25d86))
+
 ## [0.10.26](https://github.com/sunerpy/zuno/compare/v0.10.25...v0.10.26) (2026-09-09)
 
 
