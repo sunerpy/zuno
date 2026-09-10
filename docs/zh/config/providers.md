@@ -331,6 +331,24 @@ surface 上的 `{"type": "tool", "name": "…"}`，以及 Gemini 上限定单个
 决定——在 Gemini 上就是不发送 `toolConfig` 时的 `AUTO` 模式——并且永远不会被推向一个与你要求
 的不同的工具。
 
+### Bedrock token 统计口径
+
+Converse 和 Anthropic Invoke 的输入桶**互不重叠**：
+`inputTokens` / `input_tokens` 是非缓存输入，缓存读取与缓存写入单独报告，
+三者相加才是完整提示词。Bedrock OpenAI Responses 的口径不同：缓存明细已经包含在
+`input_tokens` 中。
+
+Zuno 保留 provider 原始计数与口径，再计算客户端和预算使用的最新完整提示词、
+累计非重叠用量。provider 的输出数包含推理；明确报告的 thinking 明细会从可见输出中
+拆分，不重复相加。未提供推理明细时保持未报告，不根据可见文本估算。
+
+TUI 保留分批上报中的已有字段，替换当前请求的用量快照。只有新请求才增加新的用量；
+重复事件不会再次累加提示词或推理。重试回滚恢复先前快照，恢复会话时以持久用量替换实时投影。
+
+Invoke 的 `message_start` 与 `message_delta` 更新同一次请求的快照。内容过滤响应
+保留已报告用量，并作为终态拒绝处理，不再按空回答自动重试。修正适用于新请求；
+已有持久 receipt 不会被猜测或改写。
+
 ### Bedrock 的逐模型工具声明
 
 Bedrock 是一个端点后面接着所有厂商的模型，而 Converse 对不支持工具调用的家族返回

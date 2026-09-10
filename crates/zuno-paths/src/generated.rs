@@ -196,6 +196,14 @@ pub const TOOL_OUTPUT: GeneratedPath = GeneratedPath {
     per_session: true,
 };
 
+/// `.zuno/reports/<call-digest>-<name>`, immutable text deliverables written by
+/// `zuno_tools::report_write::ReportWriteTool` without workspace edit authority.
+pub const REPORTS: GeneratedPath = GeneratedPath {
+    pattern: ".zuno/reports/",
+    reason: "host-managed report artifacts with durable tool-call receipts",
+    per_session: true,
+};
+
 /// `.zuno/background/<id>.status.json`, the `<id>.status.json.tmp` it is staged through,
 /// `<id>.output`, and `<id>.lock`: the four names one of the shell tool's background
 /// commands owns.
@@ -222,7 +230,7 @@ pub const BACKGROUND_EXECUTIONS: GeneratedPath = GeneratedPath {
 /// [`GeneratedReason::UnregisteredProjectState`] — so forgetting to register a new
 /// directory costs a less specific report and never a committed one.
 pub const GENERATED_PATHS: &[GeneratedPath] =
-    &[GOAL_PROJECTION, TOOL_OUTPUT, BACKGROUND_EXECUTIONS];
+    &[GOAL_PROJECTION, TOOL_OUTPUT, REPORTS, BACKGROUND_EXECUTIONS];
 
 /// The pattern prefix that makes git read a pattern at every depth in the worktree.
 ///
@@ -915,14 +923,19 @@ mod tests {
     /// The registry is the audit surface, so its exact contents are asserted: adding
     /// or removing an entry has to change this test, on purpose.
     #[test]
-    fn the_registry_lists_the_goal_projection_tool_output_and_background_state_and_nothing_else() {
+    fn the_registry_lists_every_host_generated_directory() {
         let patterns: Vec<&str> = GENERATED_PATHS
             .iter()
             .map(|generated| generated.pattern)
             .collect();
         assert_eq!(
             patterns,
-            [".zuno/goal/", ".zuno/tool-output/", ".zuno/background/"]
+            [
+                ".zuno/goal/",
+                ".zuno/tool-output/",
+                ".zuno/reports/",
+                ".zuno/background/"
+            ]
         );
         let per_session: Vec<bool> = GENERATED_PATHS
             .iter()
@@ -930,9 +943,9 @@ mod tests {
             .collect();
         assert_eq!(
             per_session,
-            [true, true, false],
-            "goal documents and tool output are named for their session; background \
-             state is named for its execution"
+            [true, true, true, false],
+            "goal documents, tool output, and reports have session ownership; \
+             background state is named for its execution"
         );
         for generated in GENERATED_PATHS {
             assert!(

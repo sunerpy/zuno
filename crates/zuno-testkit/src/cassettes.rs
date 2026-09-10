@@ -1024,7 +1024,7 @@ fn replay_recorded_plain_text(family: Family, cassette: &str) {
                 reasoning_tokens: None,
                 cache_read_input_tokens: None,
                 cache_write_input_tokens: None,
-                accounting: PromptAccounting::CacheInsideInput,
+                accounting: PromptAccounting::CacheBesideInput,
             },
         ],
         Family::Gemini => vec![

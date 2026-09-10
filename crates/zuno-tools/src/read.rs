@@ -2,6 +2,7 @@ mod anchor;
 mod support;
 
 use anchor::AnchoredDir;
+pub(crate) use anchor::AnchoredFile;
 
 pub use support::{FileFormatter, NoopFormatter};
 pub(crate) use support::{

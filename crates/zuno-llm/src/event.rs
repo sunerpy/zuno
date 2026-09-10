@@ -450,7 +450,7 @@ impl fmt::Display for FinishReason {
 /// | OpenAI Chat Completions and Responses | [`Self::CacheInsideInput`] | `prompt_tokens_details.cached_tokens` is a breakdown of `prompt_tokens` |
 /// | OpenAI-compatible endpoints | [`Self::CacheInsideInput`] | the OpenAI wire shape, so the OpenAI rule |
 /// | Google Gemini `generateContent` | [`Self::CacheInsideInput`] | `cachedContentTokenCount` is part of `promptTokenCount` |
-/// | Amazon Bedrock `ConverseStream` | [`Self::CacheInsideInput`] | `totalTokens` is `inputTokens + outputTokens`, cache excluded |
+/// | Amazon Bedrock `ConverseStream` | [`Self::CacheBesideInput`] | `inputTokens` excludes both cache buckets |
 /// | Anthropic Messages | [`Self::CacheBesideInput`] | `input_tokens` excludes both cache figures; the three sum to the prompt |
 /// | Google's Anthropic-compatible surface | [`Self::CacheBesideInput`] | the Anthropic wire shape |
 /// | Bedrock `InvokeModelWithResponseStream` on Anthropic | [`Self::CacheBesideInput`] | the Anthropic wire shape |
@@ -608,7 +608,7 @@ pub enum StreamEvent {
     /// `thoughtsTokenCount` *outside* `candidatesTokenCount`, so that adapter folds it
     /// in before publishing rather than leaving each consumer to discover the
     /// difference. `None` means the provider does not itemise reasoning, not that the
-    /// model did none — Anthropic bills thinking as output without breaking it out.
+    /// model did none — some provider surfaces bill thinking as output without a breakdown.
     TokenUsage {
         input_tokens: Option<u64>,
         /// Every token the provider generated, reasoning included.

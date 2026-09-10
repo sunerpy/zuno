@@ -98,7 +98,7 @@ confinement even when the invocation selected `workspace-write` or
 `danger-full-access`:
 
 ```sh
-# Cannot write, whatever sandbox.mode says.
+# Shell cannot modify the workspace, whatever sandbox.mode says.
 zuno run --agent plan "audit the retry policy"
 ```
 
@@ -111,10 +111,22 @@ and the Shell risk gate rather than an OS boundary.
 ## Read-only is a role boundary, not just a sandbox mode
 
 `explorer` is read-only by role, not merely by sandbox mode. Its default surface is
-`read`, `glob`, `grep`, read-only `lsp`, `skill`, and `shell` with `bg` under the
+`read`, `glob`, `grep`, read-only `lsp`, `skill`, `report_write`, and `shell` with `bg` under the
 read-only filesystem policy a read-only role always receives; edits, delegation, `job`,
 and network research are denied. So `du`, `stat`, and `file` are available for evidence,
-while anything that writes is refused below the prompt instead of discouraged by it.
+while workspace edits and Shell writes are refused below the prompt.
+
+Read-only investigation can still produce report files. `report_write` is a separate
+host-managed capability: it writes immutable artifacts under `.zuno/reports/` and
+returns their exact paths and SHA-256 receipts. The parent can consume those files or,
+with its own edit authority, copy them to a requested destination. The child's report
+metadata carries the artifact receipts for both foreground and background tasks.
+This does not open `.zuno` configuration, extensions, project sources, or Shell writes.
+
+The parent Attempt must expose `report_write`, and a configured tool allowlist or
+permission rule may still remove it. Without the capability, the child returns report
+text for the parent to save. A child Shell error saying `Read-only file system` describes
+that attempt's sandbox contract; it does not prove the host disk or parent is read-only.
 
 Every role that may run a command may also inspect what it started. `bg` is granted
 wherever `shell` is, including the read-only roles: a background execution is reachable
@@ -130,7 +142,7 @@ an edit — or do the work in the parent session.
 `/plan` and `/start-plan` enter Plan collaboration mode idempotently, and the restriction is
 enforced below the prompt by a deny-by-default capability overlay: repository inspection,
 read-only LSP and search, external research, questions, Skills, background inspection,
-and typed Goal/Plan/Todo operations are allowed, while file mutation, delegation, `job`,
+typed Goal/Plan/Todo operations, and host-managed reports are allowed, while workspace file mutation, delegation, `job`,
 and `execute` are denied. `shell` stays available under the read-only sandbox the role
 receives, so a command can gather evidence but cannot change the tree.
 

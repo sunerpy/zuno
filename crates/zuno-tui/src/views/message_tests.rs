@@ -1508,7 +1508,12 @@ fn views_transcript_folds_provider_token_usage_for_the_ambient_panel() {
     assert_eq!(tokens.total(), 1_540);
     assert!(!tokens.is_empty());
 
-    // Two reports accumulate rather than replace, because a turn bills per step.
+    // Distinct requests accumulate; snapshots within one request replace.
+    view.handle_event(&AppEvent::Engine(TurnEvent::ProviderRequestStarted {
+        step: 2,
+        message_count: 3,
+        estimated_prompt_tokens: 100,
+    }));
     view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
         input_tokens: Some(100),
         output_tokens: Some(10),
@@ -1670,7 +1675,12 @@ fn views_transcript_context_percentage_measures_the_last_prompt_not_the_session(
     let mut view = view();
     view.handle_event(&AppEvent::Engine(started()));
     view.transcript_mut().set_context_limit(128_000);
-    for _ in 0..2 {
+    for step in 1..=2 {
+        view.handle_event(&AppEvent::Engine(TurnEvent::ProviderRequestStarted {
+            step,
+            message_count: 3,
+            estimated_prompt_tokens: 80_000,
+        }));
         view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
             input_tokens: Some(80_000),
             output_tokens: Some(500),
@@ -1693,6 +1703,132 @@ fn views_transcript_context_percentage_measures_the_last_prompt_not_the_session(
         160_000,
         "the cumulative figure is still cumulative; it is simply not the percentage"
     );
+}
+
+#[test]
+fn views_split_usage_snapshots_replace_one_request_and_keep_reasoning_disjoint() {
+    let mut transcript = Transcript::new();
+    transcript.restore_usage(UsageSnapshot {
+        confirmed: TokenUsage {
+            input: 900,
+            output: 100,
+            cache_read: 200,
+            ..TokenUsage::default()
+        },
+        last_prompt_tokens: Some(1100),
+        confirmed_known: true,
+        ..UsageSnapshot::default()
+    });
+    transcript.observe(&TurnEvent::ProviderRequestStarted {
+        step: 1,
+        message_count: 2,
+        estimated_prompt_tokens: 5200,
+    });
+    transcript.observe(&provider(StreamEvent::TokenUsage {
+        input_tokens: Some(22),
+        output_tokens: Some(1),
+        reasoning_tokens: None,
+        cache_read_input_tokens: Some(0),
+        cache_write_input_tokens: Some(4988),
+        accounting: PromptAccounting::CacheBesideInput,
+    }));
+    let final_usage = provider(StreamEvent::TokenUsage {
+        input_tokens: None,
+        output_tokens: Some(39),
+        reasoning_tokens: Some(7),
+        cache_read_input_tokens: None,
+        cache_write_input_tokens: None,
+        accounting: PromptAccounting::CacheBesideInput,
+    });
+    transcript.observe(&final_usage);
+    let expected = TokenUsage {
+        input: 922,
+        output: 132,
+        reasoning: 7,
+        cache_read: 200,
+        cache_write: 4988,
+        unclassified: 0,
+    };
+    assert_eq!(transcript.tokens(), expected);
+    assert_eq!(transcript.tokens().total(), 6249);
+    assert_eq!(transcript.last_prompt_tokens(), Some(5010));
+    transcript.observe(&final_usage);
+    assert_eq!(
+        transcript.tokens(),
+        expected,
+        "duplicate snapshots are not new charges"
+    );
+
+    transcript.restore_usage(UsageSnapshot {
+        confirmed: expected,
+        last_prompt_tokens: Some(5010),
+        confirmed_known: true,
+        ..UsageSnapshot::default()
+    });
+    transcript.observe(&TurnEvent::ProviderRequestStarted {
+        step: 2,
+        message_count: 4,
+        estimated_prompt_tokens: 100,
+    });
+    transcript.observe(&provider(StreamEvent::TokenUsage {
+        input_tokens: Some(100),
+        output_tokens: Some(10),
+        reasoning_tokens: None,
+        cache_read_input_tokens: Some(50),
+        cache_write_input_tokens: None,
+        accounting: PromptAccounting::CacheInsideInput,
+    }));
+    assert_eq!(transcript.tokens().total(), 6359);
+    assert_eq!(
+        transcript.tokens().reasoning,
+        7,
+        "a new request starts with fresh raw fields"
+    );
+    assert_eq!(transcript.last_prompt_tokens(), Some(100));
+}
+
+#[test]
+fn views_usage_rollback_restores_the_request_baseline_before_replacement() {
+    let mut transcript = Transcript::new();
+    let baseline = TokenUsage {
+        input: 1000,
+        output: 100,
+        ..TokenUsage::default()
+    };
+    transcript.restore_usage(UsageSnapshot {
+        confirmed: baseline,
+        last_prompt_tokens: Some(1000),
+        confirmed_known: true,
+        ..UsageSnapshot::default()
+    });
+    transcript.observe(&started());
+    transcript.observe(&TurnEvent::ProviderRequestStarted {
+        step: 1,
+        message_count: 2,
+        estimated_prompt_tokens: 2000,
+    });
+    transcript.observe(&provider(StreamEvent::TokenUsage {
+        input_tokens: Some(20),
+        output_tokens: Some(5),
+        reasoning_tokens: None,
+        cache_read_input_tokens: Some(1500),
+        cache_write_input_tokens: None,
+        accounting: PromptAccounting::CacheBesideInput,
+    }));
+    transcript.observe(&provider(StreamEvent::RetryRollback { attempt: 2, max: 3 }));
+    assert_eq!(transcript.tokens(), baseline);
+    assert_eq!(transcript.last_prompt_tokens(), Some(1000));
+    transcript.observe(&provider(StreamEvent::TokenUsage {
+        input_tokens: Some(20),
+        output_tokens: Some(15),
+        reasoning_tokens: Some(5),
+        cache_read_input_tokens: Some(1500),
+        cache_write_input_tokens: Some(0),
+        accounting: PromptAccounting::CacheBesideInput,
+    }));
+    assert_eq!(transcript.tokens().total(), 2635);
+    assert_eq!(transcript.tokens().output, 110);
+    assert_eq!(transcript.tokens().reasoning, 5);
 }
 
 #[test]

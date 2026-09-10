@@ -63,7 +63,7 @@ const PARENT_WAKE_INITIAL_DELAY: Duration = Duration::from_millis(10);
 const PARENT_WAKE_MAX_DELAY: Duration = Duration::from_millis(100);
 const PARENT_WAKE_ATTEMPTS: usize = 3;
 const FOREGROUND_CHILD_CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
-const TASK_REPORT_METADATA_SCHEMA_VERSION: u32 = 2;
+const TASK_REPORT_METADATA_SCHEMA_VERSION: u32 = 3;
 const TASK_VERIFICATION_METADATA_KEY: &str = "taskVerification";
 const UNCERTAIN_SIDE_EFFECTS_METADATA_KEY: &str = "uncertainSideEffects";
 
@@ -85,6 +85,7 @@ pub(crate) struct TaskReportMetadata {
     final_text: String,
     usage: TaskReportUsage,
     changed_paths: Vec<String>,
+    artifacts: Vec<zuno_tools::report_write::ReportArtifact>,
     verification_records: Vec<TaskVerificationRecord>,
     uncertain_side_effects: Vec<String>,
     evidence_errors: Vec<String>,
@@ -2387,6 +2388,7 @@ fn task_report_metadata(
     let mut evidence_errors = Vec::new();
     let mut usage = TaskReportUsage::default();
     let mut changed_paths = Vec::new();
+    let mut artifacts = Vec::new();
     let mut verification_records = Vec::new();
 
     match database.open_connection() {
@@ -2413,6 +2415,31 @@ fn task_report_metadata(
                         let Some(metadata) = metadata else {
                             continue;
                         };
+                        if part
+                            .data
+                            .get("state")
+                            .and_then(|state| state.get("status"))
+                            .and_then(Value::as_str)
+                            == Some("completed")
+                            && part.data.get("tool").and_then(Value::as_str)
+                                == Some(zuno_tools::report_write::WIRE_ID)
+                            && let Some(value) =
+                                metadata.get(zuno_tools::report_write::METADATA_KEY)
+                        {
+                            match serde_json::from_value::<zuno_tools::report_write::ReportArtifact>(
+                                value.clone(),
+                            ) {
+                                Ok(artifact) if artifact.session_id == child_session_id => {
+                                    artifacts.push(artifact);
+                                }
+                                Ok(_) => evidence_errors.push(
+                                    "report artifact belongs to another child session".to_owned(),
+                                ),
+                                Err(error) => {
+                                    evidence_errors.push(format!("report artifact: {error}"))
+                                }
+                            }
+                        }
                         paths.extend(
                             metadata
                                 .get(zuno_tool::METADATA_WRITTEN_PATHS_KEY)
@@ -2460,6 +2487,7 @@ fn task_report_metadata(
         final_text: final_text.to_owned(),
         usage,
         changed_paths,
+        artifacts,
         verification_records,
         uncertain_side_effects,
         evidence_errors,

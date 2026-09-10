@@ -72,7 +72,7 @@ Shell 可用时，GitHub 操作优先使用已经安装的 `gh`，仓库搜索�
 沙箱遵循同一条单向规则。即使调用时选择了 `workspace-write` 或 `danger-full-access`，只读 Agent 仍然获得 `read-only` 约束：
 
 ```sh
-# Cannot write, whatever sandbox.mode says.
+# Shell cannot modify the workspace, whatever sandbox.mode says.
 zuno run --agent plan "audit the retry policy"
 ```
 
@@ -80,7 +80,11 @@ zuno run --agent plan "audit the retry policy"
 
 ## 只读是角色边界，不只是沙箱模式
 
-`explorer` 的只读来自角色，而不只是沙箱模式。它的默认工具面是 `read`、`glob`、`grep`、只读的 `lsp`、`skill`，以及在只读角色始终获得的只读文件系统策略下的 `shell` 与 `bg`；编辑、委派、`job` 和网络调研都被拒绝。因此 `du`、`stat`、`file` 可以用来取证，而任何会写入的操作都在提示词之下被拒绝，而不是靠提示词劝阻。
+`explorer` 的只读来自角色，而不只是沙箱模式。它的默认工具面是 `read`、`glob`、`grep`、只读的 `lsp`、`skill`、`report_write`，以及在只读文件系统策略下的 `shell` 与 `bg`；源码编辑、递归委派、`job` 和网络调研都被拒绝。因此 `du`、`stat`、`file` 可以用来取证，工作区编辑与 Shell 写入仍由运行时限制。
+
+只读调查也能生成报告文件。`report_write` 是独立的宿主能力：只在 `.zuno/reports/` 中保存不可覆盖的产物，并返回确切路径与 SHA-256 receipt。父 Agent 可以读取这些文件，或使用自己的编辑权限复制到用户指定的目标。前台与后台任务的报告元数据都会携带产物 receipt。这不会开放 `.zuno` 配置、扩展、项目源码或 Shell 写权限。
+
+父 Attempt 必须暴露 `report_write`；配置的工具白名单和权限规则仍可移除它。没有该能力时，子 Agent 返回报告正文，由父 Agent 保存。子会话 Shell 的 `Read-only file system` 表示该次尝试的沙箱约束，不能据此判断宿主磁盘或父 Agent 也是只读。
 
 每个能运行命令的角色也必须能检查自己启动的东西。凡是授予 `shell` 的地方都会一并授予 `bg`，只读角色也不例外：后台执行只能通过 `bg` 读回，一个大到无法直接返回进对话的结果同样如此。
 
@@ -88,7 +92,7 @@ zuno run --agent plan "audit the retry policy"
 
 ## Plan 模式
 
-终端应用中的 `/plan` 与 `/start-plan` 会幂等进入 Plan 协作模式，而这项限制是在提示词之下由一层默认拒绝的能力覆盖层强制执行的：允许仓库检查、只读 LSP 与搜索、外部调研、提问、Skill、后台检查以及带类型的 Goal/Plan/Todo 操作，而文件修改、委派、`job` 与 `execute` 被拒绝。`shell` 在该角色获得的只读沙箱下仍然可用，因此命令可以取证，但不能改动工作树。
+终端应用中的 `/plan` 与 `/start-plan` 会幂等进入 Plan 协作模式，而这项限制是在提示词之下由一层默认拒绝的能力覆盖层强制执行的：允许仓库检查、只读 LSP 与搜索、外部调研、提问、Skill、后台检查、宿主管理的报告以及带类型的 Goal/Plan/Todo 操作，而工作区文件修改、委派、`job` 与 `execute` 被拒绝。`shell` 在该角色获得的只读沙箱下仍然可用，因此命令可以取证，但不能改动工作树。
 
 回到 Work 模式要求已存在一个持久 plan，确认信息会指出它的标题、revision 和已完成步骤数。模型可以建议开始工作，但不能替你选择。一次确认过的选择会作为会话 Agent 落盘，因此 `--continue`、`--session`、`/session` 选择器以及 ACP 的 `session/load` 都会恢复该模式，连同该会话上次使用的模型与推理强度。
 

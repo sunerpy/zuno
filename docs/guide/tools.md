@@ -15,6 +15,7 @@ The default model-visible surface is deliberately small:
 | `glob` | Find files by pattern | Read-only |
 | `grep` | Search file contents | Read-only |
 | `write` | Create a file, or intentionally replace one whole | Side-effecting |
+| `report_write` | Publish an immutable report in `.zuno/reports/`, including from read-only investigation | Side-effecting |
 | `apply_patch` | Localized, context-verified source edits | Side-effecting |
 | `shell` | Run a command under the active sandbox | Side-effecting |
 | `bg` | Inspect or cancel background commands, and page output kept out of the transcript | Read-only inspection; `cancel` is side-effecting |
@@ -108,6 +109,24 @@ profile-overlay, permission, revision, and restart guidance.
 `edit`, `execute`, and `lsp` exist as registered slots but are not part of the default
 surface. `edit` remains available to explicitly constructed profiles; the default editing
 path is `apply_patch` plus `write`.
+
+## Report files from read-only work
+
+`report_write` accepts `name` (a plain filename such as `audit.md`) and `content`
+(complete UTF-8 text, at most 1 MiB). The host selects the path under the worktree's
+`.zuno/reports/`, includes a digest of the session and call identity in the filename,
+and returns the exact path, byte count, and content SHA-256. A new call publishes a new
+artifact; it cannot overwrite an existing report or select an arbitrary destination.
+Paths, symlinked ancestors, and filenames unsafe on supported platforms are refused.
+
+Report authority is independent of `edit` and does not make Shell write-capable.
+The final parent/child tool intersection and the `report_write` permission still apply.
+Strict mode treats publication as a side effect; replay policy remains `Never`.
+The complete call and its `reportArtifact` receipt are durable. Native child task
+reports also include receipts in `artifacts`, so background delivery and replay retain
+the same file references. Cite the returned path; a parent with edit authority can
+integrate it elsewhere. Reports are excluded from Git and are retained as deliverables,
+including after session pruning, until explicitly removed.
 
 ## `apply_patch` conflict recovery
 

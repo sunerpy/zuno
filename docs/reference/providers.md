@@ -393,6 +393,29 @@ than turned into a failed turn. The model then chooses freely — on Gemini that
 is the `AUTO` mode applied when no `toolConfig` is sent — and can never be
 pushed at a different tool than the one you asked for.
 
+### Bedrock token accounting
+
+Converse and Anthropic Invoke report **disjoint** input buckets:
+`inputTokens` / `input_tokens` is uncached input, alongside cache-read and cache-write
+tokens. The whole prompt is their sum. Bedrock OpenAI Responses uses a different
+contract: its cache details are already included in `input_tokens`.
+
+Zuno preserves the provider counts and their accounting mode, then derives the latest
+whole prompt and cumulative disjoint usage for clients and budgets. Output includes
+reasoning on the provider wire; a reported thinking breakdown is split from visible
+output without adding it twice. An absent breakdown remains unreported, not estimated
+from the visible text.
+
+The live TUI retains partial fields and replaces the current request's usage snapshot.
+Only a new request adds another charge; repeated usage events do not add the prompt or
+reasoning again. Retry rollback restores the prior snapshot, and durable usage replaces
+the live projection on resume.
+
+Invoke usage in `message_start` and `message_delta` updates one request snapshot.
+Content-filtered responses retain reported usage and are terminal refusals, rather
+than empty answers to retry automatically. These corrections apply to new requests;
+existing stored receipts are not guessed or rewritten.
+
 ### Bedrock tool definitions per model
 
 Bedrock is one endpoint in front of every vendor's models, and Converse answers

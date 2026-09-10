@@ -1525,7 +1525,7 @@ fn hard_interrupt_request(context: &TurnContext<'_>) -> Option<HardInterruptRequ
 /// copied, because `ProviderRequestUsage` promises disjoint buckets and this is the
 /// last place the mode is known. Handing a policy the raw figures charged the cached
 /// prompt twice under [`PromptAccounting::CacheInsideInput`] — OpenAI, every
-/// OpenAI-compatible endpoint, Gemini and Bedrock Converse — which is a budget stop
+/// OpenAI-compatible endpoint and Gemini — which is a budget stop
 /// on a turn that still had allowance. `request_context_tokens` right below already
 /// went through the mode for the same reason.
 fn request_usage(accumulator: &StepAccumulator) -> ProviderRequestUsage {
@@ -3141,9 +3141,18 @@ async fn run_turn_in_span(
         }
 
         if !accumulator.has_assistant_parts() {
-            let error = TurnError::EmptyAssistantMessage {
-                provider_id: model.catalog_provider_id,
-                step,
+            let error = if accumulator.finish_reason == Some(FinishReason::ContentFilter) {
+                TurnError::Provider(ProviderError::Refused {
+                    provider: model.catalog_provider_id,
+                    provider_text: Some(
+                        "the model returned a content-filtered response".to_owned(),
+                    ),
+                })
+            } else {
+                TurnError::EmptyAssistantMessage {
+                    provider_id: model.catalog_provider_id,
+                    step,
+                }
             };
             append_provider_request_terminal(
                 context.connection,

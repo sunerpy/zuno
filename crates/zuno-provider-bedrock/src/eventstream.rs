@@ -621,14 +621,19 @@ impl BedrockEventDecoder {
             reasoning_tokens: None,
             cache_read_input_tokens: usage.get("cacheReadInputTokens").and_then(Value::as_u64),
             cache_write_input_tokens: usage.get("cacheWriteInputTokens").and_then(Value::as_u64),
-            // Converse defines `totalTokens` as `inputTokens + outputTokens` with no
-            // cache term, so the cache figures itemise `inputTokens`.
-            accounting: PromptAccounting::CacheInsideInput,
+            // Converse's inputTokens excludes both cache buckets. The wire total
+            // includes input, cache reads, cache writes, and output exactly once.
+            accounting: PromptAccounting::CacheBesideInput,
         });
     }
 
     fn decode_native_event(&mut self, value: &Value) {
         match value.get("type").and_then(Value::as_str) {
+            Some("message_start") => {
+                if let Some(usage) = value.pointer("/message/usage") {
+                    self.native_usage(usage);
+                }
+            }
             Some("content_block_start") => {
                 let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
                 let block = value.get("content_block").unwrap_or(&Value::Null);
@@ -663,24 +668,7 @@ impl BedrockEventDecoder {
             Some("content_block_stop") => self.content_block_stop(value),
             Some("message_delta") => {
                 if let Some(usage) = value.get("usage") {
-                    self.queued.push_back(StreamEvent::TokenUsage {
-                        input_tokens: usage.get("input_tokens").and_then(Value::as_u64),
-                        output_tokens: usage.get("output_tokens").and_then(Value::as_u64),
-                        // The passed-through Messages payload bills thinking as output
-                        // and never itemises it, exactly as the direct Anthropic surface
-                        // does.
-                        reasoning_tokens: None,
-                        cache_read_input_tokens: usage
-                            .get("cache_read_input_tokens")
-                            .and_then(Value::as_u64),
-                        cache_write_input_tokens: usage
-                            .get("cache_creation_input_tokens")
-                            .and_then(Value::as_u64),
-                        // `InvokeModelWithResponseStream` passes Anthropic's own Messages
-                        // payload through, and its three prompt figures are disjoint —
-                        // unlike Converse's above.
-                        accounting: PromptAccounting::CacheBesideInput,
-                    });
+                    self.native_usage(usage);
                 }
                 let stop_reason = value
                     .pointer("/delta/stop_reason")
@@ -693,6 +681,23 @@ impl BedrockEventDecoder {
             }
             _ => {}
         }
+    }
+
+    fn native_usage(&mut self, usage: &Value) {
+        self.queued.push_back(StreamEvent::TokenUsage {
+            input_tokens: usage.get("input_tokens").and_then(Value::as_u64),
+            output_tokens: usage.get("output_tokens").and_then(Value::as_u64),
+            // Thinking is included in output. Preserve an explicit breakdown when
+            // provided; absence must not be inferred from visible reasoning text.
+            reasoning_tokens: usage
+                .pointer("/output_tokens_details/thinking_tokens")
+                .and_then(Value::as_u64),
+            cache_read_input_tokens: usage.get("cache_read_input_tokens").and_then(Value::as_u64),
+            cache_write_input_tokens: usage
+                .get("cache_creation_input_tokens")
+                .and_then(Value::as_u64),
+            accounting: PromptAccounting::CacheBesideInput,
+        });
     }
 
     fn native_delta(&mut self, value: &Value) {
@@ -752,7 +757,7 @@ fn finish_reason(value: &str) -> FinishReason {
         "end_turn" | "stop_sequence" => FinishReason::Stop,
         "max_tokens" => FinishReason::Length,
         "tool_use" => FinishReason::ToolCalls,
-        "content_filtered" | "guardrail_intervened" => FinishReason::ContentFilter,
+        "content_filtered" | "guardrail_intervened" | "refusal" => FinishReason::ContentFilter,
         _ => FinishReason::Unknown,
     }
 }

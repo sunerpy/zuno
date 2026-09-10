@@ -12,6 +12,7 @@
 | `glob` | 按模式查找文件 | 只读 |
 | `grep` | 搜索文件内容 | 只读 |
 | `write` | 创建文件，或有意整体替换一个文件 | 有副作用 |
+| `report_write` | 在 `.zuno/reports/` 发布不可覆盖的报告，支持只读调查 | 有副作用 |
 | `apply_patch` | 局部的、经上下文校验的源码编辑 | 有副作用 |
 | `shell` | 在当前沙箱下运行命令 | 有副作用 |
 | `bg` | 检查或取消后台命令，并分页读回未进入对话记录的输出 | 只读检查；`cancel` 有副作用 |
@@ -87,6 +88,19 @@ owner，因此只有一条路径能够启动 continuation turn。
 [History 与 Notes 连续性配置](/zh/config/continuity)。
 
 `edit`、`execute` 和 `lsp` 作为已注册的槽位存在，但不属于默认工具面。`edit` 仍可供显式构造的 profile 使用；默认的编辑路径是 `apply_patch` 加 `write`。
+
+## 只读任务的报告文件
+
+`report_write` 接收 `name`（如 `audit.md` 的纯文件名）与 `content`（完整 UTF-8
+正文，最多 1 MiB）。宿主选择工作树 `.zuno/reports/` 下的路径，在文件名中加入会话与
+调用身份的摘要，并返回确切路径、字节数与内容 SHA-256。每次调用创建新产物，不能覆盖
+已有报告或选择任意目标。目录路径、符号链接祖先和在支持平台上不安全的文件名会被拒绝。
+
+报告能力独立于 `edit`，不会授予 Shell 写权限。父子工具交集和 `report_write` 权限规则
+仍然生效；strict 模式把发布视为副作用，重放策略保持 `Never`。完整调用及其
+`reportArtifact` receipt 会持久化，原生子任务报告的 `artifacts` 也携带这些 receipt，
+因此后台交付与历史重放保留同一文件引用。引用工具返回的路径，由有编辑权限的父 Agent
+按需整合到其他位置。报告被 Git 忽略，作为交付产物保留；会话清理不会删除它们，需显式移除。
 
 ## `apply_patch` 冲突恢复
 

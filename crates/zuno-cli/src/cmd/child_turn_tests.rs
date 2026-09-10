@@ -525,6 +525,34 @@ fn task_report_metadata_collects_only_typed_durable_evidence() {
     .expect("tool part");
     store.put_message(&assistant).expect("persist assistant");
     store.put_part_at(&tool, 11).expect("persist tool part");
+    let artifact = json!({
+        "name": "audit.md",
+        "path": "/tmp/proj/.zuno/reports/receipt-audit.md",
+        "bytes": 42,
+        "sha256": "a".repeat(64),
+        "sessionId": "ses_child"
+    });
+    let report = zuno_db::message::PartRecord::from_json(
+        json!({
+            "id": "prt_child_artifact",
+            "sessionID": "ses_child",
+            "messageID": assistant.id,
+            "type": "tool",
+            "callID": "call_artifact",
+            "tool": "report_write",
+            "state": {
+                "status": "completed",
+                "input": {"name": "audit.md", "content": "evidence"},
+                "output": "report saved",
+                "metadata": {"reportArtifact": artifact}
+            }
+        }),
+        12,
+    )
+    .expect("report part");
+    store
+        .put_part_at(&report, 12)
+        .expect("persist report receipt");
 
     let metadata = task_report_metadata(
         fixture.host.database.as_ref(),
@@ -542,6 +570,8 @@ fn task_report_metadata_collects_only_typed_durable_evidence() {
     let metadata = serde_json::to_value(metadata).expect("serialize report metadata");
 
     assert_eq!(metadata["jobId"], "job_report");
+    assert_eq!(metadata["schemaVersion"], 3);
+    assert_eq!(metadata["artifacts"], json!([artifact]));
     assert_eq!(
         metadata["changedPaths"],
         json!(["/tmp/proj/src/a.rs", "/tmp/proj/src/b.rs"])
@@ -1241,7 +1271,8 @@ async fn foreground_dispatch_returns_the_same_host_generated_report_shape_as_bac
 
     assert_eq!(turn.job_id, None);
     assert_eq!(turn.output, "foreground answer");
-    assert_eq!(report["schemaVersion"], 2);
+    assert_eq!(report["schemaVersion"], 3);
+    assert_eq!(report["artifacts"], json!([]));
     assert!(
         report["jobId"]
             .as_str()
@@ -1689,7 +1720,8 @@ async fn background_dispatch_returns_a_durable_active_job_before_the_child_finis
         Some("child answer")
     );
     let result = settled.result.as_ref().expect("task report metadata");
-    assert_eq!(result["schemaVersion"], 2);
+    assert_eq!(result["schemaVersion"], 3);
+    assert_eq!(result["artifacts"], json!([]));
     assert_eq!(result["jobId"], job_id);
     assert_eq!(result["sessionId"], turn.session_id);
     assert_eq!(result["parentSessionId"], "ses_owner");

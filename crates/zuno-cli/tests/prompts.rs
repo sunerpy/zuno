@@ -177,6 +177,11 @@ fn descriptions() -> Vec<Description> {
             text: zuno_tools::read::DESCRIPTION,
         },
         Description {
+            wire_id: zuno_tools::report_write::WIRE_ID,
+            file: "crates/zuno-tools/src/description/report-write.txt",
+            text: zuno_tools::report_write::DESCRIPTION,
+        },
+        Description {
             wire_id: "history",
             file: "crates/zuno-continuity/src/description/history.txt",
             text: include_str!("../../zuno-continuity/src/description/history.txt"),

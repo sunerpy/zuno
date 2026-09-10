@@ -135,6 +135,21 @@ CLI 启动。无法抓取的远程规则来源使用同一类非致命 notice，
 任务、资格检查、去重与最多三次尝试约束；真实 provider 限流会保留 typed
 `Retry-After`。新会话固化新的自动默认值，已有 `/memories` 会话策略不会被追溯改写。
 
+## Provider 用量
+
+assistant checkpoint 在同一事务内对账消息快照与会话投影；同一消息的重复 checkpoint
+先扣除旧快照再加入新快照。会话分别保存累计非重叠 token 桶、最新完整提示词和统计口径。
+
+Bedrock Converse 与 Anthropic Invoke 的非缓存输入、缓存读取和缓存写入互不重叠，
+完整输入为三者之和。OpenAI Responses 的缓存明细已包含在输入数中。Invoke 的
+`message_start` 与 `message_delta` 更新同一次请求的快照，明确报告的 thinking 是输出
+的子集。内容过滤导致的空响应会保留已报告用量，并成为带类型的终态 provider 拒绝，
+不会按空回答自动重试。已有历史 receipt 不会被猜测改写。
+
+TUI 保存请求前基线及当前请求的可替换用量快照。分批事件保留未再次报告的字段，
+原始输出先拆分为可见输出和推理，再计入累计非重叠桶。新请求重置快照，
+重试回滚恢复基线；恢复持久会话时清除临时累计状态。
+
 ## 持久输入
 
 用户提示词、steering 以及子 Agent 报告在执行前进入持久 FIFO 收件箱。`reportDelivery: nextStep` 必须完成子结果结算、准许父级输入并唤醒父级，且不存在轮询竞态。
@@ -512,6 +527,20 @@ PowerShell 仍然只是那个守护器的后端依赖，而不是运行 CLI 的�
 从未启动，退出码被记录但没有 exit authority。只有捕获输出中出现守护器自身的诊断行时，
 保留码才被读作守护器的判定，普通程序自行 `exit 125` 仍保留权威收据。信号致死时守护器在
 自身重放同一信号，收据没有退出码，显示为「killed by a signal」而不是 `exit 1`。
+
+## 只读调查的报告产物
+
+`report_write` 是独立于工作区编辑的原生输出能力。宿主接收最多 1 MiB 的报告正文和
+可移植的纯文件名，在 `.zuno/reports/` 选择不可覆盖的路径，并复用 anchored file
+writer 拒绝符号链接越界。该能力不会授予 Shell 或源码写权限。
+
+最终工具快照暴露此能力时才生成 `runtime.reports` 提示词分段；`runtime.read_only`
+说明当前尝试的 Shell 约束，避免把子会话的只读拒绝误判为宿主磁盘只读。父子工具交集、
+显式工具白名单及权限规则仍然生效。
+
+子任务报告元数据 schema 3 的 `artifacts` 数组只从本次 Job 证据边界之后的
+`report_write` receipt 构建，并验证子会话归属。前台结果、后台 Job 结算、父收件箱交付
+和客户端重放使用同一份元数据。报告作为交付产物保留，会话清理不会自动删除。
 
 ## 后台子 Agent 与产品 Agent
 
