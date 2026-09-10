@@ -299,6 +299,15 @@ impl Permissions {
                 .iter()
                 .map(|tool| rule(tool, PermissionAction::Allow)),
         );
+        // Optional native recall tools accompany the corresponding role. These
+        // grants precede user rules and do not grant arbitrary filesystem writes.
+        if self.allowed.contains(&"read") {
+            rules.push(rule("memory_read", PermissionAction::Allow));
+            rules.push(rule("experience_search", PermissionAction::Allow));
+        }
+        if self.allowed.contains(&"edit") {
+            rules.push(rule("memory_update", PermissionAction::Allow));
+        }
         rules
     }
 }

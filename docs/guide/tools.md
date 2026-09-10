@@ -28,7 +28,8 @@ The default model-visible surface is deliberately small:
 | `question` | Ask a structured clarification during Plan | User-mediated |
 
 Durable work state adds `plan_get`, `plan_update`, `todo_get`, `todo_update`, and
-`goal_get`/`goal_update`. `memory_propose` appears when memory is enabled, and
+`goal_get`/`goal_update`. Bounded `memory_read` and `memory_update` appear when memory is enabled;
+updates apply automatically unless a review policy is explicitly configured, and
 `council_run` when the active agent can reach it.
 
 `session_message` is filtered out of every delegated child tool snapshot, even when the

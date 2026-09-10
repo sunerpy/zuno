@@ -569,6 +569,14 @@ impl Builtin {
             ));
             rules.push(("tool_search", allow()));
             rules.push(("report_write", allow()));
+            rules.push(("memory_read", allow()));
+            rules.push(("experience_search", allow()));
+            if matches!(
+                self.name,
+                "orchestrator" | "build" | "deep" | "general" | "fixer"
+            ) {
+                rules.push(("memory_update", allow()));
+            }
         }
         let mut object = OrderedMap::new();
         for (key, rule) in rules {

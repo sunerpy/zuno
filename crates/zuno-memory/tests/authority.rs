@@ -35,6 +35,65 @@ fn proposal(content: &str) -> MemoryProposal {
     }
 }
 
+#[cfg(any(unix, windows))]
+#[test]
+fn managed_memory_rejects_linked_files_and_directories_before_adoption() {
+    for directory_link in [false, true] {
+        let root = TempDir::new().expect("owned fixture");
+        let outside = root.path().join("outside");
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&outside).expect("outside fixture");
+        std::fs::create_dir_all(&project).expect("project fixture");
+        let target = outside.join("RULES.md");
+        std::fs::write(&target, "This is not managed memory.").expect("outside contents");
+        let managed_dir = project.join(".zuno");
+        let managed_file = managed_dir.join("RULES.md");
+        let (source, link) = if directory_link {
+            (outside.as_path(), managed_dir.as_path())
+        } else {
+            std::fs::create_dir_all(&managed_dir).expect("managed directory");
+            (target.as_path(), managed_file.as_path())
+        };
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(source, link).expect("fixture link");
+        #[cfg(windows)]
+        if directory_link {
+            std::os::windows::fs::symlink_dir(source, link).expect("fixture directory link");
+        } else {
+            std::os::windows::fs::symlink_file(source, link).expect("fixture file link");
+        }
+        let pool = Arc::new(Pool::open(&DbLocation::Memory).expect("database"));
+        migration::apply(&mut pool.get().expect("connection")).expect("migration");
+        let service = MemoryService::new(
+            pool.clone(),
+            ScopePaths::at(root.path().join("global.md"), managed_file),
+            ScopeLimits::default(),
+            PromotionPolicy::Automatic,
+        );
+        assert!(
+            service.reconcile().is_err(),
+            "links must not silently import outside data"
+        );
+        assert!(service.snapshot(Scope::Project).is_err());
+        assert!(service.propose(proposal("A bounded note.")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("outside unchanged"),
+            "This is not managed memory."
+        );
+        assert_eq!(
+            pool.get()
+                .expect("connection")
+                .query_row(
+                    "SELECT count(*) FROM resident_memory_document WHERE scope='project'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("no imported content"),
+            0
+        );
+    }
+}
+
 #[test]
 fn unchanged_writes_and_reconciliation_preserve_revision_and_notifications() {
     use std::sync::atomic::{AtomicUsize, Ordering};

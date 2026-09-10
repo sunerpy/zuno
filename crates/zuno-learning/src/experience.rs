@@ -1,9 +1,9 @@
 use crate::extraction::{ExtractedExperience, ExtractedMemory, LearningExtraction};
 use crate::text::{first_forbidden_encoding, smuggled_detail};
 use crate::{LearningServiceError, Result, digest_text};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use uuid::Uuid;
 use zuno_db::experience::{
@@ -12,17 +12,14 @@ use zuno_db::experience::{
 use zuno_db::learning_job::{LearningJobStatus, LearningJobStore, LearningLease};
 use zuno_db::learning_source::{LearningSource, LearningSourceKind, LearningSourceStore};
 use zuno_error::{LearningError, Recovery};
-use zuno_memory::{MemoryProposal, MemoryService};
-use zuno_types::{
-    ExperienceKind, MemoryAction, MemoryCandidateProjection, MemoryCandidateStatus, MemoryScope,
-    MemorySource,
-};
+use zuno_memory::MemoryService;
+use zuno_types::ExperienceKind;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemoryPromotionResult {
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryHintResult {
     pub experience_id: Option<String>,
-    pub candidate: Option<MemoryCandidateProjection>,
-    pub automatically_applied: bool,
+    pub hint: Option<ExtractedMemory>,
     pub rejected_reason: Option<String>,
 }
 
@@ -49,10 +46,12 @@ pub struct ExtractionRefusal {
     pub detail: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExtractionPersistence {
     pub experiences: Vec<ExperienceRecord>,
-    pub memory_promotions: Vec<MemoryPromotionResult>,
+    /// Raw, source-linked suggestions for the separate consolidation phase.
+    /// Extraction never changes resident memory or bypasses its promotion policy.
+    pub memory_hints: Vec<MemoryHintResult>,
     /// Entries that were refused instead of stored. Empty for a clean extraction.
     ///
     /// A front end should report these: an extraction that stored two of three
@@ -83,18 +82,9 @@ pub struct ManualExperienceRequest {
 /// An extraction whose durable identity and per-entry numbering have passed
 /// validation, so writing it can only fail on storage.
 struct ValidatedExtraction {
-    session_id: String,
-    source_message_id: String,
     /// The experiences that will be written, in ordinal order, refused entries
     /// removed.
     new_experiences: Vec<NewExperience>,
-    /// One scaled confidence per `extraction.memories` entry, in the same order.
-    ///
-    /// Scaling is a pure function of the extractor's JSON, so it is decided here
-    /// rather than in the promotion loop: a `0..100` confidence used to be rejected
-    /// *after* the experiences were durable, which left the job `running` for the
-    /// reconciler to requeue forever.
-    memory_confidences: Vec<u16>,
     /// Experiences refused during validation, in ordinal order.
     ///
     /// Refusing an entry removes it from `new_experiences` but not from the
@@ -170,21 +160,15 @@ impl ExperienceService {
             }
         };
         let ValidatedExtraction {
-            session_id,
-            source_message_id,
             new_experiences,
-            memory_confidences,
             mut refusals,
         } = validated;
 
         let mut result = serde_json::to_value(&extraction)
             .expect("LearningExtraction derives a total Serialize implementation");
-        // The experiences are recorded first and the job is settled last, with the
-        // Memory proposals in between. A proposal that fails or loses its process
-        // therefore leaves a still-`running` job under this worker's lease, which
-        // the lease reconciler requeues, instead of a completed job with no
-        // candidates. `record_extraction` is idempotent for the same job and
-        // ordinals, so the requeued attempt is safe.
+        // Extraction has no resident-memory side effects. Only a completed job's
+        // source-validated experiences and raw hints can enter consolidation.
+        // Stable ordinals keep interrupted extraction retries idempotent.
         let experiences = self
             .store
             .record_extraction(job_id, lease, &new_experiences, now)?;
@@ -212,8 +196,8 @@ impl ExperienceService {
                     .map(|ordinal| (ordinal as usize, position))
             })
             .collect::<std::collections::BTreeMap<_, _>>();
-        let mut memory_promotions = Vec::with_capacity(extraction.memories.len());
-        for (index, memory) in extraction.memories.into_iter().enumerate() {
+        let mut memory_hints = Vec::with_capacity(extraction.memories.len());
+        for memory in extraction.memories {
             let Some(linked) = stored_by_ordinal
                 .get(&memory.experience_ordinal)
                 .map(|position| &experiences[*position])
@@ -232,10 +216,9 @@ impl ExperienceService {
                     field: "memories.experience_ordinal".to_owned(),
                     detail: detail.clone(),
                 });
-                memory_promotions.push(MemoryPromotionResult {
+                memory_hints.push(MemoryHintResult {
                     experience_id: None,
-                    candidate: None,
-                    automatically_applied: false,
+                    hint: None,
                     rejected_reason: Some(detail),
                 });
                 continue;
@@ -246,106 +229,31 @@ impl ExperienceService {
                     field: field.to_owned(),
                     detail: detail.clone(),
                 });
-                memory_promotions.push(MemoryPromotionResult {
+                memory_hints.push(MemoryHintResult {
                     experience_id: Some(linked.projection.id.clone()),
-                    candidate: None,
-                    automatically_applied: false,
+                    hint: None,
                     rejected_reason: Some(format!("{field}: {detail}")),
                 });
                 continue;
             }
             if !linked.projection.kind.promotable() {
-                memory_promotions.push(MemoryPromotionResult {
+                memory_hints.push(MemoryHintResult {
                     experience_id: Some(linked.projection.id.clone()),
-                    candidate: None,
-                    automatically_applied: false,
+                    hint: None,
                     rejected_reason: Some(
                         "unresolved issues cannot become Memory or Skill".to_owned(),
                     ),
                 });
                 continue;
             }
-            let Some(service) = &self.memory else {
-                memory_promotions.push(MemoryPromotionResult {
-                    experience_id: Some(linked.projection.id.clone()),
-                    candidate: None,
-                    automatically_applied: false,
-                    rejected_reason: Some("resident Memory is disabled".to_owned()),
-                });
-                continue;
-            };
-            // Decided in `validate_extraction`, before anything was written, so an
-            // extractor that reports confidence on a `0..100` scale can no longer
-            // leave a durable experience behind a job the reconciler requeues.
-            let confidence = memory_confidences[index];
-            let proposal = service.propose_for_review(MemoryProposal {
-                scope: memory.scope.into(),
-                action: memory.action.into(),
-                content: memory.content,
-                old_text: memory.old_text,
-                reason: memory.reason,
-                confidence: memory.confidence,
-                source: MemorySource::Reflection,
-                source_session_id: Some(session_id.clone()),
-                source_message_id: Some(source_message_id.clone()),
-            });
-            let mut candidate = match proposal {
-                Ok(candidate) => candidate,
-                Err(error) => {
-                    // This is where `zuno_memory::first_threat` lands:
-                    // `preview_batch` refuses the operation with
-                    // `MemoryError::Blocked` naming the pattern, and it is the only
-                    // place that scan runs on this path. Recorded in `refusals` as
-                    // well as on the promotion result so the discard is answerable
-                    // from the job row alone — `memory_promotions` is returned to the
-                    // caller but never persisted, and the post-turn worker only logs.
-                    let detail = error.to_string();
-                    refusals.push(ExtractionRefusal {
-                        experience_ordinal: memory.experience_ordinal,
-                        field: "memories.proposal".to_owned(),
-                        detail: detail.clone(),
-                    });
-                    memory_promotions.push(MemoryPromotionResult {
-                        experience_id: Some(linked.projection.id.clone()),
-                        candidate: None,
-                        automatically_applied: false,
-                        rejected_reason: Some(detail),
-                    });
-                    continue;
-                }
-            };
-            let eligible_for_auto = candidate.projection.scope == MemoryScope::Project
-                && confidence >= 9_000
-                && linked.supports_automatic_promotion()
-                && candidate.projection.status == MemoryCandidateStatus::Pending;
-            if eligible_for_auto {
-                if let Err(error) = service.apply_from_learning(candidate.id(), job_id, lease, now)
-                {
-                    self.store
-                        .mark_promoted(&linked.projection.id, candidate.id(), now)?;
-                    let current = service
-                        .candidate(candidate.id())
-                        .map_or(candidate.projection, |record| record.projection);
-                    memory_promotions.push(MemoryPromotionResult {
-                        experience_id: Some(linked.projection.id.clone()),
-                        candidate: Some(current),
-                        automatically_applied: false,
-                        rejected_reason: Some(error.to_string()),
-                    });
-                    continue;
-                }
-                candidate = service.candidate(candidate.id())?;
-            }
-            self.store
-                .mark_promoted(&linked.projection.id, candidate.id(), now)?;
-            memory_promotions.push(MemoryPromotionResult {
+            memory_hints.push(MemoryHintResult {
                 experience_id: Some(linked.projection.id.clone()),
-                automatically_applied: candidate.projection.status
-                    == MemoryCandidateStatus::Applied,
-                candidate: Some(candidate.projection),
+                hint: Some(memory),
                 rejected_reason: None,
             });
         }
+        result["memoryHints"] =
+            serde_json::to_value(&memory_hints).expect("serializable memory hints");
         // Durable before the job is settled, in the same `result` blob the extraction
         // itself is stored in, so "what did this job discard" is answerable from
         // SQLite alone rather than only from a log line the process already dropped.
@@ -357,7 +265,7 @@ impl ExperienceService {
         self.store.finish_extraction(job_id, lease, &result, now)?;
         Ok(ExtractionPersistence {
             experiences,
-            memory_promotions,
+            memory_hints,
             refusals,
         })
     }
@@ -476,7 +384,6 @@ impl ExperienceService {
                 }
             }
         }
-        let mut memory_confidences = Vec::with_capacity(extraction.memories.len());
         for memory in &extraction.memories {
             // Bounded against what the extractor produced, not against what survived
             // validation: an ordinal inside the extractor's own list but pointing at a
@@ -488,16 +395,10 @@ impl ExperienceService {
                     "memory points outside the extracted experience list",
                 ));
             }
-            memory_confidences.push(checked_confidence(
-                memory.confidence,
-                "memories.confidence",
-            )?);
+            checked_confidence(memory.confidence, "memories.confidence")?;
         }
         Ok(ValidatedExtraction {
-            session_id,
-            source_message_id,
             new_experiences,
-            memory_confidences,
             refusals,
         })
     }
@@ -594,8 +495,8 @@ impl ExperienceService {
         self.store.list_for_session(session_id).map_err(Into::into)
     }
 
-    /// Prepare reviewable Memory reversals, then hide the session's derived
-    /// experiences. Resident Memory is never removed in this operation.
+    /// Forget source evidence and retract unsupported derived memory atomically.
+    /// User-owned and independently supported entries remain.
     pub fn prepare_session_cleanup(
         &self,
         session_id: &str,
@@ -610,113 +511,33 @@ impl ExperienceService {
         self.prepare_cleanup_for_experiences(&experience_ids, Some(session_id), now)
     }
 
-    /// Prepare reviewable Memory reversals, then hide an exact evidence set.
-    /// Applied resident Memory is never changed by this operation.
+    /// Forget an exact evidence set without replaying inverse replacements.
     pub fn prepare_cleanup_for_experiences(
         &self,
         experience_ids: &[String],
         source_session_id: Option<&str>,
         now: i64,
     ) -> Result<SessionExperienceCleanup> {
-        let experiences = experience_ids
-            .iter()
-            .map(|id| self.store.get(id))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let memory_ids = experiences
-            .iter()
-            .filter_map(|record| record.projection.promoted_memory_candidate_id.clone())
-            .collect::<BTreeSet<_>>();
-        let mut memory_revocation_candidate_ids = Vec::new();
-        let mut rejected_memory_candidate_ids = Vec::new();
-        if !memory_ids.is_empty() && self.memory.is_none() {
-            return Err(invalid(
-                "session.cleanup",
-                "resident Memory is unavailable, so promoted experience cannot be revoked safely",
-            ));
-        }
         if let Some(memory) = &self.memory {
-            for memory_id in memory_ids {
-                let candidate = memory.candidate(&memory_id)?;
-                match candidate.projection.status {
-                    MemoryCandidateStatus::Applied => {
-                        let proposal =
-                            inverse_memory_proposal(&candidate.projection, source_session_id)?;
-                        let revocation = memory.propose_for_review(proposal)?;
-                        memory_revocation_candidate_ids.push(revocation.projection.id);
-                    }
-                    MemoryCandidateStatus::Pending | MemoryCandidateStatus::Failed => {
-                        let rejected = memory.reject(&memory_id)?;
-                        rejected_memory_candidate_ids.push(rejected.projection.id);
-                    }
-                    MemoryCandidateStatus::Rejected | MemoryCandidateStatus::Undone => {}
-                    MemoryCandidateStatus::Applying
-                    | MemoryCandidateStatus::Undoing
-                    | MemoryCandidateStatus::Uncertain => {
-                        return Err(invalid(
-                            "session.cleanup",
-                            &format!(
-                                "Memory candidate `{memory_id}` is {}; reconcile it before deleting derived experience",
-                                candidate.projection.status.as_str()
-                            ),
-                        ));
-                    }
-                }
-            }
+            let result = memory.forget_sources(experience_ids, source_session_id, now)?;
+            return Ok(SessionExperienceCleanup {
+                forgotten_experience_ids: result.forgotten_experience_ids,
+                memory_revocation_candidate_ids: result
+                    .retractions
+                    .into_iter()
+                    .map(|candidate| candidate.projection.id)
+                    .collect(),
+                rejected_memory_candidate_ids: result.rejected_candidate_ids,
+            });
         }
+        // Other project scopes need not be writable here: their reader revalidates
+        // these same source references and withholds unsupported recall immediately.
         let forgotten_experience_ids = self.store.forget_many(experience_ids, now)?;
         Ok(SessionExperienceCleanup {
             forgotten_experience_ids,
-            memory_revocation_candidate_ids,
-            rejected_memory_candidate_ids,
+            ..SessionExperienceCleanup::default()
         })
     }
-}
-
-fn inverse_memory_proposal(
-    candidate: &MemoryCandidateProjection,
-    source_session_id: Option<&str>,
-) -> Result<MemoryProposal> {
-    let (action, content, old_text) = match candidate.action {
-        MemoryAction::Add => (
-            MemoryAction::Remove,
-            None,
-            candidate
-                .content
-                .clone()
-                .or_else(|| candidate.old_text.clone()),
-        ),
-        MemoryAction::Remove => (MemoryAction::Add, candidate.old_text.clone(), None),
-        MemoryAction::Replace => (
-            MemoryAction::Replace,
-            candidate.old_text.clone(),
-            candidate.content.clone(),
-        ),
-    };
-    if (action == MemoryAction::Add && content.is_none())
-        || (matches!(action, MemoryAction::Remove | MemoryAction::Replace) && old_text.is_none())
-    {
-        return Err(invalid(
-            "memory.revocation",
-            &format!(
-                "Memory candidate `{}` does not contain enough content to construct a reversal",
-                candidate.id
-            ),
-        ));
-    }
-    Ok(MemoryProposal {
-        scope: candidate.scope,
-        action,
-        content,
-        old_text,
-        reason: format!(
-            "review revocation after removing source learning evidence for Memory candidate `{}`",
-            candidate.id,
-        ),
-        confidence: 1.0,
-        source: MemorySource::User,
-        source_session_id: source_session_id.map(str::to_owned),
-        source_message_id: None,
-    })
 }
 
 /// Refuse a model-written field whose *encoding* this side cannot resolve to what a
@@ -754,40 +575,10 @@ fn refuse_forbidden_encoding(field: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Screen one extracted Memory, per candidate, before it is proposed.
-///
-/// A promoted project Memory at confidence `>= 0.9` is written to the resident
-/// project file with no review, and `turn.rs` appends that file's rendered block to
-/// the prompt as `memory.project` verbatim — a higher-authority sink than
-/// `learning.experiences`, and one with no escaping pass. Exactly one screen runs
-/// here, and the split is the point:
-///
-/// * [`first_forbidden_encoding`] runs here because resident memory's own scan
-///   cannot see this class at all: `zuno_memory::threat::INVISIBLE_CHARS` is the 17
-///   bidi/zero-width codepoints and its fold covers only `U+FF01..=U+FF5E`, so a
-///   Tags-block re-spelling of `Ignore all previous instructions` matches no pattern
-///   and is written to the resident file verbatim. This is the only screen in this
-///   crate that resident memory does not already perform.
-/// * `zuno_memory::first_threat` deliberately does **not** run here. It already runs
-///   one call later, inside `MemoryService::propose_for_review` ->
-///   `MemoryStore::preview_batch`, on the exact text that would be written; that hit
-///   is `MemoryError::Blocked`, which this caller records as a per-candidate
-///   `rejected_reason` and a durable `refusedItems` entry while keeping the
-///   experiences. Running it a second time here bought nothing and cost prose:
-///   measured hits are `Documented the deploy key in ~/.ssh/config so the sync
-///   works.` (`ssh_access`), `the user asked to update AGENTS.md`
-///   (`agent_config_mod`) and `Never cat ~/.npmrc into a log.` (`read_secrets`).
-///
-/// `old_text` and `reason` are screened for the encoding class but not for patterns,
-/// which is the same asymmetry: `old_text` names text already in the resident file
-/// and `reason` is never written to it, so neither reaches the `memory.project`
-/// prompt section — only the candidate review surface, as structured JSON.
-///
-/// A hit here loses one candidate, never the batch. The field and the detail travel
-/// out on the promotion result and into the job's durable `refusedItems`, the
-/// experiences in the same extraction stay, and the job completes: a user who meant
-/// the rule can re-teach it, where a user whose whole batch was discarded had nothing
-/// left to re-teach from.
+/// Raw hints are source-linked data, not resident writes. Refuse unresolvable
+/// encodings per item while preserving clean siblings. The separate maintenance
+/// writer applies the resident threat/budget screen to its final proposed text;
+/// extraction cannot bypass that screen by reporting a high confidence.
 fn memory_refusal(memory: &ExtractedMemory) -> Option<(&'static str, String)> {
     for (field, value) in [
         ("memories.content", memory.content.as_deref().unwrap_or("")),
@@ -1002,6 +793,7 @@ mod tests {
         ExtractedMemoryAction, ExtractedMemoryScope,
     };
     use serde_json::json;
+    use std::collections::BTreeSet;
     use tempfile::TempDir;
     use zuno_config::ResolvedLearningConfig;
     use zuno_db::learning_job::{LearningJobStore, NewLearningJob};
@@ -1319,9 +1111,9 @@ mod tests {
             outcome.experiences[0].projection.status,
             zuno_types::ExperienceStatus::Active
         );
-        assert!(outcome.memory_promotions[0].candidate.is_none());
+        assert!(outcome.memory_hints[0].hint.is_none());
         assert!(
-            outcome.memory_promotions[0]
+            outcome.memory_hints[0]
                 .rejected_reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("unresolved"))
@@ -1393,35 +1185,19 @@ mod tests {
             )
             .expect("persist");
 
-        assert_eq!(outcome.memory_promotions.len(), 3);
-        assert!(outcome.memory_promotions[0].automatically_applied);
-        assert_eq!(
-            outcome.memory_promotions[0]
-                .candidate
-                .as_ref()
-                .expect("project candidate")
-                .status,
-            MemoryCandidateStatus::Applied
+        assert_eq!(outcome.memory_hints.len(), 3);
+        assert!(outcome.memory_hints.iter().all(|hint| hint.hint.is_some()));
+        assert!(
+            memory
+                .candidates()
+                .expect("phase one creates no candidates")
+                .is_empty()
         );
-        for promotion in &outcome.memory_promotions[1..] {
-            assert!(!promotion.automatically_applied);
-            assert_eq!(
-                promotion
-                    .candidate
-                    .as_ref()
-                    .expect("review candidate")
-                    .status,
-                MemoryCandidateStatus::Pending
-            );
-        }
-        assert_eq!(
+        assert!(
             memory
                 .entries()
-                .expect("resident entries")
-                .into_iter()
-                .map(|entry| entry.content)
-                .collect::<Vec<_>>(),
-            ["Project high-confidence rule."]
+                .expect("phase one cannot bypass review")
+                .is_empty()
         );
     }
 
@@ -1573,7 +1349,7 @@ mod tests {
                 .len(),
             1
         );
-        assert!(outcome.memory_promotions[0].candidate.is_some());
+        assert!(outcome.memory_hints[0].hint.is_some());
         assert_eq!(
             jobs.get("job-order").expect("job").status,
             LearningJobStatus::Completed
@@ -1646,7 +1422,7 @@ mod tests {
     }
 
     #[test]
-    fn forgetting_promoted_experience_requires_reviewed_memory_revocation() {
+    fn forgetting_raw_experience_does_not_create_a_review_queue() {
         let (_directory, pool, service, memory) = memory_fixture(PromotionPolicy::Automatic);
         verified_job(&pool, "job-forget", &["Promoted procedure"]);
         let persisted = service
@@ -1684,7 +1460,7 @@ mod tests {
             cleanup.forgotten_experience_ids,
             std::slice::from_ref(&experience_id)
         );
-        assert_eq!(cleanup.memory_revocation_candidate_ids.len(), 1);
+        assert!(cleanup.memory_revocation_candidate_ids.is_empty());
         assert_eq!(
             service
                 .get(&experience_id)
@@ -1693,20 +1469,13 @@ mod tests {
                 .status,
             zuno_types::ExperienceStatus::Forgotten
         );
-        assert_eq!(
+        assert!(
             memory
                 .entries()
-                .expect("resident memory is not silently changed")
-                .into_iter()
-                .map(|entry| entry.content)
-                .collect::<Vec<_>>(),
-            ["Keep the verified rule."]
+                .expect("raw hints never became resident memory")
+                .is_empty()
         );
-        let revocation = memory
-            .candidate(&cleanup.memory_revocation_candidate_ids[0])
-            .expect("review candidate");
-        assert_eq!(revocation.projection.status, MemoryCandidateStatus::Pending);
-        assert_eq!(revocation.projection.action, MemoryAction::Remove);
+        assert!(memory.candidates().expect("no approval needed").is_empty());
     }
 
     /// Re-encode `text` in the Unicode Tags block, `U+E0020..=U+E007E`.
@@ -2020,16 +1789,16 @@ mod tests {
         );
         // `memories[0]` named ordinal 2 and must still resolve to ordinal 2 — the
         // assertion a compacted list fails.
-        assert_eq!(outcome.memory_promotions.len(), 1);
+        assert_eq!(outcome.memory_hints.len(), 1);
         assert_eq!(
-            outcome.memory_promotions[0].experience_id.as_deref(),
+            outcome.memory_hints[0].experience_id.as_deref(),
             Some(outcome.experiences[1].projection.id.as_str()),
             "the Memory re-pointed at the wrong experience"
         );
-        assert!(outcome.memory_promotions[0].rejected_reason.is_none());
+        assert!(outcome.memory_hints[0].rejected_reason.is_none());
         let candidates = memory.candidates().expect("candidates");
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].status, MemoryCandidateStatus::Pending);
+        assert!(candidates.is_empty());
+        assert!(outcome.memory_hints[0].hint.is_some());
         let job = jobs.get("job-batch-tags").expect("job");
         assert_eq!(job.status, LearningJobStatus::Completed);
         let refused = &job.result.as_ref().expect("result")["refusedItems"][0];
@@ -2170,18 +1939,17 @@ mod tests {
         assert_eq!(outcome.refusals.len(), 1, "{:?}", outcome.refusals);
         assert_eq!(outcome.refusals[0].field, "memories.content");
         assert!(outcome.refusals[0].detail.contains("U+E0049"));
-        assert_eq!(outcome.memory_promotions.len(), 1);
-        assert!(outcome.memory_promotions[0].candidate.is_none());
-        assert!(!outcome.memory_promotions[0].automatically_applied);
+        assert_eq!(outcome.memory_hints.len(), 1);
+        assert!(outcome.memory_hints[0].hint.is_none());
         assert!(
-            outcome.memory_promotions[0]
+            outcome.memory_hints[0]
                 .rejected_reason
                 .as_deref()
                 .is_some_and(
                     |reason| reason.contains("memories.content") && reason.contains("U+E0049")
                 ),
             "unexpected reason: {:?}",
-            outcome.memory_promotions[0].rejected_reason
+            outcome.memory_hints[0].rejected_reason
         );
         // The experience it was extracted from is kept.
         assert_eq!(outcome.experiences.len(), 1);
@@ -2297,7 +2065,7 @@ mod tests {
     /// operation with `MemoryError::Blocked`, this crate records it as
     /// `memories.proposal` with the pattern name, and the experiences stay.
     #[test]
-    fn a_memory_whose_prose_trips_the_pattern_scan_loses_only_that_candidate() {
+    fn raw_memory_hints_are_data_and_cannot_bypass_the_resident_write_screen() {
         for (pattern, content) in [
             (
                 "ssh_access",
@@ -2352,23 +2120,19 @@ mod tests {
             );
             let job = jobs.get("job-memory-prose").expect("job");
             assert_eq!(job.status, LearningJobStatus::Completed, "{pattern}");
-            // The candidate is the only casualty, and the reason names the pattern in
-            // both the returned result and the durable job row.
-            assert!(
-                outcome.memory_promotions[0]
-                    .rejected_reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains(pattern)),
-                "{pattern}: unexpected reason: {:?}",
-                outcome.memory_promotions[0].rejected_reason
-            );
-            assert_eq!(outcome.refusals.len(), 1, "{pattern}");
-            assert_eq!(outcome.refusals[0].field, "memories.proposal");
-            assert!(outcome.refusals[0].detail.contains(pattern), "{pattern}");
+            // Raw hints are auditable data. The separate maintenance writer runs
+            // the resident threat screen before any content can become recall.
+            assert!(outcome.memory_hints[0].rejected_reason.is_none());
+            assert!(outcome.refusals.is_empty());
             assert_eq!(
-                job.result.as_ref().expect("result")["refusedItems"][0]["field"],
-                json!("memories.proposal"),
-                "{pattern}"
+                job.result.as_ref().expect("result")["memoryHints"][0]["hint"]["content"],
+                json!(content)
+            );
+            assert!(
+                memory
+                    .candidates()
+                    .expect("no candidate side effect")
+                    .is_empty()
             );
             assert!(memory.entries().expect("resident entries").is_empty());
             let resident = std::fs::read_to_string(directory.path().join("project/RULES.md"))
@@ -2420,21 +2184,18 @@ mod tests {
             .expect("a reason mentioning AGENTS.md must not fail the job");
         assert!(outcome.refusals.is_empty(), "{:?}", outcome.refusals);
         assert_eq!(outcome.experiences.len(), 1);
-        assert!(outcome.memory_promotions[0].rejected_reason.is_none());
+        assert!(outcome.memory_hints[0].rejected_reason.is_none());
         let candidates = memory.candidates().expect("candidates");
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].reason, reason);
-        // At `>= 0.9` in project scope the extraction applies it, so the rule the user
-        // taught reaches the resident file instead of being lost with the batch.
-        assert_eq!(candidates[0].status, MemoryCandidateStatus::Applied);
-        assert!(outcome.memory_promotions[0].automatically_applied);
-        assert!(
-            memory
-                .entries()
-                .expect("resident entries")
-                .iter()
-                .any(|entry| entry.content == "Keep the deploy order.")
+        assert!(candidates.is_empty());
+        assert_eq!(
+            outcome.memory_hints[0]
+                .hint
+                .as_ref()
+                .expect("raw hint")
+                .reason,
+            reason
         );
+        assert!(memory.entries().expect("separate phase").is_empty());
         assert_eq!(
             jobs.get("job-memory-reason").expect("job").status,
             LearningJobStatus::Completed

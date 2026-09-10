@@ -136,6 +136,17 @@ pub struct LearningLease {
     pub token: String,
 }
 
+pub struct ProjectLearningClaim<'a> {
+    pub project_id: &'a str,
+    pub owner_id: &'a str,
+    pub now: i64,
+    pub lease_expires: i64,
+    pub idle_before: i64,
+    pub busy_session_ids: &'a [String],
+    /// None leaves memory jobs queued. Only a bound owner may claim its namespace.
+    pub memory_project_path: Option<&'a str>,
+}
+
 impl LearningJobRecord {
     pub fn lease(&self) -> Result<LearningLease, DbError> {
         match (&self.owner_id, &self.lease_token, self.status) {
@@ -429,6 +440,30 @@ impl LearningJobStore {
         idle_before: i64,
         busy_session_ids: &[String],
     ) -> Result<Option<LearningJobRecord>, DbError> {
+        self.claim_project(ProjectLearningClaim {
+            project_id,
+            owner_id,
+            now,
+            lease_expires,
+            idle_before,
+            busy_session_ids,
+            memory_project_path: None,
+        })
+    }
+
+    pub fn claim_project(
+        &self,
+        input: ProjectLearningClaim<'_>,
+    ) -> Result<Option<LearningJobRecord>, DbError> {
+        let ProjectLearningClaim {
+            project_id,
+            owner_id,
+            now,
+            lease_expires,
+            idle_before,
+            busy_session_ids,
+            memory_project_path,
+        } = input;
         if project_id.trim().is_empty() || owner_id.trim().is_empty() || lease_expires <= now {
             return Err(query_error(std::io::Error::other(
                 "project learning claim requires project and owner ids plus a future deadline",
@@ -441,6 +476,20 @@ impl LearningJobStore {
                     "SELECT learning_job.id FROM learning_job
                      WHERE learning_job.status = 'queued'
                        AND learning_job.scheduled_at <= ?1
+                       AND (
+                         COALESCE(json_extract(learning_job.payload,'$.purpose'),'') <> 'memory'
+                         OR json_extract(learning_job.payload,'$.projectPath') = ?5
+                       )
+                       AND (
+                         COALESCE(json_extract(learning_job.payload,'$.purpose'),'') <> 'memory'
+                         OR NOT EXISTS (
+                           SELECT 1 FROM learning_job running_memory
+                           WHERE running_memory.project_id=learning_job.project_id
+                             AND running_memory.kind='project_aggregation'
+                             AND json_extract(running_memory.payload,'$.purpose')='memory'
+                             AND running_memory.status='running' AND running_memory.lease_expires>?1
+                         )
+                       )
                        AND learning_job.kind IN (
                          'extraction','project_aggregation','global_aggregation'
                        )
@@ -484,7 +533,7 @@ impl LearningJobStore {
                      ORDER BY learning_job.scheduled_at, learning_job.time_created,
                               learning_job.id
                      LIMIT 1",
-                    params![now, project_id, idle_before, busy_session_ids],
+                    params![now, project_id, idle_before, busy_session_ids, memory_project_path],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()

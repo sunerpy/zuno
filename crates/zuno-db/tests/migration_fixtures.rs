@@ -17,6 +17,7 @@
 //! | `format-8.sql` | 8      | v0.10.5 | session memory policy                              |
 //! | `format-9.sql` | 9      | v0.10.21| execution control and completion routing            |
 //! | `format-10.sql`| 10     | v0.10.23| versioned memory, provenance, leases and search     |
+//! | `format-11.sql`| 11     | v0.10.28| automatic memory provenance and maintenance        |
 //!
 //! Every fixture is upgraded through the real entry point, [`migration::apply`],
 //! and the result is compared *structurally* with a database `apply` creates from
@@ -118,7 +119,20 @@ const FORMAT_TEN: Fixture = Fixture {
 };
 
 /// Every table `sqlite_master` lists once the current schema is in place.
-const CURRENT_TABLE_COUNT: usize = 55;
+const CURRENT_TABLE_COUNT: usize = 57;
+
+const FORMAT_ELEVEN: Fixture = Fixture {
+    format: 11,
+    release: "v0.10.28",
+    sql: concat!(
+        include_str!("fixtures/format-7.sql"),
+        include_str!("fixtures/format-8.sql"),
+        include_str!("fixtures/format-9.sql"),
+        include_str!("fixtures/format-10.sql"),
+        include_str!("fixtures/format-11.sql")
+    ),
+    table_count: 55,
+};
 
 /// One additive upgrade step, described by what it must leave behind and by the
 /// first statement `schema.rs` runs for it (used to prove, from the statement
@@ -255,8 +269,22 @@ const MEMORY_RUNTIME: Step = Step {
 /// transaction. SQLite rejects the duplicate while *preparing* the statement, so
 /// it never reaches `SQLITE_TRACE_STMT`; the statement immediately before it is
 /// therefore the last one the trace can show before the rollback.
-const TRAP_INDEX: &str = "experience_record_usage_idx";
-const STATEMENT_BEFORE_TRAP: &str = "CREATE INDEX `resident_memory_revision_candidate_idx`";
+const TRAP_INDEX: &str = "resident_memory_provenance_candidate_idx";
+const STATEMENT_BEFORE_TRAP: &str = "CREATE INDEX memory_candidate_path_status_updated_idx";
+
+const AUTOMATIC_MEMORY: Step = Step {
+    name: "automatic memory (format 11 -> 12)",
+    first_statement: "ALTER TABLE memory_candidate ADD COLUMN base_revision",
+    tables: &["resident_memory_provenance", "memory_maintenance_state"],
+    indexes: &[
+        "memory_candidate_path_status_updated_idx",
+        "resident_memory_provenance_candidate_idx",
+    ],
+    columns: &[
+        ("memory_candidate", "base_revision"),
+        ("memory_candidate", "evidence"),
+    ],
+};
 
 fn steps_after(format: u32) -> &'static [&'static Step] {
     match format {
@@ -267,6 +295,7 @@ fn steps_after(format: u32) -> &'static [&'static Step] {
             &MEMORY_POLICY,
             &EXECUTION,
             &MEMORY_RUNTIME,
+            &AUTOMATIC_MEMORY,
         ],
         6 => &[
             &PLAN_STACK,
@@ -274,12 +303,97 @@ fn steps_after(format: u32) -> &'static [&'static Step] {
             &MEMORY_POLICY,
             &EXECUTION,
             &MEMORY_RUNTIME,
+            &AUTOMATIC_MEMORY,
         ],
-        7 => &[&VERIFICATION, &MEMORY_POLICY, &EXECUTION, &MEMORY_RUNTIME],
-        8 => &[&MEMORY_POLICY, &EXECUTION, &MEMORY_RUNTIME],
-        9 => &[&EXECUTION, &MEMORY_RUNTIME],
-        10 => &[&MEMORY_RUNTIME],
+        7 => &[
+            &VERIFICATION,
+            &MEMORY_POLICY,
+            &EXECUTION,
+            &MEMORY_RUNTIME,
+            &AUTOMATIC_MEMORY,
+        ],
+        8 => &[
+            &MEMORY_POLICY,
+            &EXECUTION,
+            &MEMORY_RUNTIME,
+            &AUTOMATIC_MEMORY,
+        ],
+        9 => &[&EXECUTION, &MEMORY_RUNTIME, &AUTOMATIC_MEMORY],
+        10 => &[&MEMORY_RUNTIME, &AUTOMATIC_MEMORY],
+        11 => &[&AUTOMATIC_MEMORY],
         other => panic!("no fixture describes format {other}"),
+    }
+}
+
+#[test]
+fn format_eleven_fixture_matches_the_released_schema() {
+    assert_fixture_is_the_old_format(&FORMAT_ELEVEN);
+    let fixture = include_str!("fixtures/format-11.sql");
+    let ddl = fixture.split("CREATE TABLE").nth(1).expect("DDL start");
+    assert!(ddl.starts_with(" `resident_memory_document`"));
+    // The checked-in delta stays byte-identical to the released DDL, not a schema
+    // assembled by removing features from the new implementation.
+    assert!(fixture.contains(include_str!("../src/schema/memory_runtime.sql").trim()));
+}
+
+#[test]
+fn format_eleven_upgrade_preserves_resident_revisions_and_reaches_current_structure() {
+    assert_upgrade_preserves_rows_and_reaches_the_current_structure(&FORMAT_ELEVEN);
+}
+
+#[test]
+fn format_eleven_failed_upgrade_preserves_original_columns_rows_and_marker() {
+    assert_failed_upgrade_leaves_the_database_untouched(&FORMAT_ELEVEN);
+}
+
+#[test]
+fn format_eleven_backfills_automatic_source_links_without_reclassifying_user_reaffirmations() {
+    for reaffirmed in [false, true] {
+        let dir = temp_dir();
+        let mut connection = load_fixture(&dir.path().join("zuno.db"), &FORMAT_ELEVEN);
+        connection.execute_batch(
+            "INSERT INTO memory_candidate(id,target,target_path,action,content,reason,confidence,
+                source_kind,status,before_entries,after_entries,time_created,time_updated,time_applied)
+             VALUES('legacy-auto','project','legacy-path-alias','add','Keep reviewed resident memory.',
+                'Verified source',9900,'reflection','applied','[]','[\"Keep reviewed resident memory.\"]',
+                10,10,10);
+             UPDATE experience_record SET promoted_memory_candidate_id='legacy-auto' WHERE id='exp_fixture_0001';
+             UPDATE resident_memory_revision SET operation='apply',candidate_id='legacy-auto' WHERE revision=2;"
+        ).expect("released automatic memory with aliased path");
+        if reaffirmed {
+            connection.execute_batch(
+                "INSERT INTO memory_candidate(id,target,target_path,action,content,reason,confidence,
+                    source_kind,status,before_entries,after_entries,time_created,time_updated,time_applied)
+                 VALUES('user-reaffirmation','project','C:/Users/0791/project/.zuno/RULES.md','add',
+                    'Keep reviewed resident memory.','User confirmation',10000,'user','applied',
+                    '[\"Keep reviewed resident memory.\"]','[\"Keep reviewed resident memory.\"]',20,20,20);"
+            ).expect("newer user affirmation");
+        }
+        migration::apply(&mut connection).expect("upgrade");
+        let count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM resident_memory_provenance",
+                [],
+                |row| row.get(0),
+            )
+            .expect("source links");
+        assert_eq!(count, i64::from(!reaffirmed));
+        let content: String = connection
+            .query_row("SELECT entries FROM resident_memory_document", [], |row| {
+                row.get(0)
+            })
+            .expect("preserved memory");
+        assert_eq!(content, "[\"Keep reviewed resident memory.\"]");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status FROM memory_candidate WHERE id='legacy-auto'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .expect("history"),
+            "applied"
+        );
     }
 }
 
@@ -659,7 +773,7 @@ fn read_rows(connection: &Connection, table: &str, columns: &[String]) -> Vec<Ve
         .join(", ");
     let mut statement = connection
         .prepare(&format!(
-            "SELECT {projection} FROM `{table}` ORDER BY rowid"
+            "SELECT {projection} FROM `{table}` ORDER BY {projection}"
         ))
         .expect("prepare the row snapshot");
     statement
@@ -757,8 +871,23 @@ fn assert_fixture_is_the_old_format(fixture: &Fixture) {
         "{context}: table count; tables = {:?}",
         inventory.tables.keys().collect::<Vec<_>>()
     );
-    assert!(
-        inventory.other_objects.is_empty(),
+    let expected_other = if fixture.format >= 11 {
+        [
+            "experience_search_fts_insert",
+            "experience_search_fts_update",
+            "experience_search_fts_delete",
+            "experience_search_cjk_fts_insert",
+            "experience_search_cjk_fts_update",
+            "experience_search_cjk_fts_delete",
+        ]
+        .into_iter()
+        .map(|name| ("trigger".to_owned(), name.to_owned()))
+        .collect()
+    } else {
+        BTreeSet::new()
+    };
+    assert_eq!(
+        inventory.other_objects, expected_other,
         "{context}: unexpected non-table objects {:?}",
         inventory.other_objects
     );

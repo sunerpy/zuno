@@ -1052,12 +1052,12 @@ pub const DEFAULT_LEARNING_SKILL_MAX_LEARNED_RULES: u32 = 15;
 #[derive(Default, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryPromotion {
-    /// Keep every candidate pending until a user approves it.
-    #[default]
+    /// Opt in to reviewing every candidate before application.
     Review,
     /// Apply only candidates at or above `auto_confidence`.
     HighConfidence,
-    /// Apply every validated candidate immediately.
+    /// Apply every validated memory change without a separate approval step.
+    #[default]
     Automatic,
 }
 
@@ -1404,10 +1404,10 @@ impl MemoryConfig {
 #[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryOptions {
-    /// Inject frozen resident blocks into each session's system prompt.
+    /// Capture current resident revisions for each turn's prompt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resident: Option<bool>,
-    /// Expose the model-facing `memory` tool.
+    /// Expose bounded `memory_read` and `memory_update` tools.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool: Option<bool>,
     /// Character cap for global agent notes. Defaults to 2200.
@@ -1416,7 +1416,7 @@ pub struct MemoryOptions {
     /// Character cap for project rules. Defaults to 3000.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_char_limit: Option<NonZeroU32>,
-    /// Candidate promotion policy. Defaults to `review`.
+    /// Memory change policy. Defaults to `automatic`; `review` is an explicit opt-in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub promotion: Option<MemoryPromotion>,
     /// Threshold used by `high_confidence`. Defaults to 0.9.
@@ -1451,7 +1451,7 @@ impl Default for ResolvedMemoryConfig {
             tool: true,
             global_char_limit: DEFAULT_GLOBAL_MEMORY_CHAR_LIMIT as usize,
             project_char_limit: DEFAULT_PROJECT_MEMORY_CHAR_LIMIT as usize,
-            promotion: MemoryPromotion::Review,
+            promotion: MemoryPromotion::Automatic,
             auto_confidence: DEFAULT_MEMORY_AUTO_CONFIDENCE,
         }
     }

@@ -1547,17 +1547,17 @@
               "type": "null"
             }
           ],
-          "description": "Candidate promotion policy. Defaults to `review`."
+          "description": "Memory change policy. Defaults to `automatic`; `review` is an explicit opt-in."
         },
         "resident": {
-          "description": "Inject frozen resident blocks into each session's system prompt.",
+          "description": "Capture current resident revisions for each turn's prompt.",
           "type": [
             "boolean",
             "null"
           ]
         },
         "tool": {
-          "description": "Expose the model-facing `memory` tool.",
+          "description": "Expose bounded `memory_read` and `memory_update` tools.",
           "type": [
             "boolean",
             "null"
@@ -1571,7 +1571,7 @@
       "oneOf": [
         {
           "const": "review",
-          "description": "Keep every candidate pending until a user approves it.",
+          "description": "Opt in to reviewing every candidate before application.",
           "type": "string"
         },
         {
@@ -1581,7 +1581,7 @@
         },
         {
           "const": "automatic",
-          "description": "Apply every validated candidate immediately.",
+          "description": "Apply every validated memory change without a separate approval step.",
           "type": "string"
         }
       ]

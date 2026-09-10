@@ -197,6 +197,30 @@ Windows 剪贴板异步读写，优先 `pwsh.exe`，其次 `powershell.exe`；OS
 
 提交转录回退（`revert_commit`）会删除暂存边界消息 `(time_created, id)` 之后的投影 `session_message` 行与旧表 `message` 行，清空会话的 context epoch，并把所有 `queued`、`steering`、`promoted` 的收件箱输入经常规取消迁移退役，每条各记一条 `session.input.cancelled`；已消费（consumed）的输入是不可变历史，不受影响。回退永不删除收件箱行。随后追加一条 `session.reverted` 事件，字段为：`sessionID`（字符串）、`messageID`（字符串，回退后仍是转录尾部的边界消息）、`marker`（对象，暂存的回退 JSON 原样，如 `{"messageID": "...", "files": []}`）、`boundaryTimeCreated`（i64 毫秒）、`removedMessageCount`（u64，删除的投影行数）、`removedLegacyMessageCount`（u64，删除的旧表行数）、`cancelledInputIDs`（字符串数组，按准入顺序）、`contextEpochCleared`（布尔）、`timeUpdated`（i64 毫秒）。所有键始终存在。
 
+## 自动记忆
+
+常驻 Memory 默认自动维护，不需要逐条 approval。`memory_read` 返回有上限的当前条目及
+revision；`memory_update` 通过宿主管理的 add/replace/remove 接口写入，不接收任意路径。
+它的 `ToolEffect::ManagedMemory` 只免除通用 strict 副作用审批，显式工具 deny/ask、
+会话 generation policy 和只读角色限制仍然生效。已有的 `memory.promotion: review`
+配置继续复核。Skill 仍须显式复核、离线评估和应用。
+
+原始提取只保存带来源的 Experience 与记忆建议。独立的 `MemoryMaintainer` 使用
+`project_aggregation` 的 `purpose: memory` 任务，不依赖 Skill 模式聚合的数量门槛。
+无工具权限的 consolidator 根据当前记忆、有效来源和用户纠正生成最多 32 项修改；
+写入事务重新核验两个 scope 的 revision、任务租约、来源实际内容与 generation policy，
+一次提交候选日志、版本、来源关系、任务终态和无变化水位。语义无效最多修复一次；
+相同输入不在每次轮询重复调用模型。每个前台回合读取两个 scope 的同一 SQLite 快照，
+旧 Prompt receipt 不受后续改写影响。
+
+来源失效会立即隐藏失去全部支持的派生记忆。显式遗忘来源与撤回在同一事务中完成，
+不会恢复纠正前的旧内容，不会删除仍有独立支持或用户主动确认的条目。
+显式遗忘／undo 也限制后续自动重新写入。关闭生成不等于遗忘。记忆只是可出错的参考数据，
+不能成为修改权限、配置或执行命令的授权。数据库格式 12 对格式 5–11 执行原子前向迁移，
+保留原有数据和版本，不要求用户重建数据库。
+
+详见 [Memory 与学习](/zh/guide/memory-learning)。
+
 ## Plan 与 Work 状态迁移
 
 持久的 Goal、Plan、Todo、收件箱和 job 状态控制续跑，而不是自然语言。「接下来我会……」

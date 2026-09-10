@@ -24,7 +24,9 @@
 | `skill` | 发现并加载可复用指令 | 只读 |
 | `question` | 在 Plan 中向用户提出结构化澄清问题 | 用户中介型 |
 
-持久工作状态会额外加入 `plan_get`、`plan_update`、`todo_get`、`todo_update` 以及 `goal_get`/`goal_update`。启用记忆时会出现 `memory_propose`，当前 Agent 能够触达时会出现 `council_run`。
+持久工作状态会额外加入 `plan_get`、`plan_update`、`todo_get`、`todo_update` 以及 `goal_get`/`goal_update`。
+启用记忆时提供受限 `memory_read` 和 `memory_update`；普通更新默认自动应用，显式配置复核策略时除外。
+当前 Agent 能够触达时会出现 `council_run`。
 
 即使父 Attempt 包含它的 schema，`session_message` 也会从每个 delegated child 的工具快照中
 移除。执行时还会再次校验：来源必须是 root，目标必须未归档且属于同一项目，child 目标必须是

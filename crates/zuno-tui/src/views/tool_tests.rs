@@ -51,7 +51,7 @@ fn literal(code: &str) -> Option<String> {
 /// Two shapes are recognised, because the registry declares its tools in two places:
 /// `BuiltinSlot::wire_id`'s `Self::X => "name"` arms for the seventeen slots, and
 /// `pub const *_TOOL_ID: &str = "name"` for the built-ins registered outside the slot table
-/// (`memory_propose`, the goal tools, and the review tools).
+/// (`memory_update`, the goal tools, and the review tools).
 fn registry_wire_ids() -> Vec<String> {
     let mut ids = Vec::new();
     for path in registry_sources() {
@@ -212,7 +212,7 @@ fn tool_summary_quotes_the_argument_that_identifies_each_call() {
             "nosuchtool",
         ),
         (
-            "memory_propose",
+            "memory_update",
             r#"{"target":"project","action":"add","content":"run cargo fmt"}"#,
             "add project: run cargo fmt",
         ),

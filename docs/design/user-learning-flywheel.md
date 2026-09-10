@@ -23,10 +23,11 @@ The implementation is split between two native crates and typed database stores:
 | owner | responsibility |
 | --- | --- |
 | `FeedbackService` | revisioned feedback for one persisted assistant message |
-| `ExperienceService` | extraction settlement, manual records, Memory proposals, and evidence cleanup |
+| `ExperienceService` | extraction settlement, raw memory hints, manual records, and evidence cleanup |
 | `LearningIngestion` | bounded source manifests, manual selection and startup catch-up |
 | `LearningModelClient` | provider requests, deadlines, output schemas and request receipts |
 | `LearningExtractor` / `PatternConsolidator` | isolated extraction and semantic grouping |
+| `MemoryConsolidator` / `MemoryMaintainer` | independent automatic memory consolidation and source invalidation |
 | `LearningSupervisor` / `ProjectLearningService` | process ownership and project queue execution |
 | `ExperienceRetriever` | project-first SQLite FTS retrieval and prompt budgeting |
 | `PatternMiner` | project and cross-project evidence grouping |
@@ -108,18 +109,20 @@ records the exact prompt, digest, model, structured response contract, and an
 empty tool list.
 
 Extraction first atomically records accepted experiences and verified evidence.
-It then proposes Memory and settles the job last. `(job, ordinal)` makes a resumed
-attempt idempotent. Each Memory authority commit checks the attempt token and
-session generation policy in the same transaction as its candidate/document write.
+It settles the job with source-linked raw Memory hints, without mutating resident
+Memory. `(job, ordinal)` makes a resumed attempt idempotent. Only completed
+extractions enter the separate memory maintainer.
 `unresolved_issue` is durable evidence, but SQL and service validation prevent it
 from becoming Memory, pattern evidence, or Skill evaluation evidence.
 
-The extractor may propose resident Memory. Zuno first creates an ordinary
-reviewable `MemoryCandidate`. Only a project-scoped proposal with confidence at
-or above `0.9`, validated citations, and authoritative execution evidence may be
-applied automatically. Model-reported confidence is not an execution receipt. Global
-proposals and lower-confidence project proposals remain pending even when the
-general Memory promotion policy is more permissive.
+The no-tools memory maintainer combines current resident entries, verified sources
+and user correction signals into one bounded plan. It obeys `memory.promotion`
+(`automatic` by default), revalidates source content and commits the plan, candidate
+journal, provenance and completion watermark atomically. Successful tool evidence
+or verified user corrections/preferences can support project memory; global
+preferences require explicit user evidence. Model confidence is not an execution
+receipt. It cannot rewrite user-owned entries, resurrect explicitly forgotten text,
+or apply executable Skills. See [automatic resident memory](memory-learning.md).
 
 `/reflect turn` and `/reflect session` use the same durable admission and
 idempotency path. They do not bypass extraction provenance or promotion policy.
@@ -215,11 +218,11 @@ three times. The `/reflect` result carries the same `refusedItems`, and the
 post-turn extraction worker surfaces each refused entry to the client as a
 `warning: learning extraction refused experience …` status line.
 
-Resident Memory keeps its own fence. A candidate extracted from an experience is
-proposed through the normal review path, so the injection and exfiltration
+Resident Memory keeps its own fence. The separate maintenance plan passes
+through the same write validation, so the injection and exfiltration
 pattern scan still runs on the exact text that would be written to the resident
-file; a hit rejects that one candidate, is reported as `memories.proposal`, and
-the experience it came from is still stored.
+file. An invalid plan gets one bounded repair and never partially commits;
+the source Experience remains stored independently.
 
 At read time retrieval carries the rest of the boundary. The
 `learning.experiences` section escapes `&`, `<`, `>`, and `"`, announces itself
@@ -310,11 +313,12 @@ authoritative filesystem:
 Reconciliation classifies the observed state and never mechanically replays the
 filesystem effect.
 
-Applied Skills and Memory are not silently removed when evidence disappears.
-Deleting a source session or using `/learn forget` first creates pending-review
-revocation candidates and rejects pending candidates that cite the removed
-evidence. Experience rows become `forgotten` but remain durable for the review
-record.
+Applied Skills still require reviewed revocation when evidence disappears.
+Memory is recall data: invalid sources immediately suppress unsupported entries;
+explicit `/learn forget` atomically forgets its evidence and retracts unsupported
+managed entries, rejecting pending derived candidates. Independent support and
+user-owned entries survive. No inverse replacement restores old corrected text.
+Experience and mutation rows remain durable for audit.
 
 ## Client contract
 
@@ -358,6 +362,10 @@ source-verification and usage columns, extraction/evaluation ownership tokens,
 incremental Unicode/trigram FTS and query indexes. Supported formats 5 through 10
 upgrade atomically with the marker last. Exact released fixtures preserve rows;
 current markers with altered tables, triggers or indexes fail closed.
+
+Format 12 adds candidate base revisions and evidence references, resident-memory
+provenance and completed-maintenance watermarks. Formats 5–11 advance atomically;
+user-authored entries and older revision history are preserved.
 
 Schema format 9 adds `session_memory_policy`. The format-8 to format-9 migration
 creates an empty sidecar table without rewriting sessions or learning records.

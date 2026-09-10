@@ -225,6 +225,12 @@ fn validate_name_list(field: &str, values: Option<&[String]>) -> Result<(), Stri
     }
     let mut unique = std::collections::BTreeSet::new();
     for value in values {
+        if field == "tools" && value == "memory_propose" {
+            return Err(
+                "memory_propose was replaced by memory_update; rename this tool allowlist entry"
+                    .to_owned(),
+            );
+        }
         if value.trim().is_empty() {
             return Err(format!("agent `{field}` entries must not be empty"));
         }

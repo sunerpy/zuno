@@ -69,6 +69,16 @@ impl Config {
 
 fn validate_semantics(path: &Path, config: Config) -> Result<Config, ConfigError> {
     let mut issues = Vec::new();
+    if config
+        .tools
+        .as_ref()
+        .is_some_and(|tools| tools.get("memory_propose").is_some())
+    {
+        issues.push(ConfigIssue::new(
+            ["tools","memory_propose"],
+            "memory_propose was replaced by memory_update; rename this switch so an existing disable choice is not silently lost",
+        ));
+    }
     if config.acp.is_some() {
         let runtime = config.resolved_acp_runtime();
         if runtime.max_active_runtimes > runtime.max_open_sessions {

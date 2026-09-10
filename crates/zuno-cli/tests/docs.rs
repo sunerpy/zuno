@@ -1121,7 +1121,8 @@ fn public_structure_http_and_learning_guides_are_complete_and_discoverable() {
         contains_all(
             relative,
             &[
-                "memory_propose",
+                "memory_read",
+                "memory_update",
                 "experience_search",
                 "/memory",
                 "/memories",
@@ -1800,35 +1801,38 @@ fn database_docs_describe_the_guarded_chain_to_the_current_format() {
     contains_all(
         "docs/migration.md",
         &[
-            "current database format is 10",
+            &format!(
+                "current database format is {}",
+                zuno_db::migration::CURRENT_FORMAT
+            ),
             "Format 5",
-            "Format 6",
-            "Format 7",
-            "Format 8",
-            "Format 9",
+            "Formats 5–11",
             "`BEGIN IMMEDIATE`",
-            "marker from 5, 6, 7, 8, or 9 to 10",
+            "exact observed old format",
+            "`resident_memory_provenance`",
+            "`memory_maintenance_state`",
             "`session`, `message`, `memory_candidate`, `learning_job`, `verification_receipt`, or",
             "`work_plan` values",
             "future format",
             "fails closed without modification",
             "format marker updated last",
             "A valid format-5, format-6,",
-            "format-7, format-8, or format-9 database should open",
+            "format-10, or format-11 database should open",
             "should open and migrate automatically",
         ],
     );
     contains_all(
         "docs/zh/operate/migration.md",
         &[
-            "当前数据库格式为 10",
+            &format!("当前数据库格式为 {}", zuno_db::migration::CURRENT_FORMAT),
             "format 5",
             "format 6",
             "format 7",
             "format 8",
             "format 9",
             "`BEGIN IMMEDIATE`",
-            "marker 从 5、6、7、8 或 9 改为 10",
+            "把 marker 更新为 12",
+            "`resident_memory_provenance`",
             "`session`、`message`、",
             "`work_plan` 值",
             "未来格式",
@@ -1840,7 +1844,7 @@ fn database_docs_describe_the_guarded_chain_to_the_current_format() {
     contains_all(
         "docs/zh/operate/prompt-workflow.md",
         &[
-            "数据库当前格式为 10",
+            &format!("数据库当前格式为 {}", zuno_db::migration::CURRENT_FORMAT),
             "format 5",
             "format 6",
             "format 7",

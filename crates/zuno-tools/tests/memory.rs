@@ -1,4 +1,4 @@
-//! Model-facing proof for the durable `memory_propose` boundary.
+//! Model-facing proof for the durable `memory_update` boundary.
 
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -15,10 +15,15 @@ struct Fixture {
     tool: Arc<dyn Tool>,
     service: Arc<MemoryService>,
     paths: ScopePaths,
+    pool: Arc<zuno_db::Pool>,
 }
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_policy(PromotionPolicy::Review)
+    }
+
+    fn with_policy(policy: PromotionPolicy) -> Self {
         let directory = TempDir::new().expect("temp dir");
         let paths = ScopePaths::at(
             directory.path().join("MEMORY.md"),
@@ -42,16 +47,17 @@ impl Fixture {
             .expect("seed tool session");
         drop(connection);
         let service = Arc::new(MemoryService::new(
-            pool,
+            pool.clone(),
             paths.clone(),
             ScopeLimits::default(),
-            PromotionPolicy::Review,
+            policy,
         ));
         Self {
             tool: erase(MemoryTool::new(Arc::clone(&service))),
             service,
             paths,
             _directory: directory,
+            pool,
         }
     }
 
@@ -61,6 +67,129 @@ impl Fixture {
             .await
             .expect("valid proposal")
     }
+}
+
+#[tokio::test]
+async fn automatic_update_read_and_revision_checked_correction_need_no_candidate_approval() {
+    let fixture = Fixture::with_policy(PromotionPolicy::Automatic);
+    assert_eq!(
+        fixture.tool.effect(&json!({})),
+        zuno_tool::ToolEffect::ManagedMemory
+    );
+    let first = fixture
+        .call(json!({
+            "target":"project","action":"add","content":"Use compact reports.",
+            "reason":"Stable preference","confidence":0.95,
+        }))
+        .await;
+    assert_eq!(first.metadata["memory_candidate"]["status"], "applied");
+    let read = erase(zuno_tools::MemoryReadTool::new(fixture.service.clone()));
+    assert_eq!(read.replay_policy(), zuno_tool::ToolReplayPolicy::Safe);
+    let output = read
+        .execute(json!({"target":"project"}), context())
+        .await
+        .expect("read memory");
+    let value: Value = serde_json::from_str(&output.output).expect("JSON memory");
+    let revision = value["scopes"][0]["revision"].as_i64().expect("revision");
+    assert_eq!(
+        value["scopes"][0]["entries"],
+        json!(["Use compact reports."])
+    );
+    fixture
+        .call(json!({
+            "target":"project","action":"replace","old_text":"Use compact reports.",
+            "content":"Use concise Chinese reports.","expected_revision":revision,
+            "reason":"User correction","confidence":1.0,
+        }))
+        .await;
+    fixture.tool.execute(json!({
+        "target":"project","action":"remove","old_text":"reports","expected_revision":revision,
+        "reason":"Stale correction must fail","confidence":1.0,
+    }),context()).await.expect_err("stale base");
+    assert_eq!(
+        fixture.service.entries().expect("entries")[0].content,
+        "Use concise Chinese reports."
+    );
+}
+
+#[tokio::test]
+async fn memory_tools_respect_independent_session_use_and_generation_controls() {
+    for (use_memories, generation) in [(false, "enabled"), (true, "disabled")] {
+        let fixture = Fixture::with_policy(PromotionPolicy::Automatic);
+        fixture.pool.get().expect("db").execute(
+            "INSERT INTO session_memory_policy(session_id,use_memories,generation,revision,reason,source,time_created,time_updated)
+             VALUES('ses_integration',?1,?2,1,'user choice','user',10,10)",
+            rusqlite::params![use_memories,generation],
+        ).expect("session policy");
+        let read = erase(zuno_tools::MemoryReadTool::new(fixture.service.clone()));
+        assert_eq!(
+            read.execute(json!({}), context()).await.is_ok(),
+            use_memories
+        );
+        assert_eq!(fixture.tool.execute(json!({
+            "target":"project","action":"add","content":"A stable preference.","reason":"User preference","confidence":1.0,
+        }),context()).await.is_ok(),generation=="enabled");
+    }
+}
+
+#[tokio::test]
+async fn reviewed_edits_and_legacy_candidates_keep_the_resident_whitespace_contract() {
+    let fixture = Fixture::new();
+    let first=fixture.call(json!({
+        "target":"project","action":"add","content":"Initial note.","reason":"Explicit preference","confidence":1.0,
+    })).await;
+    let id = first.metadata["memory_candidate"]["id"]
+        .as_str()
+        .expect("candidate");
+    fixture
+        .service
+        .edit(
+            id,
+            Some("  Corrected note.\n".to_owned()),
+            None,
+            "User correction".to_owned(),
+            1.0,
+        )
+        .expect("edit");
+    fixture.service.apply(id).expect("apply trimmed edit");
+    assert_eq!(
+        fixture.service.entries().expect("memory")[0].content,
+        "Corrected note."
+    );
+    zuno_db::memory_candidate::MemoryCandidateStore::new(fixture.pool.clone())
+        .create(zuno_db::memory_candidate::NewMemoryCandidate {
+            id: "legacy-whitespace".to_owned(),
+            target: zuno_types::MemoryScope::Project,
+            target_path: fixture
+                .service
+                .scope_identity(zuno_types::MemoryScope::Project)
+                .expect("owned path"),
+            action: zuno_types::MemoryAction::Add,
+            content: Some("  Legacy note.\n".to_owned()),
+            old_text: None,
+            reason: "Earlier stored candidate".to_owned(),
+            confidence: 10000,
+            source: zuno_types::MemorySource::User,
+            source_session_id: None,
+            source_message_id: None,
+            fingerprint: None,
+            base_revision: None,
+            evidence: None,
+            time_created: 1,
+        })
+        .expect("old-format candidate values");
+    fixture
+        .service
+        .apply("legacy-whitespace")
+        .expect("legacy whitespace is not a false provenance conflict");
+    assert!(
+        fixture
+            .service
+            .entries()
+            .expect("memory")
+            .iter()
+            .any(|entry| entry.content == "Legacy note.")
+    );
 }
 
 fn context() -> ToolContext {
@@ -160,6 +289,11 @@ async fn ambiguous_locator_is_rejected_before_a_candidate_is_inserted() {
         ])
         .expect("seed entries");
 
+    let revision = fixture
+        .service
+        .snapshot(Scope::Project)
+        .expect("current memory")
+        .revision;
     let error = fixture
         .tool
         .execute(
@@ -167,6 +301,7 @@ async fn ambiguous_locator_is_rejected_before_a_candidate_is_inserted() {
                 "target": "project",
                 "action": "remove",
                 "old_text": "`make build`",
+                "expected_revision": revision,
                 "reason": "retire a stale command",
                 "confidence": 1.0
             }),

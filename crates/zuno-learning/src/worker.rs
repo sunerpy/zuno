@@ -18,13 +18,22 @@ pub struct ProjectLearningService {
     pub experiences: ExperienceService,
     pub patterns: PatternMiner,
     pub skills: SkillCandidateService,
+    pub memory: Option<Arc<crate::MemoryMaintainer>>,
     pub project_id: String,
     pub project_root: PathBuf,
 }
 
 impl ProjectLearningService {
     pub fn schedule_maintenance(&self, now: i64) -> crate::Result<bool> {
-        let mut changed = matches!(
+        let mut changed = if let Some(memory) = &self.memory {
+            matches!(
+                memory.schedule(&self.scheduler, now)?,
+                LearningScheduleOutcome::Queued(_)
+            )
+        } else {
+            false
+        };
+        changed |= matches!(
             self.scheduler
                 .schedule_project_aggregation(&self.project_id, now)?,
             LearningScheduleOutcome::Queued(_)
@@ -44,12 +53,18 @@ impl ProjectLearningService {
         busy_sessions: &[String],
     ) -> crate::Result<Option<LearningJobRecord>> {
         let now = zuno_db::message::now_millis();
+        let memory_path = self
+            .memory
+            .as_ref()
+            .map(|memory| memory.project_path())
+            .transpose()?;
         self.scheduler.claim_due_for_project_excluding(
             &self.project_id,
             owner,
             now,
             now.saturating_add(3_600_000),
             busy_sessions,
+            memory_path.as_deref(),
         )
     }
 
@@ -85,9 +100,28 @@ impl ProjectLearningService {
                         extraction,
                         zuno_db::message::now_millis(),
                     )?;
+                    self.schedule_maintenance(zuno_db::message::now_millis())?;
                     Ok(())
                 }
                 LearningJobKind::ProjectAggregation | LearningJobKind::GlobalAggregation => {
+                    if let Some(purpose) = job
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("purpose"))
+                    {
+                        if job.kind != LearningJobKind::ProjectAggregation
+                            || purpose.as_str()
+                                != Some(zuno_db::memory_maintenance::MEMORY_MAINTENANCE_PURPOSE)
+                        {
+                            return Err(crate::model::invalid(
+                                "unknown learning aggregation purpose",
+                            ));
+                        }
+                        let memory = self.memory.as_ref().ok_or_else(|| {
+                            crate::model::invalid("automatic memory maintenance is unavailable")
+                        })?;
+                        return memory.execute(&job, &lease, &self.scheduler).await;
+                    }
                     let result = self.aggregate(&job, &lease).await?;
                     self.scheduler.complete(
                         &job.id,

@@ -1,10 +1,9 @@
 # Zuno 数据库生命周期
 
-Zuno 管理自己的配置根目录和数据根目录。当前数据库格式为 10。空数据库直接创建为当前
+Zuno 管理自己的配置根目录和数据根目录。当前数据库格式为 12。空数据库直接创建为当前
 格式；受支持的旧格式通过受保护的前向迁移升级。format 5 是第一个受支持的历史格式，
-format 5 到 format 9 都会原地升级到 format 10，不需要重建数据库。
-迁移链显式覆盖 format 5、format 6、format 7、format 8 与 format 9。
-迁移链显式覆盖 format 5、format 6、format 7、format 8 与 format 9。
+format 5 到 format 11 都会原地升级到 format 12，不需要重建数据库。
+迁移链显式覆盖 format 5、format 6、format 7、format 8、format 9、format 10 与 format 11。
 
 ## Channel 数据库
 
@@ -50,15 +49,12 @@ zuno session list
 
 数据库打开流程识别以下状态：
 
-1. **空数据库。** 完整的 format-10 schema 与唯一 `zuno_schema` marker 被原子创建。
-2. **Format 10。** 在执行应用查询前校验 marker 与当前格式要求的表。
-3. **Format 9。** 原地增加 session execution state、completion delivery 仲裁以及
-   typed inbox trigger 字段。
-4. **Format 8。** 增加带 revision 的 `session_memory_policy`，再增加 format-10 execution schema。
-5. **Format 7。** 增加 `verification_receipt`、session memory policy 与 execution schema。
-6. **Format 6。** 增加 Plan 栈、`work_plan_archive`、验证账本、memory policy 与 execution schema。
-7. **Format 5。** 在一个事务中依次执行全部后续受支持迁移。
-8. **其他任何状态。** 不受支持的更旧格式、未来格式、缺少 marker，或 marker 与必需
+1. **空数据库。** 完整的 format-12 schema 与唯一 `zuno_schema` marker 被原子创建。
+2. **Format 12。** 应用查询前校验 marker、表、约束、索引和触发器。
+3. **Format 5–11。** 在同一事务中按顺序执行所有剩余迁移：学习（6）、Plan 栈（7）、
+   验证账本（8）、会话记忆策略（9）、执行／收件箱状态（10）、记忆版本与检索（11）、
+   自动记忆来源与处理水位（12）。
+4. **其他任何状态。** 不受支持的更旧格式、未来格式、缺少 marker，或 marker 与必需
    表不匹配，都会失败关闭且不修改文件。
 
 两个进程同时打开或升级同一个数据库时，都按拿到 SQLite 写锁之前看到的 format 做决定。
@@ -66,11 +62,11 @@ zuno session list
 总共最多尝试四次。不支持的 format 仍然报告为 schema 不匹配；如果 format 在打开过程中
 持续变化，则以 `zuno_schema` marker 上的冲突失败关闭。两种路径都不会写库。
 
-### Format 5、6、7、8 或 9 到 format 10
+### Format 5–11 到 format 12
 
 受支持的迁移使用一个 SQLite `BEGIN IMMEDIATE` 事务：
 
-1. 重新读取表清单，并要求 marker 恰好为 format 5、6、7、8 或 9。
+1. 重新读取表清单，并要求 marker 恰好为 format 5、6、7、8、9、10 或 11。
 2. 在任何变更前要求历史 `session` 与 `work_plan` 表存在。
 3. 从 format 5 出发时，创建全部 format-6 learning 表和索引。
 4. 从 format 5 或 6 出发时，增加可空的 `parent_plan_id`、默认值为 0 的 `stack_depth`
@@ -80,13 +76,18 @@ zuno session list
 7. 为 `session_input` 增加 `source_key`、`trigger_kind` 与 `cycle_id`，创建
    `session_execution_state`、`completion_delivery` 及其索引；旧输入保留
    `trigger_kind = 'legacy'`。
-8. 通过带旧值条件的更新把 singleton marker 从 5、6、7、8 或 9 改为 10。
-9. 只有全部 schema 操作和 marker 更新成功后才提交。
+8. 对 format 11 之前的格式，增加常驻记忆版本、来源验证、租约令牌、检索快照、
+   Unicode／CJK 增量索引。
+9. 增加候选的可空 `base_revision`／`evidence` 字段、`resident_memory_provenance`、
+   `memory_maintenance_state` 及其索引。回填可精确关联的自动记忆来源，不把用户后来的修改
+   重新归类为自动记忆。
+10. 最后用精确旧值条件把 marker 更新为 12；全部成功后才提交。
 
 任何失败都会回滚整个事务。迁移不会重写已有的 `session`、`message`、
-`memory_candidate`、`learning_job`、`verification_receipt` 或 `work_plan` 值。测试使用
-精确的 format-5 到 format-9 fixture，比较迁移前后的全部旧行，再查询新增 policy 与
-execution 表。
+`memory_candidate`、`verification_receipt` 或 `work_plan` 值；来源验证和租约仅执行已说明的回填。
+测试使用 format-5 到 format-11 的精确发布 fixture，比较 Session、Message、Memory 等保留值，
+再验证新增对象和 marker。Format-11 用例包含已经发布的记忆版本，并验证最后一个索引创建失败时
+整个升级回滚。不需要重建用户数据库。
 
 ### Session execution 与 completion delivery
 
@@ -130,7 +131,7 @@ Zuno 会在执行应用查询前拒绝不受支持的 schema 格式，绝不会�
 
 重要数据应使用对应旧二进制导出，或实现并验证明确的前向迁移。不要猜测 schema、静默
 丢行，也不要要求当前二进制已经支持的格式重建数据库。有效的 format-5、format-6、
-format-7、format-8 或 format-9 数据库应当自动打开并完成迁移。
+format-7、format-8、format-9、format-10 或 format-11 数据库应当自动打开并完成迁移。
 
 ## 未来 schema 变更规则
 

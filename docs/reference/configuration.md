@@ -951,6 +951,12 @@ requires approval. Shell, file writes, durable state changes, delegation,
 product agents, extension lifecycle mutations, and unknown harness or MCP tools
 are side-effecting by default.
 
+The native `memory_update` capability is a deliberate exception for bounded,
+application-owned recall data. It requires no generic strict approval; explicit
+`memory_update: deny/ask`, session generation policy and an opt-in
+`memory.promotion: review` still apply. It grants no arbitrary file, Shell,
+configuration or Skill writes. MCP and extension metadata cannot claim this effect.
+
 `shell` always requires strict approval in strict mode, even for a command such
 as `rg`. Approval and confinement are independent: the native OS sandbox still
 compiles the effective read-only or workspace-write policy after admission.
@@ -1441,7 +1447,7 @@ store:
     "tool": true,
     "global_char_limit": 2200,
     "project_char_limit": 3000,
-    "promotion": "review",
+    "promotion": "automatic",
     "auto_confidence": 0.9
   },
   "learning": {
@@ -1473,9 +1479,9 @@ store:
 }
 ```
 
-- `resident` injects the frozen global and project memory blocks into prompts.
-- `tool` exposes `memory_propose`; it never grants direct file mutation.
-- `promotion` is `review` (default), `high_confidence`, or `automatic`.
+- `resident` injects current global/project revision snapshots at each turn boundary.
+- `tool` exposes bounded `memory_read` and `memory_update`; it never grants arbitrary file mutation.
+- `promotion` is `automatic` (default), `high_confidence`, or opt-in `review`.
   `high_confidence` applies only candidates at or above `auto_confidence`.
 - `auto_confidence` is a finite value in `0..=1` and defaults to `0.9`.
 - `learning.enabled` defaults to `true` and is the master upper bound. When it
@@ -1535,9 +1541,12 @@ store:
 - `skill.require_review` must remain `true`; configuration that disables review
   is rejected.
 
-The extractor receives no tools, network, or filesystem authority. Only
-project-scoped Memory proposals at confidence `>= 0.9` can auto-apply through
-learning. Global and lower-confidence Memory proposals remain pending. Skill
+The extractor and memory consolidator receive no tools, network, or filesystem
+authority. Extraction records raw evidence/hints; separate source-validated
+maintenance obeys the configured Memory promotion policy. Global memory needs
+explicit user evidence; invalid sources cannot keep derived memory in recall.
+Memory updates skip generic strict side-effect approval, but explicit deny/ask and
+session generation policy remain enforced. Skill
 candidates always require explicit review, offline evaluation, and a later apply
 action.
 

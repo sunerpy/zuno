@@ -58,6 +58,8 @@ fn candidate(id: &str) -> NewMemoryCandidate {
         source_session_id: Some(SESSION_ID.to_owned()),
         source_message_id: Some("msg_memory".to_owned()),
         fingerprint: Some(format!("fingerprint-{id}")),
+        base_revision: None,
+        evidence: None,
         time_created: 10,
     }
 }
