@@ -137,7 +137,7 @@ fn publish(
         .map_err(|error| publish_error(WIRE_ID, std::slice::from_ref(&path), error))?;
     Ok(ReportArtifact {
         name: params.name,
-        path: path.to_string_lossy().into_owned(),
+        path: zuno_paths::display_path(&path),
         bytes: params.content.len(),
         sha256: digest,
         session_id: ctx.session_id.clone(),

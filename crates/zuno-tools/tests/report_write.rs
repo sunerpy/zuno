@@ -40,7 +40,17 @@ async fn an_investigator_publishes_complete_reports_without_editing_project_file
     assert_eq!(receipt.bytes, content.len());
     assert_eq!(receipt.sha256.len(), 64);
     assert_eq!(receipt.session_id, "ses_investigation");
-    assert!(std::path::Path::new(&receipt.path).starts_with(root.path().join(".zuno/reports")));
+    assert!(
+        std::path::Path::new(&receipt.path)
+            .canonicalize()
+            .expect("resolve report")
+            .starts_with(
+                root.path()
+                    .canonicalize()
+                    .expect("resolve workspace")
+                    .join(".zuno/reports")
+            )
+    );
     assert_eq!(
         std::fs::read_to_string(&source).expect("source"),
         "original source"
