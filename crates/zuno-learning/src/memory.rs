@@ -123,6 +123,12 @@ pub struct MemoryMaintainer {
 }
 
 impl MemoryMaintainer {
+    pub fn project_path(&self) -> crate::Result<String> {
+        self.memory
+            .scope_identity(MemoryScope::Project)
+            .map_err(Into::into)
+    }
+
     pub fn new(
         pool: Arc<zuno_db::Pool>,
         memory: Arc<MemoryService>,

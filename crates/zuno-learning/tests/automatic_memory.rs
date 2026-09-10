@@ -152,6 +152,20 @@ impl Fixture {
             .projection
             .id
     }
+
+    fn worker(&self, memory: Option<MemoryMaintainer>) -> zuno_learning::ProjectLearningService {
+        let settings = ResolvedLearningConfig::default();
+        zuno_learning::ProjectLearningService {
+            scheduler: self.scheduler.clone(),
+            extractor: Arc::new(SourceExtractor),
+            experiences: self.experiences.clone(),
+            patterns: zuno_learning::PatternMiner::new(self.pool.clone(), settings.clone()),
+            skills: zuno_learning::SkillCandidateService::new(self.pool.clone(), settings),
+            memory: memory.map(Arc::new),
+            project_id: "p".to_owned(),
+            project_root: self._dir.path().to_path_buf(),
+        }
+    }
 }
 fn update(
     request: &MemoryConsolidationRequest,
@@ -753,5 +767,82 @@ async fn canonical_and_aliased_paths_share_foreground_and_background_candidate_h
         .memory
         .undo(candidate.id())
         .expect("undo from canonical binding");
+    assert_eq!(fixture.text(), ["A supported note."]);
+}
+
+#[tokio::test]
+async fn worktree_bindings_do_not_consume_or_exhaust_each_others_memory_jobs() {
+    let fixture = Fixture::new(PromotionPolicy::Automatic, |request| {
+        add(request, "A supported note.")
+    });
+    fixture.remember("A supported note.", 10);
+    let now = zuno_db::message::now_millis();
+    let LearningScheduleOutcome::Queued(first) = fixture
+        .maintainer
+        .schedule(&fixture.scheduler, now)
+        .expect("first namespace")
+    else {
+        panic!("first job");
+    };
+    let other_memory = Arc::new(MemoryService::new(
+        fixture.pool.clone(),
+        ScopePaths::at(
+            fixture.memory.paths().for_scope(zuno_memory::Scope::Global),
+            fixture._dir.path().join("other-worktree/RULES.md"),
+        ),
+        ScopeLimits::default(),
+        PromotionPolicy::Automatic,
+    ));
+    let other = MemoryMaintainer::new(
+        fixture.pool.clone(),
+        other_memory.clone(),
+        fixture.model.clone(),
+        "p".to_owned(),
+        "s".to_owned(),
+    );
+    let LearningScheduleOutcome::Queued(second) = other
+        .schedule(&fixture.scheduler, now)
+        .expect("second namespace")
+    else {
+        panic!("second job");
+    };
+    assert!(
+        fixture
+            .worker(None)
+            .claim("unbound", &[])
+            .expect("unbound worker")
+            .is_none()
+    );
+    let worker = fixture.worker(Some(other));
+    let job = worker
+        .claim("second-worker", &[])
+        .expect("scoped claim")
+        .expect("second job");
+    assert_eq!(job.id, second.id);
+    worker
+        .execute(job, &tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("second namespace");
+    let first_state = fixture
+        .scheduler
+        .get(&first.id)
+        .expect("untouched first job");
+    assert_eq!(first_state.status, LearningJobStatus::Queued);
+    assert_eq!(first_state.attempt, 0);
+    assert!(fixture.text().is_empty());
+    assert_eq!(
+        other_memory.entries().expect("second recall")[0].content,
+        "A supported note."
+    );
+    let first_worker = fixture.worker(Some(fixture.maintainer.clone()));
+    let job = first_worker
+        .claim("first-worker", &[])
+        .expect("rebound claim")
+        .expect("first job retained");
+    assert_eq!(job.id, first.id);
+    first_worker
+        .execute(job, &tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("first namespace resumes");
     assert_eq!(fixture.text(), ["A supported note."]);
 }

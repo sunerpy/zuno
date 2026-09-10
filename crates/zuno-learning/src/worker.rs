@@ -53,12 +53,18 @@ impl ProjectLearningService {
         busy_sessions: &[String],
     ) -> crate::Result<Option<LearningJobRecord>> {
         let now = zuno_db::message::now_millis();
+        let memory_path = self
+            .memory
+            .as_ref()
+            .map(|memory| memory.project_path())
+            .transpose()?;
         self.scheduler.claim_due_for_project_excluding(
             &self.project_id,
             owner,
             now,
             now.saturating_add(3_600_000),
             busy_sessions,
+            memory_path.as_deref(),
         )
     }
 

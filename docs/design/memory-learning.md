@@ -103,6 +103,10 @@ fail closed. The no-tools model sees capped current memory, up to 64 recent veri
 experiences, and explicit correction/forget/undo signals. It returns up to 32
 typed operations. Empty output is a valid success; invalid semantics get one repair.
 
+Claiming a memory job requires the worker's canonical project-memory path to match
+its payload. Another worktree binding, or a worker without Memory enabled, leaves it
+queued without spending an attempt; it cannot misclassify that job as stale.
+
 Automatic updates require current successful tool evidence or verified user
 corrections/preferences. Global changes additionally require explicit user evidence.
 Unresolved and unverified observations cannot support automatic memory. Memory/read

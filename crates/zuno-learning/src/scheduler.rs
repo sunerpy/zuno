@@ -267,7 +267,7 @@ impl LearningScheduler {
         now: i64,
         lease_expires: i64,
     ) -> Result<Option<LearningJobRecord>> {
-        self.claim_due_for_project_excluding(project_id, owner_id, now, lease_expires, &[])
+        self.claim_due_for_project_excluding(project_id, owner_id, now, lease_expires, &[], None)
     }
 
     /// Claim project work while withholding extraction for process-local live sessions.
@@ -278,16 +278,20 @@ impl LearningScheduler {
         now: i64,
         lease_expires: i64,
         busy_session_ids: &[String],
+        memory_project_path: Option<&str>,
     ) -> Result<Option<LearningJobRecord>> {
         let idle_delay = i64::try_from(self.config.post_turn_idle_delay_ms).unwrap_or(i64::MAX);
-        let claimed = self.jobs.claim_due_for_project_eligible_excluding(
-            project_id,
-            owner_id,
-            now,
-            lease_expires,
-            now.saturating_sub(idle_delay),
-            busy_session_ids,
-        )?;
+        let claimed = self
+            .jobs
+            .claim_project(zuno_db::learning_job::ProjectLearningClaim {
+                project_id,
+                owner_id,
+                now,
+                lease_expires,
+                idle_before: now.saturating_sub(idle_delay),
+                busy_session_ids,
+                memory_project_path,
+            })?;
         self.bound_attempts(claimed, owner_id, now)
     }
 

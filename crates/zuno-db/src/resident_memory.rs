@@ -606,10 +606,10 @@ fn update_provenance(
     if candidate.projection.action == MemoryAction::Remove {
         return Ok(());
     }
-    let Some(content) = candidate.projection.content.as_ref() else {
+    let Some(content) = candidate.projection.content.as_deref().map(str::trim) else {
         return Ok(());
     };
-    if !input.after.contains(content) {
+    if !input.after.iter().any(|entry| entry == content) {
         return Err(conflict(
             input.path,
             "applied memory content is not in its after snapshot",
@@ -635,7 +635,7 @@ fn update_provenance(
         )
         .optional()
         .map_err(open::map_error)?;
-    if prior.is_none() && input.before.contains(content) {
+    if prior.is_none() && input.before.iter().any(|entry| entry == content) {
         // Re-observing a user-owned note must not make it removable with the new
         // extraction's source.
         return Ok(());

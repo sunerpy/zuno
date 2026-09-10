@@ -129,6 +129,8 @@ commits at most 32 changes atomically. A successful no-op advances its durable
 watermark, so unchanged input is not sent to the model on every poll.
 One semantic repair is allowed for an invalid plan. Stale revisions, lost leases
 or source-policy changes cannot commit a stale plan.
+Each memory job is claimed only by its bound canonical memory path; switching
+worktrees leaves other paths' queued jobs and attempt budgets intact.
 
 ### Apply and undo recovery
 

@@ -132,6 +132,66 @@ async fn memory_tools_respect_independent_session_use_and_generation_controls() 
     }
 }
 
+#[tokio::test]
+async fn reviewed_edits_and_legacy_candidates_keep_the_resident_whitespace_contract() {
+    let fixture = Fixture::new();
+    let first=fixture.call(json!({
+        "target":"project","action":"add","content":"Initial note.","reason":"Explicit preference","confidence":1.0,
+    })).await;
+    let id = first.metadata["memory_candidate"]["id"]
+        .as_str()
+        .expect("candidate");
+    fixture
+        .service
+        .edit(
+            id,
+            Some("  Corrected note.\n".to_owned()),
+            None,
+            "User correction".to_owned(),
+            1.0,
+        )
+        .expect("edit");
+    fixture.service.apply(id).expect("apply trimmed edit");
+    assert_eq!(
+        fixture.service.entries().expect("memory")[0].content,
+        "Corrected note."
+    );
+    zuno_db::memory_candidate::MemoryCandidateStore::new(fixture.pool.clone())
+        .create(zuno_db::memory_candidate::NewMemoryCandidate {
+            id: "legacy-whitespace".to_owned(),
+            target: zuno_types::MemoryScope::Project,
+            target_path: fixture
+                .service
+                .scope_identity(zuno_types::MemoryScope::Project)
+                .expect("owned path"),
+            action: zuno_types::MemoryAction::Add,
+            content: Some("  Legacy note.\n".to_owned()),
+            old_text: None,
+            reason: "Earlier stored candidate".to_owned(),
+            confidence: 10000,
+            source: zuno_types::MemorySource::User,
+            source_session_id: None,
+            source_message_id: None,
+            fingerprint: None,
+            base_revision: None,
+            evidence: None,
+            time_created: 1,
+        })
+        .expect("old-format candidate values");
+    fixture
+        .service
+        .apply("legacy-whitespace")
+        .expect("legacy whitespace is not a false provenance conflict");
+    assert!(
+        fixture
+            .service
+            .entries()
+            .expect("memory")
+            .iter()
+            .any(|entry| entry.content == "Legacy note.")
+    );
+}
+
 fn context() -> ToolContext {
     ToolContext::new(
         "ses_integration",

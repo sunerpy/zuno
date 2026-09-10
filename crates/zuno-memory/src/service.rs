@@ -177,6 +177,10 @@ impl MemoryService {
         self.limits.for_scope(Scope::from(scope))
     }
 
+    pub fn scope_identity(&self, scope: MemoryScope) -> Result<String, MemoryServiceError> {
+        self.resolved_path(Scope::from(scope))
+    }
+
     pub fn propose(
         &self,
         proposal: MemoryProposal,
@@ -407,6 +411,8 @@ impl MemoryService {
         confidence: f64,
     ) -> Result<MemoryCandidateRecord, MemoryServiceError> {
         let candidate = self.store.get(id)?;
+        let content = content.map(|value| value.trim().to_owned());
+        let old_text = old_text.map(|value| value.trim().to_owned());
         let confidence = confidence_basis_points(confidence)?;
         let reason = reason.trim();
         if reason.is_empty() {
