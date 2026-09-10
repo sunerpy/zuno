@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.29](https://github.com/sunerpy/zuno/compare/v0.10.28...v0.10.29) (2026-09-10)
+
+
+### Bug Fixes
+
+* **memory:** 重构自动提取与无审批记忆维护 ([3995338](https://github.com/sunerpy/zuno/commit/399533887c5c3e8d7c6cff06e5602e15423635cb))
+
 ## [0.10.28](https://github.com/sunerpy/zuno/compare/v0.10.27...v0.10.28) (2026-09-10)
 
 
