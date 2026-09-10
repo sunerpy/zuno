@@ -1073,9 +1073,10 @@ fn session_screen_refuses_a_paste_while_a_modal_owns_the_keyboard() {
 #[test]
 fn session_screen_the_paste_binding_reports_that_it_could_not_read_the_clipboard() {
     // `EditorSignal::Paste` used to fall into a bare redraw, so the binding did nothing
-    // and said nothing. The host clipboard still refuses to read — see
-    // `external::SystemClipboard::read` — and the point is that the refusal is now shown.
-    let (mut screen, _shutdown) = screen();
+    // and said nothing. Inject the unavailable provider: a real Windows clipboard
+    // can read asynchronously and must not make this failure-path test host-dependent.
+    let (screen, _shutdown) = screen();
+    let mut screen = screen.with_clipboard(broken_clipboard());
     let result = screen.handle_action(action("input_paste"), &press_none());
 
     assert!(result.redraw);

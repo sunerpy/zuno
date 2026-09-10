@@ -12962,7 +12962,10 @@ const READ_ONLY_REMEDIES: [&str; 13] = [
 fn sandbox_unavailable_refusal_for_a_write_capable_request_names_every_remedy() {
     let directory = tempfile::TempDir::new().expect("temporary tool workspace");
     let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
-    for json in [r#"{}"#, r#"{"sandbox":{"onUnavailable":"deny"}}"#] {
+    for json in [
+        r#"{"sandbox":{"backend":"auto"}}"#,
+        r#"{"sandbox":{"onUnavailable":"deny"}}"#,
+    ] {
         let config = config_json(json);
         let selected_agent = agent_profile(agent("build"), directory.path(), &config);
         let message = assemble_on_unsupported_platform(
@@ -13003,7 +13006,7 @@ fn sandbox_unavailable_refusal_for_a_read_only_request_names_the_native_backend_
     let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
     let selected_agent = read_only_shell_profile();
     for json in [
-        r#"{}"#,
+        r#"{"sandbox":{"onUnavailable":"deny"}}"#,
         r#"{"sandbox":{"onUnavailable":"run-unconfined"}}"#,
         r#"{"sandbox":{"backend":"auto"}}"#,
     ] {
@@ -13385,7 +13388,9 @@ fn sandbox_preflight_reports_only_an_unsupported_platform_that_assembly_would_re
         |_: &SandboxPolicy| -> Result<(), SandboxError> { Err(SandboxError::BubblewrapNotFound) };
     let confined = |_: &SandboxPolicy| -> Result<(), SandboxError> { Ok(()) };
 
-    let unset = config_json(r#"{}"#);
+    // Request confinement on every host. An unconstrained Windows/macOS default
+    // deliberately resolves to native before any confined-backend probe runs.
+    let unset = config_json(r#"{"sandbox":{"backend":"auto"}}"#);
     let build = agent_profile(agent("build"), directory.path(), &unset);
     assert_eq!(
         tool_runtime::sandbox_preflight(directory.path(), &unset, &build, &standard, &windows),
@@ -13395,7 +13400,7 @@ fn sandbox_preflight_reports_only_an_unsupported_platform_that_assembly_would_re
             },
             requested_mode: SandboxMode::WorkspaceWrite,
         }),
-        "a write-capable request under the default deny would be refused"
+        "a requested automatic backend under the default deny would be refused"
     );
 
     let denied = config_json(r#"{"sandbox":{"onUnavailable":"deny"}}"#);
@@ -13494,7 +13499,7 @@ fn sandbox_preflight_reports_only_an_unsupported_platform_that_assembly_would_re
             },
             requested_mode: SandboxMode::ReadOnly,
         }),
-        "an explicit auto is the default behaviour and is refused like it"
+        "an explicit auto keeps confinement requested even on a native-default platform"
     );
 
     // A Linux host with no usable bubblewrap is a host that genuinely cannot confine,
@@ -13655,59 +13660,54 @@ fn only_the_interactive_tui_offers_native_execution_and_only_before_raw_mode() {
 /// A Linux test host always discovers its own platform, so an injected probe is the
 /// only way to stand where a Windows or macOS user stands.
 #[test]
-fn a_write_capable_plan_without_a_platform_backend_asks_only_on_a_terminal() {
+fn an_explicitly_confined_plan_refuses_without_offering_to_relax_it() {
     use tool_runtime::SandboxUnavailableDecision;
     use zuno_sandbox::{SandboxError, SandboxMode, SandboxPolicy};
 
     let directory = tempfile::TempDir::new().expect("temporary tool workspace");
-    let plan = plan(
+    let config = config_json(r#"{"sandbox":{"backend":"auto"}}"#);
+    let selected_agent = agent("build");
+    let profile = agent_profile(selected_agent.clone(), directory.path(), &config);
+    let plan = plan_for(
         directory
             .path()
             .to_str()
             .expect("a UTF-8 temporary workspace"),
         SessionChoice::New,
+        selected_agent,
+        profile,
+        config,
     );
     let windows = |_: &SandboxPolicy| -> Result<(), SandboxError> {
         Err(SandboxError::UnsupportedPlatform("windows".to_owned()))
     };
     let confined = |_: &SandboxPolicy| -> Result<(), SandboxError> { Ok(()) };
 
-    // On a terminal the one question is offered, because the fixture's Agent is
-    // write-capable and its configuration sets no `sandbox.onUnavailable`.
-    assert_eq!(
-        crate::cmd::tui::decide_for_plan(&plan, &windows, true),
-        SandboxUnavailableDecision::OfferNativeExecution {
-            cause: zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
-                platform: "windows".to_owned(),
-            },
-            requested_mode: SandboxMode::WorkspaceWrite,
-        },
-        "an interactive start offers native execution"
-    );
-
-    // Off a terminal — every headless start, and every agent switch, which decides
-    // while the terminal is in raw mode — the same plan refuses.
-    let refused = crate::cmd::tui::decide_for_plan(&plan, &windows, false);
-    let SandboxUnavailableDecision::Refuse { message } = refused else {
-        panic!("without a terminal there is nobody to ask: {refused:?}");
-    };
-    assert_eq!(
-        message,
-        tool_runtime::sandbox_unavailable_refusal(
-            &zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
-                platform: "windows".to_owned()
-            },
-            SandboxMode::WorkspaceWrite
-        ),
-        "the refusal is the write-capable text, which offers the fallback"
-    );
-    for needle in WRITE_CAPABLE_REMEDIES {
-        assert!(message.contains(needle), "missing {needle:?} in {message}");
+    // An explicit backend choice must not be weakened by an interactive offer,
+    // whether this host's unconstrained default would be native or automatic.
+    for interactive in [true, false] {
+        let refused = crate::cmd::tui::decide_for_plan(&plan, &windows, interactive);
+        let SandboxUnavailableDecision::Refuse { message } = refused else {
+            panic!("an explicit confinement request must be kept: {refused:?}");
+        };
+        assert_eq!(
+            message,
+            tool_runtime::sandbox_unavailable_refusal(
+                &zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
+                    platform: "windows".to_owned()
+                },
+                SandboxMode::WorkspaceWrite
+            ),
+            "the refusal retains the write-capable remedies"
+        );
+        for needle in WRITE_CAPABLE_REMEDIES {
+            assert!(message.contains(needle), "missing {needle:?} in {message}");
+        }
+        assert!(
+            !message.contains("A read-only request never falls back"),
+            "a write-capable request must not read the read-only refusal: {message}"
+        );
     }
-    assert!(
-        !message.contains("A read-only request never falls back"),
-        "a write-capable request must not read the read-only refusal: {message}"
-    );
 
     // A host that does have a confined backend has nothing to decide, terminal or not.
     for interactive in [true, false] {
@@ -13719,14 +13719,90 @@ fn a_write_capable_plan_without_a_platform_backend_asks_only_on_a_terminal() {
     }
 }
 
-/// The TUI's one question, driven for the request 0.9.1 could not offer it to: a
-/// read-only plan on a host with no confined backend is offered native execution,
-/// accepting selects the native backend for the process through the same override
-/// path the flag takes, discovery reads that override as a trusted layer, and the next
-/// decision on the re-read configuration proceeds, terminal or not, with the
-/// permission mode untouched.
 #[test]
-fn accepting_the_native_offer_for_a_read_only_plan_switches_the_process_to_the_native_backend() {
+#[cfg(target_os = "linux")]
+fn an_unconfigured_linux_plan_offers_native_only_on_a_terminal_when_bubblewrap_is_missing() {
+    use tool_runtime::SandboxUnavailableDecision;
+    use zuno_sandbox::{SandboxError, SandboxMode, SandboxPolicy, SandboxUnavailableCause};
+
+    let directory = tempfile::TempDir::new().expect("temporary tool workspace");
+    let plan = plan(
+        directory.path().to_str().expect("UTF-8 workspace"),
+        SessionChoice::New,
+    );
+    let missing =
+        |_: &SandboxPolicy| -> Result<(), SandboxError> { Err(SandboxError::BubblewrapNotFound) };
+    assert_eq!(
+        crate::cmd::tui::decide_for_plan(&plan, &missing, true),
+        SandboxUnavailableDecision::OfferNativeExecution {
+            cause: SandboxUnavailableCause::BubblewrapNotFound,
+            requested_mode: SandboxMode::WorkspaceWrite,
+        }
+    );
+    assert_eq!(
+        crate::cmd::tui::decide_for_plan(&plan, &missing, false),
+        SandboxUnavailableDecision::Refuse {
+            message: tool_runtime::sandbox_unavailable_refusal(
+                &SandboxUnavailableCause::BubblewrapNotFound,
+                SandboxMode::WorkspaceWrite,
+            )
+        }
+    );
+}
+
+#[test]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn native_platform_defaults_skip_the_offer_for_write_and_read_only_plans() {
+    use tool_runtime::SandboxUnavailableDecision;
+    use zuno_config::schema::permission::PermissionMode;
+    use zuno_config::schema::sandbox::SandboxBackendSource;
+    use zuno_sandbox::{SandboxError, SandboxPolicy};
+
+    let directory = tempfile::TempDir::new().expect("temporary tool workspace");
+    let config = config_json(r#"{}"#);
+    let build = agent("build");
+    let build_profile = agent_profile(build.clone(), directory.path(), &config);
+    for (selected_agent, profile) in [
+        (build, build_profile),
+        (agent("read-only-shell"), read_only_shell_profile()),
+    ] {
+        let plan = plan_for(
+            directory.path().to_str().expect("UTF-8 workspace"),
+            SessionChoice::New,
+            selected_agent,
+            profile,
+            config.clone(),
+        );
+        assert_eq!(
+            plan.config.effective_permission_mode(),
+            PermissionMode::Standard,
+            "a platform-native default must not imply allow_all"
+        );
+        assert_eq!(
+            plan.config.resolved_sandbox_backend().source,
+            SandboxBackendSource::PlatformDefault
+        );
+        for interactive in [true, false] {
+            assert_eq!(
+                crate::cmd::tui::decide_for_plan(
+                    &plan,
+                    &|_: &SandboxPolicy| -> Result<(), SandboxError> {
+                        panic!("a platform-native default must not probe confinement")
+                    },
+                    interactive,
+                ),
+                SandboxUnavailableDecision::Proceed,
+                "interactive={interactive}: neither startup nor agent switching needs an offer"
+            );
+        }
+    }
+}
+
+/// A missing implicit Linux backend can offer native execution; unconstrained
+/// Windows/macOS already use it. In either case an explicit native selection uses
+/// the same trusted override as the CLI flag and keeps the permission mode.
+#[test]
+fn selecting_native_for_a_read_only_plan_uses_the_trusted_override_without_widening_permissions() {
     use crate::GlobalOptions;
     use crate::environment::{StartupEnvironment, ZUNO_SANDBOX_BACKEND};
     use tool_runtime::SandboxUnavailableDecision;
@@ -13769,7 +13845,15 @@ fn accepting_the_native_offer_for_a_read_only_plan_switches_the_process_to_the_n
 
     let startup = StartupEnvironment::resolve(&base, &GlobalOptions::default());
     let before = discover(&startup);
-    assert_eq!(before.sandbox_backend(), SandboxBackendSelection::Auto);
+    let native_platform = cfg!(any(target_os = "windows", target_os = "macos"));
+    assert_eq!(
+        before.sandbox_backend(),
+        if native_platform {
+            SandboxBackendSelection::Native
+        } else {
+            SandboxBackendSelection::Auto
+        }
+    );
     let plan_before = plan_for(
         workspace,
         SessionChoice::New,
@@ -13779,25 +13863,33 @@ fn accepting_the_native_offer_for_a_read_only_plan_switches_the_process_to_the_n
     );
     assert_eq!(
         crate::cmd::tui::decide_for_plan(&plan_before, &windows, true),
-        SandboxUnavailableDecision::OfferNativeExecution {
-            cause: zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
-                platform: "windows".to_owned(),
-            },
-            requested_mode: SandboxMode::ReadOnly,
+        if native_platform {
+            SandboxUnavailableDecision::Proceed
+        } else {
+            SandboxUnavailableDecision::OfferNativeExecution {
+                cause: zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
+                    platform: "windows".to_owned(),
+                },
+                requested_mode: SandboxMode::ReadOnly,
+            }
         },
-        "an interactive start offers native execution to a read-only plan too"
+        "only an unresolved implicit backend needs an interactive offer"
     );
     assert_eq!(
         crate::cmd::tui::decide_for_plan(&plan_before, &windows, false),
-        SandboxUnavailableDecision::Refuse {
-            message: tool_runtime::sandbox_unavailable_refusal(
-                &zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
-                    platform: "windows".to_owned()
-                },
-                SandboxMode::ReadOnly
-            ),
+        if native_platform {
+            SandboxUnavailableDecision::Proceed
+        } else {
+            SandboxUnavailableDecision::Refuse {
+                message: tool_runtime::sandbox_unavailable_refusal(
+                    &zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
+                        platform: "windows".to_owned(),
+                    },
+                    SandboxMode::ReadOnly,
+                ),
+            }
         },
-        "off a terminal, and on decline, the read-only refusal names the setting"
+        "a native default proceeds headlessly; an unresolved confined request refuses"
     );
 
     let accepted = crate::cmd::tui::accept_native_execution(&startup);

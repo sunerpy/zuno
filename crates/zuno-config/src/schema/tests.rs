@@ -412,8 +412,17 @@ fn native_backend_keeps_the_authored_permission_mode() {
     assert_eq!(auto.sandbox_backend(), SandboxBackendSelection::Auto);
     assert_eq!(
         Config::default().sandbox_backend(),
-        SandboxBackendSelection::Auto,
-        "absence discovers the confined backend"
+        if cfg!(any(target_os = "windows", target_os = "macos")) {
+            SandboxBackendSelection::Native
+        } else {
+            SandboxBackendSelection::Auto
+        },
+        "an unconstrained default follows the host platform"
+    );
+    assert_eq!(
+        Config::default().effective_permission_mode(),
+        PermissionMode::Standard,
+        "the platform default must not widen permission mode"
     );
 
     let error = parse(r#"{"sandbox": {"backend": "none"}}"#)
