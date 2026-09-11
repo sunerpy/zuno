@@ -1,6 +1,6 @@
 # 项目结构与执行流
 
-修改行为之前，先用本页找到负责它的 crate。Zuno 是一个包含 51 个 crate 的 Rust
+修改行为之前，先用本页找到负责它的 crate。Zuno 是一个包含 52 个 crate 的 Rust
 workspace。`crates/zuno-cli` 构建最终的 `zuno` 二进制，其余 crate 把协议、运行时、
 存储、工具和客户端职责从入口程序中分离出来。
 
@@ -65,6 +65,7 @@ workspace。`crates/zuno-cli` 构建最终的 `zuno` 二进制，其余 crate �
 | `zuno-provider-bedrock` | Amazon Bedrock Responses 与 Converse transport |
 | `zuno-provider-compatible` | 可配置的 OpenAI-compatible endpoint |
 | `zuno-auth` | API key 与 OAuth 凭据存储和刷新 |
+| `zuno-identity` | 企业 API 身份：OAuth2 JWT／introspection、OIDC 密钥发现及 Entra 声明策略 |
 | `zuno-aws-auth` | AWS 凭据链解析与 SigV4 签名 |
 | `zuno-network` | 统一的出站 HTTP client、代理路由与 transport 策略 |
 | `zuno-mcp` | MCP stdio/remote client、工具、资源与 prompt |
