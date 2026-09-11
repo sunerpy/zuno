@@ -5,7 +5,7 @@ Baseline: `v0.10.29`, `d1212860dba6a6b420ce81d444ace58feaf0adb5`.
 | Phase | State | Evidence required before completion |
 | --- | --- | --- |
 | P0 | Complete | PR #176 merged into preview; native CI run 34553054820 succeeded |
-| P1 | In progress | Principal propagation implemented; ownership migration validated; local bounded driver and scoped session application validated; local runtime Job/lease port validated; Memory interfaces and backend assembly remain |
+| P1 | In progress | Principal propagation implemented; ownership migration validated; local bounded driver and scoped session application validated; local runtime Job/lease port validated; Memory persistence/authority ports validated; backend assembly remains |
 | P2 | Pending | PostgreSQL, identity/approval, leases/checkpoints/completion |
 | P3 | Pending | Two workers, Docker gateway, root-task takeover |
 | P4 | Pending | Durable child/Workflow/Council waits, merges and cancellation |
@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p1-jobs`.
+- Current phase branch: `codex/enterprise-p1-memory`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -70,3 +70,11 @@ initialization failure. Event initialization now runs once and excludes pool
 writers; 68 Server tests pass. The Goal fixture selects Bash/PowerShell explicitly
 and uses native diagnostic syntax; its Linux end-to-end run passes. Windows
 verification is pending the next preview CI run. No release is enabled.
+
+## Memory persistence and authority
+
+- `MemoryService` accepts one `MemoryPersistence` provider plus an explicit `MemoryAuthority`; the local provider keeps all stores on one pool.
+- Existing candidate, revision, evidence, maintenance and undo semantics are retained. Candidate read/edit now enforce scope ownership; model tool provenance uses immutable call coordinates.
+- Memory/Learning tests: 179 passed. Focused Memory tool tests: 4 passed. Documentation contracts: 48 passed.
+- Workspace check, Clippy, formatting and diff checks passed after rebuilding task-owned first-party artifacts.
+- File projection remains local. Organization authorization at commit, managed namespaces and the external data owner/worker API are not certified by this port alone.

@@ -70,7 +70,9 @@
 //! **failed** one returns the entries. That last one is the anti-thrash rule and it
 //! is the easiest to undo by accident — see [`error`].
 
+pub mod authority;
 pub mod error;
+pub mod persistence;
 pub mod render;
 pub mod scope;
 pub mod service;

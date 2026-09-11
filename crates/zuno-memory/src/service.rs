@@ -4,16 +4,18 @@
 mod maintenance;
 pub use maintenance::{MemoryMaintenanceContext, MemoryMaintenanceUpdate};
 
+use crate::authority::{LocalMemoryAuthority, MemoryAccess, MemoryAuthority};
+use crate::persistence::{MemoryPersistence, SqliteMemoryPersistence};
 use crate::{MemoryError, MemoryStore, Operation, Scope, ScopeLimits};
 use sha2::{Digest as _, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 use zuno_db::Pool;
-use zuno_db::memory_candidate::{MemoryCandidateRecord, MemoryCandidateStore, NewMemoryCandidate};
+use zuno_db::memory_candidate::{MemoryCandidateRecord, NewMemoryCandidate};
 use zuno_db::resident_memory::{
     ResidentMemoryAuthority, ResidentMemoryCommit, ResidentMemoryDocument, ResidentMemoryOperation,
-    ResidentMemoryStore, ResidentMemoryView,
+    ResidentMemoryView,
 };
 use zuno_error::DbError;
 use zuno_types::{
@@ -111,6 +113,8 @@ pub struct MemorySnapshot {
 /// Candidate or resident-store failure.
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryServiceError {
+    #[error("memory access is not authorized for this scope")]
+    Denied,
     #[error(transparent)]
     Database(#[from] zuno_error::DbError),
     #[error(transparent)]
@@ -126,7 +130,7 @@ impl MemoryServiceError {
         match self {
             Self::Invalid(_) => true,
             Self::Resident(error) => error.is_proposal_correctable(),
-            Self::Database(_) => false,
+            Self::Database(_) | Self::Denied => false,
         }
     }
 }
@@ -134,9 +138,8 @@ impl MemoryServiceError {
 /// The single owner of candidate validation, promotion, apply, and undo.
 #[derive(Clone)]
 pub struct MemoryService {
-    store: MemoryCandidateStore,
-    documents: ResidentMemoryStore,
-    maintenance: zuno_db::memory_maintenance::MemoryMaintenanceStore,
+    persistence: Arc<dyn MemoryPersistence>,
+    authority: Arc<dyn MemoryAuthority>,
     paths: ScopePaths,
     limits: ScopeLimits,
     promotion: PromotionPolicy,
@@ -151,10 +154,28 @@ impl MemoryService {
         limits: ScopeLimits,
         promotion: PromotionPolicy,
     ) -> Self {
+        Self::with_persistence(
+            Arc::new(SqliteMemoryPersistence::new(pool)),
+            Arc::new(LocalMemoryAuthority),
+            paths,
+            limits,
+            promotion,
+        )
+    }
+
+    /// Inject a coherent Memory backend without changing validation, rendering,
+    /// candidate transitions or the local file-projection contract.
+    #[must_use]
+    pub fn with_persistence(
+        persistence: Arc<dyn MemoryPersistence>,
+        authority: Arc<dyn MemoryAuthority>,
+        paths: ScopePaths,
+        limits: ScopeLimits,
+        promotion: PromotionPolicy,
+    ) -> Self {
         Self {
-            store: MemoryCandidateStore::new(Arc::clone(&pool)),
-            documents: ResidentMemoryStore::new(Arc::clone(&pool)),
-            maintenance: zuno_db::memory_maintenance::MemoryMaintenanceStore::new(pool),
+            persistence,
+            authority,
             paths,
             limits,
             promotion,
@@ -178,6 +199,7 @@ impl MemoryService {
     }
 
     pub fn scope_identity(&self, scope: MemoryScope) -> Result<String, MemoryServiceError> {
+        self.authority.authorize(scope, MemoryAccess::Read)?;
         self.resolved_path(Scope::from(scope))
     }
 
@@ -195,6 +217,8 @@ impl MemoryService {
         mut expected_revision: Option<i64>,
         session_id: &str,
     ) -> Result<MemoryCandidateRecord, MemoryServiceError> {
+        self.authority
+            .authorize(proposal.scope, MemoryAccess::Propose)?;
         if expected_revision.is_none()
             && matches!(
                 proposal.action,
@@ -235,6 +259,8 @@ impl MemoryService {
         expected_revision: Option<i64>,
         authority: ResidentMemoryAuthority<'_>,
     ) -> Result<MemoryCandidateRecord, MemoryServiceError> {
+        self.authority
+            .authorize(proposal.scope, MemoryAccess::Propose)?;
         proposal.content = proposal.content.map(|content| content.trim().to_owned());
         proposal.old_text = proposal.old_text.map(|text| text.trim().to_owned());
         let confidence = confidence_basis_points(proposal.confidence)?;
@@ -284,10 +310,10 @@ impl MemoryService {
             time_created: now,
         };
         let insert = match authority {
-            ResidentMemoryAuthority::Model { session_id } => {
-                self.store.create_for_model(candidate, session_id)?
-            }
-            _ => self.store.create_or_get(candidate)?,
+            ResidentMemoryAuthority::Model { session_id } => self
+                .persistence
+                .create_model_candidate(candidate, session_id)?,
+            _ => self.persistence.create_candidate(candidate)?,
         };
         let candidate = insert.record;
         if !insert.inserted {
@@ -301,7 +327,11 @@ impl MemoryService {
     }
 
     pub fn candidate(&self, id: &str) -> Result<MemoryCandidateRecord, MemoryServiceError> {
-        self.store.get(id).map_err(Into::into)
+        let candidate = self.persistence.candidate(id)?;
+        self.ensure_owned_path(&candidate)?;
+        self.authority
+            .authorize(candidate.projection.scope, MemoryAccess::Read)?;
+        Ok(candidate)
     }
 
     pub fn apply(&self, id: &str) -> Result<MemoryCandidateRecord, MemoryServiceError> {
@@ -328,7 +358,13 @@ impl MemoryService {
         authority: ResidentMemoryAuthority<'_>,
         now: i64,
     ) -> Result<MemoryCandidateRecord, MemoryServiceError> {
-        let candidate = self.store.get(id)?;
+        let candidate = self.candidate(id)?;
+        self.authority
+            .authorize(candidate.projection.scope, MemoryAccess::Apply)?;
+        if matches!(authority, ResidentMemoryAuthority::Learning { .. }) {
+            self.authority
+                .authorize(candidate.projection.scope, MemoryAccess::Maintain)?;
+        }
         if !matches!(
             candidate.projection.status,
             MemoryCandidateStatus::Pending | MemoryCandidateStatus::Failed
@@ -354,7 +390,7 @@ impl MemoryService {
         ) {
             Ok(after) => after,
             Err(error) => {
-                let _failed = self.store.set_status(
+                let _failed = self.persistence.set_candidate_status(
                     id,
                     MemoryCandidateStatus::Failed,
                     Some(&error.to_string()),
@@ -364,7 +400,7 @@ impl MemoryService {
                 return Err(error.into());
             }
         };
-        let committed = self.documents.commit(ResidentMemoryCommit {
+        let committed = self.persistence.commit_document(ResidentMemoryCommit {
             path: &resident.path,
             scope: scope.into(),
             expected_revision: resident.revision,
@@ -376,13 +412,15 @@ impl MemoryService {
             authority,
         })?;
         self.project_document(&committed)?;
-        let record = self.store.get(id)?;
+        let record = self.persistence.candidate(id)?;
         self.notify();
         Ok(record)
     }
 
     pub fn reject(&self, id: &str) -> Result<MemoryCandidateRecord, MemoryServiceError> {
-        let candidate = self.store.get(id)?;
+        let candidate = self.candidate(id)?;
+        self.authority
+            .authorize(candidate.projection.scope, MemoryAccess::Reject)?;
         if !matches!(
             candidate.projection.status,
             MemoryCandidateStatus::Pending | MemoryCandidateStatus::Failed
@@ -392,7 +430,7 @@ impl MemoryService {
                 candidate.projection.status.as_str()
             )));
         }
-        let record = self.store.set_status(
+        let record = self.persistence.set_candidate_status(
             id,
             MemoryCandidateStatus::Rejected,
             None,
@@ -410,7 +448,9 @@ impl MemoryService {
         reason: String,
         confidence: f64,
     ) -> Result<MemoryCandidateRecord, MemoryServiceError> {
-        let candidate = self.store.get(id)?;
+        let candidate = self.candidate(id)?;
+        self.authority
+            .authorize(candidate.projection.scope, MemoryAccess::Edit)?;
         let content = content.map(|value| value.trim().to_owned());
         let old_text = old_text.map(|value| value.trim().to_owned());
         let confidence = confidence_basis_points(confidence)?;
@@ -433,23 +473,25 @@ impl MemoryService {
             &resident.entries,
             std::slice::from_ref(&operation),
         )?;
-        let record = self
-            .store
-            .edit_pending(zuno_db::memory_candidate::MemoryCandidateEdit {
-                id,
-                content: content.as_deref(),
-                old_text: old_text.as_deref(),
-                reason,
-                confidence,
-                base_revision: resident.revision,
-                time_updated: zuno_db::message::now_millis(),
-            })?;
+        let record =
+            self.persistence
+                .edit_candidate(zuno_db::memory_candidate::MemoryCandidateEdit {
+                    id,
+                    content: content.as_deref(),
+                    old_text: old_text.as_deref(),
+                    reason,
+                    confidence,
+                    base_revision: resident.revision,
+                    time_updated: zuno_db::message::now_millis(),
+                })?;
         self.notify();
         Ok(record)
     }
 
     pub fn undo(&self, id: &str) -> Result<MemoryCandidateRecord, MemoryServiceError> {
-        let candidate = self.store.get(id)?;
+        let candidate = self.candidate(id)?;
+        self.authority
+            .authorize(candidate.projection.scope, MemoryAccess::Undo)?;
         if candidate.projection.status != MemoryCandidateStatus::Applied {
             return Err(MemoryServiceError::Invalid(format!(
                 "candidate {id} is not applied"
@@ -463,7 +505,7 @@ impl MemoryService {
             MemoryServiceError::Invalid(format!("candidate {id} has no after snapshot"))
         })?;
         let resident = self.document(Scope::from(candidate.projection.scope))?;
-        let committed = self.documents.commit(ResidentMemoryCommit {
+        let committed = self.persistence.commit_document(ResidentMemoryCommit {
             path: &resident.path,
             scope: candidate.projection.scope,
             expected_revision: resident.revision,
@@ -475,7 +517,7 @@ impl MemoryService {
             authority: ResidentMemoryAuthority::Host,
         })?;
         self.project_document(&committed)?;
-        let record = self.store.get(id)?;
+        let record = self.persistence.candidate(id)?;
         self.notify();
         Ok(record)
     }
@@ -529,6 +571,7 @@ impl MemoryService {
     }
 
     pub fn snapshot(&self, scope: Scope) -> Result<MemorySnapshot, MemoryServiceError> {
+        self.authority.authorize(scope.into(), MemoryAccess::Read)?;
         if self.import_required(scope)? {
             return Ok(MemorySnapshot {
                 scope: scope.into(),
@@ -546,7 +589,7 @@ impl MemoryService {
         }
         let document = self.document(scope)?;
         let view = self
-            .documents
+            .persistence
             .views(&[document.path])?
             .into_iter()
             .next()
@@ -577,18 +620,19 @@ impl MemoryService {
     pub fn read_views(&self) -> Result<Vec<ResidentMemoryView>, MemoryServiceError> {
         let mut paths = Vec::new();
         for scope in Scope::ALL {
+            self.authority.authorize(scope.into(), MemoryAccess::Read)?;
             if !self.import_required(scope)? {
                 paths.push(self.document(scope)?.path);
             }
         }
-        self.documents.views(&paths).map_err(Into::into)
+        self.persistence.views(&paths).map_err(Into::into)
     }
 
     pub fn read_for_model(
         &self,
         session_id: &str,
     ) -> Result<Vec<ResidentMemoryView>, MemoryServiceError> {
-        self.documents.require_model_use(session_id)?;
+        self.persistence.require_model_use(session_id)?;
         self.read_views()
     }
 
@@ -624,6 +668,10 @@ impl MemoryService {
 
     /// Reconcile process loss around apply or undo without replaying a write.
     pub fn reconcile(&self) -> Result<(), MemoryServiceError> {
+        for scope in Scope::ALL {
+            self.authority
+                .authorize(scope.into(), MemoryAccess::Maintain)?;
+        }
         let mut changed = false;
         for candidate in self.records()?.into_iter().filter(|candidate| {
             matches!(
@@ -701,10 +749,12 @@ impl MemoryService {
         status: MemoryCandidateStatus,
         detail: &str,
     ) -> Result<(), MemoryServiceError> {
-        match self
-            .store
-            .set_status(id, status, Some(detail), zuno_db::message::now_millis())
-        {
+        match self.persistence.set_candidate_status(
+            id,
+            status,
+            Some(detail),
+            zuno_db::message::now_millis(),
+        ) {
             Ok(_) => Ok(()),
             Err(DbError::Conflict { .. } | DbError::NotFound { .. }) => Ok(()),
             Err(error) => Err(error.into()),
@@ -712,15 +762,18 @@ impl MemoryService {
     }
 
     fn records(&self) -> Result<Vec<MemoryCandidateRecord>, MemoryServiceError> {
+        for scope in Scope::ALL {
+            self.authority.authorize(scope.into(), MemoryAccess::Read)?;
+        }
         let global = self.paths.wire_path(Scope::Global);
         let project = self.paths.wire_path(Scope::Project);
-        let mut records = self.store.list_for_paths(&global, &project)?;
+        let mut records = self.persistence.candidates_for_paths(&global, &project)?;
         let canonical_global = self.resolved_path(Scope::Global)?;
         let canonical_project = self.resolved_path(Scope::Project)?;
         if global != canonical_global || project != canonical_project {
             records.extend(
-                self.store
-                    .list_for_paths(&canonical_global, &canonical_project)?,
+                self.persistence
+                    .candidates_for_paths(&canonical_global, &canonical_project)?,
             );
             records.sort_by_key(|record| {
                 std::cmp::Reverse((record.projection.time_created, record.projection.id.clone()))
@@ -744,21 +797,11 @@ impl MemoryService {
         candidate: &MemoryCandidateRecord,
     ) -> Result<(), MemoryServiceError> {
         let expected = self.resolved_path(Scope::from(candidate.projection.scope))?;
-        let candidate_path = zuno_atomic_file::canonical_destination(Path::new(
-            &candidate.target_path,
-        ))
-        .map_err(|source| MemoryError::Io {
-            operation: "resolve memory candidate identity",
-            path: PathBuf::from(&candidate.target_path),
-            source,
-        })?;
+        let candidate_path =
+            zuno_atomic_file::canonical_destination(Path::new(&candidate.target_path))
+                .map_err(|_| MemoryServiceError::Denied)?;
         if candidate_path.to_string_lossy() != expected {
-            return Err(MemoryServiceError::Invalid(format!(
-                "candidate {} belongs to {}, not {}",
-                candidate.id(),
-                candidate.target_path,
-                expected
-            )));
+            return Err(MemoryServiceError::Denied);
         }
         Ok(())
     }
@@ -778,8 +821,9 @@ impl MemoryService {
     }
 
     fn document(&self, scope: Scope) -> Result<ResidentMemoryDocument, MemoryServiceError> {
+        self.authority.authorize(scope.into(), MemoryAccess::Read)?;
         let key = self.resolved_path(scope)?;
-        if let Some(document) = self.documents.get(&key)? {
+        if let Some(document) = self.persistence.document(&key)? {
             return Ok(document);
         }
         if self.records()?.iter().any(|candidate| {
@@ -796,7 +840,7 @@ impl MemoryService {
             )));
         }
         let resident = self.open(scope)?;
-        Ok(self.documents.adopt(
+        Ok(self.persistence.adopt(
             &key,
             scope.into(),
             resident.entries(),
@@ -811,7 +855,7 @@ impl MemoryService {
         let expected = if document.projected_revision == 0 {
             Vec::new()
         } else {
-            self.documents
+            self.persistence
                 .revision_entries(&document.path, document.projected_revision)?
         };
         let scope = Scope::from(document.scope);
@@ -832,9 +876,11 @@ impl MemoryService {
             Ok(())
         })();
         let error = projection.err().map(|error| error.to_string());
-        Ok(self
-            .documents
-            .record_projection(&document.path, document.revision, error.as_deref())?)
+        Ok(self.persistence.record_projection(
+            &document.path,
+            document.revision,
+            error.as_deref(),
+        )?)
     }
 
     fn import_required(&self, scope: Scope) -> Result<bool, MemoryServiceError> {
@@ -845,7 +891,7 @@ impl MemoryService {
                 source,
             },
         )?;
-        if self.documents.get(&key.to_string_lossy())?.is_some() {
+        if self.persistence.document(&key.to_string_lossy())?.is_some() {
             return Ok(false);
         }
         Ok(self.records()?.iter().any(|candidate| {
@@ -864,6 +910,7 @@ impl MemoryService {
         &self,
         scope: MemoryScope,
     ) -> Result<MemorySnapshot, MemoryServiceError> {
+        self.authority.authorize(scope, MemoryAccess::Import)?;
         let scope = Scope::from(scope);
         let key = zuno_atomic_file::canonical_destination(self.paths.for_scope(scope)).map_err(
             |source| MemoryError::Io {
@@ -883,7 +930,7 @@ impl MemoryService {
         } else {
             crate::store::preview_entries(scope, self.limits.for_scope(scope), &[], &operations)?
         };
-        self.documents.import_projection(
+        self.persistence.import_projection(
             &key.to_string_lossy(),
             scope.into(),
             &entries,
@@ -894,6 +941,7 @@ impl MemoryService {
     }
 
     pub fn projection_entries(&self, scope: Scope) -> Result<Vec<String>, MemoryServiceError> {
+        self.authority.authorize(scope.into(), MemoryAccess::Read)?;
         Ok(self.open(scope)?.entries().to_vec())
     }
 
@@ -990,6 +1038,7 @@ fn normalize_fingerprint_text(value: Option<&str>) -> &str {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use zuno_db::memory_candidate::MemoryCandidateStore;
 
     fn fixture(directory: &TempDir) -> (Arc<Pool>, MemoryService) {
         let pool = Arc::new(Pool::open(&zuno_paths::DbLocation::Memory).expect("open database"));

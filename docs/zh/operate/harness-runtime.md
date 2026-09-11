@@ -196,6 +196,23 @@ CLI 启动。无法抓取的远程规则来源使用同一类非致命 notice，
 
 ## 可审计的记忆与反思
 
+预览将 `MemoryPersistence` 与 `MemoryAuthority` 分开。`MemoryService` 接收一个统一的
+持久化 provider，覆盖候选、文档版本、证据、撤回及维护结算；默认 `SqliteMemoryPersistence`
+从同一个 Pool 组装底层 store，保持批次、证据、Job 结算和维护水位的原子边界。
+
+注入后端时必须显式提供 authority。`MemoryAccess` 区分读取、提议、应用、编辑、拒绝、撤销、
+导入、维护与遗忘。个人模式使用 `LocalMemoryAuthority`，它不是 Entra 认证或企业审批服务。
+企业提交仍须在后端事务中重新校验组织授权；预检查不能取代会话 generation policy、来源有效性
+和学习任务租约检查。
+
+候选读取和编辑与 apply／undo 一样检查文档路径归属；越界返回拒绝，不泄露另一项目的路径。
+模型 Memory 工具使用不可变调用来源记录 session/message，不能通过修改公开 context 字段更换来源。
+授权拒绝属于权限失败，不作为可由模型修改参数修复的提议错误。
+
+同步持久化事务属于 Memory 数据所有者；远程状态服务须通过有界执行调用它，不能阻塞 Worker
+的异步 reactor。本阶段仍使用明确的本地文件投影，托管文档命名空间、企业授权和 PostgreSQL
+后端仍需后续接入。
+
 常驻记忆与用户学习默认启用。自动学习优先使用显式
 `learning.extractor_model`，否则依次使用当前 provider 下可达的
 `small_model` 与当前会话模型，不会打开另一个 provider 或改写配置。只有项目范围且

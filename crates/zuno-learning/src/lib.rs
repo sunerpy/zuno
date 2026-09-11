@@ -105,9 +105,11 @@ impl Recoverable for LearningServiceError {
             Self::Database(error) => Recoverable::recovery(error),
             Self::Learning(error) => Recoverable::recovery(error),
             Self::Memory(MemoryServiceError::Database(error)) => Recoverable::recovery(error),
-            Self::Memory(MemoryServiceError::Resident(_) | MemoryServiceError::Invalid(_)) => {
-                Recovery::Fail
-            }
+            Self::Memory(
+                MemoryServiceError::Denied
+                | MemoryServiceError::Resident(_)
+                | MemoryServiceError::Invalid(_),
+            ) => Recovery::Fail,
             Self::Evaluation(EvaluationError::Db(error)) => Recoverable::recovery(error),
             Self::Evaluation(
                 EvaluationError::InvalidSnapshot | EvaluationError::EmptySuite { .. },
