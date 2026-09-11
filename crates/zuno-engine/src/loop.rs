@@ -24,13 +24,15 @@ use serde_json::{Map, Value, json};
 use tokio::sync::{Semaphore, mpsc};
 use tracing::Instrument as _;
 use uuid::Uuid;
-use zuno_db::event_log::{NewSessionEvent, append_with_connection};
-use zuno_db::inbox::{SessionInbox, mark_consumed_in, read_in};
+use zuno_db::event_log::NewSessionEvent;
+#[cfg(test)]
+use zuno_db::event_log::append_with_connection;
+use zuno_db::inbox::SessionInbox;
 use zuno_db::message::{
     MessageRecord, MessageRole, MessageStore, MessageWithParts, PartKind, PartRecord,
-    TASK_REPORT_METADATA_KEY, created_after, now_millis,
+    created_after, now_millis,
 };
-use zuno_db::{Connection, open, session};
+use zuno_db::{Connection, open};
 use zuno_error::{DbError, ProviderError, UncertainCause};
 use zuno_llm::cache::{CacheViolation, DynamicContext, McpToolStatus, PreparedTurn, PromptCache};
 use zuno_llm::catalog::resolved::ModelCost;
@@ -73,6 +75,7 @@ use crate::retry::{
     ProviderRetryPolicy, retry_provider_with_wake_observed,
 };
 use crate::session_command::SessionCommand;
+use crate::state::{ProviderEventUpdate, SqliteTurnPersistence, TurnPersistence, TurnState};
 use crate::status::{DiagnosticNoticeKey, SessionRunGuard, SessionRunRegistry};
 
 /// Maximum queued transitions before the turn applies lossless backpressure.
@@ -1299,12 +1302,12 @@ pub trait ToolDispatcher: Send + Sync {
 /// Rebuilds volatile provider context after a successful tool mutation invalidates it.
 ///
 /// The engine owns when a refresh is required, while the host owns how Goal, Plan, Todo,
-/// Job, and other interface-neutral durable state are projected. Passing the active
-/// connection keeps the refreshed snapshot ordered after the committed tool result.
+/// Job, and other interface-neutral durable state are projected. The refresh is
+/// awaited after the tool result commits; the host supplies its own state provider.
+#[async_trait]
 pub trait DynamicContextRefresher: Send + Sync {
-    fn refresh(
+    async fn refresh(
         &self,
-        connection: &Connection,
         session_id: &str,
         refresh: ToolDynamicContextRefresh,
     ) -> Result<DynamicContext, String>;
@@ -1421,7 +1424,7 @@ impl RunTurnRequest {
 
 /// Dependencies shared by every interface that invokes the same loop.
 pub struct TurnContext<'a> {
-    connection: &'a mut Connection,
+    persistence: Arc<dyn TurnPersistence + 'a>,
     providers: &'a ProviderRegistry,
     resolver: &'a dyn AgentModelResolver,
     dispatcher: &'a dyn ToolDispatcher,
@@ -1450,8 +1453,26 @@ impl<'a> TurnContext<'a> {
         dispatcher: &'a dyn ToolDispatcher,
         interrupt: &'a InterruptSignal,
     ) -> Self {
+        Self::from_persistence(
+            Arc::new(SqliteTurnPersistence::new(connection)),
+            providers,
+            resolver,
+            dispatcher,
+            interrupt,
+        )
+    }
+
+    /// Assemble the ordinary loop over one coherent persistence provider.
+    #[must_use]
+    pub fn from_persistence(
+        persistence: Arc<dyn TurnPersistence + 'a>,
+        providers: &'a ProviderRegistry,
+        resolver: &'a dyn AgentModelResolver,
+        dispatcher: &'a dyn ToolDispatcher,
+        interrupt: &'a InterruptSignal,
+    ) -> Self {
         Self {
-            connection,
+            persistence,
             providers,
             resolver,
             dispatcher,
@@ -2131,7 +2152,16 @@ pub async fn advance_turn(
     events: TurnEventSender,
 ) -> Result<crate::advance::AdvanceOutcome, crate::advance::AdvanceError> {
     let owner = context.principal_scope.owner();
-    let mut admission = match crate::advance::begin(context.connection, &request, owner)? {
+    let store = TurnState::new(
+        Arc::clone(&context.persistence),
+        owner,
+        request.run.session_id.clone(),
+    );
+    let mut admission = match store
+        .persistence
+        .begin_advance(&store.scope, &request)
+        .await?
+    {
         crate::advance::BeginAdvance::Admitted(admission) => admission,
         crate::advance::BeginAdvance::AlreadyCommitted(outcome) => return Ok(outcome),
     };
@@ -2147,7 +2177,21 @@ pub async fn advance_turn(
     )
     .instrument(turn_span)
     .await;
-    crate::advance::finish(context.connection, &request.run, &admission, result)
+    let checkpoint = store
+        .persistence
+        .commit_advance(
+            &store.scope,
+            &request.run,
+            &admission,
+            crate::advance::completion_state(&result),
+        )
+        .await?;
+    match result? {
+        crate::advance::LoopOutcome::Completed(outcome) => Ok(outcome.into()),
+        crate::advance::LoopOutcome::Progressed(_) => {
+            Ok(crate::advance::AdvanceOutcome::Progressed { checkpoint })
+        }
+    }
 }
 
 async fn run_turn_in_span(
@@ -2158,25 +2202,23 @@ async fn run_turn_in_span(
     checkpoint: Option<crate::advance::LoopCheckpoint>,
     max_steps: Option<NonZeroU32>,
 ) -> Result<crate::advance::LoopOutcome, TurnError> {
+    let store = TurnState::new(
+        Arc::clone(&context.persistence),
+        context.principal_scope.owner(),
+        request.session_id.clone(),
+    );
     // One clock for the whole turn, read every time the policy is consulted: a time
     // allowance measured per step would restart on each provider request and could
     // never expire.
     let wall_now_ms = if max_steps.is_some() {
-        context
-            .connection
-            .query_row(
-                "SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER)",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(open::map_error)?
+        store.persistence.clock(&store.scope).await?
     } else {
         0
     };
     let turn_started = std::time::Instant::now();
     let budget = Arc::clone(&context.budget);
     let events = events.with_hooks(Arc::clone(&context.hooks));
-    let session = session::get(context.connection, &request.session_id)?;
+    let session = store.persistence.session(&store.scope).await?;
     let provider_session_identity =
         ProviderSessionIdentity::parse(session.id.clone()).map_err(ProviderError::fatal)?;
     let provider_request_context = if session.is_root() {
@@ -2184,9 +2226,8 @@ async fn run_turn_in_span(
     } else {
         ProviderRequestContext::ChildTurn(provider_session_identity)
     };
-    let legacy_tool_schema_snapshots =
-        load_legacy_tool_schema_snapshots(context.connection, &request.session_id)?;
-    touch_session(context.connection, &request.session_id)?;
+    let legacy_tool_schema_snapshots = store.persistence.legacy_tool_schemas(&store.scope).await?;
+    store.persistence.touch(&store.scope).await?;
     let _turn_identity = context
         .live_inputs
         .as_ref()
@@ -2264,7 +2305,7 @@ async fn run_turn_in_span(
             return Ok(outcome.into());
         }
 
-        let repaired = repair_missing_tool_outputs(context.connection, &request.session_id)?;
+        let repaired = store.persistence.repair_history(&store.scope).await?;
         if repaired > 0 {
             events
                 .send(TurnEvent::HistoryRepaired {
@@ -2273,11 +2314,7 @@ async fn run_turn_in_span(
                 .await?;
         }
 
-        if max_steps.is_some()
-            && !MessageStore::new(context.connection)
-                .pending_uncertain_tool_calls(&request.session_id, i64::MIN)?
-                .is_empty()
-        {
+        if max_steps.is_some() && store.persistence.has_uncertain_calls(&store.scope).await? {
             honour_budget_decision(
                 &events,
                 BudgetDecision::stop_uncertain_side_effect(
@@ -2313,7 +2350,7 @@ async fn run_turn_in_span(
             )));
         }
 
-        let mut history = hydrate_retained_history(context.connection, &request.session_id)?;
+        let mut history = store.persistence.history(&store.scope).await?;
         let has_compaction_checkpoint =
             crate::compaction::checkpoint::latest_checkpoint(&history).is_some();
         apply_legacy_tool_schema_identities(&mut history, &legacy_tool_schema_snapshots);
@@ -2338,12 +2375,7 @@ async fn run_turn_in_span(
         )
         .await?;
         let Some(agent) = context.resolver.resolve_agent(&requested.agent) else {
-            append_turn_rejected(
-                context.connection,
-                &request,
-                &requested,
-                "agent_unavailable",
-            )?;
+            append_turn_rejected(&store, &request, &requested, "agent_unavailable").await?;
             return Err(TurnError::AgentNotFound {
                 agent: requested.agent.clone(),
             });
@@ -2352,12 +2384,7 @@ async fn run_turn_in_span(
             .resolver
             .resolve_model(&requested.provider_id, &requested.model_id)
         else {
-            append_turn_rejected(
-                context.connection,
-                &request,
-                &requested,
-                "model_unavailable",
-            )?;
+            append_turn_rejected(&store, &request, &requested, "model_unavailable").await?;
             return Err(TurnError::ModelNotFound {
                 provider_id: requested.provider_id.clone(),
                 model_id: requested.model_id.clone(),
@@ -2370,7 +2397,7 @@ async fn run_turn_in_span(
             &model.catalog_model_id,
         );
         if !durable_turn_start_recorded {
-            append_turn_started(context.connection, &request, &requested, &agent, &model)?;
+            append_turn_started(&store, &request, &requested, &agent, &model).await?;
             durable_turn_start_recorded = true;
         }
         // Scoped before anything reads `history`, so the hook path and the direct
@@ -2397,12 +2424,10 @@ async fn run_turn_in_span(
         let restored_reasoning_replay_boundaries = if reasoning_replay.requests_encrypted() {
             let historical_developer_contexts =
                 historical_developer_contexts.get_or_insert_with(BTreeMap::new);
-            let recovered = load_historical_developer_contexts(
-                context.connection,
-                &request.session_id,
-                &history,
-                historical_developer_contexts,
-            )?;
+            let recovered = store
+                .persistence
+                .developer_contexts(&store.scope, &history, historical_developer_contexts)
+                .await?;
             historical_developer_contexts.extend(recovered);
             restore_historical_developer_contexts(&mut history, historical_developer_contexts)
         } else {
@@ -2567,7 +2592,7 @@ async fn run_turn_in_span(
             &history_tool_projection.occurrences,
             &combined_history_tool_fallbacks,
         );
-        let context_epoch = session_context_epoch(context.connection, &request.session_id)?;
+        let context_epoch = store.persistence.context_epoch(&store.scope).await?;
         let combined_history_tool_repair = combined_history_tool_repair.retain_new_diagnostics(
             context.run_registry.as_ref(),
             &request.session_id,
@@ -2683,7 +2708,14 @@ async fn run_turn_in_span(
         // pre-request intervention has accepted the request: a proactive compaction
         // or budget stop must not leave a blank assistant checkpoint behind.
         let assistant_time_created = assistant.time_created;
-        MessageStore::new(context.connection).put_message(&assistant)?;
+        store
+            .commit_assistant(&zuno_db::assistant_commit::AssistantCommit {
+                message: assistant.clone(),
+                parts: Vec::new(),
+                persisted_at_ms: now_millis(),
+                context_limit: None,
+            })
+            .await?;
         last_assistant_id = Some(assistant_id.clone());
         events
             .send(TurnEvent::AssistantMessageCreated {
@@ -2698,45 +2730,51 @@ async fn run_turn_in_span(
                 rebuilt_for_late_mcp,
             })
             .await?;
-        let prompt_receipt_id = if let Some(receipt_id) =
-            prompt_traces.receipt_id(actual_projection)
-        {
-            receipt_id.to_owned()
-        } else {
-            let mut properties = receipt_assembly.event_properties(
-                &agent.name,
-                step,
-                assembled_projection,
-                actual_projection,
-            );
-            properties.insert("turnId".to_owned(), Value::String(request.turn_id.clone()));
-            if let Some(seed) = &agent.orchestration_seed {
-                let identity = seed
-                    .capability
-                    .identity()
-                    .expect("capability snapshot contains only serializable identity data");
-                properties.insert(
-                    "capabilitySnapshotID".to_owned(),
-                    serde_json::to_value(identity)
-                        .expect("capability snapshot identity is serializable"),
+        let prompt_receipt_id =
+            if let Some(receipt_id) = prompt_traces.receipt_id(actual_projection) {
+                receipt_id.to_owned()
+            } else {
+                let mut properties = receipt_assembly.event_properties(
+                    &agent.name,
+                    step,
+                    assembled_projection,
+                    actual_projection,
                 );
-                properties.insert(
-                    "capabilitySnapshot".to_owned(),
-                    serde_json::to_value(&seed.capability)
-                        .expect("capability snapshot is serializable"),
-                );
-            }
-            let event = NewSessionEvent::new("session.prompt.assembled", properties)?;
-            let receipt = append_with_connection(context.connection, &request.session_id, event)?;
-            prompt_traces.remember(actual_projection, receipt.id.clone());
-            receipt.id
-        };
+                properties.insert("turnId".to_owned(), Value::String(request.turn_id.clone()));
+                if let Some(seed) = &agent.orchestration_seed {
+                    let identity = seed
+                        .capability
+                        .identity()
+                        .expect("capability snapshot contains only serializable identity data");
+                    properties.insert(
+                        "capabilitySnapshotID".to_owned(),
+                        serde_json::to_value(identity)
+                            .expect("capability snapshot identity is serializable"),
+                    );
+                    properties.insert(
+                        "capabilitySnapshot".to_owned(),
+                        serde_json::to_value(&seed.capability)
+                            .expect("capability snapshot is serializable"),
+                    );
+                }
+                let event = NewSessionEvent::new("session.prompt.assembled", properties)?;
+                let receipt = store.append(event, ProviderEventUpdate::None).await?;
+                prompt_traces.remember(actual_projection, receipt.id.clone());
+                receipt.id
+            };
         if persist_preceding_developer_receipt {
             assistant.data.insert(
                 PRECEDING_DEVELOPER_RECEIPT_KEY.to_owned(),
                 Value::String(prompt_receipt_id.clone()),
             );
-            MessageStore::new(context.connection).put_message(&assistant)?;
+            store
+                .commit_assistant(&zuno_db::assistant_commit::AssistantCommit {
+                    message: assistant.clone(),
+                    parts: Vec::new(),
+                    persisted_at_ms: now_millis(),
+                    context_limit: None,
+                })
+                .await?;
         }
         let message_count = completion
             .messages
@@ -2756,14 +2794,8 @@ async fn run_turn_in_span(
             locked_tools: &locked_tools,
         }));
         let request_id = format!("req_{}", Uuid::now_v7().simple());
-        session::record_provider_request_started(
-            context.connection,
-            &request.session_id,
-            estimated_prompt_tokens,
-            request.context_limit,
-        )?;
         append_provider_request_started(
-            context.connection,
+            &store,
             &request,
             ProviderRequestStart {
                 step,
@@ -2785,7 +2817,8 @@ async fn run_turn_in_span(
                     .expect("foreground completion always has provider routing context"),
                 step_limit_finalization,
             },
-        )?;
+        )
+        .await?;
         events
             .send(TurnEvent::ProviderRequestStarted {
                 step,
@@ -2807,9 +2840,9 @@ async fn run_turn_in_span(
         let provider_interrupt = context.interrupt.clone();
         let retry_interrupt = context.interrupt.clone();
         let retry_soft_interrupt = soft_interrupt.clone();
-        let attempt = {
-            let attempt_connection = &mut *context.connection;
-            retry_provider_with_wake_observed(
+        let attempt =
+            {
+                retry_provider_with_wake_observed(
                 policy,
                 |attempt| {
                     let provider = Arc::clone(&provider);
@@ -2948,114 +2981,19 @@ async fn run_turn_in_span(
                     let soft_interrupt = retry_soft_interrupt.clone();
                     async move { Ok(wait_for_provider_control(interrupt, soft_interrupt).await) }
                 },
-                |observation| match observation {
-                    ProviderAttemptObservation::Started { attempt, max } => {
-                        zuno_db::provider_backoff::clear_session(
-                            attempt_connection,
-                            &request.session_id,
-                        )?;
-                        append_provider_attempt_started(
-                            attempt_connection,
-                            &request,
-                            ProviderAttemptRecord {
-                                step,
-                                request_id: &request_id,
-                                assistant_message_id: &assistant_id,
-                                agent: &agent.name,
-                                provider_id: &model.catalog_provider_id,
-                                model_id: &model.catalog_model_id,
-                                attempt,
-                                max_attempts: max,
-                            },
-                        )
-                    }
-                    ProviderAttemptObservation::Finished {
-                        attempt,
-                        max,
-                        result,
-                    } => {
-                        let generated_output = accumulator
-                            .lock()
-                            .expect("step accumulator lock")
-                            .has_generated_output();
-                        append_provider_attempt_terminal(
-                            attempt_connection,
-                            &request,
-                            ProviderAttemptRecord {
-                                step,
-                                request_id: &request_id,
-                                assistant_message_id: &assistant_id,
-                                agent: &agent.name,
-                                provider_id: &model.catalog_provider_id,
-                                model_id: &model.catalog_model_id,
-                                attempt,
-                                max_attempts: max,
-                            },
-                            generated_output,
-                            result,
-                        )
-                    }
-                    ProviderAttemptObservation::DeadlineExceeded {
-                        attempt,
-                        max,
-                        recovery_elapsed,
-                        total_elapsed,
-                        last_provider_error_code,
-                    } => {
-                        let generated_output = accumulator
-                            .lock()
-                            .expect("step accumulator lock")
-                            .has_generated_output();
-                        append_provider_attempt_deadline(
-                            attempt_connection,
-                            &request,
-                            ProviderAttemptRecord {
-                                step,
-                                request_id: &request_id,
-                                assistant_message_id: &assistant_id,
-                                agent: &agent.name,
-                                provider_id: &model.catalog_provider_id,
-                                model_id: &model.catalog_model_id,
-                                attempt,
-                                max_attempts: max,
-                            },
-                            generated_output,
-                            recovery_elapsed,
-                            total_elapsed,
-                            last_provider_error_code,
-                        )
-                    }
-                    ProviderAttemptObservation::BackoffScheduled {
-                        failed_attempt,
-                        next_attempt,
-                        max,
-                        delay,
-                        error,
-                    } => {
-                        let scheduled_at_ms = zuno_db::message::now_millis();
-                        let delay_ms = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX).max(1);
-                        let (reason, _status) = provider_error_metadata(error);
-                        zuno_db::provider_backoff::schedule(
-                            attempt_connection,
-                            &zuno_db::provider_backoff::ProviderBackoffCheckpoint {
-                                session_id: request.session_id.clone(),
-                                request_id: request_id.clone(),
-                                turn_id: request.turn_id.clone(),
-                                failed_attempt,
-                                next_attempt,
-                                max_attempts: max,
-                                reason: reason.to_owned(),
-                                delay_ms,
-                                retry_at_ms: scheduled_at_ms.saturating_add(delay_ms),
-                                scheduled_at_ms,
-                            },
-                        )
-                        .map_err(TurnError::Database)
-                    }
+                TurnAttemptObserver {
+                    store: &store,
+                    request: &request,
+                    accumulator: &accumulator,
+                    record: ProviderAttemptRecord {
+                        step, request_id: &request_id, assistant_message_id: &assistant_id,
+                        agent: &agent.name, provider_id: &model.catalog_provider_id,
+                        model_id: &model.catalog_model_id, attempt: 1, max_attempts: 1,
+                    },
                 },
             )
             .await
-        };
+            };
         let provider_result = match attempt {
             Ok(result) => result,
             Err(ProviderRetryObservedError::Retry(error)) => match error {
@@ -3106,23 +3044,25 @@ async fn run_turn_in_span(
             Ok(exit) => exit,
             Err(error) => {
                 append_provider_request_terminal(
-                    context.connection,
+                    &store,
                     &request,
                     step,
                     &request_id,
                     "failed",
                     &assistant_id,
                     Some(&error),
-                )?;
+                )
+                .await?;
                 checkpoint_assistant(
-                    context.connection,
+                    &store,
                     &request,
                     step,
                     &mut assistant,
                     &accumulator,
                     &locked_tools,
                     AssistantCheckpointDisposition::Failed(&error),
-                )?;
+                )
+                .await?;
                 events
                     .send(TurnEvent::AssistantCheckpointed {
                         step,
@@ -3157,23 +3097,25 @@ async fn run_turn_in_span(
         if let Some(message) = hook_failure {
             let error = TurnError::Hook(message);
             append_provider_request_terminal(
-                context.connection,
+                &store,
                 &request,
                 step,
                 &request_id,
                 "failed",
                 &assistant_id,
                 Some(&error),
-            )?;
+            )
+            .await?;
             checkpoint_assistant(
-                context.connection,
+                &store,
                 &request,
                 step,
                 &mut assistant,
                 &accumulator,
                 &locked_tools,
                 AssistantCheckpointDisposition::Failed(&error),
-            )?;
+            )
+            .await?;
             events
                 .send(TurnEvent::AssistantCheckpointed {
                     step,
@@ -3187,23 +3129,25 @@ async fn run_turn_in_span(
         if provider_exit == ProviderStreamExit::Interrupted {
             let interruption = hard_interrupt_request(context);
             append_provider_request_terminal(
-                context.connection,
+                &store,
                 &request,
                 step,
                 &request_id,
                 "cancelled",
                 &assistant_id,
                 None,
-            )?;
+            )
+            .await?;
             checkpoint_assistant(
-                context.connection,
+                &store,
                 &request,
                 step,
                 &mut assistant,
                 &accumulator,
                 &locked_tools,
                 AssistantCheckpointDisposition::Interrupted(interruption),
-            )?;
+            )
+            .await?;
             events
                 .send(TurnEvent::AssistantCheckpointed {
                     step,
@@ -3227,23 +3171,25 @@ async fn run_turn_in_span(
 
         if provider_exit == ProviderStreamExit::Steered && !accumulator.saw_message_end {
             append_provider_request_terminal(
-                context.connection,
+                &store,
                 &request,
                 step,
                 &request_id,
                 "steered",
                 &assistant_id,
                 None,
-            )?;
+            )
+            .await?;
             checkpoint_assistant(
-                context.connection,
+                &store,
                 &request,
                 step,
                 &mut assistant,
                 &accumulator,
                 &locked_tools,
                 AssistantCheckpointDisposition::Steered,
-            )?;
+            )
+            .await?;
             events
                 .send(TurnEvent::AssistantCheckpointed {
                     step,
@@ -3264,23 +3210,25 @@ async fn run_turn_in_span(
         if !accumulator.saw_message_end {
             let error = TurnError::StreamEndedWithoutMessageEnd { step };
             append_provider_request_terminal(
-                context.connection,
+                &store,
                 &request,
                 step,
                 &request_id,
                 "failed",
                 &assistant_id,
                 Some(&error),
-            )?;
+            )
+            .await?;
             checkpoint_assistant(
-                context.connection,
+                &store,
                 &request,
                 step,
                 &mut assistant,
                 &accumulator,
                 &locked_tools,
                 AssistantCheckpointDisposition::Failed(&error),
-            )?;
+            )
+            .await?;
             events
                 .send(TurnEvent::AssistantCheckpointed {
                     step,
@@ -3306,23 +3254,25 @@ async fn run_turn_in_span(
                 }
             };
             append_provider_request_terminal(
-                context.connection,
+                &store,
                 &request,
                 step,
                 &request_id,
                 "failed",
                 &assistant_id,
                 Some(&error),
-            )?;
+            )
+            .await?;
             checkpoint_assistant(
-                context.connection,
+                &store,
                 &request,
                 step,
                 &mut assistant,
                 &accumulator,
                 &locked_tools,
                 AssistantCheckpointDisposition::Failed(&error),
-            )?;
+            )
+            .await?;
             events
                 .send(TurnEvent::AssistantCheckpointed {
                     step,
@@ -3333,23 +3283,25 @@ async fn run_turn_in_span(
             return Err(error);
         }
         checkpoint_assistant(
-            context.connection,
+            &store,
             &request,
             step,
             &mut assistant,
             &accumulator,
             &locked_tools,
             AssistantCheckpointDisposition::Completed,
-        )?;
+        )
+        .await?;
         append_provider_request_terminal(
-            context.connection,
+            &store,
             &request,
             step,
             &request_id,
             "completed",
             &assistant_id,
             None,
-        )?;
+        )
+        .await?;
         events
             .send(TurnEvent::AssistantCheckpointed {
                 step,
@@ -3498,7 +3450,7 @@ async fn run_turn_in_span(
                 // group in one transaction because the group runs concurrently, so any
                 // member of it may be the call that is in flight.
                 mark_group_dispatched(
-                    context.connection,
+                    &store,
                     &request,
                     step,
                     &locked_tools,
@@ -3513,7 +3465,8 @@ async fn run_turn_in_span(
                             })
                             .collect(),
                     },
-                )?;
+                )
+                .await?;
 
                 let completed = if first_policy == ToolConcurrencyPolicy::Exclusive {
                     let (call_index, call, display_name, ui_intent, dispatch) =
@@ -3582,7 +3535,35 @@ async fn run_turn_in_span(
                 // A completed parallel group is an indivisible durable unit: every
                 // execution result is appended in model order before an urgent inbox
                 // item may prevent the next group from starting.
-                for (call_index, call, display_name, ui_intent, dispatch) in completed {
+                let result_parts = completed
+                    .iter()
+                    .map(|(call_index, call, display_name, ui_intent, dispatch)| {
+                        tool_result_part(
+                            &request,
+                            ToolPartIdentity {
+                                step,
+                                position: call_positions[*call_index],
+                                message_time_created: assistant_time_created,
+                                message_id: &assistant_id,
+                                call,
+                                display_name,
+                                ui_intent: *ui_intent,
+                                schema_identity: tool_schema_identity(&locked_tools, &call.name),
+                            },
+                            dispatch,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                store
+                    .persistence
+                    .commit_tool_parts(
+                        &store.scope,
+                        &result_parts,
+                        crate::state::ToolPartCommitKind::Result,
+                        now_millis(),
+                    )
+                    .await?;
+                for (_, call, display_name, _, dispatch) in completed {
                     if !dispatch.is_error {
                         match dispatch.output.continuation {
                             ToolContinuation::Continue => {}
@@ -3607,21 +3588,6 @@ async fn run_turn_in_span(
                     } else {
                         unresolved_tool_failures.remove(&call.name);
                     }
-                    persist_tool_result(
-                        context.connection,
-                        &request,
-                        ToolPartIdentity {
-                            step,
-                            position: call_positions[call_index],
-                            message_time_created: assistant_time_created,
-                            message_id: &assistant_id,
-                            call: &call,
-                            display_name: &display_name,
-                            ui_intent,
-                            schema_identity: tool_schema_identity(&locked_tools, &call.name),
-                        },
-                        &dispatch,
-                    )?;
                     if let Some(kind) = dispatch.blocked {
                         events
                             .send(TurnEvent::ToolDispatchBlocked {
@@ -3760,7 +3726,8 @@ async fn run_turn_in_span(
                 }
             })?;
             current_dynamic_context = refresher
-                .refresh(context.connection, &request.session_id, refresh)
+                .refresh(&request.session_id, refresh)
+                .await
                 .map_err(|detail| TurnError::DynamicContextRefresh { detail })?;
         }
 
@@ -3948,6 +3915,11 @@ async fn inject_live_inputs(
     let Some(live) = context.live_inputs.as_ref() else {
         return Ok(InjectedLiveInputs::default());
     };
+    let store = TurnState::new(
+        Arc::clone(&context.persistence),
+        context.principal_scope.owner(),
+        request.session_id.clone(),
+    );
     let delivery = live.guard.take_soft_interrupts_at_safe_point();
     let mut injected = InjectedLiveInputs::default();
     for message in delivery.messages {
@@ -3964,12 +3936,13 @@ async fn inject_live_inputs(
             }
         }
         persist_live_input(
-            context.connection,
+            &store,
             request,
             requested,
             &message,
             context.attachments.as_deref(),
-        )?;
+        )
+        .await?;
         if let Some(input_id) = message.input_id.as_ref() {
             events
                 .send(TurnEvent::InputConsumed {
@@ -3986,21 +3959,20 @@ async fn inject_live_inputs(
     Ok(injected)
 }
 
-fn persist_live_input(
-    connection: &mut Connection,
+async fn persist_live_input(
+    store: &TurnState<'_>,
     request: &RunTurnRequest,
     requested: &RequestedTurn,
     input: &SoftInterruptMessage,
     attachments: Option<&zuno_attachment::AttachmentStore>,
 ) -> Result<(), TurnError> {
-    let transaction = open::immediate_transaction(connection)?;
-    let latest = MessageStore::new(&transaction).latest_time_created(&request.session_id)?;
-    let created = created_after(now_millis(), latest);
+    // The provider assigns the durable time inside the consumption transaction.
+    let created = 0;
     let message_id = input
         .input_id
         .clone()
         .unwrap_or_else(|| format!("msg_{}", Uuid::new_v4().simple()));
-    let mut message = MessageRecord::from_json(json!({
+    let message = MessageRecord::from_json(json!({
         "id": message_id,
         "sessionID": request.session_id,
         "role": "user",
@@ -4011,15 +3983,6 @@ fn persist_live_input(
             "modelID": requested.model_id
         }
     }))?;
-    if let Some(input_id) = input.input_id.as_deref()
-        && let Some(stored) = read_in(&transaction, &request.session_id, input_id)?
-        && stored.prompt.get("kind").and_then(Value::as_str) == Some("subagentReport")
-        && let Some(metadata) = stored.prompt.get("metadata")
-    {
-        message
-            .data
-            .insert(TASK_REPORT_METADATA_KEY.to_owned(), metadata.clone());
-    }
     let mut parts = Vec::with_capacity(input.images.len().saturating_add(1));
     parts.push(PartRecord::from_json(
         json!({
@@ -4076,32 +4039,17 @@ fn persist_live_input(
             ),
         )?);
     }
-    {
-        let store = MessageStore::new(&transaction);
-        store.put_message_at(&message, created)?;
-        for part in parts {
-            store.put_part_at(&part, part.time_created)?;
-        }
-    }
-    if let Some(input_id) = input.input_id.as_deref()
-        && mark_consumed_in(&transaction, &request.session_id, input_id)?.is_none()
-    {
-        return Err(DbError::Conflict {
-            table: "session_input".to_owned(),
-            id: input_id.to_owned(),
-            detail: "promoted live input was not available for consumed settlement".to_owned(),
-        }
-        .into());
-    }
-    transaction.commit().map_err(open::map_error)?;
-    Ok(())
-}
-
-fn touch_session(connection: &mut Connection, session_id: &str) -> Result<(), TurnError> {
-    let transaction = open::immediate_transaction(connection)?;
-    session::touch(&transaction, session_id)?;
-    transaction.commit().map_err(open::map_error)?;
-    Ok(())
+    store
+        .persistence
+        .consume_input(
+            &store.scope,
+            crate::state::InputMaterialization {
+                input_id: input.input_id.clone(),
+                message,
+                parts,
+            },
+        )
+        .await
 }
 
 fn requested_turn(
@@ -4228,7 +4176,7 @@ fn required_string(record: &MessageRecord, field: &'static str) -> Result<String
 /// that is worse than either honest answer — so a row whose own `callID` or `tool` is
 /// unusable still carries its obligation, under [`UNNAMED_TOOL_CALL_IDENTITY`], and is
 /// reported through `tracing::error!` as well.
-fn repair_missing_tool_outputs(
+pub(crate) fn repair_missing_tool_outputs(
     connection: &Connection,
     session_id: &str,
 ) -> Result<usize, TurnError> {
@@ -4339,7 +4287,10 @@ fn non_empty_field(part: &PartRecord, field: &str) -> Option<String> {
 type LegacyToolSchemaSnapshots = BTreeMap<String, BTreeMap<String, ToolSchemaIdentity>>;
 type HistoricalDeveloperContexts = BTreeMap<String, Option<Vec<String>>>;
 
-fn session_context_epoch(connection: &Connection, session_id: &str) -> Result<i64, DbError> {
+pub(crate) fn session_context_epoch(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<i64, DbError> {
     connection
         .query_row(
             "SELECT COALESCE(( \
@@ -4357,7 +4308,7 @@ fn session_context_epoch(connection: &Connection, session_id: &str) -> Result<i6
 /// from the provider-request event keyed by `assistantMessageID`. Runtime policy sections
 /// occupy the receipt's stable developer prefix; the remaining actual (post-hook) suffix
 /// is the turn context, memory, and request-hook context that started the response.
-fn load_historical_developer_contexts(
+pub(crate) fn load_historical_developer_contexts(
     connection: &Connection,
     session_id: &str,
     history: &[MessageWithParts],
@@ -4541,7 +4492,7 @@ fn restore_historical_developer_contexts(
 /// message it admitted. It gives released databases a proof stronger than "the current
 /// catalog has the same name": a legacy call keeps native protocol only when its exact
 /// historical description and argument-schema digests can be recovered here.
-fn load_legacy_tool_schema_snapshots(
+pub(crate) fn load_legacy_tool_schema_snapshots(
     connection: &Connection,
     session_id: &str,
 ) -> Result<LegacyToolSchemaSnapshots, DbError> {
@@ -6695,7 +6646,7 @@ fn append_tool_pair(
 /// and the next, and the append-only tracker rightly refuses the request.
 fn assistant_message(
     request: &RunTurnRequest,
-    session: &session::Session,
+    session: &crate::state::TurnSession,
     requested: &RequestedTurn,
     agent: &ResolvedAgent,
     model: &ResolvedModel,
@@ -6725,8 +6676,8 @@ fn assistant_message(
     MessageRecord::from_json(data).map_err(TurnError::from)
 }
 
-fn append_turn_started(
-    connection: &mut Connection,
+async fn append_turn_started(
+    store: &TurnState<'_>,
     request: &RunTurnRequest,
     requested: &RequestedTurn,
     agent: &ResolvedAgent,
@@ -6751,16 +6702,17 @@ fn append_turn_started(
         );
     }
     append_turn_origin_properties(&mut properties, &request.start);
-    append_with_connection(
-        connection,
-        &request.session_id,
-        NewSessionEvent::new("session.turn.started", properties)?,
-    )?;
+    store
+        .append(
+            NewSessionEvent::new("session.turn.started", properties)?,
+            ProviderEventUpdate::None,
+        )
+        .await?;
     Ok(())
 }
 
-fn append_turn_rejected(
-    connection: &mut Connection,
+async fn append_turn_rejected(
+    store: &TurnState<'_>,
     request: &RunTurnRequest,
     requested: &RequestedTurn,
     error_kind: &str,
@@ -6785,11 +6737,12 @@ fn append_turn_rejected(
         );
     }
     append_turn_origin_properties(&mut properties, &request.start);
-    append_with_connection(
-        connection,
-        &request.session_id,
-        NewSessionEvent::new("session.turn.rejected", properties)?,
-    )?;
+    store
+        .append(
+            NewSessionEvent::new("session.turn.rejected", properties)?,
+            ProviderEventUpdate::None,
+        )
+        .await?;
     Ok(())
 }
 
@@ -6842,8 +6795,115 @@ struct ProviderAttemptRecord<'a> {
     max_attempts: u32,
 }
 
-fn append_provider_request_started(
-    connection: &mut Connection,
+struct TurnAttemptObserver<'a, 'state> {
+    store: &'a TurnState<'state>,
+    request: &'a RunTurnRequest,
+    accumulator: &'a Arc<Mutex<StepAccumulator>>,
+    record: ProviderAttemptRecord<'a>,
+}
+
+impl crate::retry::ProviderAttemptObserver<Result<ProviderStreamExit, TurnError>, TurnError>
+    for TurnAttemptObserver<'_, '_>
+{
+    fn observe<'a>(
+        &'a mut self,
+        observation: ProviderAttemptObservation<'a, Result<ProviderStreamExit, TurnError>>,
+    ) -> BoxFuture<'a, Result<(), TurnError>> {
+        Box::pin(async move {
+            let generated_output = self
+                .accumulator
+                .lock()
+                .expect("step accumulator lock")
+                .has_generated_output();
+            match observation {
+                ProviderAttemptObservation::Started { attempt, max } => {
+                    append_provider_attempt_started(
+                        self.store,
+                        self.request,
+                        ProviderAttemptRecord {
+                            attempt,
+                            max_attempts: max,
+                            ..self.record
+                        },
+                    )
+                    .await
+                }
+                ProviderAttemptObservation::Finished {
+                    attempt,
+                    max,
+                    result,
+                } => {
+                    append_provider_attempt_terminal(
+                        self.store,
+                        self.request,
+                        ProviderAttemptRecord {
+                            attempt,
+                            max_attempts: max,
+                            ..self.record
+                        },
+                        generated_output,
+                        result,
+                    )
+                    .await
+                }
+                ProviderAttemptObservation::DeadlineExceeded {
+                    attempt,
+                    max,
+                    recovery_elapsed,
+                    total_elapsed,
+                    last_provider_error_code,
+                } => {
+                    append_provider_attempt_deadline(
+                        self.store,
+                        self.request,
+                        ProviderAttemptRecord {
+                            attempt,
+                            max_attempts: max,
+                            ..self.record
+                        },
+                        generated_output,
+                        recovery_elapsed,
+                        total_elapsed,
+                        last_provider_error_code,
+                    )
+                    .await
+                }
+                ProviderAttemptObservation::BackoffScheduled {
+                    failed_attempt,
+                    next_attempt,
+                    max,
+                    delay,
+                    error,
+                } => {
+                    let scheduled_at_ms = self.store.persistence.clock(&self.store.scope).await?;
+                    let delay_ms = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX).max(1);
+                    let (reason, _) = provider_error_metadata(error);
+                    self.store
+                        .persistence
+                        .schedule_backoff(
+                            &self.store.scope,
+                            zuno_db::provider_backoff::ProviderBackoffCheckpoint {
+                                session_id: self.request.session_id.clone(),
+                                request_id: self.record.request_id.to_owned(),
+                                turn_id: self.request.turn_id.clone(),
+                                failed_attempt,
+                                next_attempt,
+                                max_attempts: max,
+                                reason: reason.to_owned(),
+                                delay_ms,
+                                retry_at_ms: scheduled_at_ms.saturating_add(delay_ms),
+                                scheduled_at_ms,
+                            },
+                        )
+                        .await
+                }
+            }
+        })
+    }
+}
+
+async fn append_provider_request_started(
+    store: &TurnState<'_>,
     request: &RunTurnRequest,
     start: ProviderRequestStart<'_>,
 ) -> Result<(), TurnError> {
@@ -6930,31 +6990,36 @@ fn append_provider_request_started(
             .canonical_value()
             .expect("attempt snapshot is serializable"),
     );
-    append_with_connection(
-        connection,
-        &request.session_id,
-        NewSessionEvent::new("session.provider.request", properties)?,
-    )?;
+    store
+        .append(
+            NewSessionEvent::new("session.provider.request", properties)?,
+            ProviderEventUpdate::RequestStarted {
+                estimated_prompt_tokens: start.estimated_prompt_tokens,
+                context_limit: request.context_limit,
+            },
+        )
+        .await?;
     Ok(())
 }
 
-fn append_provider_attempt_started(
-    connection: &mut Connection,
+async fn append_provider_attempt_started(
+    store: &TurnState<'_>,
     request: &RunTurnRequest,
     attempt: ProviderAttemptRecord<'_>,
 ) -> Result<(), TurnError> {
     let mut properties = provider_attempt_properties(request, attempt);
     properties.insert("status".to_owned(), Value::String("started".to_owned()));
-    append_with_connection(
-        connection,
-        &request.session_id,
-        NewSessionEvent::new("session.provider.attempt", properties)?,
-    )?;
+    store
+        .append(
+            NewSessionEvent::new("session.provider.attempt", properties)?,
+            ProviderEventUpdate::AttemptStarted,
+        )
+        .await?;
     Ok(())
 }
 
-fn append_provider_attempt_terminal(
-    connection: &mut Connection,
+async fn append_provider_attempt_terminal(
+    store: &TurnState<'_>,
     request: &RunTurnRequest,
     attempt: ProviderAttemptRecord<'_>,
     generated_output: bool,
@@ -6993,16 +7058,17 @@ fn append_provider_attempt_terminal(
             insert_provider_attempt_error(&mut properties, error);
         }
     }
-    append_with_connection(
-        connection,
-        &request.session_id,
-        NewSessionEvent::new("session.provider.attempt", properties)?,
-    )?;
+    store
+        .append(
+            NewSessionEvent::new("session.provider.attempt", properties)?,
+            ProviderEventUpdate::None,
+        )
+        .await?;
     Ok(())
 }
 
-fn append_provider_attempt_deadline(
-    connection: &mut Connection,
+async fn append_provider_attempt_deadline(
+    store: &TurnState<'_>,
     request: &RunTurnRequest,
     attempt: ProviderAttemptRecord<'_>,
     generated_output: bool,
@@ -7036,11 +7102,12 @@ fn append_provider_attempt_deadline(
             Value::String(code.to_owned()),
         );
     }
-    append_with_connection(
-        connection,
-        &request.session_id,
-        NewSessionEvent::new("session.provider.attempt", properties)?,
-    )?;
+    store
+        .append(
+            NewSessionEvent::new("session.provider.attempt", properties)?,
+            ProviderEventUpdate::None,
+        )
+        .await?;
     Ok(())
 }
 
@@ -7178,7 +7245,7 @@ fn insert_provider_attempt_error(properties: &mut Map<String, Value>, error: &Pr
 
 struct AttemptSnapshotInput<'a> {
     request: &'a RunTurnRequest,
-    session: &'a session::Session,
+    session: &'a crate::state::TurnSession,
     agent: &'a ResolvedAgent,
     model: &'a ResolvedModel,
     step: u32,
@@ -7334,8 +7401,8 @@ fn attempt_snapshot(input: AttemptSnapshotInput<'_>) -> AttemptSnapshot {
     }
 }
 
-fn append_provider_request_terminal(
-    connection: &mut Connection,
+async fn append_provider_request_terminal(
+    store: &TurnState<'_>,
     request: &RunTurnRequest,
     step: u32,
     request_id: &str,
@@ -7382,12 +7449,14 @@ fn append_provider_request_terminal(
             }
         }
     }
-    append_with_connection(
-        connection,
-        &request.session_id,
-        NewSessionEvent::new("session.provider.request", properties)?,
-    )?;
-    zuno_db::provider_backoff::clear_request(connection, &request.session_id, request_id)?;
+    store
+        .append(
+            NewSessionEvent::new("session.provider.request", properties)?,
+            ProviderEventUpdate::RequestFinished {
+                request_id: request_id.to_owned(),
+            },
+        )
+        .await?;
     Ok(())
 }
 
@@ -7493,8 +7562,8 @@ enum AssistantCheckpointDisposition<'error> {
     Failed(&'error TurnError),
 }
 
-fn checkpoint_assistant(
-    connection: &Connection,
+async fn checkpoint_assistant(
+    store: &TurnState<'_>,
     request: &RunTurnRequest,
     step: u32,
     assistant: &mut MessageRecord,
@@ -7552,12 +7621,7 @@ fn checkpoint_assistant(
     }
     update_usage(&mut assistant.data, accumulator);
 
-    let transaction = open::immediate_transaction(connection)?;
-    let store = MessageStore::new(&transaction);
-    let previous = store
-        .find_message(&assistant.id)?
-        .map(|message| session::MessageUsage::from_data(&message.data));
-    store.put_message_at(assistant, completed)?;
+    let mut parts = Vec::new();
     let tool_failure = match &disposition {
         AssistantCheckpointDisposition::Completed => None,
         AssistantCheckpointDisposition::Interrupted(_) => Some(INTERRUPTED_TOOL_RESULT),
@@ -7589,7 +7653,7 @@ fn checkpoint_assistant(
                     }),
                     assistant.time_created,
                 )?;
-                store.put_part_at(&part, completed)?;
+                parts.push(part);
             }
             StepItem::Reasoning(slot) => {
                 if !slot.text.is_empty() {
@@ -7617,7 +7681,7 @@ fn checkpoint_assistant(
                         }),
                         assistant.time_created,
                     )?;
-                    store.put_part_at(&part, completed)?;
+                    parts.push(part);
                 }
                 if let Some(capsule) = &slot.capsule {
                     let part = provider_reasoning_part(
@@ -7628,7 +7692,7 @@ fn checkpoint_assistant(
                         completed,
                         capsule.clone(),
                     )?;
-                    store.put_part_at(&part, completed)?;
+                    parts.push(part);
                 }
             }
             StepItem::Call { ordinal } => {
@@ -7650,20 +7714,20 @@ fn checkpoint_assistant(
                     },
                     tool_failure.map_or(ToolPartStage::Pending, ToolPartStage::Closed),
                 )?;
-                store.put_part_at(&tool, completed)?;
+                parts.push(tool);
             }
         }
     }
-    session::reconcile_usage(
-        &transaction,
-        &request.session_id,
-        previous,
-        session::MessageUsage::from_data(&assistant.data),
-        request
-            .context_limit
-            .and_then(|limit| i64::try_from(limit).ok()),
-    )?;
-    transaction.commit().map_err(open::map_error)?;
+    store
+        .commit_assistant(&zuno_db::assistant_commit::AssistantCommit {
+            message: assistant.clone(),
+            parts,
+            persisted_at_ms: completed,
+            context_limit: request
+                .context_limit
+                .and_then(|limit| i64::try_from(limit).ok()),
+        })
+        .await?;
     Ok(())
 }
 
@@ -7912,15 +7976,14 @@ struct DispatchedGroup<'a> {
 ///
 /// [`TurnError::Database`] when the transaction, either write, or the commit fails. The
 /// turn stops rather than dispatching work it could not admit to having dispatched.
-fn mark_group_dispatched(
-    connection: &Connection,
+async fn mark_group_dispatched(
+    store: &TurnState<'_>,
     request: &RunTurnRequest,
     step: u32,
     locked_tools: &[ToolDefinition],
     group: DispatchedGroup<'_>,
 ) -> Result<(), TurnError> {
-    let transaction = open::immediate_transaction(connection)?;
-    let store = MessageStore::new(&transaction);
+    let mut parts = Vec::with_capacity(group.calls.len());
     let dispatched_at = now_millis();
     for (call_index, call, display_name, ui_intent) in group.calls {
         let part = checkpoint_tool_part(
@@ -7937,18 +8000,25 @@ fn mark_group_dispatched(
             },
             ToolPartStage::Dispatched,
         )?;
-        store.put_part_at(&part, dispatched_at)?;
+        parts.push(part);
     }
-    transaction.commit().map_err(open::map_error)?;
+    store
+        .persistence
+        .commit_tool_parts(
+            &store.scope,
+            &parts,
+            crate::state::ToolPartCommitKind::Dispatched,
+            dispatched_at,
+        )
+        .await?;
     Ok(())
 }
 
-fn persist_tool_result(
-    connection: &Connection,
+fn tool_result_part(
     request: &RunTurnRequest,
     identity: ToolPartIdentity<'_>,
     dispatch: &ToolDispatchResult,
-) -> Result<(), TurnError> {
+) -> Result<PartRecord, TurnError> {
     let status = if dispatch.is_error {
         "error"
     } else {
@@ -8015,9 +8085,7 @@ fn persist_tool_result(
     if let Some(signature) = &identity.call.thought_signature {
         payload["metadata"] = json!({ "thoughtSignature": signature.as_str() });
     }
-    let part = PartRecord::from_json(payload, identity.message_time_created)?;
-    MessageStore::new(connection).put_part_at(&part, now_millis())?;
-    Ok(())
+    PartRecord::from_json(payload, identity.message_time_created).map_err(Into::into)
 }
 
 fn tool_ui_intent(definitions: &[ToolDefinition], name: &str) -> ToolUiIntent {

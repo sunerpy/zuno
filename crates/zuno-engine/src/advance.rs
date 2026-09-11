@@ -168,11 +168,11 @@ pub enum AdvanceError {
 /// deliberately rebuilt; counters and recovery obligations are never reset.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct LoopCheckpoint {
+pub struct LoopCheckpoint {
     pub steps: u32,
     pub tool_calls_dispatched: u32,
     pub last_assistant_id: Option<String>,
-    pub requested_turn: Option<RequestedTurn>,
+    pub(crate) requested_turn: Option<RequestedTurn>,
     pub prompt_traces: PromptTraceSet,
     pub unresolved_tool_failures: BTreeMap<String, ToolFailureRecovery>,
     pub consecutive_invalid_tool_calls: u8,
@@ -200,22 +200,22 @@ impl From<TurnOutcome> for LoopOutcome {
 }
 
 /// The durable admission token of one local advance.
-pub(crate) struct AdvanceAdmission {
+pub struct AdvanceAdmission {
     pub checkpoint: Option<LoopCheckpoint>,
     event_id: String,
-    owner: PrincipalKey,
+    pub(crate) owner: PrincipalKey,
     request_digest: String,
     previous: Option<CheckpointRef>,
 }
 
-pub(crate) enum BeginAdvance {
+pub enum BeginAdvance {
     Admitted(Box<AdvanceAdmission>),
     AlreadyCommitted(AdvanceOutcome),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
-enum AdvanceState {
+pub enum AdvanceState {
     Started,
     Checkpointed {
         checkpoint: Box<LoopCheckpoint>,
@@ -379,13 +379,8 @@ pub(crate) fn begin(
     })))
 }
 
-pub(crate) fn finish(
-    connection: &mut Connection,
-    request: &RunTurnRequest,
-    admission: &AdvanceAdmission,
-    outcome: Result<LoopOutcome, TurnError>,
-) -> Result<AdvanceOutcome, AdvanceError> {
-    let state = match &outcome {
+pub(crate) fn completion_state(outcome: &Result<LoopOutcome, TurnError>) -> AdvanceState {
+    match outcome {
         Ok(LoopOutcome::Progressed(checkpoint)) => AdvanceState::Checkpointed {
             checkpoint: checkpoint.clone(),
         },
@@ -403,7 +398,15 @@ pub(crate) fn finish(
                 _ => None,
             },
         },
-    };
+    }
+}
+
+pub(crate) fn commit(
+    connection: &mut Connection,
+    request: &RunTurnRequest,
+    admission: &AdvanceAdmission,
+    state: AdvanceState,
+) -> Result<CheckpointRef, AdvanceError> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(zuno_db::open::map_error)?;
@@ -426,12 +429,7 @@ pub(crate) fn finish(
         })?,
     )?;
     transaction.commit().map_err(zuno_db::open::map_error)?;
-    match outcome? {
-        LoopOutcome::Completed(outcome) => Ok(outcome.into()),
-        LoopOutcome::Progressed(_) => Ok(AdvanceOutcome::Progressed {
-            checkpoint: checkpoint_ref(&event, &request.turn_id),
-        }),
-    }
+    Ok(checkpoint_ref(&event, &request.turn_id))
 }
 
 fn checkpoint_ref(event: &SessionEvent, turn_id: &str) -> CheckpointRef {

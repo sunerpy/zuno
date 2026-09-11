@@ -359,6 +359,28 @@ where
     },
 }
 
+/// An observation may await a state service. The next request, replacement, or
+/// backoff does not begin until the durable observation has completed.
+pub trait ProviderAttemptObserver<T, E> {
+    fn observe<'a>(
+        &'a mut self,
+        observation: ProviderAttemptObservation<'a, T>,
+    ) -> futures::future::BoxFuture<'a, Result<(), E>>;
+}
+
+impl<T, E, F> ProviderAttemptObserver<T, E> for F
+where
+    F: for<'a> FnMut(ProviderAttemptObservation<'a, T>) -> Result<(), E>,
+    E: Send + 'static,
+{
+    fn observe<'a>(
+        &'a mut self,
+        observation: ProviderAttemptObservation<'a, T>,
+    ) -> futures::future::BoxFuture<'a, Result<(), E>> {
+        Box::pin(std::future::ready(self(observation)))
+    }
+}
+
 /// Retry a provider operation with real Tokio sleeps between attempts.
 ///
 /// `emit` receives [`StreamEvent::RetryRollback`] before every sleep and replay.
@@ -409,7 +431,7 @@ where
     retry_provider_with_sleep_and_wake(policy, operation, emit, tokio::time::sleep, wake).await
 }
 
-/// Retry a provider operation while synchronously observing every attempt boundary.
+/// Retry a provider operation while durably observing every attempt boundary.
 ///
 /// `observe` runs before the provider call and immediately after it returns. A
 /// failed observation aborts recovery before rollback or another attempt, so a
@@ -440,7 +462,7 @@ where
     EmitError: Error + 'static,
     Wake: FnMut() -> WakeFuture,
     WakeFuture: Future<Output = T>,
-    Observe: for<'a> FnMut(ProviderAttemptObservation<'a, T>) -> Result<(), ObserveError>,
+    Observe: ProviderAttemptObserver<T, ObserveError>,
     ObserveError: Error + 'static,
 {
     retry_provider_with_sleep_and_wake_observed(
@@ -562,7 +584,7 @@ where
     SleepFuture: Future<Output = ()>,
     Wake: FnMut() -> WakeFuture,
     WakeFuture: Future<Output = T>,
-    Observe: for<'a> FnMut(ProviderAttemptObservation<'a, T>) -> Result<(), ObserveError>,
+    Observe: ProviderAttemptObserver<T, ObserveError>,
     ObserveError: Error + 'static,
 {
     let max = policy.max_attempts().get();
@@ -573,8 +595,36 @@ where
     let mut attempt = 1_u32;
 
     loop {
-        observe(ProviderAttemptObservation::Started { attempt, max })
+        observe
+            .observe(ProviderAttemptObservation::Started { attempt, max })
+            .await
             .map_err(|source| ProviderRetryObservedError::Observation { source })?;
+        // A state-service round trip can consume the remaining recovery window.
+        // Check before constructing/polling the provider future: a ready future
+        // may otherwise win an already-expired timeout.
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            let recovery_elapsed = recovery_started
+                .expect("a replacement attempt has a recovery start")
+                .elapsed();
+            let total_elapsed = total_started.elapsed();
+            observe
+                .observe(ProviderAttemptObservation::DeadlineExceeded {
+                    attempt,
+                    max,
+                    recovery_elapsed,
+                    total_elapsed,
+                    last_provider_error_code,
+                })
+                .await
+                .map_err(|source| ProviderRetryObservedError::Observation { source })?;
+            return Err(ProviderRetryError::DeadlineExceeded {
+                attempt,
+                recovery_elapsed,
+                total_elapsed,
+                last_provider_error_code,
+            }
+            .into());
+        }
         let result = match deadline {
             None => operation(attempt).await,
             Some(deadline) => match tokio::time::timeout_at(deadline, operation(attempt)).await {
@@ -584,14 +634,16 @@ where
                         .expect("a replacement attempt has a recovery start")
                         .elapsed();
                     let total_elapsed = total_started.elapsed();
-                    observe(ProviderAttemptObservation::DeadlineExceeded {
-                        attempt,
-                        max,
-                        recovery_elapsed,
-                        total_elapsed,
-                        last_provider_error_code,
-                    })
-                    .map_err(|source| ProviderRetryObservedError::Observation { source })?;
+                    observe
+                        .observe(ProviderAttemptObservation::DeadlineExceeded {
+                            attempt,
+                            max,
+                            recovery_elapsed,
+                            total_elapsed,
+                            last_provider_error_code,
+                        })
+                        .await
+                        .map_err(|source| ProviderRetryObservedError::Observation { source })?;
                     return Err(ProviderRetryError::DeadlineExceeded {
                         attempt,
                         recovery_elapsed,
@@ -602,12 +654,14 @@ where
                 }
             },
         };
-        observe(ProviderAttemptObservation::Finished {
-            attempt,
-            max,
-            result: &result,
-        })
-        .map_err(|source| ProviderRetryObservedError::Observation { source })?;
+        observe
+            .observe(ProviderAttemptObservation::Finished {
+                attempt,
+                max,
+                result: &result,
+            })
+            .await
+            .map_err(|source| ProviderRetryObservedError::Observation { source })?;
         match result {
             Ok(output) => return Ok(output),
             Err(error) if !error.is_retryable() => {
@@ -666,14 +720,16 @@ where
                         source: Box::new(source),
                     })
                 })?;
-                observe(ProviderAttemptObservation::BackoffScheduled {
-                    failed_attempt: attempt,
-                    next_attempt,
-                    max,
-                    delay,
-                    error: &error,
-                })
-                .map_err(|source| ProviderRetryObservedError::Observation { source })?;
+                observe
+                    .observe(ProviderAttemptObservation::BackoffScheduled {
+                        failed_attempt: attempt,
+                        next_attempt,
+                        max,
+                        delay,
+                        error: &error,
+                    })
+                    .await
+                    .map_err(|source| ProviderRetryObservedError::Observation { source })?;
                 let wait = async {
                     tokio::select! {
                         biased;

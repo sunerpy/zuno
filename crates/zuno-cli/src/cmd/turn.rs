@@ -175,18 +175,20 @@ impl DynamicContextRefreshInstruction {
 
 #[derive(Debug, Clone)]
 struct HostDynamicContextRefresher {
+    database: Arc<zuno_db::Pool>,
     goal_continuation: GoalContinuation,
     instruction: DynamicContextRefreshInstruction,
 }
 
+#[async_trait::async_trait]
 impl DynamicContextRefresher for HostDynamicContextRefresher {
-    fn refresh(
+    async fn refresh(
         &self,
-        connection: &zuno_db::Connection,
         session_id: &str,
         refresh: ToolDynamicContextRefresh,
     ) -> Result<DynamicContext, String> {
-        let context = goal_dynamic_context_from(connection, &self.goal_continuation, session_id)?;
+        let connection = self.database.get().map_err(to_string)?;
+        let context = goal_dynamic_context_from(&connection, &self.goal_continuation, session_id)?;
         Ok(self.instruction.apply(context, refresh))
     }
 }
@@ -7858,6 +7860,7 @@ impl TurnHost {
                 .map_err(TurnFailure::work_state)?
                 .map(|plan| (plan.id, plan.revision));
             let dynamic_context_refresher = HostDynamicContextRefresher {
+                database: Arc::clone(&self.database),
                 goal_continuation: self.goal_continuation.clone(),
                 instruction: refresh_instruction.clone(),
             };

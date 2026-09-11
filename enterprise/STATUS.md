@@ -6,8 +6,8 @@ Baseline: `v0.10.29`, `d1212860dba6a6b420ce81d444ace58feaf0adb5`.
 | --- | --- | --- |
 | P0 | Complete | PR #176 merged into preview; native CI run 34553054820 succeeded |
 | P1 | In progress | Principal propagation implemented; ownership migration validated; local bounded driver and scoped session application validated; local runtime Job/lease port validated; Memory persistence/authority ports validated; backend assembly remains |
-| P2 | In progress | PostgreSQL session TLS/RLS and OAuth2/Entra verifier contracts validated; runtime Job/Memory, login integration, organization policy/approval and remote state remain |
-| P3 | Pending | Two workers, Docker gateway, root-task takeover |
+| P2 | In progress | PostgreSQL sessions/runtime Jobs, OAuth2/Entra verification and organization/approval storage validated; Memory, login and execution integration remain |
+| P3 | In progress | Shared asynchronous turn-state port being integrated; authenticated transport, two workers, Docker gateway and root-task takeover remain |
 | P4 | Pending | Durable child/Workflow/Council waits, merges and cancellation |
 | P5 | Pending | Web, SDK, remote ACP, common projections |
 | P6 | Pending | Fault injection, native artifacts, preview publication |
@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p2-authorization`.
+- Current phase branch: `codex/enterprise-p3-state-api`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -122,3 +122,11 @@ verification is pending the next preview CI run. No release is enabled.
 - Scope review: English/Chinese authorization guides and preview entry links are updated. The stable documentation site and installation remain untouched.
 
 - Authorization PR #187 first CI (34590730300) passed all runtime/database gates but found a Windows ARM fixture race: cancellation could observe an empty PID file. The process-tree fixture now publishes completed PID files atomically. This is test-only; production process supervision is unchanged.
+- Authorization PR #187 merged at `1afbd60c20af138f5df8751511f78856aaa72702`; repaired CI 34592465239 passed all required native and PostgreSQL checks.
+
+## Shared turn-state boundary
+
+- The ordinary loop now uses an asynchronous `TurnPersistence` provider for history, prompt receipts, model attempts, ordered step/usage commits, tool results, input consumption and driver checkpoints.
+- The local adapter preserves existing SQLite semantics and checks session ownership before provider I/O. Provider event/backoff updates are atomic; tools cannot overwrite another invocation or change a settled result.
+- Validation: 449 database tests and 400 engine tests passed, including async acknowledgement rejection, retry-window expiry, owner isolation, result-batch rollback and immutable invocation receipts. Documentation/release contracts: 99 passed. Workspace check, Clippy, formatting and diff checks passed.
+- Remote transport, PostgreSQL turn records, current lease enforcement and actual Worker/gateway execution are not implemented by this extraction. Publication remains disabled.

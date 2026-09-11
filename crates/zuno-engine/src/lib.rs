@@ -17,6 +17,7 @@ pub mod prompt;
 pub mod report;
 pub mod retry;
 pub mod session_command;
+pub mod state;
 pub mod status;
 pub mod stream;
 pub mod terminal_lease;

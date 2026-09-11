@@ -116,7 +116,10 @@ async fn the_real_turn_preserves_principal_through_dispatch_policy_and_nested_to
         &[("scope-call", "inspect")],
     )));
     let providers = registry(provider);
-    let mut connection = seeded();
+    let mut connection = seed_owned(
+        open::open(&zuno_paths::DbLocation::Memory).expect("open memory database"),
+        principal.owner(),
+    );
     let interrupt = InterruptSignal::new();
     let (sender, receiver) = event_channel();
     let turn = run_turn(
@@ -140,6 +143,64 @@ async fn the_real_turn_preserves_principal_through_dispatch_policy_and_nested_to
     assert_eq!(
         approvals.lock().expect("approvals").as_slice(),
         &[principal]
+    );
+}
+
+#[tokio::test]
+async fn a_foreign_session_is_rejected_before_a_model_request_or_tool_dispatch() {
+    use std::num::NonZeroU64;
+    use zuno_types::identity::{PrincipalId, PrincipalKind, PrincipalScope, TenantId};
+
+    let principal = PrincipalScope::new(
+        TenantId::new("foreign-company").expect("tenant"),
+        PrincipalId::new("alice").expect("subject"),
+        PrincipalKind::User,
+        None,
+        NonZeroU64::MIN,
+    );
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(ScopedProbe {
+            observed: observed.clone(),
+        })],
+        Vec::new(),
+        Arc::new(AllowAll),
+        zuno_engine::dispatch::AuthorizationPolicy::Strict,
+        McpToolStatus::Ready,
+    );
+    let provider = Arc::new(ScriptedProvider::new(named_provider_events(
+        "scope_probe",
+        &[("forbidden-call", "inspect")],
+    )));
+    let providers = registry(provider.clone());
+    let mut connection = seeded();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+    let turn = run_turn(
+        RunTurnRequest::new(SESSION_ID, "foreign-turn", DynamicContext::default()),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &Resolver,
+            &dispatcher,
+            &interrupt,
+        )
+        .with_principal_scope(principal),
+        sender,
+    );
+    let (result, _) = tokio::join!(turn, collect_events(receiver));
+    assert!(result.is_err());
+    assert!(provider.requests().is_empty());
+    assert!(observed.lock().expect("observed").is_empty());
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM message WHERE session_id=?1",
+                [SESSION_ID],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("session messages"),
+        1
     );
 }
 
@@ -339,10 +400,10 @@ struct RecordingContextRefresher {
     calls: AtomicUsize,
 }
 
+#[async_trait]
 impl DynamicContextRefresher for RecordingContextRefresher {
-    fn refresh(
+    async fn refresh(
         &self,
-        _connection: &Connection,
         session_id: &str,
         refresh: ToolDynamicContextRefresh,
     ) -> Result<DynamicContext, String> {
@@ -621,17 +682,38 @@ fn seeded() -> Connection {
     seed_connection(open::open(&zuno_paths::DbLocation::Memory).expect("open memory database"))
 }
 
-fn seed_connection(mut connection: Connection) -> Connection {
+fn seed_connection(connection: Connection) -> Connection {
+    seed_owned(
+        connection,
+        zuno_types::identity::PrincipalScope::local().owner(),
+    )
+}
+
+fn seed_owned(mut connection: Connection, owner: zuno_types::identity::PrincipalKey) -> Connection {
     migration::apply(&mut connection).expect("apply schema");
     connection
-        .execute_batch(&format!(
+        .execute_batch(
             "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
-             VALUES ('project-dispatch', '/workspace', 1, 1, '[]');
-             INSERT INTO session \
-               (id, project_id, slug, directory, title, version, time_created, time_updated) \
-             VALUES ('{SESSION_ID}', 'project-dispatch', 'dispatch', '/workspace', 'dispatch', '1', 1, 1);"
-        ))
-        .expect("seed project and session");
+             VALUES ('project-dispatch', '/workspace', 1, 1, '[]');",
+        )
+        .expect("seed project");
+    let transaction = connection.transaction().expect("begin session creation");
+    zuno_db::session::create(
+        &transaction,
+        &zuno_db::session::SessionCreate::new(
+            SESSION_ID,
+            "dispatch",
+            "project-dispatch",
+            "/workspace",
+            "/workspace",
+            "dispatch",
+            "1",
+        )
+        .with_owner(owner)
+        .at(1),
+    )
+    .expect("seed owned session");
+    transaction.commit().expect("commit session");
     let message = MessageRecord::from_json(json!({
         "id": "msg_user_dispatch",
         "sessionID": SESSION_ID,

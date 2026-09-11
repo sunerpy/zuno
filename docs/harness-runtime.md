@@ -84,6 +84,40 @@ policy or shared-resource ACLs. Format 13 stores private session ownership
 independently from editable metadata. Remote authentication remains a separate
 enterprise implementation stage.
 
+### Turn persistence
+
+The shared loop accesses durable state through the asynchronous `TurnPersistence`
+port. `TurnContext::new` installs the local SQLite adapter;
+`TurnContext::from_persistence` accepts a provider selected by the host's backend
+bundle. A turn retains that provider and its owner/session scope throughout
+execution. The loop no longer retains a SQLite connection or performs SQL during
+model and tool orchestration.
+
+The port owns history reads and repair, exact prompt receipts, provider bookkeeping,
+assistant-step commits, tool handoff/result commits, inbox consumption and bounded
+driver admission/settlement. Assistant metadata, ordered parts and cumulative usage
+commit together. Repeating that step does not count usage twice, and message/part
+identities cannot overwrite another session's records. Ownership is checked before
+reading model context or initiating any provider request.
+
+Provider observations may await the state service. Attempt start commits before
+provider I/O; a retry deadline commits before waiting. Provider events and their
+usage/backoff updates share one transaction. Tool handoff commits before execution,
+and result commits check the original call, tool and parameters. A settled result
+cannot be replaced with a different outcome. A completed parallel group's results
+commit as one ordered batch. If a state-service acknowledgement consumes the retry
+window, no replacement provider request starts after that deadline.
+
+Attachment validation/admission happens before the inbox transaction. The store
+assigns the input's durable order and consumes the inbox with its message and parts.
+Dynamic-context refresh is an asynchronous host service, awaited after a committed
+tool result, with its own scoped storage access.
+
+The SQLite provider is implemented and consumed by the ordinary driver. Its
+in-process record types are not a public Web or Worker wire protocol. PostgreSQL
+turn-state encoding, authenticated state transport, lease fencing and the coherent
+enterprise backend bundle must be connected before a remote Worker is available.
+
 ### Bounded driver checkpoints
 
 The preview adds `AgentDriver::advance` to the same provider/tool loop used by
