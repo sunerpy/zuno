@@ -61,9 +61,9 @@ confidence-threshold = 0.9
 
 # A dual-licensed crate is judged on its best option, so `MIT OR MPL-2.0`
 # (termina) and `CC0-1.0 OR MIT-0 OR Apache-2.0` (dunce) resolve against the
-# list above and need no help. The three exceptions below are crates that offer
-# a single non-standard licence and nothing else. Each is named individually so
-# that adding a fourth is a visible decision rather than an inherited one.
+# list above and need no help. The exceptions below are crates that offer a
+# single non-standard licence and nothing else. Each is named individually so
+# that adding another is a visible decision rather than an inherited one.
 
 # Public-domain dedication. Permissive in substance but not OSI-approved, so it
 # is granted per-crate instead of workspace-wide.
@@ -75,6 +75,12 @@ allow = ["CC0-1.0"]
 # alternative. Reached through rustls-platform-verifier <- reqwest.
 [[licenses.exceptions]]
 name = "webpki-root-certs"
+allow = ["CDLA-Permissive-2.0"]
+
+# The same Mozilla CA data, reached through SQLx's rustls connector. Keep this
+# separate from the code licence allow list; preview packages retain its notice.
+[[licenses.exceptions]]
+name = "webpki-roots"
 allow = ["CDLA-Permissive-2.0"]
 
 # Weak, file-scoped copyleft. `option-ext` is a two-function helper reached

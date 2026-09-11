@@ -86,5 +86,5 @@ verification is pending the next preview CI run. No release is enabled.
 - `PostgresSessionPersistence` implements the same session application port using a separate preview schema, restricted runtime role, verified TLS and transaction-local RLS identity.
 - The real PostgreSQL 18 TLS contract passed locally: role limits, TLS refusal, RLS, connection reuse, isolation, idempotency, paging, rollback and schema-integrity checks.
 - Preview publishing contracts: 11 passed. Documentation/release contracts: 99 passed. Shared workspace check, Clippy, fmt and diff checks passed. Actionlint passed.
-- Dedicated PostgreSQL 16 CI is configured for Linux amd64/arm64 and is required by preview CI/publication; hosted evidence is pending this PR.
+- PostgreSQL 16 CI passed on Linux amd64/arm64 in run 34576215561. Its shared supply-chain gate identified the SQLx CA data package; `webpki-roots` now has an explicit per-package data-license exception, like `webpki-root-certs`.
 - PostgreSQL Job/Memory storage and engine integration, Entra, HITL, gateway, distributed waits and the Web are still required. Publication remains disabled.
