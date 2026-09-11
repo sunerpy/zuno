@@ -423,7 +423,7 @@ async fn production_dispatch_arguments_reach_the_rendered_permission_dialog() {
             event = wake.recv() => assert!(matches!(event, Some(TerminalEvent::Wake))),
             result = &mut dispatching => {
                 let result = result.expect("the dispatch task");
-                panic!("dispatch completed before asking permission: {}", result.output.output);
+                panic!("dispatch settled before asking permission: {result:?}");
             }
         }
     })
@@ -450,6 +450,9 @@ async fn production_dispatch_arguments_reach_the_rendered_permission_dialog() {
         .await
         .expect("the rendered permission must be answerable")
         .expect("the dispatch task");
+    let zuno_engine::r#loop::ToolDispatchOutcome::Completed(result) = result else {
+        panic!("native permission dispatch unexpectedly deferred")
+    };
     assert!(!result.is_error, "{}", result.output.output);
 }
 
@@ -499,7 +502,7 @@ async fn production_edit_dispatch_renders_path_and_diff_in_collapsed_and_fullscr
             event = wake.recv() => assert!(matches!(event, Some(TerminalEvent::Wake))),
             result = &mut dispatching => {
                 let result = result.expect("the edit dispatch task");
-                panic!("edit dispatch completed before asking permission: {}", result.output.output);
+                panic!("edit dispatch settled before asking permission: {result:?}");
             }
         }
     })
@@ -540,6 +543,9 @@ async fn production_edit_dispatch_renders_path_and_diff_in_collapsed_and_fullscr
         .await
         .expect("the rendered edit permission must be answerable")
         .expect("the edit dispatch task");
+    let zuno_engine::r#loop::ToolDispatchOutcome::Completed(result) = result else {
+        panic!("native edit dispatch unexpectedly deferred")
+    };
     assert!(!result.is_error, "{}", result.output.output);
 }
 

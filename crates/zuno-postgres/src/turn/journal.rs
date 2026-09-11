@@ -3,7 +3,7 @@ use zuno_application::runtime::{JobFinish, RuntimeCheckpoint};
 use zuno_engine::advance::{PreparedBegin, prepare_begin, prepare_commit};
 use zuno_engine::r#loop::{TurnOutcome, TurnRecovery};
 
-async fn latest(
+pub(super) async fn latest(
     tx: &mut Transaction<'_, Postgres>,
     scope: &TurnStateScope,
 ) -> Result<Option<SessionEvent>, TurnError> {
@@ -51,23 +51,79 @@ pub(super) async fn begin(
     let (mut tx, job) = store.transaction(scope).await?;
     bound(request, &job)?;
     let previous = latest(&mut tx, scope).await?;
-    let unfinished = !history::unfinished(&mut tx, scope).await?.is_empty();
+    let unfinished_parts = history::unfinished(&mut tx, scope).await?;
+    let unfinished = !unfinished_parts.is_empty()
+        && !previous
+            .as_ref()
+            .map(|event| zuno_engine::advance::protects_unfinished(event, &unfinished_parts))
+            .transpose()?
+            .unwrap_or(false);
     let uncertain = history::uncertain(&mut tx, scope).await?;
+    let waits = previous
+        .as_ref()
+        .map(zuno_engine::advance::pending_waits)
+        .transpose()?
+        .unwrap_or_default();
+    let completions = crate::runtime::waiting::ready_completions(&mut tx, &job, &waits)
+        .await
+        .map_err(state_error)?;
     let plan = prepare_begin(
         request,
         scope.owner.clone(),
         previous,
         unfinished,
         uncertain,
+        completions.is_some(),
     )?;
+    let mut released = false;
     let result = match plan {
         PreparedBegin::AlreadyCommitted(outcome) => BeginAdvance::AlreadyCommitted(outcome),
+        PreparedBegin::Consume(mut prepared) => {
+            let completions = completions.ok_or(AdvanceError::Conflict)?;
+            let parts = zuno_engine::wait::consume_results(
+                &request.run,
+                &mut prepared.checkpoint,
+                &completions,
+            )?;
+            let time = database_time(&mut tx).await.map_err(state_error)?;
+            for part in parts {
+                records::put_part(&mut tx, scope, &part, time).await?;
+            }
+            crate::runtime::waiting::consume(&mut tx, &job, &completions)
+                .await
+                .map_err(state_error)?;
+            let receipt = event(&mut tx, &job, prepared.event()?).await?;
+            let reference =
+                zuno_engine::advance::checkpoint_reference(&receipt, job.turn_id.as_str())?;
+            crate::runtime::checkpoint_in(
+                &mut tx,
+                &store.lease,
+                RuntimeCheckpoint {
+                    job_id: job.id.clone(),
+                    session_id: job.session_id.clone(),
+                    turn_id: job.turn_id.clone(),
+                    driver: "default".to_owned(),
+                    schema_version: zuno_engine::advance::DRIVER_CHECKPOINT_VERSION,
+                    reference: json!(reference),
+                },
+            )
+            .await
+            .map_err(state_error)?;
+            released = true;
+            BeginAdvance::AlreadyCommitted(zuno_engine::advance::AdvanceOutcome::Progressed {
+                checkpoint: reference,
+            })
+        }
         PreparedBegin::Admit(prepared) => {
             let receipt = event(&mut tx, &job, prepared.event()?).await?;
             BeginAdvance::Admitted(Box::new(prepared.committed(&receipt)?))
         }
     };
-    store.commit_transaction(tx).await?;
+    if released {
+        tx.commit().await.map_err(sql_error)?;
+    } else {
+        store.commit_transaction(tx).await?;
+    }
     Ok(result)
 }
 
@@ -83,13 +139,39 @@ pub(super) async fn commit(
     let previous = latest(&mut tx, scope)
         .await?
         .ok_or(AdvanceError::Conflict)?;
+    let waits = match &state {
+        AdvanceState::Waiting { checkpoint } => checkpoint.waits(),
+        _ => Vec::new(),
+    };
     let finish = match &state {
         AdvanceState::Started => return Err(AdvanceError::Conflict),
-        AdvanceState::Checkpointed { .. } => {
-            if !history::unfinished(&mut tx, scope).await?.is_empty()
+        AdvanceState::Checkpointed { checkpoint } | AdvanceState::Waiting { checkpoint } => {
+            let unfinished = history::unfinished(&mut tx, scope).await?;
+            let covered = if let Some(phase) = &checkpoint.tool_step {
+                phase.covers_unfinished(
+                    &scope.session_id,
+                    &request.run.turn_id,
+                    &unfinished,
+                    waits.is_empty(),
+                )?
+            } else {
+                unfinished.is_empty()
+            };
+            if !covered
                 || history::uncertain(&mut tx, scope).await?
+                || (matches!(&state, AdvanceState::Waiting { .. }) && waits.is_empty())
             {
                 return Err(AdvanceError::NeedsInspection);
+            }
+            if !waits.is_empty() {
+                let phase = checkpoint
+                    .tool_step
+                    .as_ref()
+                    .ok_or(AdvanceError::Conflict)?;
+                let time = database_time(&mut tx).await.map_err(state_error)?;
+                for part in phase.waiting_parts(&unfinished)? {
+                    records::put_part(&mut tx, scope, &part, time).await?;
+                }
             }
             None
         }
@@ -132,20 +214,23 @@ pub(super) async fn commit(
             .await
             .map_err(state_error)?;
     } else {
-        crate::runtime::checkpoint_in(
-            &mut tx,
-            &store.lease,
-            RuntimeCheckpoint {
-                job_id: job.id,
-                session_id: job.session_id,
-                turn_id: job.turn_id,
-                driver: "default".to_owned(),
-                schema_version: zuno_engine::advance::DRIVER_CHECKPOINT_VERSION,
-                reference: json!(reference),
-            },
-        )
-        .await
-        .map_err(state_error)?;
+        let checkpoint = RuntimeCheckpoint {
+            job_id: job.id,
+            session_id: job.session_id,
+            turn_id: job.turn_id,
+            driver: "default".to_owned(),
+            schema_version: zuno_engine::advance::DRIVER_CHECKPOINT_VERSION,
+            reference: json!(reference),
+        };
+        if waits.is_empty() {
+            crate::runtime::checkpoint_in(&mut tx, &store.lease, checkpoint)
+                .await
+                .map_err(state_error)?;
+        } else {
+            crate::runtime::suspend_in(&mut tx, &store.lease, checkpoint, &waits)
+                .await
+                .map_err(state_error)?;
+        }
     }
     tx.commit().await.map_err(sql_error)?;
     Ok(reference)

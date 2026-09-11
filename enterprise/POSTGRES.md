@@ -2,9 +2,10 @@
 
 This adapter implements scoped sessions, runtime Jobs, organization approvals and
 the shared kernel's `TurnPersistence` port. `AgentApplication` and the ordinary
-bounded driver consume the same contracts for SQLite and PostgreSQL. PostgreSQL
-Memory, authenticated Worker transport and OAuth2/OIDC HTTP entry points remain
-subsequent work; this library alone does not register an enterprise server or worker.
+bounded driver consume the same contracts for SQLite and PostgreSQL, including
+durable wait consumption. Authenticated Worker transport uses this adapter.
+PostgreSQL Memory, browser login and complete runtime assembly remain subsequent
+work; this library alone does not register an enterprise server or worker.
 
 ## Database boundary
 
@@ -97,9 +98,10 @@ transaction. A lost response after commit can therefore be reconstructed from
 the next claimant's Job checkpoint, without restarting steps or tool calls.
 Unfinished/in-flight advances retain the conservative inspection boundary.
 
-The current materializer supports the root text inputs accepted by the runtime
-application port. Remote steering, attachments, distributed human/child waits,
-gateway receipts and their consumers are not enabled by this adapter. A local
+The materializer supports root text inputs. The bounded driver also consumes
+[durable invocation waits](WAITING.md); completion facts and original tool results
+advance with the checkpoint in one transaction. Remote steering, attachments,
+human/child producers and gateway-to-tool assembly remain incomplete. A local
 human-request result cannot masquerade as a distributed wait checkpoint.
 
 Preview format 4 adds message/part and retry state, parent/context metadata and
@@ -131,10 +133,10 @@ owners cannot starve later work. Workers and end users receive no database role.
 A committed checkpoint releases worker execution capacity while retaining the
 logical session Job. The next claimant resumes that Job before another queued
 turn. Completion requires consumed input; stale leases cannot overwrite results.
-Lease expiry records `uncertain` and retains the logical session hold. Other
-sessions remain eligible. Automatic takeover of in-flight operations still needs
-the environment gateway and receipt reconciliation; this adapter does not replay
-side effects.
+Lease expiry requeues only an unchanged exact driver checkpoint whose unfinished
+calls are fully accounted for. A newer started advance or unexplained operation
+records `uncertain` and retains the logical session hold. Other sessions remain
+eligible. This adapter does not replay external side effects.
 
 PostgreSQL preview format 2 advances a verified format-1 schema atomically. The
 schema owner can be NOSUPERUSER/NOBYPASSRLS. Backfill briefly removes FORCE RLS
@@ -152,3 +154,9 @@ completion delivery, or external-operation recovery. Those integrations remain
 required before the enterprise runtime can be registered as available.
 
 Format 3 adds [organization authorization and approvals](AUTHORIZATION.md), with forward migrations from both formats 1 and 2.
+
+Format 5 adds owner-scoped waits, timer indexes and the `waiting` Job phase.
+Registration reads early completions; publication wakes only waiting Jobs.
+Consumption, tool results, checkpoint/version and lease release are atomic.
+The captured format-4 fixture verifies preserved messages, signed metadata,
+usage, budgets and lease state across rollback and forward migration.

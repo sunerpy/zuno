@@ -132,15 +132,17 @@ compatible driver before admitting recoverable work. `AdvanceRequest` bounds the
 number of provider steps and binds the original turn request to a resolved,
 immutable configuration digest. It does not authorize the caller.
 
-`AdvanceOutcome` distinguishes a committed checkpoint, completion, interruption
-and a human-request wait. A step yields only after its tool results and history
-repairs are durable. The checkpoint retains step/tool counters, disjoint usage,
+`AdvanceOutcome` distinguishes a committed checkpoint, completion, interruption,
+a local human-request result, and a durable invocation wait. A complete step
+yields after its tool results and history repairs are durable. A deferred tool
+phase instead commits its exact unfinished calls and waits before yielding.
+The checkpoint retains step/tool counters, disjoint usage,
 elapsed wall-clock time, dynamic context, prompt receipt identities and unresolved
 recovery obligations. Process handles and provider caches are reconstructed.
 Resuming the same turn neither emits another turn start nor resets its limits.
-Checkpoint schema 2 retains a database-clock start anchor, so time between
+Checkpoint schema 3 retains the tool-phase cursor and database-clock start anchor, so time between
 advances counts toward the same wall-clock allowance; a clock rollback cannot
-reduce already-accounted time. Unpublished schema-1 checkpoints are conservatively
+reduce already-accounted time. Unpublished schema-1/2 checkpoints are conservatively
 refused, with their transcript and evidence retained.
 
 The local journal compares the latest driver event in a short SQLite transaction
@@ -150,9 +152,22 @@ Wrong owners, changed configuration, stale references, unsupported schemas and
 in-flight advances without a completed checkpoint fail closed. Checkpoint bodies
 are internal state, limited to 8 MiB; clients carry stable references.
 
-The checkpoint contract now has SQLite and PostgreSQL providers, sharing admission
-and immutable request validation. Remote state APIs, environment receipts and
-suspended distributed child calls remain subsequent enterprise stages. A checkpoint
+The checkpoint contract has SQLite and PostgreSQL providers and authenticated
+Worker transport, sharing admission and immutable request validation.
+`PreparedToolDispatch::Pending` carries a typed `WaitRef`; it never supplies an
+interim successful tool result. `WaitCompletionStore` publishes the authoritative
+completion. Driver admission atomically consumes that fact, writes the original
+result and advances the checkpoint before remaining tools or models run.
+The PostgreSQL wait releases the Worker lease while retaining the logical Job.
+History repair rejects attempts to overtake an exact protected tool checkpoint.
+
+Expired claims can resume only when the latest durable driver event is still
+exactly the Job's committed checkpoint. Newer in-flight advances retain uncertain
+recovery. Waiting counts toward the same turn allowance; remaining tools recheck
+that allowance and current authority. See [durable invocation waits](../enterprise/WAITING.md)
+for producer boundaries, atomic transitions and current delivery limits.
+
+Environment/tool assembly and distributed child producers remain later stages. A checkpoint
 does not move a running process or prove that an external side effect stopped.
 The host must resolve the recorded configuration and recheck current authorization
 before entering each advance.

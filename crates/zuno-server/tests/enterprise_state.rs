@@ -149,6 +149,42 @@ impl Tool for Inspect {
     }
 }
 
+struct DeferredDispatcher {
+    inner: ToolRegistryDispatcher,
+    turn_id: zuno_types::identity::TurnId,
+    reference: Mutex<Option<zuno_types::wait::WaitRef>>,
+}
+
+#[async_trait]
+impl zuno_engine::r#loop::ToolDispatcher for DeferredDispatcher {
+    fn available_tools(&self) -> zuno_engine::r#loop::AvailableTools {
+        self.inner.available_tools()
+    }
+
+    async fn prepare(
+        &self,
+        request: zuno_engine::r#loop::DispatchRequest,
+    ) -> zuno_engine::r#loop::PreparedToolDispatch {
+        use zuno_types::identity::{InvocationId, OperationId, WaitId};
+        use zuno_types::wait::{WaitContinuation, WaitRef, WaitTarget};
+        if request.call.id != "waiting" {
+            return self.inner.prepare(request).await;
+        }
+        let reference = WaitRef {
+            id: WaitId::new("wire-wait").unwrap(),
+            turn_id: self.turn_id.clone(),
+            invocation_id: InvocationId::new(&request.call.id).unwrap(),
+            arguments_sha256: zuno_orchestration::sha256_json(&request.call.input),
+            target: WaitTarget::Operation {
+                operation_id: OperationId::new("wire-operation").unwrap(),
+            },
+            continuation: WaitContinuation::CurrentTurn,
+        };
+        *self.reference.lock().unwrap() = Some(reference.clone());
+        zuno_engine::r#loop::PreparedToolDispatch::Pending(reference)
+    }
+}
+
 async fn tls_server(router: Router, fixture: &Fixture) -> (url::Url, tokio::task::JoinHandle<()>) {
     let root = fixture.root_certificate.parent().unwrap();
     let certs = CertificateDer::pem_file_iter(root.join("server.crt"))
@@ -430,6 +466,17 @@ async fn authenticated_workers_resume_the_kernel_over_https_without_database_cre
                 StreamEvent::ToolUseEnd {
                     id: "call".to_owned(),
                 },
+                StreamEvent::ToolUseStart {
+                    id: "waiting".to_owned(),
+                    name: "inspect".to_owned(),
+                },
+                StreamEvent::ToolInputDelta {
+                    id: "waiting".to_owned(),
+                    delta: "{}".to_owned(),
+                },
+                StreamEvent::ToolUseEnd {
+                    id: "waiting".to_owned(),
+                },
                 StreamEvent::MessageEnd {
                     stop_reason: Some(FinishReason::ToolCalls),
                 },
@@ -447,13 +494,17 @@ async fn authenticated_workers_resume_the_kernel_over_https_without_database_cre
     let source = Arc::clone(&script);
     providers.register("wire-test", move |_| source.clone());
     let calls = Arc::new(AtomicUsize::new(0));
-    let dispatcher = ToolRegistryDispatcher::new(
-        vec![Arc::new(Inspect(Arc::clone(&calls)))],
-        vec![],
-        Arc::new(AllowAll),
-        AuthorizationPolicy::Strict,
-        McpToolStatus::Ready,
-    );
+    let dispatcher = DeferredDispatcher {
+        inner: ToolRegistryDispatcher::new(
+            vec![Arc::new(Inspect(Arc::clone(&calls)))],
+            vec![],
+            Arc::new(AllowAll),
+            AuthorizationPolicy::Strict,
+            McpToolStatus::Ready,
+        ),
+        turn_id: job.turn_id.clone(),
+        reference: Mutex::new(None),
+    };
     let request = || {
         AdvanceRequest::new(
             RunTurnRequest::new(
@@ -484,9 +535,27 @@ async fn authenticated_workers_resume_the_kernel_over_https_without_database_cre
         async { while receiver.recv().await.is_some() {} },
     );
     assert!(
-        matches!(outcome, Ok(AdvanceOutcome::Progressed { .. })),
+        matches!(outcome, Ok(AdvanceOutcome::Waiting { .. })),
         "{outcome:?}"
     );
+    assert!(
+        client
+            .claim(WorkerInstanceId::new("waiting").unwrap())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    use zuno_engine::wait::WaitCompletionStore;
+    let completion = zuno_engine::wait::WaitCompletion {
+        id: zuno_types::identity::CompletionId::new("wire-completed").unwrap(),
+        reference: dispatcher.reference.lock().unwrap().clone().unwrap(),
+        result: zuno_engine::r#loop::ToolDispatchResult::success(ToolOutput::text(
+            "Remote",
+            "Verified completion",
+        )),
+    };
+    let fact = runtime.publish(&scope, &completion).await.unwrap();
+    assert_eq!(runtime.publish(&scope, &completion).await.unwrap(), fact);
     let second = client
         .claim(WorkerInstanceId::new("second").unwrap())
         .await
@@ -508,6 +577,34 @@ async fn authenticated_workers_resume_the_kernel_over_https_without_database_cre
             TurnContext::from_persistence(state, &providers, &Resolver, &dispatcher, &interrupt)
                 .with_principal_scope(actor.clone()),
             sender
+        ),
+        async { while receiver.recv().await.is_some() {} },
+    );
+    assert!(
+        matches!(outcome, Ok(AdvanceOutcome::Progressed { .. })),
+        "{outcome:?}"
+    );
+    assert_eq!(script.calls.load(Ordering::SeqCst), 1);
+    // Reconstruct from the Job after losing the consumption response.
+    let third = client
+        .claim(WorkerInstanceId::new("third").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let checkpoint: CheckpointRef =
+        serde_json::from_value(third.job.checkpoint.as_ref().unwrap().reference.clone()).unwrap();
+    let state = Arc::new(
+        client
+            .persistence(&third, "/executor/workspace".to_owned())
+            .unwrap(),
+    );
+    let (sender, mut receiver) = event_channel();
+    let (outcome, _) = tokio::join!(
+        advance_turn(
+            request().resume(checkpoint),
+            TurnContext::from_persistence(state, &providers, &Resolver, &dispatcher, &interrupt)
+                .with_principal_scope(actor.clone()),
+            sender,
         ),
         async { while receiver.recv().await.is_some() {} },
     );

@@ -2,6 +2,7 @@
 
 pub mod execution;
 pub mod identity;
+pub mod wait;
 
 /// One durable Plan step's lifecycle status.
 ///

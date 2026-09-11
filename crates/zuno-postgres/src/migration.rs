@@ -7,7 +7,7 @@ use zuno_application::ApplicationError;
 use crate::database_error;
 
 pub const PREVIEW_SCHEMA: &str = "zuno_enterprise_preview";
-pub(crate) const FORMAT: i32 = 4;
+pub(crate) const FORMAT: i32 = 5;
 const TABLES: &[&str] = &["workspace", "session", "request_receipt", "input", "event"];
 const RUNTIME_TABLES: &[&str] = &[
     "agent_job",
@@ -20,6 +20,8 @@ const DDL: &str = include_str!("schema.sql");
 const RUNTIME_DDL: &str = include_str!("schema_runtime.sql");
 const AUTHORIZATION_DDL: &str = include_str!("schema_authorization.sql");
 const TURN_DDL: &str = include_str!("schema_turn.sql");
+const WAIT_DDL: &str = include_str!("schema_wait.sql");
+const WAIT_TABLES: &[&str] = &["runtime_wait"];
 const TURN_TABLES: &[&str] = &["message", "part", "provider_retry_backoff"];
 const AUTHORIZATION_TABLES: &[&str] = &[
     "organization_member",
@@ -42,9 +44,13 @@ fn source_digest(version: i32) -> String {
         zuno_orchestration::sha256_text(&format!(
             "3\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{POLICY}\n{TENANT_POLICY}"
         ))
+    } else if version == 4 {
+        zuno_orchestration::sha256_text(&format!(
+            "4\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{POLICY}\n{TENANT_POLICY}"
+        ))
     } else {
         zuno_orchestration::sha256_text(&format!(
-            "{FORMAT}\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{POLICY}\n{TENANT_POLICY}"
+            "{FORMAT}\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{WAIT_DDL}\n{POLICY}\n{TENANT_POLICY}"
         ))
     }
 }
@@ -123,7 +129,10 @@ pub async fn migrate(admin: &PgPool, runtime_role: &str) -> Result<(), Applicati
                 if version < 3 {
                     install_authorization(&mut tx).await?;
                 }
-                install_turn(&mut tx).await?;
+                if version < 4 {
+                    install_turn(&mut tx).await?;
+                }
+                install_waits(&mut tx).await?;
                 grant_runtime(&mut tx, runtime_role).await?;
                 let manifest = schema_manifest(&mut tx).await?;
                 let changed = sqlx_core::query::query(
@@ -166,6 +175,7 @@ pub async fn migrate(admin: &PgPool, runtime_role: &str) -> Result<(), Applicati
     install_runtime(&mut tx).await?;
     install_authorization(&mut tx).await?;
     install_turn(&mut tx).await?;
+    install_waits(&mut tx).await?;
     sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
         "REVOKE ALL ON SCHEMA {PREVIEW_SCHEMA} FROM PUBLIC;
          CREATE TABLE {PREVIEW_SCHEMA}.schema_format(
@@ -372,6 +382,7 @@ async fn grant_runtime(connection: &mut PgConnection, role: &str) -> Result<(), 
         .chain(RUNTIME_TABLES)
         .chain(AUTHORIZATION_TABLES)
         .chain(TURN_TABLES)
+        .chain(WAIT_TABLES)
         .chain(["organization_policy", "organization_audit"].iter())
     {
         sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
@@ -409,6 +420,22 @@ async fn install_turn(connection: &mut PgConnection) -> Result<(), ApplicationEr
         .execute(&mut *connection)
         .await
         .map_err(database_error)?;
+    }
+    Ok(())
+}
+
+async fn install_waits(connection: &mut PgConnection) -> Result<(), ApplicationError> {
+    sqlx_core::raw_sql::raw_sql(WAIT_DDL)
+        .execute(&mut *connection)
+        .await
+        .map_err(database_error)?;
+    for table in WAIT_TABLES {
+        sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
+            "ALTER TABLE {PREVIEW_SCHEMA}.{table} ENABLE ROW LEVEL SECURITY;
+             ALTER TABLE {PREVIEW_SCHEMA}.{table} FORCE ROW LEVEL SECURITY;
+             CREATE POLICY owner_scope ON {PREVIEW_SCHEMA}.{table} USING ({POLICY}) WITH CHECK ({POLICY});
+             REVOKE ALL ON {PREVIEW_SCHEMA}.{table} FROM PUBLIC;"
+        ))).execute(&mut *connection).await.map_err(database_error)?;
     }
     Ok(())
 }
@@ -594,6 +621,46 @@ pub(crate) async fn install_format_three_fixture(
     sqlx_core::query::query(
         "UPDATE zuno_enterprise_preview.schema_format SET version=3,source_digest=$1,manifest=$2 WHERE singleton=1",
     ).bind("825b8b1de2fe3924eb9114125a0e2b1c4c92768ab18577ad4ad605ba19588dd9")
+        .bind(manifest).execute(&mut *tx).await.map_err(database_error)?;
+    tx.commit().await.map_err(database_error)
+}
+
+#[cfg(test)]
+pub(crate) async fn install_format_four_fixture(
+    pool: &PgPool,
+    role: &str,
+) -> Result<(), ApplicationError> {
+    install_format_three_fixture(pool, role).await?;
+    let mut tx = pool.begin().await.map_err(database_error)?;
+    // Turn DDL and digest captured from preview commit 510290b5.
+    sqlx_core::raw_sql::raw_sql(include_str!("fixtures/format4-turn.sql"))
+        .execute(&mut *tx)
+        .await
+        .map_err(database_error)?;
+    for table in ["message", "part", "provider_retry_backoff"] {
+        sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
+            "ALTER TABLE {PREVIEW_SCHEMA}.{table} ENABLE ROW LEVEL SECURITY;
+             ALTER TABLE {PREVIEW_SCHEMA}.{table} FORCE ROW LEVEL SECURITY;
+             CREATE POLICY owner_scope ON {PREVIEW_SCHEMA}.{table} USING ({POLICY}) WITH CHECK ({POLICY});
+             REVOKE ALL ON {PREVIEW_SCHEMA}.{table} FROM PUBLIC;
+             GRANT SELECT,INSERT,UPDATE,DELETE ON {PREVIEW_SCHEMA}.{table} TO \"{role}\";"
+        ))).execute(&mut *tx).await.map_err(database_error)?;
+    }
+    sqlx_core::raw_sql::raw_sql(
+        "SELECT set_config('zuno.tenant_id','migration-fixture',true),set_config('zuno.principal_id','owner',true);
+         INSERT INTO zuno_enterprise_preview.message(tenant_id,principal_id,session_id,id,role,data,time_created,time_updated)
+         VALUES('migration-fixture','owner','legacy-session','legacy-assistant','assistant',
+           '{\"id\":\"legacy-assistant\",\"sessionID\":\"legacy-session\",\"role\":\"assistant\",\"time\":{\"created\":1004},\"providerID\":\"fixture\",\"modelID\":\"model\"}',1004,1004);
+         INSERT INTO zuno_enterprise_preview.part(tenant_id,principal_id,session_id,message_id,id,kind,data,time_created,time_updated)
+         VALUES('migration-fixture','owner','legacy-session','legacy-assistant','legacy-tool','tool',
+           '{\"id\":\"legacy-tool\",\"sessionID\":\"legacy-session\",\"messageID\":\"legacy-assistant\",\"type\":\"tool\",\"callID\":\"legacy-call\",\"tool\":\"inspect\",\"state\":{\"status\":\"completed\",\"input\":{},\"output\":\"preserved result\"},\"metadata\":{\"thoughtSignature\":\"preserved-signature\"}}',1004,1004);
+         UPDATE zuno_enterprise_preview.session SET context_epoch=3,tokens_known=true,tokens_input=123,tokens_output=9
+           WHERE tenant_id='migration-fixture' AND principal_id='owner' AND id='legacy-session';",
+    ).execute(&mut *tx).await.map_err(database_error)?;
+    let manifest = schema_manifest(&mut tx).await?;
+    sqlx_core::query::query(
+        "UPDATE zuno_enterprise_preview.schema_format SET version=4,source_digest=$1,manifest=$2 WHERE singleton=1",
+    ).bind("563173ce50200fcd2a4dbbfb4a99270d51687a80b9b6e46609de2e04f8cfdeb2")
         .bind(manifest).execute(&mut *tx).await.map_err(database_error)?;
     tx.commit().await.map_err(database_error)
 }

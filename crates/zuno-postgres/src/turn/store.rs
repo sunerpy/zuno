@@ -35,8 +35,16 @@ impl TurnPersistence for PostgresTurnPersistence {
     async fn repair_history(&self, scope: &TurnStateScope) -> Result<usize, TurnError> {
         let (mut tx, _) = self.transaction(scope).await?;
         let at = database_time(&mut tx).await.map_err(state_error)?;
+        let unfinished = history::unfinished(&mut tx, scope).await?;
+        if !unfinished.is_empty()
+            && let Some(event) = journal::latest(&mut tx, scope).await?
+            && zuno_engine::advance::protects_unfinished(&event, &unfinished)
+                .map_err(|_| TurnStateError::InvalidData)?
+        {
+            return Err(TurnStateError::Conflict.into());
+        }
         let mut count = 0;
-        for part in history::unfinished(&mut tx, scope).await? {
+        for part in unfinished {
             if let Some(part) = zuno_engine::r#loop::repair_unanswered_tool_part(part, at) {
                 records::put_part(&mut tx, scope, &part, at).await?;
                 count += 1;

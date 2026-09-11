@@ -36,6 +36,9 @@ use zuno_permission::enterprise::OrganizationPolicy;
 use zuno_tool::{AllowAll, Tool, ToolContext, ToolOutput};
 use zuno_types::identity::*;
 
+#[path = "turn_tests/waits.rs"]
+mod waits;
+
 #[derive(Debug)]
 struct Script {
     replies: Mutex<VecDeque<Vec<StreamEvent>>>,
@@ -108,6 +111,7 @@ fn usage() -> StreamEvent {
 }
 
 pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator: &PgPool) {
+    waits::exercise(backend, admin, migrator).await;
     let actor = PrincipalScope::new(
         TenantId::new("turn-contract").unwrap(),
         PrincipalId::new("alice").unwrap(),

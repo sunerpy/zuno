@@ -4,6 +4,10 @@ use zuno_engine::budget::{
     BudgetDecision, BudgetPolicyError, NoopBudgetPolicy, TurnBudgetPolicy, TurnUsageSnapshot,
 };
 use zuno_engine::driver::{AgentDriver, DefaultAgentDriver};
+use zuno_engine::r#loop::ToolDispatcher;
+
+#[path = "waits.rs"]
+mod waits;
 
 fn request() -> AdvanceRequest {
     AdvanceRequest::new(
@@ -33,10 +37,68 @@ fn dispatcher(tools: Vec<Arc<dyn Tool>>) -> ToolRegistryDispatcher {
     )
 }
 
+struct AliasedResolver;
+impl AgentModelResolver for AliasedResolver {
+    fn resolve_agent(&self, requested: &str) -> Option<ResolvedAgent> {
+        (requested == "build").then(|| ResolvedAgent::new("canonical-build", "Alias fixture"))
+    }
+    fn resolve_model(&self, provider: &str, model: &str) -> Option<ResolvedModel> {
+        Resolver.resolve_model(provider, model)
+    }
+}
+
+struct CanonicalAgentProbe;
+#[async_trait]
+impl Tool for CanonicalAgentProbe {
+    fn id(&self) -> &str {
+        "shell"
+    }
+    fn description(&self) -> &str {
+        "Check canonical dispatch attribution."
+    }
+    fn raw_parameters_schema(&self) -> Value {
+        json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]})
+    }
+    async fn execute(&self, _args: Value, context: ToolContext) -> Result<ToolOutput, ToolError> {
+        assert_eq!(context.agent, "canonical-build");
+        Ok(ToolOutput::text("Agent", "Canonical identity retained"))
+    }
+}
+
+#[tokio::test]
+async fn tool_phase_uses_the_resolved_agent_identity_instead_of_its_requested_alias() {
+    let mut connection = seeded();
+    let provider = Arc::new(ScriptedProvider::new(provider_events(&[(
+        "alias", "inspect",
+    )])));
+    let providers = registry(provider);
+    let dispatcher = dispatcher(vec![Arc::new(CanonicalAgentProbe)]);
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+    let (outcome, _) = tokio::join!(
+        DefaultAgentDriver.advance(
+            request(),
+            TurnContext::new(
+                &mut connection,
+                &providers,
+                &AliasedResolver,
+                &dispatcher,
+                &interrupt
+            ),
+            sender,
+        ),
+        collect_events(receiver),
+    );
+    assert!(matches!(
+        outcome.unwrap(),
+        AdvanceOutcome::Progressed { .. }
+    ));
+}
+
 async fn advance(
     connection: &mut Connection,
     provider: Arc<ScriptedProvider>,
-    dispatcher: &ToolRegistryDispatcher,
+    dispatcher: &dyn ToolDispatcher,
     request: AdvanceRequest,
     budget: Arc<dyn TurnBudgetPolicy>,
 ) -> (Result<AdvanceOutcome, AdvanceError>, Vec<TurnEvent>) {

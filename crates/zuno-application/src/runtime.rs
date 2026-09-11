@@ -78,6 +78,7 @@ impl RuntimeCheckpoint {
 pub enum JobPhase {
     Ready,
     Running,
+    Waiting,
     Paused,
     Completed,
     Failed,
