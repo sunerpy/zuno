@@ -243,6 +243,726 @@ fn parent_attempt(turn_id: &str, extension_revision: u64) -> AttemptSnapshot {
     .expect("parent attempt snapshot")
 }
 
+fn parent_authority(tools: &[&str]) -> ParentAuthoritySnapshot {
+    serde_json::from_value(json!({
+        "permissionMode": "allow_all",
+        "workspace": std::env::temp_dir().canonicalize().expect("absolute temporary root").to_string_lossy(),
+        "rules": [{"permission":"*","pattern":"*","action":"allow","source":"live-parent"}],
+        "sandbox": {
+            "mode":"workspace-write", "network":"deny", "backend":"native",
+            "writableRoots":[], "protectedPaths":[]
+        },
+        "sandboxOnUnavailable":"deny",
+        "tools": tools.iter().map(|name| json!({
+            "name": name,
+            "descriptionSha256": format!("description-{name}"),
+            "schemaSha256": format!("schema-{name}"),
+            "uiIntent":"generic"
+        })).collect::<Vec<_>>()
+    }))
+    .expect("complete parent authority")
+}
+
+fn parent_report_with_cycle(inbox: &SessionInbox, id: &str, cycle: Option<&str>) -> SessionInput {
+    inbox.admit(
+        NewSessionInput::new(
+            id, "ses_owner",
+            json!({"kind":"subagentReport","jobID":format!("job-{id}"),"text":"durable evidence"}),
+            InputDelivery::Queue, 10,
+        )
+        .with_trigger_kind(InputTriggerKind::Automatic)
+        .with_cycle_id(cycle),
+    ).expect("admit report")
+}
+
+#[test]
+fn child_report_construction_carries_only_the_original_work_cycle() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    fixture.session("ses_report_child", Some("ses_owner"));
+    for (index, cycle) in [Some("original-work-cycle"), None].into_iter().enumerate() {
+        let mut snapshot = parent_attempt("provider-turn-is-not-a-cycle", 7);
+        snapshot.cycle_id = cycle.map(str::to_owned);
+        let mut request = fixture.request("ses_owner");
+        request.parent_attempt = Some(Arc::new(snapshot.clone()));
+        let metadata = task_report_metadata(
+            &fixture.host.database,
+            &request,
+            TaskReportBuild {
+                job_id: None,
+                work_context: None,
+                child_session_id: "ses_report_child",
+                evidence_start_rowid: 0,
+                status: "completed",
+                final_text: "result",
+                uncertain_side_effects: Vec::new(),
+            },
+        );
+        let report = report_input(
+            &request,
+            "job-live",
+            "ses_report_child",
+            "completed",
+            "result",
+            &metadata,
+            10,
+        )
+        .expect("live report");
+        assert_eq!(report.cycle_id.as_deref(), cycle);
+        assert_eq!(report.trigger_kind, InputTriggerKind::Automatic);
+        let job = fixture
+            .host
+            .job_store
+            .create(
+                NewAgentJob::new(
+                    format!("job-cycle-{index}"),
+                    "ses_owner",
+                    JobSubject::child_session("ses_report_child"),
+                    DbReportDelivery::NextStep,
+                    1,
+                )
+                .queued()
+                .with_orchestration_snapshot(Some(snapshot)),
+            )
+            .expect("persist original invocation");
+        let recovered =
+            report_for_job(&job, "completed", "result", None, 11).expect("recovered report");
+        assert_eq!(recovered.cycle_id.as_deref(), cycle);
+        assert_eq!(recovered.trigger_kind, InputTriggerKind::Automatic);
+    }
+}
+
+#[tokio::test]
+async fn rejected_parent_report_wakes_are_quiet_for_idle_and_live_parents() {
+    for active in [false, true] {
+        let fixture = Fixture::new();
+        fixture.session("ses_owner", None);
+        let inbox = fixture.host.inbox.clone();
+        let report = parent_report_with_cycle(&inbox, "unbound-report", None);
+        assert_eq!(
+            inbox.wake_admission(&report).expect("shared admission"),
+            WakeAdmission::Reject
+        );
+        let runs = SessionRunRegistry::new();
+        let guard = active.then(|| runs.begin_turn("ses_owner").expect("live parent"));
+        let driver = Arc::new(PromotingInputDriver::new(inbox.clone()));
+        let wake = CoordinatedParentWake {
+            inbox: inbox.clone(),
+            coordinator: SessionWakeCoordinator::new(inbox.clone(), runs, driver.clone()),
+        };
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wake_parent_report(&wake, report.clone(), CancellationToken::new()),
+        )
+        .await
+        .expect("a rejection must not wait or retry")
+        .expect("quiet rejection");
+        assert!(driver.seen.lock().expect("driver calls").is_empty());
+        assert_eq!(
+            inbox.get("ses_owner", &report.id).expect("get"),
+            Some(report)
+        );
+        if let Some(guard) = guard {
+            assert!(
+                guard
+                    .take_soft_interrupts_at_safe_point()
+                    .messages
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn paused_or_old_cycle_parent_reports_cannot_start_a_driver() {
+    use zuno_types::execution::{
+        CollaborationMode, SessionExecutionPhase, SessionPauseReason, TurnExecutionIdentity,
+    };
+    for paused in [false, true] {
+        let fixture = Fixture::new();
+        fixture.session("ses_owner", None);
+        let store = zuno_db::session_execution::SessionExecutionStore::new(Arc::clone(
+            &fixture.host.database,
+        ));
+        let mut state = store
+            .seed(
+                "ses_owner",
+                CollaborationMode::Work,
+                Some(TurnExecutionIdentity::new("deep", "fake", "model")),
+                1,
+            )
+            .expect("execution state");
+        state.cycle_id = Some("current-work-cycle".to_owned());
+        state.phase = SessionExecutionPhase::Running;
+        state.time_updated = 2;
+        let state = store.update(state.revision, state).expect("current cycle");
+        if paused {
+            fixture
+                .host
+                .database
+                .transaction(|tx| {
+                    zuno_db::session_execution::set_paused_in(
+                        tx,
+                        "ses_owner",
+                        state.revision,
+                        SessionPauseReason::NoProgress,
+                        3,
+                    )
+                })
+                .expect("pause parent");
+        }
+        let inbox = fixture.host.inbox.clone();
+        let cycle = if paused {
+            "current-work-cycle"
+        } else {
+            "previous-work-cycle"
+        };
+        let report = parent_report_with_cycle(&inbox, "blocked-report", Some(cycle));
+        let before = store.get("ses_owner").expect("state");
+        let driver = Arc::new(PromotingInputDriver::new(inbox.clone()));
+        let wake = CoordinatedParentWake {
+            inbox: inbox.clone(),
+            coordinator: SessionWakeCoordinator::new(
+                inbox.clone(),
+                SessionRunRegistry::new(),
+                driver.clone(),
+            ),
+        };
+        wake.wake(report.clone()).await.expect("not a retry error");
+        assert!(driver.seen.lock().expect("driver calls").is_empty());
+        assert_eq!(
+            inbox.get("ses_owner", &report.id).expect("get"),
+            Some(report)
+        );
+        assert_eq!(store.get("ses_owner").expect("state"), before);
+    }
+}
+
+fn child_profile(name: &str) -> zuno_agent::profile::AgentProfile {
+    let definition = zuno_catalog::agent::resolve(&Default::default(), &[])
+        .into_iter()
+        .find(|definition| definition.name == name)
+        .expect("native role");
+    zuno_agent::profile::AgentProfile::resolve(
+        definition,
+        vec![zuno_permission::Rule {
+            source: Some("unrelated-global-generation".to_owned()),
+            permission: "*".to_owned(),
+            pattern: "*".to_owned(),
+            action: zuno_permission::PermissionAction::Allow,
+        }],
+        false,
+    )
+}
+
+#[tokio::test]
+async fn real_turn_plans_bind_native_parent_and_readonly_child_to_the_raw_catalog_generation() {
+    use zuno_config::schema::sandbox::{SandboxBackendSelection, SandboxMode};
+    let fixture = zuno_testkit::ScriptedEnv::new().expect("isolated resolver environment");
+    let directory = fixture.working_dir().canonicalize().expect("workspace");
+    let config = json!({
+        "formatter":false,
+        "lsp":false,
+        "model":"authority-fixture/model",
+        "permission":{"mode":"allow_all","rules":{"*":"allow"}},
+        "sandbox":{"mode":"danger-full-access","backend":"auto","network":"allow"},
+        "provider":{
+            "authority-fixture":{
+                "name":"authority-fixture","id":"authority-fixture","env":[],
+                "transport":"openai-compatible",
+                "models":{"model":{
+                    "id":"model","name":"model","attachment":false,"reasoning":false,
+                    "temperature":false,"tool_call":true,"release_date":"2025-01-01",
+                    "limit":{"context":100000,"output":10000},
+                    "cost":{"input":0,"output":0},"options":{}
+                }},
+                "options":{"apiKey":"fixture","baseURL":"http://127.0.0.1:9/v1"}
+            }
+        }
+    });
+    let variables = Env::from_pairs(fixture.env_vars())
+        .with("ZUNO_CONFIG_CONTENT", config.to_string())
+        .with("ZUNO_AUTH_CONTENT", "{}")
+        .with("ZUNO_DISABLE_MODELS_FETCH", "true");
+    let environment = StartupEnvironment::resolve(&variables, &GlobalOptions::default());
+    let parent_plan = TurnPlan::resolve(
+        &TurnOptions {
+            directory: Some(directory.clone()),
+            agent: Some("orchestrator".to_owned()),
+            ..TurnOptions::default()
+        },
+        &environment,
+    )
+    .await
+    .expect("real parent resolution");
+    assert_eq!(
+        parent_plan.config().sandbox_backend(),
+        SandboxBackendSelection::Auto
+    );
+    let mut parent = parent_attempt("parent-provider-turn", 0);
+    parent.capability = parent_plan.capability_snapshot_for_test().clone();
+    parent.cycle_id = Some("parent-work-cycle".to_owned());
+    let mut authority = parent_authority(&["read", "shell", "write", "apply_patch"]);
+    authority.workspace = directory.to_string_lossy().into_owned();
+    authority.rules = serde_json::from_value(
+        serde_json::to_value(parent_plan.agent_profile().capabilities().rules())
+            .expect("parent rules"),
+    )
+    .expect("typed parent authority rules");
+    authority.sandbox.mode = "danger-full-access".to_owned();
+    authority.sandbox.network = "allow".to_owned();
+    // Full-access uses the native backend even though the raw catalog says auto.
+    authority.sandbox.backend = "native".to_owned();
+    parent.parent_authority = Some(authority.clone());
+    let child_options = TurnOptions {
+        directory: Some(directory),
+        agent: Some("explorer".to_owned()),
+        tool_authority: Some(Arc::from(authority.tools.clone())),
+        parent_authority: Some(Arc::new(authority)),
+        ..TurnOptions::default()
+    };
+    let mut child = TurnPlan::resolve(&child_options, &environment)
+        .await
+        .expect("real child resolution");
+    assert_eq!(
+        child.config().sandbox_backend(),
+        SandboxBackendSelection::Native
+    );
+    assert_eq!(child.config().sandbox_mode(), SandboxMode::ReadOnly);
+    assert!(!child.agent_profile().capabilities().tool_available("write"));
+    assert!(
+        !child
+            .agent_profile()
+            .capabilities()
+            .tool_available("apply_patch")
+    );
+    assert_eq!(child.capability_snapshot_for_test(), &parent.capability);
+    child
+        .inherit_orchestration(&parent, None, None)
+        .expect("invocation narrowing must not look like catalog drift");
+
+    let mut drifted_config = config;
+    drifted_config["permission"]["rules"]["shell"] = json!("deny");
+    let drifted_environment = StartupEnvironment::resolve(
+        &variables.with("ZUNO_CONFIG_CONTENT", drifted_config.to_string()),
+        &GlobalOptions::default(),
+    );
+    let mut drifted = TurnPlan::resolve(&child_options, &drifted_environment)
+        .await
+        .expect("resolve changed catalog");
+    let error = drifted
+        .inherit_orchestration(&parent, None, None)
+        .expect_err("a current global catalog change must still fail closed");
+    assert!(error.contains("stale or mismatched"), "{error}");
+}
+
+#[test]
+fn child_parent_authority_preserves_mode_rules_and_resource_constraints() {
+    use zuno_permission::{PermissionAction, evaluate};
+    let mut authority = parent_authority(&["read", "shell", "bg", "mcp_query"]);
+    authority.permission_mode = PermissionModeSnapshot::Standard;
+    authority.sandbox.backend = "auto".to_owned();
+    authority.sandbox_on_unavailable = "run-unconfined".to_owned();
+    authority.sandbox.writable_roots = vec![
+        Path::new(&authority.workspace)
+            .join("parent-extra-root")
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    authority.sandbox.protected_paths = vec![
+        Path::new(&authority.workspace)
+            .join("parent-protected-path")
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    authority.rules.extend(
+        serde_json::from_value::<Vec<zuno_orchestration::PermissionRuleSnapshot>>(json!([
+            {"permission":"read","pattern":"*/private/*","action":"deny","source":"parent-deny"},
+            {"permission":"read","pattern":"*/review/*","action":"ask","source":"parent-ask"},
+            {"permission":"mcp_query","pattern":"*","action":"ask","source":"parent-mcp"}
+        ]))
+        .expect("resource rules"),
+    );
+    let mut global: zuno_config::schema::Config = serde_json::from_value(json!({
+        "permission":{"mode":"allow_all","rules":{"*":"allow"}},
+        "sandbox":{"mode":"danger-full-access","network":"allow","backend":"native"},
+        "tools":{"mcp_query":false}
+    }))
+    .expect("wider unrelated global configuration");
+    let inherited = inherit_parent_authority(&mut global, child_profile("deep"), &authority)
+        .expect("derive current parent authority");
+    assert_eq!(
+        global.effective_permission_mode(),
+        zuno_config::schema::permission::PermissionMode::Standard
+    );
+    assert_eq!(
+        global.sandbox_mode(),
+        zuno_config::schema::sandbox::SandboxMode::WorkspaceWrite
+    );
+    let sandbox = global.sandbox.as_ref().expect("inherited resources");
+    assert_eq!(
+        sandbox.writable_roots.as_ref(),
+        Some(&authority.sandbox.writable_roots)
+    );
+    assert_eq!(
+        sandbox.protected_paths.as_ref(),
+        Some(&authority.sandbox.protected_paths)
+    );
+    assert_eq!(
+        global.sandbox_network(),
+        zuno_config::schema::sandbox::SandboxNetworkMode::Deny
+    );
+    assert_eq!(
+        global.sandbox_backend(),
+        zuno_config::schema::sandbox::SandboxBackendSelection::Auto
+    );
+    assert_eq!(
+        global.sandbox_on_unavailable(),
+        zuno_config::schema::sandbox::SandboxUnavailableAction::RunUnconfined
+    );
+    let rules = inherited.capabilities().rules();
+    assert_eq!(
+        evaluate("read", "/work/private/key", rules),
+        PermissionAction::Deny
+    );
+    assert_eq!(
+        evaluate("read", "/work/review/notes", rules),
+        PermissionAction::Ask
+    );
+    assert_eq!(
+        evaluate("read", "/work/public", rules),
+        PermissionAction::Allow
+    );
+    assert_eq!(evaluate("mcp_query", "*", rules), PermissionAction::Ask);
+    assert_eq!(rules[1].source.as_deref(), Some("parent-deny"));
+    assert!(inherited.capabilities().tool_available("mcp_query"));
+    assert_eq!(
+        global
+            .tools
+            .as_ref()
+            .expect("tool authority")
+            .get("mcp_query"),
+        Some(&true)
+    );
+}
+
+#[test]
+fn native_working_children_inherit_shell_edit_and_external_rules_in_both_permission_modes() {
+    for mode in [
+        PermissionModeSnapshot::Standard,
+        PermissionModeSnapshot::AllowAll,
+    ] {
+        for name in ["deep", "general", "fixer"] {
+            let mut authority =
+                parent_authority(&["shell", "read", "write", "apply_patch", "mcp_query"]);
+            authority.permission_mode = mode;
+            authority
+                .rules
+                .push(zuno_orchestration::PermissionRuleSnapshot {
+                    permission: "external_directory".to_owned(),
+                    pattern: "*".to_owned(),
+                    action: PermissionActionSnapshot::Ask,
+                    source: Some("current-parent".to_owned()),
+                });
+            let definition = zuno_catalog::agent::resolve(&Default::default(), &[])
+                .into_iter()
+                .find(|entry| entry.name == name)
+                .expect("native catalog definition");
+            let baseline = zuno_catalog::agent::builtin::get(name)
+                .expect("native overlay")
+                .permission_overlay()
+                .expect("permission baseline");
+            let profile = zuno_agent::profile::AgentProfile::resolve(
+                definition,
+                zuno_permission::rules_from_config(&baseline),
+                false,
+            );
+            let mut config = zuno_config::schema::Config::default();
+            let profile = inherit_parent_authority(&mut config, profile, &authority)
+                .expect("derive native child");
+            assert_eq!(
+                config.effective_permission_mode(),
+                match mode {
+                    PermissionModeSnapshot::Standard =>
+                        zuno_config::schema::permission::PermissionMode::Standard,
+                    PermissionModeSnapshot::AllowAll =>
+                        zuno_config::schema::permission::PermissionMode::AllowAll,
+                    PermissionModeSnapshot::Strict => unreachable!(),
+                },
+            );
+            for tool in ["shell", "write", "apply_patch", "mcp_query"] {
+                assert!(
+                    profile.capabilities().tool_available(tool),
+                    "{mode:?}/{name}: {tool}"
+                );
+            }
+            assert_eq!(
+                zuno_permission::evaluate(
+                    "external_directory",
+                    "/external/file",
+                    profile.capabilities().rules()
+                ),
+                zuno_permission::PermissionAction::Ask,
+                "{mode:?}/{name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn child_readonly_role_narrows_parent_allow_all_even_when_global_rules_allow_writes() {
+    let mut authority = parent_authority(&["read", "shell", "write", "apply_patch", "mcp_mutate"]);
+    authority.sandbox.mode = "danger-full-access".to_owned();
+    authority.sandbox.network = "allow".to_owned();
+    authority.sandbox.backend = "auto".to_owned();
+    let mut config = zuno_config::schema::Config::default();
+    let inherited = inherit_parent_authority(&mut config, child_profile("explorer"), &authority)
+        .expect("derive read-only role");
+    assert_eq!(
+        config.effective_permission_mode(),
+        zuno_config::schema::permission::PermissionMode::AllowAll
+    );
+    assert_eq!(
+        config.sandbox_mode(),
+        zuno_config::schema::sandbox::SandboxMode::ReadOnly
+    );
+    assert_eq!(
+        config.sandbox_backend(),
+        zuno_config::schema::sandbox::SandboxBackendSelection::Auto
+    );
+    assert_eq!(
+        zuno_permission::evaluate("edit", "*", inherited.capabilities().rules()),
+        zuno_permission::PermissionAction::Deny,
+    );
+    assert!(inherited.capabilities().tool_available("shell"));
+    assert!(!inherited.capabilities().tool_available("apply_patch"));
+    assert!(!inherited.capabilities().tool_available("mcp_mutate"));
+}
+
+#[test]
+fn child_authority_rejects_missing_or_inconsistent_snapshots_without_global_fallback() {
+    let attempt = parent_attempt("legacy", 7);
+    assert!(required_parent_authority(&attempt, "ses_owner").is_err());
+    let mut malformed = parent_authority(&["read"]);
+    malformed.sandbox.mode = "danger-full-access".to_owned();
+    malformed.permission_mode = PermissionModeSnapshot::Strict;
+    let mut config = zuno_config::schema::Config::default();
+    let before = config.clone();
+    assert!(inherit_parent_authority(&mut config, child_profile("deep"), &malformed).is_err());
+    assert_eq!(config, before);
+    let mut duplicate = parent_authority(&["read", "read"]);
+    assert!(inherit_parent_authority(&mut config, child_profile("deep"), &duplicate).is_err());
+    duplicate.tools.pop();
+    duplicate.sandbox.backend = "unknown".to_owned();
+    assert!(inherit_parent_authority(&mut config, child_profile("deep"), &duplicate).is_err());
+    assert_eq!(config, before);
+}
+
+#[test]
+fn child_resource_bounds_reject_reanchoring_outside_the_parent_workspace() {
+    let root = tempfile::TempDir::new().expect("parent workspace");
+    let other = tempfile::TempDir::new().expect("unrelated workspace");
+    let mut authority = parent_authority(&["shell"]);
+    authority.workspace = root
+        .path()
+        .canonicalize()
+        .expect("resolved workspace")
+        .to_string_lossy()
+        .into_owned();
+    assert!(validate_child_workspace(root.path(), &authority).is_ok());
+    assert!(validate_child_workspace(other.path(), &authority).is_err());
+    authority.sandbox.writable_roots.push(
+        other
+            .path()
+            .canonicalize()
+            .expect("allowed extra root")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    assert!(
+        validate_child_workspace(other.path(), &authority).is_err(),
+        "an extra writable root must not become internal and bypass parent external_directory rules"
+    );
+    authority
+        .sandbox
+        .protected_paths
+        .push("relative-protection".to_owned());
+    assert!(validate_child_workspace(root.path(), &authority).is_err());
+}
+
+#[tokio::test]
+async fn child_continuation_refreshes_parent_authority_and_persists_the_new_snapshot() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    let mut request = fixture.request("ses_owner");
+    let mut original_attempt = parent_attempt("old-parent-turn", 7);
+    request.agent = "general".to_owned();
+    original_attempt.parent_authority = Some(parent_authority(&["read", "shell"]));
+    request.parent_attempt = Some(Arc::new(original_attempt));
+    let child = fixture.persist_child_for_request(&request);
+    let original = ChildSessionSpec::resolved(&request, "general", "provider/model", None);
+    checkpoint_child_session_spec(
+        &fixture.host.database,
+        &fixture.host.supervisor.children,
+        &child,
+        &original,
+        false,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("initial child spec");
+
+    let mut fresh = parent_attempt("new-parent-turn", 8);
+    fresh.agent.permission_sha256 = "fresh-permissions".to_owned();
+    let mut authority = parent_authority(&["read", "shell", "mcp_query"]);
+    authority.permission_mode = PermissionModeSnapshot::Strict;
+    authority.sandbox.mode = "read-only".to_owned();
+    authority
+        .rules
+        .push(zuno_orchestration::PermissionRuleSnapshot {
+            source: Some("new-parent-deny".to_owned()),
+            permission: "shell".to_owned(),
+            pattern: "*".to_owned(),
+            action: PermissionActionSnapshot::Deny,
+        });
+    fresh.parent_authority = Some(authority.clone());
+    let mut candidate = original.clone();
+    candidate.parent_attempt = Some(fresh.clone());
+    checkpoint_child_session_spec(
+        &fixture.host.database,
+        &fixture.host.supervisor.children,
+        &child,
+        &candidate,
+        true,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("fresh authority may replace stale parent permissions");
+    let restored = ChildSessionSpecs::default()
+        .get_or_restore(&fixture.host.database, &child)
+        .expect("cold restore");
+    assert_eq!(restored, candidate);
+    assert_eq!(
+        fixture.host.supervisor.children.get(&child),
+        Some(candidate)
+    );
+    let mut config = zuno_config::schema::Config::default();
+    let profile = inherit_parent_authority(&mut config, child_profile("general"), &authority)
+        .expect("apply fresh authority");
+    assert!(!profile.capabilities().tool_available("shell"));
+    assert!(profile.capabilities().tool_available("mcp_query"));
+    assert_eq!(
+        config.effective_permission_mode(),
+        zuno_config::schema::permission::PermissionMode::Strict
+    );
+    assert_eq!(
+        config.sandbox_mode(),
+        zuno_config::schema::sandbox::SandboxMode::ReadOnly
+    );
+}
+
+#[test]
+fn child_direct_input_uses_the_latest_durable_parent_snapshot_and_never_an_older_valid_one() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    let log = zuno_db::event_log::SessionEventLog::new(Arc::clone(&fixture.host.database));
+    let mut first = parent_attempt("first", 7);
+    first.parent_authority = Some(parent_authority(&["shell"]));
+    for (turn, tools) in [
+        ("first", vec!["shell"]),
+        ("fresh", vec!["read", "mcp_query"]),
+    ] {
+        let mut attempt = first.clone();
+        attempt.turn_id = turn.to_owned();
+        attempt.parent_authority = Some(parent_authority(&tools));
+        log.append(
+            "ses_owner",
+            zuno_db::event_log::NewSessionEvent::new(
+                "session.provider.request",
+                json!({"orchestrationSnapshot":attempt})
+                    .as_object()
+                    .expect("properties")
+                    .clone(),
+            )
+            .expect("provider event"),
+        )
+        .expect("persist current parent attempt");
+    }
+    let current = current_parent_attempt(&fixture.host.database, "ses_owner").expect("latest");
+    assert_eq!(current.turn_id, "fresh");
+    let authority = required_parent_authority(&current, "ses_owner").expect("current authority");
+    assert_eq!(
+        authority
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["read", "mcp_query"]
+    );
+    assert!(required_parent_authority(&current, "different-parent").is_err());
+    log.append(
+        "ses_owner",
+        zuno_db::event_log::NewSessionEvent::new("session.provider.request", Map::new())
+            .expect("invalid event"),
+    )
+    .expect("append newer corrupt event");
+    assert!(
+        current_parent_attempt(&fixture.host.database, "ses_owner").is_err(),
+        "a missing new snapshot must not revive older, broader shell authority"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ordinary_child_shell_can_create_and_run_a_script_with_inherited_write_authority() {
+    use zuno_sandbox::SandboxResolver as _;
+    use zuno_tool::Tool as _;
+    for name in ["deep", "general", "fixer"] {
+        let root = tempfile::TempDir::new().expect("script workspace");
+        let authority = parent_authority(&["shell", "bg"]);
+        let mut config = zuno_config::schema::Config::default();
+        let profile = inherit_parent_authority(&mut config, child_profile(name), &authority)
+            .expect("writable parent authority");
+        let requested = super::super::tool_runtime::sandbox_policy(
+            root.path(),
+            &config,
+            &profile,
+            profile.capabilities().rules(),
+        )
+        .expect("compile inherited resource contract");
+        assert_eq!(requested.mode(), zuno_sandbox::SandboxMode::WorkspaceWrite);
+        let resolution = Arc::new(zuno_sandbox::SystemSandboxResolver)
+            .resolve(
+                requested,
+                super::super::tool_runtime::sandbox_backend_request(&config),
+            )
+            .expect("use the parent's explicit native backend");
+        let (backend, policy) = resolution.into_execution();
+        let tool = zuno_tools::shell::ShellTool::with_sandbox_backend_and_generated_root(
+            root.path(),
+            Some("/bin/sh"),
+            backend,
+            policy,
+            Some(root.path().join(".zuno")),
+        )
+        .expect("construct inherited Shell");
+        tool.execute(
+            json!({
+                "command":"printf '%s\\n' 'printf child-output > child-result.txt' > child-check.sh; sh child-check.sh",
+                "timeout":10000
+            }),
+            zuno_tool::ToolContext::new(
+                "child", "message", "call", name, Arc::new(zuno_tool::AllowAll), no_interrupt(),
+            ),
+        ).await.expect("create and run a writing script");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("child-result.txt")).expect("script output"),
+            "child-output",
+            "{name}"
+        );
+    }
+}
+
 #[test]
 fn child_continuation_preserves_exact_provider_options() {
     let fixture = Fixture::new();
@@ -1156,22 +1876,22 @@ async fn resumed_child_rejects_identity_drift_without_rewriting_durable_metadata
     let mut changed_policy = original.clone();
     changed_policy.subagent_model_policy_sha256 = Some("changed-policy".to_owned());
     candidates.push(("subagent model policy", changed_policy));
-    let mut changed_capability = original.clone();
-    changed_capability
-        .parent_attempt
-        .as_mut()
-        .expect("parent attempt")
-        .capability
-        .extension_revision = 8;
-    candidates.push(("parent capability generation", changed_capability));
     let mut changed_parent_attempt = original.clone();
     changed_parent_attempt
         .parent_attempt
         .as_mut()
         .expect("parent attempt")
-        .agent
-        .permission_sha256 = "changed-parent-authority".to_owned();
+        .owner
+        .session_id = "another-parent".to_owned();
     candidates.push(("parent Attempt", changed_parent_attempt));
+    let mut changed_parent_model = original.clone();
+    changed_parent_model
+        .parent_attempt
+        .as_mut()
+        .expect("parent attempt")
+        .model
+        .model_id = "another-model".to_owned();
+    candidates.push(("parent Attempt model", changed_parent_model));
 
     for (field, candidate) in candidates {
         let error = checkpoint_child_session_spec(

@@ -62,6 +62,17 @@ fn initialized(location: &DbLocation) -> Arc<Pool> {
         Ok(())
     })
     .expect("create sessions");
+    let execution = zuno_db::session_execution::SessionExecutionStore::new(Arc::clone(&pool));
+    let mut state = execution
+        .seed(
+            PARENT,
+            zuno_types::execution::CollaborationMode::Work,
+            None,
+            1,
+        )
+        .expect("execution");
+    state.cycle_id = Some("job-cycle".to_owned());
+    execution.update(state.revision, state).expect("bind cycle");
     pool
 }
 
@@ -82,6 +93,8 @@ fn report(id: &str) -> NewSessionInput {
         InputDelivery::Queue,
         20,
     )
+    .with_trigger_kind(zuno_types::execution::InputTriggerKind::Automatic)
+    .with_cycle_id(Some("job-cycle"))
 }
 
 fn orchestration_snapshot() -> AttemptSnapshot {

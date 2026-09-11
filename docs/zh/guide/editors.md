@@ -256,12 +256,10 @@ Zed 呈现权限与征询请求，但策略拥有者仍然是 Zuno：
 重试之前发送摘要；load/resume replay 的也是同一份文本和标记。因此成功的内部压缩不会
 先表现为终端 turn failure，也不需要用户再发一次 prompt。
 
-所选模型有已知上下文窗口时，每个 `ProviderRequestStarted` 事件都会让 ACP 立即发送一条
-绝对值 `usage_update`。此时 `used` 是刚组装完成的 prompt 估算，因此压缩后的新请求可以
-立刻让 UI 从上一请求的 100% 重新计算，而无需等到响应结束。provider 随后报告 token
-usage 时，ACP 再发送一条带该请求真实 provider 用量的 `usage_update`。provider 输出仍然
-按 attempt 缓冲，但请求开始时的用量重置不会被缓冲；模型上下文大小未知时，ACP 不会虚构
-估算值或窗口大小。
+ACP 从原生 `ContextUsageSnapshot` 投影绝对值 `usage_update`，完整快照位于
+`_meta.zuno.contextUsage`。窗口占用为最近供应商确认基线，加尚未计入内容的估算，
+不是会话累计账单。分批 usage 按快照合并，缓存与推理子项不重复相加；较小的请求粗估值
+不能覆盖确认基线。压缩推进 epoch，load/resume 读取同一持久快照，未知值保持未知。
 
 历史重放会为将来的 provider 请求保持 provider 推理胶囊持久，但当同一条消息已经包含它可见的推理摘要时，不会再渲染一份完全相同的胶囊副本。仅存在于 provider 侧的推理仍然可见，因此重放去重不会隐藏唯一可用的思考内容。
 
@@ -274,33 +272,35 @@ Shell 工具调用的标题是提交时的确切命令，而不是加了解释�
 - 正常情况下它会被转向进正在运行的那个回合。模型在该回合的下一个安全点收到它 —— provider 请求之间，或在进行中的工具调用之后 —— 并在同一个回合里继续工作；
 - 如果正在运行的回合在转向落地之前就结束了，这条提示词会持久地留在队列中，由该会话的下一个回合按接纳顺序提升。
 
-ACP v1 没有「已接纳，但本请求没有跑任何回合」的成功形态：`stopReason` 是一个封闭枚举，任何取值都会把本请求从未拥有过的回合说错。因此 Zuno 用实现自定义区间内的一个 JSON-RPC 错误回答第二个 `session/prompt`，并把接纳事实放在 `error.data` 里：
+标准 `session/prompt` 等待已接收输入的关联处理结果，不再用 busy 错误表示接收成功，
+也不会在尚未处理时编造 `stopReason`。执行由原生会话持有，RPC 观察持久回执。
+完成后返回合法 `stopReason` 与 `_meta.zuno.receipt`；接收、写入历史、进入模型、
+执行完成是不同状态。要支持断线重试，可提交会话级客户端消息 ID：
 
 ```json
 {
   "jsonrpc": "2.0",
   "id": 4,
-  "error": {
-    "code": -32001,
-    "message": "session ses_x is running a turn; this prompt was admitted durably and steered into it",
-    "data": {
-      "sessionId": "ses_x",
-      "admission": "steered",
-      "inputId": "msg_1f2e",
-      "admittedSequence": 42,
-      "delivery": "steer"
-    }
+  "method": "session/prompt",
+  "params": {
+    "sessionId": "ses_x",
+    "prompt": [{ "type": "text", "text": "Adjust the active work." }],
+    "_meta": { "zuno": { "messageId": "client-message-42" } }
   }
 }
 ```
 
-当正在运行的回合接纳了这条提示词时，`data.admission` 为 `steered`；当它在等待下一个回合时为 `queued`。`delivery` 与 `admittedSequence` 就是那条持久 inbox 行自己的字段，`inputId` 指名该行。被接纳的提示词对应的 `user_message_chunk`、助手输出与 `stopReason` 全部到达拥有该回合的那个请求，所以一个忽略 `data` 的 v1 客户端仍然能看到这些工作 —— 它看到的是错误消息文本，而不是第二个 `stopReason`。
+客户端 ID 为 1–256 字节。同一会话中，相同 ID 和内容只观察原输入，内容冲突则拒绝；
+相同文本使用不同 ID 仍是独立输入。接收后的执行失败在错误数据中保留 receipt，
+与真正拒绝区分。断线不会撤回已接收输入。需要立即接收回执的客户端使用带
+`expectedTurnId` 的 `session/steer`。
 
 斜杠命令不同。它要对宿主命令目录解析，并作为自己的回合运行，因此无法被转向进已经在飞的工作里。Zuno 用同一个错误码拒绝它，`admission` 为 `"rejected"`，`reason` 为 `"commandRequiresIdleSession"`，并且不写入任何持久内容；等会话空闲后重新发送即可。只有真正指名了某个命令、某个无歧义 Skill 或某个原生会话控制项的提示词才算命令调用。仅仅以 `/` 开头的提示词 —— 一个 POSIX 绝对路径、一个正则表达式 —— 是普通内容，因此会像其他提示词一样被持久接纳并转向，而不是被当成无法解析的命令拒绝。
 
-取消按 JSON-RPC 请求 id 键控，绝不按请求的内容键控：两条提示词可以携带逐字节相同的 params。对拥有回合的那个请求发 `$/cancel_request` 会中断该回合，而任何其他请求的取消都停不掉它。
-
-撤回一个尚未被回答的 `session/prompt` 只会退役该请求自己贡献的东西：它的持久 inbox 行被取消，因此被撤回的文本永远不会被提升进任何回合；该请求以 JSON-RPC 取消码 `-32800` 回答，`data.admission` 为 `"withdrawn"`，并带上它退役的那一行的 `inputId`。已经以 `admission: "steered"` 或 `"queued"` 回答过的请求已经结束：对它发 `$/cancel_request` 什么都不做，因为它的提示词已经持久化，而它喂入的那个回合属于另一个请求。要不论归属地停掉会话的活跃回合，使用 `session/cancel`。
+取消按 RPC 请求 ID 键控，不按相同文本键控。`$/cancel_request` 只撤回该请求贡献且
+尚未处理的输入，以 `-32800` 和持久 receipt 回答；不能抹掉已进入模型的内容，
+重复 ID 的观察者也不能撤回原贡献者的输入。`session/cancel` 才是会话级中断。
+观察者断开、显式撤回与 Zuno 进程退出是不同生命周期事件。
 
 ### 被委派的子会话
 

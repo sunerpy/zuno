@@ -815,6 +815,46 @@ impl GoalStore {
         pause_state_from(&connection, session_id)
     }
 
+    pub fn pause_state_in(
+        connection: &rusqlite::Connection,
+        session_id: &str,
+    ) -> Result<Option<GoalPauseState>, GoalError> {
+        pause_state_from(connection, session_id)
+    }
+
+    /// Explicit user recovery composed with session/inbox changes by the host.
+    /// Budget enforcement is the same SQL guard used by the existing user API.
+    pub fn resume_explicit_in(
+        tx: &Transaction<'_>,
+        session_id: &str,
+        expected_revision: i64,
+        at_ms: i64,
+    ) -> Result<Option<Goal>, GoalError> {
+        let goal = update_system_status_in(
+            tx,
+            session_id,
+            SystemStatus::Active,
+            Some(expected_revision),
+            at_ms,
+        )?;
+        if goal.is_none()
+            && let Some(error) = revision_conflict(tx, session_id, Some(expected_revision))?
+        {
+            return Err(error);
+        }
+        if let Some(goal) = &goal {
+            clear_failure_and_retry_state(tx, session_id)?;
+            if goal.status != GoalStatus::Paused {
+                tx.execute("DELETE FROM goal_pause WHERE session_id=?1", [session_id])
+                    .map_err(zuno_db::map_error)?;
+            }
+            if !checklist_dormant(goal.status) {
+                backfill_criteria(tx, Some(session_id))?;
+            }
+        }
+        Ok(goal)
+    }
+
     /// Shared durable human-request store over the same application pool.
     #[must_use]
     pub fn human_requests(&self) -> zuno_db::human_request::HumanRequestStore {
@@ -933,6 +973,110 @@ impl GoalStore {
             clear_failure_and_retry_state(tx, session_id)?;
             Ok(request)
         })
+    }
+
+    /// Attach a newly committed-in-this-transaction question to the exact Goal.
+    ///
+    /// The question service owns the outer transaction, so the question
+    /// definition, pause, and response channel cannot become visible separately.
+    pub fn pause_for_question_in(
+        tx: &Transaction<'_>,
+        session_id: &str,
+        request_id: &str,
+        expected_revision: i64,
+        paused_at_ms: i64,
+    ) -> Result<(), GoalError> {
+        let goal = goal_from_transaction(tx, session_id)?.ok_or_else(|| GoalError::NoGoal {
+            session_id: session_id.to_owned(),
+        })?;
+        if goal.revision != expected_revision {
+            return Err(GoalError::RevisionConflict {
+                session_id: session_id.to_owned(),
+                expected: expected_revision,
+                actual: goal.revision,
+            });
+        }
+        if goal.status != GoalStatus::Active {
+            return Err(GoalError::GoalNotActive {
+                session_id: session_id.to_owned(),
+                status: goal.status,
+            });
+        }
+        let request = zuno_db::human_request::get_from(tx, request_id)?
+            .filter(|request| {
+                request.session_id == session_id
+                    && request.goal_id.as_deref() == Some(goal.goal_id.as_str())
+                    && request.kind == HumanRequestKind::Input
+                    && request.state == HumanRequestState::Pending
+            })
+            .ok_or_else(|| zuno_error::DbError::Conflict {
+                table: "human_request".to_owned(),
+                id: request_id.to_owned(),
+                detail: "question does not belong to the active Goal".to_owned(),
+            })?;
+        let paused = update_system_status_in(
+            tx,
+            session_id,
+            SystemStatus::Paused,
+            Some(expected_revision),
+            paused_at_ms,
+        )?
+        .expect("the active Goal revision was read in this transaction");
+        upsert_pause_in(
+            tx,
+            &paused,
+            GoalPauseReason::HumanInput,
+            Some(&request.id),
+            paused_at_ms,
+        )?;
+        clear_failure_and_retry_state(tx, session_id)?;
+        Ok(())
+    }
+
+    /// Settle only the pause owned by this particular question.
+    ///
+    /// Cancelling a necessary question becomes an explicit user pause, not an
+    /// impossible wait for a closed row and not an implicit answer.
+    pub fn settle_question_pause_in(
+        tx: &Transaction<'_>,
+        session_id: &str,
+        request_id: &str,
+        at_ms: i64,
+    ) -> Result<(), GoalError> {
+        let Some(goal) = Self::goal_in(tx, session_id)? else {
+            return Ok(());
+        };
+        let Some(pause) = pause_state_from(tx, session_id)? else {
+            return Ok(());
+        };
+        if goal.status != GoalStatus::Paused
+            || pause.goal_id != goal.goal_id
+            || pause.reason != GoalPauseReason::HumanInput
+            || pause.human_request_id.as_deref() != Some(request_id)
+        {
+            return Ok(());
+        }
+        let Some(request) = zuno_db::human_request::get_from(tx, request_id)? else {
+            return Ok(());
+        };
+        if request.session_id != session_id
+            || request.goal_id.as_deref() != Some(goal.goal_id.as_str())
+        {
+            return Ok(());
+        }
+        match request.state {
+            HumanRequestState::Answered => {
+                Self::resume_for_work_in(tx, session_id, at_ms)?;
+            }
+            HumanRequestState::Cancelled
+            | HumanRequestState::Expired
+            | HumanRequestState::Failed => {
+                upsert_pause_in(tx, &goal, GoalPauseReason::UserInterruption, None, at_ms)?;
+                clear_failure_and_retry_state(tx, session_id)?;
+            }
+            HumanRequestState::Pending => {}
+        }
+        Ok(())
     }
 
     /// Persist a permission request and pause an active Goal before the gated

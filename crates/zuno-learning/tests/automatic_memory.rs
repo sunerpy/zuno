@@ -4,7 +4,9 @@ use serde_json::json;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use zuno_config::ResolvedLearningConfig;
-use zuno_db::learning_job::{LearningJobRecord, LearningJobStatus};
+use zuno_db::learning_job::{
+    LearningJobRecord, LearningJobStatus, LearningJobStore, NewLearningJob,
+};
 use zuno_db::{Pool, migration};
 use zuno_learning::{
     ExperienceService, ExtractedMemoryAction as Action, ExtractedMemoryScope as Scope,
@@ -57,7 +59,7 @@ impl Fixture {
                  INSERT INTO session(id,project_id,slug,directory,title,version,time_created,time_updated)
                  VALUES('s','p','s','/work','memory test','test',1,1);
                  INSERT INTO message(id,session_id,time_created,time_updated,data)
-                 VALUES('m','s',2,2,'{\"role\":\"assistant\"}');"
+                 VALUES('m','s',2,2,'{\"role\":\"assistant\",\"finish\":\"stop\",\"time\":{\"completed\":2}}');"
             ).expect("source session");
         }
         let memory = Arc::new(MemoryService::new(
@@ -198,6 +200,123 @@ fn add(request: &MemoryConsolidationRequest, text: &str) -> MemoryConsolidation 
             Some(text),
         )],
     }
+}
+
+#[tokio::test]
+async fn maintenance_upgrade_retries_a_legacy_failure_once_without_replaying_successful_inputs() {
+    let fixture = Fixture::new(PromotionPolicy::Automatic, |_| MemoryConsolidation {
+        updates: vec![],
+    });
+    fixture.remember("Prefer concise reports.", 1);
+    let old = fixture.claim();
+    let old_key = format!(
+        "memory:p:{}",
+        zuno_db::learning_source::digest(&old.payload.as_ref().unwrap().to_string())
+    );
+    fixture
+        .pool
+        .get()
+        .unwrap()
+        .execute(
+            "UPDATE learning_job SET idempotency_key=?2 WHERE id=?1",
+            rusqlite::params![old.id, old_key],
+        )
+        .unwrap();
+    let now = zuno_db::message::now_millis();
+    fixture
+        .scheduler
+        .fail(
+            &old.id,
+            &old.lease().unwrap(),
+            "legacy unsupported request",
+            now,
+        )
+        .unwrap();
+    let LearningScheduleOutcome::Queued(upgraded) = fixture
+        .maintainer
+        .schedule(&fixture.scheduler, now)
+        .unwrap()
+    else {
+        panic!("the corrected maintenance implementation must not reuse a failed legacy key");
+    };
+    assert_ne!(upgraded.idempotency_key, old_key);
+    assert!(matches!(
+        fixture
+            .maintainer
+            .schedule(&fixture.scheduler, now)
+            .unwrap(),
+        LearningScheduleOutcome::Existing(_)
+    ));
+    let running = fixture
+        .scheduler
+        .claim(&upgraded.id, "memory-worker", now, now + 60000)
+        .unwrap()
+        .unwrap();
+    fixture
+        .maintainer
+        .execute(&running, &running.lease().unwrap(), &fixture.scheduler)
+        .await
+        .unwrap();
+    assert_eq!(fixture.model.requests.lock().unwrap().len(), 1);
+    assert!(matches!(
+        fixture
+            .maintainer
+            .schedule(&fixture.scheduler, now + 1)
+            .unwrap(),
+        LearningScheduleOutcome::Ineligible
+    ));
+    assert_eq!(
+        fixture.scheduler.get(&old.id).unwrap().error.as_deref(),
+        Some("legacy unsupported request")
+    );
+}
+
+#[tokio::test]
+async fn maintenance_upgrade_skips_duplicate_queued_noop_inputs_before_a_second_model_call() {
+    let fixture = Fixture::new(PromotionPolicy::Automatic, |_| MemoryConsolidation {
+        updates: vec![],
+    });
+    fixture.remember("Prefer concise reports.", 1);
+    let first = fixture.claim();
+    let now = zuno_db::message::now_millis();
+    LearningJobStore::new(fixture.pool.clone())
+        .enqueue(NewLearningJob {
+            id: "duplicate-memory".to_owned(),
+            project_id: first.project_id.clone(),
+            session_id: first.session_id.clone(),
+            source_message_id: None,
+            kind: first.kind,
+            extractor_version: None,
+            idempotency_key: "memory-other-implementation".to_owned(),
+            scheduled_at: now,
+            payload: first.payload.clone(),
+            time_created: now,
+        })
+        .unwrap();
+    fixture
+        .maintainer
+        .execute(&first, &first.lease().unwrap(), &fixture.scheduler)
+        .await
+        .unwrap();
+    let duplicate = fixture
+        .scheduler
+        .claim("duplicate-memory", "memory-worker", now, now + 60000)
+        .unwrap()
+        .unwrap();
+    fixture
+        .maintainer
+        .execute(&duplicate, &duplicate.lease().unwrap(), &fixture.scheduler)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.model.requests.lock().unwrap().len(),
+        1,
+        "a consumed no-op must be checked before another paid consolidation"
+    );
+    assert_eq!(
+        fixture.scheduler.get("duplicate-memory").unwrap().status,
+        LearningJobStatus::Skipped
+    );
 }
 
 #[tokio::test]

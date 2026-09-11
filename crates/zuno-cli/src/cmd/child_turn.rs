@@ -35,13 +35,16 @@ use zuno_engine::planning::PlanningInputSource;
 use zuno_engine::report::ReportBatch;
 use zuno_engine::status::{SessionRunGuard, SessionRunRegistry};
 use zuno_engine::wake::{PendingInputDriver, SessionWakeCoordinator};
-use zuno_orchestration::AttemptSnapshot;
+use zuno_orchestration::{
+    AttemptSnapshot, ParentAuthoritySnapshot, PermissionActionSnapshot, PermissionModeSnapshot,
+};
+use zuno_tool::question::QuestionPort;
 use zuno_tool::{InterruptHandle, PermissionAsker};
-use zuno_tools::question::QuestionAsker;
 use zuno_tools::task::{
     ChildTurn, ChildTurnError, ChildTurnHost, ChildTurnRequest, ChildTurnState,
     ReportDelivery as ToolReportDelivery,
 };
+use zuno_types::execution::{InputTriggerKind, WakeAdmission};
 
 use super::delegation::DelegationLimiter;
 use super::turn::{SessionChoice, TurnHost, TurnHostDependencies, TurnOptions, TurnPlan};
@@ -362,23 +365,188 @@ fn validate_parent_attempt_authority(
             Err("child continuation parent Attempt identity changed".to_owned())
         };
     };
-    let stored_capability = stored.capability.identity().map_err(to_string)?;
-    let candidate_capability = candidate.capability.identity().map_err(to_string)?;
-    if stored_capability != candidate_capability {
-        return Err("child continuation parent capability generation changed".to_owned());
-    }
-    if stored.schema_version != candidate.schema_version
-        || stored.owner.session_id != candidate.owner.session_id
+    // Authority belongs to this invocation. A current parent may change rules,
+    // resources, or deferred tool exposure between two continuations. Child
+    // model/variant and role identities are checked separately by the spec.
+    if stored.owner.session_id != candidate.owner.session_id
         || stored.owner.parent_session_id != candidate.owner.parent_session_id
-        || stored.owner.parent_attempt != candidate.owner.parent_attempt
-        || stored.agent != candidate.agent
-        || stored.model != candidate.model
-        || stored.subagent_model_policy_sha256 != candidate.subagent_model_policy_sha256
-        || stored.tools != candidate.tools
     {
-        return Err("child continuation parent Attempt authority changed".to_owned());
+        return Err("child continuation parent Attempt ownership changed".to_owned());
+    }
+    if stored.model != candidate.model
+        || stored.subagent_model_policy_sha256 != candidate.subagent_model_policy_sha256
+    {
+        return Err("child continuation parent Attempt model authority changed".to_owned());
     }
     Ok(())
+}
+
+/// Install the current parent's effective permission/resource upper bound.
+///
+/// The turn resolver must retain the returned profile for actual registry and
+/// dispatcher construction. Model/variant, instructions, and generic execution
+/// limits are outside this operation.
+pub(super) fn inherit_parent_authority(
+    config: &mut zuno_config::schema::Config,
+    profile: zuno_agent::profile::AgentProfile,
+    authority: &ParentAuthoritySnapshot,
+) -> Result<zuno_agent::profile::AgentProfile, String> {
+    use zuno_agent::profile::ShellFilesystemAccess;
+    use zuno_config::schema::permission::PermissionMode;
+    use zuno_config::schema::sandbox::{
+        SandboxBackendSelection, SandboxConfig, SandboxMode, SandboxNetworkMode,
+        SandboxUnavailableAction,
+    };
+    validate_parent_resource_paths(authority)?;
+    let permission_mode = match authority.permission_mode {
+        PermissionModeSnapshot::Standard => PermissionMode::Standard,
+        PermissionModeSnapshot::Strict => PermissionMode::Strict,
+        PermissionModeSnapshot::AllowAll => PermissionMode::AllowAll,
+    };
+    let mode: SandboxMode =
+        serde_json::from_value(Value::String(authority.sandbox.mode.clone())).map_err(to_string)?;
+    let network: SandboxNetworkMode =
+        serde_json::from_value(Value::String(authority.sandbox.network.clone()))
+            .map_err(to_string)?;
+    let backend: SandboxBackendSelection =
+        serde_json::from_value(Value::String(authority.sandbox.backend.clone()))
+            .map_err(to_string)?;
+    let on_unavailable: SandboxUnavailableAction =
+        serde_json::from_value(Value::String(authority.sandbox_on_unavailable.clone()))
+            .map_err(to_string)?;
+    if mode == SandboxMode::DangerFullAccess
+        && (permission_mode != PermissionMode::AllowAll || network != SandboxNetworkMode::Allow)
+    {
+        return Err(
+            "parent full-access authority has inconsistent permission/network modes".to_owned(),
+        );
+    }
+    let mut names = BTreeSet::new();
+    for tool in &authority.tools {
+        if tool.name.trim().is_empty() || !names.insert(tool.name.as_str()) {
+            return Err("parent authority has an empty or duplicate tool identity".to_owned());
+        }
+    }
+    let rules = authority
+        .rules
+        .iter()
+        .map(|rule| zuno_permission::Rule {
+            source: rule.source.clone(),
+            permission: rule.permission.clone(),
+            pattern: rule.pattern.clone(),
+            action: match rule.action {
+                PermissionActionSnapshot::Allow => zuno_permission::PermissionAction::Allow,
+                PermissionActionSnapshot::Ask => zuno_permission::PermissionAction::Ask,
+                PermissionActionSnapshot::Deny => zuno_permission::PermissionAction::Deny,
+            },
+        })
+        .collect();
+    let profile = profile.with_parent_authority(
+        rules,
+        authority.tools.iter().map(|tool| tool.name.clone()),
+        if mode == SandboxMode::ReadOnly {
+            ShellFilesystemAccess::ReadOnly
+        } else {
+            ShellFilesystemAccess::WorkspaceWrite
+        },
+    );
+    let mode =
+        if profile.capabilities().shell_filesystem_access() == ShellFilesystemAccess::ReadOnly {
+            SandboxMode::ReadOnly
+        } else {
+            mode
+        };
+    config.permission.get_or_insert_with(Default::default).mode = permission_mode;
+    config.sandbox = Some(SandboxConfig {
+        mode: Some(mode),
+        network: Some(network),
+        backend: Some(backend),
+        // Inherit only the trusted parent choice; discovery in this child must
+        // not substitute a different global fallback. Read-only never falls back.
+        on_unavailable: Some(on_unavailable),
+        writable_roots: Some(if mode == SandboxMode::ReadOnly {
+            Vec::new()
+        } else {
+            authority.sandbox.writable_roots.clone()
+        }),
+        protected_paths: Some(authority.sandbox.protected_paths.clone()),
+    });
+    // Already-authorized deferred tools survive a newly discovered global toggle.
+    // The immutable tool identities and profile still enforce the upper bound.
+    config.tools = Some(
+        authority
+            .tools
+            .iter()
+            .map(|tool| (tool.name.clone(), true))
+            .collect(),
+    );
+    Ok(profile)
+}
+
+fn validate_parent_resource_paths(authority: &ParentAuthoritySnapshot) -> Result<(), String> {
+    for path in std::iter::once(&authority.workspace)
+        .chain(&authority.sandbox.writable_roots)
+        .chain(&authority.sandbox.protected_paths)
+    {
+        if !Path::new(path).is_absolute() {
+            return Err(format!(
+                "parent authority resource path must be absolute: {path}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_child_workspace(
+    directory: &Path,
+    authority: &ParentAuthoritySnapshot,
+) -> Result<(), String> {
+    validate_parent_resource_paths(authority)?;
+    let directory = directory.canonicalize().map_err(to_string)?;
+    let directory = PathBuf::from(zuno_paths::display_path(&directory));
+    let workspace = zuno_paths::display_path(Path::new(&authority.workspace));
+    if directory.starts_with(workspace) {
+        return Ok(());
+    }
+    // Even a writable extra root is external to the parent. Making it the
+    // child's base directory would bypass inherited external_directory gates.
+    Err("child workspace lies outside the current parent's permission scope".to_owned())
+}
+
+fn required_parent_authority(
+    parent: &AttemptSnapshot,
+    parent_session_id: &str,
+) -> Result<Arc<ParentAuthoritySnapshot>, String> {
+    if parent.owner.session_id != parent_session_id {
+        return Err("child parent Attempt belongs to a different session".to_owned());
+    }
+    parent.parent_authority.as_ref().cloned().map(Arc::new).ok_or_else(|| {
+        "child turn needs a current parent authority snapshot; run the parent again before delegating"
+            .to_owned()
+    })
+}
+
+/// Direct child input uses the latest durable parent attempt, never the
+/// permissions cached with the child's original creation.
+fn current_parent_attempt(
+    database: &zuno_db::pool::Pool,
+    parent_session_id: &str,
+) -> Result<AttemptSnapshot, String> {
+    let connection = database.get().map_err(to_string)?;
+    let event = zuno_db::event_log::latest_of_type_in(
+        &connection,
+        parent_session_id,
+        "session.provider.request",
+    )
+    .map_err(to_string)?
+    .ok_or_else(|| "child continuation has no current durable parent Attempt".to_owned())?;
+    let snapshot = event
+        .properties
+        .get("orchestrationSnapshot")
+        .ok_or_else(|| "latest parent provider request has no authority snapshot".to_owned())?;
+    let attempt: AttemptSnapshot = serde_json::from_value(snapshot.clone()).map_err(to_string)?;
+    required_parent_authority(&attempt, parent_session_id)?;
+    Ok(attempt)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -458,7 +626,7 @@ async fn checkpoint_child_session_spec(
 ) -> Result<(), String> {
     if resumed {
         let stored = children.get_or_restore(database, session_id)?;
-        return stored.validate_continuation(spec);
+        stored.validate_continuation(spec)?;
     }
     persist_child_session_spec(database, session_id, spec, cancellation).await?;
     children.remember(session_id, spec.clone());
@@ -900,7 +1068,7 @@ pub(crate) struct ChildSessionContext {
     pub(crate) environment: StartupEnvironment,
     pub(crate) directory: PathBuf,
     pub(crate) approval: Arc<dyn PermissionAsker>,
-    pub(crate) question: Option<Arc<dyn QuestionAsker>>,
+    pub(crate) question: Option<Arc<dyn QuestionPort>>,
     pub(crate) runs: SessionRunRegistry,
     pub(crate) mcp: Option<zuno_mcp::Catalog>,
     pub(crate) observer: Option<Arc<dyn ChildTurnObserver>>,
@@ -919,7 +1087,7 @@ pub(crate) struct InteractiveChildInputContext {
     pub(crate) environment: StartupEnvironment,
     pub(crate) directory: PathBuf,
     pub(crate) approval: Arc<dyn PermissionAsker>,
-    pub(crate) question: Option<Arc<dyn QuestionAsker>>,
+    pub(crate) question: Option<Arc<dyn QuestionPort>>,
     pub(crate) runs: SessionRunRegistry,
     pub(crate) mcp: Option<zuno_mcp::Catalog>,
     pub(crate) observer: Option<Arc<dyn ChildTurnObserver>>,
@@ -980,6 +1148,7 @@ impl ChildSessionHost {
             effort: context.parent_effort,
         });
         let wake: Arc<dyn ParentReportWake> = Arc::new(CoordinatedParentWake {
+            inbox: inbox.clone(),
             coordinator: SessionWakeCoordinator::new(inbox.clone(), context.runs, parent_driver),
         });
         Ok(Self {
@@ -1541,7 +1710,7 @@ struct ProductionDelegatedTurnRunner {
     environment: StartupEnvironment,
     directory: PathBuf,
     approval: Arc<dyn PermissionAsker>,
-    question: Option<Arc<dyn QuestionAsker>>,
+    question: Option<Arc<dyn QuestionPort>>,
     runs: SessionRunRegistry,
     mcp: Option<zuno_mcp::Catalog>,
     observer: Option<Arc<dyn ChildTurnObserver>>,
@@ -1563,6 +1732,9 @@ impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
         let parent_attempt = request.parent_attempt.as_deref().ok_or_else(|| {
             "delegated child turn is missing the immutable parent Attempt snapshot".to_owned()
         })?;
+        let parent_authority =
+            required_parent_authority(parent_attempt, &request.parent_session_id)?;
+        validate_child_workspace(&self.directory, &parent_authority)?;
         request
             .subagent_model_policy
             .validate()
@@ -1601,7 +1773,8 @@ impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
             effort,
             variant: None,
             thinking: false,
-            tool_authority: Some(Arc::from(parent_attempt.tools.clone())),
+            tool_authority: Some(Arc::from(parent_authority.tools.clone())),
+            parent_authority: Some(parent_authority),
             extension_composition: super::turn::ExtensionComposition::Active,
         };
         let mut plan = TurnPlan::resolve(&options, &self.environment).await?;
@@ -1613,33 +1786,20 @@ impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
             &plan.qualified_model(),
             plan.effort(),
         );
-        if resumed {
-            checkpoint_child_session_spec(
-                &self.database,
-                &self.children,
-                session_id,
-                &spec,
-                true,
-                &cancellation,
-            )
-            .await?;
-        }
         plan.inherit_orchestration(
             parent_attempt,
             spec.workflow.as_deref(),
             spec.workflow_node.as_deref(),
         )?;
-        if !resumed {
-            checkpoint_child_session_spec(
-                &self.database,
-                &self.children,
-                session_id,
-                &spec,
-                false,
-                &cancellation,
-            )
-            .await?;
-        }
+        checkpoint_child_session_spec(
+            &self.database,
+            &self.children,
+            session_id,
+            &spec,
+            resumed,
+            &cancellation,
+        )
+        .await?;
         let mut host = TurnHost::open_with_dependencies(
             plan,
             &self.environment,
@@ -1896,9 +2056,21 @@ impl InteractiveChildInput {
         let task_cancellation = cancellation.clone();
         self.supervisor.spawn(
             format!("interactive-{}", input.id),
-            input.session_id,
+            input.session_id.clone(),
             cancellation,
             async move {
+                match inbox.wake_admission(&input) {
+                    Ok(WakeAdmission::Admit | WakeAdmission::Resume) => {}
+                    Ok(WakeAdmission::Reject) => return,
+                    Err(error) => {
+                        tracing::warn!(
+                            input_id = %input.id,
+                            %error,
+                            "child input remains pending until wake admission can be verified"
+                        );
+                        return;
+                    }
+                }
                 let message = SoftInterruptMessage {
                     revision: Some(input.revision),
                     input_id: Some(task_input_id.clone()),
@@ -1935,6 +2107,12 @@ impl InteractiveChildInput {
                     outcome = &mut delivery => outcome,
                 };
                 if let Err(error) = outcome {
+                    if inbox
+                        .wake_admission(&input)
+                        .is_ok_and(|decision| decision == WakeAdmission::Reject)
+                    {
+                        return;
+                    }
                     let _failed =
                         inbox.mark_failed(&task_session_id, &task_input_id, error.clone());
                     if let Some(observer) = observer.as_ref() {
@@ -1968,7 +2146,7 @@ struct InteractiveChildInputDriver {
     environment: StartupEnvironment,
     directory: PathBuf,
     approval: Arc<dyn PermissionAsker>,
-    question: Option<Arc<dyn QuestionAsker>>,
+    question: Option<Arc<dyn QuestionPort>>,
     runs: SessionRunRegistry,
     mcp: Option<zuno_mcp::Catalog>,
     observer: Option<Arc<dyn ChildTurnObserver>>,
@@ -1980,6 +2158,9 @@ struct InteractiveChildInputDriver {
 #[async_trait]
 impl PendingInputDriver for InteractiveChildInputDriver {
     async fn drive(&self, input: SessionInput, guard: SessionRunGuard) -> Result<(), String> {
+        if self.inbox.wake_admission(&input).map_err(to_string)? == WakeAdmission::Reject {
+            return Ok(());
+        }
         let text = input
             .prompt
             .get("text")
@@ -1991,12 +2172,13 @@ impl PendingInputDriver for InteractiveChildInputDriver {
                 )
             })?
             .to_owned();
-        let spec = self
+        let mut spec = self
             .children
             .get_or_restore(&self.database, &input.session_id)?;
-        let parent_attempt = spec.parent_attempt.as_ref().ok_or_else(|| {
-            "interactive child session is missing the immutable parent Attempt snapshot".to_owned()
-        })?;
+        let parent_attempt = current_parent_attempt(&self.database, &spec.parent_session_id)?;
+        let parent_authority = required_parent_authority(&parent_attempt, &spec.parent_session_id)?;
+        validate_child_workspace(&self.directory, &parent_authority)?;
+        spec.parent_attempt = Some(parent_attempt.clone());
         let options = TurnOptions {
             directory: Some(self.directory.clone()),
             model: Some(spec.model.clone()),
@@ -2007,16 +2189,26 @@ impl PendingInputDriver for InteractiveChildInputDriver {
             effort: spec.effort,
             variant: None,
             thinking: false,
-            tool_authority: Some(Arc::from(parent_attempt.tools.clone())),
+            tool_authority: Some(Arc::from(parent_authority.tools.clone())),
+            parent_authority: Some(parent_authority),
             extension_composition: super::turn::ExtensionComposition::Active,
         };
         let mut plan = TurnPlan::resolve(&options, &self.environment).await?;
         plan.inherit_request_parameters(spec.provider_options.clone());
         plan.inherit_orchestration(
-            parent_attempt,
+            &parent_attempt,
             spec.workflow.as_deref(),
             spec.workflow_node.as_deref(),
         )?;
+        checkpoint_child_session_spec(
+            &self.database,
+            &self.children,
+            &input.session_id,
+            &spec,
+            true,
+            &CancellationToken::new(),
+        )
+        .await?;
         let mut host = TurnHost::open_with_dependencies(
             plan,
             &self.environment,
@@ -2093,7 +2285,7 @@ struct ParentReportDriver {
     environment: StartupEnvironment,
     directory: PathBuf,
     approval: Arc<dyn PermissionAsker>,
-    question: Option<Arc<dyn QuestionAsker>>,
+    question: Option<Arc<dyn QuestionPort>>,
     runs: SessionRunRegistry,
     mcp: Option<zuno_mcp::Catalog>,
     child_observer: Option<Arc<dyn ChildTurnObserver>>,
@@ -2114,6 +2306,9 @@ impl PendingInputDriver for ParentReportDriver {
     /// what stops the parent from opening a turn per report and announcing states a
     /// later report in the same batch already replaced.
     async fn drive(&self, input: SessionInput, guard: SessionRunGuard) -> Result<(), String> {
+        if self.inbox.wake_admission(&input).map_err(to_string)? == WakeAdmission::Reject {
+            return Ok(());
+        }
         let options = TurnOptions {
             directory: Some(self.directory.clone()),
             model: Some(self.model.clone()),
@@ -2125,6 +2320,7 @@ impl PendingInputDriver for ParentReportDriver {
             variant: None,
             thinking: false,
             tool_authority: None,
+            parent_authority: None,
             extension_composition: super::turn::ExtensionComposition::Active,
         };
         let plan = TurnPlan::resolve(&options, &self.environment).await?;
@@ -2143,11 +2339,22 @@ impl PendingInputDriver for ParentReportDriver {
         )
         .await?;
         host.activate_extension_composition()?;
+        if self.inbox.wake_admission(&input).map_err(to_string)? == WakeAdmission::Reject {
+            return host.shutdown().await;
+        }
         let promoted = self
             .inbox
             .promote_pending_async(&input.session_id)
             .map_err(to_string)?;
-        let batch = ReportBatch::project(&promoted);
+        // Recheck claimed revisions before entering a model driver: a gate may
+        // change after promotion.
+        let mut admitted = Vec::new();
+        for report in promoted {
+            if self.inbox.wake_admission(&report).map_err(to_string)? != WakeAdmission::Reject {
+                admitted.push(report);
+            }
+        }
+        let batch = ReportBatch::project(&admitted);
         for input_id in batch.undecodable() {
             self.settle_undecodable(&input.session_id, input_id);
         }
@@ -2201,11 +2408,15 @@ impl ParentReportDriver {
 
 struct CoordinatedParentWake {
     coordinator: SessionWakeCoordinator,
+    inbox: SessionInbox,
 }
 
 #[async_trait]
 impl ParentReportWake for CoordinatedParentWake {
     async fn wake(&self, report: SessionInput) -> Result<(), String> {
+        if self.inbox.wake_admission(&report).map_err(to_string)? == WakeAdmission::Reject {
+            return Ok(());
+        }
         let content = report
             .prompt
             .get("text")
@@ -2217,12 +2428,13 @@ impl ParentReportWake for CoordinatedParentWake {
                 )
             })?
             .to_owned();
-        self.coordinator
+        let outcome = self
+            .coordinator
             .deliver(
                 &report.session_id,
                 &report.id,
                 SoftInterruptMessage {
-                    revision: None,
+                    revision: Some(report.revision),
                     input_id: Some(report.id.clone()),
                     content,
                     images: Vec::new(),
@@ -2231,8 +2443,19 @@ impl ParentReportWake for CoordinatedParentWake {
                     source: SoftInterruptSource::BackgroundTask,
                 },
             )
-            .await?;
-        Ok(())
+            .await;
+        match outcome {
+            Ok(_) => Ok(()),
+            Err(_)
+                if self.inbox.wake_admission(&report).map_err(to_string)?
+                    == WakeAdmission::Reject =>
+            {
+                // Rejection while waiting for an idle lease is a normal defer.
+                // Keep the durable evidence; never turn it into a wake retry.
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -2874,6 +3097,13 @@ fn report_input(
             InputDelivery::Queue,
             created,
         )
+        .with_trigger_kind(InputTriggerKind::Automatic)
+        .with_cycle_id(
+            request
+                .parent_attempt
+                .as_deref()
+                .and_then(|snapshot| snapshot.cycle_id.clone()),
+        )
     })
 }
 
@@ -2901,13 +3131,21 @@ fn report_for_job(
         prompt["metadata"] =
             serde_json::to_value(metadata).expect("task report metadata is serializable");
     }
-    Some(NewSessionInput::new(
-        crate::cmd::turn::prefixed_id("input"),
-        job.parent_session_id.clone(),
-        prompt,
-        InputDelivery::Queue,
-        created,
-    ))
+    Some(
+        NewSessionInput::new(
+            crate::cmd::turn::prefixed_id("input"),
+            job.parent_session_id.clone(),
+            prompt,
+            InputDelivery::Queue,
+            created,
+        )
+        .with_trigger_kind(InputTriggerKind::Automatic)
+        .with_cycle_id(
+            job.orchestration_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.cycle_id.clone()),
+        ),
+    )
 }
 
 fn to_string(error: impl std::fmt::Display) -> String {

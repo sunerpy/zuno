@@ -34,7 +34,7 @@ Zuno is a released, fast-moving Rust agent harness. Prefer the correct foundatio
 
 ## Agents And Tools
 
-- `build` owns end-to-end delivery; `plan` is read-only planning; `deep` owns difficult cross-cutting implementation without recursive delegation.
+- `build` owns end-to-end delivery; `plan` is read-only planning; `deep` owns difficult cross-cutting implementation and may delegate bounded subtasks without recursively handing off the original objective.
 - Specialist agents have explicit positive responsibilities, negative delegation boundaries, permissions, and structured output expectations.
 - `web_search` accepts a batch of queries and owns concurrency, cancellation, stable ordering, limits, and URL deduplication above single-query providers.
 - A CLI command is not registered until a real handler exists. Help text, dispatch, assembled execution, and failure behavior must agree.
@@ -60,6 +60,7 @@ Zuno is a released, fast-moving Rust agent harness. Prefer the correct foundatio
 - Every code change includes a documentation-impact review. A user-visible behavior, configuration, CLI, protocol, persistence, permission, platform, deployment, or operational change updates the relevant English and Chinese guides or references in the same change; generated CLI/schema material and documentation contract tests must be refreshed when applicable. A genuinely internal-only change records why no user documentation changed instead of silently skipping the review.
 - Adding, renaming, or removing a documentation page also updates repository entry links and the FirLab site navigation or sync contract so the published page is discoverable. A documentation-bearing delivery is not complete until the `Publish docs` workflow succeeds and the corresponding live route is verified after the source change reaches `main`.
 - Tests describe Zuno behavior. Remove tests whose only purpose is cross-product parity.
+- For reproducible bugs and state-machine changes, first add or extend a focused behavior test and run it against the old implementation; confirm the failure is the target behavior, not a build or environment error. Then implement, rerun to green, and record exact commands, tested source/inputs, and authoritative results. Read-only work collects reproduction evidence without writing. Use proportional checks for documentation, trivial changes, and command-only work. Source-string assertions alone do not prove runtime behavior; prompt-output contract tests prove only their output.
 - Rapid-development releases are patch-only until this rule is removed. `feat` and `fix`
   may change changelog grouping but must not change the major or minor component; do not
   use `!`, `BREAKING CHANGE`, `Release-As`, or another override that would produce anything

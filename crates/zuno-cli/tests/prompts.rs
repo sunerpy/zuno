@@ -177,6 +177,11 @@ fn descriptions() -> Vec<Description> {
             text: zuno_tools::question::DESCRIPTION,
         },
         Description {
+            wire_id: "question_async",
+            file: "crates/zuno-tools/src/description/question-async.txt",
+            text: zuno_tools::question::ASYNC_DESCRIPTION,
+        },
+        Description {
             wire_id: "read",
             file: "crates/zuno-tools/src/description/read.txt",
             text: zuno_tools::read::DESCRIPTION,

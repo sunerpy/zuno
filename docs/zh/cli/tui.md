@@ -77,6 +77,27 @@ supervisor 只绑定 loopback，生成随机 Basic-auth 密码，并把状态保
 1.5 秒内连续按两次相同的 `Ctrl+C` 或 `Ctrl+D`；这会退出被保留的子进程，而 `Ctrl+]`
 只负责 detach。
 
+## 提问与恢复命令
+
+在 TUI 中输入以下命令：
+
+| 命令 | 行为 |
+| --- | --- |
+| `/questions` 或 `/questions list` | 查看待答请求、已保存草稿和已确认答案数 |
+| `/questions open <request-id>` 或 `/questions <request-id>` | 带着持久化答案和草稿值重新打开指定请求 |
+| `/resume` | 显式恢复当前会话中已暂停或已结束的 Work |
+
+在问题表单中按 `Ctrl+S` 会保存持久草稿。即使全部填满，草稿仍然待答，草稿文本不会发给模型。
+进程重启后打开同一会话，可恢复已经保存的草稿。只有明确提交才确认答案，并且只进入一次持久
+FIFO；延期和空答复都不会产生模型输入。
+
+Plan 批准必须明确选择 `approve`；Draft review 还需要非空的风险接受理由。高亮选项或保存
+批准草稿都不会开始 Work。`/resume` 不会绕过 Plan 批准或指定的人类／外部事件等待；
+Goal 本身不活跃时，先使用 `/goal resume`。
+
+选择历史会话请用 `/session`、`/sessions` 或 `/continue`。完整的问题交互说明见
+[终端应用](/zh/guide/tui)。
+
 ## 参见
 
 - [全局选项](/zh/cli/global-options)

@@ -56,18 +56,14 @@ Database opening recognizes these states:
    marker are created atomically.
 2. **Format 14.** The marker, tables, constraints, indexes and triggers are validated
    before application queries run.
-3. **Formats 5–13.** Every remaining supported additive migration runs in a single
+3. **Formats 5–13.** Every remaining supported migration runs in a single
    transaction: learning (6), Plan stack (7), verification receipts (8), session
    memory policy (9), execution/inbox state (10), versioned memory and search (11),
-   automatic-memory provenance and watermarks (12), session ownership (13), and runtime authority (14).
+   automatic-memory provenance and watermarks (12), then durable questions and
+   session scheduling (13), then input processing receipts, canonical Context
+   snapshots and revision-bound Goal resume choices (14).
 4. **Any other state.** An older unsupported format, a future format, a missing marker,
    or a marker whose required tables are absent fails closed without modification.
-
-An event service initializes once before publishing. Concurrent first publishers
-share that initialization, and schema validation excludes writes through the same
-pool. This prevents shared-cache memory databases from opening a connection or
-holding schema-read locks while another publisher starts its transaction.
-Only successful initialization is cached; a failed attempt remains retryable.
 
 Two processes that open or upgrade the same database at the same time both decide from
 the format they saw before taking SQLite's write lock. The one that loses the lock does
@@ -98,59 +94,32 @@ The supported migration uses one SQLite `BEGIN IMMEDIATE` transaction:
 9. Add nullable candidate `base_revision`/`evidence`, `resident_memory_provenance`,
    `memory_maintenance_state` and their indexes. Backfill exact linked automatic
    provenance without reclassifying newer user-authored memory.
-10. Create `session_ownership`, backfill every historical session with the explicit
-    local owner, and install the child-inheritance trigger and principal index.
-11. Widen the native Job subject constraint through a guarded transactional copy that
-    preserves every existing column. Add runtime session/input authority, execution
-    attempts, checkpoint pointers and owner scheduling state.
-12. Conditionally update the singleton marker from the exact observed old format to
+10. Add `question_interaction`, `question_action_receipt` and their index. Valid
+    legacy questions gain stable item IDs in companion rows; their original
+    `human_request` payloads and responses are not rewritten.
+11. Add nullable `session_execution_state.scheduling`. Repair only an exactly
+    evidenced legacy `running` row whose latest structured driver event is
+    `paused/no_progress`; preserve its cycle and progress.
+12. Preserve the published question definition bytes while widening the purpose
+    constraint to include native `goal_resume`. Create `session_input_receipt` and
+    `session_context_usage` and their indexes. Old consumed inputs become
+    `recorded`, never `applied` or `completed` without provider evidence.
+13. Conditionally update the singleton marker from the exact observed old format to
     14, last. Commit only after every operation succeeds.
 
 Any failure rolls the transaction back. The migration does not rewrite existing
 `session`, `message`, `memory_candidate`, `learning_job`, `verification_receipt`, or
 `work_plan` values except the documented source-validation/lease backfills.
-Tests use exact format-5 through format-12 release fixtures and the exact format-13 preview fixture, compare representative
+Tests use exact format-5 through format-13 release fixtures, compare representative
 session/message/memory values and preserved rows, then verify new objects and marker.
-Format-12 tests include previously published resident revisions, provenance and maintenance watermarks and rollback of the
+Format-11 tests include previously published resident revisions and rollback of the
 entire additive change if the final index creation fails.
 
-### Private session ownership (enterprise preview)
-
-`session_ownership` separates tenant and principal identifiers from editable session
-metadata. Existing sessions receive `local` / `local-user`; migration never guesses
-an enterprise owner from a directory, title, or OAuth claim. A trusted host binds a
-new root's owner in its creation transaction. Children inherit the parent owner;
-explicitly mismatched or missing parents abort scoped creation. Duplicate creation
-cannot transfer ownership.
-
-`ScopedSessionStore` fixes the owner for create, get and list. Listings apply the
-ownership predicate in SQL before ordering and pagination. These are storage
-primitives, not an authentication service: the host must authenticate and authorize
-before constructing a scoped store. Other local stores remain local-only until
-scoped adapters are implemented. Preview format 14 must only open a separate
-preview database; do not point a preview binary at a stable installation's data.
-
-### Runtime authority (enterprise preview)
-
-Format 14 extends the existing `agent_job` identity with root turns. SQLite cannot
-widen its subject CHECK in place, so the migration first verifies the supported
-table and indexes, rejects unexpected inbound references, copies all columns in
-the same transaction, and restores the canonical indexes with foreign keys still
-enabled. A failed replacement or later DDL rolls the whole upgrade back.
-
-`runtime_session` separates input revision, logical active Job and worker lease
-epoch. Native input admission and edits advance the input clock through triggers;
-promotion and consumption do not. `runtime_job` stores a fixed definition
-reference and checkpoint version, `runtime_attempt` records each worker claim,
-and `runtime_owner_schedule` rotates execution among owners.
-
-Claim/renew/checkpoint/settlement use database time and compare worker incarnation,
-attempt, epoch and checkpoint version. A checkpoint releases worker capacity while
-retaining the logical active turn. Expiry marks the in-flight Job uncertain and
-blocks that session until inspection; it does not prove that an external effect
-stopped. Root completion never adds a report back to its own inbox. PostgreSQL,
-remote engine state access, durable distributed waits and authoritative operation
-reconciliation remain separate enterprise implementation stages.
+The format-14 migration never runs a model, extracts Memory, invents Context
+counts, or resumes a paused Goal. Legacy source verification and optional
+reprocessing are resumable learning jobs, not migration side effects.
+Use `/learn repair-history --dry-run` to inspect repair eligibility before
+`/learn repair-history`; missing evidence stays unverified.
 
 ### Session execution and completion delivery
 
@@ -161,11 +130,32 @@ continuation cycle and context epoch, and any explicit Draft-review risk accepta
 and admits its `UserControl` input in one `BEGIN IMMEDIATE` transaction.
 
 `completion_delivery` is the exactly-once ownership ledger for background commands,
-subagents, workflows, and product Agents. A synchronous `bg wait` and an asynchronous
+subagents, workflows, and product Agents. Terminal `bg output`, synchronous `bg wait` and an asynchronous
 callback compete for one `inline` or `callback` owner. The losing path cannot admit a
 second turn. `session_input.source_key` makes producer admission idempotent across
 restarts, while `trigger_kind` distinguishes user, control, automatic, and recovery
 turns without inventing user history.
+
+Scheduling distinguishes ready, exact human/external waits, paused and completed
+sessions, including ordinary sessions without a Goal. Automatic callbacks never
+clear an unrelated gate or invent an origin cycle. Validated explicit answers and
+user controls use the same transactional inbox promotion boundary.
+
+Question rows separate confirmed answers from `draftAnswers`; Defer and empty
+answers do not generate model input. Request revisions and command receipts make
+retries idempotent. Plan consent is bound to the exact Plan/review/Work identity and
+source cycle; only a successful logical handoff can apply early approval.
+
+`session_input_receipt` separates acceptance, recording, model application and
+terminal completion. A callback recorded while a Goal is paused is not evidence
+that the model processed it. A native Goal resume choice binds the exact Goal
+ID/revision and existing input ID; answering commits Goal/execution/input changes
+together. Skipping never authorizes a resume or replays an old user message.
+
+`session_context_usage` stores a source-scoped tracker and its revision, epoch
+and update time. Main, child, learning and compaction requests cannot overwrite
+one another's context window. The application reconstructs known usage from
+durable request evidence; unknown counters remain unknown.
 
 ### Per-session memory policy
 
@@ -233,3 +223,21 @@ family cannot share a request builder.
 If a provider id is not claimed by any family, Zuno returns an error naming it rather
 than silently trying the OpenAI-compatible route. A named failure is the intended,
 actionable outcome.
+
+
+## Enterprise preview runtime overlay
+
+The preview retains main's core format 14 and records its runtime extension in
+`zuno_preview_schema` (format 1, channel `enterprise-preview`). This separates
+stable schema numbering from preview ownership and root-Job storage.
+
+Published core formats 5–13 migrate forward with their sessions, messages, Memory
+and question records preserved. A valid core-14 database receives the overlay in
+one transaction. The unpublished preview previously used different formats 13
+(ownership) and 14 (runtime Jobs); those exact shapes are identified and upgraded
+without discarding their ownership, budgets, checkpoints or lease epochs.
+
+A missing or future overlay marker, malformed required objects, or an unmarked
+mixture of the two histories fails closed. DDL, backfills, validation and markers
+commit together. Preview installations continue to use separate configuration and
+data paths; these migrations are validated on isolated fixtures.

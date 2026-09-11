@@ -14,21 +14,9 @@ use zuno_db::learning_job::{
 };
 use zuno_types::SessionMemoryGeneration;
 
-/// How many times one learning job may be handed to a worker before it is settled
-/// `Failed` instead of claimed again.
-///
-/// `LearningJobStore::claim_due` increments `attempt` and never reads it, and
-/// `reconcile_expired` requeues any expired `running` extraction unconditionally, so
-/// without a cap a job that can never succeed is re-claimed on every lease cycle —
-/// and each cycle of an extraction job is a full paid model call. Three is chosen so
-/// the genuinely recoverable causes still recover (SQLite contention, a lost lease
-/// across a restart, one provider hiccup) while a permanent failure that the worker
-/// reports without settling stops costing tokens.
-///
-/// This is the consumer-side half of the bound. The store-side half — refusing to
-/// requeue or claim an over-cap row in SQL, so a caller that bypasses this scheduler
-/// is bounded too — is an integrator seam in `zuno-db`, which this lane does not own.
-const MAX_JOB_ATTEMPTS: u32 = 3;
+/// The durable store enforces this bound at claim, retry, and lease recovery.
+/// The scheduler keeps the same defensive limit before handing work to a model.
+const MAX_JOB_ATTEMPTS: u32 = zuno_db::learning_job::MAX_LEARNING_JOB_ATTEMPTS;
 const RETRY_INITIAL_DELAY_MS: i64 = 1_000;
 const RETRY_MAX_DELAY_MS: i64 = 5 * 60 * 1_000;
 
@@ -70,6 +58,7 @@ pub enum LearningScheduleOutcome {
 pub struct LearningScheduler {
     jobs: LearningJobStore,
     experiences: ExperienceStore,
+    sources: zuno_db::learning_source::LearningSourceStore,
     config: ResolvedLearningConfig,
     extractor_version: String,
 }
@@ -83,6 +72,7 @@ impl LearningScheduler {
             .unwrap_or_else(|| "learning-disabled".to_owned());
         Self {
             jobs: LearningJobStore::new(pool.clone()),
+            sources: zuno_db::learning_source::LearningSourceStore::new(pool.clone()),
             experiences: ExperienceStore::new(pool),
             config,
             extractor_version,
@@ -106,6 +96,43 @@ impl LearningScheduler {
     #[must_use]
     pub const fn use_existing(&self) -> bool {
         self.config.use_existing
+    }
+
+    #[must_use]
+    pub const fn generates(&self) -> bool {
+        self.config.generate
+    }
+
+    #[must_use]
+    pub const fn automatic_enabled(&self) -> bool {
+        self.config.generate && self.config.post_turn_enabled
+    }
+
+    #[must_use]
+    pub fn extractor_version(&self) -> &str {
+        &self.extractor_version
+    }
+
+    #[must_use]
+    pub const fn allows_closed_turn_while_busy(&self) -> bool {
+        self.config.post_turn_idle_delay_ms == 0
+    }
+
+    pub(crate) fn capture_snapshot(
+        &self,
+        request: &ExtractionRequest,
+        trigger: ExtractionTrigger,
+    ) -> Result<zuno_db::learning_source::LearningSourceSnapshot> {
+        self.sources
+            .snapshot(
+                &request.project_id,
+                &request.session_id,
+                &request.source_message_id,
+                &request.sources,
+                trigger == ExtractionTrigger::Manual,
+                self.allows_closed_turn_while_busy(),
+            )
+            .map_err(Into::into)
     }
 
     /// Whether automatic extraction should exclude turns that consumed external context.
@@ -164,6 +191,25 @@ impl LearningScheduler {
             return Ok(LearningScheduleOutcome::Disabled);
         }
         self.enqueue_extraction(request, ExtractionTrigger::Manual, now, now)
+    }
+
+    /// Reprocess once per extractor version. Repeated repair requests do not
+    /// reset attempts or replay a completed current-version extraction.
+    pub fn schedule_reprocess(
+        &self,
+        request: ExtractionRequest,
+        now: i64,
+    ) -> Result<LearningScheduleOutcome> {
+        if !self.config.generate {
+            return Ok(LearningScheduleOutcome::Disabled);
+        }
+        let delay = i64::try_from(self.config.post_turn_idle_delay_ms).unwrap_or(i64::MAX);
+        self.enqueue_extraction(
+            request,
+            ExtractionTrigger::LegacyReprocess,
+            now.saturating_add(delay),
+            now,
+        )
     }
 
     pub fn schedule_project_aggregation(
@@ -254,6 +300,9 @@ impl LearningScheduler {
         now: i64,
         lease_expires: i64,
     ) -> Result<Option<LearningJobRecord>> {
+        if !self.config.generate {
+            return Ok(None);
+        }
         let claimed = self.jobs.claim_due(owner_id, now, lease_expires)?;
         self.bound_attempts(claimed, owner_id, now)
     }
@@ -280,6 +329,9 @@ impl LearningScheduler {
         busy_session_ids: &[String],
         memory_project_path: Option<&str>,
     ) -> Result<Option<LearningJobRecord>> {
+        if !self.config.generate {
+            return Ok(None);
+        }
         let idle_delay = i64::try_from(self.config.post_turn_idle_delay_ms).unwrap_or(i64::MAX);
         let claimed = self
             .jobs
@@ -303,6 +355,9 @@ impl LearningScheduler {
         now: i64,
         lease_expires: i64,
     ) -> Result<Option<LearningJobRecord>> {
+        if !self.config.generate {
+            return Ok(None);
+        }
         let record = self.jobs.get(job_id)?;
         let manual = record.kind == LearningJobKind::Extraction
             && record
@@ -476,6 +531,9 @@ impl LearningScheduler {
         now: i64,
         expires: i64,
     ) -> Result<bool> {
+        if !self.config.generate {
+            return Ok(false);
+        }
         self.jobs
             .heartbeat(job_id, lease, now, expires)
             .map_err(Into::into)
@@ -496,8 +554,17 @@ impl LearningScheduler {
         let project_id = request.project_id.clone();
         let session_id = request.session_id.clone();
         let source_message_id = request.source_message_id.clone();
-        let payload = serde_json::to_value(ExtractionJobPayload { trigger, request })
-            .expect("ExtractionJobPayload is serializable");
+        let source_snapshot = if request.sources.is_empty() {
+            None
+        } else {
+            Some(self.capture_snapshot(&request, trigger)?)
+        };
+        let payload = serde_json::to_value(ExtractionJobPayload {
+            trigger,
+            request,
+            source_snapshot,
+        })
+        .expect("ExtractionJobPayload is serializable");
         let mut job = NewLearningJob::extraction(
             format!("lrn_{}", Uuid::now_v7().simple()),
             project_id,
@@ -1016,9 +1083,13 @@ mod tests {
         assert!(
             job.error
                 .as_deref()
-                .is_some_and(|error| error.contains("stopped after 4 attempts")),
+                .is_some_and(|error| error.contains("attempt limit reached")),
             "unexpected settled error: {:?}",
             job.error
+        );
+        assert_eq!(
+            job.attempt, 3,
+            "the store must reject a fourth claim before incrementing"
         );
         // Terminal, so the reconciler has nothing left to requeue.
         assert_eq!(

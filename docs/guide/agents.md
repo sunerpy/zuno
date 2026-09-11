@@ -16,27 +16,105 @@ configuration can quietly reverse.
 | `build` | Direct end-to-end implementation in one lane | No child tools |
 | `plan` | Read-only research and implementation-ready planning | No child tools |
 | `review` | Read-only high-assurance review: records checkable evidence and decides draft or ready | May delegate the review seats |
-| `deep` | Deep-work mode, or delegated root-cause and cross-cutting implementation | No recursive delegation |
+| `deep` | Establish evidence, test competing causes, fix the root when authorized, verify recovery | Bounded tasks within runtime authority |
 | `fixer` | Focused local change and its regression scope | No recursive delegation |
 | `general` | Bounded work with no narrower specialist | No recursive delegation |
 | `explorer` | Read-only repository and call-chain research | No recursive delegation |
 | `librarian` | Current external documentation and upstream research | No recursive delegation |
 | `oracle` | Read-only architecture and root-cause review | No recursive delegation |
 | `looker` | Visual artifact inspection | No recursive delegation |
+| `compaction` | Preserve the task, constraints, evidence, and unfinished work in a context checkpoint | Hidden; no tools |
+| `title` | Name the session from its subject in the user's language | Hidden; no tools |
+| `summary` | Condense the session's outcome and outstanding user request | Hidden; no tools |
+| `council-synth` | Synthesize supplied Council evidence while preserving attribution and dissent | Hidden; no tools |
 
-`orchestrator` is the default and the only native primary Agent exposing the general
-`task` delegation tool. The native `review_open` operation automatically seats the
+All 15 roles remain native. `orchestrator` is the default; it and `deep` declare the
+general `task` delegation tool. Actual delegation depends on the current tool surface,
+parent authority, configured depth, and per-Agent restrictions. `build` keeps work
+directly in one lane without child tools. `deep` has mode `all`, so it can be selected
+as the session Agent or assigned a bounded objective by a delegating Agent.
+
+The native `review_open` operation automatically seats the
 `balanced-review` Council over `explorer`, `librarian` and `oracle`; `council_run` is
 not exposed to the review model, so it cannot switch presets or bypass the review
-binding. Both remain bounded — neither can reach a writing child from a read-only role,
-and `review` cannot seat another `review`, update Plan/Todo state, or forge source and
+binding. A read-only role cannot reach a writing child.
+`review` cannot seat another `review`, update Plan/Todo state, or forge source and
 receipt fields. Council seat output is parsed and imported by the runtime before
 synthesis.
-`deep` has mode `all`, so it can be selected directly as a session agent
-while `orchestrator` can also target it; direct selection does not grant it recursive
-delegation. `deep` can read, create, update, and request input for the current durable
-Goal, so a directly selected deep-work session can close the same evidence-gated objective
-it implements. Goal ownership does not add child-Agent authority.
+
+`deep` can read, create, update, and request input for the current durable Goal, so a
+directly selected deep-work session can close the same evidence-gated objective it
+implements. Goal ownership and delegation are separate capabilities.
+
+## Verification and test-first changes
+
+Working built-in Agents share one verification rubric for implementation, fixes,
+testing, planning, and review:
+
+1. For an authorized fix to a reproducible bug or a state-machine change, first add or
+   extend a focused behavior test and run it against the old implementation.
+2. Check that the red result demonstrates the intended behavioral failure. A build,
+   dependency, permission, or environment error is not a reproduced regression.
+3. Implement the change, rerun the same test to green, and run the relevant regression
+   checks. Cover observable inputs, outputs, transitions, and applicable interruption,
+   restart, or recovery paths.
+
+Record exact commands, working directory, tested source and inputs, expected and
+observed results, exit status, and authoritative test output or artifact/run receipts.
+Separate completed checks from proposed, blocked, and unrun checks. If reproduction
+is unavailable, explain why and report the strongest verification that was feasible.
+
+Read-only roles gather existing reproduction steps, tests, and receipts without
+editing files or running commands that write. They hand missing tests to an authorized
+writer. Reviewers check the red/green evidence and name gaps; a plan specifies the
+test and expected failure without claiming the test ran.
+
+Documentation, trivial changes, and command/script deliverables use proportional
+checks; not every command needs a new test. Source-string assertions alone do not
+establish runtime behavior. Prompt-output contract tests verify the rendered prompt,
+not whether a model follows it or whether the described runtime behavior works.
+
+Keep serial CI waits on the critical path in the same foreground workflow, with one
+polling owner. Background work is for independent parallel work or an explicit user
+request. A polling timeout does not establish a remote failure; inspect the authoritative
+run status before reporting its outcome.
+
+This is built-in prompt guidance, with no new runtime gate, approval mechanism, or
+authority. Explicit prompt overrides remain authoritative, and existing role and
+delegation boundaries still apply. Hidden tool-free roles keep their output contracts.
+
+The design reference is Codex `eaa8b6d917`: `codex-rs/models-manager/prompt.md`
+("Validating your work"), `codex-rs/prompts/src/review_request.rs::REVIEW_PROMPT`
+with `codex-rs/prompts/templates/review/rubric.md`, and
+`codex-rs/core/tests/suite/prompt_caching.rs::prompt_tools_are_consistent_across_requests`.
+Zuno adopts focused validation and checkable findings, adapting prompt composition
+to one rubric shared by its working roles. The required old-implementation red/green
+sequence for reproducible bugs and state-machine changes is a stricter, user-chosen
+Zuno policy. It is not a claim that Codex enforces a runtime test-first gate.
+
+## Deep work
+
+The native `deep` definition requires the first-party `deepwork` and
+`verification-planning` Skills at the start of each turn. Its method is:
+
+1. Establish evidence and a reproducible baseline from the actual code, tests, logs,
+   durable state, and authoritative sources.
+2. Rank competing hypotheses and trace the causal chain through callers, state
+   transitions, cleanup, and error paths.
+3. Choose an experiment whose expected observations distinguish the plausible causes.
+   Change one causal variable, inspect the result, and revise the hypotheses.
+4. When authorized, fix the owning abstraction and update affected callers.
+5. Verify the original failure, corrected behavior, and the relevant interruption,
+   restart, or recovery path. Report checks actually run and remaining uncertainty.
+
+An explanation or diagnosis request ends with the answer or demonstrated cause; selecting
+a writing role does not authorize an unrequested fix. Authorized commands and scripts
+are valid work, including when the deliverable is an operational action rather than a
+source change. They remain subject to runtime permissions.
+
+Deep may delegate bounded evidence or implementation tasks when specialization helps.
+It retains causal reasoning, integration, and independent verification of child reports.
+The runtime controls delegation limits; the prompt does not prescribe a fanout count.
 
 ## Choosing one
 
@@ -171,6 +249,14 @@ selected-body Skill budgets, rendered and omitted coverage, and a bounded previe
 `debug permissions` reports both the configured and the effective permission mode. Use
 these rather than inferring the result from configuration, because global and project
 definitions overlap.
+
+`GET /api/agent` uses the same resolved catalog order, base prompts, and native role
+permission overlays. Config and Markdown prompt overrides are preserved, including
+overrides of hidden native roles; the explicit environment config layer still wins.
+Permission rules are ordered as common defaults, native role policy, global configuration,
+and resolved per-Agent configuration. The endpoint describes catalog policy before
+runtime tool filtering and inherited attempt authority; it does not replace the effective
+view shown by the debug commands.
 
 ## Custom agents
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.30](https://github.com/sunerpy/zuno/compare/v0.10.29...v0.10.30) (2026-09-11)
+
+
+### Bug Fixes
+
+* **runtime:** 完善异步提问与会话调度及 Agent 权限 ([64778f7](https://github.com/sunerpy/zuno/commit/64778f7a27729bf12076bd0c72b19d2c6f22df3d))
+
 ## [0.10.29](https://github.com/sunerpy/zuno/compare/v0.10.28...v0.10.29) (2026-09-10)
 
 

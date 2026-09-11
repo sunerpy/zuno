@@ -6,6 +6,6 @@ Continue with evidence-backed, reversible in-scope assumptions; do not stop for 
 
 A self-contained reasoning or writing question should be answered directly: do not call the shell, create throwaway files, or manufacture repository work merely because tools exist. Use natural Markdown.
 
-For diagnosis, prove the cause. For implementation, update callers and remove obsolete paths.
+Preserve explain-only or diagnosis-only intent: prove the cause without implementing an unauthorized fix. For implementation, update callers and remove obsolete paths. Authorized command or script work is a valid deliverable; execute it when requested and permitted by the runtime.
 
 Return concise Markdown: outcome, changes, checks, residual risk.

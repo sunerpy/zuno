@@ -1,178 +1,37 @@
-//! `question` — the tool that stops and asks the user something.
+//! Structured questions over the session-owned durable [`QuestionPort`].
 //!
-//! # Its exposure is a client capability, not a preference
-//!
-//! Offered only when the client has somewhere to draw a prompt — `app`, `cli` or
-//! `desktop` — or when [`crate::exposure::ENV_ENABLE_QUESTION_TOOL`] overrides that
-//! (`registry.ts:202,228`). A headless host that offered it would advertise a tool
-//! whose every call blocks forever, so the condition is a capability check and the
-//! predicate is [`crate::exposure::exposes_question`]. Verified against the real
-//! binary: `ZUNO_CLIENT=tui` drops it, the same run with the override flag
-//! restores it.
-//!
-//! # Where the answer comes from
-//!
-//! Not from here. A question travels out to a client, waits for a human, and comes
-//! back — a round trip through the event bus and the HTTP API upstream
-//! (`packages/core/src/question.ts`). This crate has neither, so the round trip is a
-//! seam: [`QuestionAsker`]. The tool's job is to shape the request, hand it over, and
-//! render whatever comes back; the transport belongs to the server layer.
-//!
-//! [`ScriptedAnswers`] is the test double, and it is also what makes the rendering
-//! assertions possible without a running server.
-//!
-//! # `Prompt` is not `Info`
-//!
-//! Upstream has two shapes that differ by one field. The **tool's** parameters are
-//! `Question.Prompt` — `question`, `header`, `options`, `multiple`
-//! (`packages/schema/src/v1/question.ts:20-25,30`) — while the **service** takes
-//! `Question.Info`, which adds `custom`. So the model cannot switch off the
-//! "type your own answer" affordance; only an internal caller can, which is exactly
-//! what [`crate::plan_exit`] does with `custom: false`. [`QuestionPrompt`] is the
-//! model-facing shape and [`QuestionRequest`] the internal one, kept apart for that
-//! reason rather than merged with an optional field.
+//! Publication and a tool's optional waiting future have separate lifetimes.
+//! The tool returns a receipt; the accepted answer enters the durable inbox once.
+//! Only the host can create a closed Plan authorization binding. Model-authored
+//! questions retain the custom-answer affordance.
 
 use crate::exposure::{ExposureFlags, exposes_question};
 use async_trait::async_trait;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use zuno_error::ToolError;
+use zuno_tool::question::{QuestionError, QuestionPort, QuestionResult};
 use zuno_tool::{
     QuestionResultPresentation, QuestionResultStatus, ToolContext, ToolEffect, ToolOutput,
     ToolResultPresentation, TypedTool,
 };
+use zuno_types::question::{
+    QuestionCommand, QuestionItem, QuestionMode, QuestionOrigin, QuestionPurpose, QuestionReceipt,
+    QuestionSpec, QuestionState, QuestionView,
+};
 
 /// The id the model calls. Registry key and wire id agree (`registry.ts:218`).
 pub const WIRE_ID: &str = "question";
+pub const ASYNC_WIRE_ID: &str = "question_async";
+pub const ASYNC_DESCRIPTION: &str = include_str!("description/question-async.txt");
 
 /// The description the model reads, verbatim from `tool/question.txt`.
 pub const DESCRIPTION: &str = include_str!("description/question.txt");
 
-/// What a question with no selected answer renders as.
-///
-/// Oracle: `question.ts:31`. Rendered rather than omitted, so the model can tell
-/// "the user skipped this" from "the user chose nothing meaningful".
-pub const UNANSWERED: &str = "Unanswered";
-
-/// One selectable answer.
-///
-/// Field descriptions are the oracle's annotations
-/// (`packages/schema/src/v1/question.ts:16-19`), including the length guidance, since
-/// that text is what steers the model into writing usable labels.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct QuestionOption {
-    /// Display text (1-5 words, concise)
-    pub label: String,
-    /// Explanation of choice
-    pub description: String,
-}
-
-impl QuestionOption {
-    /// An option.
-    #[must_use]
-    pub fn new(label: impl Into<String>, description: impl Into<String>) -> Self {
-        Self {
-            label: label.into(),
-            description: description.into(),
-        }
-    }
-}
-
-/// One question, as the model may write it.
-///
-/// Deliberately without `custom`: see the module docs. Upstream's `Prompt` omits it,
-/// so a model asking for a closed set of options cannot get one.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct QuestionPrompt {
-    /// Complete question
-    pub question: String,
-    /// Very short label (max 30 chars)
-    pub header: String,
-    /// Available choices
-    pub options: Vec<QuestionOption>,
-    /// Allow selecting multiple choices
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub multiple: Option<bool>,
-}
-
-impl QuestionPrompt {
-    /// A question with the given options.
-    #[must_use]
-    pub fn new(
-        question: impl Into<String>,
-        header: impl Into<String>,
-        options: Vec<QuestionOption>,
-    ) -> Self {
-        Self {
-            question: question.into(),
-            header: header.into(),
-            options,
-            multiple: None,
-        }
-    }
-
-    /// The internal request form, with the custom-answer affordance left at its
-    /// default.
-    #[must_use]
-    pub fn into_request(self) -> QuestionRequest {
-        QuestionRequest {
-            question: self.question,
-            header: self.header,
-            options: self.options,
-            multiple: self.multiple,
-            custom: None,
-        }
-    }
-}
-
-/// One question as the asking layer receives it.
-///
-/// Upstream's `Question.Info`: `Prompt` plus `custom`
-/// (`packages/schema/src/v1/question.ts:27-30`). Only internal callers construct this
-/// with `custom` set; a model-written question always leaves it `None`, which the
-/// client reads as "allow a typed answer" — the documented default.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub struct QuestionRequest {
-    /// The question text.
-    pub question: String,
-    /// The short label shown beside it.
-    pub header: String,
-    /// The offered choices.
-    pub options: Vec<QuestionOption>,
-    /// Whether more than one choice may be selected.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub multiple: Option<bool>,
-    /// Whether a typed answer is offered. `None` means the client's default, which is
-    /// on.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub custom: Option<bool>,
-}
-
-impl QuestionRequest {
-    /// A question with the custom-answer affordance suppressed.
-    ///
-    /// The shape [`crate::plan_exit`] needs: a strict yes/no where a typed answer
-    /// would have no meaning.
-    #[must_use]
-    pub fn closed(
-        question: impl Into<String>,
-        header: impl Into<String>,
-        options: Vec<QuestionOption>,
-    ) -> Self {
-        Self {
-            question: question.into(),
-            header: header.into(),
-            options,
-            multiple: None,
-            custom: Some(false),
-        }
-    }
-}
+pub use zuno_types::question::{QuestionOption, QuestionPrompt, QuestionRequest};
 
 /// One question's answer: the labels the user selected.
 ///
@@ -180,77 +39,28 @@ impl QuestionRequest {
 /// `Schema.Array(Schema.String)` (`v1/question.ts:41`) — empty means unanswered.
 pub type Answer = Vec<String>;
 
-/// An authoritative result from the client that owned the human prompt.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum QuestionOutcome {
+/// Response script used only by the in-memory port double.
+#[derive(Debug, Clone, Default)]
+enum ScriptedOutcome {
     Answered(Vec<Answer>),
     Cancelled,
     Expired,
+    #[default]
     Failed,
 }
 
-impl QuestionOutcome {
-    /// The terminal status represented by this outcome.
-    #[must_use]
-    pub const fn status(&self) -> QuestionResultStatus {
-        match self {
-            Self::Answered(_) => QuestionResultStatus::Answered,
-            Self::Cancelled => QuestionResultStatus::Cancelled,
-            Self::Expired => QuestionResultStatus::Expired,
-            Self::Failed => QuestionResultStatus::Failed,
-        }
-    }
-}
-
-impl Default for QuestionOutcome {
-    fn default() -> Self {
-        Self::Answered(Vec::new())
-    }
-}
-
-/// The round trip to a human.
-///
-/// # Errors
-///
-/// [`ToolError::Denied`] when the user dismissed the request rather than answering.
-/// That maps upstream's `Question.RejectedError`, and `Denied` is the honest variant:
-/// the call cannot proceed until a human decides differently, which is exactly what
-/// `Denied` means to the retry policy.
-#[async_trait]
-pub trait QuestionAsker: Send + Sync + 'static {
-    /// Ask `questions` for `session_id` and wait for the answers.
-    ///
-    /// The returned list is positional: `answers[i]` belongs to `questions[i]`. An
-    /// implementation that returns a shorter list is treated as having left the
-    /// remainder unanswered rather than as an error, matching upstream's
-    /// `answers[i]?.length` guard (`question.ts:31`).
-    ///
-    /// `call` is `(message_id, call_id)` when the ask originated in a tool call, so
-    /// the client can attach the prompt to that call in the transcript. `None` for an
-    /// ask that did not (`question.ts:27`).
-    ///
-    /// # Errors
-    ///
-    /// [`ToolError`] only when the asker cannot even construct the request. Delivery
-    /// and human terminal states are values so the originating tool call can be
-    /// persisted and is never re-opened after a session replay.
-    async fn ask(
-        &self,
-        session_id: &str,
-        questions: &[QuestionRequest],
-        call: Option<(&str, &str)>,
-    ) -> Result<QuestionOutcome, ToolError>;
-}
-
-/// A [`QuestionAsker`] that answers from a script and records what it was asked.
-///
-/// The only way to assert the rendering without a client on the other end. Also used
-/// by [`crate::plan_exit`]'s tests, which is why it lives here rather than in a test
-/// module: one double, one contract.
-#[derive(Debug, Default)]
+/// In-memory QuestionPort for isolated tool/registry tests.
+#[derive(Debug)]
 pub struct ScriptedAnswers {
-    outcome: QuestionOutcome,
+    outcome: ScriptedOutcome,
     asked: Mutex<Vec<QuestionRequest>>,
+    current: Mutex<Option<QuestionView>>,
+}
+
+impl Default for ScriptedAnswers {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
 }
 
 impl ScriptedAnswers {
@@ -258,8 +68,9 @@ impl ScriptedAnswers {
     #[must_use]
     pub fn new(answers: Vec<Answer>) -> Self {
         Self {
-            outcome: QuestionOutcome::Answered(answers),
+            outcome: ScriptedOutcome::Answered(answers),
             asked: Mutex::new(Vec::new()),
+            current: Mutex::new(None),
         }
     }
 
@@ -272,25 +83,26 @@ impl ScriptedAnswers {
     /// Cancels every ask, as a user dismissing the prompt does.
     #[must_use]
     pub fn rejecting() -> Self {
-        Self::with_outcome(QuestionOutcome::Cancelled)
+        Self::with_outcome(ScriptedOutcome::Cancelled)
     }
 
     /// Returns an expired terminal outcome.
     #[must_use]
     pub fn expiring() -> Self {
-        Self::with_outcome(QuestionOutcome::Expired)
+        Self::with_outcome(ScriptedOutcome::Expired)
     }
 
     /// Returns a failed-delivery terminal outcome.
     #[must_use]
     pub fn failing() -> Self {
-        Self::with_outcome(QuestionOutcome::Failed)
+        Self::with_outcome(ScriptedOutcome::Failed)
     }
 
-    fn with_outcome(outcome: QuestionOutcome) -> Self {
+    fn with_outcome(outcome: ScriptedOutcome) -> Self {
         Self {
             outcome,
             asked: Mutex::new(Vec::new()),
+            current: Mutex::new(None),
         }
     }
 
@@ -305,18 +117,109 @@ impl ScriptedAnswers {
 }
 
 #[async_trait]
-impl QuestionAsker for ScriptedAnswers {
-    async fn ask(
-        &self,
-        _session_id: &str,
-        questions: &[QuestionRequest],
-        _call: Option<(&str, &str)>,
-    ) -> Result<QuestionOutcome, ToolError> {
+impl QuestionPort for ScriptedAnswers {
+    async fn open(&self, spec: QuestionSpec) -> QuestionResult<QuestionReceipt> {
         self.asked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .extend_from_slice(questions);
-        Ok(self.outcome.clone())
+            .extend_from_slice(&spec.questions);
+        let view = QuestionView {
+            id: "que_scripted".to_owned(),
+            origin: spec.origin,
+            revision: 1,
+            mode: spec.mode,
+            purpose: spec.purpose,
+            state: QuestionState::Pending,
+            questions: spec
+                .questions
+                .into_iter()
+                .enumerate()
+                .map(|(index, question)| QuestionItem {
+                    id: format!("q{}", index + 1),
+                    question,
+                })
+                .collect(),
+            answers: Default::default(),
+            draft_answers: Default::default(),
+            plan: spec.plan,
+            decision: None,
+            authorization: None,
+            time_created: 0,
+            time_updated: 0,
+        };
+        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = Some(view.clone());
+        Ok(QuestionReceipt {
+            question: view,
+            input_id: None,
+            duplicate: false,
+        })
+    }
+
+    async fn apply(&self, _: &str, _: &str, _: QuestionCommand) -> QuestionResult<QuestionReceipt> {
+        Err(QuestionError::Unavailable(
+            "scripted questions do not accept client input".to_owned(),
+        ))
+    }
+
+    async fn get(&self, session_id: &str, request_id: &str) -> QuestionResult<QuestionView> {
+        self.current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .filter(|view| view.id == request_id && view.origin.session_id == session_id)
+            .ok_or_else(|| QuestionError::NotFound {
+                session_id: session_id.to_owned(),
+                request_id: request_id.to_owned(),
+            })
+    }
+
+    async fn pending(&self, session_id: &str) -> QuestionResult<Vec<QuestionView>> {
+        Ok(self
+            .current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .filter(|view| {
+                view.origin.session_id == session_id && view.state == QuestionState::Pending
+            })
+            .into_iter()
+            .collect())
+    }
+
+    async fn wait_for_change(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        _: i64,
+        interrupt: Arc<dyn zuno_tool::InterruptHandle>,
+    ) -> QuestionResult<QuestionView> {
+        if interrupt.is_set() {
+            return Err(QuestionError::Interrupted);
+        }
+        let mut view = self.get(session_id, request_id).await?;
+        view.mode = QuestionMode::Deferred;
+        view.revision += 1;
+        view.state = match &self.outcome {
+            ScriptedOutcome::Answered(answers) => {
+                view.answers = view
+                    .questions
+                    .iter()
+                    .zip(answers)
+                    .filter(|(_, answers)| !answers.is_empty())
+                    .map(|(question, answers)| (question.id.clone(), answers.clone()))
+                    .collect();
+                if view.is_fully_answered() {
+                    QuestionState::Answered
+                } else {
+                    QuestionState::Pending
+                }
+            }
+            ScriptedOutcome::Cancelled => QuestionState::Cancelled,
+            ScriptedOutcome::Expired => QuestionState::Expired,
+            ScriptedOutcome::Failed => QuestionState::Failed,
+        };
+        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = Some(view.clone());
+        Ok(view)
     }
 }
 
@@ -328,16 +231,40 @@ pub struct QuestionParams {
     pub questions: Vec<QuestionPrompt>,
 }
 
-/// Asks the user one or more questions and returns their answers.
+/// Publishes questions and returns a receipt; answers are delivered by the inbox.
 pub struct QuestionTool {
-    asker: Arc<dyn QuestionAsker>,
+    port: Arc<dyn QuestionPort>,
+    mode: QuestionMode,
+    purpose: QuestionPurpose,
 }
 
 impl QuestionTool {
     /// The tool, asking through `asker`.
     #[must_use]
-    pub fn new(asker: Arc<dyn QuestionAsker>) -> Self {
-        Self { asker }
+    pub fn new(port: Arc<dyn QuestionPort>) -> Self {
+        Self {
+            port,
+            mode: QuestionMode::Blocking,
+            purpose: QuestionPurpose::Clarification,
+        }
+    }
+
+    #[must_use]
+    pub fn asynchronous(port: Arc<dyn QuestionPort>) -> Self {
+        Self {
+            port,
+            mode: QuestionMode::Deferred,
+            purpose: QuestionPurpose::Clarification,
+        }
+    }
+
+    #[must_use]
+    pub fn required(port: Arc<dyn QuestionPort>) -> Self {
+        Self {
+            port,
+            mode: QuestionMode::Blocking,
+            purpose: QuestionPurpose::RequiredInput,
+        }
     }
 
     /// Whether the registry offers this tool under `flags`.
@@ -359,26 +286,6 @@ impl QuestionTool {
             format_elapsed(elapsed)
         )
     }
-
-    /// The `"question"="answer"` list upstream builds from the answers.
-    ///
-    /// Oracle: `question.ts:30-32`. A question with no selected labels renders as
-    /// [`UNANSWERED`]; multiple labels join with `", "` — the same separator that
-    /// joins the pairs, which is upstream's ambiguity and not this port's to fix.
-    #[must_use]
-    pub fn format_answers(questions: &[QuestionPrompt], answers: &[Answer]) -> String {
-        questions
-            .iter()
-            .enumerate()
-            .map(|(index, prompt)| {
-                let selected = answers.get(index).filter(|labels| !labels.is_empty());
-                let rendered =
-                    selected.map_or_else(|| UNANSWERED.to_owned(), |labels| labels.join(", "));
-                format!("\"{}\"=\"{}\"", prompt.question, rendered)
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
 }
 
 #[async_trait]
@@ -386,11 +293,19 @@ impl TypedTool for QuestionTool {
     type Params = QuestionParams;
 
     fn id(&self) -> &str {
-        WIRE_ID
+        if self.mode == QuestionMode::Deferred {
+            ASYNC_WIRE_ID
+        } else {
+            WIRE_ID
+        }
     }
 
     fn description(&self) -> &str {
-        DESCRIPTION
+        if self.mode == QuestionMode::Deferred {
+            ASYNC_DESCRIPTION
+        } else {
+            DESCRIPTION
+        }
     }
 
     fn effect(&self, _args: &serde_json::Value) -> ToolEffect {
@@ -398,9 +313,15 @@ impl TypedTool for QuestionTool {
     }
 
     async fn run(&self, params: QuestionParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
-        // No permission ask. Upstream's `question.ts` has none (contrast `todo.ts:24`),
-        // because the tool's whole effect *is* asking the user — gating a prompt behind
-        // a prompt would be circular.
+        if ctx
+            .orchestration_snapshot()
+            .is_some_and(|snapshot| snapshot.owner.parent_session_id.is_some())
+        {
+            return Err(ToolError::Denied {
+                tool: self.id().to_owned(),
+                denial: None,
+            });
+        }
         let requests: Vec<QuestionRequest> = params
             .questions
             .iter()
@@ -409,66 +330,109 @@ impl TypedTool for QuestionTool {
             .collect();
 
         let started = Instant::now();
-        let outcome = self
-            .asker
-            .ask(
-                &ctx.session_id,
-                &requests,
-                Some((&ctx.message_id, &ctx.call_id)),
-            )
-            .await?;
-        let elapsed = started.elapsed();
-        let status = outcome.status();
-        let presentation_answers = match &outcome {
-            QuestionOutcome::Answered(answers) => Some(answers.clone()),
-            QuestionOutcome::Cancelled | QuestionOutcome::Expired | QuestionOutcome::Failed => None,
-        };
-
-        let output = match outcome {
-            QuestionOutcome::Answered(answers) => {
-                let formatted = Self::format_answers(&params.questions, &answers);
-                let metadata =
-                    serde_json::to_value(&answers).map_err(|error| ToolError::Failed {
-                        tool: WIRE_ID.to_owned(),
-                        source: Box::new(error),
-                    })?;
-                ToolOutput::text(
-                    Self::title(status, params.questions.len(), elapsed),
-                    format!(
-                        "User has answered your questions: {formatted}. \
-                         You can now continue with the user's answers in mind."
-                    ),
+        let receipt = self
+            .port
+            .open(QuestionSpec {
+                origin: question_origin(&ctx),
+                mode: self.mode,
+                purpose: self.purpose,
+                questions: requests,
+                expected_goal_revision: None,
+                plan: None,
+            })
+            .await
+            .map_err(|error| question_error(self.id(), error))?;
+        let mut view = receipt.question;
+        if self.mode == QuestionMode::Blocking
+            && view.state == QuestionState::Pending
+            && view.mode == QuestionMode::Blocking
+        {
+            match self
+                .port
+                .wait_for_change(
+                    &ctx.session_id,
+                    &view.id,
+                    view.revision,
+                    Arc::clone(&ctx.interrupt),
                 )
-                .with_metadata("answers", metadata)
+                .await
+            {
+                Ok(changed) => view = changed,
+                Err(QuestionError::Interrupted) => {}
+                Err(error) => return Err(question_error(self.id(), error)),
             }
-            QuestionOutcome::Cancelled => ToolOutput::text(
-                Self::title(status, params.questions.len(), elapsed),
-                "The user cancelled this question request. Do not infer an answer or immediately \
-                 repeat the same question.",
-            ),
-            QuestionOutcome::Expired => ToolOutput::text(
-                Self::title(status, params.questions.len(), elapsed),
-                "This question request expired before the user answered. Do not infer an answer.",
-            ),
-            QuestionOutcome::Failed => ToolOutput::text(
-                Self::title(status, params.questions.len(), elapsed),
-                "This question request could not be delivered. Do not infer an answer.",
-            ),
-        };
-        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-        Ok(output
-            .with_metadata("questionStatus", status.as_str())
-            .with_metadata("questionCount", params.questions.len() as u64)
-            .with_metadata("elapsedMs", elapsed_ms)
-            .with_presentation(ToolResultPresentation::Question(
-                QuestionResultPresentation::new(
-                    status,
-                    presentation_answers,
-                    params.questions.len(),
-                    elapsed_ms,
-                ),
-            )))
+        }
+        let mut output = question_receipt_output(&view, started.elapsed());
+        if self.purpose == QuestionPurpose::RequiredInput && view.state != QuestionState::Answered {
+            output = output.with_continuation(zuno_tool::ToolContinuation::WaitingForHuman);
+        }
+        Ok(output)
     }
+}
+
+pub(crate) fn question_origin(ctx: &ToolContext) -> QuestionOrigin {
+    QuestionOrigin {
+        session_id: ctx.session_id.clone(),
+        message_id: Some(ctx.message_id.clone()),
+        call_id: Some(ctx.call_id.clone()),
+        turn_id: ctx
+            .orchestration_snapshot()
+            .map(|snapshot| snapshot.turn_id.clone()),
+        goal_id: None,
+    }
+}
+
+pub(crate) fn question_error(tool: &str, error: QuestionError) -> ToolError {
+    ToolError::Failed {
+        tool: tool.to_owned(),
+        source: Box::new(error),
+    }
+}
+
+pub(crate) fn question_receipt_output(view: &QuestionView, elapsed: Duration) -> ToolOutput {
+    let status = match view.state {
+        QuestionState::Pending if view.revision > 1 => QuestionResultStatus::Deferred,
+        QuestionState::Pending => QuestionResultStatus::Pending,
+        QuestionState::Answered => QuestionResultStatus::Answered,
+        QuestionState::Cancelled => QuestionResultStatus::Cancelled,
+        QuestionState::Expired => QuestionResultStatus::Expired,
+        QuestionState::Failed => QuestionResultStatus::Failed,
+    };
+    let detail = match view.state {
+        QuestionState::Pending if view.purpose == QuestionPurpose::RequiredInput => {
+            "Required input is still missing. Wait for a real human response; do not infer an answer."
+        }
+        QuestionState::Pending if view.purpose == QuestionPurpose::PlanAuthorization => {
+            "The Plan confirmation is pending. Continue the planning summary; do not begin Work without explicit approval."
+        }
+        QuestionState::Pending => {
+            "The question remains open. Continue independent work and state assumptions. The reply will arrive as new input."
+        }
+        QuestionState::Answered => {
+            "The human response is recorded and delivered through the durable inbox. This receipt does not duplicate the answer."
+        }
+        QuestionState::Cancelled => {
+            "The user cancelled the question. Do not infer an answer or immediately repeat the same question."
+        }
+        QuestionState::Expired => "The question expired without an answer. Do not infer consent.",
+        QuestionState::Failed => "The question could not be delivered. Do not infer an answer.",
+    };
+    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    ToolOutput::text(
+        QuestionTool::title(status, view.questions.len(), elapsed),
+        format!(
+            "Question `{}` revision {}: {detail}",
+            view.id, view.revision
+        ),
+    )
+    .with_metadata(zuno_tool::METADATA_HUMAN_REQUEST_ID_KEY, view.id.clone())
+    .with_metadata("questionStatus", status.as_str())
+    .with_metadata("questionCount", view.questions.len() as u64)
+    .with_metadata("questionPurpose", view.purpose.as_str())
+    .with_metadata("elapsedMs", elapsed_ms)
+    .with_presentation(ToolResultPresentation::Question(
+        QuestionResultPresentation::new(status, None, view.questions.len(), elapsed_ms),
+    ))
 }
 
 /// A [`ToolOutput`]'s `answers` metadata, decoded back into answers.
@@ -513,7 +477,7 @@ mod tests {
         )
     }
 
-    fn tool(asker: Arc<dyn QuestionAsker>) -> Arc<dyn Tool> {
+    fn tool(asker: Arc<dyn QuestionPort>) -> Arc<dyn Tool> {
         erase(QuestionTool::new(asker))
     }
 
@@ -589,7 +553,7 @@ mod tests {
     #[tokio::test]
     async fn the_question_reaches_the_asker_with_the_call_coordinates() {
         let asker = Arc::new(ScriptedAnswers::selecting("Postgres"));
-        let output = tool(Arc::clone(&asker) as Arc<dyn QuestionAsker>)
+        let output = tool(Arc::clone(&asker) as Arc<dyn QuestionPort>)
             .execute(one_question(), context())
             .await
             .expect("the scripted answer");
@@ -603,31 +567,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_output_quotes_the_question_and_the_selected_label() {
+    async fn tool_receipts_do_not_deliver_answers_twice() {
         let output = tool(Arc::new(ScriptedAnswers::selecting("SQLite")))
             .execute(one_question(), context())
             .await
             .expect("the scripted answer");
 
-        assert_eq!(
-            output.output,
-            "User has answered your questions: \"Which database?\"=\"SQLite\". \
-             You can now continue with the user's answers in mind."
-        );
-        assert_eq!(
-            answers_from_metadata(&output.metadata).expect("decodable"),
-            vec![vec!["SQLite".to_owned()]]
-        );
+        assert!(output.output.contains("durable inbox"));
+        assert!(!output.output.contains("SQLite"));
+        assert!(!output.metadata.contains_key("answers"));
         let Some(ToolResultPresentation::Question(presentation)) = output.presentation.as_ref()
         else {
             panic!("question output must carry a typed presentation");
         };
         assert_eq!(presentation.status(), QuestionResultStatus::Answered);
-        assert_eq!(
-            presentation.answers(),
-            Some(&[vec!["SQLite".to_owned()]][..])
-        );
+        assert_eq!(presentation.answers(), None);
         assert_eq!(presentation.question_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn full_draft_values_never_enter_model_tool_output_or_presentation() {
+        let port = ScriptedAnswers::default();
+        let mut view = port
+            .open(QuestionSpec {
+                origin: question_origin(&context()),
+                mode: QuestionMode::Deferred,
+                purpose: QuestionPurpose::Clarification,
+                questions: vec![QuestionPrompt::new("Choose", "Choice", Vec::new()).into_request()],
+                expected_goal_revision: None,
+                plan: None,
+            })
+            .await
+            .expect("open")
+            .question;
+        view.revision = 2;
+        view.draft_answers.insert(
+            view.questions[0].id.clone(),
+            vec!["PRIVATE_UNSUBMITTED_VALUE".to_owned()],
+        );
+        let output = question_receipt_output(&view, Duration::ZERO);
+        assert_eq!(output.metadata["questionStatus"], "deferred");
+        let surfaces = format!(
+            "{}\n{}\n{}\n{}",
+            output.title,
+            output.output,
+            serde_json::to_string(&output.metadata).expect("metadata"),
+            serde_json::to_string(&output.presentation).expect("presentation"),
+        );
+        assert!(!surfaces.contains("PRIVATE_UNSUBMITTED_VALUE"));
+        assert!(!surfaces.contains("draftAnswers"));
+        assert!(view.answers.is_empty());
+        assert!(!view.is_fully_answered());
     }
 
     #[tokio::test]
@@ -637,18 +627,17 @@ mod tests {
             .await
             .expect("an empty answer is not a failure");
 
-        assert!(output.output.contains("\"Which database?\"=\"Unanswered\""));
+        assert_eq!(output.metadata["questionStatus"], "deferred");
     }
 
     #[tokio::test]
     async fn a_missing_answer_renders_as_unanswered_rather_than_failing() {
-        // Upstream's `answers[i]?.length` tolerates a short list; so does this.
         let output = tool(Arc::new(ScriptedAnswers::new(Vec::new())))
             .execute(one_question(), context())
             .await
             .expect("a short answer list is tolerated");
 
-        assert!(output.output.contains("\"Unanswered\""));
+        assert_eq!(output.metadata["questionStatus"], "deferred");
     }
 
     #[tokio::test]
@@ -677,7 +666,7 @@ mod tests {
         }
     }
 
-    // --- rendering rules that look wrong and are upstream's ---
+    // --- receipt presentation ---
 
     #[test]
     fn the_title_marks_terminal_status_count_and_elapsed_time() {
@@ -696,32 +685,6 @@ mod tests {
     }
 
     #[test]
-    fn multiple_selected_labels_join_with_a_comma() {
-        let questions = vec![QuestionPrompt::new("Pick two", "Pick", Vec::new())];
-        let answers = vec![vec!["a".to_owned(), "b".to_owned()]];
-        assert_eq!(
-            QuestionTool::format_answers(&questions, &answers),
-            "\"Pick two\"=\"a, b\""
-        );
-    }
-
-    #[test]
-    fn several_questions_join_with_the_same_separator_as_their_labels() {
-        // Upstream's ambiguity, reproduced: the pair separator and the label separator
-        // are both ", ", so a multi-select answer is indistinguishable from two
-        // questions by the separator alone.
-        let questions = vec![
-            QuestionPrompt::new("One?", "1", Vec::new()),
-            QuestionPrompt::new("Two?", "2", Vec::new()),
-        ];
-        let answers = vec![vec!["x".to_owned()], vec!["y".to_owned()]];
-        assert_eq!(
-            QuestionTool::format_answers(&questions, &answers),
-            "\"One?\"=\"x\", \"Two?\"=\"y\""
-        );
-    }
-
-    #[test]
     fn absent_metadata_decodes_to_no_answers() {
         assert!(
             answers_from_metadata(&serde_json::Map::new())
@@ -731,10 +694,9 @@ mod tests {
     }
 
     #[test]
-    fn the_description_is_the_oracles_file() {
-        assert!(DESCRIPTION.starts_with(
-            "Use this tool only during Plan when an undiscoverable user decision is required"
-        ));
+    fn description_explains_required_deferred_and_receipt_semantics() {
+        assert!(DESCRIPTION.contains("question_async"));
+        assert!(DESCRIPTION.contains("Tool results are receipts"));
         assert!(
             DESCRIPTION.contains("cannot be discovered from available evidence"),
             "{DESCRIPTION}"

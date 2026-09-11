@@ -95,6 +95,32 @@ fn unknown_usage_is_explicit_in_goal_context() {
 }
 
 #[test]
+fn paused_goal_injection_does_not_claim_the_goal_is_active() {
+    let fixture = Fixture::new();
+    fixture.create("finish the original task");
+    fixture
+        .store
+        .pause_with_reason("ses_goal", GoalPauseReason::UserInterruption)
+        .expect("pause after interruption");
+
+    let entry = fixture
+        .continuation
+        .injection("ses_goal")
+        .expect("read the current Goal")
+        .expect("paused Goal remains visible");
+    let prompt = text(&entry);
+    assert!(
+        prompt.contains("Goal status: paused"),
+        "the model must see the persisted paused state: {prompt}"
+    );
+    assert!(prompt.contains("/goal resume"));
+    assert!(
+        !prompt.contains("Continue working toward the active session goal"),
+        "a paused Goal must not instruct automatic continuation"
+    );
+}
+
+#[test]
 fn idle_active_goal_prepares_exactly_one_continuation() {
     let fixture = Fixture::new();
     fixture.create("continue once");

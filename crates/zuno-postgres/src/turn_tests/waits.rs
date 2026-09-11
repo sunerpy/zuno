@@ -180,6 +180,7 @@ pub(super) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
             session_id: job.session_id.to_string(),
         };
         state.consume_input(&scope, InputMaterialization {
+                turn_id: None,
             input_id: Some(job.input_id.to_string()),
             message: MessageRecord::from_json(json!({
                 "id":job.input_id,"sessionID":job.session_id,"role":"user","time":{"created":0},

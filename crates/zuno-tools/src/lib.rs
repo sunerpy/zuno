@@ -242,13 +242,13 @@ pub use crate::job_cancel::{
 pub use crate::job_reconcile::{
     JobReconcileParams, JobReconcileTool, ReconciledOutcome, WIRE_ID as JOB_RECONCILE_WIRE_ID,
 };
-pub use crate::plan_exit::{PlanExitHost, PlanExitParams, PlanExitTool, RecordingHost};
+pub use crate::plan_exit::{PlanExitParams, PlanExitTool};
 pub use crate::product_agent::{
     ProductAgentHost, ProductAgentParams, ProductAgentRequest, ProductAgentTool, ProductAgentTurn,
 };
 pub use crate::question::{
-    Answer, QuestionAsker, QuestionOption, QuestionParams, QuestionPrompt, QuestionRequest,
-    QuestionTool, ScriptedAnswers,
+    Answer, QuestionOption, QuestionParams, QuestionPrompt, QuestionRequest, QuestionTool,
+    ScriptedAnswers,
 };
 pub use crate::task_report::{
     DESCRIPTION as TASK_REPORT_DESCRIPTION, TaskReportParams, TaskReportTool,

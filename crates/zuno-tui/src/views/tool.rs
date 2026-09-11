@@ -148,10 +148,11 @@ impl Summary {
 /// disciplines.
 /// Runtime aliases such as `exec_command` and `google_search` reuse those rules but stay
 /// out of this registry-wire-id list, because the stale-rule half of that test is exact.
-pub const SUMMARISED: [&str; 36] = [
+pub const SUMMARISED: [&str; 37] = [
     // The `BuiltinSlot` positions, in `BUILTIN_ORDER`.
     "invalid",
     "question",
+    "question_async",
     "shell",
     "bg",
     "read",
@@ -346,7 +347,7 @@ pub fn summary(name: &str, arguments: &str) -> Option<Summary> {
         }
         // The first question, and how many follow. A user is about to be asked these, so
         // the text matters more here than for any other tool.
-        "question" => {
+        "question" | "question_async" => {
             let questions = value.get("questions").and_then(Value::as_array)?;
             let first = questions.first().and_then(|item| field(item, "question"))?;
             Some(Summary::tail(match questions.len() {

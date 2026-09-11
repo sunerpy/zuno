@@ -60,7 +60,7 @@ use zuno_engine::status::{SessionControl, SessionRunRegistry};
 use zuno_engine::terminal_lease::{TerminalLease, TerminalLeaseCleanup};
 use zuno_llm::event::StreamEvent;
 use zuno_tool::PermissionAsker;
-use zuno_tools::question::QuestionAsker;
+use zuno_tool::question::QuestionPort;
 use zuno_tui::app::{App, CrosstermDrawTarget, CrosstermLifecycle, TerminalEvent, TerminalSession};
 use zuno_tui::config::{ResolveOptions, ResolvedTuiConfig};
 use zuno_tui::keybind::{KeyDispatcher, Keymap};
@@ -92,7 +92,7 @@ use super::child_turn::{
 };
 use super::tool_runtime::SandboxUnavailableDecision;
 use super::tui_permission::{AutoApproval, PermissionBridge, PermissionBroker};
-use super::tui_question::{QuestionBridge, QuestionBroker};
+use super::tui_question::{QuestionBridge, QuestionBroker, QuestionScreen};
 use super::turn::{
     SessionChoice, SessionTitleSink, TurnHost, TurnHostRuntimeDependencies, TurnOptions, TurnPlan,
     background_execution_projections,
@@ -265,6 +265,7 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         variant: None,
         thinking: false,
         tool_authority: None,
+        parent_authority: None,
         extension_composition: super::turn::ExtensionComposition::Active,
     };
     let mut terminal = None;
@@ -618,7 +619,7 @@ fn execute_once(
     let mut catalog = runtime.block_on(session_catalog(&plan, environment));
     let broker = Arc::new(PermissionBroker::new(terminal_sender.clone()));
     let question_broker = Arc::new(QuestionBroker::new(terminal_sender.clone()));
-    let question: Arc<dyn QuestionAsker> = Arc::clone(&question_broker) as Arc<dyn QuestionAsker>;
+    let question: Arc<dyn QuestionPort> = Arc::clone(&question_broker) as Arc<dyn QuestionPort>;
     let approval: Arc<dyn PermissionAsker> = if args.auto && !plan.config().strict_authorization() {
         Arc::new(AutoApproval)
     } else {
@@ -669,7 +670,22 @@ fn execute_once(
         Arc::clone(&goals),
         host.session_id(),
     );
-    question_broker.attach_durable(human_requests, goals, host.session_id());
+    question_broker.attach_service(
+        Arc::new(
+            zuno_session_control::QuestionService::new(host.database_pool())
+                .with_runs(runs.clone()),
+        ),
+        host.session_id(),
+    )?;
+    if host.is_session_materialized() {
+        // Codex offers this on thread resume. Publication is not consent and
+        // must never turn a saved pause into an automatic continuation.
+        if let Err(error) =
+            runtime.block_on(question_broker.offer_goal_resume(host.session_id(), None))
+        {
+            tracing::warn!(%error, "could not offer paused Goal recovery");
+        }
+    }
     let child_restore_diagnostics = if host.is_session_materialized() {
         restore_child_sessions(&host.database_pool(), host.session_id(), &live_sessions)
     } else {
@@ -807,11 +823,25 @@ fn execute_once(
                 source: Some(skill.source),
             }
         }));
+    let mut context_restore_warning = None;
     if host.is_session_materialized() {
         screen
             .transcript_mut()
             .transcript_mut()
             .restore_usage(host.session_usage().snapshot());
+        match zuno_db::context_usage::ContextUsageStore::new(host.database_pool())
+            .get(host.session_id())
+        {
+            Ok(Some(snapshot)) => {
+                screen.set_context_usage(snapshot);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                context_restore_warning = Some(format!(
+                    "warning: saved Context usage could not be loaded: {error}"
+                ));
+            }
+        }
     }
     // Before every notice below, and that order is load-bearing in both directions.
     //
@@ -845,6 +875,12 @@ fn execute_once(
                 .transcript_mut()
                 .push(super::tui_replay::failure_notice(host.session_id(), &error));
         }
+    }
+    if let Some(warning) = context_restore_warning {
+        screen
+            .transcript_mut()
+            .transcript_mut()
+            .push(Message::notice(warning));
     }
     for diagnostic in child_restore_diagnostics {
         screen
@@ -881,11 +917,15 @@ fn execute_once(
     // `zuno_tui::views::toast` for why one deadline and one wake was chosen over giving
     // the redraw scheduler a fourth tier.
     let initial_dialog = initial_dialog.map(|RemountDialog::Sessions| screen.session_picker());
-    let mut dialogs =
-        DialogHost::new(context.clone(), Box::new(screen)).with_waker(terminal_sender.clone());
+    let mut dialogs = DialogHost::new(
+        context.clone(),
+        Box::new(QuestionScreen::new(screen, Arc::clone(&question_broker))),
+    )
+    .with_waker(terminal_sender.clone());
     if let Some(dialog) = initial_dialog {
         dialogs.open(dialog);
     }
+    let question_worker = Arc::clone(&question_broker);
     let bridge = PermissionBridge::new(context.clone(), broker, dialogs)
         .with_question(QuestionBridge::new(context, question_broker));
     let root = KeyDispatcher::new(keymap, scopes(), Box::new(bridge))
@@ -930,6 +970,16 @@ fn execute_once(
     }
     let outcome = runtime.block_on(async move {
         let (worker_shutdown, worker_shutdown_source) = watch::channel(false);
+        let (turn_prompt_sender, turn_prompt_receiver) = mpsc::channel(PROMPT_CHANNEL_CAPACITY);
+        let mut question_commands = tokio::spawn(route_question_commands(
+            prompt_receiver,
+            turn_prompt_sender,
+            Arc::clone(&question_worker),
+            queued_inputs.clone(),
+            queue_wake.clone(),
+            engine_sender.clone(),
+            worker_shutdown_source.clone(),
+        ));
         let input_shutdown = Arc::clone(&input_control);
         let mut input = tokio::spawn(zuno_tui::app::forward_terminal_input(
             terminal_sender,
@@ -942,6 +992,7 @@ fn execute_once(
                 options: driver_options,
                 approval: driver_approval,
                 question,
+                question_presenter: Arc::clone(&question_worker),
                 reference_root,
                 mcp_catalog,
                 mcp_dirty: Arc::clone(&mcp_dirty),
@@ -956,7 +1007,7 @@ fn execute_once(
                 remount: driver_remount,
                 shutdown: session_shutdown,
             },
-            prompt_receiver,
+            turn_prompt_receiver,
             selection_receiver,
             queue_mutation_receiver,
             driver_environment,
@@ -970,6 +1021,7 @@ fn execute_once(
             background_wake,
             worker_shutdown_source.clone(),
         ));
+        let mut questions = tokio::spawn(question_worker.run(worker_shutdown_source.clone()));
         let mut skills = tokio::spawn(drive_skill_catalog_projection(
             skill_catalog_updates,
             catalog_commands,
@@ -1036,6 +1088,8 @@ fn execute_once(
             history_shutdown,
             turn_shutdown,
             background_shutdown,
+            question_shutdown,
+            question_command_shutdown,
             skill_shutdown,
             mcp_shutdown,
             lsp_shutdown,
@@ -1046,6 +1100,8 @@ fn execute_once(
             await_worker("prompt history", &mut history),
             await_turn_driver(&mut turns),
             await_worker("background projection", &mut background),
+            await_worker("question presenter", &mut questions),
+            await_worker("question command router", &mut question_commands),
             await_worker("Skill catalog projection", &mut skills),
             await_worker("MCP lifecycle", &mut mcp),
             await_worker("LSP diagnostics", &mut checks),
@@ -1059,6 +1115,8 @@ fn execute_once(
                 history_shutdown,
                 turn_shutdown,
                 background_shutdown,
+                question_shutdown,
+                question_command_shutdown,
                 skill_shutdown,
                 mcp_shutdown,
                 lsp_shutdown,
@@ -1470,22 +1528,28 @@ impl TuiHostContinuity {
         plan: TurnPlan,
         environment: &StartupEnvironment,
         approval: Arc<dyn PermissionAsker>,
-        question: Arc<dyn QuestionAsker>,
+        question: Arc<dyn QuestionPort>,
         mcp: zuno_mcp::Catalog,
+        preserve_goal: bool,
     ) -> Result<TurnHost, String> {
-        let mut host = TurnHost::open_with_runtime_mcp_and_observers(
-            plan,
-            environment,
-            TurnHostRuntimeDependencies {
-                approval,
-                question: Some(question),
-                runs: self.runs(),
-                mcp: Some(mcp),
-                child_observer: self.child_observer(),
-                detached_observer: self.detached_observer(),
-            },
-        )
-        .await?;
+        let dependencies = TurnHostRuntimeDependencies {
+            approval,
+            question: Some(question),
+            runs: self.runs(),
+            mcp: Some(mcp),
+            child_observer: self.child_observer(),
+            detached_observer: self.detached_observer(),
+        };
+        let mut host = if preserve_goal {
+            TurnHost::open_with_runtime_mcp_and_observers_preserving_goal(
+                plan,
+                environment,
+                dependencies,
+            )
+            .await?
+        } else {
+            TurnHost::open_with_runtime_mcp_and_observers(plan, environment, dependencies).await?
+        };
         host.set_title_sink(self.title_sink());
         if let Some(root) = self.detached_root.as_ref() {
             bind_tui_detached_root(root, host.session_id());
@@ -2155,7 +2219,7 @@ struct TurnRebuild<'a> {
     options: &'a TurnOptions,
     environment: &'a StartupEnvironment,
     approval: &'a Arc<dyn PermissionAsker>,
-    question: &'a Arc<dyn QuestionAsker>,
+    question: &'a Arc<dyn QuestionPort>,
     continuity: &'a TuiHostContinuity,
     events: &'a TurnEventSender,
     mcp_catalog: &'a zuno_mcp::Catalog,
@@ -2236,6 +2300,41 @@ async fn apply_selection(
     host: &mut TurnHost,
     rebuild: &TurnRebuild<'_>,
 ) -> SelectionOutcome {
+    apply_selection_with_committed_work(selection, host, rebuild, None).await
+}
+
+/// A durable Work control is already authorized. Reusing the selection rebuild
+/// must not ask the service to mint another approval or continuation.
+struct CommittedWorkControl {
+    input: zuno_db::inbox::SessionInput,
+    continuation: zuno_types::execution::ContinuationToken,
+}
+
+fn validate_committed_work(
+    control: &CommittedWorkControl,
+    state: &zuno_types::execution::SessionExecutionState,
+) -> Result<(), String> {
+    use zuno_types::execution::{CollaborationMode, InputTriggerKind};
+    if control.input.session_id != state.session_id
+        || control.input.trigger_kind != InputTriggerKind::UserControl
+        || state.mode != CollaborationMode::Work
+        || control.continuation.mode != CollaborationMode::Work
+        || state.continuation.as_ref() != Some(&control.continuation)
+        || state.work_identity.as_ref() != Some(&control.continuation.identity)
+        || state.cycle_id.as_deref() != Some(control.continuation.cycle_id.as_str())
+        || control.input.cycle_id.as_deref() != Some(control.continuation.cycle_id.as_str())
+    {
+        return Err("queued Work control no longer matches its stored authorization".to_owned());
+    }
+    Ok(())
+}
+
+async fn apply_selection_with_committed_work(
+    selection: zuno_tui::views::session::Selection,
+    host: &mut TurnHost,
+    rebuild: &TurnRebuild<'_>,
+    committed_work: Option<&CommittedWorkControl>,
+) -> SelectionOutcome {
     let session_control = host.session_control_service();
     let execution_before = match session_control.state(host.session_id()) {
         Ok(state) => state,
@@ -2252,6 +2351,21 @@ async fn apply_selection(
             return SelectionOutcome::Unchanged;
         }
     };
+    if let Some(control) = committed_work {
+        let validation = execution_before
+            .as_ref()
+            .ok_or_else(|| "queued Work control has no execution state".to_owned())
+            .and_then(|state| validate_committed_work(control, state));
+        if !matches!(selection, zuno_tui::views::session::Selection::StartWork)
+            || validation.is_err()
+        {
+            let error = validation.err().unwrap_or_else(|| {
+                "a committed Work control can only rebuild its Work host".to_owned()
+            });
+            report_input_failure(rebuild.events, error).await;
+            return SelectionOutcome::Unchanged;
+        }
+    }
     if let zuno_tui::views::session::Selection::Agent(agent) = &selection
         && execution_before
             .as_ref()
@@ -2345,14 +2459,16 @@ async fn apply_selection(
                     .await;
                 return SelectionOutcome::Unchanged;
             };
-            work_anchor = match host.latest_user_anchor_id() {
-                Ok(anchor) => anchor,
-                Err(error) => {
-                    return SelectionOutcome::Shutdown(format!(
-                        "Start Work could not read its user anchor: {error}"
-                    ));
-                }
-            };
+            if committed_work.is_none() {
+                work_anchor = match host.latest_user_anchor_id() {
+                    Ok(anchor) => anchor,
+                    Err(error) => {
+                        return SelectionOutcome::Shutdown(format!(
+                            "Start Work could not read its user anchor: {error}"
+                        ));
+                    }
+                };
+            }
             next.agent = Some(identity.agent.clone());
             next.model = Some(format!("{}/{}", identity.provider_id, identity.model_id));
             next.effort = identity
@@ -2751,9 +2867,34 @@ async fn apply_selection(
             .await;
         return SelectionOutcome::Unchanged;
     }
+    if let Some(control) = committed_work {
+        let valid = (|| -> Result<(), String> {
+            if plan.execution_identity() != control.continuation.identity {
+                return Err("resolved Work identity differs from the approved identity".to_owned());
+            }
+            let state = session_control
+                .state(host.session_id())
+                .map_err(to_string)?
+                .ok_or_else(|| "queued Work control has no execution state".to_owned())?;
+            validate_committed_work(control, &state)?;
+            if host
+                .session_inbox()
+                .wake_admission(&control.input)
+                .map_err(to_string)?
+                == zuno_types::execution::WakeAdmission::Reject
+            {
+                return Err("queued Work control is no longer eligible to run".to_owned());
+            }
+            Ok(())
+        })();
+        if let Err(error) = valid {
+            report_input_failure(rebuild.events, error).await;
+            return SelectionOutcome::Unchanged;
+        }
+    }
     // Target resolution and complete execution preflight have succeeded. Only now
     // may Plan/Work change durable state or admit a continuation control.
-    if mode_agent_transition {
+    if mode_agent_transition && committed_work.is_none() {
         if let Err(error) = host.materialize_session() {
             return SelectionOutcome::Shutdown(format!(
                 "the collaboration switch could not materialize the session: {error}"
@@ -2813,6 +2954,7 @@ async fn apply_selection(
                 Arc::clone(rebuild.approval),
                 Arc::clone(rebuild.question),
                 rebuild.mcp_catalog.clone(),
+                committed_work.is_some(),
             )
             .await
     })
@@ -2852,6 +2994,17 @@ async fn apply_selection(
             {
                 return SelectionOutcome::Shutdown(format!(
                     "the Plan-mode Work identity changed in memory but could not be persisted: {error}"
+                ));
+            }
+            if host.agent_name() != "plan"
+                && let Err(error) = session_control.record_work_selection(
+                    host.session_id(),
+                    host.execution_identity_for(host.agent_name()),
+                    zuno_db::message::now_millis(),
+                )
+            {
+                return SelectionOutcome::Shutdown(format!(
+                    "the selected Work identity could not be persisted: {error}"
                 ));
             }
             SelectionOutcome::Rebuilt(rebuild.events.clone())
@@ -2919,7 +3072,8 @@ struct TurnDriver {
     host: TurnHost,
     options: TurnOptions,
     approval: Arc<dyn PermissionAsker>,
-    question: Arc<dyn QuestionAsker>,
+    question: Arc<dyn QuestionPort>,
+    question_presenter: Arc<QuestionBroker>,
     reference_root: PathBuf,
     mcp_catalog: zuno_mcp::Catalog,
     mcp_dirty: Arc<AtomicBool>,
@@ -3145,6 +3299,8 @@ fn queued_submission_display(submission: &PromptSubmission) -> (String, bool) {
                 HostCommand::Goal(arguments) => format!("/goal {arguments}"),
                 HostCommand::Learn(arguments) => format!("/learn {arguments}"),
                 HostCommand::Reflect(arguments) => format!("/reflect {arguments}"),
+                HostCommand::Questions(arguments) => format!("/questions {arguments}"),
+                HostCommand::Resume(arguments) => format!("/resume {arguments}"),
                 HostCommand::Preset(Some(preset)) => format!("/preset {preset}"),
                 HostCommand::Preset(None) => "/preset".to_owned(),
                 HostCommand::Council(arguments) => format!("/council {arguments}"),
@@ -3358,10 +3514,16 @@ async fn drive_turns(
     let mut work_changes = driver.host.work_state_changes();
     let mut queue_mutations_open = true;
     let mut root_prompts = VecDeque::new();
+    let mut held_work_rebuild = None;
+    let mut last_work_control_error = None;
+    let question_work_ready = driver.question_presenter.work_notifications();
     let mut session_message_poll = tokio::time::interval(SESSION_MESSAGE_POLL_INTERVAL);
     session_message_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     session_message_poll.tick().await;
     'driver: loop {
+        if *shutdown.borrow() {
+            break 'driver;
+        }
         while let Ok(prompt) = prompts.try_recv() {
             route_targeted_prompt(
                 &driver.interactive_children,
@@ -3402,8 +3564,35 @@ async fn drive_turns(
                 zuno_goal::QueuedUserInput::Present
             };
         if driver.ready_inputs.is_empty() {
-            match driver.host.drive_pending_start_work(events.clone()).await {
-                Ok(true) => {
+            let work_control =
+                drive_tui_pending_work(&mut driver, &environment, &events, &mut held_work_rebuild)
+                    .await;
+            let work_control = match work_control {
+                Ok(outcome) => {
+                    last_work_control_error = None;
+                    outcome
+                }
+                Err(PendingWorkError::Held(message)) => {
+                    if last_work_control_error.as_ref() != Some(&message) {
+                        report_input_failure(&events, message.clone()).await;
+                        last_work_control_error = Some(message);
+                    }
+                    PendingWorkProgress::Held
+                }
+                Err(PendingWorkError::Fatal(message)) => {
+                    report_turn_failure(&events, message.clone()).await;
+                    let _ = driver.shutdown.send(TerminalEvent::Shutdown).await;
+                    return match driver.host.shutdown().await {
+                        Ok(()) => Err(message),
+                        Err(shutdown) => {
+                            Err(format!("{message}; host shutdown failed: {shutdown}"))
+                        }
+                    };
+                }
+            };
+            match work_control {
+                PendingWorkProgress::Ran | PendingWorkProgress::Rebuilt => {
+                    work_changes = driver.host.work_state_changes();
                     refresh_work_state(
                         &mut driver.host,
                         &driver.work_state,
@@ -3414,14 +3603,16 @@ async fn drive_turns(
                     work_changes.borrow_and_update();
                     continue;
                 }
-                Ok(false) => {}
-                Err(message) => report_turn_failure(&events, message).await,
+                PendingWorkProgress::Idle | PendingWorkProgress::Held => {}
             }
-            match driver
-                .host
-                .continue_goal_if_idle(queued, events.clone())
-                .await
-            {
+            match if work_control == PendingWorkProgress::Idle {
+                driver
+                    .host
+                    .continue_goal_if_idle(queued, events.clone())
+                    .await
+            } else {
+                Ok(false)
+            } {
                 Ok(true) => {
                     refresh_work_state(
                         &mut driver.host,
@@ -3564,6 +3755,9 @@ async fn drive_turns(
                         SelectionOutcome::Rebuilt(rebuilt) => {
                             events = rebuilt;
                             work_changes = driver.host.work_state_changes();
+                            driver.question_presenter.host_replaced(
+                                driver.host.execution_identity_for(driver.host.agent_name()),
+                            );
                         }
                         SelectionOutcome::Remount(request) => {
                             driver.remount.request(*request);
@@ -3610,6 +3804,10 @@ async fn drive_turns(
                     .await;
                     work_changes.borrow_and_update();
                     continue;
+                }
+                () = question_work_ready.notified() => {
+                    held_work_rebuild = None;
+                    continue 'driver;
                 }
                 _ = session_message_poll.tick() => {
                     if let Err(error) = driver
@@ -3684,6 +3882,136 @@ async fn drive_turns(
     driver.host.shutdown().await
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingWorkProgress {
+    Idle,
+    Held,
+    Rebuilt,
+    Ran,
+}
+
+enum PendingWorkError {
+    Held(String),
+    Fatal(String),
+}
+
+impl From<String> for PendingWorkError {
+    fn from(error: String) -> Self {
+        Self::Held(error)
+    }
+}
+
+/// Runs only between turns. Early Plan approval cannot reach this path until
+/// the source Plan turn has returned and the service has committed its handoff.
+async fn drive_tui_pending_work(
+    driver: &mut TurnDriver,
+    environment: &StartupEnvironment,
+    events: &TurnEventSender,
+    held_rebuild: &mut Option<(String, i64, i64)>,
+) -> Result<PendingWorkProgress, PendingWorkError> {
+    let inbox = driver.host.session_inbox();
+    let Some(input) = inbox
+        .pending(driver.host.session_id())
+        .map_err(to_string)?
+        .into_iter()
+        .find(|input| {
+            zuno_db::inbox::DurableInputKind::classify(&input.prompt)
+                == Some(zuno_db::inbox::DurableInputKind::SessionControl)
+                && matches!(
+                    input
+                        .prompt
+                        .get("control")
+                        .and_then(serde_json::Value::as_str),
+                    Some("start_work" | "resume_work")
+                )
+        })
+    else {
+        *held_rebuild = None;
+        return Ok(PendingWorkProgress::Idle);
+    };
+    if inbox.wake_admission(&input).map_err(to_string)?
+        == zuno_types::execution::WakeAdmission::Reject
+    {
+        return Ok(PendingWorkProgress::Held);
+    }
+    let continuation = serde_json::from_value(
+        input
+            .prompt
+            .get("continuation")
+            .cloned()
+            .ok_or_else(|| format!("Work control `{}` has no continuation", input.id))?,
+    )
+    .map_err(to_string)?;
+    let control = CommittedWorkControl {
+        input,
+        continuation,
+    };
+    let state = driver
+        .host
+        .session_control_service()
+        .state(driver.host.session_id())
+        .map_err(to_string)?
+        .ok_or_else(|| "Work control has no durable execution state".to_owned())?;
+    validate_committed_work(&control, &state)?;
+    if driver.host.execution_identity_for(driver.host.agent_name()) != control.continuation.identity
+    {
+        let attempt = (
+            control.input.id.clone(),
+            control.input.revision,
+            state.revision,
+        );
+        if held_rebuild.as_ref() == Some(&attempt) {
+            return Ok(PendingWorkProgress::Held);
+        }
+        let rebuild = TurnRebuild {
+            options: &driver.options,
+            environment,
+            approval: &driver.approval,
+            question: &driver.question,
+            continuity: &driver.continuity,
+            events,
+            mcp_catalog: &driver.mcp_catalog,
+        };
+        return match apply_selection_with_committed_work(
+            zuno_tui::views::session::Selection::StartWork,
+            &mut driver.host,
+            &rebuild,
+            Some(&control),
+        )
+        .await
+        {
+            SelectionOutcome::Rebuilt(_) => {
+                *held_rebuild = None;
+                driver
+                    .question_presenter
+                    .host_replaced(driver.host.execution_identity_for(driver.host.agent_name()));
+                Ok(PendingWorkProgress::Rebuilt)
+            }
+            SelectionOutcome::Unchanged => {
+                *held_rebuild = Some(attempt);
+                Ok(PendingWorkProgress::Held)
+            }
+            SelectionOutcome::Shutdown(error) => Err(PendingWorkError::Fatal(error)),
+            SelectionOutcome::Remount(_) => Err(PendingWorkError::Fatal(
+                "a committed Work control cannot remount another session".to_owned(),
+            )),
+        };
+    }
+    *held_rebuild = None;
+    driver
+        .host
+        .drive_pending_start_work(events.clone())
+        .await
+        .map(|ran| {
+            if ran {
+                PendingWorkProgress::Ran
+            } else {
+                PendingWorkProgress::Held
+            }
+        })
+        .map_err(PendingWorkError::Held)
+}
+
 async fn drive_background_projection(
     service: Arc<zuno_pty::BackgroundExecutionService>,
     session_id: String,
@@ -3712,6 +4040,61 @@ async fn drive_background_projection(
                 let _changed = changed;
                 break;
             }
+        }
+    }
+}
+
+/// Presentation controls remain usable while the turn host is awaiting a tool.
+/// Other envelopes retain their target, delivery, and admission identity.
+async fn route_question_commands(
+    mut source: mpsc::Receiver<TargetedPromptSubmission>,
+    target: mpsc::Sender<TargetedPromptSubmission>,
+    questions: Arc<QuestionBroker>,
+    queued_inputs: QueuedInputProjection,
+    wake: mpsc::Sender<TerminalEvent>,
+    events: TurnEventSender,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        let submission = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+                continue;
+            }
+            submission = source.recv() => {
+                let Some(submission) = submission else { break };
+                submission
+            }
+        };
+        if let TargetedPromptSubmission {
+            target: PromptTarget::Root,
+            prompt:
+                PromptEnvelope {
+                    payload: PromptSubmission::Host(HostCommand::Questions(arguments)),
+                    request_id,
+                    ..
+                },
+        } = &submission
+        {
+            let result = questions.show_questions(arguments);
+            if let Some(request_id) = request_id {
+                queued_inputs
+                    .acknowledge_prompt(request_id.clone(), result.as_ref().err().cloned());
+                let _ = wake.try_send(TerminalEvent::Wake);
+            }
+            if let Err(error) = result {
+                report_input_failure(&events, error).await;
+            }
+            continue;
+        }
+        tokio::select! {
+            result = target.send(submission) => {
+                if result.is_err() { break; }
+            }
+            _ = shutdown.changed() => break,
         }
     }
 }
@@ -3843,7 +4226,7 @@ async fn refresh_mcp_host(
     let continuity = driver.continuity.clone();
     replace_host(&mut driver.host, || async move {
         continuity
-            .open_host(plan, environment, approval, question, mcp_catalog)
+            .open_host(plan, environment, approval, question, mcp_catalog, false)
             .await
     })
     .await
@@ -3984,6 +4367,7 @@ async fn drive_one(
     let child_observer = driver.continuity.child_observer();
     let TurnDriver {
         host,
+        question_presenter,
         reference_root,
         queued_inputs,
         queue_wake,
@@ -4005,7 +4389,18 @@ async fn drive_one(
             let prompt =
                 super::tui_reference::resolve_submission(reference_root, submission).await?;
             if let PromptSubmission::Host(command) = prompt {
-                return execute_host_command(host, command, snapshots, events).await;
+                let outcome =
+                    execute_host_command(host, command, snapshots, question_presenter, events)
+                        .await;
+                if let Some(input_id) = promoted_message_id {
+                    settle_host_input(
+                        &host.session_inbox(),
+                        host.session_id(),
+                        &input_id,
+                        &outcome,
+                    )?;
+                }
+                return outcome;
             }
             let capture = begin_snapshot(&snapshots.store, events).await;
             let inbox = host.session_inbox();
@@ -4121,6 +4516,19 @@ async fn drive_one(
                 }
             };
             drop(turn);
+            if turn_outcome.is_ok()
+                && let Err(error) = question_presenter
+                    .offer_goal_resume(host.session_id(), promoted_message_id.as_deref())
+                    .await
+            {
+                // The original input already completed. A presentation error
+                // cannot reclassify it as failed or submit it a second time.
+                report_input_failure(
+                    &admission_events,
+                    format!("paused Goal recovery choice could not be shown: {error}"),
+                )
+                .await;
+            }
             while let Ok(followup) = prompts.try_recv() {
                 match followup.target {
                     PromptTarget::Root => admissions.push(Box::pin(admit_followup(
@@ -4507,23 +4915,7 @@ fn promote_pending_prompt(
     queue_wake: &mpsc::Sender<TerminalEvent>,
 ) -> Result<Option<DriverPrompt>, String> {
     let inbox = host.session_inbox();
-    let pending = inbox.pending(host.session_id()).map_err(to_string)?;
-    let Some((input, submission)) =
-        pending
-            .into_iter()
-            .find_map(|input| match decode_pending_prompt(&input) {
-                Some(submission) => Some((input, submission)),
-                None => {
-                    tracing::debug!(
-                        target: "zuno::tui::inbox",
-                        session_id = %host.session_id(),
-                        input_id = %input.id,
-                        "pending durable input belongs to another surface; leaving it queued"
-                    );
-                    None
-                }
-            })
-    else {
+    let Some((input, submission)) = next_admissible_prompt(&inbox, host.session_id())? else {
         return Ok(None);
     };
     let Some(promoted) = inbox
@@ -4543,6 +4935,40 @@ fn promote_pending_prompt(
         }),
     );
     Ok(Some(DriverPrompt::promoted(promoted.id, submission)))
+}
+
+fn next_admissible_prompt(
+    inbox: &zuno_db::inbox::SessionInbox,
+    session_id: &str,
+) -> Result<Option<(zuno_db::inbox::SessionInput, PromptSubmission)>, String> {
+    for input in inbox.pending(session_id).map_err(to_string)? {
+        let Some(submission) = decode_pending_prompt(&input) else {
+            continue;
+        };
+        if inbox.wake_admission(&input).map_err(to_string)?
+            == zuno_types::execution::WakeAdmission::Reject
+        {
+            // Preserve the original row and its evidence. The caller reaches
+            // its normal event/timer wait when no eligible input remains.
+            continue;
+        }
+        return Ok(Some((input, submission)));
+    }
+    Ok(None)
+}
+
+fn settle_host_input(
+    inbox: &zuno_db::inbox::SessionInbox,
+    session_id: &str,
+    input_id: &str,
+    outcome: &Result<(), String>,
+) -> Result<(), String> {
+    match outcome {
+        Ok(()) => inbox.mark_consumed(session_id, input_id),
+        Err(error) => inbox.mark_failed(session_id, input_id, error.clone()),
+    }
+    .map(|_| ())
+    .map_err(to_string)
 }
 
 /// Decode a durable input, or `None` when another surface owns its shape.
@@ -4589,6 +5015,11 @@ fn steer_pending_session_messages(
         }
         let kind = zuno_db::inbox::DurableInputKind::classify(&input.prompt);
         if kind != Some(zuno_db::inbox::DurableInputKind::SessionMessage) {
+            continue;
+        }
+        if inbox.wake_admission(&input).map_err(to_string)?
+            == zuno_types::execution::WakeAdmission::Reject
+        {
             continue;
         }
         let text = kind
@@ -4729,6 +5160,9 @@ async fn restore_snapshot(
         HostCommand::Learn(_) | HostCommand::Reflect(_) => {
             return Err("learning commands must be handled by the turn host".to_owned());
         }
+        HostCommand::Questions(_) | HostCommand::Resume(_) => {
+            return Err("question and resume controls do not restore snapshots".to_owned());
+        }
         HostCommand::Preset(_) => {
             return Err("preset controls must be handled by the TUI selection layer".to_owned());
         }
@@ -4779,6 +5213,7 @@ async fn execute_host_command(
     host: &mut TurnHost,
     command: HostCommand,
     snapshots: &mut SnapshotHistory,
+    questions: &QuestionBroker,
     events: &TurnEventSender,
 ) -> Result<(), String> {
     match command {
@@ -4798,6 +5233,15 @@ async fn execute_host_command(
             .execute_session_command(SessionCommand::Reflect, &arguments, events.clone())
             .await
             .map_err(|error| error.to_string()),
+        HostCommand::Questions(arguments) => questions.show_questions(&arguments),
+        HostCommand::Resume(arguments) => {
+            if !arguments.trim().is_empty() {
+                return Err("usage: /resume".to_owned());
+            }
+            let output = host.resume_work()?;
+            publish_snapshot_notice(events, NoticeSeverity::Info, "session.resumed", output).await;
+            Ok(())
+        }
         HostCommand::Undo | HostCommand::Redo => restore_snapshot(command, snapshots, events).await,
         HostCommand::Plan | HostCommand::StartPlan | HostCommand::StartWork => {
             Err("plan mode controls must be handled by the TUI selection layer".to_owned())
@@ -4853,6 +5297,10 @@ async fn publish_snapshot_notice(
 fn to_string(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
+
+#[cfg(test)]
+#[path = "tui_tests_deferred.rs"]
+mod deferred_tests;
 
 #[cfg(test)]
 mod tests {

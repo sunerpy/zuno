@@ -23,14 +23,19 @@ use zuno_engine::status::{SessionRunGuard, SessionStatus};
 use zuno_error::DbError;
 use zuno_llm::event::RequestContentBlock;
 use zuno_paths::GLOBAL_PROJECT_ID;
+use zuno_types::admission::InputAdmissionReceipt;
+use zuno_types::context_usage::{ContextUsageSnapshot, ContextUsageSource};
+use zuno_types::execution::{
+    CollaborationMode, ContinuationToken, InputTriggerKind, WakeAdmission,
+};
 
 use super::Data;
 use super::error::ApiError;
 use super::state::ApiState;
 use crate::{
-    ServerServices, SessionCompactExecution, SessionMemoryPolicyExecution,
+    ServerServices, SessionCompactExecution, SessionControlExecution, SessionMemoryPolicyExecution,
     SessionMemoryPolicyMutationError, SessionModelSelection, SessionPromptExecution,
-    SessionReportExecution,
+    SessionReportExecution, SessionResumeError, SessionResumeRequest,
 };
 
 #[derive(Debug, Deserialize)]
@@ -156,6 +161,10 @@ pub struct SessionInfo {
     pub title: String,
     pub version: String,
     pub time: SessionTime,
+    /// Detail responses include canonical state or an explicit legacy/unknown
+    /// projection. Lists include already persisted state without hydrating history.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<ContextUsageSnapshot>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -264,7 +273,7 @@ pub struct ModelBody {
     model: ModelRefBody,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct PromptInputBody {
     pub(crate) text: String,
     #[serde(default)]
@@ -273,7 +282,7 @@ pub struct PromptInputBody {
     pub(crate) agents: Vec<Value>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum PromptDelivery {
     Queue,
@@ -299,7 +308,7 @@ pub struct PromptBody {
     pub(crate) model: Option<ModelRefBody>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptAdmitted {
     admitted_seq: u64,
@@ -309,6 +318,8 @@ pub struct PromptAdmitted {
     prompt: PromptInputBody,
     delivery: PromptDelivery,
     time_created: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt: Option<InputAdmissionReceipt>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -358,6 +369,8 @@ enum DrivenInput {
     Report,
     /// One attributed plain-text input delivered on its own.
     PlainText,
+    /// A Work control already authorized and committed by session control.
+    Control,
 }
 
 impl DrivenInput {
@@ -387,8 +400,12 @@ impl DrivenInput {
             }
             DurableInputKind::TuiPrompt
             | DurableInputKind::AcpPrompt
-            | DurableInputKind::SessionControl
             | DurableInputKind::HostMessage => None,
+            DurableInputKind::SessionControl => matches!(
+                prompt.get("control").and_then(Value::as_str),
+                Some("start_work" | "resume_work")
+            )
+            .then_some(Self::Control),
         }
     }
 }
@@ -399,6 +416,7 @@ enum DrivenPromotion {
     Prompt(SessionInput),
     /// One answered human request or peer-session message.
     PlainText(SessionInput),
+    Control(SessionInput),
     /// Every settled report the session had pending, as one provider request.
     Reports(ReportBatch),
 }
@@ -407,7 +425,9 @@ impl DrivenPromotion {
     /// The durable rows this promotion is responsible for settling.
     fn input_ids(&self) -> Vec<String> {
         match self {
-            Self::Prompt(input) | Self::PlainText(input) => vec![input.id.clone()],
+            Self::Prompt(input) | Self::PlainText(input) | Self::Control(input) => {
+                vec![input.id.clone()]
+            }
             Self::Reports(batch) => batch
                 .reports()
                 .iter()
@@ -421,6 +441,7 @@ impl DrivenPromotion {
 enum DrivenRequest {
     Prompt(SessionPromptExecution),
     Reports(SessionReportExecution),
+    Control(SessionControlExecution),
 }
 
 impl DrivenRequest {
@@ -428,6 +449,7 @@ impl DrivenRequest {
         match self {
             Self::Prompt(request) => &request.session_id,
             Self::Reports(request) => &request.session_id,
+            Self::Control(request) => &request.session_id,
         }
     }
 }
@@ -467,8 +489,24 @@ impl From<Session> for SessionInfo {
                 created: session.time_created,
                 updated: session.time_updated,
             },
+            context_usage: None,
         }
     }
+}
+
+async fn session_info_with_context(
+    state: &ApiState,
+    session: Session,
+) -> Result<SessionInfo, ApiError> {
+    let pool = state.pool_arc();
+    super::blocking::run(super::blocking::Budget::Maintenance, move || {
+        let connection = pool.get()?;
+        let context_usage = zuno_engine::context_usage::read_context_usage(&connection, &session)?;
+        let mut info = SessionInfo::from(session);
+        info.context_usage = Some(context_usage);
+        Ok(info)
+    })
+    .await
 }
 
 pub async fn list(
@@ -511,12 +549,42 @@ pub async fn list(
         Some(SessionOrderBy::Created) => query.created_order(),
         Some(SessionOrderBy::Updated) | None => query,
     };
-    let data = state
-        .sessions()
-        .list(&query)?
-        .into_iter()
-        .map(SessionInfo::from)
-        .collect();
+    let sessions = state.sessions().list(&query)?;
+    let pool = state.pool_arc();
+    let data = super::blocking::run(super::blocking::Budget::Maintenance, move || {
+        let connection = pool.get()?;
+        let main_ids = sessions
+            .iter()
+            .filter(|session| session.parent_id.is_none())
+            .map(|session| session.id.as_str())
+            .collect::<Vec<_>>();
+        let child_ids = sessions
+            .iter()
+            .filter(|session| session.parent_id.is_some())
+            .map(|session| session.id.as_str())
+            .collect::<Vec<_>>();
+        let mut main =
+            zuno_db::context_usage::read_many_in(&connection, &main_ids, ContextUsageSource::Main)?;
+        let mut children = zuno_db::context_usage::read_many_in(
+            &connection,
+            &child_ids,
+            ContextUsageSource::Child,
+        )?;
+        Ok(sessions
+            .into_iter()
+            .map(|session| {
+                let context = if session.parent_id.is_some() {
+                    children.remove(&session.id)
+                } else {
+                    main.remove(&session.id)
+                };
+                let mut info = SessionInfo::from(session);
+                info.context_usage = context.map(|tracker| tracker.snapshot().clone());
+                info
+            })
+            .collect())
+    })
+    .await?;
     Ok(Json(SessionListResponse {
         data,
         cursor: SessionCursor {
@@ -602,7 +670,7 @@ pub(crate) async fn create_session(
         }
         Ok(creation.into_session())
     })?;
-    let info = SessionInfo::from(session);
+    let info = session_info_with_context(state, session).await?;
     if let Some(events) = state.events() {
         let properties = json!({"sessionID": id, "info": &info})
             .as_object()
@@ -640,7 +708,9 @@ pub async fn get(
     Path(session_id): Path<String>,
 ) -> Result<Json<Data<SessionInfo>>, ApiError> {
     let session = state.sessions().get(&session_id)?;
-    Ok(Json(Data::new(SessionInfo::from(session))))
+    Ok(Json(Data::new(
+        session_info_with_context(&state, session).await?,
+    )))
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -1082,11 +1152,13 @@ pub async fn prompt(
         .map_err(|_| ApiError::MutationFailed("negative admission sequence".to_owned()))?;
     let admitted = PromptAdmitted {
         admitted_seq,
-        id: message_id,
+        id: admitted_input.input().id.clone(),
         session_id: session_id.clone(),
         prompt,
         delivery,
         time_created: created,
+        receipt: zuno_db::input_receipt::InputReceiptStore::new(state.pool_arc())
+            .get(&session_id, &admitted_input.input().id)?,
     };
     if let InputAdmission::Drive { guard, .. } = admitted_input {
         spawn_prompt_driver(state, services, executor, session_id, guard);
@@ -1104,9 +1176,10 @@ fn spawn_prompt_driver(
     tokio::spawn(async move {
         let _session_count = zuno_observability::memory::SessionCount::enter();
         let inbox = SessionInbox::new(state.pool_arc());
+        let controls_available = state.session_controls().is_some();
         let mut guard = Some(guard);
         loop {
-            let promoted = match promote_next_driven(&inbox, &session_id) {
+            let promoted = match promote_next_driven(&inbox, &session_id, controls_available) {
                 Ok(promoted) => promoted,
                 Err(error) => {
                     eprintln!("session input promotion failed for `{session_id}`: {error}");
@@ -1122,7 +1195,13 @@ fn spawn_prompt_driver(
                 Err(error) => {
                     settle_failed(&inbox, &session_id, &input_ids, &error);
                     publish_prompt_error(&state, &session_id, &error).await;
-                    if !continue_prompt_driver(&inbox, &services, &session_id, &mut guard) {
+                    if !continue_prompt_driver(
+                        &inbox,
+                        &services,
+                        &session_id,
+                        &mut guard,
+                        controls_available,
+                    ) {
                         return;
                     }
                     continue;
@@ -1144,7 +1223,13 @@ fn spawn_prompt_driver(
                 eprintln!("session prompt execution failed: {error}");
                 publish_prompt_error(&state, &session_id, &error).await;
             }
-            if !continue_prompt_driver(&inbox, &services, &session_id, &mut guard) {
+            if !continue_prompt_driver(
+                &inbox,
+                &services,
+                &session_id,
+                &mut guard,
+                controls_available,
+            ) {
                 return;
             }
         }
@@ -1177,11 +1262,18 @@ fn settle_failed(inbox: &SessionInbox, session_id: &str, input_ids: &[String], e
 fn promote_next_driven(
     inbox: &SessionInbox,
     session_id: &str,
+    controls_available: bool,
 ) -> Result<Option<DrivenPromotion>, DbError> {
     for pending in inbox.pending(session_id)? {
         let Some(driven) = DrivenInput::of(&pending.prompt) else {
             continue;
         };
+        if driven == DrivenInput::Control && !controls_available {
+            continue;
+        }
+        if inbox.wake_admission(&pending)? == WakeAdmission::Reject {
+            continue;
+        }
         match driven {
             DrivenInput::Report => {
                 let batch = ReportBatch::project(&inbox.promote_pending_async(session_id)?);
@@ -1209,17 +1301,31 @@ fn promote_next_driven(
                     return Ok(Some(DrivenPromotion::PlainText(promoted)));
                 }
             }
+            DrivenInput::Control => {
+                if let Some(promoted) = inbox.promote_id(session_id, &pending.id)? {
+                    return Ok(Some(DrivenPromotion::Control(promoted)));
+                }
+            }
         }
     }
     Ok(None)
 }
 
 /// Whether any pending row is one this surface drives.
-fn has_driven_pending(inbox: &SessionInbox, session_id: &str) -> Result<bool, DbError> {
-    Ok(inbox
-        .pending(session_id)?
-        .iter()
-        .any(|pending| DrivenInput::of(&pending.prompt).is_some()))
+fn has_driven_pending(
+    inbox: &SessionInbox,
+    session_id: &str,
+    controls_available: bool,
+) -> Result<bool, DbError> {
+    for pending in inbox.pending(session_id)? {
+        if DrivenInput::of(&pending.prompt)
+            .is_some_and(|kind| kind != DrivenInput::Control || controls_available)
+            && inbox.wake_admission(&pending)? != WakeAdmission::Reject
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn continue_prompt_driver(
@@ -1227,8 +1333,9 @@ fn continue_prompt_driver(
     services: &ServerServices,
     session_id: &str,
     guard: &mut Option<SessionRunGuard>,
+    controls_available: bool,
 ) -> bool {
-    match has_driven_pending(inbox, session_id) {
+    match has_driven_pending(inbox, session_id, controls_available) {
         Ok(false) => false,
         Ok(true) if guard.is_some() => true,
         Ok(true) => match services.runs.begin_turn(session_id) {
@@ -1259,7 +1366,40 @@ fn driven_request(
         DrivenPromotion::Reports(batch) => {
             report_execution(state, session_id, batch).map(DrivenRequest::Reports)
         }
+        DrivenPromotion::Control(input) => {
+            control_execution(state, input).map(DrivenRequest::Control)
+        }
     }
+}
+
+fn control_execution(
+    state: &ApiState,
+    input: SessionInput,
+) -> Result<SessionControlExecution, String> {
+    if input.trigger_kind != InputTriggerKind::UserControl {
+        return Err("Work control must carry a durable user-control trigger".to_owned());
+    }
+    let continuation: ContinuationToken = serde_json::from_value(
+        input
+            .prompt
+            .get("continuation")
+            .cloned()
+            .ok_or_else(|| "Work control has no frozen continuation".to_owned())?,
+    )
+    .map_err(|error| format!("invalid Work continuation: {error}"))?;
+    if continuation.mode != CollaborationMode::Work {
+        return Err("Work control cannot execute a Plan-mode continuation".to_owned());
+    }
+    let session = state
+        .sessions()
+        .get(&input.session_id)
+        .map_err(|error| error.to_string())?;
+    Ok(SessionControlExecution {
+        session_id: input.session_id,
+        directory: session.directory.into(),
+        input_id: input.id,
+        continuation,
+    })
 }
 
 fn prompt_execution(
@@ -1461,6 +1601,10 @@ async fn run_driven_execution(
     let execution = match request {
         DrivenRequest::Prompt(request) => executor.prompt(request, guard, sender),
         DrivenRequest::Reports(request) => executor.reports(request, guard, sender),
+        DrivenRequest::Control(request) => state
+            .session_controls()
+            .ok_or_else(|| "no Work control executor is installed".to_owned())?
+            .control(request, guard, sender),
     };
     if let Some(events) = durable_events.as_ref() {
         let (outcome, ()) = tokio::join!(
@@ -1568,7 +1712,11 @@ async fn resume_pending_inputs(
     executor: Arc<dyn crate::SessionMutationExecutor>,
     session_id: &str,
 ) {
-    match has_driven_pending(&SessionInbox::new(state.pool_arc()), session_id) {
+    match has_driven_pending(
+        &SessionInbox::new(state.pool_arc()),
+        session_id,
+        state.session_controls().is_some(),
+    ) {
         Ok(false) => return,
         Ok(true) => {}
         Err(error) => {
@@ -1586,6 +1734,72 @@ async fn resume_pending_inputs(
             guard,
         );
     }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct ResumeBody {
+    expected_revision: i64,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ResumeAdmitted {
+    session_id: String,
+    input_id: String,
+    execution_revision: i64,
+    admitted_sequence: i64,
+}
+
+pub(super) async fn resume(
+    State(state): State<ApiState>,
+    Extension(services): Extension<ServerServices>,
+    Path(session_id): Path<String>,
+    body: Result<Json<ResumeBody>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<Data<ResumeAdmitted>>, ApiError> {
+    let Json(body) = body.map_err(|_| ApiError::InvalidRequest("resume body is invalid"))?;
+    if body.expected_revision < 1 {
+        return Err(ApiError::InvalidRequest(
+            "expectedRevision must be positive",
+        ));
+    }
+    let controls = state.session_controls().cloned().ok_or_else(|| {
+        ApiError::BackendUnavailable("POST /api/session/{sessionID}/resume".to_owned())
+    })?;
+    let lookup = state.clone();
+    let checked = session_id.clone();
+    tokio::task::spawn_blocking(move || lookup.sessions().get(&checked))
+        .await
+        .map_err(|error| ApiError::MutationFailed(error.to_string()))??;
+    let outcome = controls
+        .resume(SessionResumeRequest {
+            session_id: session_id.clone(),
+            expected_revision: body.expected_revision,
+        })
+        .await
+        .map_err(|error| match error {
+            SessionResumeError::Invalid(message) => ApiError::InvalidRequestMessage(message),
+            SessionResumeError::NotFound(_) => ApiError::Database(DbError::NotFound {
+                table: "session".to_owned(),
+                id: session_id.clone(),
+            }),
+            SessionResumeError::Conflict(message) => ApiError::Conflict(message),
+            SessionResumeError::Internal(message) => ApiError::MutationFailed(message),
+        })?;
+    let admitted = ResumeAdmitted {
+        session_id: session_id.clone(),
+        input_id: outcome.input.id.clone(),
+        execution_revision: outcome.execution_revision,
+        admitted_sequence: outcome.input.admitted_sequence,
+    };
+    let admission =
+        SessionInputAdmission::new(SessionInbox::new(state.pool_arc()), services.runs.clone())
+            .route_admitted(outcome.input, TurnLease::Acquire, None);
+    if let InputAdmission::Drive { guard, .. } = admission {
+        let executor: Arc<dyn crate::SessionMutationExecutor> = controls;
+        spawn_prompt_driver(state, services, executor, session_id, guard);
+    }
+    Ok(Json(Data::new(admitted)))
 }
 
 pub async fn wait(
@@ -1854,6 +2068,172 @@ mod tests {
 
     use super::super::blocking::Budget;
     use super::*;
+
+    fn driver_fixture() -> (ApiState, SessionInbox) {
+        let state = ApiState::memory("/workspace").expect("API state");
+        state
+            .sessions()
+            .create(&SessionCreate::new(
+                "ses_driver",
+                "driver",
+                "global",
+                "/workspace",
+                "/workspace",
+                "Driver",
+                "test",
+            ))
+            .expect("session");
+        state
+            .pool()
+            .transaction(|tx| {
+                let mut execution = zuno_db::session_execution::seed_in(
+                    tx,
+                    "ses_driver",
+                    CollaborationMode::Work,
+                    None,
+                    1,
+                )?;
+                let revision = execution.revision;
+                execution.cycle_id = Some("cycle_current".to_owned());
+                zuno_db::session_execution::update_in(tx, revision, execution).map(|_| ())
+            })
+            .expect("execution state");
+        let inbox = SessionInbox::new(state.pool_arc());
+        (state, inbox)
+    }
+
+    fn report_input(id: &str, cycle: Option<&str>) -> NewSessionInput {
+        NewSessionInput::new(
+            id, "ses_driver",
+            json!({"kind":"subagentReport","jobID":id,"text":"completed report","status":"completed"}),
+            InputDelivery::Queue, 2,
+        ).with_trigger_kind(InputTriggerKind::Automatic).with_cycle_id(cycle)
+    }
+
+    #[test]
+    fn rejected_callbacks_stay_pending_without_restarting_the_http_driver() {
+        let (state, inbox) = driver_fixture();
+        state
+            .pool()
+            .transaction(|tx| {
+                let current =
+                    zuno_db::session_execution::read_in(tx, "ses_driver")?.expect("state");
+                zuno_db::session_execution::set_paused_in(
+                    tx,
+                    "ses_driver",
+                    current.revision,
+                    zuno_types::execution::SessionPauseReason::User,
+                    2,
+                )
+                .map(|_| ())
+            })
+            .expect("pause work");
+        let callback = inbox
+            .admit(report_input("callback", Some("cycle_current")))
+            .expect("callback");
+        let services = ServerServices::new(16);
+        let mut guard = None;
+        for _ in 0..3 {
+            assert!(!has_driven_pending(&inbox, "ses_driver", false).expect("eligibility"));
+            assert!(
+                promote_next_driven(&inbox, "ses_driver", false)
+                    .expect("no error")
+                    .is_none()
+            );
+            assert!(!continue_prompt_driver(
+                &inbox,
+                &services,
+                "ses_driver",
+                &mut guard,
+                false
+            ));
+        }
+        assert_eq!(
+            inbox.get("ses_driver", "callback").expect("read"),
+            Some(callback)
+        );
+        inbox
+            .admit(
+                NewSessionInput::new(
+                    "status_query",
+                    "ses_driver",
+                    json!({"kind":"user","prompt":{"text":"status?","files":[],"agents":[]}}),
+                    InputDelivery::Queue,
+                    3,
+                )
+                .with_trigger_kind(InputTriggerKind::User),
+            )
+            .expect("user query");
+        assert!(matches!(
+            promote_next_driven(&inbox, "ses_driver", false).expect("query admitted"),
+            Some(DrivenPromotion::Prompt(input)) if input.id == "status_query"
+        ));
+        assert!(!has_driven_pending(&inbox, "ses_driver", false).expect("callback stays deferred"));
+    }
+
+    #[test]
+    fn an_eligible_report_batch_does_not_claim_a_rejected_peer() {
+        let (_state, inbox) = driver_fixture();
+        let rejected = inbox
+            .admit(report_input("old_cycle", Some("cycle_old")))
+            .expect("old callback");
+        inbox
+            .admit(report_input("current_cycle", Some("cycle_current")))
+            .expect("current callback");
+        let Some(DrivenPromotion::Reports(batch)) =
+            promote_next_driven(&inbox, "ses_driver", false).expect("batch")
+        else {
+            panic!("expected one eligible report batch")
+        };
+        assert_eq!(
+            batch
+                .reports()
+                .iter()
+                .map(|report| report.input_id.as_str())
+                .collect::<Vec<_>>(),
+            ["current_cycle"]
+        );
+        assert_eq!(
+            inbox.get("ses_driver", "old_cycle").expect("read"),
+            Some(rejected)
+        );
+        assert!(!has_driven_pending(&inbox, "ses_driver", false).expect("no retry spin"));
+    }
+
+    #[test]
+    fn work_controls_keep_their_frozen_identity_and_require_a_consumer() {
+        let (state, inbox) = driver_fixture();
+        let continuation = ContinuationToken {
+            cycle_id: "cycle_current".to_owned(),
+            identity: zuno_types::execution::TurnExecutionIdentity::new("deep", "work", "model")
+                .with_reasoning(Some("high")),
+            mode: CollaborationMode::Work,
+            plan_id: None,
+            plan_revision: None,
+            context_epoch: 0,
+            anchor_message_id: None,
+        };
+        inbox.admit(NewSessionInput::new(
+            "work_control", "ses_driver",
+            json!({"kind":"sessionControl","control":"resume_work","continuation":continuation}),
+            InputDelivery::Queue, 3,
+        ).with_trigger_kind(InputTriggerKind::UserControl)).expect("authorized control");
+        assert!(
+            promote_next_driven(&inbox, "ses_driver", false)
+                .expect("no consumer")
+                .is_none()
+        );
+        let promoted = promote_next_driven(&inbox, "ses_driver", true)
+            .expect("control")
+            .expect("promoted");
+        let DrivenRequest::Control(request) =
+            driven_request(&state, "ses_driver", promoted).expect("projection")
+        else {
+            panic!("control must not become an ordinary prompt")
+        };
+        assert_eq!(request.input_id, "work_control");
+        assert_eq!(request.continuation, continuation);
+    }
 
     /// The four names the attachment crate can admit, spelled every way its own suite
     /// accepts (`a_valid_declared_mime_spelling_is_accepted_for_matching_bytes`) plus

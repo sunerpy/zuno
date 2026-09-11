@@ -24,7 +24,7 @@ The implementation is split between two native crates and typed database stores:
 | --- | --- |
 | `FeedbackService` | revisioned feedback for one persisted assistant message |
 | `ExperienceService` | extraction settlement, raw memory hints, manual records, and evidence cleanup |
-| `LearningIngestion` | bounded source manifests, manual selection and startup catch-up |
+| `LearningIngestion` | bounded closed-turn source snapshots, manual selection, history repair and startup catch-up |
 | `LearningModelClient` | provider requests, deadlines, output schemas and request receipts |
 | `LearningExtractor` / `PatternConsolidator` | isolated extraction and semantic grouping |
 | `MemoryConsolidator` / `MemoryMaintainer` | independent automatic memory consolidation and source invalidation |
@@ -73,19 +73,42 @@ A completed turn is eligible when it includes at least one of:
 The runtime collects bounded durable source records, redacts credentials before
 clipping, and admits an extraction job before invoking the extractor. Every source
 has a part/feedback address, a raw-source digest and a redacted-content digest.
+The model-facing projection exposes only one citation `source_id` per record,
+equal to the manifest's canonical reference. Raw storage IDs and digests remain
+host-owned; the model is not asked to choose between two differently named IDs.
+Unknown references still produce unverified observations, never automatic
+promotion or an inferred alias.
 The extractor's exact admitted subset is persisted on the claimed job before the
 provider request; full legacy transcript blobs are never sent alongside it. The original user Message remains unchanged. The unique identity is
 `(session_id, source_message_id, extractor_version)`. Retrying admission, losing a
 worker lease, or restarting the process therefore returns to the same job and
 cannot create a second experience batch.
 
-Automatic jobs do not run in the foreground completion path. By default they
-become due after six idle hours; a process-owned project worker polls every 60 seconds and
-claims at most two jobs per wake. Claiming and the idle decision share one SQLite
-write transaction. A newer session activity timestamp, queued/steering/promoted
-input, a process-local live-turn lease, or a disabled/excluded session policy
-prevents the claim without spending an attempt. Manual `/reflect` is made
-immediately due, but still respects the session generation policy.
+Automatic model work does not run in the foreground completion path. The default
+idle delay is zero: admission captures the completed turn and makes its durable
+job immediately due. A process-owned project worker polls every 60 seconds and
+claims at most two jobs per wake; explicit wake notifications coalesce on the
+existing project worker and create no foreground session input.
+
+`LearningSourceSnapshot` binds the project/session, start and end message IDs,
+successful completion timestamp, terminal message digest, and exact bounded
+source-manifest digest. A source must end in a normally completed assistant message
+with no error or pending tool. A caller-provided marker is not authority:
+the database revalidates the closure and every admitted source against stored rows.
+The final redacted/clipped manifest is persisted before the provider request.
+
+With the default zero delay, a valid closed-turn snapshot can be claimed and
+heartbeated while a subsequent turn in the same session is live. Its source window
+does not expand to include the newer messages. Explicit positive delays retain
+idle-session checks, including newer activity and pending input. A live turn never
+grants an exception to a legacy job that lacks a verified snapshot. Current
+closed-turn work is selected before legacy backlog.
+
+Claiming, source validation, session policy, and attempt admission share the
+database boundary. At claim, a changed source becomes `skipped` without consuming
+a new attempt; disabled/excluded generation and forgotten sources cannot gain a
+lease. Manual `/reflect` is immediately due but still respects the source and policy
+boundaries.
 
 There is no quota-percentage, daily-token, or currency budget for automatic
 learning. Zuno's API-key providers do not expose one common remaining-quota
@@ -105,8 +128,23 @@ tool narration or a mutable registry guess.
 The extractor has no tools, network capability, filesystem capability, or
 foreground-session identity. Its request and terminal outcome are durable
 `learning.extraction.request` and `learning.extraction.outcome` events. The request
-records the exact prompt, digest, model, structured response contract, and an
-empty tool list.
+records the exact prompt, digest, model, effective request parameters, structured
+response contract, and an empty tool list.
+
+`LearningModel` carries the selected model's resolved parameters, request headers,
+API surface, and sampling capability. `LearningModelClient` retains reasoning and
+supported endpoint options, removes unsupported sampling controls, and never
+introduces a fixed temperature. The host clamps the learning output budget to the
+model's declared capacity; the client further intersects any smaller explicit
+model request limit. Multiple token-limit aliases cannot enlarge that bound.
+Request headers are forwarded without persisting their values in request receipts.
+
+Native structured output is opt-in through `learning.execution.structured_output`;
+otherwise the same schema is supplied in the prompt and decoded locally.
+JSON repair shares the request deadline. Provider errors retain their typed
+recovery behavior and bounded, redacted diagnostics: HTTP status, provider error
+code, request ID, and reason when available. Job settlement reports validation
+failures separately from a provider successfully returning text.
 
 Extraction first atomically records accepted experiences and verified evidence.
 It settles the job with source-linked raw Memory hints, without mutating resident
@@ -126,6 +164,51 @@ or apply executable Skills. See [automatic resident memory](memory-learning.md).
 
 `/reflect turn` and `/reflect session` use the same durable admission and
 idempotency path. They do not bypass extraction provenance or promotion policy.
+
+## Historical repair and reprocessing
+
+`LearningIngestion::repair_history` selects at most 32 legacy extraction jobs from
+the current project. The batch includes queued, completed, skipped, and failed
+records; running and uncertain jobs remain outside repair. A dry run performs the
+same source checks without changing evidence flags, job payloads, queue state,
+files, or attempt counters.
+
+For a completed old job, exact evidence can be revalidated without another model
+request. Source addresses, excerpts, and any recorded source digests must agree.
+An edited source cannot regain verification merely because its old excerpt still
+appears in the new text. Unavailable and unverifiable evidence stays unverified.
+If usable closed source remains but fresh extraction is needed, repair admits a
+versioned `LegacyReprocess` job.
+
+`LearningIngestion::reprocess` selects one assistant-message ID from the same
+project. It reuses an existing current-version extraction, even when that job has
+already completed or exhausted its attempts. A running source extraction is also
+reused rather than overlapped. A new extractor version permits one upgrade job;
+the old input and failure remain available. Reprocess admission retains the
+configured scheduling delay and the source session's generation/privacy policy.
+
+Repair bookkeeping uses a compare-and-set timestamp and records the extractor
+version and outcome without replacing the original request or failure. Terminal
+repair outcomes prevent the same missing/excluded source or paid failure from
+being processed on every scan. Forgotten sources and experiences cannot be
+re-admitted or reverified. Independent support and explicit user-owned Memory
+remain governed by the existing provenance/retraction rules.
+
+The native command contract is:
+
+| Command | Service boundary |
+| --- | --- |
+| `/learn status` | Durable projection plus use/generation availability, extractor version, session generation policy, and history batch limit |
+| `/learn repair-history --dry-run` | Read-only bounded repair preview |
+| `/learn repair-history` | Apply eligible revalidation and admit required background extraction |
+| `/learn reprocess <assistant-message-id>` | Admit or return the existing extraction for that exact project-owned source |
+
+The repair report includes `dryRun`, `examined`, `revalidatedExperiences`, `queued`,
+`wouldQueue`, `unavailable`, `excluded`, `hasMore`, and per-job actions.
+An admission response identifies `queued` or `existing`, job/source/version,
+attempt, deadline, and any bounded diagnostic. Commands return native results;
+they do not invoke the foreground model, create a foreground input, or resume a
+Goal. An admitted background job may subsequently call the provider.
 
 ## Slow path: consolidate repeated evidence
 
@@ -188,6 +271,28 @@ source identity, content, and SHA-256 digest. Prompt assembly persists the exact
 post-hook section in the normal prompt receipt before the provider request.
 Replaying the receipt therefore reconstructs every model-visible learned item
 without consulting the current FTS index.
+
+Resident Memory is refreshed at provider-request and compaction safe points, not
+only when a foreground turn starts. The host reads the accepted global/project
+revisions and the current session use policy, builds bounded dynamic Memory
+context, and removes earlier static Memory sections so an old and a new version
+cannot appear together. Changes committed by maintenance or another session can
+reach the next model request without opening another foreground turn.
+Already-sent requests and durable prompt receipts remain unchanged.
+
+The host integration must preserve the complete service chain:
+
+- Completion admits the closed snapshot and wakes the existing project worker.
+  Disabled generation or unavailable model construction suspends an older binding.
+- The actual learning-model constructor passes the selected model's resolved
+  native reasoning/request settings, headers, sampling capability, and output cap.
+- The extraction writer calls `extraction_sources_current_on` inside its SQLite
+  transaction; a separate earlier preflight cannot fence a concurrent source edit
+  or forget operation.
+- The request refresher attaches current Memory at each safe point. Worker success
+  alone is not proof that the next foreground request used the new revision.
+- `/learn` dispatches the native status/repair/reprocess adapters through the
+  existing command-result path.
 
 ## Untrusted learned text
 
@@ -336,8 +441,10 @@ disabled or the extractor model cannot start.
   `cleanupDerivedExperiences` boolean.
 
 `/memory` remains the resident Memory review surface. `/memories` controls use
-and generation for the current session. `/learn` owns evidence,
-patterns, feedback, Skill review, evaluation, apply, and undo.
+and generation for the current session. `/learn` owns evidence, bounded history
+repair/reprocessing, status, patterns, feedback, Skill review, evaluation, apply,
+and undo. Reading status is independent of model construction and generation
+availability.
 
 ## Storage and migration
 
@@ -388,10 +495,17 @@ does not need to be present to enable learning:
   "learning": {
     "post_turn": {
       "enabled": true,
-      "idle_delay_ms": 21600000,
+      "idle_delay_ms": 0,
       "poll_interval_ms": 60000,
       "max_jobs_per_wake": 2,
       "disable_on_external_context": false
+    },
+    "execution": {
+      "timeout_ms": 120000,
+      "max_input_bytes": 131072,
+      "max_output_tokens": 4096,
+      "max_steps": 8,
+      "structured_output": false
     },
     "aggregation": {
       "interval_ms": 86400000,
@@ -420,6 +534,27 @@ switch caps both subordinate capabilities. The retired `memory.reflection` and
 unknown keys. An explicit `learning.extractor_model` wins; otherwise learning
 uses a reachable same-provider `small_model`, then the active session model.
 Existing durable session policies are not rewritten when this default changes.
+
+## Source-informed design choices
+
+The Memory implementation was compared with Codex commit
+`eaa8b6d91701d6cabe464141facc677e5915fbfc`. The references below name the actual
+source paths and callers at that pin; they do not use older README descriptions
+as evidence of current scheduling.
+
+| Concern | Pinned Codex source | Zuno decision |
+| --- | --- | --- |
+| Separate extraction and consolidation | `codex-rs/memories/write/src/start.rs::start_memories_startup_task`; `codex-rs/memories/write/src/phase1.rs::job::run`; `codex-rs/memories/write/src/phase2.rs::run` | Adopt phase separation. Extraction persists Experience/raw hints; independent Memory maintenance commits a bounded managed-data plan. |
+| Closed, bounded input and exact consumption | `codex-rs/memories/write/src/phase1.rs::job::sample`; `codex-rs/state/src/runtime/memories.rs::mark_global_phase2_job_succeeded` | Adapt immutable input/consumption principles to closed-turn SQLite snapshots, content digests, leases, and transactional source verification. |
+| When work becomes eligible | `codex-rs/app-server/src/request_processors/turn_processor.rs::TurnRequestProcessor::turn_start_inner`; `codex-rs/state/src/runtime/memories.rs::claim_stage1_jobs_for_startup` | Codex kicks an idle sweep of other threads at turn start. Zuno deliberately selects each eligible completed turn, defaults to zero delay, and permits a verified old snapshot while the next turn is busy. |
+| Worker authority and model binding | `codex-rs/memories/write/src/runtime.rs::MemoryStartupContext::stage_one_request_context` and `stream_stage_one_prompt`; `codex-rs/memories/write/src/phase2.rs::agent::get_config` | Adopt explicit model settings and detached work identity. Zuno keeps both stages tool-free; it does not copy Codex's default ephemeral phase-two agent with Memory-root write capability. |
+| User edits and authoritative storage | `codex-rs/memories/write/src/workspace.rs::memory_workspace_diff`; `codex-rs/memories/write/templates/memories/consolidation.md` | Preserve user authority using Zuno's SQLite revision/CAS journal. External file edits are preserved and explicitly imported, rather than automatically ingested through a Memory Git diff. |
+| Forgetting and surviving support | `codex-rs/state/src/runtime/memories.rs::delete_thread_memory` and `mark_thread_memory_mode_polluted`; `codex-rs/memories/write/templates/memories/consolidation.md` | Adopt selective removal of unsupported material and non-resurrection. Zuno retains its durable audit/revision history and does not claim equivalent filesystem erasure. |
+| Bounded retries and unchanged inputs | `codex-rs/state/src/runtime/memories.rs::try_claim_stage1_job`; `codex-rs/memories/write/src/phase2.rs::run` | Adapt ownership/backoff and no-op principles to source/extractor-version identities, three storage-enforced attempts, and consumed-input watermarks. |
+
+These are design references, not configuration, storage, protocol, scheduling,
+or filesystem compatibility claims. The operator commands and limits above are
+Zuno contracts.
 
 ## Non-goals
 

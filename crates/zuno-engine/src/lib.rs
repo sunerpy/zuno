@@ -4,6 +4,7 @@ pub mod admission;
 pub mod advance;
 pub mod budget;
 pub mod compaction;
+pub mod context_usage;
 mod deferred_tools;
 pub mod dispatch;
 pub mod driver;

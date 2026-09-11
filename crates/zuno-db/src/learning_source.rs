@@ -1,6 +1,10 @@
 //! Bounded, source-addressed evidence for isolated learning requests.
 
-use crate::message::MessageStore;
+mod closed;
+
+pub use closed::{LearningSourceSnapshot, source_manifest_digest};
+pub(crate) use closed::{closed_turn_on, snapshot_current_on};
+
 use crate::{Pool, open};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -94,8 +98,13 @@ impl LearningSourceStore {
         redact: &dyn Fn(&str) -> String,
     ) -> Result<LearningSourceWindow, DbError> {
         let connection = self.pool.get()?;
-        let (mut start, end) =
-            MessageStore::new(&connection).completed_turn_bounds(session_id, end_message_id)?;
+        // Closure, source selection, and receipt reads observe one SQLite snapshot.
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(open::map_error)?;
+        let connection = &transaction;
+        let turn = closed_turn_on(connection, session_id, end_message_id)?;
+        let (mut start, end) = (turn.start, turn.end);
         if session_wide {
             start = (i64::MIN, String::new());
         }
@@ -338,6 +347,10 @@ impl LearningSourceStore {
         use rusqlite::OptionalExtension as _;
         self.pool.get()?.query_row(
             "SELECT id FROM message WHERE session_id=?1 AND json_extract(data,'$.role')='assistant'
+             AND json_extract(data,'$.finish')='stop'
+             AND json_type(data,'$.time.completed')='integer'
+             AND json_extract(data,'$.error') IS NULL
+             AND COALESCE(json_extract(data,'$.summary'),0)=0
              ORDER BY time_created DESC,id DESC LIMIT 1",
             [session_id],|row|row.get(0),
         ).optional().map_err(open::map_error)
@@ -355,7 +368,9 @@ impl LearningSourceStore {
              FROM message m JOIN session s ON s.id=m.session_id
              WHERE s.project_id=?1 AND m.time_created>=?2
                AND json_extract(m.data,'$.role')='assistant' AND json_extract(m.data,'$.finish')='stop'
-               AND json_extract(m.data,'$.time.completed') IS NOT NULL
+               AND json_type(m.data,'$.time.completed')='integer'
+               AND json_extract(m.data,'$.error') IS NULL
+               AND COALESCE(json_extract(m.data,'$.summary'),0)=0
                AND NOT EXISTS(SELECT 1 FROM learning_job j WHERE j.session_id=m.session_id
                    AND j.source_message_id=m.id AND j.kind='extraction')
                AND NOT EXISTS(SELECT 1 FROM session_memory_policy p WHERE p.session_id=m.session_id

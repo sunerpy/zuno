@@ -206,7 +206,7 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
         message:MessageRecord::from_json(json!({
             "id":"expire-during-commit","sessionID":session.id,"role":"assistant","time":{"created":1}
         })).unwrap(),
-        parts:vec![],persisted_at_ms:1,context_limit:None,
+        parts:vec![],persisted_at_ms:1,context_limit:None,context_usage:None,
     }).await;
     assert!(matches!(
         expired,
@@ -229,6 +229,7 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
         .consume_input(
             &scope,
             InputMaterialization {
+                turn_id: None,
                 input_id: Some(job.input_id.to_string()),
                 message: MessageRecord::from_json(json!({
                     "id":job.input_id,"sessionID":session.id,"role":"user","time":{"created":0},
@@ -393,6 +394,15 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
     assert_eq!(totals.get::<i64, _>("tokens_reasoning"), 4);
     assert_eq!(totals.get::<i64, _>("tokens_cache_read"), 40);
     assert_eq!(totals.get::<i64, _>("tokens_cache_write"), 10);
+    let receipt = query(
+        "SELECT state,turn_id,applied_at,completed_at FROM zuno_enterprise_preview.input_execution_receipt
+         WHERE tenant_id=$1 AND principal_id=$2 AND input_id=$3",
+    ).bind(actor.tenant_id().as_str()).bind(actor.principal_id().as_str()).bind(job.input_id.as_str())
+        .fetch_one(admin).await.unwrap();
+    assert_eq!(receipt.get::<String, _>("state"), "completed");
+    assert_eq!(receipt.get::<String, _>("turn_id"), job.turn_id.as_str());
+    assert!(receipt.get::<Option<i64>, _>("applied_at").is_some());
+    assert!(receipt.get::<Option<i64>, _>("completed_at").is_some());
     assert!(
         next.history(&scope).await.is_err(),
         "a completed attempt no longer has Worker read authority"
@@ -423,6 +433,7 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
         .turn_state(third.lease.clone(), "/workspace".to_owned())
         .unwrap();
     failed_state.consume_input(&scope,InputMaterialization {
+                turn_id: None,
         input_id:Some(next_job.input_id.to_string()),
         message:MessageRecord::from_json(json!({
             "id":next_job.input_id,"sessionID":session.id,"role":"user","time":{"created":0},
@@ -433,6 +444,102 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
             "type":"text","text":"Inspect the fixture",
         }),0).unwrap()],
     }).await.unwrap();
+    let seed = failed_state.context_usage(&scope).await.unwrap();
+    let unchanged = zuno_types::context_usage::ContextUsageWrite {
+        expected_revision: seed.persisted_revision,
+        tracker: seed.tracker.clone(),
+    };
+    failed_state
+        .commit_context_usage(&scope, &unchanged)
+        .await
+        .unwrap();
+    let mut stale = unchanged.clone();
+    stale.expected_revision = Some(u64::MAX);
+    stale.tracker.observe_history_epoch(
+        i64::try_from(seed.tracker.snapshot().context_epoch + 1).unwrap(),
+        zuno_db::message::now_millis(),
+    );
+    assert!(
+        failed_state
+            .commit_context_usage(&scope, &stale)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        failed_state.context_usage(&scope).await.unwrap().tracker,
+        seed.tracker
+    );
+
+    raw_sql(
+        "CREATE FUNCTION public.zuno_refuse_context_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'injected context commit failure'; END $$;
+         CREATE TRIGGER zuno_refuse_context_commit BEFORE INSERT ON zuno_enterprise_preview.event
+         FOR EACH ROW WHEN(NEW.type='session.context.usage') EXECUTE FUNCTION public.zuno_refuse_context_commit();",
+    ).execute(admin).await.unwrap();
+    let before_context: Value = query_scalar(
+        "SELECT jsonb_build_object('tokens',tokens_input,'estimate',tokens_estimated_pending_prompt,'sequence',event_sequence)
+         FROM zuno_enterprise_preview.session WHERE tenant_id=$1 AND principal_id=$2 AND id=$3",
+    ).bind(actor.tenant_id().as_str()).bind(actor.principal_id().as_str()).bind(session.id.as_str())
+        .fetch_one(admin).await.unwrap();
+    let preparation = zuno_engine::context_usage::ContextRequestPreparation {
+        before: seed.clone(),
+        identity: zuno_types::context_usage::ContextRequestIdentity {
+            request_id: "atomic-request".to_owned(),
+            request_sequence: 0,
+            attempt: 1,
+            context_epoch: seed.tracker.snapshot().context_epoch,
+            provider_id: "turn-test".to_owned(),
+            model_id: "model".to_owned(),
+            source: zuno_types::context_usage::ContextUsageSource::Main,
+            turn_id: Some(next_job.turn_id.to_string()),
+            time_started: zuno_db::message::now_millis(),
+            request_context_tokens: Some(10),
+            history_prefix: None,
+        },
+        prompt_tokens: 10,
+        tail_tokens: Some(0),
+        context_limit: Some(1000),
+    };
+    let start = zuno_engine::state::ProviderRequestCommit {
+        assistant: MessageRecord::from_json(json!({
+            "id":"atomic-assistant","sessionID":session.id,"role":"assistant",
+            "requestID":"atomic-request","time":{"created":9999999999999_i64},
+        })).unwrap(),
+        event: zuno_db::event_log::NewSessionEvent::new("session.provider.request", json!({
+            "turnID":next_job.turn_id,"requestID":"atomic-request","assistantMessageID":"atomic-assistant","status":"started",
+        }).as_object().unwrap().clone()).unwrap(),
+        estimated_prompt_tokens: 10, context_limit: Some(1000), context: preparation,
+    };
+    assert!(
+        failed_state
+            .start_provider_request(&scope, start)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        query_scalar::<_, i64>(
+            "SELECT count(*) FROM zuno_enterprise_preview.message WHERE id='atomic-assistant'"
+        )
+        .fetch_one(admin)
+        .await
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        failed_state.context_usage(&scope).await.unwrap().tracker,
+        seed.tracker
+    );
+    let after_context: Value = query_scalar(
+        "SELECT jsonb_build_object('tokens',tokens_input,'estimate',tokens_estimated_pending_prompt,'sequence',event_sequence)
+         FROM zuno_enterprise_preview.session WHERE tenant_id=$1 AND principal_id=$2 AND id=$3",
+    ).bind(actor.tenant_id().as_str()).bind(actor.principal_id().as_str()).bind(session.id.as_str())
+        .fetch_one(admin).await.unwrap();
+    assert_eq!(
+        after_context, before_context,
+        "provider start and context commit roll back together"
+    );
+    raw_sql("DROP TRIGGER zuno_refuse_context_commit ON zuno_enterprise_preview.event; DROP FUNCTION public.zuno_refuse_context_commit()")
+        .execute(admin).await.unwrap();
     script.replies.lock().unwrap().push_back(vec![
         StreamEvent::ToolUseStart {
             id: "rollback-call".to_owned(),

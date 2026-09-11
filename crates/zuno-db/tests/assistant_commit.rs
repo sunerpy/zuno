@@ -26,7 +26,7 @@ fn commit(message: &str, part: &str) -> AssistantCommit {
         parts:vec![PartRecord::from_json(json!({
             "id":part,"sessionID":"session","messageID":message,"type":"text","text":"Result"
         }),10).unwrap()],
-        persisted_at_ms:11,context_limit:Some(100_000),
+        persisted_at_ms:11,context_limit:Some(100_000),context_usage:None,
     }
 }
 fn usage(connection: &Connection) -> (f64, i64, i64, i64, i64) {

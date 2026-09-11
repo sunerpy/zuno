@@ -16,6 +16,11 @@ use zuno_types::execution::{
 
 const SESSION: &str = "ses_control";
 
+#[path = "control/goal_resume.rs"]
+mod goal_resume;
+#[path = "control/questions.rs"]
+mod questions;
+
 struct Fixture {
     _spill: TempDir,
     pool: Arc<Pool>,

@@ -1,6 +1,6 @@
 # Enterprise implementation status
 
-Baseline: `v0.10.29`, `d1212860dba6a6b420ce81d444ace58feaf0adb5`.
+Original baseline: `v0.10.29`, `d1212860dba6a6b420ce81d444ace58feaf0adb5`.
 
 | Phase | State | Evidence required before completion |
 | --- | --- | --- |
@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p4-durable-waits`.
+- Current phase branch: `codex/enterprise-p0-main-sync`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -168,3 +168,16 @@ verification is pending the next preview CI run. No release is enabled.
 - Engine/database regression, final dispatch/alias tests, 52 CLI production/permission tests, PostgreSQL/HTTPS wait contracts, 99 documentation/release contracts and 11 preview publishing tests passed. Workspace check, Clippy, fmt and diff checks passed.
 - This phase's remote CI remains pending. The complete enterprise runtime, child/Workflow producers, public approval/control APIs and Web remain unregistered; publication stays disabled.
 - Main was refreshed at `1518f0ef` (package version `0.10.30`). Its session, permission and automatic Memory fixes will enter preview through a separate synchronization PR; this phase still targets the existing preview baseline.
+
+
+## Main synchronization candidate
+
+- Wait PR #194 merged into preview at `d179d736f3ac9ec3cfe373339be2ee68e4710875`; CI 34631734711 passed all native gates.
+- This synchronization imports main `1518f0ef5448a7016f67e74f9ddd026501b645be`, package version 0.10.30, including questions, foreground scheduling, context usage, input execution receipts and automatic Memory repairs.
+- Stable SQLite core format 14 and preview overlay format 1 are independent. Exact unpublished preview 13/14 fixtures migrate without losing owned state. Forty-seven migration tests passed.
+- Main context/Memory/foreground tests use the same asynchronous persistence port; provider start and assistant completion retain atomic context accounting. Tool continuation uses a non-billing admission hook.
+- Core database/engine/Memory/learning/session-control regression passed 1,226 tests. CLI library and ACP/foreground/serve entry points passed 773 tests; documentation/release contracts passed 100, and preview publishing contracts passed 11.
+- PostgreSQL format-6 and authenticated HTTPS tests passed, including the captured format-5 migration, context CAS/start rollback and input applied/completed receipts. Workspace check, Clippy, formatting and diff checks passed. Remote synchronization CI remains pending.
+- The preview remains disabled. With this incorporated stable baseline, the first version request will use 0.10.31-preview.1, subject to later main synchronization and runnable acceptance.
+
+- Synchronization PR #195 first CI (34643334370) passed Linux, PostgreSQL and Docker gates but exposed a Windows clipboard fixture timing race. A 300ms caller-start delay reproduces its 250ms harness watchdog failure. The fixture now synchronizes caller startup, waits for the intended hostile branch, and releases its fake blocked threads afterward; 51 focused tests pass. Production clipboard deadlines are unchanged. Repaired native CI is pending.

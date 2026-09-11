@@ -42,19 +42,35 @@ fn initialized() -> (Arc<Pool>, SessionInbox) {
         .map(|_| ())
     })
     .expect("create session");
+    let execution = zuno_db::session_execution::SessionExecutionStore::new(Arc::clone(&pool));
+    let mut state = execution
+        .seed(
+            SESSION,
+            zuno_types::execution::CollaborationMode::Work,
+            None,
+            1,
+        )
+        .expect("execution");
+    state.cycle_id = Some("wake-cycle".to_owned());
+    execution
+        .update(state.revision, state)
+        .expect("bound cycle");
     let inbox = SessionInbox::new(Arc::clone(&pool));
     (pool, inbox)
 }
 
 fn admit(inbox: &SessionInbox, id: &str) {
     inbox
-        .admit(NewSessionInput::new(
-            id,
-            SESSION,
-            json!({"kind": "subagentReport", "text": id}),
-            InputDelivery::Queue,
-            10,
-        ))
+        .admit(
+            NewSessionInput::new(
+                id,
+                SESSION,
+                json!({"kind": "subagentReport", "jobID": id, "text": id}),
+                InputDelivery::Queue,
+                10,
+            )
+            .with_cycle_id(Some("wake-cycle")),
+        )
         .expect("admit input");
 }
 
@@ -467,19 +483,22 @@ async fn a_typed_submission_wake_never_drags_settled_reports_into_the_running_tu
 
 fn admit_job_report(inbox: &SessionInbox, id: &str, job_id: &str, text: &str, completed: i64) {
     inbox
-        .admit(NewSessionInput::new(
-            id,
-            SESSION,
-            json!({
-                "kind": "subagentReport",
-                "jobID": job_id,
-                "childSessionID": "ses_child",
-                "status": "completed",
-                "text": text
-            }),
-            InputDelivery::Queue,
-            completed,
-        ))
+        .admit(
+            NewSessionInput::new(
+                id,
+                SESSION,
+                json!({
+                    "kind": "subagentReport",
+                    "jobID": job_id,
+                    "childSessionID": "ses_child",
+                    "status": "completed",
+                    "text": text
+                }),
+                InputDelivery::Queue,
+                completed,
+            )
+            .with_cycle_id(Some("wake-cycle")),
+        )
         .expect("admit report");
 }
 
@@ -546,13 +565,16 @@ async fn a_busy_parent_reads_a_superseded_report_as_superseded() {
 async fn a_report_the_projection_cannot_render_still_steers_its_own_wake() {
     let (_pool, inbox) = initialized();
     inbox
-        .admit(NewSessionInput::new(
-            "input_broken",
-            SESSION,
-            json!({"kind": "subagentReport", "jobID": "job_1", "status": "completed"}),
-            InputDelivery::Queue,
-            10,
-        ))
+        .admit(
+            NewSessionInput::new(
+                "input_broken",
+                SESSION,
+                json!({"kind": "subagentReport", "jobID": "job_1", "status": "completed"}),
+                InputDelivery::Queue,
+                10,
+            )
+            .with_cycle_id(Some("wake-cycle")),
+        )
         .expect("admit report");
     let runs = SessionRunRegistry::new();
     let guard = runs.begin_turn(SESSION).expect("active parent");

@@ -2,16 +2,29 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde_json::{Value, json};
+use zuno_engine::context_usage::counters_from_stream_event;
 use zuno_engine::r#loop::{INTERRUPTED_TURN_NOTICE, ToolDiff, ToolInterruption, TurnEvent};
 use zuno_llm::event::StreamEvent;
 use zuno_tool::{QuestionResultStatus, ToolResultPresentation};
+use zuno_types::context_usage::{
+    ContextRequestIdentity, ContextUsageSnapshot, ContextUsageSource, ContextUsageTracker,
+    InvalidContextUsage,
+};
 
 use crate::presentation::{decorate_completed_tool_update, decorate_tool_call};
 
 #[derive(Debug, Default)]
 pub struct TurnEventProjector {
     context_size: Option<u64>,
+    session_id: Option<String>,
     turn_id: Option<String>,
+    context_source: ContextUsageSource,
+    context_tracker: Option<ContextUsageTracker>,
+    canonical_context: Option<ContextUsageSnapshot>,
+    provider_id: Option<String>,
+    model_id: Option<String>,
+    assistant_message_id: Option<String>,
+    request_step: Option<u32>,
     raw_inputs: HashMap<String, String>,
     tool_names: HashMap<String, String>,
     visible_tools: HashSet<String>,
@@ -46,10 +59,27 @@ impl AttemptBufferedTurnEventProjector {
         }
     }
 
+    pub fn with_context_usage(snapshot: ContextUsageSnapshot) -> Result<Self, InvalidContextUsage> {
+        Ok(Self {
+            projector: TurnEventProjector::with_context_usage(snapshot)?,
+            ..Self::default()
+        })
+    }
+
+    /// State updates are revisable and must not wait behind append-only content.
+    #[must_use]
+    pub fn project_context_usage(&mut self, snapshot: &ContextUsageSnapshot) -> Vec<Value> {
+        self.projector
+            .project_context_usage(snapshot)
+            .into_iter()
+            .collect()
+    }
+
     /// Project one engine event into zero or more committed ACP updates.
     #[must_use]
     pub fn project(&mut self, event: &TurnEvent) -> Vec<Value> {
         match event {
+            TurnEvent::ContextUsageUpdated { snapshot } => self.project_context_usage(snapshot),
             TurnEvent::ToolResultPresented {
                 call_id,
                 presentation,
@@ -90,8 +120,12 @@ impl AttemptBufferedTurnEventProjector {
             } => {
                 self.pending.clear();
                 self.projector.reset_attempt();
-                Vec::new()
+                self.projector.project(event).into_iter().collect()
             }
+            TurnEvent::Provider {
+                event: StreamEvent::TokenUsage { .. },
+                ..
+            } => self.projector.project(event).into_iter().collect(),
             TurnEvent::AssistantCheckpointed { .. } => {
                 if let Some(update) = self.projector.project(event) {
                     self.pending.push(update);
@@ -111,6 +145,9 @@ impl AttemptBufferedTurnEventProjector {
                 self.answered_questions.clear();
                 self.buffering = false;
                 let mut committed = std::mem::take(&mut self.deferred_completions);
+                if let Some(update) = self.projector.abandon_context_request() {
+                    committed.push(update);
+                }
                 if let Some(update) = self.projector.project(event) {
                     committed.push(update);
                 }
@@ -134,7 +171,11 @@ impl AttemptBufferedTurnEventProjector {
         self.answered_questions.clear();
         self.buffering = false;
         self.projector.reset_attempt();
-        std::mem::take(&mut self.deferred_completions)
+        let mut committed = std::mem::take(&mut self.deferred_completions);
+        if let Some(update) = self.projector.abandon_context_request() {
+            committed.push(update);
+        }
+        committed
     }
 }
 
@@ -147,15 +188,75 @@ impl TurnEventProjector {
     #[must_use]
     pub fn with_context_size(context_size: u64) -> Self {
         Self {
-            context_size: Some(context_size),
+            context_size: Some(context_size).filter(|size| *size > 0),
             ..Self::default()
         }
     }
 
+    /// Seed the exact persisted snapshot when restoring a session.
+    pub fn with_context_usage(snapshot: ContextUsageSnapshot) -> Result<Self, InvalidContextUsage> {
+        snapshot.validate()?;
+        Ok(Self {
+            context_size: snapshot.context_limit,
+            session_id: Some(snapshot.session_id.clone()),
+            context_source: snapshot.source,
+            canonical_context: Some(snapshot),
+            ..Self::default()
+        })
+    }
+
+    /// Project a canonical state revision supplied by the host.
+    ///
+    /// Once the host supplies canonical state, raw request estimates and provider
+    /// frames cannot overwrite it. Different sessions/sources and old revisions
+    /// are rejected; higher revisions can legitimately reduce occupancy.
+    #[must_use]
+    pub fn project_context_usage(&mut self, snapshot: &ContextUsageSnapshot) -> Option<Value> {
+        snapshot.validate().ok()?;
+        if snapshot.source != self.context_source
+            || self
+                .session_id
+                .as_ref()
+                .is_some_and(|session_id| session_id != &snapshot.session_id)
+            || self.canonical_context.as_ref().is_some_and(|current| {
+                snapshot.revision <= current.revision
+                    || snapshot.context_epoch < current.context_epoch
+            })
+        {
+            return None;
+        }
+        self.session_id = Some(snapshot.session_id.clone());
+        self.context_size = snapshot.context_limit;
+        self.canonical_context = Some(snapshot.clone());
+        self.context_tracker = None;
+        let mut update = context_usage_update(snapshot)?;
+        if let Some(turn_id) = self.turn_id.as_deref() {
+            attach_turn_id(&mut update, turn_id);
+        }
+        Some(update)
+    }
+
     #[must_use]
     pub fn project(&mut self, event: &TurnEvent) -> Option<Value> {
-        if let TurnEvent::TurnStarted { turn_id, .. } = event {
+        if let TurnEvent::TurnStarted {
+            session_id,
+            turn_id,
+        } = event
+        {
+            if self
+                .session_id
+                .as_ref()
+                .is_some_and(|current| current != session_id)
+            {
+                self.context_tracker = None;
+                self.canonical_context = None;
+                self.provider_id = None;
+                self.model_id = None;
+            }
+            self.session_id = Some(session_id.clone());
             self.turn_id = Some(turn_id.clone());
+            self.assistant_message_id = None;
+            self.request_step = None;
             return None;
         }
         let mut update = self.project_inner(event)?;
@@ -172,9 +273,75 @@ impl TurnEventProjector {
         self.result_presentations.clear();
     }
 
+    fn begin_context_request(&mut self, step: u32, estimate: Option<u64>) {
+        if self.canonical_context.is_some() || step == 0 {
+            return;
+        }
+        let session_id = self.session_id.as_deref().unwrap_or("acp-unbound");
+        let tracker = self.context_tracker.get_or_insert_with(|| {
+            ContextUsageTracker::for_source(session_id, self.context_source)
+        });
+        let request_id = format!(
+            "acp:{}:{}:{}",
+            self.turn_id.as_deref().unwrap_or("unbound"),
+            self.assistant_message_id.as_deref().unwrap_or("message"),
+            step,
+        );
+        let current = tracker.snapshot().request.as_ref();
+        if current.is_some_and(|current| current.request_id == request_id) {
+            return;
+        }
+        let request = ContextRequestIdentity {
+            request_id,
+            request_sequence: current
+                .map_or(1, |current| current.request_sequence.saturating_add(1)),
+            attempt: 1,
+            context_epoch: tracker.snapshot().context_epoch,
+            provider_id: self
+                .provider_id
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned()),
+            model_id: self
+                .model_id
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned()),
+            source: self.context_source,
+            turn_id: self.turn_id.clone(),
+            // Legacy TurnEvent carries no request timestamp. Do not substitute
+            // replay time for event time; canonical host snapshots carry it.
+            time_started: 0,
+            request_context_tokens: None,
+            history_prefix: None,
+        };
+        self.request_step = Some(step);
+        tracker.start_request(request, estimate, Some(0), self.context_size, 0);
+    }
+
+    fn projected_context(&self) -> Option<Value> {
+        // Preserve the old API's explicit-window requirement. Canonical snapshots
+        // can also publish an unknown state through project_context_usage().
+        self.context_size?;
+        let mut update = context_usage_update(self.context_tracker.as_ref()?.snapshot())?;
+        update["_meta"]["zuno"]["contextUsageOrigin"] = json!("turn_events");
+        Some(update)
+    }
+
+    fn abandon_context_request(&mut self) -> Option<Value> {
+        if self.canonical_context.is_some() {
+            return None;
+        }
+        let tracker = self.context_tracker.as_mut()?;
+        let request = tracker.snapshot().request.clone()?;
+        tracker
+            .abandon_request(&request, 0)
+            .then(|| self.projected_context())
+            .flatten()
+    }
+
     #[must_use]
     fn project_inner(&mut self, event: &TurnEvent) -> Option<Value> {
         match event {
+            TurnEvent::ContextUsageUpdated { snapshot } => self.project_context_usage(snapshot),
             TurnEvent::Provider {
                 event: StreamEvent::TextDelta(text),
                 ..
@@ -188,15 +355,52 @@ impl TurnEventProjector {
                 "title": title,
             })),
             TurnEvent::ProviderRequestStarted {
+                step,
                 estimated_prompt_tokens,
                 ..
-            } => self.context_size.map(|size| {
-                json!({
-                    "sessionUpdate": "usage_update",
-                    "used": estimated_prompt_tokens,
-                    "size": size,
-                })
-            }),
+            } => {
+                if self.canonical_context.is_some() || *step == 0 {
+                    return None;
+                }
+                self.begin_context_request(*step, Some(*estimated_prompt_tokens));
+                self.projected_context()
+            }
+            TurnEvent::ModelResolved {
+                provider_id,
+                model_id,
+                ..
+            } => {
+                self.provider_id = Some(provider_id.clone());
+                self.model_id = Some(model_id.clone());
+                None
+            }
+            TurnEvent::AssistantMessageCreated { message_id, .. } => {
+                self.assistant_message_id = Some(message_id.clone());
+                None
+            }
+            TurnEvent::AssistantCheckpointed { step, .. } => {
+                if self.request_step == Some(*step)
+                    && let Some(tracker) = self.context_tracker.as_mut()
+                    && let Some(request) = tracker.snapshot().request.clone()
+                {
+                    tracker.commit_request(&request, 0);
+                }
+                None
+            }
+            TurnEvent::Provider {
+                step,
+                event: StreamEvent::RetryRollback { attempt, .. },
+            } => {
+                if self.canonical_context.is_some() || self.request_step != Some(*step) {
+                    return None;
+                }
+                let tracker = self.context_tracker.as_mut()?;
+                let request = tracker.snapshot().request.clone()?;
+                tracker
+                    .rollback_request(&request, *attempt, 0)
+                    .then(|| self.projected_context())
+                    .flatten()
+            }
             TurnEvent::SessionCommandOutput { command, content } => {
                 let mut update = content_update("agent_message_chunk", content);
                 if matches!(
@@ -408,29 +612,25 @@ impl TurnEventProjector {
                 }))
             }
             TurnEvent::Provider {
-                event:
-                    StreamEvent::TokenUsage {
-                        input_tokens,
-                        output_tokens,
-                        // Not added: the frame's `output_tokens` already contains its
-                        // reasoning count, so charging the breakdown again would report
-                        // a context window fuller than the request made it.
-                        reasoning_tokens: _,
-                        cache_read_input_tokens,
-                        cache_write_input_tokens,
-                        accounting,
-                    },
-                ..
-            } => self.context_size.map(|size| {
-                let used = accounting
-                    .prompt_total(
-                        input_tokens.unwrap_or_default(),
-                        cache_read_input_tokens.unwrap_or_default(),
-                        cache_write_input_tokens.unwrap_or_default(),
-                    )
-                    .saturating_add(output_tokens.unwrap_or_default());
-                json!({ "sessionUpdate": "usage_update", "used": used, "size": size })
-            }),
+                step,
+                event: frame @ StreamEvent::TokenUsage { .. },
+            } => {
+                if self.canonical_context.is_some() || *step == 0 {
+                    return None;
+                }
+                if self.context_tracker.is_none() {
+                    self.begin_context_request(*step, None);
+                }
+                if self.request_step != Some(*step) {
+                    return None;
+                }
+                let tracker = self.context_tracker.as_mut()?;
+                let request = tracker.snapshot().request.clone()?;
+                tracker
+                    .observe_usage(&request, counters_from_stream_event(frame)?, 0)
+                    .then(|| self.projected_context())
+                    .flatten()
+            }
             TurnEvent::Notice {
                 audience,
                 severity,
@@ -464,6 +664,38 @@ impl TurnEventProjector {
 #[must_use]
 pub fn turn_event_update(event: &TurnEvent) -> Option<Value> {
     TurnEventProjector::new().project(event)
+}
+
+/// One representation for live state and durable replay.
+///
+/// ACP's numeric usage update requires both `used` and `size`. Unknown state
+/// travels as session metadata, so no client receives a fabricated zero or
+/// context window.
+pub(crate) fn context_usage_update(snapshot: &ContextUsageSnapshot) -> Option<Value> {
+    snapshot.validate().ok()?;
+    let mut update = match snapshot.used_tokens.zip(snapshot.context_limit) {
+        Some((used, size)) => json!({
+            "sessionUpdate": "usage_update",
+            "used": used,
+            "size": size,
+        }),
+        None => json!({
+            "sessionUpdate": "session_info_update",
+        }),
+    };
+    update["_meta"] = json!({
+        "zuno": {
+            "contextUsage": snapshot,
+        },
+    });
+    if let Some(turn_id) = snapshot
+        .request
+        .as_ref()
+        .and_then(|request| request.turn_id.as_deref())
+    {
+        attach_turn_id(&mut update, turn_id);
+    }
+    Some(update)
 }
 
 fn attach_turn_id(update: &mut Value, turn_id: &str) {

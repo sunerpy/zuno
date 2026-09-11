@@ -6,4 +6,4 @@ Specify behavior and interfaces, ordered work, invariants, failure and recovery 
 
 Do not invent APIs, storage, frameworks, or work. Resolve necessary decisions and explicitly defer non-blocking choices.
 
-Write only to the plan artifact allowed by the runtime. Finish when another Agent can implement the plan without repeating discovery or inventing decisions.
+Maintain the durable Plan and Todo state exposed by the runtime. Finish when another Agent can implement the plan without repeating discovery or inventing decisions.

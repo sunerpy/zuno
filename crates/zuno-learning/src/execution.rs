@@ -69,6 +69,11 @@ pub(crate) fn prepare_extraction_request(
     lease: &LearningLease,
 ) -> crate::Result<ExtractionRequest> {
     let prepared = extractor.prepare_request(request)?;
+    if prepared.sources.is_empty() {
+        return Err(crate::model::invalid(
+            "learning extraction has no verifiable closed sources",
+        ));
+    }
     let job = scheduler.get(job_id)?;
     let mut payload = crate::decode_extraction_job_payload(
         job.payload
@@ -76,6 +81,12 @@ pub(crate) fn prepare_extraction_request(
     )
     .map_err(|error| crate::model::invalid(&format!("corrupt extraction input: {error}")))?;
     payload.request = prepared.clone();
+    if let Some(snapshot) = &mut payload.source_snapshot {
+        snapshot.manifest_digest =
+            zuno_db::learning_source::source_manifest_digest(&prepared.sources);
+    } else {
+        payload.source_snapshot = Some(scheduler.capture_snapshot(&prepared, payload.trigger)?);
+    }
     scheduler.refresh_legacy_input(
         job_id,
         lease,

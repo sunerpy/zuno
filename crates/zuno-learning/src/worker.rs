@@ -73,7 +73,22 @@ impl ProjectLearningService {
         job: LearningJobRecord,
         cancel: &CancellationToken,
     ) -> crate::Result<()> {
+        if job.kind != LearningJobKind::GlobalAggregation
+            && job.project_id.as_deref() != Some(self.project_id.as_str())
+        {
+            return Err(crate::model::invalid(
+                "learning job belongs to another project",
+            ));
+        }
         let lease = job.lease()?;
+        if !self.scheduler.generates() {
+            return self.scheduler.skip(
+                &job.id,
+                &lease,
+                "learning generation is disabled",
+                zuno_db::message::now_millis(),
+            );
+        }
         let work = async {
             match job.kind {
                 LearningJobKind::Extraction => {
@@ -170,11 +185,11 @@ impl ProjectLearningService {
             match error.recovery() {
                 Recovery::Retry { after } => {
                     self.scheduler
-                        .retry(job_id, lease, &error.to_string(), after, now)?;
+                        .retry(job_id, lease, &error.diagnostic(), after, now)?;
                 }
                 Recovery::Reauthenticate | Recovery::Compact | Recovery::Fail => {
                     self.scheduler
-                        .fail(job_id, lease, &error.to_string(), now)?;
+                        .fail(job_id, lease, &error.diagnostic(), now)?;
                 }
             }
         }

@@ -591,8 +591,8 @@ pub enum ChildTurnError {
 /// Creating a session, recording its parent, and driving a turn all belong to layers
 /// above this one, and `zuno-engine` exposes no seam a tool can hold: `run_turn` wants
 /// a `&mut Connection`, a provider registry, and the very dispatcher that is calling
-/// this tool. So the contract is stated here and satisfied there, exactly as
-/// [`crate::plan_exit::PlanExitHost`] does for session messages.
+/// this tool. The typed host contract separates tool intent from those lifecycle
+/// effects and the durable child-session implementation.
 #[async_trait]
 pub trait ChildTurnHost: Send + Sync + 'static {
     /// How many delegation hops already separate `session_id` from the user's.
@@ -1385,8 +1385,7 @@ fn render(
 
 /// Catalog facts stated by hand, for a test or an unconfigured install.
 ///
-/// Public for the same reason [`crate::plan_exit::RecordingHost`] is: the seam it
-/// stands in for lives above this crate, so a caller integrating that seam needs
+/// The seam it stands in for lives above this crate, so an integrating caller needs
 /// something to hold while doing it, and every assertion about effort honouring has
 /// to be able to declare a non-reasoning model without a models.dev document.
 #[derive(Debug, Clone, Default)]

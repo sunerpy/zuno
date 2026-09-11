@@ -160,3 +160,27 @@ Registration reads early completions; publication wakes only waiting Jobs.
 Consumption, tool results, checkpoint/version and lease release are atomic.
 The captured format-4 fixture verifies preserved messages, signed metadata,
 usage, budgets and lease state across rollback and forward migration.
+
+
+## Canonical context and input application
+
+Format 6 adds owner-scoped canonical context state and input execution receipts.
+Tracker revision CAS, epoch/time monotonicity and duplicate handling share the
+SQLite validation rules. A provider request commits its initial assistant,
+request event, database-assigned request sequence and context state atomically.
+Assistant completion also commits its context snapshot with parts and usage.
+No SQLite connection is passed through the shared driver or Worker protocol.
+
+The root materializer distinguishes received/history-recorded input from input
+actually applied immediately before provider dispatch. A consumed legacy input
+is backfilled as recorded, not as proof that a model executed it. Remote steering
+and arbitrary old-turn reassignment remain unsupported.
+
+A pre-canonical PostgreSQL session retains its authoritative cumulative usage;
+its context occupancy stays unknown until a current request supplies a confirmed
+measurement. The current request's post-hook estimate still protects its context
+limit. No incomplete history is treated as an exact old context window.
+
+The captured format-5 fixture preserves pending waits, Job budgets, lease state,
+messages and usage across failed/successful format-6 migration. The internal Worker
+protocol is version 3; it is separate from public UI DTOs.

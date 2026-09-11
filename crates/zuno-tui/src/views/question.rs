@@ -28,11 +28,21 @@
 //! single-select question answers with a one-element list. That is what keeps
 //! `answers[i]` positional and lets an empty list mean "unanswered" rather than
 //! needing a separate sentinel.
+//!
+//! # Reopening and deferring
+//!
+//! [`QuestionPrompt::with_answers`] restores a stored positional answer set without
+//! submitting it. Moving between questions only moves focus; it never selects the
+//! highlighted option. An explicit defer, or a submit that reaches the end with
+//! unanswered questions, returns [`DialogOutcome::QuestionDeferred`]. That outcome
+//! carries the answers and any current custom draft for persistence and reopening,
+//! even when every slot is filled; it is never approval. Only an explicit submit
+//! with every question answered returns [`DialogOutcome::Question`].
 
 use crate::keybind::Definition;
 use crate::views::dialog::{Dialog, DialogOutcome, DialogPlacement, DialogStep};
 use crate::views::{ViewContext, padded};
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use serde::{Deserialize, Serialize};
@@ -150,7 +160,58 @@ impl QuestionPrompt {
         }
     }
 
-    /// The answers collected so far, positional with the questions.
+    /// Restore stored answers and focus the first unanswered question.
+    ///
+    /// Call on a newly constructed prompt before opening it. Each outer slot
+    /// corresponds to the question at the same index; an empty slot is unanswered.
+    /// Missing slots are padded and surplus slots are discarded. A blank answer,
+    /// multiple answers to a single-select question, or an unknown label when
+    /// `custom: false` leaves that question unanswered, without choosing a default.
+    ///
+    /// Selected options and custom text are restored, including embedded newlines.
+    /// Enter on a restored custom row opens its editor. Restoring even a complete
+    /// answer set does not submit it or approve a closed confirmation question.
+    #[must_use]
+    pub fn with_answers(mut self, mut answers: Vec<Vec<String>>) -> Self {
+        answers.resize_with(self.questions.len(), Vec::new);
+        for (index, question) in self.questions.iter().enumerate() {
+            let answer = &mut answers[index];
+            if (!question.is_multiple() && answer.len() > 1)
+                || answer.iter().any(|label| {
+                    label.trim().is_empty()
+                        || (!question.allows_custom()
+                            && !question.options.iter().any(|option| option.label == *label))
+                })
+            {
+                answer.clear();
+            }
+            self.editing[index] = false;
+            self.drafts[index].clear();
+            if let Some(custom) = answer.iter().find(|label| {
+                !question
+                    .options
+                    .iter()
+                    .any(|option| option.label == **label)
+            }) {
+                self.drafts[index].clone_from(custom);
+                self.cursors[index] = question.options.len();
+            } else {
+                self.cursors[index] = question
+                    .options
+                    .iter()
+                    .position(|option| answer.contains(&option.label))
+                    .unwrap_or_default();
+            }
+        }
+        self.current = answers.iter().position(Vec::is_empty).unwrap_or_default();
+        self.answers = answers;
+        self
+    }
+
+    /// The confirmed answers so far, positional with the questions.
+    ///
+    /// A custom draft still being edited is included in the deferred outcome when
+    /// the user chooses to answer later.
     #[must_use]
     pub fn answers(&self) -> &[Vec<String>] {
         &self.answers
@@ -204,6 +265,9 @@ impl QuestionPrompt {
         let Some(option) = self.question().options.get(self.cursor()) else {
             return;
         };
+        if option.label.trim().is_empty() {
+            return;
+        }
         let label = option.label.clone();
         let answers = &mut self.answers[self.current];
         if let Some(index) = answers.iter().position(|held| *held == label) {
@@ -213,21 +277,42 @@ impl QuestionPrompt {
         }
     }
 
-    /// Record the current question's answer and move on, resolving after the last.
+    /// Move on after an explicit answer, preserving any skipped slots at the end.
     fn advance(&mut self) -> DialogStep {
+        self.editing[self.current] = false;
+        if self.answers.iter().all(|answer| !answer.is_empty()) {
+            return DialogStep::Resolved(DialogOutcome::Question(std::mem::take(
+                &mut self.answers,
+            )));
+        }
         if self.current + 1 < self.questions.len() {
             self.current += 1;
             return DialogStep::Redraw;
         }
-        DialogStep::Resolved(DialogOutcome::Question(std::mem::take(&mut self.answers)))
+        self.defer()
+    }
+
+    fn save_custom_answer(&mut self) {
+        let typed = self.draft().trim().to_owned();
+        self.answers[self.current] = if typed.is_empty() {
+            Vec::new()
+        } else {
+            vec![typed]
+        };
+    }
+
+    fn defer(&mut self) -> DialogStep {
+        if self.is_editing() {
+            self.save_custom_answer();
+        }
+        DialogStep::Resolved(DialogOutcome::QuestionDeferred(std::mem::take(
+            &mut self.answers,
+        )))
     }
 
     fn submit(&mut self) -> DialogStep {
         if self.is_custom_row() {
-            let typed = self.draft().trim().to_owned();
-            if !typed.is_empty() {
-                self.answers[self.current] = vec![typed];
-            }
+            self.save_custom_answer();
             return self.advance();
         }
         if !self.question().is_multiple() {
@@ -235,6 +320,7 @@ impl QuestionPrompt {
                 .question()
                 .options
                 .get(self.cursor())
+                .filter(|option| !option.label.trim().is_empty())
                 .map(|option| vec![option.label.clone()])
                 .unwrap_or_default();
         }
@@ -364,7 +450,9 @@ impl Dialog for QuestionPrompt {
     }
 
     fn title(&self) -> String {
-        let question = self.question();
+        let Some(question) = self.questions.get(self.current) else {
+            return String::from("Question (0 unanswered)");
+        };
         let unanswered = self
             .answers
             .iter()
@@ -383,7 +471,13 @@ impl Dialog for QuestionPrompt {
     }
 
     fn lines(&mut self, width: u16) -> Vec<Line<'static>> {
-        let question = &self.questions[self.current];
+        let Some(question) = self.questions.get(self.current) else {
+            return vec![padded(
+                " No questions to answer",
+                width,
+                self.context.muted(),
+            )];
+        };
         let selected = &self.answers[self.current];
         let mut lines = Vec::new();
         let question_style = if selected.is_empty() {
@@ -465,17 +559,29 @@ impl Dialog for QuestionPrompt {
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        if self.questions.is_empty() {
+            return vec![("ctrl+s", "answer later"), ("esc", "cancel")];
+        }
         if self.is_editing() {
             return vec![
-                ("shift+enter", "newline"),
                 ("enter", "submit"),
+                ("ctrl+s", "answer later"),
+                ("shift+enter", "newline"),
                 ("esc", "cancel"),
             ];
         }
-        let mut hints = vec![("enter", "confirm"), ("1-9", "choose"), ("↑↓/jk", "move")];
+        let submit = if self.is_custom_row() {
+            "edit"
+        } else if self.question().is_multiple() {
+            "submit"
+        } else {
+            "confirm"
+        };
+        let mut hints = vec![("enter", submit), ("ctrl+s", "answer later")];
         if self.question().is_multiple() {
-            hints.insert(1, ("space", "toggle"));
+            hints.push(("space", "toggle"));
         }
+        hints.extend([("1-9", "choose"), ("↑↓/jk", "move")]);
         if self.questions.len() > 1 {
             hints.push(("←→", "question"));
         }
@@ -488,24 +594,47 @@ impl Dialog for QuestionPrompt {
     }
 
     fn focused_scopes(&self) -> Vec<&'static str> {
-        vec!["dialog.question"]
+        if self.is_editing() {
+            // Own the text-editing bindings even when the host has no composer
+            // scope. Keep Enter assigned to this dialog before the input scope.
+            vec!["dialog.question", "dialog.prompt", "input"]
+        } else {
+            vec!["dialog.question"]
+        }
     }
 
     fn handle_typed(&mut self, key: &KeyEvent) -> DialogStep {
-        if !self.is_editing() {
-            return match key.code {
-                KeyCode::Char(character) => self.choose_digit(character),
-                _ => DialogStep::Ignored,
-            };
+        if self.questions.is_empty() || (!self.is_editing() && !key.modifiers.is_empty()) {
+            return DialogStep::Ignored;
         }
-        if let Some(character) = crate::views::permission::typed_character(key) {
+        let Some(character) = crate::views::permission::typed_character(key) else {
+            return DialogStep::Ignored;
+        };
+        if self.is_editing() {
             self.drafts[self.current].push(character);
             return DialogStep::Redraw;
         }
-        DialogStep::Ignored
+        if character == ' ' && self.question().is_multiple() && !self.is_custom_row() {
+            self.toggle();
+            return DialogStep::Redraw;
+        }
+        self.choose_digit(character)
     }
 
     fn handle_action(&mut self, action: &'static Definition, event: &KeyEvent) -> DialogStep {
+        match action.name {
+            "dialog.question.defer" => return self.defer(),
+            "app_exit" | "session_interrupt" => {
+                return DialogStep::Resolved(DialogOutcome::Cancelled);
+            }
+            _ => {}
+        }
+        if self.questions.is_empty() {
+            return match action.name {
+                "dialog.prompt.submit" | "dialog.select.submit" => self.defer(),
+                _ => DialogStep::Ignored,
+            };
+        }
         if self.is_editing() {
             match action.name {
                 "dialog.prompt.submit" | "dialog.select.submit" => return self.submit(),
@@ -516,9 +645,6 @@ impl Dialog for QuestionPrompt {
                 "input_backspace" => {
                     self.drafts[self.current].pop();
                     return DialogStep::Redraw;
-                }
-                "app_exit" | "session_interrupt" => {
-                    return DialogStep::Resolved(DialogOutcome::Cancelled);
                 }
                 _ => return self.handle_typed(event),
             }
@@ -544,9 +670,8 @@ impl Dialog for QuestionPrompt {
                 DialogStep::Redraw
             }
             "dialog.mcp.toggle" => {
-                // The table's only `space` binding. A multi-select question needs
-                // one, and adding a second `space` row would be a keybind conflict
-                // the table rejects at construction.
+                // Accept the existing toggle action as well as the unbound
+                // printable space handled by `handle_typed`.
                 if self.question().is_multiple() && !self.is_custom_row() {
                     self.toggle();
                     return DialogStep::Redraw;
@@ -554,31 +679,19 @@ impl Dialog for QuestionPrompt {
                 DialogStep::Ignored
             }
             "dialog.select.submit" | "dialog.prompt.submit" => {
-                if self.is_custom_row() && !self.is_editing() && self.draft().is_empty() {
+                if self.is_custom_row() {
                     self.editing[self.current] = true;
                     return DialogStep::Redraw;
                 }
                 self.submit()
             }
-            "app_exit" | "session_interrupt" => DialogStep::Resolved(DialogOutcome::Cancelled),
-            _ => {
-                if let KeyCode::Char(' ') = event.code
-                    && self.question().is_multiple()
-                    && !self.is_custom_row()
-                {
-                    self.toggle();
-                    return DialogStep::Redraw;
-                }
-                match event.code {
-                    KeyCode::Char(character) => self.choose_digit(character),
-                    _ => DialogStep::Ignored,
-                }
-            }
+            _ => self.handle_typed(event),
         }
     }
 
     fn handle_mouse(&mut self, event: &MouseEvent, body: Rect) -> DialogStep {
-        if event.column < body.left()
+        if self.questions.is_empty()
+            || event.column < body.left()
             || event.column >= body.right()
             || event.row < body.top()
             || event.row >= body.bottom()
@@ -614,6 +727,7 @@ impl Dialog for QuestionPrompt {
             self.editing[self.current] = true;
             return DialogStep::Redraw;
         }
+        self.editing[self.current] = false;
         if self.question().is_multiple() {
             self.toggle();
             DialogStep::Redraw

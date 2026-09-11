@@ -1,3 +1,4 @@
+use schemars::JsonSchema;
 use serde_json::{Map, Value, json};
 
 type BodySchemaGap = (&'static str, &'static str, &'static str);
@@ -31,16 +32,6 @@ pub const OPERATIONS: &[(&str, &str)] = &[
         "/api/session/{sessionID}/permission/{requestID}/reply",
         "post",
     ),
-    ("/api/question/request", "get"),
-    ("/api/session/{sessionID}/question", "get"),
-    (
-        "/api/session/{sessionID}/question/{requestID}/reply",
-        "post",
-    ),
-    (
-        "/api/session/{sessionID}/question/{requestID}/reject",
-        "post",
-    ),
     ("/api/session", "get"),
     ("/api/session", "post"),
     ("/api/session/prune", "get"),
@@ -64,6 +55,26 @@ pub const OPERATIONS: &[(&str, &str)] = &[
     ("/api/session/{sessionID}/interrupt", "post"),
     ("/api/session/{sessionID}/message", "get"),
 ];
+
+/// Operations mounted only when the application supplies a question provider.
+const QUESTION_OPERATIONS: &[(&str, &str)] = &[
+    ("/api/question/request", "get"),
+    ("/api/session/{sessionID}/question", "get"),
+    (
+        "/api/session/{sessionID}/question/{requestID}/reply",
+        "post",
+    ),
+    (
+        "/api/session/{sessionID}/question/{requestID}/reject",
+        "post",
+    ),
+    (
+        "/api/session/{sessionID}/question/{requestID}/defer",
+        "post",
+    ),
+];
+
+const CONTROL_OPERATIONS: &[(&str, &str)] = &[("/api/session/{sessionID}/resume", "post")];
 
 const BODY_SCHEMA_GAPS: &[BodySchemaGap] = &[
     (
@@ -230,10 +241,6 @@ pub(crate) const fn body_schema_gaps() -> &'static [BodySchemaGap] {
 #[cfg(test)]
 const BODYLESS_OPERATIONS: &[(&str, &str)] = &[
     ("/api/pty/{ptyID}", "delete"),
-    (
-        "/api/session/{sessionID}/question/{requestID}/reject",
-        "post",
-    ),
     ("/api/session/{sessionID}/compact", "post"),
     ("/api/session/{sessionID}/wait", "post"),
     ("/api/session/{sessionID}/revert/clear", "post"),
@@ -243,8 +250,31 @@ const BODYLESS_OPERATIONS: &[(&str, &str)] = &[
 
 #[must_use]
 pub fn document() -> Value {
+    document_for(false, false)
+}
+
+#[must_use]
+pub fn document_with_questions() -> Value {
+    document_for(true, false)
+}
+
+pub(super) fn document_for(has_questions: bool, has_controls: bool) -> Value {
     let mut paths = Map::new();
-    for (path, method) in OPERATIONS {
+    let question_operations = if has_questions {
+        QUESTION_OPERATIONS
+    } else {
+        &[]
+    };
+    let control_operations = if has_controls {
+        CONTROL_OPERATIONS
+    } else {
+        &[]
+    };
+    for (path, method) in OPERATIONS
+        .iter()
+        .chain(question_operations)
+        .chain(control_operations)
+    {
         let item = paths
             .entry((*path).to_owned())
             .or_insert_with(|| Value::Object(Map::new()));
@@ -263,7 +293,7 @@ pub fn document() -> Value {
             methods.insert((*method).to_owned(), operation);
         }
     }
-    json!({
+    let mut document = json!({
         "openapi": "3.1.0",
         "info": {"title": "Zuno API", "version": env!("CARGO_PKG_VERSION")},
         "paths": paths,
@@ -273,6 +303,9 @@ pub fn document() -> Value {
                 "SessionCreate": schemars::schema_for!(super::session::CreateSessionBody),
                 "SessionResponse": schemars::schema_for!(super::Data<super::session::SessionInfo>),
                 "LearningStateResponse": schemars::schema_for!(super::Data<zuno_types::LearningStateProjection>),
+                "InputAdmissionReceipt": question_schema::<zuno_types::admission::InputAdmissionReceipt>("InputAdmissionReceipt"),
+                "ContextUsageSnapshot": question_schema::<zuno_types::context_usage::ContextUsageSnapshot>("ContextUsageSnapshot"),
+                "GoalResumeRequest": question_schema::<zuno_types::goal_resume::GoalResumeRequest>("GoalResumeRequest"),
                 "SessionListResponse": schemars::schema_for!(super::session::SessionListResponse),
                 "SessionActive": schemars::schema_for!(super::session::SessionActive),
                 "SessionActiveResponse": schemars::schema_for!(super::session::SessionActiveResponse),
@@ -292,18 +325,78 @@ pub fn document() -> Value {
                 "PermissionReply": schemars::schema_for!(
                     super::request::PermissionReplyBody
                 ),
-                "QuestionRequestListResponse": schemars::schema_for!(
-                    super::request::LocationResponse<crate::QuestionRequest>
-                ),
-                "SessionQuestionResponse": schemars::schema_for!(
-                    super::Data<Vec<crate::QuestionRequest>>
-                ),
-                "QuestionReply": schemars::schema_for!(
-                    super::request::QuestionReplyBody
-                )
             }
         }
-    })
+    });
+    if has_questions {
+        let schemas = document["components"]["schemas"]
+            .as_object_mut()
+            .expect("schema object");
+        schemas.extend(
+            json!({
+                "QuestionRequestListResponse": question_schema::<
+                    super::request::LocationResponse<zuno_types::question::QuestionView>
+                >("QuestionRequestListResponse"),
+                "SessionQuestionResponse": question_schema::<
+                    super::Data<Vec<zuno_types::question::QuestionView>>
+                >("SessionQuestionResponse"),
+                "QuestionCommand": question_schema::<zuno_types::question::QuestionCommand>("QuestionCommand"),
+                "QuestionReceiptResponse": question_schema::<
+                    super::Data<zuno_types::question::QuestionReceipt>
+                >("QuestionReceiptResponse"),
+                "QuestionErrorResponse": question_schema::<super::request::QuestionErrorResponse>("QuestionErrorResponse")
+            })
+            .as_object()
+            .expect("question schemas")
+            .clone(),
+        );
+    }
+    if has_controls {
+        document["components"]["schemas"]["SessionResumeRequest"] =
+            question_schema::<super::session::ResumeBody>("SessionResumeRequest");
+        document["components"]["schemas"]["SessionResumeResponse"] =
+            question_schema::<super::Data<super::session::ResumeAdmitted>>("SessionResumeResponse");
+    }
+    // Session projections now contain the same nested Context/receipt schemas
+    // as dedicated responses. Every component's local definitions must resolve
+    // relative to that component, not the OpenAPI document root.
+    for (name, schema) in document["components"]["schemas"]
+        .as_object_mut()
+        .expect("schema object")
+    {
+        rebase_schema_refs(schema, &format!("#/components/schemas/{name}"));
+    }
+    document
+}
+
+/// Schemars' local definition references must resolve inside the OpenAPI document.
+fn question_schema<T: JsonSchema>(name: &str) -> Value {
+    let mut schema = serde_json::to_value(schemars::schema_for!(T)).expect("schema serializes");
+    rebase_schema_refs(&mut schema, &format!("#/components/schemas/{name}"));
+    schema
+}
+
+fn rebase_schema_refs(value: &mut Value, base: &str) {
+    match value {
+        Value::Object(fields) => {
+            if let Some(Value::String(reference)) = fields.get_mut("$ref") {
+                if reference == "#" {
+                    *reference = base.to_owned();
+                } else if let Some(local) = reference.strip_prefix("#/$defs/") {
+                    *reference = format!("{base}/$defs/{local}");
+                }
+            }
+            for child in fields.values_mut() {
+                rebase_schema_refs(child, base);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                rebase_schema_refs(child, base);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn bind_existing_body_schemas(operation: &mut Value, method: &str, path: &str) {
@@ -312,6 +405,14 @@ fn bind_existing_body_schemas(operation: &mut Value, method: &str, path: &str) {
         ("post", "/api/session") => {
             bind_request(operation, "SessionCreate");
             bind_response(operation, "SessionResponse");
+        }
+        ("post", "/api/session/{sessionID}/resume") => {
+            bind_request(operation, "SessionResumeRequest");
+            bind_response(operation, "SessionResumeResponse");
+            operation["responses"]["400"] =
+                json!({"description":"Invalid request or expectedRevision"});
+            operation["responses"]["404"] = json!({"description":"Session does not exist"});
+            operation["responses"]["409"] = json!({"description":"Stale revision, Plan mode, exact wait, inactive Goal, or Work is not explicitly paused/completed"});
         }
         ("post", "/api/session/prune") => {
             bind_request(operation, "SessionPruneMutation");
@@ -350,14 +451,46 @@ fn bind_existing_body_schemas(operation: &mut Value, method: &str, path: &str) {
         }
         ("get", "/api/question/request") => {
             bind_response(operation, "QuestionRequestListResponse");
+            bind_question_errors(operation);
         }
         ("get", "/api/session/{sessionID}/question") => {
             bind_response(operation, "SessionQuestionResponse");
+            bind_question_errors(operation);
         }
-        ("post", "/api/session/{sessionID}/question/{requestID}/reply") => {
-            bind_request(operation, "QuestionReply");
+        ("post", "/api/session/{sessionID}/question/{requestID}/reply")
+        | ("post", "/api/session/{sessionID}/question/{requestID}/reject")
+        | ("post", "/api/session/{sessionID}/question/{requestID}/defer") => {
+            bind_request(operation, "QuestionCommand");
+            bind_response(operation, "QuestionReceiptResponse");
+            bind_question_errors(operation);
         }
         _ => {}
+    }
+}
+
+fn bind_question_errors(operation: &mut Value) {
+    for (status, description) in [
+        (
+            "400",
+            "Invalid path, body, command, item ID, answer, or route action; the question remains unchanged",
+        ),
+        ("404", "The session or question does not exist"),
+        (
+            "409",
+            "Stale revision, reused command ID with different input, closed question, or rejected Plan/Goal transition",
+        ),
+        ("500", "Question storage or worker failed"),
+        (
+            "503",
+            "The injected question provider is temporarily unavailable",
+        ),
+    ] {
+        operation["responses"][status] = json!({
+            "description": description,
+            "content": {"application/json": {
+                "schema": {"$ref": "#/components/schemas/QuestionErrorResponse"}
+            }}
+        });
     }
 }
 
@@ -375,7 +508,16 @@ fn operation_description(method: &str, path: &str) -> Option<&'static str> {
             Some("Lists pending durable human-input requests in deterministic creation order.")
         }
         ("post", "/api/session/{sessionID}/question/{requestID}/reply") => Some(
-            "Atomically settles one durable question and admits the model-visible answer to the session inbox.",
+            "Applies a revision-checked, idempotent QuestionCommand through the configured provider and returns its committed receipt. Answers use stable item IDs. Empty answers do not enter model input. Plan approval requires an explicit plan_decision action.",
+        ),
+        ("post", "/api/session/{sessionID}/question/{requestID}/reject") => Some(
+            "Applies an explicit cancel QuestionCommand. commandId and expectedRevision are required; an absent body is not consent or cancellation.",
+        ),
+        ("post", "/api/session/{sessionID}/question/{requestID}/defer") => Some(
+            "Applies an explicit defer QuestionCommand with optional draftAnswers and returns its committed receipt. Draft values remain client-only. Deferral leaves the question pending, creates no model inbox input, and does not authorize Work.",
+        ),
+        ("post", "/api/session/{sessionID}/resume") => Some(
+            "Explicitly resumes the exact paused or completed Work revision through native session control. It does not authorize a Plan or waive an exact wait. The response identifies the committed control input, not completed execution.",
         ),
         ("put", "/api/session/{sessionID}/memory-policy") => Some(
             "Updates useMemories and enabled|disabled generation through the session's active TurnHost. expectedRevision is a compare-and-set guard; excluded is host-owned and cannot be requested.",
@@ -420,6 +562,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn context_and_receipt_schema_references_resolve_in_the_whole_openapi_document() {
+        fn check(document: &Value, value: &Value) {
+            match value {
+                Value::Object(fields) => {
+                    if let Some(Value::String(reference)) = fields.get("$ref")
+                        && let Some(pointer) = reference.strip_prefix('#')
+                    {
+                        assert!(
+                            document.pointer(pointer).is_some(),
+                            "unresolved schema ref {reference}"
+                        );
+                    }
+                    for value in fields.values() {
+                        check(document, value);
+                    }
+                }
+                Value::Array(values) => {
+                    for value in values {
+                        check(document, value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let document = document_for(true, true);
+        check(&document, &document);
+    }
+
+    #[test]
     fn every_operation_is_bound_bodyless_or_a_reasoned_frozen_gap() {
         assert_eq!(
             BODY_SCHEMA_GAPS.len(),
@@ -428,14 +599,19 @@ mod tests {
         );
         assert_eq!(
             BODYLESS_OPERATIONS.len(),
-            7,
+            6,
             "review and re-freeze every bodyless change"
         );
 
-        let operations = OPERATIONS.iter().copied().collect::<BTreeSet<_>>();
+        let operations = OPERATIONS
+            .iter()
+            .chain(QUESTION_OPERATIONS)
+            .chain(CONTROL_OPERATIONS)
+            .copied()
+            .collect::<BTreeSet<_>>();
         assert_eq!(
             operations.len(),
-            OPERATIONS.len(),
+            OPERATIONS.len() + QUESTION_OPERATIONS.len() + CONTROL_OPERATIONS.len(),
             "duplicate OpenAPI operation"
         );
         let gaps = BODY_SCHEMA_GAPS
@@ -464,8 +640,12 @@ mod tests {
             "an operation cannot be both bodyless and a body-schema gap"
         );
 
-        let document = document();
-        for (path, method) in OPERATIONS {
+        let document = document_for(true, true);
+        for (path, method) in OPERATIONS
+            .iter()
+            .chain(QUESTION_OPERATIONS)
+            .chain(CONTROL_OPERATIONS)
+        {
             let operation = &document["paths"][path][method];
             let bound = operation.get("requestBody").is_some()
                 || operation["responses"]["200"].get("content").is_some();
@@ -482,5 +662,20 @@ mod tests {
                 key.0
             );
         }
+    }
+
+    #[test]
+    fn question_operations_require_a_configured_provider() {
+        let without = document();
+        let with = document_with_questions();
+        for (path, method) in QUESTION_OPERATIONS {
+            assert!(without["paths"].get(*path).is_none());
+            assert!(with["paths"][path][method].is_object());
+        }
+        assert!(
+            without["components"]["schemas"]
+                .get("QuestionCommand")
+                .is_none()
+        );
     }
 }

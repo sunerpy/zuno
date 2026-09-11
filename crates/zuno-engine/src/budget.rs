@@ -298,6 +298,15 @@ pub trait TurnBudgetPolicy: Send + Sync {
         Ok(BudgetDecision::Continue)
     }
 
+    /// Admission after a durable tool wait. It must not account for the previous
+    /// provider response again; the default reuses the non-billing admission hook.
+    async fn before_tool_continuation(
+        &self,
+        snapshot: &TurnUsageSnapshot<'_>,
+    ) -> Result<BudgetDecision, BudgetPolicyError> {
+        self.before_request(snapshot).await
+    }
+
     /// Called after each provider response is accounted for.
     ///
     /// # Errors

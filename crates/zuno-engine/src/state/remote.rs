@@ -83,6 +83,101 @@ fn advance_error(failure: StateFailure) -> AdvanceError {
 
 #[async_trait]
 impl TurnPersistence for RemoteTurnPersistence {
+    async fn mark_inputs_applied(
+        &self,
+        scope: &TurnStateScope,
+        turn_id: &str,
+        input_ids: &[String],
+        at_ms: i64,
+    ) -> Result<(), TurnError> {
+        self.done(
+            scope,
+            StateCommand::MarkInputsApplied {
+                turn_id: zuno_types::identity::TurnId::new(turn_id)
+                    .map_err(|_| TurnStateError::InvalidData)?,
+                input_ids: input_ids
+                    .iter()
+                    .map(|id| {
+                        zuno_types::identity::InputId::new(id)
+                            .map_err(|_| TurnStateError::InvalidData)
+                    })
+                    .collect::<Result<_, _>>()?,
+                at_ms,
+            },
+        )
+        .await
+    }
+
+    async fn context_usage(
+        &self,
+        scope: &TurnStateScope,
+    ) -> Result<crate::context_usage::ContextUsageSeed, TurnError> {
+        match self.call(scope, StateCommand::ContextUsage).await? {
+            StateReply::ContextUsage(seed)
+                if seed.tracker.snapshot().session_id == scope.session_id =>
+            {
+                Ok(*seed)
+            }
+            _ => Err(TurnStateError::InvalidData.into()),
+        }
+    }
+
+    async fn commit_context_usage(
+        &self,
+        scope: &TurnStateScope,
+        update: &zuno_types::context_usage::ContextUsageWrite,
+    ) -> Result<(), TurnError> {
+        self.done(
+            scope,
+            StateCommand::CommitContextUsage(Box::new(update.clone())),
+        )
+        .await
+    }
+
+    async fn start_provider_request(
+        &self,
+        scope: &TurnStateScope,
+        commit: ProviderRequestCommit,
+    ) -> Result<ProviderRequestReceipt, TurnError> {
+        match self
+            .call(
+                scope,
+                StateCommand::StartProviderRequest(Box::new(commit.into())),
+            )
+            .await?
+        {
+            StateReply::ProviderRequest { event, context }
+                if event.session_id.as_str() == scope.session_id
+                    && context.snapshot().session_id == scope.session_id =>
+            {
+                Ok(ProviderRequestReceipt {
+                    event: event.into(),
+                    context: *context,
+                })
+            }
+            _ => Err(TurnStateError::InvalidData.into()),
+        }
+    }
+
+    async fn applicable_inputs(
+        &self,
+        scope: &TurnStateScope,
+        candidates: &[String],
+    ) -> Result<Vec<String>, TurnError> {
+        match self
+            .call(
+                scope,
+                StateCommand::ApplicableInputs {
+                    candidates: candidates.to_vec(),
+                },
+            )
+            .await?
+        {
+            StateReply::InputIds(ids) if ids.iter().all(|id| candidates.contains(id)) => Ok(ids),
+            _ => Err(TurnStateError::InvalidData.into()),
+        }
+    }
+
     async fn session(&self, scope: &TurnStateScope) -> Result<TurnSession, TurnError> {
         match self.call(scope, StateCommand::Session).await? {
             StateReply::Session { id, parent_id } if id.as_str() == scope.session_id => {
@@ -172,8 +267,11 @@ impl TurnPersistence for RemoteTurnPersistence {
         scope: &TurnStateScope,
         commit: &AssistantCommit,
     ) -> Result<(), TurnError> {
-        self.done(scope, StateCommand::CommitAssistant(commit.into()))
-            .await
+        self.done(
+            scope,
+            StateCommand::CommitAssistant(Box::new(commit.into())),
+        )
+        .await
     }
     async fn append_event(
         &self,
@@ -236,7 +334,7 @@ impl TurnPersistence for RemoteTurnPersistence {
         request: &AdvanceRequest,
     ) -> Result<BeginAdvance, AdvanceError> {
         match self
-            .exchange(scope, StateCommand::BeginAdvance(request.into()))
+            .exchange(scope, StateCommand::BeginAdvance(Box::new(request.into())))
             .await
             .map_err(advance_error)?
         {
@@ -257,9 +355,9 @@ impl TurnPersistence for RemoteTurnPersistence {
             .exchange(
                 scope,
                 StateCommand::CommitAdvance {
-                    request: request.into(),
+                    request: Box::new(request.into()),
                     admission: Box::new(admission.clone()),
-                    state,
+                    state: Box::new(state),
                 },
             )
             .await

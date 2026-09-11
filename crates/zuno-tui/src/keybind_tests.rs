@@ -413,6 +413,37 @@ fn question_navigation_resolves_only_in_the_question_dialog_scope() {
 }
 
 #[test]
+fn question_defer_has_a_distinct_scope_local_binding() {
+    let mut keymap = Keymap::defaults().expect("the shipped defaults must not conflict");
+    let chord = Chord::parse("ctrl+s").expect("valid defer chord");
+    assert!(!is_exit_chord(chord), "deferring must not request app exit");
+    let now = Instant::now();
+    let Resolution::Action { definition, .. } = keymap.resolve(
+        &[
+            "dialog.question",
+            "dialog.prompt",
+            "input",
+            "dialog.select",
+            "session",
+            "app",
+        ],
+        chord,
+        now,
+    ) else {
+        panic!("defer is not reachable while answering or editing a question");
+    };
+    assert_eq!(definition.name, "dialog.question.defer");
+    assert!(matches!(
+        keymap.resolve(
+            &["dialog.prompt", "input", "dialog.select", "session", "app"],
+            chord,
+            now
+        ),
+        Resolution::Unmatched
+    ));
+}
+
+#[test]
 fn a_leader_sequence_resolves_end_to_end() {
     let mut keymap = Keymap::defaults().expect("defaults build");
     let start = Instant::now();

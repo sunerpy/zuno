@@ -134,6 +134,13 @@ pub(crate) async fn finish_in(
          WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3",
     ).bind(lease.owner.tenant_id.as_str()).bind(lease.owner.principal_id.as_str()).bind(job.id.as_str()).bind(phase).bind(time)
         .execute(&mut **tx).await.map_err(database_error)?;
+    if matches!(phase, "completed" | "failed" | "cancelled") {
+        query(
+            "UPDATE zuno_enterprise_preview.input_execution_receipt SET state=$4,completed_at=COALESCE(completed_at,$5),time_updated=$5
+             WHERE tenant_id=$1 AND principal_id=$2 AND input_id=$3 AND state IN('admitted','recorded','applied')",
+        ).bind(lease.owner.tenant_id.as_str()).bind(lease.owner.principal_id.as_str()).bind(job.input_id.as_str())
+            .bind(phase).bind(time).execute(&mut **tx).await.map_err(database_error)?;
+    }
     release(tx, lease, "completed", time, phase != "uncertain").await?;
     emit(
         tx,

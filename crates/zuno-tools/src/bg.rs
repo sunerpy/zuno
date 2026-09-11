@@ -29,11 +29,13 @@ use zuno_db::inbox::{InputDelivery, NewSessionInput};
 use zuno_error::ToolError;
 use zuno_paths::GeneratedDirectory;
 use zuno_pty::{
-    BackgroundExecutionId, BackgroundExecutionInfo, BackgroundExecutionOutput,
-    BackgroundExecutionService, ReplayCursor,
+    BackgroundExecutionError, BackgroundExecutionId, BackgroundExecutionInfo,
+    BackgroundExecutionOutput, BackgroundExecutionService, ForegroundExecution,
+    ForegroundWaitOutcome, ReplayCursor,
 };
 use zuno_tool::{
     ToolContext, ToolEffect, ToolOutput, ToolOutputStore, ToolReplayPolicy, TypedTool,
+    VerificationReceipt,
 };
 use zuno_types::execution::{CompletionEnvelope, CompletionSource, InputTriggerKind};
 
@@ -152,7 +154,7 @@ pub struct BackgroundParams {
 pub struct BackgroundTool {
     service: Arc<BackgroundExecutionService>,
     output_store: Option<ToolOutputStore>,
-    completion_delivery: Option<CompletionDeliveryStore>,
+    completion_pool: Option<Arc<zuno_db::Pool>>,
 }
 
 impl BackgroundTool {
@@ -175,7 +177,7 @@ impl BackgroundTool {
         Self {
             service,
             output_store,
-            completion_delivery: None,
+            completion_pool: None,
         }
     }
 
@@ -192,7 +194,7 @@ impl BackgroundTool {
     /// Arbitrate terminal completion with the asynchronous callback path.
     #[must_use]
     pub fn with_completion_delivery(mut self, pool: Arc<zuno_db::Pool>) -> Self {
-        self.completion_delivery = Some(CompletionDeliveryStore::new(pool));
+        self.completion_pool = Some(pool);
         self
     }
 
@@ -203,7 +205,7 @@ impl BackgroundTool {
     ) -> Result<(BackgroundExecutionId, BackgroundExecutionInfo), ToolError> {
         let raw = raw.ok_or_else(|| invalid(format!("{TASK_ID} is required for this action")))?;
         let id = BackgroundExecutionId::parse(raw).map_err(failed)?;
-        let info = self.service.get(&id).map_err(failed)?;
+        let info = self.service.get(&id).map_err(observation_failed)?;
         if info.session_id != session_id {
             return Err(invalid(
                 "background execution was not found for this session",
@@ -235,6 +237,129 @@ impl BackgroundTool {
             )
             .map_err(failed)
     }
+
+    /// Claim only the terminal state this read actually exposes, after its output
+    /// window was read successfully. Running snapshots must leave callback delivery
+    /// available even if the process settles immediately after the snapshot.
+    fn consume_terminal_inline(&self, info: &BackgroundExecutionInfo) -> Result<bool, ToolError> {
+        if !info.status.is_terminal() {
+            return Ok(false);
+        }
+        let Some(pool) = &self.completion_pool else {
+            return Ok(false);
+        };
+        let delivery = CompletionDeliveryStore::new(Arc::clone(pool));
+        let envelope = background_completion_envelope(info);
+        let completed_at = completion_time(info);
+        delivery
+            .publish(envelope.clone(), completed_at)
+            .map_err(failed)?;
+        delivery
+            .claim_inline(
+                &envelope.source_key,
+                zuno_db::message::now_millis().max(completed_at),
+            )
+            .map(|claimed| claimed.is_some())
+            .map_err(failed)
+    }
+
+    fn consume_foreground_inline(
+        &self,
+        execution: &ForegroundExecution,
+        output: &ToolOutput,
+    ) -> Result<bool, ToolError> {
+        let Some(pool) = &self.completion_pool else {
+            // Without a durable sink, only observe. The host acknowledges after
+            // it has recorded the tool result through its own delivery path.
+            return Ok(false);
+        };
+        let receipt = VerificationReceipt::from_metadata(&output.metadata)
+            .map_err(failed)?
+            .ok_or_else(|| {
+                invalid("foreground terminal result is missing its verification receipt")
+            })?;
+        let envelope = foreground_completion_envelope(execution, &receipt);
+        let completed_at = completion_time(&execution.info);
+        // A foreground result is never visible as an unclaimed background row:
+        // callback recovery scans that set, including between tool calls.
+        let claimed = pool
+            .transaction(|transaction| {
+                zuno_db::completion_delivery::publish_in(
+                    transaction,
+                    envelope.clone(),
+                    completed_at,
+                )?;
+                zuno_db::completion_delivery::claim_inline_in(
+                    transaction,
+                    &envelope.source_key,
+                    zuno_db::message::now_millis().max(completed_at),
+                )
+            })
+            .map_err(failed)?
+            .is_some();
+        self.service
+            .consume_foreground(&execution.info.id, &execution.info.session_id)
+            .map_err(observation_failed)?;
+        Ok(claimed)
+    }
+
+    /// Build verification before claiming a completion: a failed output/context
+    /// read must leave the original result pending for recovery.
+    fn execution_output(
+        &self,
+        info: BackgroundExecutionInfo,
+        window: BackgroundExecutionOutput,
+        wait: Option<(bool, bool)>,
+    ) -> Result<ToolOutput, ToolError> {
+        let foreground = match self.service.foreground(&info.id, &info.session_id) {
+            Ok(execution) => Some(execution),
+            Err(BackgroundExecutionError::NotForeground(_)) => None,
+            Err(error) => return Err(observation_failed(error)),
+        };
+        let mut fields = render_window(&window);
+        fields.insert("foreground".to_owned(), Value::Bool(foreground.is_some()));
+        if let Some((timed_out, interrupted)) = wait {
+            fields.insert("waitTimedOut".to_owned(), Value::Bool(timed_out));
+            fields.insert("waitInterrupted".to_owned(), Value::Bool(interrupted));
+        }
+        fields.insert("execution".to_owned(), render_info(info.clone()));
+        let mut output = render(
+            format!("{}: {}", info.id, info.status.as_str()),
+            BACKGROUND_METADATA_KEY,
+            Value::Object(fields.clone()),
+        )?;
+        if foreground.is_some() && info.status.is_terminal() {
+            let completion = self
+                .service
+                .foreground_completion(&info.id, &info.session_id)
+                .map_err(observation_failed)?;
+            output = crate::shell::attach_foreground_verification(output, &completion)?;
+        }
+        let claimed_inline = match &foreground {
+            Some(execution) if info.status.is_terminal() => {
+                self.consume_foreground_inline(execution, &output)?
+            }
+            Some(_) => false,
+            None => self.consume_terminal_inline(&info)?,
+        };
+        fields.insert(
+            "completionClaimedInline".to_owned(),
+            Value::Bool(claimed_inline),
+        );
+        fields.insert(
+            "foregroundConsumed".to_owned(),
+            Value::Bool(
+                foreground
+                    .as_ref()
+                    .is_some_and(|execution| execution.consumed)
+                    || (foreground.is_some()
+                        && info.status.is_terminal()
+                        && self.completion_pool.is_some()),
+            ),
+        );
+        output.output = serde_json::to_string_pretty(&fields).map_err(failed)?;
+        Ok(output.with_metadata(BACKGROUND_METADATA_KEY, Value::Object(fields)))
+    }
 }
 
 #[async_trait]
@@ -246,13 +371,15 @@ impl TypedTool for BackgroundTool {
     }
 
     fn description(&self) -> &str {
-        "List, inspect, wait for, or cancel shell commands that are already running in the \
-         background, and page through output that was withheld for size. Reads return one \
+        "List, inspect, wait for, or cancel existing foreground handles and explicitly detached \
+         shell commands, and page through output that was withheld for size. Reads return one \
          bounded window plus the cursor the next window starts at, so ask again with that \
          cursor instead of slicing a file with a shell command. Background completion normally \
-         notifies and wakes the parent automatically. Use wait only when the current step \
-         synchronously depends on the result; one wait is capped at 60 seconds, so do not loop \
-         waiting across turns. Cancellation is a side effect and this tool is never \
+         notifies and wakes the parent automatically. Serial critical-path work stays foreground: \
+         wait on the SAME taskID without rerunning the command or creating an observer agent. \
+         Each wait is capped at 60 seconds; an observation timeout is not terminal status. \
+         Keep polling bounded and honor steering/interruption between waits. A remoteObserver \
+         exit still requires an authoritative remote-state recheck. Cancellation is a side effect and this tool is never \
          automatically replayed."
     }
 
@@ -275,12 +402,23 @@ impl TypedTool for BackgroundTool {
         match params.action {
             BackgroundAction::List => {
                 reject_unused(&params, &[])?;
-                let rows = self
+                let mut rows = self
                     .service
                     .list_for_session(&ctx.session_id)
                     .into_iter()
                     .map(render_info)
                     .collect::<Vec<_>>();
+                rows.extend(
+                    self.service
+                        .foreground_for_session(&ctx.session_id)
+                        .into_iter()
+                        .map(|execution| {
+                            let mut row = render_info(execution.info);
+                            row["foreground"] = Value::Bool(true);
+                            row["originCallID"] = Value::String(execution.context.call_id);
+                            row
+                        }),
+                );
                 render(
                     "background executions",
                     BACKGROUND_METADATA_KEY,
@@ -291,10 +429,7 @@ impl TypedTool for BackgroundTool {
                 reject_unused(&params, &[TASK_ID, CURSOR, LIMIT])?;
                 let (id, info) = self.owned(params.task_id, &ctx.session_id)?;
                 let window = self.window(&id, params.cursor, params.limit)?;
-                let title = format!("{}: {}", id, info.status.as_str());
-                let mut fields = render_window(&window);
-                fields.insert("execution".to_owned(), render_info(info));
-                render(title, BACKGROUND_METADATA_KEY, Value::Object(fields))
+                self.execution_output(info, window, None)
             }
             BackgroundAction::Wait => {
                 reject_unused(&params, &[TASK_ID, CURSOR, LIMIT, TIMEOUT])?;
@@ -305,38 +440,47 @@ impl TypedTool for BackgroundTool {
                 let timeout = Duration::from_millis(
                     params.timeout.unwrap_or(DEFAULT_WAIT_MS).min(MAX_WAIT_MS),
                 );
-                let waited = self
+                let (info, timed_out, interrupted) = match self
                     .service
-                    .wait(&id, Some(timeout))
-                    .await
-                    .map_err(failed)?;
-                let window = self.window(&id, params.cursor, params.limit)?;
-                let title = format!("{}: {}", id, waited.info.status.as_str());
-                let mut fields = render_window(&window);
-                fields.insert("waitTimedOut".to_owned(), Value::Bool(waited.timed_out));
-                let claimed_inline = if waited.info.status.is_terminal() {
-                    match &self.completion_delivery {
-                        Some(delivery) => {
-                            let envelope = background_completion_envelope(&waited.info);
-                            delivery
-                                .publish(envelope.clone(), completion_time(&waited.info))
-                                .map_err(failed)?;
-                            delivery
-                                .claim_inline(&envelope.source_key, completion_time(&waited.info))
-                                .map_err(failed)?
-                                .is_some()
+                    .foreground(&id, &ctx.session_id)
+                {
+                    Ok(_) => match self
+                        .service
+                        .wait_foreground(&id, &ctx.session_id, timeout, ctx.interrupt.notified())
+                        .await
+                        .map_err(observation_failed)?
+                    {
+                        ForegroundWaitOutcome::Terminal(execution) => {
+                            (execution.info, false, false)
                         }
-                        None => false,
+                        ForegroundWaitOutcome::ObservationTimeout(execution) => {
+                            (execution.info, true, false)
+                        }
+                        ForegroundWaitOutcome::Interrupted(_) => {
+                            self.service.cancel(&id).map_err(observation_failed)?;
+                            let settled = self
+                                .service
+                                .wait(&id, Some(Duration::from_secs(5)))
+                                .await
+                                .map_err(observation_failed)?;
+                            (settled.info, settled.timed_out, true)
+                        }
+                    },
+                    Err(BackgroundExecutionError::NotForeground(_)) => {
+                        tokio::select! {
+                            result = self.service.wait(&id, Some(timeout)) => {
+                                let outcome = result.map_err(observation_failed)?;
+                                (outcome.info, outcome.timed_out, false)
+                            }
+                            () = ctx.interrupt.notified() => {
+                                (self.service.get(&id).map_err(observation_failed)?, false, true)
+                            }
+                        }
                     }
-                } else {
-                    false
+                    Err(error) => return Err(observation_failed(error)),
                 };
-                fields.insert(
-                    "completionClaimedInline".to_owned(),
-                    Value::Bool(claimed_inline),
-                );
-                fields.insert("execution".to_owned(), render_info(waited.info));
-                render(title, BACKGROUND_METADATA_KEY, Value::Object(fields))
+                let window = self.window(&id, params.cursor, params.limit)?;
+                self.execution_output(info, window, Some((timed_out, interrupted)))
             }
             BackgroundAction::Cancel => {
                 reject_unused(&params, &[TASK_ID])?;
@@ -411,7 +555,7 @@ impl TypedTool for BackgroundTool {
     }
 }
 
-/// Deterministic terminal identity shared by synchronous wait and callback delivery.
+/// Deterministic terminal identity shared by explicit reads and callback delivery.
 #[must_use]
 pub fn background_completion_source_key(info: &BackgroundExecutionInfo) -> String {
     format!("background:{}:{}", info.id.as_str(), info.time_updated)
@@ -425,9 +569,31 @@ pub fn background_completion_envelope(info: &BackgroundExecutionInfo) -> Complet
         source: CompletionSource::BackgroundExecution,
         terminal_revision: u64::try_from(info.time_updated).unwrap_or_default(),
         parent_session_id: info.session_id.clone(),
-        cycle_id: None,
+        cycle_id: info.cycle_id.clone(),
         payload: background_completion_payload(info),
     }
+}
+
+/// Canonical foreground receipt under the original completion identity and cycle.
+///
+/// Publish and claim this inline in ONE transaction before acknowledging the
+/// process handle. It must never be offered to asynchronous callback delivery.
+#[must_use]
+pub fn foreground_completion_envelope(
+    execution: &ForegroundExecution,
+    receipt: &VerificationReceipt,
+) -> CompletionEnvelope {
+    let mut envelope = background_completion_envelope(&execution.info);
+    envelope.payload = json!({
+        "kind": "foregroundExecutionResult",
+        "executionID": execution.info.id.as_str(),
+        "originCallID": execution.context.call_id,
+        "status": execution.info.status.as_str(),
+        "purpose": execution.info.purpose.as_str(),
+        "requiresAuthoritativeRefresh": execution.info.purpose.requires_authoritative_refresh(),
+        "verification": receipt.to_metadata_value(),
+    });
+    envelope
 }
 
 /// Canonical callback input for one terminal background execution.
@@ -442,6 +608,7 @@ pub fn background_completion_input(info: &BackgroundExecutionInfo) -> NewSession
     )
     .with_source_key(background_completion_source_key(info))
     .with_trigger_kind(InputTriggerKind::Automatic)
+    .with_cycle_id(info.cycle_id.clone())
 }
 
 fn background_completion_payload(info: &BackgroundExecutionInfo) -> Value {
@@ -570,6 +737,7 @@ fn render_info(info: BackgroundExecutionInfo) -> Value {
     json!({
         "taskID": info.id.as_str(),
         "sessionID": info.session_id,
+        "cycleID": info.cycle_id,
         "title": info.title,
         "command": info.command,
         "purpose": info.purpose.as_str(),
@@ -611,5 +779,17 @@ fn failed(error: impl std::error::Error + Send + Sync + 'static) -> ToolError {
     ToolError::Failed {
         tool: WIRE_ID.to_owned(),
         source: Box::new(error),
+    }
+}
+
+fn observation_failed(error: BackgroundExecutionError) -> ToolError {
+    match error {
+        BackgroundExecutionError::InvalidId(_)
+        | BackgroundExecutionError::InvalidObservationTimeout => failed(error),
+        _ => ToolError::Uncertain {
+            tool: WIRE_ID.to_owned(),
+            applied_paths: Vec::new(),
+            source: Box::new(error),
+        },
     }
 }

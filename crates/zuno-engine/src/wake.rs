@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use zuno_db::inbox::{DurableInputKind, SessionInbox, SessionInput};
+use zuno_types::execution::WakeAdmission;
 
 use crate::interrupt::{SoftInterruptMessage, SoftInterruptSource};
 use crate::report::ReportBatch;
@@ -15,7 +16,8 @@ pub trait PendingInputDriver: Send + Sync + 'static {
     /// Drive `input` while owning `guard`.
     ///
     /// The implementation must leave `input` no longer pending before it returns: it
-    /// either promotes and drives the row, or settles it as failed. A driver is free to
+    /// either promotes and drives the row, settles it as failed, or retains it when
+    /// the shared scheduling gate changes before execution. A driver is free to
     /// claim the session's other pending rows of the same kind in the same turn, which
     /// is how a batch of settled reports reaches the model as one request instead of one
     /// request per report.
@@ -25,6 +27,8 @@ pub trait PendingInputDriver: Send + Sync + 'static {
 /// How one durable wake request reached the parent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakeOutcome {
+    /// Input remains durable, but its wait/pause/cycle does not permit execution.
+    DeferredByScheduling,
     /// Another process-local delivery already owns this exact durable input.
     AlreadyInFlight,
     /// The active turn claimed the input at a safe point.
@@ -109,6 +113,14 @@ impl SessionWakeCoordinator {
             let Some(input) = pending.iter().find(|input| input.id == input_id).cloned() else {
                 return Ok(WakeOutcome::ClaimedByActiveTurn);
             };
+            if self
+                .inbox
+                .wake_admission(&input)
+                .map_err(|error| error.to_string())?
+                == WakeAdmission::Reject
+            {
+                return Ok(WakeOutcome::DeferredByScheduling);
+            }
             match self.runs.begin_turn(session_id) {
                 Ok(guard) => {
                     let input = if steer_active {
@@ -116,12 +128,26 @@ impl SessionWakeCoordinator {
                     } else {
                         pending
                             .into_iter()
-                            .find(|input| input.delivery == zuno_db::inbox::InputDelivery::Queue)
+                            .find(|input| {
+                                input.delivery == zuno_db::inbox::InputDelivery::Queue
+                                    && self
+                                        .inbox
+                                        .wake_admission(input)
+                                        .is_ok_and(|admission| admission != WakeAdmission::Reject)
+                            })
                             .unwrap_or(input)
                     };
                     let driven_id = input.id.clone();
                     self.driver.drive(input, guard).await?;
-                    if self.pending_input(session_id, &driven_id)?.is_some() {
+                    if let Some(pending) = self.pending_input(session_id, &driven_id)? {
+                        if self
+                            .inbox
+                            .wake_admission(&pending)
+                            .map_err(|error| error.to_string())?
+                            == WakeAdmission::Reject
+                        {
+                            return Ok(WakeOutcome::DeferredByScheduling);
+                        }
                         return Err(format!(
                             "pending-input driver returned without claiming `{driven_id}`"
                         ));
@@ -164,13 +190,29 @@ impl SessionWakeCoordinator {
         woken: &SessionInput,
         message: &SoftInterruptMessage,
     ) -> bool {
+        if !self
+            .inbox
+            .wake_admission(woken)
+            .is_ok_and(|admission| admission != WakeAdmission::Reject)
+        {
+            return false;
+        }
         if !is_settled_report(woken) {
             return self
                 .runs
                 .queue_soft_interrupt(session_id, message.clone())
                 .is_ok();
         }
-        let batch = ReportBatch::project(pending);
+        let eligible = pending
+            .iter()
+            .filter(|input| {
+                self.inbox
+                    .wake_admission(input)
+                    .is_ok_and(|admission| admission != WakeAdmission::Reject)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let batch = ReportBatch::project(&eligible);
         let mut woken_queued = None;
         for report in batch.reports() {
             let is_woken = report.input_id == woken.id;
@@ -210,9 +252,13 @@ impl SessionWakeCoordinator {
         // delivery still decides this outcome, so it is offered exactly as its caller
         // built it rather than through content this coordinator invented.
         woken_queued.unwrap_or_else(|| {
-            self.runs
-                .queue_soft_interrupt(session_id, message.clone())
-                .is_ok()
+            self.inbox
+                .wake_admission(woken)
+                .is_ok_and(|admission| admission != WakeAdmission::Reject)
+                && self
+                    .runs
+                    .queue_soft_interrupt(session_id, message.clone())
+                    .is_ok()
         })
     }
 

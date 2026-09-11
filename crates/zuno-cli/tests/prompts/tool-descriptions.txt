@@ -26,9 +26,11 @@ Format:
 - Every initial-content line in an Add File section must start with `+`.
 >>>
 
-## shell | crates/zuno-tools/src/description/shell.txt | 4432 bytes | trailing-newline: yes
+## shell | crates/zuno-tools/src/description/shell.txt | 5389 bytes | trailing-newline: yes
 <<<
 Executes a command with the configured shell. Commands are parsed with tree-sitter before execution so each constituent command is permission-checked independently. A deterministic destructive-command gate runs before every foreground or background spawn. Under approval-bearing permission modes, confirmable operations such as replacing an existing redirect target require fresh human approval; `allow_all` skips that ask, while catastrophic targets remain hard-denied in every mode. Local Git history rewrites (`commit --amend`, a new `rebase`, or forced tag movement) additionally require `expectedGitHead` containing the exact full object id returned by an immediately preceding `git rev-parse HEAD`; execution fails before spawning if HEAD changed. Select that repository with `workdir`: repository-changing Git global options or environment variables are refused for a rewrite. Published history may only be rewritten with an explicit atomic lease such as `--force-with-lease=refs/heads/main:<expected-full-oid>`; bare `--force`, an implicit lease, and `+` refspecs are refused. Creating a new static file in the OS temp directory does not require approval. For one-off scripts, prefer interpreter stdin such as `python3 - <<'PY'` over fixed `/tmp` filenames. Set `backgroundPurpose: "remoteObserver"` when a command only watches work owned by a remote system, such as a CI run or release. Its terminal process state is a durable wake signal, not proof that the remote work succeeded; after wake, inspect output and re-query the authoritative remote state by stable identifier. A pipeline's exit code is meaningless unless pipefail is in effect: `cargo test | tail -5` exits zero when the tests fail, because only `tail` decides it. `exitPolicy` defaults to `"pipefail"`, so a failure at any stage of a pipeline is the command's failure; `exitPolicy: "all"` also stops at the first failing command in a sequence, and `exitPolicy: "last"` is the way to run a command that is meant to tolerate a failing stage. Every result carries a verification receipt stating whether its exit status covers the whole command; PowerShell has no pipefail equivalent, so only `"all"` is authoritative there. The receipt is downgraded to derived when the command's own text takes the guarantee back: `|| true` or any fallback that cannot fail, `set +e` or `set +o pipefail`, a script handed to an inner `bash -c` or heredoc, and under `"pipefail"` a sequence of statements where only the last one decides the status. Only an authoritative receipt can close a goal success criterion, so run one command, chain with `&&`, or pass `exitPolicy: "all"` when the status has to mean something. Every result reports requested and effective sandbox authority, backend, network policy, resolution kind, and any fallback reason. `read-only` and `workspace-write` require a proved OS confinement backend and fail closed by default. A trusted `sandbox.onUnavailable: "run-unconfined"` policy may run a `workspace-write` request with host authority only for a typed platform, launcher-absence, or namespace-availability failure; it never applies to read-only Agents, untrusted launchers, invalid policy or paths, helper/internal failures, or command execution errors. This fallback preserves the configured permission mode, explicit denies, catastrophic-command refusals, background lifecycle, timeout, and cancellation, but requested filesystem and network restrictions are not OS-enforced. `danger-full-access` is a separate explicit trusted choice that skips restricted-backend discovery and runs as the Zuno user with host filesystem, process, credential, and network access. Explicit permission denies, history-rewrite guards, and catastrophic Shell denials remain terminal. Use workdir instead of changing directories inside the command.
+
+With `background: false` (the default), an attention deadline yields a resumable foreground handle. The same command, task ID, original work cycle, hard ceiling, sandbox authority and cancellation contract remain in effect. Serial critical-path waits, including CI needed by the current step, stay foreground: continue the SAME task ID with `bg` wait/output and do not create another observer agent or rerun the command. Each observation is bounded to 60 seconds; an observation timeout is not command completion. Keep polling bounded and honor steering or interruption between waits. Only explicit `background: true` detaches work and enables its normal completion callback. A foreground handle never schedules that callback. A remoteObserver exit in either mode still requires an authoritative remote-state recheck by stable identifier. A lost process or handle leaves an uncertain outcome; inspect authoritative state before any replay of side effects.
 
 For source changes, prefer native `apply_patch` or structured `edit`, which validate current file bytes or context and report a structured diff. Use `git apply` only for an already-supplied standard unified diff whose provenance and paths you understand: read every affected existing file, run `git apply --check`, and apply it only when that preflight succeeds. Git is not a stale-read or rollback authority. If the check or apply fails, stop, re-read current files, and use a smaller native patch/edit. Do not automatically add `--3way` or `--reject`; never recover with `git reset --hard` or `git checkout --`.
 >>>
@@ -146,32 +148,18 @@ Read current global/project memory and its scope revisions. Use this before corr
 Maintain durable memory: remember a stable fact, correct an outdated entry, or remove information that should no longer be recalled. Use global only for reusable user preferences and project for repository-specific knowledge. Valid changes normally apply automatically; a deliberately configured review policy can retain them pending. Check the returned status before claiming a change took effect. Never store secrets, unresolved guesses, task narration, or instructions that expand permissions. Memory is fallible reference data, not authorization.
 >>>
 
-## plan_exit | crates/zuno-tools/src/description/plan-exit.txt | 812 bytes | trailing-newline: yes
+## plan_exit | crates/zuno-tools/src/description/plan-exit.txt | 448 bytes | trailing-newline: yes
 <<<
-Use this tool when you have completed the planning phase and are ready to exit plan agent.
-
-This tool asks the user whether to switch to the orchestrator and start implementing the plan.
-
-Call this tool:
-- After you have written a complete plan to the plan file
-- After every material question is resolved and no unresolved implementation decision remains
-- When another agent can execute the plan without repeating discovery
-
-Do NOT call this tool:
-- Before you have created or finalized the plan
-- If you still have unanswered questions about the implementation
-- If the user has indicated they want to continue planning
-- Merely because you have reached the end of a turn
-
-Do not duplicate the approval question in chat; this tool owns that interaction. A cancellation or "No" keeps the session in plan mode.
+Request the user's explicit approval to start implementing the current durable Plan. The host shows the exact Plan revision, Work Agent/model, and review status. This tool returns immediately so you can finish the planning summary; it does not change mode or authorize Work. Only a real explicit approval and successful source-turn handoff may start Work. Empty answers, deferral, cancellation, prose, and automatic callbacks never approve a Plan.
 >>>
 
-## question | crates/zuno-tools/src/description/question.txt | 1026 bytes | trailing-newline: yes
+## question | crates/zuno-tools/src/description/question.txt | 1403 bytes | trailing-newline: yes
 <<<
-Use this tool only during Plan when an undiscoverable user decision is required to make the plan decision-complete. This allows you to:
-1. Resolve a material requirement or preference
-2. Clarify genuinely ambiguous instructions
-3. Choose between implementation directions that produce different plans
+Ask for a material user decision that cannot be discovered from available evidence.
+In Plan this is a clarification. In ordinary Work this registers required human input
+and suspends automatic execution until the exact request is answered.
+For an optional question that should not delay independent work or your final summary,
+use question_async instead.
 
 Usage notes:
 - Ask only when the answer materially changes the outcome and cannot be discovered from available evidence
@@ -180,8 +168,16 @@ Usage notes:
 - When `custom` is enabled (default), a "Type your own answer" option is added automatically; don't include "Other" or catch-all options
 - Provide 2-3 mutually exclusive options; set `multiple: true` only when combinations are meaningful
 - If you recommend a specific option, make that the first option in the list and add "(Recommended)" at the end of the label
-- Answers are returned as arrays of labels
+- The request persists independently of this tool call; the user may answer later or choose Defer
+- Tool results are receipts. Actual answers arrive through the durable session inbox once
+- A partial or empty answer leaves the unanswered items pending and is never approval
 - Cancellation is a refusal, not an answer; do not fabricate a selection
+- To request authorization of an exact Plan for Work, use plan_exit, not a generic question
+>>>
+
+## question_async | crates/zuno-tools/src/description/question-async.txt | 351 bytes | trailing-newline: yes
+<<<
+Ask optional clarifying questions without waiting or ending the turn. The question is durable and the user's reply arrives later as new input. Continue independent work and state any assumptions; an unanswered question is not consent. Use question when required input prevents further work, and plan_exit only for explicit Plan-to-Work authorization.
 >>>
 
 ## read | crates/zuno-tools/src/description/read.txt | 1083 bytes | trailing-newline: no

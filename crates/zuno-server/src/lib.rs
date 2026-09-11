@@ -38,7 +38,8 @@ pub use request_broker::{
 };
 pub use server::{
     BoundServer, ServerBuilder, ServerConfig, ServerError, ServerServices, SessionCompactExecution,
-    SessionMemoryPolicyExecution, SessionMemoryPolicyFuture, SessionMemoryPolicyMutationError,
-    SessionModelSelection, SessionMutationExecutor, SessionMutationFuture, SessionPromptExecution,
-    SessionReportExecution,
+    SessionControlExecution, SessionControlExecutor, SessionMemoryPolicyExecution,
+    SessionMemoryPolicyFuture, SessionMemoryPolicyMutationError, SessionModelSelection,
+    SessionMutationExecutor, SessionMutationFuture, SessionPromptExecution, SessionReportExecution,
+    SessionResumeError, SessionResumeFuture, SessionResumeOutcome, SessionResumeRequest,
 };

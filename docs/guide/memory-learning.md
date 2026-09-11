@@ -5,7 +5,7 @@ does not require per-entry approval; executable Skill changes still do.
 
 | Kind | What it holds | Where it appears | Who can apply it |
 | --- | --- | --- | --- |
-| Resident Memory | A small global preference or project rule | Versioned `memory.global` and `memory.project` prompt sections | Automatic by default, with an auditable `MemoryCandidate` |
+| Resident Memory | A small global preference or project rule | Versioned global/project context on model requests | Automatic by default, with an auditable `MemoryCandidate` |
 | Experience | Evidence from one outcome, correction, failure, or verified procedure | Retrieved `learning.experiences` prompt section and `/learn` | The learning service writes evidence; it does not edit Memory directly |
 | Skill candidate | A proposed reusable method with complete `SKILL.md`, diff, and evidence | `/learn` review state | A user, after review and a passing offline evaluation |
 
@@ -27,8 +27,11 @@ Run `/learn help` for the complete action list:
 
 ```text
 /learn
+/learn status
 /learn list [offset]
 /learn get <experience-id>
+/learn reprocess <assistant-message-id>
+/learn repair-history [--dry-run]
 /learn inspect-memory|import-memory <global|project>
 /learn remember <stable fact, preference, or project rule>
 /learn issue <unresolved issue>
@@ -151,9 +154,12 @@ missing projection from its recorded revision, while a file with different
 external contents is preserved and reported. Cooperating file writers use a
 shared operating-system lock around comparison and atomic replacement.
 
-Each foreground turn captures the current Memory revision. A change in another
-session is visible at the next turn boundary; previously persisted prompt
-receipts still reconstruct the original version.
+The host refreshes accepted Memory at the next provider-request or compaction
+safe point, including between model steps of one foreground turn. A change made
+by background maintenance or another session can therefore enter the next request
+without starting a new foreground turn. The current `/memories` use policy still
+applies. Requests already sent and their persisted prompt receipts retain the
+exact revision and content they used.
 
 Older releases may have left candidates in `applying` or `undoing`. Startup
 continues to reconcile these historical states from their exact snapshots:
@@ -180,16 +186,28 @@ Learning is enabled by default. `learning.enabled` is the ceiling;
 This lets a project retrieve old evidence without starting an extractor, or record
 new evidence without placing it in foreground prompts.
 
-A completed turn is eligible for automatic extraction when it contains at least
-one tool call, artifact, recovered error, explicit correction, or feedback item.
-The default scheduler waits for six idle hours, polls every 60 seconds, and claims
-at most two jobs per wake. A job identity is
-`(session_id, source_message_id, extractor_version)`, so retries and restarts do
-not create a second batch. A process-owned supervisor keeps project learning alive
-when an ACP session releases its foreground host. It does not keep the entire
-foreground runtime open. A new process checks up to 64 recent completed turns
-from the last seven days for missed admission. Pending work is resumed from
-SQLite; a stopped process does not run background work.
+A successfully completed assistant turn is eligible for automatic extraction when
+it contains at least one tool call, artifact, recovered error, explicit correction,
+or feedback item. Unfinished, failed, or output-truncated turns and turns with
+pending tools are not closed learning sources.
+
+`learning.post_turn.idle_delay_ms` defaults to `0`. The completed turn is captured
+as a bounded source snapshot and its extraction job becomes due immediately.
+A later live turn does not block work on that already closed snapshot or add new
+messages to its input. The worker rechecks the source at admission, claim, heartbeat,
+and settlement. A queued source that changed or became unavailable is skipped
+before spending a new attempt; losing source or lease authority during execution
+prevents a stale result from committing. An explicit positive idle delay retains
+the idle-session requirement.
+
+The worker polls every 60 seconds to recover missed work and claims at most two
+jobs per wake. A job identity is `(session_id, source_message_id, extractor_version)`,
+so retries and restarts do not create a second batch. New closed-turn jobs take
+priority over legacy backlog. A process-owned supervisor keeps project learning
+alive when an ACP session releases its foreground host, without retaining the
+entire foreground runtime. A new process checks up to 64 recent completed turns
+from the last seven days for missed admission. Pending work is resumed from SQLite;
+a stopped process does not run background work.
 
 `/reflect turn` selects the latest completed assistant turn. `/reflect session`
 selects bounded sources across the durable session. Manual reflection becomes due immediately
@@ -203,13 +221,91 @@ The extractor:
 
 - uses `learning.extractor_model` when configured, otherwise the active
   Provider's reachable `small_model`, then the session model;
-- receives bounded, redacted source records with exact part/feedback addresses,
-  source digests, and authoritative verification markers;
+- receives bounded, redacted source records with one canonical citation ID per
+  record and authoritative verification markers; raw storage IDs and digests
+  remain in the host's durable source manifest;
 - caps input, output and total request time; a malformed JSON answer gets at most
   one repair within the same deadline;
 - has no tools, network, filesystem authority, or foreground-session identity;
 - persists its exact request and terminal outcome;
 - attempts one durable job at most three times.
+
+### Model settings and diagnostics
+
+Learning uses the selected model's resolved request parameters and headers,
+including reasoning controls and compatible endpoint-specific options.
+It does not impose a temperature. Explicit sampling settings are retained only
+when the selected model supports them; unsupported sampling parameters are omitted.
+Headers reach the provider without their values being copied into learning receipts.
+
+`learning.execution.max_output_tokens` defaults to `4096`. The effective output
+limit is the smallest applicable limit from learning configuration, the model's
+declared output capacity, and an explicitly smaller model request limit.
+Increasing one limit does not bypass the others. The serialized request is bounded
+by `max_input_bytes` (default `131072`), and model work has a total `timeout_ms`
+(default `120000`); a JSON repair shares the original deadline.
+
+A provider-level `maxTokens: 0` means no additional configured limit; it does not
+disable the learning output ceiling. Native requests lower that ceiling to the
+selected API's output-limit field. If the endpoint rejects bounded output for
+the selected model, learning reports that failure without silently removing the
+ceiling or switching models.
+
+`learning.execution.structured_output` defaults to `false`: the output schema is
+included in the prompt and the answer is decoded locally. Enable native structured
+output only for a selected endpoint that supports its Chat, Responses, or Messages
+JSON-schema format. A provider rejecting an option is a request failure, not proof
+that the completed source turn was lost.
+
+The durable request/outcome events carry a request ID, selected provider/model,
+effective parameters, prompt digest, and terminal result. Provider failures retain
+a bounded, redacted reason and, when supplied upstream, HTTP status, error code,
+and provider request ID. `/learn` shows job state, attempt count, next deadline, and
+recent errors. Check the job result as well as the provider outcome: a completed
+provider response can still fail JSON or evidence validation.
+
+### Inspect and repair learning history
+
+Historical repair works on the current project's legacy extraction jobs.
+It preserves old requests, errors, and audit history; it does not rewrite an old
+HTTP 400 message into a newly inferred cause.
+
+| Action | Effect |
+| --- | --- |
+| `/learn status` | Read queue state, recent errors, retrieval selection, current extractor version, and generation availability/policy |
+| `/learn repair-history --dry-run` | Preview at most 32 legacy jobs without changing evidence, queues, files, or attempt counts |
+| `/learn repair-history` | Revalidate eligible old evidence and queue a versioned extraction where new model work is needed |
+| `/learn reprocess <assistant-message-id>` | Select one completed assistant message from this project and admit or reuse its current-version extraction job |
+
+Start with the dry run. Its report distinguishes `would_revalidate`, `would_queue`,
+`existing`, `excluded`, and `unavailable` items, with `wouldQueue` and `hasMore`
+summary fields. Dry-run counts describe proposed work. Apply with
+`/learn repair-history` after inspecting that report.
+If `hasMore` is true, a later invocation examines another bounded batch.
+
+Exact old citations can be revalidated against their source addresses, excerpts,
+and recorded digests without a paid extraction. Missing or changed evidence stays
+unverified. A source digest mismatch is not repaired merely because the old quote
+still appears somewhere in the edited text. The service queues fresh extraction
+only when the source remains available and eligible.
+
+`reprocess` takes an assistant-message ID, not an Experience ID. An existing
+current-version job is returned unchanged, including a completed or failed job;
+repeating the command does not reset its attempt counter or repeat a completed
+extraction. An already running extraction for that source is reused as well.
+A new extractor version can admit one upgrade job while preserving
+the old failure. Each new durable job still has the three-attempt ceiling.
+Running or uncertain legacy jobs are not rewritten by repair.
+
+These actions retain project ownership, session generation, external-context,
+and explicit-forget restrictions. Forgotten sources cannot be re-admitted or
+reverified. `status` remains readable when generation or model construction is
+unavailable. A repair result saying `queued` means background admission, not
+completed learning or accepted Memory: the command does not invoke a foreground
+model, insert a foreground input, or resume a Goal. A subsequently claimed
+background extraction may make a provider request.
+
+### Evidence validation
 
 Settlement stores accepted Experience and evidence in one transaction. A bad item
 with an unresolvable model-visible encoding is refused without discarding clean

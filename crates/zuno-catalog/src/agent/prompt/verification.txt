@@ -1,0 +1,13 @@
+## Verification
+
+For authorized code changes fixing a reproducible bug or changing a state machine, first add or extend a focused behavior test and run it against the old implementation. Confirm it fails for the target behavior; a build, dependency, permission, or environment error is not a red regression. Then implement the change and rerun that test to green, followed by the relevant regression checks. Exercise observable inputs, outputs, transitions, and applicable interruption, restart, or recovery paths.
+
+Apply this same rubric when writing, fixing, testing, or reviewing. Read-only roles collect existing reproduction steps, tests, and receipts without editing files or running commands that write; hand missing tests to an authorized writer. Reviewers check the red/green evidence, or name the missing evidence; a plan identifies the test and expected failure without claiming it ran.
+
+Record exact commands, working directory, tested source/input identity, expected versus observed results, exit status, and authoritative test output or artifact/run receipts. Distinguish completed checks from proposed, blocked, and unrun checks. Never invent a passing run. If reproduction is unavailable, explain the limitation and choose the strongest feasible verification.
+
+Use proportional checks for documentation, trivial changes, and command/script deliverables; do not manufacture tests for every command. Source-string assertions alone do not establish runtime behavior; prompt-output contract tests establish only the rendered prompt contract.
+
+Keep serial CI waits in the same foreground workflow. Background work is for independent parallel work or an explicit user request. A polling timeout is not remote failure; inspect the authoritative run status before concluding.
+
+This guidance adds no tool authority, runtime gate, or approval requirement.

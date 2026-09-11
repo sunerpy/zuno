@@ -1,6 +1,6 @@
 # Harness design comparison
 
-Status: 2026-08-31.
+Status: 2026-09-11. Earlier comparisons retain their explicitly recorded source pins.
 
 This document records which ideas Zuno adopts from other agent harnesses. The source projects are references, not runtime compatibility targets.
 
@@ -44,6 +44,36 @@ The release sequence reinforces these rules for Zuno:
    later configuration edit rewrite an existing child.
 
 ## Project lessons
+
+### Six-part runtime consistency audit
+
+The v0.10.30-based repair uses the local Codex checkout at
+`eaa8b6d91701d6cabe464141facc677e5915fbfc`, inspected read-only. The paths below
+are relative to that exact checkout. The source is a design reference, not a
+claim that Zuno implements the same wire protocol or storage schema.
+
+| Zuno change | Inspected Codex source under `codex-rs/` | Adopted principle and deliberate adaptation |
+| --- | --- | --- |
+| Memory | `memories/write/src/start.rs::start_memories_startup_task`; `phase1.rs::job::sample`; `phase2.rs::agent::get_config`; `runtime.rs::MemoryStartupContext::stage_one_request_context`; `state/src/runtime/memories.rs::mark_global_phase2_job_succeeded` | Separate extraction and consolidation, bounded immutable sources, exact watermarks and explicit model binding. The user chose per-completed-turn scheduling; Codex's inspected caller kicks an idle sweep on new turn start. Zuno keeps both phases tool-free and uses managed SQLite/CAS mutations, not Codex's file-writing consolidation agent. |
+| Input receipts / ACP | `protocol/src/turn_input.rs::TurnInputSubmission`; `app-server/src/request_processors/turn_processor.rs::turn_start_inner` and `turn_steer_inner`; `core/src/session/mod.rs::SessionIo::submit_turn_input` | Separate acceptance from model application and completion. Receiver loss does not retract queued work. Codex returns an in-progress turn; standard ACP waits for a real processing stop reason, while Zuno's steer extension returns immediate admission. Persistent client-ID deduplication is Zuno's additional contract, not inferred from Codex correlation IDs. |
+| Explicit Goal resume | `tui/src/chatwidget/interaction.rs::pause_active_goal_for_interrupt`; `tui/src/chatwidget/goal_menu.rs::show_resume_paused_goal_prompt`; `ext/goal/src/api.rs::GoalService::set_thread_goal` | Interrupt pauses; only an explicit Resume action changes Goal state. Zuno adapts the menu to durable QuestionPort choices and an atomic Goal-ID/revision/execution/input transaction. Deferral, omission and ordinary text do not authorize recovery; other gates remain intact. |
+| Verification guidance | `models-manager/prompt.md` (Validating your work); `prompts/templates/review/rubric.md`; `core/src/tasks/review.rs::start_review_conversation`; `core/tests/suite/prompt_caching.rs` | Scoped verification, one shared rubric and evidence from actual rendered requests. Red-before-fix for reproducible defects is the user's stricter Zuno prompt rule, not a Codex runtime gate. Documentation and low-risk work retain proportional checks. |
+| Foreground processes | `core/src/unified_exec/process_manager.rs::exec_command_inner`, `write_stdin` and `collect_output_until_deadline`; `core/src/session/turn_input.rs::Session::steer_input`; `core/src/session/input_queue.rs::InputQueue::subscribe_activity` | Keep one process identity, distinguish observation expiry from process exit, and preserve exact-turn steering. Zuno additionally keeps a native logical foreground wait, budget and completion-consumption ledger; the inspected Codex task can finish with terminals still running and does not prove this stronger Zuno barrier. |
+| Context usage | `core/src/context_manager/history.rs::ContextManager::get_total_token_usage` and `items_after_last_model_generated_item`; `protocol/src/protocol.rs::TokenUsageInfo::new_or_append` and `append_last_usage` | Latest provider measurement plus uncounted tail, cumulative usage separate, no re-estimation of reasoning already included by the server. Zuno adds provider accounting modes, partial-frame merging, source/attempt/epoch fencing, an explicit unknown state and one durable snapshot for every surface. No model-specific context constant is copied. |
+
+Two safety differences are intentional. Codex's inspected state migrator
+(`state/src/migrations.rs::runtime_migrator`) tolerates unknown newer migrations;
+Zuno rejects future or structurally corrupt formats without mutation. Codex's
+Memory workspace diff treats current files as user edits; Zuno preserves external
+file changes but adopts them only through explicit import, retaining its existing
+managed-path and SQLite revision authority.
+
+The corresponding Zuno contracts are documented in
+[Harness Runtime](../harness-runtime.md), [client interfaces](client-interfaces.md),
+[Memory and learning](../guide/memory-learning.md), and
+[database lifecycle](../migration.md). Regression fixtures use synthetic data;
+reading Codex tests is not reported as executing those tests or verifying a live
+Codex service.
 
 ### DeepSeek Harness
 

@@ -85,9 +85,10 @@ by the presence of their target enum variants.
 
 ## Storage and verification
 
-SQLite reuses indexed immutable session events without changing database format
-14. PostgreSQL preview format 5 adds `runtime_wait`, forced owner RLS, timer/Job
-indexes and a typed waiting Job phase. Formats 1–4 migrate forward atomically.
+SQLite reuses indexed immutable session events. Stable core format 14 is separate
+from preview runtime overlay 1. PostgreSQL preview format 5 adds `runtime_wait`, forced owner RLS, timer/Job
+indexes and a typed waiting Job phase. Current PostgreSQL format 6 also stores canonical context and input execution
+receipts; formats 1–5 migrate forward atomically.
 The format-4 fixture retains captured turn DDL, its original source digest,
 messages, signed metadata, usage, Job budget and lease state.
 
@@ -97,7 +98,7 @@ budget refusal before remaining tools. The real PostgreSQL contract covers
 competing claims, independent sessions, early completion, timers, paused parents,
 cross-owner denial, failed consumption followed by checkpoint takeover, and
 failed/successful migration. The authenticated HTTPS contract carries the same
-wait and consumption through the separately versioned Worker protocol (version 2).
+wait and consumption through the separately versioned Worker protocol (version 3).
 
 These tests do not certify independently launched Workers, gateway-to-tool
 assembly, distributed child/Council orchestration or a complete enterprise UI.

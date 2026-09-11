@@ -7,7 +7,7 @@ use crate::risk::{
 };
 use crate::search_common::directory_grant_pattern;
 use crate::timeout::{
-    background_started_output, normalize_foreground_timeout, timeout_promoted_output,
+    background_started_output, foreground_yielded_output, normalize_foreground_timeout,
 };
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -22,13 +22,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
 use tree_sitter::{Node, Parser};
+use zuno_db::session_execution::SessionExecutionStore;
 use zuno_error::ToolError;
 use zuno_paths::GeneratedDirectory;
 use zuno_process::GuardExit;
 use zuno_pty::{
     BackgroundExecutionInfo, BackgroundExecutionInput, BackgroundExecutionPurpose,
     BackgroundExecutionRetention, BackgroundExecutionService, BackgroundExecutionStatus,
-    CommandShell, CommandShellKind,
+    CommandShell, CommandShellKind, ForegroundExecutionCompletion, ForegroundExecutionContext,
 };
 use zuno_sandbox::{
     ExecutionAuthority, NetworkAccess, PrepareRequest, SandboxBackend, SandboxMode, SandboxPolicy,
@@ -148,7 +149,7 @@ impl ExitPolicy {
 pub struct ShellParams {
     /// The command to execute.
     pub command: String,
-    /// The caller's foreground deadline in milliseconds; todo 72 owns promotion at this deadline.
+    /// Foreground attention deadline in milliseconds. A deadline yields the same foreground handle.
     #[serde(default)]
     pub timeout: Option<u64>,
     /// The command's working directory, relative to the workspace when not absolute.
@@ -219,7 +220,7 @@ struct ShellRequest<'a> {
 }
 
 /// What a completed command's exit status is worth under one shell configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ExitContract {
     /// How much of the command the status covers.
     authority: ExitAuthority,
@@ -233,7 +234,7 @@ struct ExitContract {
 /// caller's own command text, the directory the tool resolved, the `HEAD` this
 /// call already read for its history-rewrite guard, and the contract the
 /// interpreter agreed to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ShellVerification {
     /// The caller's command, verbatim: the transcript title and the summary source.
     command: String,
@@ -245,10 +246,177 @@ struct ShellVerification {
     contract: ExitContract,
 }
 
+/// Originating Shell facts, retained even if another turn or Shell configuration
+/// later reads the handle. The process service stores this without interpreting it.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ForegroundShellContext {
+    version: u32,
+    verification: ShellVerification,
+    shell: String,
+    timeout_ms: u64,
+    writes: WriteWatch,
+}
+
+impl ForegroundShellContext {
+    fn decode(completion: &ForegroundExecutionCompletion) -> Result<Self, ToolError> {
+        let execution = &completion.execution;
+        let decode = || -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+            let value = execution.context.metadata.get("shell").ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "foreground Shell context is missing",
+                )
+            })?;
+            let context: Self = serde_json::from_value(value.clone())?;
+            if context.version != 1
+                || context.verification.command != execution.info.command
+                || context.verification.workdir != execution.info.cwd.to_string_lossy()
+                || context.shell.is_empty()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "foreground Shell context does not match the original execution",
+                )
+                .into());
+            }
+            Ok(context)
+        };
+        decode().map_err(|source| ToolError::Uncertain {
+            tool: TOOL_ID.to_owned(),
+            applied_paths: Vec::new(),
+            source,
+        })
+    }
+}
+
+/// Restores the original Shell receipt on a foreground terminal observation.
+///
+/// The digest covers complete captured bytes, regardless of the bounded window
+/// returned by `bg`. Missing/corrupt context fails as an uncertain outcome and
+/// never reconstructs an exit policy from a later caller's configuration.
+pub(crate) fn attach_foreground_verification(
+    output: ToolOutput,
+    completion: &ForegroundExecutionCompletion,
+) -> Result<ToolOutput, ToolError> {
+    let context = ForegroundShellContext::decode(completion)?;
+    let execution = &completion.execution;
+    let info = &execution.info;
+    let text = String::from_utf8_lossy(&completion.output);
+    let receipt = if info.status == BackgroundExecutionStatus::Completed
+        && !info.purpose.requires_authoritative_refresh()
+    {
+        match ShellTool::guard_aware_receipt(
+            &context.verification,
+            info.exit_code,
+            &completion.output,
+            &text,
+        ) {
+            Ok(receipt) => receipt,
+            Err(ToolError::Uncertain { .. }) => context.verification.unresolved(
+                "the process guard did not establish the command outcome; inspect authoritative \
+                 state before any replay",
+            ),
+            Err(error) => return Err(error),
+        }
+    } else {
+        let detail = if info.purpose.requires_authoritative_refresh() {
+            "the remote observer's exit only ends observation; re-query authoritative remote \
+             state using its stable identifier before claiming success"
+                .to_owned()
+        } else {
+            format!(
+                "the foreground execution ended as {}{}; inspect authoritative state before \
+                 deciding whether any replay is safe",
+                info.status.as_str(),
+                info.error
+                    .as_deref()
+                    .map_or(String::new(), |error| format!(": {error}")),
+            )
+        };
+        context.verification.unresolved(detail)
+    };
+    let receipt = VerificationReceipt {
+        output_digest: Some(crate::read::digest_bytes(&completion.output)),
+        ..receipt
+    };
+    let mut output = with_sandbox_metadata(
+        output
+            .with_metadata("background", false)
+            .with_metadata("foreground_yielded", true)
+            .with_metadata("foreground_terminal", true)
+            .with_metadata("task_id", info.id.as_str())
+            .with_metadata("origin_call_id", execution.context.call_id.as_str())
+            .with_metadata("origin_cycle_id", json!(info.cycle_id))
+            .with_metadata("background_purpose", info.purpose.as_str())
+            .with_metadata(
+                "requires_authoritative_refresh",
+                info.purpose.requires_authoritative_refresh(),
+            )
+            .with_metadata("exit", json!(info.exit_code))
+            .with_metadata("shell", context.shell)
+            .with_metadata("timeout", context.timeout_ms)
+            .with_verification(&receipt),
+        &info.authority,
+    );
+    if info.status == BackgroundExecutionStatus::Cancelled {
+        output = output.with_metadata(
+            METADATA_CANCELLATION_KEY,
+            CancelledExecution::killed(
+                info.status,
+                info.exit_code,
+                receipt.detail.clone().unwrap_or_else(|| {
+                    "the command was cancelled without an authoritative outcome".to_owned()
+                }),
+            )
+            .to_metadata_value(),
+        );
+    }
+    Ok(context.writes.report(output))
+}
+
+/// Renders a ready foreground result for host delivery without consuming it.
+///
+/// Persist this output under the original session/cycle/call, then acknowledge
+/// with `BackgroundExecutionService::consume_foreground`. This function never
+/// executes a command or creates a detached completion callback.
+pub fn foreground_completion_output(
+    completion: &ForegroundExecutionCompletion,
+    output_store: ToolOutputStore,
+    output_limits: OutputLimits,
+) -> Result<ToolOutput, ToolError> {
+    let info = &completion.execution.info;
+    let body = if completion.output.is_empty() {
+        "(no output)".to_owned()
+    } else {
+        String::from_utf8_lossy(&completion.output).into_owned()
+    };
+    let output = attach_foreground_verification(ToolOutput::text(&info.command, body), completion)?;
+    let mut output = OutputPolicy::new(output_store, output_limits).apply_bytes(
+        TOOL_ID,
+        &info.session_id,
+        output,
+        &completion.output,
+        false,
+    )?;
+    if info.status != BackgroundExecutionStatus::Completed
+        || info.purpose.requires_authoritative_refresh()
+    {
+        output.output = format!(
+            "Foreground command {} ended as {}. Inspect authoritative state before replaying \
+             side effects or declaring success.\n\n{}",
+            info.id,
+            info.status.as_str(),
+            output.output,
+        );
+    }
+    Ok(output)
+}
+
 impl ShellVerification {
     /// A receipt for a run that produced no exit status at all.
     ///
-    /// Used for a background launch, a promotion at the foreground deadline, and a
+    /// Used for a background launch, a yield at the foreground deadline, and a
     /// command killed by a signal. Outcome and authority keep their defaults —
     /// `Unknown` and `Absent` — so [`VerificationReceipt::proves_success`] is false
     /// no matter what a reader does with it.
@@ -439,6 +607,7 @@ pub struct ShellTool {
     hard_ceiling: Duration,
     git_ceiling: Duration,
     background_executions: Arc<BackgroundExecutionService>,
+    execution_store: Option<SessionExecutionStore>,
     /// The generated directory the background service writes into, when its root is
     /// one. `None` for a service a caller rooted somewhere of its own choosing, which
     /// is not Zuno's generated state and not Zuno's to exclude.
@@ -532,6 +701,7 @@ impl ShellTool {
             hard_ceiling: crate::timeout::DEFAULT_HARD_CEILING,
             git_ceiling: GIT_READ_CEILING,
             background_executions,
+            execution_store: None,
             background_directory: Some(background_directory),
             sandbox,
             sandbox_policy,
@@ -581,6 +751,16 @@ impl ShellTool {
             &zuno_paths::generated::BACKGROUND_EXECUTIONS,
         );
         self.background_executions = service;
+        self
+    }
+
+    /// Bind process completion to the session's work cycle before launch, including
+    /// foreground commands that may later yield a resumable handle.
+    ///
+    /// Missing execution state stays unbound. A turn id is not a work cycle.
+    #[must_use]
+    pub fn with_execution_store(mut self, pool: Arc<zuno_db::Pool>) -> Self {
+        self.execution_store = Some(SessionExecutionStore::new(pool));
         self
     }
 
@@ -784,24 +964,52 @@ impl ShellTool {
             }
         };
         if waited.timed_out {
-            let promoted = self
+            let mut metadata = Map::new();
+            metadata.insert(
+                "shell".to_owned(),
+                serde_json::to_value(ForegroundShellContext {
+                    version: 1,
+                    verification: verification.clone(),
+                    shell: self.shell.name().to_owned(),
+                    timeout_ms: foreground_timeout_ms,
+                    writes,
+                })
+                .map_err(|source| ToolError::Uncertain {
+                    tool: TOOL_ID.to_owned(),
+                    applied_paths: Vec::new(),
+                    source: Box::new(source),
+                })?,
+            );
+            let foreground = self
                 .background_executions
-                .promote(&execution.id)
-                .map_err(failed)?;
+                .yield_foreground(
+                    &execution.id,
+                    ForegroundExecutionContext {
+                        call_id: ctx.call_id.clone(),
+                        metadata,
+                    },
+                )
+                .map_err(|source| ToolError::Uncertain {
+                    tool: TOOL_ID.to_owned(),
+                    applied_paths: Vec::new(),
+                    source: Box::new(source),
+                })?;
             lease.disarm();
             let receipt = verification.unresolved(format!(
                 "the command was still running at its {foreground_timeout_ms}ms foreground \
-                 deadline and continues in the background, so no exit status exists yet"
+                 deadline; the same foreground handle continues and no exit status was observed"
             ));
             return Ok(with_sandbox_metadata(
-                timeout_promoted_output(
+                foreground_yielded_output(
                     verification.command.clone(),
                     foreground_timeout_ms,
-                    &promoted,
+                    &foreground.info,
                 )
                 .with_metadata("shell", self.shell.name())
+                .with_metadata("origin_call_id", foreground.context.call_id)
+                .with_metadata("origin_cycle_id", json!(foreground.info.cycle_id))
                 .with_verification(&receipt),
-                &promoted.authority,
+                &foreground.info.authority,
             ));
         }
         let full = self
@@ -1051,9 +1259,17 @@ impl ShellTool {
                 policy,
             })
             .map_err(failed)?;
+        let cycle_id = match &self.execution_store {
+            Some(store) => store
+                .get(&ctx.session_id)
+                .map_err(failed)?
+                .and_then(|state| state.cycle_id),
+            None => None,
+        };
         Ok(BackgroundExecutionInput {
             prepared,
             session_id: ctx.session_id.clone(),
+            cycle_id,
             title: request.command.to_owned(),
             command: request.command.to_owned(),
             purpose: lifecycle.purpose,
@@ -2689,7 +2905,7 @@ const MAX_WRITE_CANDIDATES: usize = 64;
 /// sharper on Unix and does not exist on Windows, and `created()` is unsupported on some
 /// Linux filesystems. A rewrite that preserves *both* fields is not observed — which is a
 /// residual of the mechanism, not of the command: see [`WriteWatch`].
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct FileFacts {
     modified: Option<std::time::SystemTime>,
     len: u64,
@@ -2744,7 +2960,8 @@ impl FileFacts {
 ///   [`zuno_tool::METADATA_WRITTEN_PATHS_KEY`]: the key means "this file is now here to be
 ///   re-read".
 /// * A rewrite that leaves both modification time and length unchanged is invisible to
-///   `stat`, and a command promoted to the background is still writing when this call ends.
+///   `stat`. Yielded foreground handles retain this snapshot for their terminal report.
+#[derive(Serialize, Deserialize)]
 struct WriteWatch {
     before: Vec<(PathBuf, Option<FileFacts>)>,
 }
@@ -3953,6 +4170,7 @@ mod tests {
             id: zuno_pty::BackgroundExecutionId::parse(format!("bg_{}", "a".repeat(32)))
                 .expect("a well-formed execution id"),
             session_id: "ses_cancel".to_owned(),
+            cycle_id: None,
             title: "cargo test --workspace".to_owned(),
             command: "cargo test --workspace".to_owned(),
             purpose: BackgroundExecutionPurpose::Command,

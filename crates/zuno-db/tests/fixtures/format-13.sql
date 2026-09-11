@@ -1,45 +1,41 @@
--- Preview database format 13 delta; no enterprise release was published for it.
--- Provenance: git show b56a2aeeeb32b3891ad0830ea4d129e8fb33432e:crates/zuno-db/src/schema/session_ownership.sql
--- Load after format-7.sql through format-12.sql.
--- Ownership is separate from user-editable session metadata and from the
--- application/policy identity captured by a particular request.
-CREATE TABLE session_ownership (
-  session_id text PRIMARY KEY NOT NULL,
-  tenant_id text NOT NULL CHECK (length(tenant_id) BETWEEN 1 AND 128),
-  principal_id text NOT NULL CHECK (length(principal_id) BETWEEN 1 AND 128),
-  FOREIGN KEY (session_id) REFERENCES session(id) ON DELETE CASCADE
+-- Zuno format 13 delta, frozen from v0.10.30 (fb875e92833a68c77daf3c05e7cda566db055c14).
+-- Load after the released format-7 through format-12 fixture chain.
+-- questions.sql SHA-256: c15bc8e71e662618646653915b15aa46dda371c5e3c4f5b435835a83d25353c4
+-- BEGIN v0.10.30 questions.sql
+CREATE TABLE question_interaction (
+  request_id text PRIMARY KEY REFERENCES human_request(id) ON DELETE CASCADE,
+  purpose text NOT NULL CHECK (purpose IN ('clarification','required_input','plan_authorization')),
+  mode text NOT NULL CHECK (mode IN ('blocking','deferred')),
+  definition text NOT NULL CHECK (json_valid(definition) AND json_type(definition) = 'object'),
+  decision text CHECK (decision IN ('approve','decline')),
+  authorization text CHECK (authorization IN ('waiting_for_handoff','applied','invalidated')),
+  risk_reason text,
+  authorization_input_id text
 );
-
--- Published local databases have one explicit local owner. Import into an
--- enterprise namespace is a separate, authorized operation.
-INSERT INTO session_ownership (session_id, tenant_id, principal_id)
-  SELECT id, 'local', 'local-user' FROM session;
-
--- Raw local insertions keep the same invariant as the public creation service.
--- A service creating an authenticated root replaces this initial binding in
--- the same creation transaction, before any observer can see it.
-CREATE TRIGGER session_ownership_insert AFTER INSERT ON session
-BEGIN
-  INSERT INTO session_ownership (session_id, tenant_id, principal_id)
-  VALUES (
-    NEW.id,
-    COALESCE((SELECT tenant_id FROM session_ownership WHERE session_id=NEW.parent_id), 'local'),
-    COALESCE((SELECT principal_id FROM session_ownership WHERE session_id=NEW.parent_id), 'local-user')
-  );
-END;
-
-CREATE INDEX session_ownership_principal_idx
-  ON session_ownership(tenant_id, principal_id, session_id);
-
--- A pre-runtime Job whose identity, result, cursor and status must survive
--- widening the table's subject constraint.
-INSERT INTO agent_job(
-  id,parent_session_id,logical_key,subject_kind,subject_payload,orchestration_snapshot,
-  evidence_start_rowid,status,report_delivery,result,error,report_input_id,created_seq,
-  settled_seq,time_created,time_updated,time_completed
-) VALUES(
-  'job_fixture_13','ses_fixture_0001','fixture-workflow','workflow',
-  '{"kind":"workflow","runID":"run_fixture_13","workflow":"audit"}',NULL,
-  23,'completed','quiet','{"answer":"保留已完成的工作"}',NULL,NULL,7,12,100,200,200
+CREATE TABLE question_action_receipt (
+  request_id text NOT NULL REFERENCES human_request(id) ON DELETE CASCADE,
+  command_id text NOT NULL,
+  command_json text NOT NULL CHECK (json_valid(command_json)),
+  receipt text NOT NULL CHECK (json_valid(receipt)),
+  time_created integer NOT NULL,
+  PRIMARY KEY (request_id, command_id)
 );
+CREATE INDEX question_interaction_purpose_authorization_idx
+  ON question_interaction(purpose, authorization, request_id);
+-- END v0.10.30 questions.sql
+-- scheduling.sql SHA-256: 2e0541aac322b475128873def272500a298b1b4c24c2b56af8556ad486e61808
+-- BEGIN v0.10.30 scheduling.sql
+-- Format 13 stores scheduling eligibility on the existing execution row.
+-- NULL preserves legacy rows; the migration repairs only structured no-progress pauses.
+ALTER TABLE session_execution_state ADD COLUMN scheduling text
+  CHECK (scheduling IS NULL OR (json_valid(scheduling) AND json_type(scheduling) = 'object'));
+-- END v0.10.30 scheduling.sql
+INSERT INTO human_request
+  (id,session_id,kind,state,payload,response,revision,time_created,time_updated)
+VALUES ('req_format13','ses_fixture_0001','input','pending',
+  '{"source":"question_async","questions":[{"question":"Any correction?","header":"Notes","options":[]}]}',
+  '{"draftAnswers":{"q1":["keep this draft"]}}',2,1735690000000,1735690001000);
+INSERT INTO question_interaction(request_id,purpose,mode,definition)
+VALUES ('req_format13','clarification','deferred',
+  '{"origin":{"sessionId":"ses_fixture_0001"},"questions":[{"id":"q1","question":"Any correction?","header":"Notes","options":[]}],"plan":null,"initialMode":"deferred","handoffCompleted":false}');
 UPDATE zuno_schema SET format=13 WHERE singleton=1 AND format=12;

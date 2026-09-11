@@ -34,6 +34,7 @@ zuno-paths = { workspace = true }
 zuno-permission = { workspace = true }
 zuno-postgres = { workspace = true }
 zuno-pty = { workspace = true }
+zuno-tool = { workspace = true }
 zuno-types = { workspace = true }
 zuno-worker = { workspace = true }
 rusqlite = { workspace = true }
@@ -59,6 +60,8 @@ reqwest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true }
+zuno-session-control = { workspace = true }
+zuno-tools = { workspace = true }
 
 [lints]
 workspace = true

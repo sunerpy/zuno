@@ -4,16 +4,17 @@ mod route;
 mod store;
 mod types;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use zuno_db::Pool;
 use zuno_engine::r#loop::TurnEvent;
 use zuno_llm::event::{ConnectionPhase, StreamEvent as ProviderEvent};
+use zuno_types::context_usage::ContextUsageSnapshot;
 
 use crate::{Delivery, EventFanout, EventSubscription};
 use store::{Page, Snapshot, Store};
@@ -57,6 +58,80 @@ impl EventService {
         self
     }
 
+    /// Offer an already committed domain event to live HTTP subscribers.
+    ///
+    /// The caller must supply the actual event from this service's database after
+    /// its owning transaction commits. This method preserves its ID, sequence,
+    /// version, and payload; it never appends another event. Domain services use
+    /// this post-commit hook for events such as durable question transitions.
+    pub fn announce_committed(&self, event: zuno_db::event_log::SessionEvent) {
+        let stored = StreamEvent {
+            cursor: EventCursor {
+                session_id: event.session_id,
+                sequence: event.sequence,
+            },
+            id: event.id,
+            event_type: event.event_type,
+            version: event.version,
+            properties: event.properties,
+        };
+        self.announce(&stored);
+    }
+
+    fn announce(&self, stored: &StreamEvent) {
+        if let Some(fanout) = self.live_fanout(&stored.cursor.session_id) {
+            fanout.publish(stored.clone());
+        }
+        self.global.publish(stored.clone());
+    }
+
+    /// Forward committed question events using service receipts only as wakeups.
+    ///
+    /// Run one forwarder per HTTP event service, subscribing before questions may
+    /// be opened. The caller owns this future's lifetime. Replays preserve the
+    /// database's event identities; a receipt is never appended as another event.
+    /// If notifications lag, discover the affected sessions from the durable log.
+    pub async fn forward_question_events(
+        &self,
+        mut changes: broadcast::Receiver<zuno_types::question::QuestionReceipt>,
+    ) -> Result<(), EventStreamError> {
+        let mut cursors = BTreeMap::<String, i64>::new();
+        loop {
+            let sessions = match changes.recv().await {
+                Ok(receipt) if receipt.duplicate => continue,
+                Ok(receipt) => vec![receipt.question.origin.session_id],
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let store = Arc::clone(&self.store);
+                    tokio::task::spawn_blocking(move || store.question_sessions())
+                        .await
+                        .map_err(|source| EventStreamError::Worker { source })??
+                }
+            };
+            for session_id in sessions {
+                let mut after = cursors.get(&session_id).copied();
+                loop {
+                    let page = self.history_page(&session_id, after, 128).await?;
+                    for event in page.events {
+                        after = Some(event.sequence());
+                        if matches!(
+                            event.event_type(),
+                            "question.opened" | "question.updated" | "question.authorization"
+                        ) {
+                            self.announce(&event);
+                        }
+                    }
+                    if let Some(sequence) = after {
+                        cursors.insert(session_id.clone(), sequence);
+                    }
+                    if !page.has_more {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     /// Commits one event before offering it to live subscribers.
     pub async fn publish(
         &self,
@@ -71,10 +146,23 @@ impl EventService {
         })
         .await
         .map_err(|source| EventStreamError::Worker { source })??;
-        if let Some(fanout) = self.live_fanout(&session_id) {
-            fanout.publish(stored.clone());
-        }
-        self.global.publish(stored.clone());
+        self.announce(&stored);
+        Ok(stored)
+    }
+
+    /// Publish a host-supplied context snapshot without re-running usage tracking.
+    ///
+    /// The engine owns canonical state persistence. This appends the corresponding
+    /// HTTP projection before live delivery and preserves request/attempt identity.
+    pub async fn publish_context_usage(
+        &self,
+        snapshot: ContextUsageSnapshot,
+    ) -> Result<StreamEvent, EventStreamError> {
+        let store = Arc::clone(&self.store);
+        let stored = tokio::task::spawn_blocking(move || store.append_context_usage(snapshot))
+            .await
+            .map_err(|source| EventStreamError::Worker { source })??;
+        self.announce(&stored);
         Ok(stored)
     }
 
@@ -103,10 +191,7 @@ impl EventService {
         })
         .await
         .map_err(|source| EventStreamError::Worker { source })??;
-        if let Some(fanout) = self.live_fanout(&session_id) {
-            fanout.publish(stored.clone());
-        }
-        self.global.publish(stored.clone());
+        self.announce(&stored);
         Ok(stored)
     }
 
@@ -177,6 +262,18 @@ impl EventService {
         local: &EventFanout<TurnEvent>,
         event: TurnEvent,
     ) {
+        if let TurnEvent::ContextUsageUpdated { snapshot } = &event {
+            if snapshot.session_id != session_id {
+                return;
+            }
+            match self.publish_context_usage(snapshot.as_ref().clone()).await {
+                Ok(_) => local.publish(event),
+                Err(error) => {
+                    eprintln!("failed to publish HTTP context event for `{session_id}`: {error}")
+                }
+            }
+            return;
+        }
         if matches!(
             event,
             TurnEvent::Notice {
@@ -211,16 +308,20 @@ impl EventService {
         let live = self.subscribe_live(&session_id);
         let store = Arc::clone(&self.store);
         let snapshot_session = session_id.clone();
-        let Snapshot { events, boundary } =
-            tokio::task::spawn_blocking(move || store.snapshot(&snapshot_session, after))
-                .await
-                .map_err(|source| EventStreamError::Worker { source })??;
+        let Snapshot {
+            events,
+            boundary,
+            context_usage,
+        } = tokio::task::spawn_blocking(move || store.snapshot(&snapshot_session, after))
+            .await
+            .map_err(|source| EventStreamError::Worker { source })??;
         Ok(SessionSubscription {
             session_id,
             events,
             boundary,
             live,
             cursor: cursor.cloned(),
+            context_usage,
         })
     }
 
@@ -262,6 +363,10 @@ impl EventService {
 
 fn turn_event(event: &TurnEvent) -> NewEvent {
     let (event_type, properties) = match event {
+        TurnEvent::ContextUsageUpdated { snapshot } => (
+            "session.context.usage",
+            object(json!({"snapshot": snapshot})),
+        ),
         TurnEvent::SessionMaterialized { session_id, title } => (
             "session.materialized",
             object(json!({"sessionID": session_id, "title": title})),
@@ -742,6 +847,7 @@ struct SessionSubscription {
     boundary: i64,
     live: LiveSessionSubscription,
     cursor: Option<EventCursor>,
+    context_usage: Option<ContextUsageSnapshot>,
 }
 
 /// One session's live subscription plus the fan-out bookkeeping it owes on exit.

@@ -62,14 +62,12 @@ impl std::fmt::Display for ToolSuppressionDiagnostic {
     }
 }
 
-/// Built-in positions from `packages/opencode/src/tool/registry.ts:224-247`.
-///
-/// The enum names follow upstream's internal registry keys. [`Self::wire_id`]
-/// records the provider-facing id where the two differ.
+/// Native built-in positions and their provider-facing tool identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BuiltinSlot {
     Invalid,
     Question,
+    QuestionAsync,
     Shell,
     Background,
     Read,
@@ -96,6 +94,7 @@ impl BuiltinSlot {
         match self {
             Self::Invalid => "invalid",
             Self::Question => "question",
+            Self::QuestionAsync => "question_async",
             Self::Shell => "shell",
             Self::Background => "bg",
             Self::Read => "read",
@@ -132,9 +131,10 @@ impl BuiltinSlot {
 }
 
 /// The exact built-in order used before custom and MCP tools are appended.
-pub const BUILTIN_ORDER: [BuiltinSlot; 19] = [
+pub const BUILTIN_ORDER: [BuiltinSlot; 20] = [
     BuiltinSlot::Invalid,
     BuiltinSlot::Question,
+    BuiltinSlot::QuestionAsync,
     BuiltinSlot::Shell,
     BuiltinSlot::Background,
     BuiltinSlot::Read,
@@ -156,14 +156,15 @@ pub const BUILTIN_ORDER: [BuiltinSlot; 19] = [
 
 /// Built-ins whose interface, implementation, and default-host consumer are complete.
 ///
-/// `execute`, `lsp`, and `plan_exit` remain extension slots. The default harness must
+/// `execute` and `lsp` remain extension slots. The default harness must
 /// not claim them until production assembly supplies their missing configuration or
 /// host collaborator. `edit` remains registered for explicitly constructed internal
 /// profiles, but the default model surface has one structured editing path:
 /// `apply_patch`, plus `write` for new files or intentional full replacement.
-pub const DEFAULT_BUILTINS: [BuiltinSlot; 15] = [
+pub const DEFAULT_BUILTINS: [BuiltinSlot; 17] = [
     BuiltinSlot::Invalid,
     BuiltinSlot::Question,
+    BuiltinSlot::QuestionAsync,
     BuiltinSlot::Shell,
     BuiltinSlot::Background,
     BuiltinSlot::Read,
@@ -177,6 +178,7 @@ pub const DEFAULT_BUILTINS: [BuiltinSlot; 15] = [
     BuiltinSlot::Search,
     BuiltinSlot::Skill,
     BuiltinSlot::Patch,
+    BuiltinSlot::Plan,
 ];
 
 /// Process-wide flags consulted while the registry is assembled and resolved.
@@ -708,6 +710,7 @@ pub(crate) fn canonical_tool_name(name: &str) -> &str {
         "WebSearch" => "web_search",
         "ApplyPatch" => "apply_patch",
         "Question" => "question",
+        "QuestionAsync" => "question_async",
         "PlanExit" => "plan_exit",
         "Lsp" => "lsp",
         "Execute" => "execute",

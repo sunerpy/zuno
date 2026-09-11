@@ -8,7 +8,7 @@ use futures::StreamExt;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tracing::Instrument as _;
 use zuno_config::ResolvedLearningConfig;
 use zuno_db::event_log::{NewSessionEvent, SessionEventLog};
@@ -21,7 +21,7 @@ use zuno_llm::{
     stream::StreamAccumulator,
 };
 
-pub const LEARNING_EXTRACTOR_VERSION: &str = "zuno-learning-extractor-v2";
+pub const LEARNING_EXTRACTOR_VERSION: &str = "zuno-learning-extractor-v3";
 
 #[derive(Clone)]
 pub struct LearningModel {
@@ -29,6 +29,11 @@ pub struct LearningModel {
     pub model_id: String,
     pub wire_id: String,
     pub surface: ApiSurface,
+    /// The selected model's resolved request settings, including reasoning controls.
+    pub parameters: serde_json::Map<String, Value>,
+    /// Request headers are forwarded but never persisted as credential-bearing values.
+    pub headers: BTreeMap<String, String>,
+    pub sampling_params: bool,
 }
 
 /// A minimal provider binding. It holds no foreground host, tools or MCP client.
@@ -109,13 +114,43 @@ impl LearningModelClient {
         tools: Vec<ToolSchema>,
         schema: Option<&Value>,
     ) -> Result<StreamAccumulator> {
-        let mut parameters = serde_json::Map::new();
-        parameters.insert(
-            generation::MAX_TOKENS.to_owned(),
-            json!(self.limits.execution_max_output_tokens),
-        );
-        if self.provider.capabilities().sampling_params {
-            parameters.insert(generation::TEMPERATURE.to_owned(), json!(0));
+        let mut parameters = self.model.parameters.clone();
+        let mut output_limit = u64::from(self.limits.execution_max_output_tokens);
+        if output_limit == 0 {
+            return Err(invalid("learning execution output limit must be positive"));
+        }
+        for key in [
+            "maxTokens",
+            "max_tokens",
+            "max_output_tokens",
+            "max_completion_tokens",
+        ] {
+            if let Some(value) = parameters.remove(key) {
+                let limit = value
+                    .as_u64()
+                    .ok_or_else(|| invalid("model output limit must be a non-negative integer"))?;
+                // Like the foreground adapter, zero means no additional model cap.
+                // The isolated request still keeps its positive execution ceiling.
+                if limit > 0 {
+                    output_limit = output_limit.min(limit);
+                }
+            }
+        }
+        // The provider's shared apply_parameters path lowers this single bounded
+        // semantic cap after selecting its actual wire surface.
+        parameters.insert(generation::MAX_TOKENS.to_owned(), json!(output_limit));
+        if !self.model.sampling_params {
+            for key in [
+                "temperature",
+                "topP",
+                "top_p",
+                "frequencyPenalty",
+                "frequency_penalty",
+                "presencePenalty",
+                "presence_penalty",
+            ] {
+                parameters.remove(key);
+            }
         }
         if self.limits.execution_structured_output
             && let Some(schema) = schema
@@ -129,13 +164,23 @@ impl LearningModelClient {
                     );
                 }
                 ApiSurface::Responses => {
-                    parameters.insert("text".to_owned(), json!({"format":{
-                        "type":"json_schema","name":"learning_output","strict":true,"schema":schema}}));
+                    let text = parameters.entry("text").or_insert_with(|| json!({}));
+                    let text = text
+                        .as_object_mut()
+                        .ok_or_else(|| invalid("Responses text options must be an object"))?;
+                    text.insert("format".to_owned(), json!({
+                        "type":"json_schema","name":"learning_output","strict":true,"schema":schema}));
                 }
                 ApiSurface::Messages => {
-                    parameters.insert(
-                        "output_config".to_owned(),
-                        json!({"format":{"type":"json_schema","schema":schema}}),
+                    let output = parameters
+                        .entry("output_config")
+                        .or_insert_with(|| json!({}));
+                    let output = output
+                        .as_object_mut()
+                        .ok_or_else(|| invalid("Messages output_config must be an object"))?;
+                    output.insert(
+                        "format".to_owned(),
+                        json!({"type":"json_schema","schema":schema}),
                     );
                 }
                 ApiSurface::Default => {
@@ -177,6 +222,7 @@ impl LearningModelClient {
         let request = CompletionRequest::new(self.model.wire_id.clone(), messages)
             .on_surface(self.model.surface)
             .with_parameters(parameters)
+            .with_headers(self.model.headers.clone())
             .with_tools(tools.clone())
             .with_request_context(purpose);
         let span = zuno_observability::span::provider_request_for_session(
@@ -214,11 +260,20 @@ impl LearningModelClient {
                     })).collect::<Vec<_>>()
                 }),
             )?,
-            Err(error) => self.event(
-                session_id,
-                &format!("{operation}.outcome"),
-                json!({"requestID":request_id,"status":"failed","error":error.to_string()}),
-            )?,
+            Err(error) => {
+                let provider_diagnostic = match error {
+                    LearningServiceError::ExtractorProvider { source, .. } => {
+                        Some(source.diagnostic_fields())
+                    }
+                    _ => None,
+                };
+                self.event(
+                    session_id,
+                    &format!("{operation}.outcome"),
+                    json!({"requestID":request_id,"status":"failed","error":error.diagnostic(),
+                        "providerDiagnostic":provider_diagnostic}),
+                )?;
+            }
         }
         result
     }
@@ -322,7 +377,7 @@ impl LearningExtractor for LearningModelClient {
                 &request.session_id,
                 "learning.extraction",
                 extraction_prompt(),
-                serde_json::to_value(&request).expect("serializable extraction"),
+                request.model_input(),
             )
             .await?;
         output.validate_bounds()?;
@@ -333,8 +388,9 @@ impl LearningExtractor for LearningModelClient {
 pub fn extraction_prompt() -> &'static str {
     "You are Zuno's isolated experience extractor. You have no tools or filesystem authority. \
      Record concrete outcomes, problems, corrections, feedback and verified procedures. \
-     Use only supplied sources. Copy source.reference_id into evidence.source_id and an exact \
-     substring of source.content into evidence.excerpt. Never invent evidence. Empty sources \
+     Use only supplied sources. Copy source.source_id exactly into evidence.source_id, match \
+     evidence.kind to source.kind, and copy an exact substring of source.content into \
+     evidence.excerpt. Never invent evidence. Empty sources \
      require empty experiences and memories. Assistant prose alone does not prove execution. \
      Only proves_success=true marks host-verified execution. Unresolved issues must have \
      kind=unresolved_issue, resolution=null and no memory. Propose memory only for stable facts, \

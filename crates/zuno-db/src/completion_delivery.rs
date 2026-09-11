@@ -1,6 +1,6 @@
-//! Exactly-once arbitration between asynchronous callbacks and synchronous waits.
+//! Exactly-once arbitration between asynchronous callbacks and explicit terminal reads.
 
-use crate::inbox::{NewSessionInput, SessionInput, admit_in};
+use crate::inbox::{self, NewSessionInput, SessionInput, SubmissionState, admit_in};
 use crate::{Pool, open};
 use rusqlite::{OptionalExtension, Row, Transaction, params};
 use std::sync::Arc;
@@ -14,6 +14,13 @@ pub enum CompletionOwner {
 }
 
 impl CompletionOwner {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Callback => "callback",
+            Self::Inline => "inline",
+        }
+    }
+
     fn parse(value: &str) -> Result<Self, DbError> {
         match value {
             "callback" => Ok(Self::Callback),
@@ -52,6 +59,8 @@ impl CompletionDeliveryStore {
             .transaction(|transaction| publish_in(transaction, envelope, at_ms))
     }
 
+    /// Consume a terminal result, superseding a callback only while its inbox input
+    /// is still pending. Promotion reserves the callback for its existing consumer.
     pub fn claim_inline(
         &self,
         source_key: &str,
@@ -153,20 +162,77 @@ pub fn claim_inline_in(
     let Some(mut delivery) = read_in(transaction, source_key)? else {
         return Ok(None);
     };
-    if delivery.owner.is_some() {
-        return Ok(None);
+    let callback_input_id = match delivery.owner {
+        Some(CompletionOwner::Inline) => return Ok(None),
+        Some(CompletionOwner::Callback) => Some(
+            delivery
+                .input_id
+                .clone()
+                .ok_or_else(|| query_error("callback completion has no inbox input id"))?,
+        ),
+        // Older callbacks may have entered the inbox before completion ownership
+        // existed. The durable source identity must arbitrate those rows as well.
+        None => transaction
+            .query_row(
+                "SELECT id FROM session_input WHERE session_id = ?1 AND source_key = ?2",
+                params![delivery.envelope.parent_session_id, source_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(open::map_error)?,
+    };
+    if let Some(input_id) = callback_input_id {
+        let input = inbox::read_in(transaction, &delivery.envelope.parent_session_id, &input_id)?
+            .ok_or_else(|| query_error("callback completion inbox input is missing"))?;
+        if input.source_key.as_deref() != Some(source_key) {
+            return Err(query_error(
+                "callback completion inbox input belongs to another source",
+            ));
+        }
+        // A pending callback may have been edited to carry additional work.
+        // Reading the original terminal result does not consume that work.
+        if input.prompt != delivery.envelope.payload {
+            return Ok(None);
+        }
+        if inbox::transition_in(
+            transaction,
+            &delivery.envelope.parent_session_id,
+            &input_id,
+            &[SubmissionState::Queued, SubmissionState::Steering],
+            SubmissionState::Cancelled,
+            Some("completion consumed inline before callback promotion"),
+            "session.input.superseded",
+        )?
+        .is_none()
+        {
+            return Ok(None);
+        }
     }
+    let at_ms = at_ms.max(delivery.time_updated);
     let changed = transaction
         .execute(
-            "UPDATE completion_delivery SET owner = 'inline', time_updated = ?1 \
-             WHERE source_key = ?2 AND owner IS NULL",
-            params![at_ms, source_key],
+            "UPDATE completion_delivery SET owner = 'inline', input_id = NULL, time_updated = ?1 \
+             WHERE source_key = ?2 AND owner IS ?3",
+            params![
+                at_ms,
+                source_key,
+                delivery.owner.map(CompletionOwner::as_str)
+            ],
         )
         .map_err(open::map_error)?;
     if changed != 1 {
-        return Ok(None);
+        // Roll back the inbox cancellation with this failed ownership change.
+        return Err(DbError::Conflict {
+            table: "completion_delivery".to_owned(),
+            id: source_key.to_owned(),
+            detail: "completion delivery owner changed during inline claim".to_owned(),
+        });
     }
+    // Inline ownership has no input_id in the released schema. The cancelled inbox
+    // row and its revisioned event retain the original id and shared source_key, so
+    // the audit survives and a stale steer still fails its normal revision claim.
     delivery.owner = Some(CompletionOwner::Inline);
+    delivery.input_id = None;
     delivery.time_updated = at_ms;
     Ok(Some(delivery))
 }
@@ -189,6 +255,7 @@ pub fn claim_callback_in(
         ));
     }
     input.source_key = Some(source_key.to_owned());
+    input.cycle_id = delivery.envelope.cycle_id.clone();
     let input = admit_in(transaction, input)?;
     let changed = transaction
         .execute(

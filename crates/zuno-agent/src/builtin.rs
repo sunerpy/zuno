@@ -11,10 +11,9 @@
 //! miscellaneous execution ([`GENERAL`]), local evidence, external evidence,
 //! architecture/review, and visual inspection.
 //!
-//! The roster adapts role boundaries from the pinned OMO references without copying
-//! their prompt-only security model. Read-only and no-child contracts are enforced by
-//! deny-by-default permissions. Council remains a durable workflow concern, not a
-//! nominal agent that asks the model to simulate a scheduler.
+//! Read-only and child-Agent boundaries are expressed by native permission policies
+//! and constrained by runtime authority. Council remains a durable workflow concern,
+//! not a nominal agent that asks the model to simulate a scheduler.
 //!
 //! # Why every agent carries a *negative* boundary
 //!
@@ -44,8 +43,9 @@
 //! `parent_session_id` is the calling session. A Job row exists because a `task` call
 //! created it, so an agent that may not delegate can never name a Job it owns:
 //! offering it `job` advertises a tool whose every argument answers "not found for this
-//! session". [`ORCHESTRATOR`] is the one agent that may delegate, so it is the one
-//! agent that may inspect. `job_cancel` and `job_reconcile` are absent from
+//! session". [`ORCHESTRATOR`] and [`DEEP`] may delegate and inspect their Jobs.
+//! The catalog also grants `review` Job inspection for its fixed Council.
+//! `job_cancel` and `job_reconcile` are absent from
 //! [`GOVERNED_TOOL_IDS`] because they are not fixed default-surface slots — the
 //! composition root registers them as configured built-ins next to `job`.
 //!
@@ -123,7 +123,7 @@ pub const GOVERNED_TOOL_IDS: [&str; 20] = [
 /// Where an agent sits in the delegation graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
-    /// The user-facing primary agent. The only role that may delegate.
+    /// The default user-facing coordinator. Delegation is declared separately.
     Orchestrator,
     /// A user-facing direct execution mode that may not delegate.
     Primary,
@@ -136,8 +136,9 @@ pub enum Role {
 /// Whether the agent may spawn children.
 ///
 /// The distinction is load-bearing rather than cosmetic: an agent that can
-/// delegate can also fan out recursively, which is why todo 65 gates `task` on
-/// depth. Exactly one entry in the roster is [`Self::MayDelegate`].
+/// delegate can also create nested work, so the runtime gates `task` on depth and
+/// inherited authority. The coordinator and deep-work lane declare this capability;
+/// the catalog separately owns review's fixed Council.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Delegation {
     /// May call `task`.
@@ -161,8 +162,8 @@ pub enum Write {
 /// The field makes the difference between a focused local fix and a broad execution
 /// lane executable rather than rhetorical. [`FIXER`] is intentionally confined to
 /// repository evidence and focused verification; [`GENERAL`] and [`DEEP`] may gather
-/// external context when the assigned outcome genuinely depends on it. Every lane is
-/// still bounded by [`Delegation::NoChildren`].
+/// external context when the assigned outcome depends on it. Research does not
+/// grant delegation: [`Agent::delegation`] states that boundary separately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Research {
     /// May search, read, fetch, and iterate until the task is done.
@@ -252,11 +253,10 @@ impl Boundary {
 pub enum OutputContract {
     /// User-facing Markdown with no harness-only wrapper.
     Natural,
-    /// The engine consumes the raw completion — a title string, a compacted
-    /// transcript, a session summary. Wrapping those in tags would mean stripping
-    /// the tags again at the only call site.
+    /// The engine consumes the raw completion — a title, checkpoint, session summary,
+    /// or Council synthesis — using the catalog's output contract.
     EnginePrompt {
-        /// The upstream prompt constant that specifies the format instead.
+        /// The canonical catalog prompt that specifies the format.
         prompt: &'static str,
     },
 }
@@ -483,7 +483,7 @@ const READ_ONLY_ALLOWED: &[&str] = &[
     "report_write",
 ];
 
-/// The default primary coordinator and the only Agent that may delegate.
+/// The default primary coordinator for bounded multi-agent delivery.
 pub const ORCHESTRATOR: Agent = Agent {
     name: "orchestrator",
     role: Role::Orchestrator,
@@ -491,7 +491,7 @@ pub const ORCHESTRATOR: Agent = Agent {
     hidden: false,
     description: "Owns multi-agent delivery end to end: builds the dependency graph, routes \
                   bounded non-overlapping work to specialists, integrates their evidence, and \
-                  verifies the user's outcome. The only Agent that may spawn children.",
+                  independently verifies the user's requested outcome.",
     boundary: Boundary::DontDelegateWhen(
         "the whole task is smaller than the briefing it would take • you already have the \
          file path and need its contents • the answer is in this conversation • explaining \
@@ -581,9 +581,9 @@ pub const DEEP: Agent = Agent {
     role: Role::Subagent,
     mode: AgentMode::All,
     hidden: false,
-    description: "Owns one difficult debugging or cross-cutting objective from evidence \
-                  gathering through implementation and real-surface verification. It may be \
-                  selected directly or delegated, but cannot spawn children.",
+    description: "Owns difficult debugging and cross-cutting work: gathers evidence, ranks \
+                  hypotheses, runs discriminating experiments, fixes the cause when authorized, \
+                  and verifies recovery. May delegate bounded tasks within runtime authority.",
     boundary: Boundary::DontDelegateWhen(
         "the change is already well specified and local enough for `fixer` • the caller needs \
          only repository locations or external research • the task still needs product \
@@ -592,7 +592,7 @@ pub const DEEP: Agent = Agent {
     temperature: 0.1,
     output: OutputContract::Natural,
     permissions: Permissions {
-        denied: &["task", "job", "plan_exit"],
+        denied: &["plan_exit"],
         allowed: &[
             "read",
             "report_write",
@@ -602,6 +602,8 @@ pub const DEEP: Agent = Agent {
             "edit",
             "shell",
             "bg",
+            "task",
+            "job",
             "webfetch",
             "web_search",
             "plan_get",
@@ -614,7 +616,7 @@ pub const DEEP: Agent = Agent {
         ],
         extension_tools: ExtensionTools::Inherit,
     },
-    delegation: Delegation::NoChildren,
+    delegation: Delegation::MayDelegate,
     write: Write::Capable,
     research: Research::Allowed,
     gate: Gate::Always,
@@ -869,21 +871,16 @@ pub fn lean() -> Vec<Agent> {
 
 /// The engine's internal agents.
 ///
-/// # Why these four, and why not `plan`
+/// # Why these four, and why not `plan` or `review`
 ///
-/// Upstream declares seven natives at `packages/opencode/src/agent/agent.ts:140-265`.
-/// `compaction`, `title`, and `summary` retain the upstream engine roles. Zuno adds
-/// `council-synth` as a hidden, tool-free reducer for bounded structured Council
-/// results. All four are `hidden: true`, take a
-/// prompt, deny every tool, and are invoked by the engine rather than chosen by
-/// anyone; dropping any of them silently removes auto-compaction, session titles,
-/// or session summaries, with nothing else in the roster providing them. They are
-/// carried here by reference to [`zuno_catalog::agent::builtin`] so the upstream
-/// prompt text stays in exactly one place.
+/// `compaction`, `title`, `summary`, and `council-synth` are hidden, tool-free
+/// engine roles. They condense context, name sessions, summarize outcomes, and
+/// reduce structured Council results. Their prompts come from
+/// [`zuno_catalog::agent::builtin`] so each contract has one source.
 ///
-/// `plan` is a visible primary mode, not a task target. Its read-only edit policy
-/// depends on a session-specific plan path, so the catalog and CLI composition root
-/// own it instead of duplicating it in this static delegation roster.
+/// `plan` and `review` are visible primary modes, not task targets. The catalog
+/// owns their read-only policies and review's fixed Council; they are not duplicated
+/// in this static delegation roster.
 #[must_use]
 pub fn internals() -> Vec<Agent> {
     INTERNAL_NAMES
@@ -892,7 +889,7 @@ pub fn internals() -> Vec<Agent> {
         .collect()
 }
 
-/// One internal agent, derived from the catalog's port of the upstream native.
+/// One internal agent, derived from its canonical catalog definition.
 fn internal(name: &str) -> Option<Agent> {
     let native = zuno_catalog::agent::builtin::get(name)?;
     let prompt = native.prompt?;
@@ -922,11 +919,7 @@ fn internal(name: &str) -> Option<Agent> {
             reason: "the engine invokes it at a fixed point in the turn loop; no caller \
                      chooses it, so there is no delegation decision to bound.",
         },
-        // Upstream declares a temperature only for `title` (0.5, `agent.ts:239`)
-        // and leaves the other two unset, i.e. at the provider default. This roster
-        // requires a declared value from every agent — an undeclared temperature is
-        // a per-provider behaviour difference nobody chose — so the two summarisers
-        // take the floor, which is what deterministic condensation wants anyway.
+        // Keep the catalog's sampling policy alongside its prompt.
         temperature: native.temperature.unwrap_or(0.1),
         output: OutputContract::EnginePrompt { prompt },
         permissions: Permissions {

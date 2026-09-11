@@ -1,12 +1,16 @@
 //! Question prompt tests, including the oracle wire-shape check.
 
 use super::*;
-use crate::app::render_offscreen;
+use crate::app::{AppEvent, Component, EventResult, TerminalEvent, render_offscreen};
+use crate::keybind::{ActionComponent, KeyDispatcher, Keymap};
 use crate::views::dialog::{DialogHost, ObservedBase};
 use crate::views::message::TranscriptView;
 use crate::views::testkit::{action, press, rows};
-use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    Event as CrosstermEvent, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::Rect;
+use std::sync::{Arc, Mutex};
 
 fn options() -> Vec<QuestionOption> {
     vec![
@@ -24,6 +28,13 @@ fn answered(step: DialogStep) -> Vec<Vec<String>> {
     match step {
         DialogStep::Resolved(DialogOutcome::Question(answers)) => answers,
         other => panic!("expected question answers, got {other:?}"),
+    }
+}
+
+fn deferred(step: DialogStep) -> Vec<Vec<String>> {
+    match step {
+        DialogStep::Resolved(DialogOutcome::QuestionDeferred(answers)) => answers,
+        other => panic!("expected deferred question answers, got {other:?}"),
     }
 }
 
@@ -433,4 +444,480 @@ fn views_question_typed_answer_hints_explain_newline_and_submit() {
 
     assert!(prompt.hints().contains(&("shift+enter", "newline")));
     assert!(prompt.hints().contains(&("enter", "submit")));
+}
+
+// ---------------------------------------------------------------------------
+// Stored answers and explicit deferral
+// ---------------------------------------------------------------------------
+
+#[test]
+fn views_question_prefilled_complete_answers_are_restored_before_explicit_submit() {
+    let mut multiple = QuestionRequest::new("Which changes?", "Changes", options());
+    multiple.multiple = Some(true);
+    let answers = vec![
+        vec![String::from("Patch")],
+        vec![String::from("Rewrite"), String::from("Skip")],
+    ];
+    let mut prompt = QuestionPrompt::new(
+        ViewContext::defaults(),
+        vec![
+            QuestionRequest::new("How?", "Approach", options()),
+            multiple,
+        ],
+    )
+    .with_answers(answers.clone());
+
+    assert_eq!(prompt.current(), 0);
+    assert_eq!(prompt.cursor(), 1);
+    assert_eq!(prompt.answers(), answers);
+    assert_eq!(prompt.title(), "Question 1/2 · Approach");
+    assert_eq!(
+        answered(prompt.handle_action(action("dialog.select.submit"), &press(KeyCode::Enter))),
+        answers
+    );
+}
+
+#[test]
+fn views_question_partial_submit_preserves_skipped_slots_for_reopening() {
+    let questions = vec![
+        QuestionRequest::new("How?", "Approach", options()),
+        QuestionRequest::new("Which?", "Change", options()),
+    ];
+    let mut prompt = QuestionPrompt::new(ViewContext::defaults(), questions.clone());
+    prompt.handle_action(action("dialog.select.next"), &press(KeyCode::Down));
+    prompt.handle_action(
+        action("dialog.question.next_question"),
+        &press(KeyCode::Right),
+    );
+    let answers = deferred(prompt.handle_typed(&press(KeyCode::Char('3'))));
+    assert_eq!(answers, vec![vec![], vec![String::from("Skip")]]);
+
+    let mut reopened =
+        QuestionPrompt::new(ViewContext::defaults(), questions).with_answers(answers.clone());
+    assert_eq!(reopened.current(), 0);
+    assert_eq!(reopened.answers(), answers);
+    assert_eq!(reopened.title(), "Question 1/2 (1 unanswered) · Approach");
+    assert_eq!(
+        answered(reopened.handle_typed(&press(KeyCode::Char('2')))),
+        vec![vec![String::from("Patch")], vec![String::from("Skip")]]
+    );
+}
+
+#[test]
+fn views_question_defer_keeps_selected_answers_without_selecting_highlighted_choices() {
+    let questions = vec![
+        QuestionRequest::new("How?", "Approach", options()),
+        QuestionRequest::new("Which?", "Change", options()),
+    ];
+    let answers = vec![vec![String::from("Skip")], vec![]];
+    let mut prompt =
+        QuestionPrompt::new(ViewContext::defaults(), questions).with_answers(answers.clone());
+    assert_eq!(prompt.current(), 1);
+    prompt.handle_action(
+        action("dialog.question.prev_question"),
+        &press(KeyCode::Left),
+    );
+    assert_eq!(prompt.cursor(), 2);
+    prompt.handle_action(action("dialog.select.home"), &press(KeyCode::Home));
+    prompt.handle_action(
+        action("dialog.question.next_question"),
+        &press(KeyCode::Right),
+    );
+    prompt.handle_action(action("dialog.select.next"), &press(KeyCode::Down));
+    assert_eq!(
+        deferred(prompt.handle_action(
+            action("dialog.question.defer"),
+            &KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        )),
+        answers
+    );
+}
+
+#[test]
+fn views_question_defer_is_distinct_even_with_no_answers_or_all_answers() {
+    for answers in [vec![vec![]], vec![vec![String::from("Patch")]]] {
+        let mut prompt =
+            prompt(QuestionRequest::new("q", "h", options())).with_answers(answers.clone());
+        assert_eq!(
+            deferred(prompt.handle_action(
+                action("dialog.question.defer"),
+                &KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            )),
+            answers
+        );
+    }
+}
+
+#[test]
+fn views_question_prefilled_multiple_answers_can_be_toggled_by_space_and_digit() {
+    let mut request = QuestionRequest::new("q", "h", options());
+    request.multiple = Some(true);
+    let mut prompt =
+        prompt(request).with_answers(vec![vec![String::from("Rewrite"), String::from("Patch")]]);
+    assert_eq!(prompt.cursor(), 0);
+    assert_eq!(
+        prompt.handle_typed(&press(KeyCode::Char(' '))),
+        DialogStep::Redraw
+    );
+    assert_eq!(
+        prompt.handle_typed(&press(KeyCode::Char('3'))),
+        DialogStep::Redraw
+    );
+    assert_eq!(
+        answered(prompt.handle_action(action("dialog.select.submit"), &press(KeyCode::Enter))),
+        vec![vec![String::from("Patch"), String::from("Skip")]]
+    );
+}
+
+#[test]
+fn views_question_clearing_a_reopened_custom_answer_keeps_it_unanswered() {
+    for finish in ["dialog.question.defer", "dialog.prompt.submit"] {
+        let mut prompt = prompt(QuestionRequest::new("q", "h", options()))
+            .with_answers(vec![vec![String::from("old")]]);
+        assert_eq!(prompt.cursor(), options().len());
+        assert!(prompt.hints().contains(&("enter", "edit")));
+        assert_eq!(
+            prompt.handle_action(action("dialog.select.submit"), &press(KeyCode::Enter)),
+            DialogStep::Redraw
+        );
+        assert!(prompt.is_editing());
+        for _ in 0..3 {
+            prompt.handle_action(action("input_backspace"), &press(KeyCode::Backspace));
+        }
+        assert_eq!(
+            deferred(prompt.handle_action(action(finish), &press(KeyCode::Null))),
+            vec![Vec::<String>::new()],
+            "{finish} restored the old answer after it was explicitly cleared"
+        );
+    }
+}
+
+#[test]
+fn views_question_custom_answer_survives_navigation_and_partial_deferral() {
+    let questions = vec![
+        QuestionRequest::new("How?", "Approach", options()),
+        QuestionRequest::new("Which?", "Change", options()),
+    ];
+    let mut prompt = QuestionPrompt::new(ViewContext::defaults(), questions.clone());
+    prompt.handle_typed(&press(KeyCode::Char('4')));
+    for character in "first".chars() {
+        prompt.handle_typed(&press(KeyCode::Char(character)));
+    }
+    prompt.handle_action(action("input_newline"), &press(KeyCode::Enter));
+    for character in "second".chars() {
+        prompt.handle_typed(&press(KeyCode::Char(character)));
+    }
+    assert_eq!(
+        prompt.handle_action(action("dialog.prompt.submit"), &press(KeyCode::Enter)),
+        DialogStep::Redraw
+    );
+    assert_eq!(prompt.current(), 1);
+    prompt.handle_action(
+        action("dialog.question.prev_question"),
+        &press(KeyCode::Left),
+    );
+    assert_eq!(prompt.current(), 0);
+    assert!(!prompt.is_editing());
+    prompt.handle_action(
+        action("dialog.question.next_question"),
+        &press(KeyCode::Right),
+    );
+    assert_eq!(prompt.current(), 1);
+    let answers =
+        deferred(prompt.handle_action(action("dialog.question.defer"), &press(KeyCode::Null)));
+    assert_eq!(answers, vec![vec![String::from("first\nsecond")], vec![]]);
+
+    let mut reopened =
+        QuestionPrompt::new(ViewContext::defaults(), questions).with_answers(answers);
+    assert_eq!(reopened.current(), 1);
+    assert_eq!(
+        answered(reopened.handle_typed(&press(KeyCode::Char('2')))),
+        vec![
+            vec![String::from("first\nsecond")],
+            vec![String::from("Patch")],
+        ]
+    );
+}
+
+#[test]
+fn views_question_stored_answer_slots_are_padded_or_truncated_positionally() {
+    let questions = vec![
+        QuestionRequest::new("How?", "Approach", options()),
+        QuestionRequest::new("Which?", "Change", options()),
+    ];
+    let short = QuestionPrompt::new(ViewContext::defaults(), questions.clone())
+        .with_answers(vec![vec![String::from("Skip")]]);
+    assert_eq!(short.current(), 1);
+    assert_eq!(short.answers(), &[vec![String::from("Skip")], vec![]]);
+
+    let long = QuestionPrompt::new(ViewContext::defaults(), questions).with_answers(vec![
+        vec![String::from("Skip")],
+        vec![],
+        vec![String::from("Rewrite")],
+    ]);
+    assert_eq!(long.answers(), short.answers());
+}
+
+fn plan_question() -> QuestionRequest {
+    let mut question = QuestionRequest::new(
+        "Start working on this plan?",
+        "Plan",
+        vec![
+            QuestionOption::new("Yes", "Approve the plan"),
+            QuestionOption::new("No", "Keep planning"),
+        ],
+    );
+    question.custom = Some(false);
+    question
+}
+
+#[test]
+fn views_question_closed_confirmation_requires_an_explicit_approve_choice() {
+    let mut prompt = prompt(plan_question());
+    assert_eq!(prompt.answers(), &[Vec::<String>::new()]);
+    assert_eq!(
+        prompt.handle_typed(&press(KeyCode::Char('3'))),
+        DialogStep::Ignored,
+        "a closed confirmation offered a custom answer"
+    );
+    assert_eq!(
+        answered(prompt.handle_typed(&press(KeyCode::Char('1')))),
+        vec![vec![String::from("Yes")]]
+    );
+}
+
+#[test]
+fn views_question_closed_confirmation_does_not_restore_invalid_answers_as_approval() {
+    for invalid in [
+        vec![String::new()],
+        vec![String::from(" \n ")],
+        vec![String::from("unknown")],
+        vec![String::from("Yes"), String::from("No")],
+        vec![String::from("Yes"), String::from("unknown")],
+    ] {
+        let mut prompt = prompt(plan_question()).with_answers(vec![invalid]);
+        assert_eq!(prompt.answers(), &[Vec::<String>::new()]);
+        assert_eq!(
+            deferred(prompt.handle_action(
+                action("dialog.question.defer"),
+                &KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            )),
+            vec![Vec::<String>::new()]
+        );
+    }
+}
+
+#[test]
+fn views_question_closing_or_deferring_a_prefilled_approval_does_not_approve() {
+    for finish in ["app_exit", "session_interrupt", "dialog.question.defer"] {
+        let answers = vec![vec![String::from("Yes")]];
+        let mut prompt = prompt(plan_question()).with_answers(answers.clone());
+        let outcome = prompt.handle_action(action(finish), &press(KeyCode::Null));
+        if finish == "dialog.question.defer" {
+            assert_eq!(deferred(outcome), answers);
+        } else {
+            assert_eq!(outcome, DialogStep::Resolved(DialogOutcome::Cancelled));
+        }
+    }
+}
+
+#[test]
+fn views_question_empty_requests_and_optionless_closed_questions_never_approve() {
+    let mut empty = QuestionPrompt::new(ViewContext::defaults(), vec![])
+        .with_answers(vec![vec![String::from("Yes")]]);
+    assert_eq!(empty.title(), "Question (0 unanswered)");
+    assert!(!empty.lines(40).is_empty());
+    assert!(empty.hints().contains(&("ctrl+s", "answer later")));
+    assert_eq!(
+        deferred(empty.handle_action(action("dialog.select.submit"), &press(KeyCode::Enter))),
+        Vec::<Vec<String>>::new()
+    );
+
+    for options in [vec![], vec![QuestionOption::new(" \n ", "Blank label")]] {
+        let mut request = plan_question();
+        request.options = options;
+        let mut prompt = prompt(request);
+        assert_eq!(
+            deferred(prompt.handle_action(action("dialog.select.submit"), &press(KeyCode::Enter))),
+            vec![Vec::<String>::new()]
+        );
+    }
+}
+
+#[test]
+fn views_question_modified_digits_do_not_choose_or_submit_an_option() {
+    for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+        let mut prompt = prompt(plan_question());
+        let key = KeyEvent::new(KeyCode::Char('1'), modifiers);
+        assert_eq!(prompt.handle_typed(&key), DialogStep::Ignored);
+        assert_eq!(
+            prompt.handle_action(action("messages_next"), &key),
+            DialogStep::Ignored
+        );
+        assert_eq!(prompt.answers(), &[Vec::<String>::new()]);
+    }
+}
+
+#[test]
+fn views_question_defer_hint_is_visible_in_existing_controls() {
+    for width in [40, 56, 80] {
+        let joined = render(prompt(plan_question()), width, 14).join("\n");
+        assert!(
+            joined.contains("ctrl+s") && joined.contains("answer later"),
+            "the defer action is hidden at width {width}:\n{joined}"
+        );
+    }
+}
+
+#[derive(Default)]
+struct QuestionObservations {
+    outcomes: Vec<DialogOutcome>,
+    base_actions: Vec<&'static str>,
+}
+
+struct QuestionObserver(Arc<Mutex<QuestionObservations>>);
+
+impl Component for QuestionObserver {
+    fn render(&mut self, _frame: &mut ratatui::Frame<'_>, _area: Rect) {}
+
+    fn handle_event(&mut self, _event: &AppEvent) -> EventResult {
+        EventResult::IGNORED
+    }
+}
+
+impl ActionComponent for QuestionObserver {
+    fn handle_action(&mut self, action: &'static Definition, _event: &KeyEvent) -> EventResult {
+        self.0
+            .lock()
+            .expect("question observer")
+            .base_actions
+            .push(action.name);
+        EventResult::IGNORED
+    }
+
+    fn apply_dialog_outcome(
+        &mut self,
+        dialog: &'static str,
+        outcome: &DialogOutcome,
+    ) -> EventResult {
+        assert_eq!(dialog, DIALOG_ID);
+        self.0
+            .lock()
+            .expect("question observer")
+            .outcomes
+            .push(outcome.clone());
+        EventResult::REDRAW
+    }
+}
+
+fn dispatched(prompt: QuestionPrompt) -> (KeyDispatcher, Arc<Mutex<QuestionObservations>>) {
+    let observations = Arc::new(Mutex::new(QuestionObservations::default()));
+    let mut host = DialogHost::new(
+        ViewContext::defaults(),
+        Box::new(QuestionObserver(Arc::clone(&observations))),
+    );
+    host.open(Box::new(prompt));
+    (
+        KeyDispatcher::new(
+            Keymap::defaults().expect("conflict-free defaults"),
+            vec![String::from("app")],
+            Box::new(host),
+        ),
+        observations,
+    )
+}
+
+fn send_key(dispatcher: &mut KeyDispatcher, key: KeyEvent) {
+    dispatcher.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+        CrosstermEvent::Key(key),
+    )));
+}
+
+#[test]
+fn views_question_dispatcher_defers_and_reopens_editable_multiline_custom_text() {
+    let request = QuestionRequest::new("q", "h", options());
+    let (mut dispatcher, observed) = dispatched(prompt(request.clone()));
+    send_key(&mut dispatcher, press(KeyCode::Char('4')));
+    for character in "hjkl123".chars() {
+        send_key(&mut dispatcher, press(KeyCode::Char(character)));
+    }
+    send_key(
+        &mut dispatcher,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+    );
+    for character in "second!".chars() {
+        send_key(&mut dispatcher, press(KeyCode::Char(character)));
+    }
+    send_key(&mut dispatcher, press(KeyCode::Backspace));
+    send_key(
+        &mut dispatcher,
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+    );
+    let answers = vec![vec![String::from("hjkl123\nsecond")]];
+    {
+        let observed = observed.lock().expect("question observer");
+        assert_eq!(
+            observed.outcomes,
+            vec![DialogOutcome::QuestionDeferred(answers.clone())]
+        );
+        assert!(observed.base_actions.is_empty(), "defer armed interruption");
+    }
+
+    let reopened = prompt(request).with_answers(answers);
+    assert_eq!(reopened.cursor(), 3);
+    assert!(!reopened.is_editing());
+    let (mut dispatcher, observed) = dispatched(reopened);
+    let rendered = rows(&render_offscreen(&mut dispatcher, 80, 18).expect("infallible")).join("\n");
+    assert!(rendered.contains("hjkl123") && rendered.contains("second"));
+    send_key(&mut dispatcher, press(KeyCode::Enter));
+    assert!(
+        observed
+            .lock()
+            .expect("question observer")
+            .outcomes
+            .is_empty()
+    );
+    let rendered = rows(&render_offscreen(&mut dispatcher, 80, 18).expect("infallible")).join("\n");
+    assert!(rendered.contains("ctrl+s") && rendered.contains("answer later"));
+    assert!(rendered.contains("shift+enter") && rendered.contains("newline"));
+    send_key(
+        &mut dispatcher,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+    );
+    for character in "third".chars() {
+        send_key(&mut dispatcher, press(KeyCode::Char(character)));
+    }
+    send_key(&mut dispatcher, press(KeyCode::Enter));
+    assert_eq!(
+        observed.lock().expect("question observer").outcomes,
+        vec![DialogOutcome::Question(vec![vec![String::from(
+            "hjkl123\nsecond\nthird"
+        )]])]
+    );
+}
+
+#[test]
+fn views_question_dispatcher_toggles_and_submits_multiple_choices() {
+    let mut request = QuestionRequest::new("q", "h", options());
+    request.multiple = Some(true);
+    let (mut dispatcher, observed) = dispatched(prompt(request));
+    for code in [KeyCode::Char(' '), KeyCode::Char('2'), KeyCode::Enter] {
+        send_key(&mut dispatcher, press(code));
+    }
+    assert_eq!(
+        observed.lock().expect("question observer").outcomes,
+        vec![DialogOutcome::Question(vec![vec![
+            String::from("Rewrite"),
+            String::from("Patch"),
+        ]])]
+    );
+}
+
+#[test]
+fn views_question_dispatcher_escape_still_closes_and_reaches_the_global_interrupt() {
+    let (mut dispatcher, observed) = dispatched(prompt(plan_question()));
+    send_key(&mut dispatcher, press(KeyCode::Esc));
+    let observed = observed.lock().expect("question observer");
+    assert_eq!(observed.outcomes, vec![DialogOutcome::Cancelled]);
+    assert_eq!(observed.base_actions, vec!["session_interrupt"]);
 }

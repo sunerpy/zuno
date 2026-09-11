@@ -39,12 +39,17 @@ connection concurrency are unchanged, avoiding an unnecessary network or
 subprocess handshake. Structural MCP changes still reconnect. Reconfiguration
 logs include phase timings but omit selected values and credentials.
 
-A `session/prompt` that arrives while the session is already running a turn is
-committed to the durable input inbox first and then steered into that turn, so
-the model receives it without interrupting the running work. That second request
-is answered with JSON-RPC error `-32001`; its `data` reports `admission`
-(`steered`, `queued`, or `rejected`), `sessionId`, and the durable `inputId`; the
-streamed output and the `stopReason` stay on the request that owns the turn.
+A `session/prompt` that arrives while the session is already running is committed
+to the durable inbox, then steered at a safe point or left queued. Its RPC waits
+for that input's associated processing outcome and returns a legal `stopReason`;
+accepted content is no longer reported as a `-32001` busy error. Session-owned
+execution outlives an individual RPC observer. Responses include
+`_meta.zuno.receipt`, separating admitted, recorded, applied and terminal state.
+
+Normal prompts may set `_meta.zuno.messageId` (1–256 bytes). Retrying the same ID
+in the same session observes the original receipt, not a second execution;
+conflicting content is rejected. Identical text with different IDs remains
+different user input.
 
 Clients that support Zuno extensions can use `session/steer` instead. The
 initialize response advertises `_meta.zuno.steering`; turn-scoped
@@ -56,16 +61,17 @@ Rejections use `-32002` with `reason` equal to `noActiveTurn`,
 The expected turn is checked before the inbox transaction commits. If that turn
 ends or changes while admission waits for SQLite, the input and its admission
 event roll back together, so a rejected steer cannot reach a later turn.
-`session/prompt` and `session/cancel` retain their existing ACP V1 semantics.
+`session/cancel` remains the explicit session-wide stop control.
 
 A slash command cannot be steered and is refused with
 `reason: "commandRequiresIdleSession"` and nothing durable written; only text
 that resolves to a real command, Skill, or native control counts as a slash
 command, so a prompt that merely starts with `/` is admitted as ordinary content.
 
-Withdrawing a prompt request with `$/cancel_request` before it returns cancels
-the durable row that request admitted, so the withdrawn text never reaches the
-model, and answers that request with `-32800` and `data.admission: "withdrawn"`.
+Withdrawing a pending prompt with `$/cancel_request` retires the input contributed
+by that request when it has not entered the model. It cannot erase already
+processed input or withdraw the original on behalf of a duplicate retry observer.
+Disconnect is not withdrawal: accepted input and processing receipts remain durable.
 See [Zed ACP integration](/reference/zed-acp) for the full shape.
 
 Background completion is different from a slash command. Terminal commands,
@@ -110,11 +116,12 @@ the editor does not first receive a terminal prompt failure or wait for another
 wake. Historical load/resume projects the same durable summary with the same
 tag.
 
-For a known model context window, `ProviderRequestStarted` immediately publishes an
-ACP `usage_update` with the assembled prompt estimate. When provider token usage
-arrives, a second update replaces it with the measured value. These are absolute
-request-occupancy updates rather than cumulative percentages, so a request after
-compaction immediately recalculates the editor's context indicator.
+ACP `usage_update` consumes the native `ContextUsageSnapshot`: the latest
+provider-confirmed baseline plus estimated content not yet counted by that provider.
+A smaller request estimate cannot replace a confirmed baseline. Partial usage
+frames merge as snapshots; compaction changes the epoch. `_meta.zuno.contextUsage`
+carries source, request identity, freshness and update time. Cumulative disjoint
+usage is separate from current occupancy; unknown values remain unknown.
 
 ## Goal continuation
 
@@ -139,7 +146,11 @@ compacted session whose retained tail starts with an assistant message.
 `/goal budget <positive tokens|none>` changes one Goal's explicit ceiling.
 `goal_update` accepts `in_progress` and `active` only as idempotent confirmation
 of an already-active Goal; a paused or blocked Goal still requires the user-owned
-`/goal resume` control.
+`/goal resume` control or the native **Resume goal / Keep paused** choice.
+Interrupt keeps the Goal paused. A new ordinary prompt, skipped choice or recorded
+background report never resumes it. The resume transaction validates Goal ID and
+revision and preserves Plan, approval, authentication, uncertainty and budget
+gates. Already processed user input is not submitted again.
 
 ## Session MCP servers
 

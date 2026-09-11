@@ -202,6 +202,22 @@ impl MemoryMaintainer {
         Ok(input)
     }
 
+    fn input_consumed(&self, input: &Inputs) -> crate::Result<bool> {
+        if input.views.iter().any(|view| !view.suppressed.is_empty()) {
+            return Ok(false);
+        }
+        let global = scope(&input.views, MemoryScope::Global)?;
+        let project = scope(&input.views, MemoryScope::Project)?;
+        Ok(self
+            .memory
+            .maintenance_state(&self.project_id)?
+            .is_some_and(|state| {
+                state.input_digest == input.digest
+                    && state.global_revision == global.document.revision
+                    && state.project_revision == project.document.revision
+            }))
+    }
+
     pub fn schedule(
         &self,
         scheduler: &LearningScheduler,
@@ -213,16 +229,7 @@ impl MemoryMaintainer {
         if input.evidence.is_empty() && input.views.iter().all(|view| view.suppressed.is_empty()) {
             return Ok(LearningScheduleOutcome::Ineligible);
         }
-        if input.views.iter().all(|view| view.suppressed.is_empty())
-            && self
-                .memory
-                .maintenance_state(&self.project_id)?
-                .is_some_and(|state| {
-                    state.input_digest == input.digest
-                        && state.global_revision == global.document.revision
-                        && state.project_revision == project.document.revision
-                })
-        {
+        if self.input_consumed(&input)? {
             return Ok(LearningScheduleOutcome::Ineligible);
         }
         let payload = MemoryJobInput {
@@ -246,7 +253,11 @@ impl MemoryMaintainer {
             source_message_id: None,
             kind: LearningJobKind::ProjectAggregation,
             extractor_version: None,
-            idempotency_key: format!("memory:{}:{identity}", self.project_id),
+            idempotency_key: format!(
+                "memory:{}:{}:{identity}",
+                crate::LEARNING_EXTRACTOR_VERSION,
+                self.project_id,
+            ),
             scheduled_at: now,
             payload: Some(payload),
             time_created: now,
@@ -282,6 +293,15 @@ impl MemoryMaintainer {
                 &job.id,
                 lease,
                 "memory inputs changed before execution",
+                zuno_db::message::now_millis(),
+            )?;
+            return Ok(());
+        }
+        if self.input_consumed(&input)? {
+            scheduler.skip(
+                &job.id,
+                lease,
+                "memory inputs already consumed",
                 zuno_db::message::now_millis(),
             )?;
             return Ok(());

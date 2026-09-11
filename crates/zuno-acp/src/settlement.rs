@@ -1,11 +1,8 @@
-//! One durable settlement rule for every human request an ACP surface presents.
+//! Durable settlement for [`crate::AcpPermissionAsker`].
 //!
-//! Both askers in this crate — [`crate::AcpPermissionAsker`] and
-//! [`crate::AcpQuestionAsker`], on both their live and their recovery paths — settle
-//! their durable rows through [`settle`]. The rule lives here rather than once per
-//! asker because the half of it that matters is invisible from the arm that gets it
-//! wrong: three separate reviews found a decided dialog that resolved its durable
-//! row and left the active Goal paused forever, once per surface.
+//! Permission replies use this rule on both live and recovery paths. Durable
+//! questions use [`crate::AcpQuestionPresenter`] and the host's `QuestionPort`;
+//! question deferral and Plan authorization never enter this permission flow.
 
 use serde_json::Value;
 use zuno_db::human_request::{HumanRequest, HumanRequestState, HumanRequestStore};
@@ -49,7 +46,7 @@ pub(crate) enum Settlement {
 /// the payload it copied.
 ///
 /// No parameter can opt out of the resume: there is no state argument and no
-/// per-outcome flag, so a new outcome variant on either asker can only change
+/// per-outcome flag, so a new permission outcome can only change
 /// `response` and cannot grow an arm that forgets the Goal.
 ///
 /// `Some` is the settled row. Under [`Settlement::DurableInput`] it means exactly

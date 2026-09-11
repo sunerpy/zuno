@@ -355,6 +355,11 @@ pub struct AttemptSeed {
     pub parent_attempt: Option<SnapshotIdentity>,
     pub workflow: Option<String>,
     pub workflow_node: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_authority: Option<crate::ParentAuthoritySnapshot>,
+    /// The scheduling cycle is independent from the engine's provider turn ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycle_id: Option<String>,
 }
 
 /// Complete immutable identity for one provider request Attempt.
@@ -374,6 +379,10 @@ pub struct AttemptSnapshot {
     pub prompt: PromptReceiptIdentity,
     /// Preserves provider-visible order rather than sorting by name.
     pub tools: Vec<ToolSchemaIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_authority: Option<crate::ParentAuthoritySnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycle_id: Option<String>,
 }
 
 fn default_subagent_model_policy_sha256() -> String {
@@ -599,6 +608,8 @@ mod tests {
         AttemptSnapshot {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             turn_id: "turn-1".to_owned(),
+            parent_authority: None,
+            cycle_id: None,
             step: 1,
             capability: capability(),
             owner: OwnerLineage {
@@ -647,6 +658,18 @@ mod tests {
                 ui_intent: "generic".to_owned(),
             }],
         }
+    }
+
+    #[test]
+    fn legacy_attempts_remain_unbound_and_do_not_gain_parent_authority() {
+        let value = serde_json::to_value(attempt()).expect("serialize legacy");
+        assert!(value.get("parentAuthority").is_none());
+        assert!(value.get("cycleId").is_none());
+        let decoded: AttemptSnapshot =
+            serde_json::from_value(value.clone()).expect("legacy decode");
+        assert!(decoded.parent_authority.is_none());
+        assert!(decoded.cycle_id.is_none());
+        assert_eq!(serde_json::to_value(decoded).expect("round trip"), value);
     }
 
     #[test]

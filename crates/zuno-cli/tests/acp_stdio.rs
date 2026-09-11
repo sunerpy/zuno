@@ -1,4 +1,3 @@
-#[cfg(unix)]
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::process::{ChildStdin, ChildStdout, Command, Stdio};
@@ -23,6 +22,9 @@ use rusqlite::OptionalExtension as _;
 use serde_json::{Value, json};
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+#[path = "acp_prompt_acceptance/mod.rs"]
+mod prompt_acceptance;
 
 fn binary() -> Command {
     Command::new(env!("CARGO_BIN_EXE_zuno"))
@@ -1316,7 +1318,12 @@ fn request_with_elicitation(
                     .expect("elicitation request id must be a string");
                 let request = response["params"].clone();
                 assert_eq!(request["sessionId"], expected_session_id);
-                assert_eq!(request["toolCallId"], "call_question");
+                assert!(
+                    request.get("toolCallId").is_none(),
+                    "a durable form is not owned by a tool RPC"
+                );
+                assert!(request["_meta"]["zuno"]["questionId"].as_str().is_some());
+                assert_eq!(request["_meta"]["zuno"]["questionRevision"], 1);
                 assert_eq!(request["mode"], "form");
                 assert_eq!(request["message"], "Which database?");
 
@@ -1334,7 +1341,7 @@ fn request_with_elicitation(
                         .len(),
                     2
                 );
-                let choice = &schema["properties"]["q0_choice"];
+                let choice = &schema["properties"]["choice:q1"];
                 assert_eq!(choice["type"], "string");
                 assert_eq!(choice["title"], "Database");
                 assert_eq!(choice["description"], "Which database?");
@@ -1345,10 +1352,13 @@ fn request_with_elicitation(
                 assert_eq!(options[1]["const"], "SQLite");
                 assert_eq!(options[1]["description"], "Embedded database");
 
-                let custom = &schema["properties"]["q0_custom"];
+                let custom = &schema["properties"]["custom:q1"];
                 assert_eq!(custom["type"], "string");
                 assert_eq!(custom["title"], "Database — Other");
-                assert_eq!(custom["minLength"], 1);
+                assert!(
+                    custom.get("minLength").is_none(),
+                    "empty input may be deferred"
+                );
                 assert!(custom["description"].as_str().is_some_and(|description| {
                     description.contains("Which database?") && description.contains("custom answer")
                 }));
@@ -1358,7 +1368,7 @@ fn request_with_elicitation(
                     "id": request_id,
                     "result": {
                         "action": "accept",
-                        "content": {"q0_choice": "SQLite"}
+                        "content": {"choice:q1": "SQLite"}
                     }
                 });
                 writeln!(
@@ -2704,7 +2714,7 @@ async fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
         .as_array()
         .expect("available commands")
         .iter()
-        .take(7)
+        .take(9)
         .map(|command| command["name"].as_str().expect("command name"))
         .collect::<Vec<_>>();
     assert_eq!(
@@ -2714,7 +2724,9 @@ async fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
             "goal",
             "learn",
             "plan",
+            "questions",
             "reflect",
+            "resume",
             "start-plan",
             "start-work"
         ]
@@ -3138,7 +3150,7 @@ async fn acp_goal_turns_use_current_agent_and_model_after_reconfiguration() {
         .prepare(
             "SELECT data FROM event \
              WHERE aggregate_id = ?1 AND type = 'session.turn.started.1' \
-               AND json_extract(data, '$.turnTrigger') = 'goal' ORDER BY seq",
+               AND json_extract(data, '$.turnTrigger') IN ('goal', 'user_control') ORDER BY seq",
         )
         .expect("prepare Goal turn-start query");
     let starts = statement
@@ -3151,14 +3163,50 @@ async fn acp_goal_turns_use_current_agent_and_model_after_reconfiguration() {
         .collect::<Vec<_>>();
     assert_eq!(starts.len(), 2, "{starts:#?}");
     assert!(starts.iter().all(|start| {
-        start["turnTrigger"] == "goal"
-            && start["anchorMessageID"] == users[0].info.id
+        start["anchorMessageID"] == users[0].info.id
             && start["agent"] == "orchestrator"
             && start["providerID"] == "test"
             && start["modelID"] == "test-model-2"
     }));
-    assert_eq!(starts[0]["goalRevision"], blocked.revision + 1);
+    // Explicit resume consumes its committed native control; creating an active
+    // Goal still enters the autonomous continuation path.
+    assert_eq!(starts[0]["turnTrigger"], "user_control");
+    assert_eq!(starts[0]["userControl"], "resume_work");
+    assert_eq!(starts[1]["turnTrigger"], "goal");
     assert_eq!(starts[1]["goalRevision"], 1);
+
+    let resume_events = zuno_db::event_log::read_of_type_after_in(
+        &connection,
+        &session_id,
+        "session.goal.resumed",
+        None,
+    )
+    .expect("read native Goal resume events");
+    assert_eq!(resume_events.len(), 1, "{resume_events:#?}");
+    let resume_event = &resume_events[0].properties;
+    assert_eq!(resume_event["goalId"], blocked.goal_id);
+    assert_eq!(resume_event["revision"], blocked.revision + 1);
+    assert_eq!(resume_event["previousRevision"], blocked.revision);
+    let resumed_input_id = resume_event["inputId"]
+        .as_str()
+        .expect("native Goal resume admitted its control");
+    let receipt = zuno_db::input_receipt::InputReceiptStore::new(Arc::clone(&pool))
+        .get(&session_id, resumed_input_id)
+        .expect("read native Goal resume receipt")
+        .expect("native Goal resume receipt exists");
+    assert_eq!(
+        receipt.state,
+        zuno_types::admission::InputReceiptState::Completed
+    );
+    assert_eq!(
+        receipt.turn_id.as_deref(),
+        starts[0]["turnID"].as_str(),
+        "the native resume receipt must bind the real resumed turn"
+    );
+    assert_eq!(
+        receipt.stop_reason,
+        Some(zuno_types::admission::InputStopReason::EndTurn)
+    );
 
     let goal = goals
         .goal(&session_id)
@@ -5238,7 +5286,10 @@ async fn acp_plan_round_trips_question_tool_through_stable_elicitation() {
         &session_id,
     );
     assert_eq!(completed["stopReason"], "end_turn");
-    assert_eq!(elicitation["toolCallId"], "call_question");
+    assert!(elicitation.get("toolCallId").is_none());
+    let question_id = elicitation["_meta"]["zuno"]["questionId"]
+        .as_str()
+        .expect("durable question id");
     let continuing_index = updates
         .iter()
         .position(|update| {
@@ -5282,15 +5333,43 @@ async fn acp_plan_round_trips_question_tool_through_stable_elicitation() {
             let body: Value = serde_json::from_slice(&request.body).expect("provider request JSON");
             body["messages"].as_array().is_some_and(|messages| {
                 messages.iter().any(|message| {
-                    message["role"] == "tool"
-                        && message["tool_call_id"] == "call_question"
+                    message["role"] == "user"
                         && message["content"].as_str().is_some_and(|content| {
-                            content.contains(r#""Which database?"="SQLite""#)
+                            content.contains(question_id) && content.contains("SQLite")
                         })
                 })
             })
         }),
-        "provider never received the accepted question answer: {received:?}"
+        "provider never received the durable inbox answer: {received:?}"
+    );
+    let final_request: Value =
+        serde_json::from_slice(&received.last().expect("final provider request").body)
+            .expect("provider request");
+    let messages = final_request["messages"].as_array().expect("messages");
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| {
+                message["role"] == "user"
+                    && message["content"].as_str().is_some_and(|content| {
+                        content.contains(question_id) && content.contains("SQLite")
+                    })
+            })
+            .count(),
+        1,
+        "one accepted answer enters the provider once"
+    );
+    assert!(
+        messages
+            .iter()
+            .filter(
+                |message| message["role"] == "tool" && message["tool_call_id"] == "call_question"
+            )
+            .all(|message| !message["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("SQLite")),
+        "the question tool result is a receipt, not another delivery of the answer"
     );
 
     drop(stdin);
@@ -6386,7 +6465,28 @@ fn acp_load_replays_durable_content_tools_plan_and_usage() {
         .iter()
         .find(|update| update["sessionUpdate"] == "usage_update")
         .expect("usage replay");
-    assert_eq!(usage["used"], 175);
+    // The measured assistant accounts for input + both cache splits + output.
+    // Its returned tool result is a subsequent model message: project_history
+    // includes the result envelope and "ok", not the edit path/diff/attachment.
+    let confirmed_tokens = 100_u64 + 40 + 10 + 25;
+    let tool_result = json!([{
+        "role": "tool",
+        "content": [{
+            "type": "tool_result",
+            "tool_use_id": "call_acp_load_edit",
+            "content": "ok",
+            "is_error": false
+        }]
+    }]);
+    let tail_tokens = u64::try_from(tool_result.to_string().len().div_ceil(4))
+        .expect("fixture tool result token estimate");
+    assert_eq!(tail_tokens, 30);
+    let context_usage = &usage["_meta"]["zuno"]["contextUsage"];
+    assert_eq!(context_usage["lastConfirmed"]["usage"]["inputTokens"], 100);
+    assert_eq!(context_usage["lastConfirmed"]["usage"]["outputTokens"], 25);
+    assert_eq!(context_usage["estimatedTailTokens"], tail_tokens);
+    assert_eq!(context_usage["freshness"], "estimated");
+    assert_eq!(usage["used"], confirmed_tokens + tail_tokens);
     assert_eq!(usage["size"], 200_000);
     assert_eq!(usage["cost"], json!({"amount":1.25,"currency":"USD"}));
 
@@ -6655,8 +6755,8 @@ fn send_request(stdin: &mut ChildStdin, id: u64, method: &str, params: Value) {
 
 /// Read frames until the response for `id` arrives, keeping the session updates.
 ///
-/// The whole response frame is returned rather than its `result`, because the
-/// admission outcome of a second concurrent prompt travels in `error.data`.
+/// Keep the whole frame so callers can distinguish processing failures from
+/// successful prompt receipts.
 fn await_response(stdout: &mut BufReader<ChildStdout>, id: u64, updates: &mut Vec<Value>) -> Value {
     loop {
         let mut line = String::new();
@@ -6678,7 +6778,6 @@ fn await_response(stdout: &mut BufReader<ChildStdout>, id: u64, updates: &mut Ve
     }
 }
 
-#[cfg(unix)]
 fn await_responses(
     stdout: &mut BufReader<ChildStdout>,
     ids: impl IntoIterator<Item = u64>,
@@ -6899,33 +6998,32 @@ async fn acp_admits_a_second_prompt_durably_and_steers_it_into_the_live_turn() {
             "prompt": [{"type": "text", "text": "Also read the release notes."}]
         }),
     );
-    let mut updates = Vec::new();
-    let admitted = await_response(&mut stdout, 4, &mut updates);
-    let error = admitted
-        .get("error")
-        .unwrap_or_else(|| panic!("the second prompt did not report its admission: {admitted}"));
-    assert_eq!(error["code"], -32001);
-    assert_eq!(error["data"]["sessionId"], session_id.as_str());
-    assert_eq!(error["data"]["admission"], "steered");
-    assert_eq!(error["data"]["delivery"], "steer");
-    let input_id = error["data"]["inputId"]
-        .as_str()
-        .expect("the admission must name its durable input")
-        .to_owned();
-    assert!(
-        error["data"]["admittedSequence"]
-            .as_i64()
-            .is_some_and(|sequence| sequence > 0),
-        "the admission must name its durable sequence: {error}"
-    );
-
+    let input = prompt_acceptance::admitted_prompt(
+        root.path(),
+        &session_id,
+        "Also read the release notes.",
+    )
+    .await;
+    let input_id = input.id.clone();
     let _released = release.send(());
-    let completed = await_response(&mut stdout, 3, &mut updates);
-    assert!(
-        completed.get("error").is_none(),
-        "the running turn was disturbed by the steered prompt: {completed}"
+    let completed = await_responses(&mut stdout, [3, 4]);
+    for response in completed.values() {
+        assert!(
+            response.get("error").is_none(),
+            "an accepted prompt was returned as an error: {response}"
+        );
+        assert_eq!(response["result"]["stopReason"], "end_turn");
+    }
+    let receipt = &completed[&4]["result"]["_meta"]["zuno"]["receipt"];
+    assert_eq!(receipt["sessionId"], session_id);
+    assert_eq!(receipt["inputId"], input.id);
+    assert_eq!(receipt["admittedSequence"], input.admitted_sequence);
+    assert_eq!(receipt["delivery"], "steer");
+    assert_eq!(receipt["state"], "completed");
+    assert_eq!(
+        receipt["turnId"],
+        completed[&3]["result"]["_meta"]["zuno"]["receipt"]["turnId"]
     );
-    assert_eq!(completed["result"]["stopReason"], "end_turn");
 
     let received = provider
         .received_requests()
@@ -7381,28 +7479,16 @@ async fn acp_steers_a_slash_prefixed_prompt_that_names_no_command() {
             "prompt": [{"type": "text", "text": path_prompt}]
         }),
     );
-    let mut updates = Vec::new();
-    let admitted = await_response(&mut stdout, 4, &mut updates);
-    let error = admitted.get("error").unwrap_or_else(|| {
-        panic!("a `/`-prefixed prompt did not report its admission: {admitted}")
-    });
-    assert_eq!(error["code"], -32001);
-    assert_eq!(
-        error["data"]["admission"], "steered",
-        "a prompt that names no command must be steered, not refused: {error}"
-    );
-    assert!(
-        error["data"]["reason"].is_null(),
-        "a prompt that names no command must not be reported as a command: {error}"
-    );
-    let input_id = error["data"]["inputId"]
-        .as_str()
-        .expect("the admission must name its durable input")
-        .to_owned();
-
+    let input = prompt_acceptance::admitted_prompt(root.path(), &session_id, path_prompt).await;
+    let input_id = input.id.clone();
     let _released = release.send(());
-    let completed = await_response(&mut stdout, 3, &mut updates);
-    assert_eq!(completed["result"]["stopReason"], "end_turn");
+    let completed = await_responses(&mut stdout, [3, 4]);
+    for response in completed.values() {
+        assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    }
+    let receipt = &completed[&4]["result"]["_meta"]["zuno"]["receipt"];
+    assert_eq!(receipt["inputId"], input_id);
+    assert_eq!(receipt["delivery"], "steer");
 
     let received = provider
         .received_requests()
@@ -7513,25 +7599,11 @@ async fn acp_withdrawing_a_duplicate_prompt_leaves_the_owning_turn_running() {
     await_turn_requests(&turns, 1).await;
 
     let mut updates = Vec::new();
-    let mut withdrawn_in_flight = false;
-    for id in 4..4 + WITHDRAWAL_ATTEMPTS {
-        send_prompt_then_withdraw(&mut stdin, id, params.clone());
-        let answered = await_response(&mut stdout, id, &mut updates);
-        // -32800 is only produced after the Agent was told this request was
-        // withdrawn, so it is the observation this test needs.
-        if answered["error"]["code"] == json!(-32800) {
-            withdrawn_in_flight = true;
-            break;
-        }
-        assert_eq!(
-            answered["error"]["code"],
-            json!(-32001),
-            "a duplicate prompt was neither admitted nor withdrawn: {answered}"
-        );
-    }
-    assert!(
-        withdrawn_in_flight,
-        "no withdrawal reached the Agent while its own prompt was in flight"
+    send_prompt_then_withdraw(&mut stdin, 4, params);
+    let answered = await_response(&mut stdout, 4, &mut updates);
+    assert_eq!(
+        answered["error"]["code"], -32800,
+        "a withdrawn prompt returned an unrelated outcome: {answered}"
     );
 
     let _released = release.send(());
@@ -7623,10 +7695,7 @@ async fn acp_withdrawing_an_admitted_prompt_cancels_its_durable_row() {
             // own admission, so this attempt has no durable row to retire.
             continue;
         }
-        assert!(
-            matches!(admission, Some("steered" | "queued")),
-            "a prompt was neither admitted nor withdrawn: {answered}"
-        );
+        panic!("a withdrawn prompt returned an unrelated outcome: {answered}");
     }
     let (withdrawn_text, withdrawn_input) = withdrawn.expect(
         "no withdrawal reached the Agent between its prompt's durable admission and its response",
@@ -7793,22 +7862,6 @@ fn acp_load_restores_the_saved_model_and_thought_level_and_survives_a_missing_mo
         "the row records the model without a variant for a model that declares none"
     );
 
-    // A saved model the catalog no longer offers falls back to `config.model`.
-    {
-        let connection = zuno_db::open::open(&zuno_paths::DbLocation::File(
-            root.path().join("zuno-acp.db"),
-        ))
-        .expect("open ACP database");
-        connection
-            .execute(
-                "UPDATE session SET model = ?1 WHERE id = ?2",
-                rusqlite::params![
-                    zuno_db::session::model_reference("test", "gone"),
-                    session_id
-                ],
-            )
-            .expect("retire the saved model");
-    }
     request(
         &mut stdin,
         &mut stdout,
@@ -7816,18 +7869,177 @@ fn acp_load_restores_the_saved_model_and_thought_level_and_survives_a_missing_mo
         "session/close",
         json!({"sessionId": &session_id}),
     );
-    let (fallen_back, _replay) = request_with_updates(
-        &mut stdin,
-        &mut stdout,
-        10,
-        "session/load",
-        json!({"sessionId": &session_id, "cwd": root.path(), "mcpServers": []}),
+
+    let pool = Arc::new(
+        zuno_db::Pool::open(&acp_database(root.path())).expect("cold selection fixture pool"),
     );
-    assert_eq!(
-        option(&fallen_back, "model"),
-        Some(json!("test/test-model")),
-        "a retired saved model must not make the session unloadable: {fallen_back}"
-    );
+    let goals = zuno_goal::GoalStore::from_pool(
+        Arc::clone(&pool),
+        root.path().join("cold-selection-goals"),
+    )
+    .expect("cold selection Goal store");
+    goals
+        .create_goal(
+            &session_id,
+            "Keep this Goal paused during cold-load fallback.",
+            None,
+        )
+        .expect("create protected Goal");
+    let paused_goal = goals
+        .pause_with_reason(&session_id, zuno_goal::GoalPauseReason::UserInterruption)
+        .expect("pause protected Goal")
+        .expect("paused Goal");
+
+    use zuno_types::execution::{
+        CollaborationMode, ContinuationToken, SessionExecutionPhase, SessionPauseReason,
+        SessionReadiness, SessionScheduling,
+    };
+    for (mode, load_id, previous_model) in [
+        (CollaborationMode::Work, 10, "test-model-2"),
+        (CollaborationMode::Plan, 12, "test-model"),
+    ] {
+        if mode == CollaborationMode::Plan {
+            request(
+                &mut stdin,
+                &mut stdout,
+                load_id - 1,
+                "session/close",
+                json!({"sessionId": &session_id}),
+            );
+        }
+        // Retire every saved representation after the runtime is closed.
+        // A valid old Work selection would not exercise the missing-model path.
+        let connection = zuno_db::open::open(&zuno_paths::DbLocation::File(
+            root.path().join("zuno-acp.db"),
+        ))
+        .expect("open ACP database");
+        let transaction = zuno_db::open::immediate_transaction(&connection)
+            .expect("begin coherent model-retirement fixture");
+        let unavailable_model = zuno_db::session::model_reference("test", "gone");
+        assert_eq!(
+            transaction
+                .execute(
+                    "UPDATE session SET model = ?1 WHERE id = ?2",
+                    rusqlite::params![&unavailable_model, &session_id],
+                )
+                .expect("retire the session model"),
+            1
+        );
+        let mut execution = zuno_db::session_execution::read_in(&transaction, &session_id)
+            .expect("read saved execution identity")
+            .expect("the successful model selector persisted Work state");
+        let mut unavailable_identity = execution
+            .work_identity
+            .clone()
+            .expect("saved Work selection exists");
+        assert_eq!(unavailable_identity.provider_id, "test");
+        assert_eq!(unavailable_identity.model_id, previous_model);
+        unavailable_identity.model_id = "gone".to_owned();
+        execution.work_identity = Some(unavailable_identity.clone());
+        execution.mode = mode;
+        let readiness = match mode {
+            CollaborationMode::Work => {
+                execution.phase = SessionExecutionPhase::Paused;
+                execution.cycle_id = Some("cold-selection-cycle".to_owned());
+                execution.continuation = Some(ContinuationToken {
+                    cycle_id: "cold-selection-cycle".to_owned(),
+                    identity: unavailable_identity.clone(),
+                    mode,
+                    plan_id: None,
+                    plan_revision: None,
+                    context_epoch: 7,
+                    anchor_message_id: None,
+                });
+                SessionReadiness::Paused {
+                    reason: SessionPauseReason::User,
+                }
+            }
+            CollaborationMode::Plan => {
+                execution.phase = SessionExecutionPhase::Planning;
+                execution.cycle_id = None;
+                execution.continuation = None;
+                SessionReadiness::Ready
+            }
+        };
+        execution.scheduling = Some(SessionScheduling {
+            readiness,
+            progress_fingerprint: Some("preserve-cold-load-scheduling".to_owned()),
+            unchanged_progress_count: 3,
+        });
+        execution.time_updated = execution.time_updated.max(zuno_db::message::now_millis());
+        zuno_db::session_execution::update_in(&transaction, execution.revision, execution)
+            .expect("retire selected Work and continuation identities");
+        transaction
+            .commit()
+            .expect("commit coherent model-retirement fixture");
+
+        let retired =
+            zuno_db::session::get(&connection, &session_id).expect("read retired session model");
+        assert_eq!(retired.model.as_deref(), Some(unavailable_model.as_str()));
+        let execution = zuno_db::session_execution::read_in(&connection, &session_id)
+            .expect("read retired execution identity")
+            .expect("the fixture preserves Work state");
+        assert_eq!(
+            execution.work_identity.as_ref(),
+            Some(&unavailable_identity)
+        );
+        assert!(
+            execution
+                .continuation
+                .as_ref()
+                .is_none_or(|continuation| continuation.identity == unavailable_identity),
+            "the fixture must not leave a valid old continuation: {execution:?}"
+        );
+        drop(connection);
+
+        let (fallen_back, _replay) = request_with_updates(
+            &mut stdin,
+            &mut stdout,
+            load_id,
+            "session/load",
+            json!({"sessionId": &session_id, "cwd": root.path(), "mcpServers": []}),
+        );
+        assert_eq!(
+            option(&fallen_back, "model"),
+            Some(json!("test/test-model")),
+            "a retired saved model must not make the session unloadable: {fallen_back}"
+        );
+        assert_eq!(
+            fallen_back["modes"]["currentModeId"],
+            if mode == CollaborationMode::Plan {
+                "plan"
+            } else {
+                "build"
+            }
+        );
+        let resolved = zuno_db::session_execution::SessionExecutionStore::new(Arc::clone(&pool))
+            .get(&session_id)
+            .expect("read resolved Work selection")
+            .expect("Work state remains present");
+        let identity = resolved
+            .work_identity
+            .as_ref()
+            .expect("resolved Work identity");
+        assert_eq!(identity.agent, unavailable_identity.agent);
+        assert_eq!(identity.provider_id, "test");
+        assert_eq!(identity.model_id, "test-model");
+        assert_eq!(resolved.revision, execution.revision + 1);
+        assert!(resolved.time_updated >= execution.time_updated);
+        let mut expected = execution;
+        expected.work_identity = resolved.work_identity.clone();
+        expected.revision = resolved.revision;
+        expected.time_updated = resolved.time_updated;
+        assert_eq!(
+            resolved, expected,
+            "cold model resolution changed execution, continuation, scheduling or authorization"
+        );
+        assert_eq!(
+            serde_json::to_value(goals.goal(&session_id).expect("read protected Goal"))
+                .expect("serialize protected Goal"),
+            serde_json::to_value(Some(&paused_goal)).expect("serialize expected paused Goal"),
+            "loading must not resume or otherwise mutate the Goal"
+        );
+    }
 
     drop(stdin);
     let status = child.wait().expect("wait for ACP process");

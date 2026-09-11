@@ -291,22 +291,14 @@ pub fn exposes_question(flags: &ExposureFlags) -> bool {
     flags.client.can_render_questions() || flags.enable_question_tool
 }
 
-/// Whether `plan_exit` is offered.
+/// Whether a question-capable host may expose a Plan authorization publisher.
 ///
-/// Oracle, verbatim in structure (`registry.ts:243`):
-///
-/// ```text
-/// flags.experimentalPlanMode && flags.client === "cli"
-/// ```
-///
-/// A **conjunction**, and unlike [`exposes_question`] there is no flag that rescues a
-/// non-CLI client: `ZUNO_CLIENT=app` with plan mode on offers `question` and
-/// withholds `plan_exit` (transcript cases 10 and 4). Remember the second layer
-/// documented on this module — the permission ruleset withholds it again from every
-/// agent but `plan`.
+/// Production registration additionally requires the shared QuestionPort and a
+/// Plan interaction policy. The service checks mode, origin and exact authority
+/// again at execution time; a client-name or experimental flag is not authority.
 #[must_use]
 pub fn exposes_plan_exit(flags: &ExposureFlags) -> bool {
-    flags.experimental_plan_mode && flags.client.is_plan_exit_client()
+    exposes_question(flags)
 }
 
 /// The shape every exposure condition has.
@@ -321,13 +313,14 @@ pub type ExposurePredicate = fn(&ExposureFlags) -> bool;
 /// id, so these are wire ids and not upstream's internal registry keys. Upstream
 /// keys `plan_exit` as `plan` (`registry.ts:220`), while `invalid` and `question`
 /// are the same in both spaces.
-pub const CONDITIONAL_TOOLS: [(&str, ExposurePredicate); 3] = [
+pub const CONDITIONAL_TOOLS: [(&str, ExposurePredicate); 4] = [
     (crate::invalid::WIRE_ID, exposes_invalid),
     (crate::question::WIRE_ID, exposes_question),
+    (crate::question::ASYNC_WIRE_ID, exposes_question),
     (crate::plan_exit::WIRE_ID, exposes_plan_exit),
 ];
 
-/// The predicate gating `wire_id`, or `None` when the tool is not one of these three.
+/// The predicate gating `wire_id`, or `None` for an unconditional tool.
 ///
 /// Todo 44's filter is meant to be `predicate(&flags)` for the tools this returns
 /// something for, and unconditional for the rest — one lookup instead of a `match`
@@ -471,25 +464,22 @@ mod tests {
     }
 
     #[test]
-    fn conditional_plan_exit_is_absent_without_plan_mode() {
-        // First half of the conjunction fails. Transcript case 11.
+    fn plan_publisher_does_not_require_an_experimental_flag() {
         let configuration = flags(&[(ENV_CLIENT, "cli")]);
         assert!(!configuration.experimental_plan_mode);
-        assert!(!exposes_plan_exit(&configuration));
-        assert!(!exposed_conditional_tools(&configuration).contains(&"plan_exit"));
+        assert!(exposes_plan_exit(&configuration));
+        assert!(exposed_conditional_tools(&configuration).contains(&"plan_exit"));
     }
 
     #[test]
-    fn conditional_plan_exit_is_absent_for_a_non_cli_client_even_in_plan_mode() {
-        // Second half of the conjunction fails. Transcript cases 9 and 10: `app` and
-        // `desktop` get `question` and still not `plan_exit`.
+    fn plan_publisher_is_available_on_every_question_capable_surface() {
         for client in ["tui", "app", "desktop"] {
             let configuration = ExposureFlags::default()
                 .with_client(client)
-                .with_plan_mode();
+                .with_question_tool();
             assert!(
-                !exposes_plan_exit(&configuration),
-                "plan_exit must not be offered to the {client} client"
+                exposes_plan_exit(&configuration),
+                "a configured question consumer must work on {client}"
             );
         }
         assert!(exposes_question(
@@ -498,8 +488,8 @@ mod tests {
     }
 
     #[test]
-    fn conditional_plan_exit_needs_both_halves_not_either() {
-        assert!(!exposes_plan_exit(&ExposureFlags::default()));
+    fn an_experiment_flag_alone_does_not_make_a_question_consumer() {
+        assert!(exposes_plan_exit(&ExposureFlags::default()));
         assert!(!exposes_plan_exit(
             &ExposureFlags::default().with_client("tui").with_plan_mode()
         ));
@@ -537,7 +527,6 @@ mod tests {
             (ENV_EXPERIMENTAL_PLAN_MODE, "false"),
         ]);
         assert!(!configuration.experimental_plan_mode);
-        assert!(!exposes_plan_exit(&configuration));
     }
 
     #[test]
@@ -614,18 +603,19 @@ mod tests {
     #[test]
     fn conditional_the_wire_ids_are_the_wire_ids_and_not_the_registry_keys() {
         let ids: Vec<&str> = CONDITIONAL_TOOLS.iter().map(|(id, _)| *id).collect();
-        assert_eq!(ids, vec!["invalid", "question", "plan_exit"]);
+        assert_eq!(
+            ids,
+            vec!["invalid", "question", "question_async", "plan_exit"]
+        );
         // Upstream's registry key for plan_exit is not its wire id.
         assert!(!ids.contains(&"plan"));
     }
 
     #[test]
-    fn conditional_the_default_configuration_matches_the_measured_baseline() {
-        // Transcript case 1: a bare invocation offers invalid and question and
-        // withholds plan_exit.
+    fn a_question_capable_host_has_all_registered_question_variants() {
         assert_eq!(
             exposed_conditional_tools(&ExposureFlags::default()),
-            vec!["invalid", "question"]
+            vec!["invalid", "question", "question_async", "plan_exit"]
         );
     }
 
@@ -633,7 +623,7 @@ mod tests {
     fn conditional_the_full_plan_mode_cli_configuration_offers_all_four() {
         assert_eq!(
             exposed_conditional_tools(&ExposureFlags::default().with_plan_mode()),
-            vec!["invalid", "question", "plan_exit"]
+            vec!["invalid", "question", "question_async", "plan_exit"]
         );
     }
 

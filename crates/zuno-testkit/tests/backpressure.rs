@@ -218,6 +218,19 @@ const CHANNELS: &[ChannelGate] = &[
         "self.sender.send_modify(|generation| {",
     ),
     gate(
+        // ForegroundTurnBudget owns one watch slot for the entire logical
+        // operation, including foreground continuations. The first BudgetStop
+        // is latched; late subscribers read it before waiting for a change.
+        // Observers neither block the sender nor create a queue of stop reasons.
+        "foreground-turn-budget-stop",
+        "zuno-cli/src/cmd/turn/foreground.rs",
+        "let (stop, _) = watch::channel(None);",
+        "latest value (one latched Option<BudgetStop> per logical operation)",
+        Policy::LatestValue,
+        "zuno-cli/src/cmd/turn/foreground.rs",
+        "self.stop.send_if_modified(|current| { if current.is_some() { false } else { *current = Some(reason); true } });",
+    ),
+    gate(
         "plugin-host-completion",
         "zuno-extension/src/host.rs",
         "let (outcome, _receiver) = watch::channel(None);",
@@ -387,11 +400,38 @@ const CHANNELS: &[ChannelGate] = &[
     gate(
         "tui-questions",
         "zuno-cli/src/cmd/tui_question.rs",
-        "let (waiting, pending) = mpsc::channel(QUESTION_CHANNEL_CAPACITY);",
-        "QUESTION_CHANNEL_CAPACITY=8",
+        "let (commands, command_source) = mpsc::channel(QUESTION_CHANNEL_CAPACITY);",
+        "QUESTION_CHANNEL_CAPACITY=32",
+        Policy::RefuseNewest,
+        "zuno-cli/src/cmd/tui_question.rs",
+        ".try_send(command)",
+    ),
+    gate(
+        "tui-question-updates",
+        "zuno-cli/src/cmd/tui_question.rs",
+        "let (updates, pending) = mpsc::channel(QUESTION_CHANNEL_CAPACITY);",
+        "QUESTION_CHANNEL_CAPACITY=32",
         Policy::LosslessBlock,
         "zuno-cli/src/cmd/tui_question.rs",
-        ".send(PendingQuestion {",
+        "self.updates.send(update).await",
+    ),
+    gate(
+        "tui-turn-prompts",
+        "zuno-cli/src/cmd/tui.rs",
+        "let (turn_prompt_sender, turn_prompt_receiver) = mpsc::channel(PROMPT_CHANNEL_CAPACITY);",
+        "PROMPT_CHANNEL_CAPACITY=16",
+        Policy::LosslessBlock,
+        "zuno-cli/src/cmd/tui.rs",
+        "target.send(submission)",
+    ),
+    gate(
+        "durable-question-changes",
+        "zuno-session-control/src/question.rs",
+        "let (changes, _) = broadcast::channel(128);",
+        "128",
+        Policy::BroadcastLag,
+        "zuno-session-control/src/question.rs",
+        "self.changes.send(",
     ),
     gate(
         "tui-prompt-history",
@@ -477,7 +517,7 @@ fn source_channel_inventory_matches_the_declared_registry() {
         actual, expected,
         "channel registry differs from production source"
     );
-    assert_eq!(CHANNELS.len(), 43);
+    assert_eq!(CHANNELS.len(), 47);
 
     let crates = crates_root();
     for entry in CHANNELS {
@@ -556,6 +596,10 @@ channel_gate!(
 channel_gate!(
     turn_work_state_changes_keep_latest_value,
     "turn-work-state-changes"
+);
+channel_gate!(
+    foreground_turn_budget_stop_retains_one_snapshot,
+    "foreground-turn-budget-stop"
 );
 channel_gate!(
     learning_project_bindings_keep_latest_value,
@@ -641,6 +685,15 @@ channel_gate!(
 );
 channel_gate!(tui_mcp_toggles_refuse_the_newest_request, "tui-mcp-toggles");
 channel_gate!(tui_questions_apply_backpressure, "tui-questions");
+channel_gate!(
+    tui_question_updates_apply_backpressure,
+    "tui-question-updates"
+);
+channel_gate!(tui_turn_prompts_apply_backpressure, "tui-turn-prompts");
+channel_gate!(
+    durable_question_changes_lag_one_subscriber,
+    "durable-question-changes"
+);
 channel_gate!(tui_editor_requests_refuse_the_newest, "tui-editor-requests");
 channel_gate!(tui_editor_results_apply_backpressure, "tui-editor-results");
 channel_gate!(
@@ -1028,7 +1081,7 @@ fn is_production_rust_source(path: &Path) -> bool {
         && !path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with("_tests.rs"))
+            .is_some_and(|name| name.ends_with("_tests.rs") || name.contains("_tests_"))
 }
 
 fn production_lines(source: &str) -> Vec<&str> {
