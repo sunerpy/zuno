@@ -65,7 +65,7 @@ impl HttpTokenIntrospector {
         {
             return Err(IdentityConfigError("invalid introspection client credentials").into());
         }
-        let client = Client::builder()
+        let client = zuno_network::client_builder()
             .https_only(true)
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(3))

@@ -121,3 +121,5 @@ audience／issuer／应用错误、身份类型混用、过期、跨 issuer 主�
 [OIDC discovery](https://openid.net/specs/openid-connect-discovery-1_0.html) 和
 [Entra 声明校验](https://learn.microsoft.com/en-us/entra/identity-platform/claims-validation)。
 另见 [English](AUTHENTICATION.md) 和[实施状态](STATUS.md)。
+
+身份服务的 HTTP client 通过 `zuno-network` 创建，遵守控制面进程的代理策略及 `NO_PROXY`；适配器继续强制 HTTPS、禁止重定向并限制请求。

@@ -31,7 +31,7 @@ pub struct OidcKeySource {
 
 impl OidcKeySource {
     pub fn new(authority: OAuth2Authority) -> Result<Self, IdentityError> {
-        let client = Client::builder()
+        let client = zuno_network::client_builder()
             .https_only(true)
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(3))

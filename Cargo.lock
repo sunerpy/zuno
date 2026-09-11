@@ -7875,6 +7875,7 @@ dependencies = [
  "tokio",
  "uuid",
  "zuno-auth",
+ "zuno-network",
  "zuno-types",
 ]
 

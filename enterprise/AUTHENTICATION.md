@@ -157,3 +157,5 @@ Reference specifications: [OAuth2](https://www.rfc-editor.org/rfc/rfc6749),
 [OIDC discovery](https://openid.net/specs/openid-connect-discovery-1_0.html),
 and [Entra claim validation](https://learn.microsoft.com/en-us/entra/identity-platform/claims-validation).
 See [中文](AUTHENTICATION.zh.md) and [status](STATUS.md).
+
+Identity HTTP clients use `zuno-network` and honor the control-plane process proxy policy, including `NO_PROXY`. HTTPS, redirect refusal and request limits remain enforced by the identity adapter.
