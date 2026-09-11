@@ -1,5 +1,7 @@
 //! Execution-environment contracts. Identifiers and requests never grant access.
 
+pub mod wire;
+
 use crate::ApplicationError;
 use crate::runtime::ExecutionLease;
 use async_trait::async_trait;

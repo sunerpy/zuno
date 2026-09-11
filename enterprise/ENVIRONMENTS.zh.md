@@ -62,3 +62,9 @@ ZUNO_ROOTLESS_DOCKER_SOCKET=/run/user/1000/zuno-preview/docker.sock \
 结果才算平台证据。
 
 另见 [English](ENVIRONMENTS.md)、[授权](AUTHORIZATION.zh.md)和[实施状态](STATUS.md)。
+
+## 网关传输
+
+后端的 Worker／控制面 HTTP 适配见[网关传输](GATEWAY.zh.md)。请求凭证不绕过操作
+审批，Docker gate 还通过临时 PostgreSQL／TLS 控制面验证真实 HTTP 执行路径。
+独立角色启动、Agent 工具装配及管理级取消仍有单独交付要求。

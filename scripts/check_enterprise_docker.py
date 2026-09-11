@@ -64,6 +64,14 @@ def main():
             ["cargo", "test", "-p", "zuno-environment", "--", "--include-ignored"],
             cwd=repository, env=environment, check=True,
         )
+        # Require the complete authenticated gateway path in this native gate.
+        # The PostgreSQL-only gate separately exercises the control API without
+        # starting Docker; it cannot stand in for this execution evidence.
+        environment["ZUNO_GATEWAY_TEST_REQUIRED"] = "1"
+        subprocess.run(
+            ["python3", str(repository / "scripts/check_enterprise_postgres.py")],
+            cwd=repository, env=environment, check=True,
+        )
     finally:
         if daemon is not None:
             if daemon.poll() is None:

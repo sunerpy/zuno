@@ -1,5 +1,7 @@
 //! Worker-side transport. No PostgreSQL dependency or database credentials.
 
+pub mod gateway;
+
 use async_trait::async_trait;
 use futures::StreamExt as _;
 use reqwest::header::{CONTENT_TYPE, HeaderValue};
@@ -21,6 +23,19 @@ pub const CLAIM_PATH: &str = "internal/worker/v1/claim";
 pub const RENEW_PATH: &str = "internal/worker/v1/renew";
 pub const STATE_PATH: &str = "internal/worker/v1/state";
 pub const GRANT_HEADER: &str = "x-zuno-job-grant";
+pub const GATEWAY_TICKET_PATH: &str = "internal/worker/v1/gateway-ticket";
+pub const GATEWAY_RESOLVE_PATH: &str = "internal/gateway/v1/resolve";
+pub const GATEWAY_PREPARE_PATH: &str = "internal/gateway/v1/prepare";
+pub const GATEWAY_AUTHORIZE_PATH: &str = "internal/gateway/v1/authorize";
+pub const GATEWAY_TICKET_HEADER: &str = "x-zuno-gateway-ticket";
+pub const GATEWAY_EXECUTE_PATH: &str = "internal/execution/v1/request";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IssuedGatewayRequest {
+    pub assignment: zuno_application::environment::wire::GatewayAssignment,
+    pub ticket: zuno_identity::gateway::GatewayTicket,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -130,6 +145,20 @@ impl WorkerClient {
         grant: Option<&JobGrantToken>,
         body: Vec<u8>,
     ) -> Result<Vec<u8>, TurnStateError> {
+        self.post_header(
+            path,
+            grant.map(|grant| (GRANT_HEADER, grant.expose())),
+            body,
+        )
+        .await
+    }
+
+    async fn post_header(
+        &self,
+        path: &str,
+        extra: Option<(&str, &str)>,
+        body: Vec<u8>,
+    ) -> Result<Vec<u8>, TurnStateError> {
         if body.len() > MAX_WORKER_FRAME_BYTES {
             return Err(TurnStateError::InvalidData);
         }
@@ -144,11 +173,11 @@ impl WorkerClient {
             .bearer_auth(token.expose())
             .header(CONTENT_TYPE, "application/json")
             .body(body);
-        if let Some(grant) = grant {
+        if let Some((name, value)) = extra {
             let mut header =
-                HeaderValue::from_str(grant.expose()).map_err(|_| TurnStateError::InvalidData)?;
+                HeaderValue::from_str(value).map_err(|_| TurnStateError::InvalidData)?;
             header.set_sensitive(true);
-            request = request.header(GRANT_HEADER, header);
+            request = request.header(name, header);
         }
         // A failed POST can have committed. Never mechanically replay it.
         let response = request

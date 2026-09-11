@@ -147,10 +147,14 @@ struct GrantClaims {
 /// still check current database time, epoch, policy, ownership and checkpoint.
 #[derive(Debug, Clone)]
 pub struct VerifiedJobGrant {
+    subject: WorkerSubject,
     lease: ExecutionLease,
     expires_at_ms: i64,
 }
 impl VerifiedJobGrant {
+    pub fn subject(&self) -> &WorkerSubject {
+        &self.subject
+    }
     pub fn lease(&self) -> &ExecutionLease {
         &self.lease
     }
@@ -258,6 +262,7 @@ impl JobGrantAuthority {
             return Err(WorkerAuthError::Expired);
         }
         Ok(VerifiedJobGrant {
+            subject: claims.subject,
             lease: claims.lease,
             expires_at_ms: claims.expires_at_ms,
         })

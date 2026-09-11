@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p3-approval-resume`.
+- Current phase branch: `codex/enterprise-p3-gateway-transport`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -207,3 +207,12 @@ verification is pending the next preview CI run. No release is enabled.
 - Two focused failing tests demonstrated premature tool completion and a missing approval wakeup before their fixes. The engine dispatch suite and real PostgreSQL/HTTPS contracts now pass, including a full kernel continuation through three lease identities, failed wakeup rollback, original-result consumption, unchanged earlier effects and preserved budgets.
 - Validation passed: 456 engine tests, native PostgreSQL and both HTTPS contracts, 100 documentation/release tests, workspace check, Clippy, formatting and diff checks.
 - Public approval endpoints and production gateway/Worker dispatch remain pending. The enterprise runtime and preview release remain disabled.
+
+## Authenticated gateway transport
+
+- Approval continuation PR #198 merged at `6d8b54f71554c6d4be1f7c7b4ad04880369821ec`; CI `34656279425` passed every gate.
+- A separately authenticated gateway redeems request-scoped, short-lived tickets from the control plane. Tickets bind Worker identity, lease, gateway and request; actual execution still checks current organization policy, assignment and operation approval.
+- The Worker client, control-plane routes and Docker execution router now implement bounded typed acquire/get/prepare/submit/inspect/output requests. Gateway credentials contain no database or model access. Configuration resolution requires the Job's exact installed snapshot.
+- The real PostgreSQL/TLS/Docker fixture passed HITL refusal/approval, request/service/environment boundaries, output recovery, stale revision rejection and expired-lease refusal. A separately approved file read verifies one actual execution. Fixture corrections included the exact lease column, private directory mode and current environment revision.
+- The Docker runner now requires the combined gateway execution fixture on Linux amd64/arm64. Local validation passed 218 related tests, the complete rootless Docker/PostgreSQL/HTTPS runner, 100 documentation/release tests, 11 preview publisher tests, workspace check, Clippy, formatting, diff and actionlint checks. Worker normal dependencies still exclude PostgreSQL and the server crate. Remote CI remains pending.
+- Independent Worker/role startup, production Agent tool assembly, public application/approval APIs, cancellation propagation, Memory, Workflow/Council and Web remain outstanding. Preview publication remains disabled.

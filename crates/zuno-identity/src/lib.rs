@@ -8,6 +8,7 @@
 mod authority;
 pub mod browser_login;
 mod config;
+pub mod gateway;
 mod id_token;
 mod introspection;
 mod jwt;

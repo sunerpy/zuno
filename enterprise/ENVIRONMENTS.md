@@ -90,3 +90,11 @@ The preview CI/release gate runs it natively on Linux amd64 and arm64. Only comp
 CI results count as platform evidence.
 
 See [中文](ENVIRONMENTS.zh.md), [authorization](AUTHORIZATION.md) and [status](STATUS.md).
+
+## Gateway transport
+
+The backend now has an authenticated Worker/control-plane HTTP adapter, described
+in [gateway transport](GATEWAY.md). A request ticket does not bypass operation
+approval. The combined Docker gate also verifies the real HTTP path against a
+temporary PostgreSQL/TLS control plane. Role startup, Agent tool assembly and
+administrative cancellation remain separate delivery items.

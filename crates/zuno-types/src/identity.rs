@@ -159,6 +159,7 @@ identity_id!(
     EnvironmentId,
     "An isolated execution workspace, independent of a host path."
 );
+identity_id!(GatewayId, "A deployment-owned execution gateway identity.");
 identity_id!(
     EnvironmentSnapshotId,
     "A durable execution workspace snapshot."
