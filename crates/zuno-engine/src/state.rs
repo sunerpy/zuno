@@ -21,10 +21,31 @@ use zuno_types::identity::PrincipalKey;
 use crate::advance::{
     AdvanceAdmission, AdvanceError, AdvanceRequest, AdvanceState, BeginAdvance, CheckpointRef,
 };
-use crate::r#loop::{RunTurnRequest, TurnError};
+use crate::r#loop::TurnError;
 
 pub type LegacyToolSchemas = BTreeMap<String, BTreeMap<String, ToolSchemaIdentity>>;
 pub type DeveloperContexts = BTreeMap<String, Option<Vec<String>>>;
+
+/// Backend-independent failures. Transport failure is not permission to replay
+/// an operation whose commit acknowledgement may have been lost.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnStateError {
+    #[error("turn state is temporarily unavailable; reconcile the commit before resuming")]
+    Unavailable,
+    #[error("the execution lease is no longer current")]
+    LeaseLost,
+    #[error("current organization authorization denies this turn")]
+    Forbidden,
+    #[error("turn state was not found in this scope")]
+    NotFound,
+    #[error("turn state changed concurrently")]
+    Conflict,
+    #[error("stored turn state is invalid")]
+    InvalidData,
+}
 
 /// Only the session facts consumed by the kernel. The directory is the
 /// executor-visible working directory; transport adapters must not substitute
@@ -134,7 +155,7 @@ pub trait TurnPersistence: Send + Sync {
     async fn commit_advance(
         &self,
         scope: &TurnStateScope,
-        request: &RunTurnRequest,
+        request: &AdvanceRequest,
         admission: &AdvanceAdmission,
         state: AdvanceState,
     ) -> Result<CheckpointRef, AdvanceError>;

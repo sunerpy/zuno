@@ -23,7 +23,7 @@ use zuno_observability::span;
 
 use crate::retry::{RecoveryBudget, RecoveryBudgets};
 
-pub(crate) mod checkpoint;
+pub mod checkpoint;
 mod response;
 mod trace;
 

@@ -339,12 +339,12 @@ impl MessageUsage {
         }
     }
 
-    fn normalized(self) -> Option<Tokens> {
+    pub fn normalized(self) -> Option<Tokens> {
         self.accounting
             .map(|accounting| accounting.normalized(self.tokens))
     }
 
-    fn last_prompt_tokens(self) -> Option<i64> {
+    pub fn last_prompt_tokens(self) -> Option<i64> {
         self.accounting
             .map(|accounting| accounting.prompt_total(self.tokens))
     }

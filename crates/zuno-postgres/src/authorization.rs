@@ -106,7 +106,7 @@ pub async fn bootstrap_organization(
     Ok(created)
 }
 
-async fn access_in(
+pub(crate) async fn access_in(
     tx: &mut Transaction<'_, Postgres>,
     owner: &PrincipalKey,
 ) -> Result<OrganizationAccess, ApplicationError> {

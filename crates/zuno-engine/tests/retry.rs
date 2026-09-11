@@ -29,6 +29,25 @@ fn policy(max_attempts: u32) -> ProviderRetryPolicy {
 }
 
 #[test]
+fn state_acknowledgement_or_authority_loss_never_authorizes_effect_replay() {
+    use zuno_engine::state::TurnStateError;
+    for kind in [
+        TurnStateError::Unavailable,
+        TurnStateError::LeaseLost,
+        TurnStateError::Forbidden,
+    ] {
+        assert_eq!(TurnError::State(kind).recovery(), TurnRecovery::Pause);
+    }
+    for kind in [
+        TurnStateError::NotFound,
+        TurnStateError::Conflict,
+        TurnStateError::InvalidData,
+    ] {
+        assert_eq!(TurnError::State(kind).recovery(), TurnRecovery::Fail);
+    }
+}
+
+#[test]
 fn every_terminal_turn_error_has_an_explicit_goal_recovery_decision() {
     let cases = [
         (
