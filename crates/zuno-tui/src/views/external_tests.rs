@@ -1077,15 +1077,31 @@ struct HostileClipboardState {
     kill_called: std::sync::atomic::AtomicBool,
     try_wait_called: std::sync::atomic::AtomicBool,
     wait_called: std::sync::atomic::AtomicBool,
+    release_fixture: std::sync::atomic::AtomicBool,
 }
 
-struct NeverReturningStdin;
+struct ReleaseHostileClipboard(Arc<HostileClipboardState>);
+
+impl Drop for ReleaseHostileClipboard {
+    fn drop(&mut self) {
+        self.0
+            .release_fixture
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+struct NeverReturningStdin(Arc<HostileClipboardState>);
 
 impl std::io::Write for NeverReturningStdin {
     fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
-        loop {
+        while !self
+            .0
+            .release_fixture
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        Err(std::io::Error::other("clipboard fixture released"))
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -1103,7 +1119,7 @@ impl HostileClipboardChild {
     fn new(mode: HostileClipboardMode, state: Arc<HostileClipboardState>) -> Self {
         let stdin: Box<dyn std::io::Write + Send> = match mode {
             HostileClipboardMode::KillFails | HostileClipboardMode::DescendantHoldsPipe => {
-                Box::new(NeverReturningStdin)
+                Box::new(NeverReturningStdin(Arc::clone(&state)))
             }
             HostileClipboardMode::TryWaitFails | HostileClipboardMode::WaitNeverReturns => {
                 Box::new(std::io::sink())
@@ -1146,9 +1162,14 @@ impl ClipboardChild for HostileClipboardChild {
         self.state
             .wait_called
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        loop {
+        while !self
+            .state
+            .release_fixture
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        Err(std::io::Error::other("clipboard fixture released"))
     }
 }
 
@@ -1170,7 +1191,15 @@ impl CommandRunner for HostileClipboardRunner {
 }
 
 fn assert_hostile_native_copy_is_bounded(mode: HostileClipboardMode) -> Arc<HostileClipboardState> {
+    assert_hostile_native_copy_with_start_delay(mode, std::time::Duration::ZERO)
+}
+
+fn assert_hostile_native_copy_with_start_delay(
+    mode: HostileClipboardMode,
+    caller_start_delay: std::time::Duration,
+) -> Arc<HostileClipboardState> {
     let state = Arc::new(HostileClipboardState::default());
+    let _release_fixture = ReleaseHostileClipboard(Arc::clone(&state));
     let clipboard = SystemClipboard::new(
         None,
         false,
@@ -1181,16 +1210,54 @@ fn assert_hostile_native_copy_is_bounded(mode: HostileClipboardMode) -> Arc<Host
         }),
     );
     let (finished, outcome) = std::sync::mpsc::sync_channel(1);
+    let (started, ready) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
+        std::thread::sleep(caller_start_delay);
+        started.send(()).expect("test caller observes readiness");
         let result = clipboard.write("payload");
         let _reported = finished.send(result);
     });
 
+    ready
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("clipboard caller thread must start");
+    // This watchdog detects a stuck call without treating host thread startup or
+    // scheduler preemption as evidence that the production 150ms wait regressed.
     outcome
-        .recv_timeout(std::time::Duration::from_millis(250))
+        .recv_timeout(std::time::Duration::from_secs(2))
         .expect("the component-facing clipboard call exceeded its hard bound")
         .expect_err("a hostile clipboard helper cannot report success");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let exercised = match mode {
+            HostileClipboardMode::KillFails | HostileClipboardMode::DescendantHoldsPipe => {
+                state.kill_called.load(std::sync::atomic::Ordering::SeqCst)
+            }
+            HostileClipboardMode::TryWaitFails => state
+                .try_wait_called
+                .load(std::sync::atomic::Ordering::SeqCst),
+            HostileClipboardMode::WaitNeverReturns => {
+                state.wait_called.load(std::sync::atomic::Ordering::SeqCst)
+            }
+        };
+        if exercised {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the hostile clipboard branch was not reached"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     state
+}
+
+#[test]
+fn views_external_clipboard_bound_is_independent_from_test_caller_startup() {
+    assert_hostile_native_copy_with_start_delay(
+        HostileClipboardMode::KillFails,
+        std::time::Duration::from_millis(300),
+    );
 }
 
 #[test]
