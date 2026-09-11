@@ -287,6 +287,8 @@ async fn real_postgres_enforces_scopes_transactions_role_boundaries_and_schema_i
     a.queue_text(failed).await.unwrap();
 
     crate::runtime_tests::exercise(&backend, &admin).await;
+    crate::authorization_tests::exercise(&backend, &admin, &migrator).await;
+    format_two_upgrade(&fixture, &admin).await;
     let expected_count: i64 = query_scalar("SELECT count(*) FROM zuno_enterprise_preview.session")
         .fetch_one(&admin)
         .await
@@ -362,4 +364,68 @@ async fn legacy_snapshot(pool: &sqlx_postgres::PgPool) -> serde_json::Value {
           'receipt',(SELECT to_jsonb(r) FROM zuno_enterprise_preview.request_receipt r WHERE r.request_id='legacy-request')
         ) AS snapshot",
     ).fetch_one(pool).await.unwrap().try_get("snapshot").unwrap()
+}
+
+async fn format_two_upgrade(fixture: &Fixture, admin: &sqlx_postgres::PgPool) {
+    use sqlx_core::row::Row;
+    use zuno_application::runtime::RuntimeStore;
+    // A second database in the same disposable cluster keeps both historical
+    // upgrade paths independent; no existing deployment database is used.
+    raw_sql("CREATE DATABASE zuno_format_two_fixture OWNER zuno_preview_migrator")
+        .execute(admin)
+        .await
+        .unwrap();
+    fn database(mut options: PostgresOptions) -> PostgresOptions {
+        let prefix = options
+            .url
+            .strip_suffix("/postgres")
+            .expect("isolated fixture database");
+        options.url = format!("{prefix}/zuno_format_two_fixture");
+        options
+    }
+    let old_migrator = database(fixture.migration_options())
+        .connect()
+        .await
+        .unwrap();
+    let old_admin = database(fixture.options(true, 2)).connect().await.unwrap();
+    migration::install_format_two_fixture(&old_migrator, &fixture.runtime_role)
+        .await
+        .unwrap();
+    async fn snapshot(pool: &sqlx_postgres::PgPool) -> serde_json::Value {
+        query(
+            "SELECT jsonb_build_object(
+              'nativeJob',(SELECT to_jsonb(j) FROM zuno_enterprise_preview.agent_job j WHERE id='legacy-job'),
+              'runtimeJob',(SELECT to_jsonb(j) FROM zuno_enterprise_preview.runtime_job j WHERE job_id='legacy-job'),
+              'slot',(SELECT to_jsonb(s) FROM zuno_enterprise_preview.runtime_session s WHERE session_id='legacy-session'),
+              'attempt',(SELECT to_jsonb(a) FROM zuno_enterprise_preview.runtime_attempt a WHERE id='legacy-attempt'),
+              'input',(SELECT to_jsonb(i) FROM zuno_enterprise_preview.input i WHERE id='legacy-input')
+            ) AS snapshot",
+        ).fetch_one(pool).await.unwrap().try_get("snapshot").unwrap()
+    }
+    let before = snapshot(&old_admin).await;
+    migrate(&old_migrator, &fixture.runtime_role).await.unwrap();
+    assert_eq!(snapshot(&old_admin).await, before);
+    let backend = PostgresBackend::connect(database(fixture.options(false, 2)))
+        .await
+        .unwrap();
+    let owner = principal("migration-fixture", "owner").owner();
+    let job = backend
+        .runtime(owner.tenant_id.clone())
+        .get(
+            &owner,
+            &zuno_types::identity::JobId::new("legacy-job").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(job.checkpoint_version, 1);
+    assert_eq!(job.checkpoint.unwrap().reference["spentTokens"], 1234);
+    assert_eq!(query_scalar::<_,i64>("SELECT lease_epoch FROM zuno_enterprise_preview.runtime_session WHERE session_id='legacy-session'")
+        .fetch_one(&old_admin).await.unwrap(),7);
+    assert_eq!(
+        query_scalar::<_, i32>("SELECT version FROM zuno_enterprise_preview.schema_format")
+            .fetch_one(&old_admin)
+            .await
+            .unwrap(),
+        migration::FORMAT
+    );
 }
