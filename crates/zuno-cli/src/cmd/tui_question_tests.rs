@@ -1047,3 +1047,66 @@ fn invalid_questions_command_arguments_do_not_enqueue_any_action() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn native_goal_resume_choice_opens_without_blocking_and_only_explicit_resume_wakes() {
+    use zuno_types::execution::{CollaborationMode, TurnExecutionIdentity};
+    for resume in [false, true] {
+        let pool = database();
+        let spill = tempfile::tempdir().expect("spill");
+        let goals = zuno_goal::GoalStore::from_pool(Arc::clone(&pool), spill.path().to_owned())
+            .expect("goals");
+        goals
+            .create_goal(SESSION, "Finish the approved change", None)
+            .expect("goal");
+        goals
+            .pause_with_reason(SESSION, zuno_goal::GoalPauseReason::UserInterruption)
+            .expect("pause");
+        zuno_db::session_execution::SessionExecutionStore::new(Arc::clone(&pool))
+            .seed(
+                SESSION,
+                CollaborationMode::Work,
+                Some(TurnExecutionIdentity::new("build", "provider", "model")),
+                1,
+            )
+            .expect("execution");
+        let service = Arc::new(QuestionService::new(Arc::clone(&pool)));
+        let (broker, mut wake) = broker(Arc::clone(&service));
+        let (shutdown, stopping) = watch::channel(false);
+        let worker = tokio::spawn(Arc::clone(&broker).run(stopping));
+        broker
+            .offer_goal_resume(SESSION, None)
+            .await
+            .expect("offer");
+        let view = service.pending(SESSION).await.expect("pending").remove(0);
+        assert_eq!(view.purpose, QuestionPurpose::GoalResume);
+        let mut bridge = bridge(&broker);
+        wait_for_frame(&mut bridge, &mut wake, "Resume paused Goal").await;
+        assert!(!broker.presentation_blocks_turn.load(Ordering::Acquire));
+        if !resume {
+            apply_action(&mut bridge, "dialog.select.next");
+        }
+        apply_action(&mut bridge, "dialog.select.submit");
+        let answered = wait_for_revision(&service, &view.id, 2).await;
+        assert_eq!(answered.state, QuestionState::Answered);
+        assert_eq!(
+            goals.goal(SESSION).expect("goal").expect("present").status,
+            if resume {
+                zuno_goal::GoalStatus::Active
+            } else {
+                zuno_goal::GoalStatus::Paused
+            }
+        );
+        let pending = zuno_db::inbox::SessionInbox::new(pool)
+            .pending(SESSION)
+            .expect("inbox");
+        assert_eq!(pending.len(), usize::from(resume));
+        assert!(
+            pending
+                .iter()
+                .all(|input| input.prompt["kind"] == "sessionControl")
+        );
+        shutdown.send(true).expect("stop");
+        worker.await.expect("stopped");
+    }
+}

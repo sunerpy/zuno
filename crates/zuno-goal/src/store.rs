@@ -815,6 +815,46 @@ impl GoalStore {
         pause_state_from(&connection, session_id)
     }
 
+    pub fn pause_state_in(
+        connection: &rusqlite::Connection,
+        session_id: &str,
+    ) -> Result<Option<GoalPauseState>, GoalError> {
+        pause_state_from(connection, session_id)
+    }
+
+    /// Explicit user recovery composed with session/inbox changes by the host.
+    /// Budget enforcement is the same SQL guard used by the existing user API.
+    pub fn resume_explicit_in(
+        tx: &Transaction<'_>,
+        session_id: &str,
+        expected_revision: i64,
+        at_ms: i64,
+    ) -> Result<Option<Goal>, GoalError> {
+        let goal = update_system_status_in(
+            tx,
+            session_id,
+            SystemStatus::Active,
+            Some(expected_revision),
+            at_ms,
+        )?;
+        if goal.is_none()
+            && let Some(error) = revision_conflict(tx, session_id, Some(expected_revision))?
+        {
+            return Err(error);
+        }
+        if let Some(goal) = &goal {
+            clear_failure_and_retry_state(tx, session_id)?;
+            if goal.status != GoalStatus::Paused {
+                tx.execute("DELETE FROM goal_pause WHERE session_id=?1", [session_id])
+                    .map_err(zuno_db::map_error)?;
+            }
+            if !checklist_dormant(goal.status) {
+                backfill_criteria(tx, Some(session_id))?;
+            }
+        }
+        Ok(goal)
+    }
+
     /// Shared durable human-request store over the same application pool.
     #[must_use]
     pub fn human_requests(&self) -> zuno_db::human_request::HumanRequestStore {

@@ -16,7 +16,10 @@ use zuno_learning::{
 };
 use zuno_llm::{
     event::{FinishReason, StreamEvent},
-    registry::{ApiSurface, Capabilities, CompletionRequest, Provider, ProviderStream, generation},
+    registry::{
+        ApiSurface, Capabilities, CompletionRequest, Provider, ProviderStream, Spec, generation,
+        model_capabilities,
+    },
 };
 use zuno_paths::DbLocation;
 use zuno_types::ExperienceKind;
@@ -31,7 +34,7 @@ fn pool() -> Arc<Pool> {
           INSERT INTO session(id,project_id,slug,directory,title,version,time_created,time_updated)
           VALUES('s','p','s','/work','test','1',1,1),('s2','p','s2','/work','test two','1',1,1);
           INSERT INTO message(id,session_id,time_created,time_updated,data)
-          VALUES('m','s',2,2,'{"role":"assistant"}');
+          VALUES('m','s',2,2,'{"role":"assistant","finish":"stop","time":{"completed":2}}');
         "#).expect("fixture");
     }
     pool
@@ -40,6 +43,7 @@ fn pool() -> Arc<Pool> {
 #[derive(Debug)]
 enum Reply {
     Events(Vec<StreamEvent>),
+    Failure(zuno_error::ProviderError),
     Pending,
 }
 #[derive(Debug)]
@@ -67,9 +71,39 @@ impl Provider for ScriptedProvider {
             .expect("unexpected model request")
         {
             Reply::Pending => Box::pin(stream::pending()),
+            Reply::Failure(error) => Box::pin(stream::once(async move { Err(error) })),
             Reply::Events(events) => Box::pin(stream::iter(events.into_iter().map(Ok))),
         }
     }
+}
+
+#[tokio::test]
+async fn provider_diagnostics_keep_the_bounded_reason_and_redact_credentials() {
+    let (client, _) = client(vec![Reply::Failure(zuno_error::ProviderError::Fatal {
+        status: Some(400),
+        source: Some(Box::new(std::io::Error::other(
+            "code=unsupported_parameter requestID=req_test reason=unsupported setting; \
+             Authorization: Bearer sk-secret-credential-for-test",
+        ))),
+    })]);
+    let error = client
+        .extract(request())
+        .await
+        .expect_err("invalid request");
+    assert_eq!(error.recovery(), zuno_error::Recovery::Fail);
+    let events = client
+        .events
+        .read_after("s", None)
+        .expect("durable outcome");
+    let diagnostic = events.last().unwrap().properties["error"].as_str().unwrap();
+    assert!(diagnostic.contains("unsupported_parameter"), "{diagnostic}");
+    assert!(diagnostic.contains("req_test"), "{diagnostic}");
+    assert!(diagnostic.contains("unsupported setting"), "{diagnostic}");
+    assert!(
+        !diagnostic.contains("sk-secret-credential-for-test"),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.len() <= 4096);
 }
 
 fn answer(text: &str) -> Reply {
@@ -93,6 +127,9 @@ fn client(replies: Vec<Reply>) -> (LearningModelClient, Arc<Mutex<Vec<Completion
                 model_id: "model".to_owned(),
                 wire_id: "model".to_owned(),
                 surface: ApiSurface::Chat,
+                parameters: Default::default(),
+                headers: Default::default(),
+                sampling_params: true,
             },
             events: zuno_db::event_log::SessionEventLog::new(pool()),
             limits: ResolvedLearningConfig::default(),
@@ -117,9 +154,172 @@ fn request() -> ExtractionRequest {
 }
 
 #[tokio::test]
+async fn copying_the_model_visible_source_id_preserves_verified_evidence() {
+    use zuno_db::{
+        learning_job::{LearningJobStore, NewLearningJob},
+        learning_source::LearningSourceStore,
+    };
+    use zuno_llm::event::RequestContentBlock;
+
+    #[derive(Debug)]
+    struct CopyingProvider {
+        requests: Arc<Mutex<Vec<CompletionRequest>>>,
+    }
+    impl Provider for CopyingProvider {
+        fn id(&self) -> &str {
+            "test"
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::text_only()
+        }
+        fn stream(&self, request: CompletionRequest) -> ProviderStream<'_> {
+            let RequestContentBlock::Text { text } = &request.messages[1].message().content[0]
+            else {
+                panic!("plain JSON input");
+            };
+            let input: serde_json::Value = serde_json::from_str(text).expect("source input");
+            let evidence: Vec<_> = input["sources"]
+                .as_array()
+                .expect("sources")
+                .iter()
+                .map(|source| {
+                    json!({
+                        "kind": source["kind"],
+                        "source_id": source["source_id"],
+                        "excerpt": source["content"],
+                    })
+                })
+                .collect();
+            let output = json!({
+                "experiences": [{
+                    "kind":"user_correction", "title":"Concise reports",
+                    "summary":"The user requested concise reports.",
+                    "resolution":"Keep reports concise.", "confidence":0.9,
+                    "evidence": evidence,
+                }],
+                "memories": [{
+                    "experience_ordinal":0, "scope":"project", "action":"add",
+                    "content":"Keep reports concise.", "old_text":null,
+                    "reason":"An explicit user correction.", "confidence":0.9,
+                }],
+            });
+            self.requests.lock().expect("requests").push(request);
+            Box::pin(stream::iter([
+                Ok(StreamEvent::TextDelta(output.to_string())),
+                Ok(StreamEvent::MessageEnd {
+                    stop_reason: Some(FinishReason::Stop),
+                }),
+            ]))
+        }
+    }
+
+    let pool = pool();
+    pool.get()
+        .expect("connection")
+        .execute_batch(
+            r#"INSERT INTO message(id,session_id,time_created,time_updated,data)
+           VALUES('user','s',1,1,'{"role":"user"}');
+           INSERT INTO part(id,message_id,session_id,time_created,time_updated,data)
+           VALUES('user-part','user','s',1,1,
+                  '{"type":"text","text":"Correction: keep reports concise."}'),
+                 ('assistant-part','m','s',2,2,'{"type":"text","text":"Understood."}');"#,
+        )
+        .expect("source rows");
+    let sources = LearningSourceStore::new(pool.clone())
+        .for_turn("s", "m", &str::to_owned)
+        .expect("closed sources")
+        .sources;
+    assert_eq!(sources.len(), 2);
+    let mut input = request();
+    input.sources = sources.clone();
+    input.had_tool_calls = false;
+    input.user_corrected = true;
+    let jobs = LearningJobStore::new(pool.clone());
+    jobs.enqueue(NewLearningJob::extraction(
+        "citation-job",
+        "p",
+        "s",
+        "m",
+        zuno_learning::LEARNING_EXTRACTOR_VERSION,
+        json!({"request": input}),
+        10,
+    ))
+    .expect("admit");
+    let lease = jobs
+        .claim_due("worker", 11, 1000)
+        .expect("claim")
+        .expect("job")
+        .lease()
+        .expect("lease");
+    let (mut client, _) = client(Vec::new());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    client.provider = Arc::new(CopyingProvider {
+        requests: requests.clone(),
+    });
+    client.events = zuno_db::event_log::SessionEventLog::new(pool.clone());
+    let output = client.extract(input).await.expect("extract");
+    let events = client.events.read_after("s", None).expect("receipts");
+    let stored = ExperienceService::new(pool.clone(), None)
+        .persist_extraction("citation-job", &lease, output, 20)
+        .expect("persist");
+    assert!(
+        stored.experiences[0].verified_sources(),
+        "copying the supplied source_id must cite the exact admitted source"
+    );
+    assert!(
+        zuno_db::memory_evidence::MemoryEvidenceStore::new(pool)
+            .get(&stored.experiences[0].projection.id)
+            .expect("evidence")
+            .is_some(),
+        "the verified user correction can enter the independent Memory stage"
+    );
+
+    let requests = requests.lock().expect("requests");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].tools.is_empty());
+    let RequestContentBlock::Text { text } = &requests[0].messages[1].message().content[0] else {
+        panic!("plain JSON input");
+    };
+    let projected: serde_json::Value = serde_json::from_str(text).expect("projection");
+    for (source, original) in projected["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(&sources)
+    {
+        assert_eq!(source["source_id"], original.reference_id);
+        for private_field in [
+            "reference_id",
+            "message_id",
+            "source_digest",
+            "content_digest",
+        ] {
+            assert!(source.get(private_field).is_none(), "{private_field}");
+        }
+    }
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events[0].properties["request"]["messages"],
+        serde_json::to_value(&requests[0].messages).expect("actual input"),
+        "the durable receipt records the projection actually sent to the provider"
+    );
+    let manifest = jobs.get("citation-job").expect("job").payload.unwrap();
+    assert_eq!(
+        manifest["request"]["sources"],
+        serde_json::to_value(&sources).expect("original manifest"),
+        "model projection must not change the durable storage identities or digests"
+    );
+}
+
+#[tokio::test]
 async fn memory_consolidation_uses_the_audited_no_tools_provider_path() {
     use zuno_learning::{MemoryConsolidationRequest, MemoryConsolidator};
-    let (client, requests) = client(vec![answer(r#"{"updates":[]}"#)]);
+    let (mut client, requests) = client(vec![answer(r#"{"updates":[]}"#)]);
+    client
+        .model
+        .parameters
+        .insert(generation::MAX_TOKENS.to_owned(), json!(0));
+    client.limits.execution_max_output_tokens = 512;
     let result = client
         .consolidate_memory(MemoryConsolidationRequest {
             project_id: "p".to_owned(),
@@ -135,6 +335,7 @@ async fn memory_consolidation_uses_the_audited_no_tools_provider_path() {
     let requests = requests.lock().expect("requests");
     assert_eq!(requests.len(), 1);
     assert!(requests[0].tools.is_empty());
+    assert_eq!(requests[0].parameters[generation::MAX_TOKENS], 512);
     let events = client
         .events
         .read_after("s", None)
@@ -182,6 +383,234 @@ async fn extraction_bounds_legacy_input_repairs_once_and_audits_the_real_request
         events[2].properties["request"]["messages"]
             .to_string()
             .contains("invalid JSON")
+    );
+}
+
+#[tokio::test]
+async fn learning_preserves_resolved_model_controls_headers_and_its_own_output_bound() {
+    let (mut client, requests) = client(vec![answer(r#"{"experiences":[],"memories":[]}"#)]);
+    client.model.surface = ApiSurface::Responses;
+    client.model.parameters = serde_json::from_value(json!({
+        "reasoning":{"effort":"high"},"text":{"verbosity":"low"},
+        "temperature":0.7,"max_output_tokens":9000
+    }))
+    .unwrap();
+    client
+        .model
+        .headers
+        .insert("x-model-revision".to_owned(), "chosen-revision".to_owned());
+    client.model.sampling_params = false;
+    client.limits.execution_structured_output = true;
+    client.limits.execution_max_output_tokens = 512;
+    client.extract(request()).await.unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let sent = &requests[0];
+    assert_eq!(sent.model_id, "model");
+    assert_eq!(sent.surface, ApiSurface::Responses);
+    assert_eq!(sent.parameters["reasoning"]["effort"], "high");
+    assert_eq!(sent.parameters["text"]["verbosity"], "low");
+    assert_eq!(sent.parameters["text"]["format"]["type"], "json_schema");
+    assert_eq!(sent.parameters[generation::MAX_TOKENS], 512);
+    assert!(sent.parameters.get("max_output_tokens").is_none());
+    assert!(sent.parameters.get("temperature").is_none());
+    assert_eq!(sent.headers["x-model-revision"], "chosen-revision");
+    assert!(sent.tools.is_empty());
+    assert_eq!(
+        sent.request_context(),
+        Some(&zuno_llm::registry::ProviderRequestContext::Learning)
+    );
+}
+
+#[tokio::test]
+async fn a_supported_explicit_sampling_setting_and_smaller_output_limit_are_preserved() {
+    let (mut client, requests) = client(vec![answer(r#"{"experiences":[],"memories":[]}"#)]);
+    client.model.parameters =
+        serde_json::from_value(json!({"temperature":0.65,"maxTokens":128})).unwrap();
+    client.extract(request()).await.unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests[0].parameters["temperature"], 0.65);
+    assert_eq!(requests[0].parameters[generation::MAX_TOKENS], 128);
+}
+
+#[tokio::test]
+async fn learning_output_limit_zero_is_unspecified_but_the_captured_request_stays_bounded() {
+    for alias in [
+        "maxTokens",
+        "max_tokens",
+        "max_output_tokens",
+        "max_completion_tokens",
+    ] {
+        for surface in [ApiSurface::Chat, ApiSurface::Responses] {
+            for sampling_supported in [false, true] {
+                let (mut client, requests) =
+                    client(vec![answer(r#"{"experiences":[],"memories":[]}"#)]);
+                let spec = Spec::new(&client.model.provider_id)
+                    .with_option(
+                        "capabilities",
+                        json!({"sampling_params": !sampling_supported}),
+                    )
+                    .with_option(
+                        "modelCapabilities",
+                        json!({(client.model.wire_id.clone()): {
+                            "sampling_params": sampling_supported
+                        }}),
+                    );
+                let capabilities = model_capabilities(
+                    &spec,
+                    &client.model.wire_id,
+                    client.provider.capabilities(),
+                );
+                assert_eq!(capabilities.sampling_params, sampling_supported);
+                client.model.sampling_params = capabilities.sampling_params;
+                client.model.surface = surface;
+                client.model.parameters.insert(alias.to_owned(), json!(0));
+                client
+                    .model
+                    .parameters
+                    .insert(generation::TEMPERATURE.to_owned(), json!(0.7));
+                client.limits.execution_max_output_tokens = 512;
+
+                let result = client.extract(request()).await;
+                assert!(
+                    result.is_ok(),
+                    "{alias}=0 must mean no additional model cap: {result:?}"
+                );
+                let requests = requests.lock().expect("captured requests");
+                assert_eq!(requests.len(), 1, "zero must not cause a paid repair");
+                let sent = &requests[0];
+                assert_eq!(sent.model_id, client.model.wire_id);
+                assert_eq!(sent.surface, surface);
+                assert_eq!(sent.parameters[generation::MAX_TOKENS], 512);
+                assert!(sent.tools.is_empty());
+                assert_eq!(
+                    sent.parameters.get(generation::TEMPERATURE),
+                    sampling_supported.then_some(&json!(0.7)),
+                );
+
+                let events = client.events.read_after("s", None).expect("audit events");
+                assert_eq!(events.len(), 2);
+                let recorded = &events[0].properties["request"]["parameters"];
+                assert_eq!(recorded[generation::MAX_TOKENS], 512);
+                for other in ["max_tokens", "max_output_tokens", "max_completion_tokens"] {
+                    assert!(sent.parameters.get(other).is_none());
+                    assert!(recorded.get(other).is_none());
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn learning_output_limit_reaches_the_wire_under_the_resolved_surface_key() {
+    for (surface, wire_key) in [
+        (ApiSurface::Chat, "max_tokens"),
+        (ApiSurface::Responses, "max_output_tokens"),
+        (ApiSurface::Messages, "max_tokens"),
+    ] {
+        let (mut client, requests) = client(vec![answer(r#"{"experiences":[],"memories":[]}"#)]);
+        client.model.surface = surface;
+        client
+            .model
+            .parameters
+            .insert(generation::MAX_TOKENS.to_owned(), json!(0));
+        client.limits.execution_max_output_tokens = 512;
+        client.extract(request()).await.expect("bounded extraction");
+        let requests = requests.lock().expect("captured request");
+        assert_eq!(requests.len(), 1);
+        // The compatible provider calls this same lowering after assembling its body.
+        let mut body = json!({});
+        requests[0].apply_parameters(&mut body, surface);
+        assert_eq!(
+            body[wire_key], 512,
+            "wire output must keep the execution cap"
+        );
+        assert!(body.get(generation::MAX_TOKENS).is_none());
+        for other in ["max_tokens", "max_output_tokens", "max_completion_tokens"] {
+            if other != wire_key {
+                assert!(body.get(other).is_none(), "unexpected wire alias {other}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn learning_output_limit_positive_caps_still_win_over_unspecified_aliases() {
+    let (mut client, requests) = client(vec![answer(r#"{"experiences":[],"memories":[]}"#)]);
+    client.model.parameters = serde_json::from_value(json!({
+        "maxTokens": 0, "max_tokens": 128,
+        "max_output_tokens": 4096, "max_completion_tokens": 0
+    }))
+    .expect("model options");
+    client.limits.execution_max_output_tokens = 512;
+    let result = client.extract(request()).await;
+    assert!(
+        result.is_ok(),
+        "zero must not override a positive cap: {result:?}"
+    );
+    let requests = requests.lock().expect("captured request");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].parameters[generation::MAX_TOKENS], 128);
+    for alias in ["max_tokens", "max_output_tokens", "max_completion_tokens"] {
+        assert!(requests[0].parameters.get(alias).is_none());
+    }
+}
+
+#[tokio::test]
+async fn learning_output_limit_rejects_negative_fractional_boolean_and_non_numeric_values() {
+    for alias in [
+        "maxTokens",
+        "max_tokens",
+        "max_output_tokens",
+        "max_completion_tokens",
+    ] {
+        for value in [
+            json!(-1),
+            json!(0.5),
+            json!(1.5),
+            json!(true),
+            json!(false),
+            json!("0"),
+            json!(null),
+        ] {
+            let (mut client, requests) =
+                client(vec![answer(r#"{"experiences":[],"memories":[]}"#)]);
+            client
+                .model
+                .parameters
+                .insert(alias.to_owned(), value.clone());
+            let result = client.extract(request()).await;
+            assert!(result.is_err(), "{alias}={value} must remain invalid");
+            assert_eq!(result.unwrap_err().recovery(), zuno_error::Recovery::Fail);
+            assert!(requests.lock().expect("captured requests").is_empty());
+            assert!(
+                client
+                    .events
+                    .read_after("s", None)
+                    .expect("events")
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn learning_output_limit_requires_a_positive_execution_bound_before_requesting() {
+    let (mut client, requests) = client(vec![answer(r#"{"experiences":[],"memories":[]}"#)]);
+    client.limits.execution_max_output_tokens = 0;
+    let result = client.extract(request()).await;
+    assert!(
+        result.is_err(),
+        "execution bound zero must not reach the provider"
+    );
+    assert_eq!(result.unwrap_err().recovery(), zuno_error::Recovery::Fail);
+    assert!(requests.lock().expect("captured requests").is_empty());
+    assert!(
+        client
+            .events
+            .read_after("s", None)
+            .expect("events")
+            .is_empty()
     );
 }
 

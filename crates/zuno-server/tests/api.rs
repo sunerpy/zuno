@@ -917,7 +917,8 @@ async fn api_session_response_validates_against_its_published_openapi_binding() 
         schema.is_object(),
         "the bound response component `{schema_name}` exists"
     );
-    let validator = jsonschema::validator_for(schema)
+    let bound_schema = json!({"$ref": schema_ref, "components": document["components"]});
+    let validator = jsonschema::validator_for(&bound_schema)
         .unwrap_or_else(|error| panic!("published `{schema_name}` schema compiles: {error}"));
 
     let response = app
@@ -968,9 +969,11 @@ async fn api_session_learning_returns_the_shared_durable_projection_shape() {
         })
     );
     let document = api::openapi();
-    let validator =
-        jsonschema::validator_for(&document["components"]["schemas"]["LearningStateResponse"])
-            .expect("learning response schema");
+    let bound_schema = json!({
+        "$ref":"#/components/schemas/LearningStateResponse",
+        "components":document["components"],
+    });
+    let validator = jsonschema::validator_for(&bound_schema).expect("learning response schema");
     assert!(validator.is_valid(&body));
     for index in 1..=3 {
         fixture.pool.get().expect("connection").execute(

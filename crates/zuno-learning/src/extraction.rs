@@ -24,6 +24,36 @@ pub struct ExtractionRequest {
 }
 
 impl ExtractionRequest {
+    /// Present one unambiguous citation address without exposing the manifest's
+    /// separate storage identifiers or host-only integrity digests. The durable
+    /// request keeps the original manifest for strict settlement revalidation.
+    pub(crate) fn model_input(&self) -> Value {
+        let sources: Vec<_> = self
+            .sources
+            .iter()
+            .map(|source| {
+                serde_json::json!({
+                    "source_id": source.reference_id,
+                    "kind": source.kind,
+                    "field": source.field,
+                    "content": source.content,
+                    "tool": source.tool,
+                    "arguments": source.arguments,
+                    "proves_success": source.proves_success,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "sources": sources,
+            "sources_truncated": self.sources_truncated,
+            "had_tool_calls": self.had_tool_calls,
+            "had_artifacts": self.had_artifacts,
+            "recovered_from_error": self.recovered_from_error,
+            "user_corrected": self.user_corrected,
+            "explicit_feedback": self.explicit_feedback,
+        })
+    }
+
     /// Project the durable source manifest to one bounded request. Legacy
     /// transcript blobs are never sent alongside (or instead of) cited sources.
     pub fn bounded(mut self, max_bytes: usize) -> crate::Result<Self> {
@@ -64,6 +94,8 @@ pub enum ExtractionTrigger {
     AutomaticPostTurn,
     /// Explicit user-requested reflection.
     Manual,
+    /// Bounded legacy repair; lower priority than newly completed turns.
+    LegacyReprocess,
 }
 
 /// Durable extraction payload shared by automatic and explicit reflection.
@@ -71,6 +103,12 @@ pub enum ExtractionTrigger {
 pub struct ExtractionJobPayload {
     pub trigger: ExtractionTrigger,
     pub request: ExtractionRequest,
+    #[serde(
+        default,
+        rename = "sourceSnapshot",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub source_snapshot: Option<zuno_db::learning_source::LearningSourceSnapshot>,
 }
 
 impl ExtractionJobPayload {
@@ -79,6 +117,7 @@ impl ExtractionJobPayload {
         Self {
             trigger: ExtractionTrigger::AutomaticPostTurn,
             request,
+            source_snapshot: None,
         }
     }
 
@@ -87,6 +126,7 @@ impl ExtractionJobPayload {
         Self {
             trigger: ExtractionTrigger::Manual,
             request,
+            source_snapshot: None,
         }
     }
 

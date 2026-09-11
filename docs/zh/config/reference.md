@@ -690,7 +690,7 @@ Skill 的复核、评估和应用边界不变。`memory.resident` 在每个回�
   "learning": {
     "post_turn": {
       "enabled": true,
-      "idle_delay_ms": 21600000,
+      "idle_delay_ms": 0,
       "poll_interval_ms": 60000,
       "max_jobs_per_wake": 2,
       "disable_on_external_context": false
@@ -711,9 +711,11 @@ Skill 的复核、评估和应用边界不变。`memory.resident` 在每个回�
   JSON Schema 协议时才开启。默认模式会把同一 schema 放入 Prompt，并在本地做有界解析与修复。
   Skill 评测只在 `/learn skill-review` 时启动，不需要单独配置模型。
 - `post_turn.enabled` 只控制符合条件任务完成后的自动抽取，不控制既有 Experience 的读取。
-- `post_turn.idle_delay_ms` 默认 `21600000`（六小时），可设为 `0` 表示自动任务立即具备运行资格。
+- `post_turn.idle_delay_ms` 默认 `0`：合格回合完成后立即保存有界来源快照、入队并唤醒 worker，
+  下一轮正在执行不会阻止前一轮快照提炼。显式正值保留延迟空闲策略，只作用于自动提炼。
 - `post_turn.poll_interval_ms` 默认 `60000` 且必须大于零；`post_turn.max_jobs_per_wake` 默认 `2` 且必须大于零。
-- 自动学习不设置额度百分比、每日 token 或金额预算。provider 的限流错误会保留 typed `Retry-After`；六小时空闲、每次两个任务、资格检查、去重与最多三次尝试共同限制后台工作量。
+- 自动学习不设置额度百分比、每日 token 或金额预算。provider 的限流错误会保留 typed `Retry-After`；
+  显式空闲延迟、每次两个任务、资格检查、去重、输入/输出/时间上限与最多三次尝试共同限制后台工作量。
 - `post_turn.disable_on_external_context` 默认 `false`；为 `true` 时，带外部上下文标记的完成回合会把该会话置为 `generation=excluded`，跳过已排队的自动抽取；只有新会话才能重新启用显式或自动生成。
 - 自动任务领取还会在同一 SQLite 事务中检查会话活动时间、待处理输入、当前进程的活跃回合以及会话策略；不符合条件时不会消耗 attempt。可重试的抽取器错误进入有界指数退避，不会立即永久失败。
 - 自动检索会先把提示词转换为有界的字面量 FTS 查询；引号、运算符、列选择器和标识符标点只作为数据处理，不会成为 SQLite FTS5 语法。

@@ -6,13 +6,15 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value, json};
 use url::Url;
 use zuno_db::message::{MessageRole, MessageWithParts, PartKind, PartRecord};
-use zuno_db::session::{MessageUsage, TokenAccounting};
+use zuno_engine::context_usage::context_usage_from_history;
 use zuno_engine::r#loop::{INTERRUPTED_TURN_NOTICE, ToolDiff, ToolInterruption};
 use zuno_tool::ToolOutput;
 use zuno_types::WorkStateProjection;
+use zuno_types::context_usage::{ContextUsageSnapshot, ContextUsageSource};
 
 use crate::projection::{
-    CompletedToolUpdate, completed_tool_update, interrupted_tool_update, tool_call,
+    CompletedToolUpdate, completed_tool_update, context_usage_update, interrupted_tool_update,
+    tool_call,
 };
 
 /// Maximum retained durable messages hydrated for one ACP load.
@@ -146,7 +148,29 @@ fn replay_omission_update(omitted_messages: usize) -> Value {
     })
 }
 
-/// Replays the last provider-confirmed context usage, never cumulative session tokens.
+/// Replay the canonical persisted snapshot using the live projection contract.
+#[must_use]
+pub fn durable_context_usage_update(
+    snapshot: &ContextUsageSnapshot,
+    cumulative_cost: f64,
+) -> Option<Value> {
+    let mut update = context_usage_update(snapshot)?;
+    if cumulative_cost.is_finite() && cumulative_cost >= 0.0 {
+        let cost = json!({ "amount": cumulative_cost, "currency": "USD" });
+        if update["sessionUpdate"] == "usage_update" {
+            update["cost"] = cost;
+        } else {
+            update["_meta"]["zuno"]["contextUsageCost"] = cost;
+        }
+    }
+    Some(update)
+}
+
+/// Adopt bounded history from before canonical snapshots were persisted.
+///
+/// New sessions and runtime resume use [`durable_context_usage_update`]. Historical
+/// replay uses the same tracker and normalized-history projection, preserving
+/// unknown fields and excluding compaction/learning/auxiliary request counters.
 #[must_use]
 pub fn durable_usage_update(
     history: &[MessageWithParts],
@@ -156,29 +180,10 @@ pub fn durable_usage_update(
     if context_size == 0 {
         return None;
     }
-    let usage = history
-        .iter()
-        .rev()
-        .filter(|message| message.info.role == MessageRole::Assistant)
-        .map(|message| MessageUsage::from_data(&message.info.data))
-        .find(|usage| usage.reported)?;
-    let prompt = match usage.accounting? {
-        TokenAccounting::CacheInsideInput => usage.tokens.input,
-        TokenAccounting::CacheBesideInput => usage
-            .tokens
-            .input
-            .saturating_add(usage.tokens.cache_read)
-            .saturating_add(usage.tokens.cache_write),
-    };
-    let used = u64::try_from(prompt.saturating_add(usage.tokens.output).max(0)).ok()?;
-    let mut update = json!({
-        "sessionUpdate": "usage_update",
-        "used": used,
-        "size": context_size,
-    });
-    if cumulative_cost.is_finite() && cumulative_cost >= 0.0 {
-        update["cost"] = json!({ "amount": cumulative_cost, "currency": "USD" });
-    }
+    let snapshot =
+        context_usage_from_history(history, ContextUsageSource::Main, Some(context_size), None)?;
+    let mut update = durable_context_usage_update(&snapshot, cumulative_cost)?;
+    update["_meta"]["zuno"]["contextUsageOrigin"] = json!("message_history");
     Some(update)
 }
 
@@ -635,6 +640,10 @@ fn data_url_payload<'a>(url: &'a str, mime: &str) -> Option<&'a str> {
 fn json_or_string(value: &str) -> Value {
     serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_owned()))
 }
+
+#[cfg(test)]
+#[path = "replay_context_usage_tests.rs"]
+mod context_usage_tests;
 
 #[cfg(test)]
 mod tests {

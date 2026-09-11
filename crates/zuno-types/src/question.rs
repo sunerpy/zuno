@@ -176,6 +176,7 @@ pub enum QuestionPurpose {
     Clarification,
     RequiredInput,
     PlanAuthorization,
+    GoalResume,
 }
 
 impl QuestionPurpose {
@@ -185,6 +186,7 @@ impl QuestionPurpose {
             Self::Clarification => "clarification",
             Self::RequiredInput => "required_input",
             Self::PlanAuthorization => "plan_authorization",
+            Self::GoalResume => "goal_resume",
         }
     }
 }
@@ -293,7 +295,10 @@ impl QuestionSpec {
             ));
         }
         if self.origin.goal_id.is_some()
-            && self.purpose == QuestionPurpose::RequiredInput
+            && matches!(
+                self.purpose,
+                QuestionPurpose::RequiredInput | QuestionPurpose::GoalResume
+            )
             && self
                 .expected_goal_revision
                 .is_none_or(|revision| revision < 1)
@@ -303,11 +308,39 @@ impl QuestionSpec {
             ));
         }
         if self.expected_goal_revision.is_some()
-            && (self.purpose != QuestionPurpose::RequiredInput || self.origin.goal_id.is_none())
+            && (!matches!(
+                self.purpose,
+                QuestionPurpose::RequiredInput | QuestionPurpose::GoalResume
+            ) || self.origin.goal_id.is_none())
         {
             return Err(QuestionValidationError(
-                "a Goal revision is only valid for Goal-owned required input".to_owned(),
+                "a Goal revision is only valid for Goal-owned input or resume".to_owned(),
             ));
+        }
+        if self.purpose == QuestionPurpose::GoalResume {
+            let valid_choices = self.questions.as_slice().first().is_some_and(|question| {
+                !question.allows_custom()
+                    && !question.is_multiple()
+                    && question
+                        .options
+                        .iter()
+                        .map(|option| option.label.as_str())
+                        .eq([
+                            crate::goal_resume::RESUME_GOAL_CHOICE,
+                            crate::goal_resume::KEEP_GOAL_PAUSED_CHOICE,
+                        ])
+            });
+            if self.origin.goal_id.is_none()
+                || self.expected_goal_revision.is_none()
+                || self.mode != QuestionMode::Deferred
+                || self.questions.len() != 1
+                || !valid_choices
+            {
+                return Err(QuestionValidationError(
+                    "Goal resume requires a deferred closed choice bound to a Goal revision"
+                        .to_owned(),
+                ));
+            }
         }
         Ok(())
     }

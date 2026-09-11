@@ -58,6 +58,93 @@ fn context() -> ProjectionContext {
     ProjectionContext::new(SESSION_ID, MESSAGE_ID, 1, 10, "build").with_cost(0.125)
 }
 
+#[test]
+fn stream_context_usage_keeps_reasoning_when_a_later_snapshot_omits_it() {
+    let connection = seeded();
+    let mut effects = RecordingEffects::default();
+    let mut projector = StreamProjector::start(&connection, context(), &mut effects).unwrap();
+    for event in [
+        StreamEvent::TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(40),
+            reasoning_tokens: Some(10),
+            cache_read_input_tokens: Some(20),
+            cache_write_input_tokens: Some(10),
+            accounting: PromptAccounting::CacheInsideInput,
+        },
+        StreamEvent::TokenUsage {
+            input_tokens: None,
+            output_tokens: Some(45),
+            reasoning_tokens: None,
+            cache_read_input_tokens: None,
+            cache_write_input_tokens: None,
+            accounting: PromptAccounting::CacheInsideInput,
+        },
+        StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::Stop),
+        },
+    ] {
+        projector.apply(event).unwrap();
+    }
+    drop(projector);
+    let assistant = MessageStore::new(&connection).message(MESSAGE_ID).unwrap();
+    assert_eq!(assistant.data["tokens"]["input"], 100);
+    assert_eq!(assistant.data["tokens"]["output"], 35);
+    assert_eq!(assistant.data["tokens"]["reasoning"], 10);
+    let finish = message_parts(&connection)
+        .into_iter()
+        .find(|part| part.kind == PartKind::StepFinish)
+        .unwrap();
+    assert_eq!(finish.data["tokens"]["total"], 145);
+}
+
+#[test]
+fn stream_context_usage_after_message_end_updates_bookkeeping_once() {
+    let connection = seeded();
+    let mut effects = RecordingEffects::default();
+    let mut projector = StreamProjector::start(&connection, context(), &mut effects).unwrap();
+    projector
+        .apply(StreamEvent::TextDelta("done".to_owned()))
+        .unwrap();
+    projector
+        .apply(StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::Stop),
+        })
+        .unwrap();
+    let usage = StreamEvent::TokenUsage {
+        input_tokens: Some(100),
+        output_tokens: Some(40),
+        reasoning_tokens: Some(10),
+        cache_read_input_tokens: Some(20),
+        cache_write_input_tokens: Some(5),
+        accounting: PromptAccounting::CacheInsideInput,
+    };
+    projector.apply(usage.clone()).unwrap();
+    let writes = projector.stats().total_writes;
+    projector.apply(usage).unwrap();
+    assert_eq!(projector.stats().total_writes, writes);
+    drop(projector);
+    assert_eq!(effects.summaries.len(), 1);
+    let message = MessageStore::new(&connection).message(MESSAGE_ID).unwrap();
+    assert_eq!(message.data["cost"], 0.125);
+    assert_eq!(message.data["tokens"]["input"], 100);
+    assert_eq!(message.data["tokens"]["output"], 30);
+    assert_eq!(message.data["tokens"]["reasoning"], 10);
+    let parts = message_parts(&connection);
+    let finish = parts
+        .iter()
+        .find(|part| part.kind == PartKind::StepFinish)
+        .unwrap();
+    assert_eq!(finish.data["tokens"]["total"], 140);
+    assert_eq!(
+        parts
+            .iter()
+            .filter(|part| part.kind == PartKind::StepFinish)
+            .count(),
+        1
+    );
+}
+
 fn message_parts(connection: &Connection) -> Vec<PartRecord> {
     MessageStore::new(connection)
         .hydrate_session(SESSION_ID)

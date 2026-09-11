@@ -50,7 +50,8 @@ pub use crate::background::{
     BackgroundExecutionInfo, BackgroundExecutionInput, BackgroundExecutionLease,
     BackgroundExecutionOutput, BackgroundExecutionProjection, BackgroundExecutionPurpose,
     BackgroundExecutionRetention, BackgroundExecutionService, BackgroundExecutionStatus,
-    BackgroundWaitOutcome, MAX_RETAINED_TERMINAL_EXECUTIONS,
+    BackgroundWaitOutcome, ForegroundExecution, ForegroundExecutionCompletion,
+    ForegroundExecutionContext, ForegroundWaitOutcome, MAX_RETAINED_TERMINAL_EXECUTIONS,
 };
 pub use crate::buffer::{BUFFER_LIMIT, Replay, ReplayCursor, ScrollbackBuffer};
 pub use crate::retention::EXITED_LIMIT;

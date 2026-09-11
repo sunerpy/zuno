@@ -124,6 +124,18 @@ impl QuestionBroker {
         Arc::clone(&self.work_ready)
     }
 
+    /// Host-only resume affordance; displaying or dismissing it grants nothing.
+    pub(crate) async fn offer_goal_resume(
+        &self,
+        session_id: &str,
+        input_id: Option<&str>,
+    ) -> QuestionResult<()> {
+        self.service()?
+            .offer_goal_resume(session_id, input_id)
+            .await?;
+        Ok(())
+    }
+
     pub(crate) fn host_replaced(&self, identity: zuno_types::execution::TurnExecutionIdentity) {
         *locked(&self.replaced_identity) = Some(identity);
         let _ = self.wake.try_send(TerminalEvent::Wake);
@@ -784,7 +796,9 @@ impl QuestionBridge {
                     .pending
                     .iter()
                     .find(|view| {
-                        view.mode == QuestionMode::Blocking && !self.seen.contains(&view.id)
+                        (view.mode == QuestionMode::Blocking
+                            || view.purpose == QuestionPurpose::GoalResume)
+                            && !self.seen.contains(&view.id)
                     })
                     .cloned()
             {

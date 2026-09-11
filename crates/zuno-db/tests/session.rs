@@ -845,6 +845,12 @@ fn session_mutation_fields_and_revert_commit_are_atomic() {
         ),
         0
     );
+    let context = zuno_db::context_usage::read_in(&connection, "ses_a")
+        .expect("canonical context")
+        .expect("revert records an invalidated window even at epoch zero");
+    assert!(context.snapshot().context_epoch > 0);
+    assert_eq!(context.snapshot().used_tokens, None);
+    assert_eq!(context.snapshot().last_confirmed, None);
     drop(connection);
 
     // The consumed input is immutable history: same state, same revision.
@@ -987,6 +993,7 @@ fn revert_retires_unconsumed_inputs_when_the_boundary_lives_only_in_the_legacy_t
         [
             "session.input.admitted",
             "session.input.cancelled",
+            "session.context.usage",
             "session.reverted"
         ]
     );

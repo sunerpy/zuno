@@ -1027,7 +1027,7 @@
           ]
         },
         "idle_delay_ms": {
-          "description": "Delay before an automatic extraction job becomes runnable. Defaults to\n21600000 milliseconds (six hours).\n\nZero keeps automatic extraction immediate.",
+          "description": "Delay before an automatic extraction job becomes runnable. Defaults to 0 milliseconds.\nAn explicit nonzero value requires the source session to remain idle.",
           "format": "uint64",
           "minimum": 0,
           "type": [

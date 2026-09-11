@@ -112,7 +112,7 @@ mod tests {
             .as_object()
             .expect("LearningPostTurnConfig properties");
         for (field, default) in [
-            ("idle_delay_ms", "21600000"),
+            ("idle_delay_ms", "Defaults to 0 milliseconds"),
             ("poll_interval_ms", "60000"),
             ("max_jobs_per_wake", "Defaults to 2"),
             ("disable_on_external_context", "Defaults to false"),

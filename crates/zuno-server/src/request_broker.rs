@@ -158,7 +158,7 @@ fn reusable_grant(request: &PermissionRequest) -> Option<StandingGrant> {
 
 struct PendingPermission {
     request: PermissionRequest,
-    /// The asker's sender while the ask is unclaimed; `None` once a reply owns it.
+    /// The asker's sender; `None` once a reply or registration cleanup owns it.
     ///
     /// A claimed ask stays in the map as a marker instead of being removed, and the
     /// marker outlives the durable write. Removing the entry on claim made a claim two
@@ -168,11 +168,11 @@ struct PendingPermission {
     /// See [`RequestBroker::claim_permission`].
     answer: Option<oneshot::Sender<PermissionOutcome>>,
     grant: Option<StandingGrant>,
-    /// Whether the durable row this ask is recovered from has been written yet.
+    /// Whether this live ask's durable row and asked event have both committed.
     ///
-    /// An ask is registered before that write so no durable row is ever answerable
-    /// while its asker has no sender, and stays hidden until the write lands so a
-    /// reply cannot settle an ask that never persisted.
+    /// An ask is registered before either write so no durable row is answerable
+    /// while its asker has no sender. It stays hidden until publication succeeds,
+    /// so a reply cannot settle an unannounced ask or overtake its event.
     persisted: bool,
 }
 
@@ -185,14 +185,14 @@ impl PendingPermission {
 
 struct PendingQuestion {
     request: QuestionRequest,
-    /// The asker's sender while the question is unclaimed; `None` once a reply owns it.
+    /// The asker's sender; `None` once a reply or registration cleanup owns it.
     ///
     /// Same claim marker as [`PendingPermission::answer`], for the same reason.
     answer: Option<oneshot::Sender<QuestionDecision>>,
-    /// Whether the durable row this question is recovered from has been written yet.
+    /// Whether this live question's durable row and asked event have both committed.
     ///
     /// Same invariant as [`PendingPermission::persisted`]: registering first keeps the
-    /// asker's sender attached to the id, and staying hidden until the write lands keeps
+    /// asker's sender attached to the id, and staying hidden until publication keeps
     /// a client from claiming the row through the recovered-request path — which would
     /// admit inbox input for a question whose live asker is still waiting.
     persisted: bool,
@@ -314,10 +314,14 @@ impl RequestBroker {
         self.spawn_permission_watchdog(&request);
         if let Err(error) = self.publish("permission.v2.asked", &request).await {
             eprintln!(
-                "failed to publish HTTP permission request `{}`: {error}",
+                "failed to publish HTTP permission request `{}`: {error:?}",
                 request.id
             );
             self.finish_permission(&request.session_id, &request.id, PermissionOutcome::Failed);
+        } else {
+            // The durable row alone is not a complete registration. A fast reply
+            // must not race this first event-store use or commit before its ask.
+            mark_permission_persisted(&self.pending, &request.id);
         }
         let outcome = receiver.await.unwrap_or(PermissionOutcome::Failed);
         self.settle_permission(&request, outcome).await;
@@ -401,13 +405,14 @@ impl RequestBroker {
     /// Settles the durable row with the state the outcome earned.
     async fn settle_permission(&self, request: &PermissionRequest, outcome: PermissionOutcome) {
         let Some(store) = self.durable.clone() else {
+            release_permission_claim(&self.pending, &request.id);
             return;
         };
         let goals = self.goals.clone();
         let request_id = request.id.clone();
         let session_id = request.session_id.clone();
         let (state, response) = permission_state_and_response(outcome);
-        let _settled = tokio::task::spawn_blocking(move || {
+        let terminal = tokio::task::spawn_blocking(move || {
             let goal_owned = store
                 .get(&request_id)
                 .ok()
@@ -416,7 +421,7 @@ impl RequestBroker {
             // A reply already settled its own row inside `PermissionResolution::settle`;
             // `resolve` only touches a row that is still pending, so this is the write
             // for every path that never reached a resolution.
-            let _settled = store.resolve(
+            let settled = store.resolve(
                 &request_id,
                 state,
                 response.as_ref(),
@@ -425,8 +430,13 @@ impl RequestBroker {
             if goal_owned && let Some(goals) = &goals {
                 let _resumed = goals.resume_for_work(&session_id);
             }
+            settled.is_ok_and(|row| row.is_none_or(|row| row.state.is_terminal()))
         })
-        .await;
+        .await
+        .unwrap_or(false);
+        if terminal {
+            release_permission_claim(&self.pending, &request.id);
+        }
     }
 
     pub async fn ask_question(&self, request: QuestionRequest) -> QuestionDecision {
@@ -452,10 +462,12 @@ impl RequestBroker {
         self.spawn_question_watchdog(&request);
         if let Err(error) = self.publish("question.v2.asked", &request).await {
             eprintln!(
-                "failed to publish HTTP question request `{}`: {error}",
+                "failed to publish HTTP question request `{}`: {error:?}",
                 request.id
             );
             self.finish_question(&request.session_id, &request.id, QuestionDecision::Failed);
+        } else {
+            mark_question_persisted(&self.pending, &request.id);
         }
         let decision = receiver.await.unwrap_or(QuestionDecision::Failed);
         self.settle_question(&request, &decision).await;
@@ -465,13 +477,14 @@ impl RequestBroker {
     /// Settles the durable row with the state the decision earned, off the reactor.
     async fn settle_question(&self, request: &QuestionRequest, decision: &QuestionDecision) {
         let Some(store) = self.durable.clone() else {
+            release_question_claim(&self.pending, &request.id);
             return;
         };
         let goals = self.goals.clone();
         let request_id = request.id.clone();
         let session_id = request.session_id.clone();
         let (state, response) = question_state_and_response(decision);
-        let _settled = tokio::task::spawn_blocking(move || {
+        let terminal = tokio::task::spawn_blocking(move || {
             let goal_owned = store
                 .get(&request_id)
                 .ok()
@@ -480,7 +493,7 @@ impl RequestBroker {
             // A reply already settled its own row inside `QuestionResolution::settle`;
             // `resolve` only touches a row that is still pending, so this is the write
             // for every path that never reached a resolution.
-            let _settled = store.resolve(
+            let settled = store.resolve(
                 &request_id,
                 state,
                 response.as_ref(),
@@ -492,8 +505,13 @@ impl RequestBroker {
             {
                 let _resumed = goals.resume_for_work(&session_id);
             }
+            settled.is_ok_and(|row| row.is_none_or(|row| row.state.is_terminal()))
         })
-        .await;
+        .await
+        .unwrap_or(false);
+        if terminal {
+            release_question_claim(&self.pending, &request.id);
+        }
     }
 
     #[must_use]
@@ -834,18 +852,12 @@ impl RequestBroker {
         request: &PermissionRequest,
     ) -> Result<(), zuno_error::DbError> {
         let Some(store) = self.durable.clone() else {
-            mark_permission_persisted(&self.pending, &request.id);
             return Ok(());
         };
         let goals = self.goals.clone();
-        let pending = Arc::clone(&self.pending);
         let request = request.clone();
         tokio::task::spawn_blocking(move || {
-            write_permission_row(&store, goals.as_deref(), &request)?;
-            // Under the same lock the reply routes use, so an ask is answerable only
-            // once the row it settles is already on disk.
-            mark_permission_persisted(&pending, &request.id);
-            Ok(())
+            write_permission_row(&store, goals.as_deref(), &request)
         })
         .await
         .map_err(|error| zuno_error::DbError::Query {
@@ -853,13 +865,11 @@ impl RequestBroker {
         })?
     }
 
-    /// Persists one question off the reactor, then makes it answerable.
+    /// Persists one question off the reactor; publishing its ask completes registration.
     async fn persist_question(&self, request: &QuestionRequest) -> Result<(), zuno_error::DbError> {
         let Some(store) = self.durable.clone() else {
-            mark_question_persisted(&self.pending, &request.id);
             return Ok(());
         };
-        let pending = Arc::clone(&self.pending);
         let request = request.clone();
         tokio::task::spawn_blocking(move || {
             store.create(NewHumanRequest {
@@ -876,9 +886,6 @@ impl RequestBroker {
                 call_id: request.tool.as_ref().map(|tool| tool.call_id.clone()),
                 time_created: zuno_db::message::now_millis(),
             })?;
-            // Under the same lock the reply routes use, so a question is answerable only
-            // once the row it settles is already on disk.
-            mark_question_persisted(&pending, &request.id);
             Ok(())
         })
         .await
@@ -997,7 +1004,7 @@ fn finish_permission(
 ) {
     let answer = {
         let mut pending = pending.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(request) = pending.permissions.get(request_id) else {
+        let Some(request) = pending.permissions.get_mut(request_id) else {
             return;
         };
         if request.request.session_id != session_id {
@@ -1009,10 +1016,16 @@ fn finish_permission(
         if request.claimed() {
             return;
         }
-        pending
-            .permissions
-            .remove(request_id)
-            .and_then(|request| request.answer)
+        if request.persisted {
+            pending
+                .permissions
+                .remove(request_id)
+                .and_then(|request| request.answer)
+        } else {
+            // The registration task still owns this unpublished row. Its terminal
+            // write must land before a list or claim can recover the same id.
+            request.answer.take()
+        }
     };
     if let Some(answer) = answer {
         let _delivered = answer.send(outcome);
@@ -1027,7 +1040,7 @@ fn finish_question(
 ) {
     let answer = {
         let mut pending = pending.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(request) = pending.questions.get(request_id) else {
+        let Some(request) = pending.questions.get_mut(request_id) else {
             return;
         };
         if request.request.session_id != session_id {
@@ -1037,10 +1050,14 @@ fn finish_question(
         if request.claimed() {
             return;
         }
-        pending
-            .questions
-            .remove(request_id)
-            .and_then(|request| request.answer)
+        if request.persisted {
+            pending
+                .questions
+                .remove(request_id)
+                .and_then(|request| request.answer)
+        } else {
+            request.answer.take()
+        }
     };
     if let Some(answer) = answer {
         let _delivered = answer.send(decision);
@@ -1097,28 +1114,36 @@ fn take_named_requests(
     // cancellation scoped to what this stream actually showed.
     let mut permissions = Vec::new();
     for id in &ids.permissions {
-        let cancellable = pending
+        let Some(request) = pending
             .permissions
-            .get(id)
-            .is_some_and(|request| request.request.session_id == session_id && !request.claimed());
-        if cancellable
-            && let Some(request) = pending.permissions.remove(id)
-            && let Some(answer) = request.answer
-        {
+            .get_mut(id)
+            .filter(|request| request.request.session_id == session_id && !request.claimed())
+        else {
+            continue;
+        };
+        let ready = request.persisted;
+        if let Some(answer) = request.answer.take() {
             permissions.push(answer);
+        }
+        if ready {
+            pending.permissions.remove(id);
         }
     }
     let mut questions = Vec::new();
     for id in &ids.questions {
-        let cancellable = pending
+        let Some(request) = pending
             .questions
-            .get(id)
-            .is_some_and(|request| request.request.session_id == session_id && !request.claimed());
-        if cancellable
-            && let Some(request) = pending.questions.remove(id)
-            && let Some(answer) = request.answer
-        {
+            .get_mut(id)
+            .filter(|request| request.request.session_id == session_id && !request.claimed())
+        else {
+            continue;
+        };
+        let ready = request.persisted;
+        if let Some(answer) = request.answer.take() {
             questions.push(answer);
+        }
+        if ready {
+            pending.questions.remove(id);
         }
     }
     (permissions, questions)
@@ -1622,7 +1647,7 @@ fn permission_from_durable(request: &HumanRequest) -> Option<PermissionRequest> 
     })
 }
 
-/// Makes a registered question answerable, now that the row it settles exists.
+/// Makes a question answerable after its row and asked event have committed.
 fn mark_question_persisted(pending: &Mutex<Pending>, request_id: &str) {
     if let Some(request) = pending
         .lock()
@@ -1634,7 +1659,7 @@ fn mark_question_persisted(pending: &Mutex<Pending>, request_id: &str) {
     }
 }
 
-/// Makes a registered ask answerable, now that the row it settles exists.
+/// Makes a permission answerable after its row and asked event have committed.
 fn mark_permission_persisted(pending: &Mutex<Pending>, request_id: &str) {
     if let Some(request) = pending
         .lock()
@@ -2031,6 +2056,21 @@ mod tests {
             assert!(
                 std::time::Instant::now() < ceiling,
                 "`{request_id}` never reached the human"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    async fn wait_for_durable_request(pool: &Arc<zuno_db::Pool>, request_id: &str) {
+        let store = HumanRequestStore::new(Arc::clone(pool));
+        let ceiling = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if store.get(request_id).is_ok_and(|row| row.is_some()) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < ceiling,
+                "`{request_id}` never committed its request row"
             );
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
@@ -2439,15 +2479,10 @@ mod tests {
         // `cargo test` alone would not.
         //
         // The clock jumps by a full deadline on *every* turn of the wait, not once up
-        // front. The ask becomes visible when the blocking pool marks its row persisted,
-        // but the watchdog that owns the deadline is spawned only after the asker resumes
-        // from that write, and it arms its timer on its own first poll. A single jump
-        // taken as soon as the ask shows up can therefore land before the timer exists;
-        // a timer armed after the jump sits a whole deadline ahead of a clock this spin
-        // never lets auto-advance, and nothing releases the asker until the ceiling fires
-        // (about 1 run in 20 on Linux, more often under Windows scheduling). Jumping on
-        // every turn reaches a timer armed at any point, and `advance` yields, so each
-        // turn also lets the watchdog, the asker, and the settle write make progress.
+        // front. Registration publishes the ask and spawns its watchdog, but the
+        // watchdog arms its timer on its own first poll. Jumping on every turn
+        // reaches a timer armed at any point, and `advance` yields, so each turn
+        // also lets the watchdog, the asker, and the settle write make progress.
         let ceiling = std::time::Instant::now() + Duration::from_secs(60);
         let mut answer = std::pin::pin!(answer);
         let outcome = loop {
@@ -2475,7 +2510,7 @@ mod tests {
     #[tokio::test]
     async fn a_standing_grant_records_the_call_it_authorizes() {
         let (_spill, pool, _goals, broker) = durable_broker();
-        let mut saved = tokio::spawn({
+        let mut asking = Box::pin({
             let broker = broker.clone();
             async move {
                 broker
@@ -2483,7 +2518,25 @@ mod tests {
                     .await
             }
         });
+        // Stop the asker at the blocking row write. Its task has not resumed to
+        // publish `permission.v2.asked`, even after the durable row becomes visible.
+        // A client must not claim it here and race the event store's first use, or
+        // put `permission.v2.replied` before the ask in durable history.
+        assert!(futures::poll!(&mut asking).is_pending());
+        wait_for_durable_request(&pool, "per_saved").await;
+        assert!(
+            broker.permissions(None).is_empty(),
+            "a row without its committed asked event is not an answerable prompt"
+        );
+        assert!(
+            broker.claim_permission("ses_http", "per_saved").is_none(),
+            "the unannounced live row must not fall through to a recovered claim"
+        );
+        let mut saved = tokio::spawn(asking);
+        let ceiling = std::time::Instant::now() + Duration::from_secs(5);
         while broker.permissions(None).is_empty() {
+            assert!(!saved.is_finished(), "registration must reach the human");
+            assert!(std::time::Instant::now() < ceiling, "ask stays hidden");
             tokio::task::yield_now().await;
         }
         broker
@@ -2517,6 +2570,165 @@ mod tests {
                 .and_then(|response| response.get("source")),
             Some(&json!("standing")),
             "the history has to show that no human answered this ask"
+        );
+        let history = broker
+            .events
+            .as_ref()
+            .expect("event service")
+            .replay("ses_http", None)
+            .await
+            .expect("replay the permission decisions");
+        assert_eq!(
+            history
+                .iter()
+                .map(|event| event.event_type())
+                .collect::<Vec<_>>(),
+            ["permission.v2.asked", "permission.v2.replied"],
+            "a reply follows its committed ask, and a standing grant invents no human reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_registration_is_not_recovered_before_its_row_settles() {
+        let (_spill, pool, _goals, broker) = durable_broker();
+        let mut asking = Box::pin({
+            let broker = broker.clone();
+            async move {
+                broker
+                    .ask_permission(ask("per_failed_registration", Vec::new()))
+                    .await
+            }
+        });
+        assert!(futures::poll!(&mut asking).is_pending());
+        wait_for_durable_request(&pool, "per_failed_registration").await;
+
+        // Publication failure ends the live ask before its asynchronous cleanup
+        // writes Failed. Keep this interleaving open until both projections run.
+        broker.finish_permission(
+            "ses_http",
+            "per_failed_registration",
+            PermissionOutcome::Failed,
+        );
+        assert!(
+            broker.permissions(None).is_empty(),
+            "a failed live ask must not reappear as a recovered pending request"
+        );
+        assert!(
+            broker
+                .claim_permission("ses_http", "per_failed_registration")
+                .is_none(),
+            "cleanup still owns the uncommitted terminal transition"
+        );
+        assert_eq!(asking.await, ReplyKind::Reject);
+        let row = HumanRequestStore::new(Arc::clone(&pool))
+            .get("per_failed_registration")
+            .expect("read the failed request")
+            .expect("request row");
+        assert_eq!(row.state, HumanRequestState::Failed);
+        assert_eq!(row.response, None, "failure is not a human decision");
+        assert_eq!(inbox_admissions(&pool, "per_failed_registration"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_question_is_not_recovered_before_its_row_settles() {
+        let (_spill, pool, _goals, broker) = durable_broker();
+        let mut asking = Box::pin({
+            let broker = broker.clone();
+            async move {
+                broker
+                    .ask_question(QuestionRequest {
+                        id: "que_cancelled_registration".to_owned(),
+                        session_id: "ses_http".to_owned(),
+                        questions: vec![json!({"question": "Which environment?"})],
+                        tool: None,
+                    })
+                    .await
+            }
+        });
+        assert!(futures::poll!(&mut asking).is_pending());
+        wait_for_durable_request(&pool, "que_cancelled_registration").await;
+        broker.finish_question(
+            "ses_http",
+            "que_cancelled_registration",
+            QuestionDecision::Cancelled,
+        );
+        assert!(
+            broker.questions(None).is_empty(),
+            "a cancelled live question must not reappear as a recovered request"
+        );
+        assert!(
+            broker
+                .claim_question("ses_http", "que_cancelled_registration")
+                .is_none()
+        );
+        assert_eq!(asking.await, QuestionDecision::Cancelled);
+        let row = HumanRequestStore::new(Arc::clone(&pool))
+            .get("que_cancelled_registration")
+            .expect("read the cancelled question")
+            .expect("question row");
+        assert_eq!(row.state, HumanRequestState::Cancelled);
+        assert_eq!(row.response, None);
+        assert_eq!(inbox_admissions(&pool, "que_cancelled_registration"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_question_is_not_answerable_until_its_asked_event_commits() {
+        let (_spill, pool, _goals, broker) = durable_broker();
+        let mut asking = Box::pin({
+            let broker = broker.clone();
+            async move {
+                broker
+                    .ask_question(QuestionRequest {
+                        id: "que_unannounced".to_owned(),
+                        session_id: "ses_http".to_owned(),
+                        questions: vec![json!({"question": "Which environment?"})],
+                        tool: None,
+                    })
+                    .await
+            }
+        });
+        assert!(futures::poll!(&mut asking).is_pending());
+        wait_for_durable_request(&pool, "que_unannounced").await;
+        assert!(
+            broker.questions(None).is_empty(),
+            "the pending row must stay hidden until question.v2.asked commits"
+        );
+        assert!(
+            broker
+                .claim_question("ses_http", "que_unannounced")
+                .is_none()
+        );
+        let asking = tokio::spawn(asking);
+        let ceiling = std::time::Instant::now() + Duration::from_secs(5);
+        let resolution = loop {
+            if let Some(resolution) = broker.claim_question("ses_http", "que_unannounced") {
+                break resolution;
+            }
+            assert!(std::time::Instant::now() < ceiling, "question stays hidden");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        };
+        let answers = vec![vec!["staging".to_owned()]];
+        resolution
+            .settle(QuestionDecision::Answered(answers.clone()))
+            .await
+            .expect("the announced question settles");
+        assert_eq!(
+            asking.await.expect("question asker"),
+            QuestionDecision::Answered(answers)
+        );
+        let history = broker
+            .events
+            .as_ref()
+            .expect("event service")
+            .replay("ses_http", None)
+            .await
+            .expect("replay the question");
+        assert_eq!(
+            history
+                .iter()
+                .map(|event| event.event_type())
+                .collect::<Vec<_>>(),
+            ["question.v2.asked", "question.v2.replied"]
         );
     }
 

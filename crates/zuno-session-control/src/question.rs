@@ -12,7 +12,7 @@ use zuno_db::inbox::{SessionInbox, read_in};
 use zuno_db::question::{self, QuestionStore};
 use zuno_engine::admission::{SessionInputAdmission, SteeringContent, TurnLease};
 use zuno_engine::status::SessionRunRegistry;
-use zuno_goal::{GoalError, GoalStore};
+use zuno_goal::{GoalError, GoalStatus, GoalStore};
 use zuno_review::ReviewStore;
 use zuno_tool::InterruptHandle;
 use zuno_tool::question::{QuestionError, QuestionPort, QuestionResult};
@@ -20,10 +20,11 @@ use zuno_tools::WorkStateStore;
 use zuno_types::execution::{
     CollaborationMode, SessionPauseReason, SessionReadiness, SessionWaitReference,
 };
+use zuno_types::goal_resume::{GoalResumeRequest, KEEP_GOAL_PAUSED_CHOICE, RESUME_GOAL_CHOICE};
 use zuno_types::question::{
     PlanAuthorizationState, PlanQuestionBinding, PlanQuestionDecision, QuestionAction,
-    QuestionCommand, QuestionMode, QuestionOption, QuestionPurpose, QuestionReceipt,
-    QuestionRequest, QuestionSpec, QuestionState, QuestionView,
+    QuestionCommand, QuestionMode, QuestionOption, QuestionOrigin, QuestionPurpose,
+    QuestionReceipt, QuestionRequest, QuestionSpec, QuestionState, QuestionView,
 };
 
 use crate::{SessionControlError, SessionControlService};
@@ -60,6 +61,91 @@ impl QuestionService {
 
     pub fn subscribe(&self) -> broadcast::Receiver<QuestionReceipt> {
         self.changes.subscribe()
+    }
+
+    /// Offer consent without changing Goal, execution, or input state.
+    ///
+    /// Like Codex's paused-Goal menu this is a host-owned choice, not an
+    /// inference from the user's next text. Zuno additionally freezes the Goal
+    /// revision and original durable input because replies may arrive later.
+    pub async fn offer_goal_resume(
+        &self,
+        session_id: &str,
+        input_id: Option<&str>,
+    ) -> QuestionResult<Option<QuestionReceipt>> {
+        let pool = Arc::clone(&self.pool);
+        let session_id = session_id.to_owned();
+        let input_id = input_id.map(str::to_owned);
+        let receipt = blocking(move || {
+            pool.try_transaction(|tx| {
+                let Some(goal) = GoalStore::goal_in(tx, &session_id)
+                    .map_err(goal_error)?
+                    .filter(|goal| matches!(goal.status, GoalStatus::Paused | GoalStatus::Blocked))
+                else {
+                    return Ok(None);
+                };
+                let binding = GoalResumeRequest {
+                    session_id: session_id.clone(),
+                    goal_id: goal.goal_id.clone(),
+                    expected_revision: goal.revision,
+                    input_id: input_id.clone(),
+                };
+                match SessionControlService::validate_goal_resume_in(tx, &binding) {
+                    Ok(_) => {}
+                    Err(SessionControlError::ResumeRejected { .. }) => return Ok(None),
+                    Err(error) => return Err(control_error(error)),
+                }
+                if let Some(previous) = previous_goal_resume_in(tx, &binding)? {
+                    return Ok((!previous.state.is_terminal()).then_some(QuestionReceipt {
+                        question: previous,
+                        input_id: None,
+                        duplicate: true,
+                    }));
+                }
+                let spec = QuestionSpec {
+                    origin: QuestionOrigin {
+                        session_id: session_id.clone(),
+                        message_id: input_id.clone(),
+                        call_id: None,
+                        turn_id: None,
+                        goal_id: Some(goal.goal_id),
+                    },
+                    mode: QuestionMode::Deferred,
+                    purpose: QuestionPurpose::GoalResume,
+                    questions: vec![QuestionRequest::closed(
+                        format!(
+                            "Resume paused Goal \"{}\"? Skipping keeps it paused.",
+                            goal.objective
+                        ),
+                        "Resume Goal",
+                        vec![
+                            QuestionOption::new(
+                                RESUME_GOAL_CHOICE,
+                                "Resume this Goal when its execution gates allow",
+                            ),
+                            QuestionOption::new(
+                                KEEP_GOAL_PAUSED_CHOICE,
+                                "Keep it paused; /goal resume remains available",
+                            ),
+                        ],
+                    )],
+                    expected_goal_revision: Some(goal.revision),
+                    plan: None,
+                };
+                question::create_in(
+                    tx,
+                    &format!("que_{}", Uuid::now_v7().simple()),
+                    &spec,
+                    zuno_db::message::now_millis(),
+                )
+                .map(Some)
+            })
+        })
+        .await?;
+        if let Some(receipt) = &receipt {
+            self.after_commit(receipt.clone());
+        }
+        Ok(receipt)
     }
 
     /// The host calls this only after the source Plan turn completed normally.
@@ -272,6 +358,23 @@ impl QuestionPort for QuestionService {
                     }
                 }
                 spec.validate()?;
+                if spec.purpose == QuestionPurpose::GoalResume {
+                    let binding = GoalResumeRequest {
+                        session_id: spec.origin.session_id.clone(),
+                        goal_id: spec.origin.goal_id.clone().expect("validated Goal"),
+                        expected_revision: spec.expected_goal_revision.expect("validated revision"),
+                        input_id: spec.origin.message_id.clone(),
+                    };
+                    SessionControlService::validate_goal_resume_in(tx, &binding)
+                        .map_err(control_error)?;
+                    if let Some(question) = previous_goal_resume_in(tx, &binding)? {
+                        return Ok(QuestionReceipt {
+                            question,
+                            input_id: None,
+                            duplicate: true,
+                        });
+                    }
+                }
                 let now = zuno_db::message::now_millis();
                 let receipt = question::create_in(
                     tx,
@@ -323,6 +426,20 @@ impl QuestionPort for QuestionService {
                 if let Some(receipt) = question::receipt_in(tx, &request_id, &command)? {
                     return Ok(receipt);
                 }
+                let goal_resume = if current.purpose == QuestionPurpose::GoalResume
+                    && let QuestionAction::Answer { answers } = &command.action
+                    && answers
+                        .values()
+                        .any(|values| values.iter().any(|value| value == RESUME_GOAL_CHOICE))
+                {
+                    current.validate_answers(answers)?;
+                    let binding = question::goal_resume_request_in(tx, &session_id, &request_id)?;
+                    SessionControlService::validate_goal_resume_in(tx, &binding)
+                        .map_err(control_error)?;
+                    Some(binding)
+                } else {
+                    None
+                };
                 if let QuestionAction::PlanDecision {
                     decision: PlanQuestionDecision::Approve,
                     risk_reason,
@@ -347,6 +464,12 @@ impl QuestionPort for QuestionService {
                 }
                 let now = zuno_db::message::now_millis();
                 let mut receipt = question::apply_in(tx, &session_id, &request_id, &command, now)?;
+                if let Some(binding) = goal_resume {
+                    let resumed = SessionControlService::resume_goal_in(tx, &binding, now)
+                        .map_err(control_error)?;
+                    receipt.input_id = resumed.input.map(|input| input.id);
+                    question::record_receipt_in(tx, &command.command_id, &receipt)?;
+                }
                 if !matches!(command.action, QuestionAction::Defer { .. }) {
                     if receipt.question.purpose == QuestionPurpose::RequiredInput {
                         GoalStore::settle_question_pause_in(tx, &session_id, &request_id, now)
@@ -485,7 +608,10 @@ fn supersede_plan_question_in(tx: &Transaction<'_>, question: &QuestionView) -> 
 }
 
 fn settle_wait_in(tx: &Transaction<'_>, question: &QuestionView, now: i64) -> QuestionResult<()> {
-    if question.purpose == QuestionPurpose::Clarification {
+    if matches!(
+        question.purpose,
+        QuestionPurpose::Clarification | QuestionPurpose::GoalResume
+    ) {
         return Ok(());
     }
     let session_id = &question.origin.session_id;
@@ -516,6 +642,36 @@ fn settle_wait_in(tx: &Transaction<'_>, question: &QuestionView, now: i64) -> Qu
         )?;
     }
     Ok(())
+}
+
+fn previous_goal_resume_in(
+    tx: &Transaction<'_>,
+    binding: &GoalResumeRequest,
+) -> QuestionResult<Option<QuestionView>> {
+    use rusqlite::OptionalExtension;
+    loop {
+        let id: Option<String> = tx.query_row(
+            "SELECT q.request_id FROM question_interaction q JOIN human_request h ON h.id=q.request_id \
+             WHERE h.session_id=?1 AND q.purpose='goal_resume' \
+             AND json_extract(q.definition,'$.goalResume.goalId')=?2 \
+             AND json_extract(q.definition,'$.goalResume.expectedRevision')=?3 \
+             AND COALESCE(json_extract(h.response,'$.resumeSuperseded'),0)=0 \
+             ORDER BY h.time_created,h.id LIMIT 1",
+            rusqlite::params![binding.session_id, binding.goal_id, binding.expected_revision],
+            |row| row.get(0),
+        ).optional().map_err(zuno_db::map_error)?;
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        if !question::supersede_unusable_goal_resume_in(
+            tx,
+            &binding.session_id,
+            &id,
+            zuno_db::message::now_millis(),
+        )? {
+            return question::get_in(tx, &binding.session_id, &id).map(Some);
+        }
+    }
 }
 
 fn prepare_plan_spec(tx: &Transaction<'_>, spec: &mut QuestionSpec) -> QuestionResult<()> {

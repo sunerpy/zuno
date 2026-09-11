@@ -140,11 +140,9 @@ impl ExperienceStore {
 
     /// Persist an extractor response and settle its job in one atomic commit.
     ///
-    /// This is [`Self::record_extraction`] followed by [`Self::finish_extraction`]
-    /// inside one transaction. A caller that must propose Memory from the recorded
-    /// experiences before the job may count as done uses the two steps directly,
-    /// so a failed proposal leaves a still-running job rather than a completed
-    /// job with no candidates.
+    /// Source/forget and lease authority are checked inside the writer transaction;
+    /// a source that changes before commit rolls back rows, events, and settlement.
+    /// Resident Memory consolidation consumes the completed extraction separately.
     pub fn complete_extraction(
         &self,
         job_id: &str,
@@ -158,18 +156,17 @@ impl ExperienceStore {
         self.pool.transaction(|transaction| {
             let stored = record_extraction_in(transaction, job_id, lease, experiences, now)?;
             finish_extraction_in(transaction, job_id, lease, &result, now)?;
+            require_current_extraction_sources(transaction, job_id)?;
             Ok(stored)
         })
     }
 
     /// Store extracted experiences for a running job without settling the job.
     ///
-    /// The job stays `running` under the caller's lease. Work that must follow —
-    /// proposing Memory from the recorded experiences — can therefore fail or
-    /// lose its process without ever producing a completed job that has no
-    /// candidates: the lease reconciler requeues the job instead. Repeating the
-    /// call for the same job and ordinals is idempotent and logs no second
-    /// `learning.experience.recorded` event.
+    /// The job stays `running` under the caller's lease and cannot yet support
+    /// resident Memory. Prefer [`Self::complete_extraction`] for phase-one delivery.
+    /// This staged write also revalidates its source before committing. Repeating
+    /// the same job and ordinals logs no second `learning.experience.recorded` event.
     ///
     /// # Errors
     ///
@@ -185,11 +182,13 @@ impl ExperienceStore {
     ) -> Result<Vec<ExperienceRecord>, DbError> {
         validate_batch(experiences)?;
         self.pool.transaction(|transaction| {
-            record_extraction_in(transaction, job_id, lease, experiences, now)
+            let stored = record_extraction_in(transaction, job_id, lease, experiences, now)?;
+            require_current_extraction_sources(transaction, job_id)?;
+            Ok(stored)
         })
     }
 
-    /// Settle a running extraction job whose experiences and Memory proposals are recorded.
+    /// Settle a running extraction job whose experiences are recorded.
     ///
     /// Fails without mutation when the job is not `running` under `owner_id`, so a
     /// worker whose lease was reconciled away cannot complete it. The
@@ -209,7 +208,8 @@ impl ExperienceStore {
     ) -> Result<(), DbError> {
         let result = serde_json::to_string(result).map_err(query_error)?;
         self.pool.transaction(|transaction| {
-            finish_extraction_in(transaction, job_id, lease, &result, now)
+            finish_extraction_in(transaction, job_id, lease, &result, now)?;
+            require_current_extraction_sources(transaction, job_id)
         })
     }
 
@@ -589,14 +589,30 @@ fn validate_new(experience: &NewExperience) -> Result<(), DbError> {
     Ok(())
 }
 
-/// The session and source message of a job that is `running` under `owner_id`.
+/// Source authority must be read through the same transaction that writes the
+/// extraction. Preflight validation outside this transaction is not a commit fence.
+fn require_current_extraction_sources(
+    transaction: &rusqlite::Transaction<'_>,
+    job_id: &str,
+) -> Result<(), DbError> {
+    if !crate::learning_job::extraction_sources_current_on(transaction, job_id)? {
+        return Err(DbError::Conflict {
+            table: "learning_job".to_owned(),
+            id: job_id.to_owned(),
+            detail: "extraction source changed or was forgotten before commit".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// The still-current session and source of a job running under this attempt's lease.
 fn running_extraction_job(
     transaction: &rusqlite::Transaction<'_>,
     job_id: &str,
     lease: &LearningLease,
     now: i64,
 ) -> Result<(String, String), DbError> {
-    transaction
+    let source = transaction
         .query_row(
             "SELECT session_id, source_message_id FROM learning_job
              WHERE id = ?1 AND owner_id = ?2 AND status = 'running'
@@ -614,7 +630,9 @@ fn running_extraction_job(
             query_error(std::io::Error::other(format!(
                 "extraction job `{job_id}` no longer permits this attempt"
             )))
-        })
+        })?;
+    require_current_extraction_sources(transaction, job_id)?;
+    Ok(source)
 }
 
 fn record_extraction_in(

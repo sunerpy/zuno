@@ -14,6 +14,7 @@ use tokio::sync::{broadcast, mpsc};
 use zuno_db::Pool;
 use zuno_engine::r#loop::TurnEvent;
 use zuno_llm::event::{ConnectionPhase, StreamEvent as ProviderEvent};
+use zuno_types::context_usage::ContextUsageSnapshot;
 
 use crate::{Delivery, EventFanout, EventSubscription};
 use store::{Page, Snapshot, Store};
@@ -149,6 +150,22 @@ impl EventService {
         Ok(stored)
     }
 
+    /// Publish a host-supplied context snapshot without re-running usage tracking.
+    ///
+    /// The engine owns canonical state persistence. This appends the corresponding
+    /// HTTP projection before live delivery and preserves request/attempt identity.
+    pub async fn publish_context_usage(
+        &self,
+        snapshot: ContextUsageSnapshot,
+    ) -> Result<StreamEvent, EventStreamError> {
+        let store = Arc::clone(&self.store);
+        let stored = tokio::task::spawn_blocking(move || store.append_context_usage(snapshot))
+            .await
+            .map_err(|source| EventStreamError::Worker { source })??;
+        self.announce(&stored);
+        Ok(stored)
+    }
+
     /// Commits one event in the same transaction as the state that event asserts,
     /// then offers it to live subscribers.
     ///
@@ -245,6 +262,18 @@ impl EventService {
         local: &EventFanout<TurnEvent>,
         event: TurnEvent,
     ) {
+        if let TurnEvent::ContextUsageUpdated { snapshot } = &event {
+            if snapshot.session_id != session_id {
+                return;
+            }
+            match self.publish_context_usage(snapshot.as_ref().clone()).await {
+                Ok(_) => local.publish(event),
+                Err(error) => {
+                    eprintln!("failed to publish HTTP context event for `{session_id}`: {error}")
+                }
+            }
+            return;
+        }
         if matches!(
             event,
             TurnEvent::Notice {
@@ -279,16 +308,20 @@ impl EventService {
         let live = self.subscribe_live(&session_id);
         let store = Arc::clone(&self.store);
         let snapshot_session = session_id.clone();
-        let Snapshot { events, boundary } =
-            tokio::task::spawn_blocking(move || store.snapshot(&snapshot_session, after))
-                .await
-                .map_err(|source| EventStreamError::Worker { source })??;
+        let Snapshot {
+            events,
+            boundary,
+            context_usage,
+        } = tokio::task::spawn_blocking(move || store.snapshot(&snapshot_session, after))
+            .await
+            .map_err(|source| EventStreamError::Worker { source })??;
         Ok(SessionSubscription {
             session_id,
             events,
             boundary,
             live,
             cursor: cursor.cloned(),
+            context_usage,
         })
     }
 
@@ -330,6 +363,10 @@ impl EventService {
 
 fn turn_event(event: &TurnEvent) -> NewEvent {
     let (event_type, properties) = match event {
+        TurnEvent::ContextUsageUpdated { snapshot } => (
+            "session.context.usage",
+            object(json!({"snapshot": snapshot})),
+        ),
         TurnEvent::SessionMaterialized { session_id, title } => (
             "session.materialized",
             object(json!({"sessionID": session_id, "title": title})),
@@ -810,6 +847,7 @@ struct SessionSubscription {
     boundary: i64,
     live: LiveSessionSubscription,
     cursor: Option<EventCursor>,
+    context_usage: Option<ContextUsageSnapshot>,
 }
 
 /// One session's live subscription plus the fan-out bookkeeping it owes on exit.

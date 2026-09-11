@@ -22,7 +22,7 @@ fn fixture() -> (TempDir, Arc<Pool>, ExperienceService, Vec<LearningSource>) {
             VALUES ('session', 'project', 'session', '/workspace', 'source test', 'test', 1, 1);
             INSERT INTO message (id, session_id, time_created, time_updated, data)
             VALUES ('user', 'session', 1, 1, '{"role":"user"}'),
-                   ('assistant', 'session', 2, 2, '{"role":"assistant"}');
+                   ('assistant', 'session', 2, 2, '{"role":"assistant","finish":"stop","time":{"completed":2}}');
             INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
             VALUES ('user-part', 'user', 'session', 1, 1,
                     '{"type":"text","text":"Verify this change before publishing."}'),
@@ -206,6 +206,19 @@ fn revoked_lease_between_extraction_and_promotion_cannot_commit_memory() {
         )
         .expect("applied candidates");
     assert_eq!(applied, 0);
+    let experiences = pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM experience_record WHERE extraction_job_id='job'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(
+        experiences, 0,
+        "a lost completion fence must roll back the whole extraction"
+    );
 }
 
 #[test]
@@ -333,27 +346,21 @@ fn a_retry_cannot_borrow_the_previous_attempts_verified_evidence_for_new_memory(
         if changed_summary {
             retried.experiences[0].summary = "A changed interpretation.".to_owned();
         }
-        let error = experiences
+        let retried = experiences
             .persist_extraction("job", &lease, retried, 21)
-            .expect_err("changed retry is refused");
-        match error {
-            zuno_learning::LearningServiceError::Database(zuno_error::DbError::Query {
-                source,
-            }) => {
-                assert!(
-                    source
-                        .to_string()
-                        .contains("an extraction retry produced different"),
-                    "{source}"
-                );
-            }
-            other => panic!("unexpected retry failure: {other:?}"),
-        }
+            .expect("the failed atomic attempt left no effects to reuse");
+        assert!(!retried.experiences[0].verified_sources());
         let records = experiences
             .list_for_project("project", 10)
             .expect("durable observations");
         assert_eq!(records.len(), 1);
-        assert!(records[0].verified_sources());
+        assert!(!records[0].verified_sources());
+        assert!(
+            zuno_db::memory_evidence::MemoryEvidenceStore::new(pool.clone())
+                .get(&records[0].projection.id)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             pool.get()
                 .expect("connection")

@@ -18,6 +18,7 @@
 //! | `format-10.sql`| 10     | v0.10.23| versioned memory, provenance, leases and search     |
 //! | `format-11.sql`| 11     | v0.10.28| automatic memory provenance and maintenance        |
 //! | `format-12.sql`| 12     | v0.10.29| question metadata and command receipt ledger       |
+//! | `format-13.sql`| 13     | v0.10.30| input receipts, context usage, goal-resume purpose |
 //!
 //! Every fixture is upgraded through the real entry point, [`migration::apply`],
 //! and the result is compared *structurally* with a database `apply` creates from
@@ -35,6 +36,12 @@
 //! SQLite's own statement trace that the marker update never executed and that the
 //! marker, the rows, and the whole object inventory are exactly what the fixture
 //! loaded.
+//!
+//! Design reference: Codex eaa8b6d917,
+//! `codex-rs/state/src/migrations_tests.rs::thread_attachment_migration_preserves_existing_data`.
+//! Zuno adapts the seeded-old-data comparison to frozen released fixtures and
+//! marker-last rollback. Codex's `runtime_migrator` future-version tolerance is
+//! deliberately not adopted: Zuno rejects future and unmarked formats.
 
 use rusqlite::OptionalExtension as _;
 use rusqlite::trace::{TraceEvent, TraceEventCodes};
@@ -122,7 +129,7 @@ const FORMAT_TEN: Fixture = Fixture {
 };
 
 /// Every table `sqlite_master` lists once the current schema is in place.
-const CURRENT_TABLE_COUNT: usize = 59;
+const CURRENT_TABLE_COUNT: usize = 61;
 
 const FORMAT_ELEVEN: Fixture = Fixture {
     format: 11,
@@ -151,6 +158,21 @@ const FORMAT_TWELVE: Fixture = Fixture {
     table_count: 57,
 };
 
+const FORMAT_THIRTEEN: Fixture = Fixture {
+    format: 13,
+    release: "v0.10.30",
+    sql: concat!(
+        include_str!("fixtures/format-7.sql"),
+        include_str!("fixtures/format-8.sql"),
+        include_str!("fixtures/format-9.sql"),
+        include_str!("fixtures/format-10.sql"),
+        include_str!("fixtures/format-11.sql"),
+        include_str!("fixtures/format-12.sql"),
+        include_str!("fixtures/format-13.sql")
+    ),
+    table_count: 59,
+};
+
 const SUPPORTED_FIXTURES: &[&Fixture] = &[
     &FORMAT_FIVE,
     &FORMAT_SIX,
@@ -160,6 +182,7 @@ const SUPPORTED_FIXTURES: &[&Fixture] = &[
     &FORMAT_TEN,
     &FORMAT_ELEVEN,
     &FORMAT_TWELVE,
+    &FORMAT_THIRTEEN,
 ];
 
 /// One additive upgrade step, described by what it must leave behind and by the
@@ -297,8 +320,8 @@ const MEMORY_RUNTIME: Step = Step {
 /// transaction. SQLite rejects the duplicate while *preparing* the statement, so
 /// it never reaches `SQLITE_TRACE_STMT`; the statement immediately before it is
 /// therefore the last one the trace can show before the rollback.
-const TRAP_INDEX: &str = "question_interaction_purpose_authorization_idx";
-const STATEMENT_BEFORE_TRAP: &str = "CREATE TABLE question_action_receipt";
+const TRAP_INDEX: &str = "session_context_usage_updated_idx";
+const STATEMENT_BEFORE_TRAP: &str = "CREATE TABLE `session_context_usage`";
 
 const AUTOMATIC_MEMORY: Step = Step {
     name: "automatic memory (format 11 -> 12)",
@@ -315,10 +338,21 @@ const AUTOMATIC_MEMORY: Step = Step {
 };
 
 const QUESTIONS: Step = Step {
-    name: "question companions (format 12 -> 13)",
+    name: "question companions and scheduling (format 12 -> 13)",
     first_statement: "CREATE TABLE question_interaction",
     tables: &["question_interaction", "question_action_receipt"],
     indexes: &["question_interaction_purpose_authorization_idx"],
+    columns: &[("session_execution_state", "scheduling")],
+};
+
+const RUNTIME_CONSISTENCY: Step = Step {
+    name: "input receipts, context usage, and goal-resume purpose (format 13 -> 14)",
+    first_statement: "CREATE TABLE question_interaction_v14",
+    tables: &["session_input_receipt", "session_context_usage"],
+    indexes: &[
+        "session_input_receipt_turn_state_idx",
+        "session_context_usage_updated_idx",
+    ],
     columns: &[],
 };
 
@@ -333,6 +367,7 @@ fn steps_after(format: u32) -> &'static [&'static Step] {
             &MEMORY_RUNTIME,
             &AUTOMATIC_MEMORY,
             &QUESTIONS,
+            &RUNTIME_CONSISTENCY,
         ],
         6 => &[
             &PLAN_STACK,
@@ -342,6 +377,7 @@ fn steps_after(format: u32) -> &'static [&'static Step] {
             &MEMORY_RUNTIME,
             &AUTOMATIC_MEMORY,
             &QUESTIONS,
+            &RUNTIME_CONSISTENCY,
         ],
         7 => &[
             &VERIFICATION,
@@ -350,6 +386,7 @@ fn steps_after(format: u32) -> &'static [&'static Step] {
             &MEMORY_RUNTIME,
             &AUTOMATIC_MEMORY,
             &QUESTIONS,
+            &RUNTIME_CONSISTENCY,
         ],
         8 => &[
             &MEMORY_POLICY,
@@ -357,13 +394,74 @@ fn steps_after(format: u32) -> &'static [&'static Step] {
             &MEMORY_RUNTIME,
             &AUTOMATIC_MEMORY,
             &QUESTIONS,
+            &RUNTIME_CONSISTENCY,
         ],
-        9 => &[&EXECUTION, &MEMORY_RUNTIME, &AUTOMATIC_MEMORY, &QUESTIONS],
-        10 => &[&MEMORY_RUNTIME, &AUTOMATIC_MEMORY, &QUESTIONS],
-        11 => &[&AUTOMATIC_MEMORY, &QUESTIONS],
-        12 => &[&QUESTIONS],
+        9 => &[
+            &EXECUTION,
+            &MEMORY_RUNTIME,
+            &AUTOMATIC_MEMORY,
+            &QUESTIONS,
+            &RUNTIME_CONSISTENCY,
+        ],
+        10 => &[
+            &MEMORY_RUNTIME,
+            &AUTOMATIC_MEMORY,
+            &QUESTIONS,
+            &RUNTIME_CONSISTENCY,
+        ],
+        11 => &[&AUTOMATIC_MEMORY, &QUESTIONS, &RUNTIME_CONSISTENCY],
+        12 => &[&QUESTIONS, &RUNTIME_CONSISTENCY],
+        13 => &[&RUNTIME_CONSISTENCY],
         other => panic!("no fixture describes format {other}"),
     }
+}
+
+#[test]
+fn published_fixture_matrix_covers_every_supported_format_five_through_thirteen() {
+    assert_eq!(migration::CURRENT_FORMAT, 14);
+    assert_eq!(
+        SUPPORTED_FIXTURES
+            .iter()
+            .map(|fixture| fixture.format)
+            .collect::<Vec<_>>(),
+        (5..=13).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn format_thirteen_fixture_is_the_v0_10_30_database_with_frozen_ddl() {
+    assert_fixture_is_the_old_format(&FORMAT_THIRTEEN);
+    let fixture = include_str!("fixtures/format-13.sql");
+    for (section, digest) in [
+        (
+            "questions.sql",
+            "c15bc8e71e662618646653915b15aa46dda371c5e3c4f5b435835a83d25353c4",
+        ),
+        (
+            "scheduling.sql",
+            "2e0541aac322b475128873def272500a298b1b4c24c2b56af8556ad486e61808",
+        ),
+    ] {
+        let start = format!("-- BEGIN v0.10.30 {section}\n");
+        let end = format!("-- END v0.10.30 {section}\n");
+        let (_, published) = fixture.split_once(&start).expect("frozen DDL start");
+        let (published, _) = published.split_once(&end).expect("frozen DDL end");
+        assert_eq!(
+            hex::encode(Sha256::digest(published.as_bytes())),
+            digest,
+            "{section} must retain the exact v0.10.30 bytes"
+        );
+    }
+}
+
+#[test]
+fn format_thirteen_upgrade_preserves_every_row_and_reaches_the_current_structure() {
+    assert_upgrade_preserves_rows_and_reaches_the_current_structure(&FORMAT_THIRTEEN);
+}
+
+#[test]
+fn format_thirteen_failed_upgrade_preserves_the_original_database() {
+    assert_failed_upgrade_leaves_the_database_untouched(&FORMAT_THIRTEEN);
 }
 
 #[test]
@@ -900,9 +998,47 @@ fn load_fixture(path: &Path, fixture: &Fixture) -> Connection {
     connection
         .execute_batch(fixture.sql)
         .unwrap_or_else(|error| panic!("load the {} fixture: {error}", fixture.release));
-    connection
-        .execute_batch(include_str!("fixtures/legacy-human-requests.sql"))
-        .expect("seed released human-request payloads and responses");
+    if fixture.format < 13 {
+        connection
+            .execute_batch(include_str!("fixtures/legacy-human-requests.sql"))
+            .expect("seed released human-request payloads and responses");
+    }
+    // Seed data through columns shared by the published layouts. The frozen DDL
+    // files stay untouched; the matrix must exercise a nonempty receipt backfill.
+    for (ordinal, state) in [
+        "queued",
+        "steering",
+        "promoted",
+        "consumed",
+        "cancelled",
+        "failed",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let sequence = i64::try_from(ordinal).expect("bounded fixture ordinal") + 100;
+        connection
+            .execute(
+                "INSERT INTO session_input
+             (id,session_id,prompt,delivery,state,revision,admitted_seq,promoted_seq,error,
+              time_created,time_updated)
+             VALUES (?1,'ses_fixture_0001',?2,?3,?4,2,?5,?6,?7,1735690000000,1735690001000)",
+                rusqlite::params![
+                    format!("inp_migration_{state}"),
+                    format!("Preserve {state} input — 保留输入"),
+                    if state == "steering" {
+                        "steer"
+                    } else {
+                        "queue"
+                    },
+                    state,
+                    sequence,
+                    matches!(state, "promoted" | "consumed").then_some(sequence + 100),
+                    (state == "failed").then_some("historical failure — 原始错误"),
+                ],
+            )
+            .expect("seed historical inbox states");
+    }
     connection
 }
 
@@ -1018,6 +1154,65 @@ fn assert_question_backfill(connection: &Connection) {
         receipts, 0,
         "migration never invents a client command receipt"
     );
+}
+
+fn assert_question_migration(connection: &Connection, format: u32) {
+    if format < 13 {
+        assert_question_backfill(connection);
+    } else {
+        assert_literal_values(
+            connection,
+            &[
+                (
+                    "SELECT response FROM human_request WHERE id='req_format13'",
+                    r#"{"draftAnswers":{"q1":["keep this draft"]}}"#,
+                ),
+                (
+                    "SELECT purpose FROM question_interaction WHERE request_id='req_format13'",
+                    "clarification",
+                ),
+                (
+                    "SELECT definition FROM question_interaction WHERE request_id='req_format13'",
+                    r#"{"origin":{"sessionId":"ses_fixture_0001"},"questions":[{"id":"q1","question":"Any correction?","header":"Notes","options":[]}],"plan":null,"initialMode":"deferred","handoffCompleted":false}"#,
+                ),
+            ],
+            "published format-13 question metadata",
+        );
+    }
+}
+
+fn assert_legacy_input_receipts(connection: &Connection) {
+    let mismatches: i64 = connection.query_row(
+        "SELECT count(*) FROM session_input i LEFT JOIN session_input_receipt r ON r.input_id=i.id
+         WHERE r.input_id IS NULL OR
+           r.state <> CASE i.state WHEN 'consumed' THEN 'recorded'
+                    WHEN 'failed' THEN 'failed' WHEN 'cancelled' THEN 'cancelled' ELSE 'admitted' END
+           OR r.delivery <> i.delivery OR r.time_updated <> i.time_updated
+           OR r.error IS NOT i.error OR r.turn_id IS NOT NULL OR r.applied_at IS NOT NULL
+           OR r.stop_reason IS NOT NULL
+           OR r.completed_at IS NOT
+             CASE WHEN i.state IN ('failed','cancelled') THEN i.time_updated ELSE NULL END",
+        [], |row| row.get(0),
+    ).expect("compare migration receipts to historical inbox facts");
+    assert_eq!(
+        mismatches, 0,
+        "legacy consumption must never imply model application"
+    );
+    let (inputs, receipts, usage): (i64, i64, i64) = connection
+        .query_row(
+            "SELECT (SELECT count(*) FROM session_input),
+                (SELECT count(*) FROM session_input_receipt),
+                (SELECT count(*) FROM session_context_usage)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("runtime ledger counts");
+    assert_eq!(
+        inputs, 6,
+        "the backfill check must exercise every historical state"
+    );
+    assert_eq!(receipts, inputs);
+    assert_eq!(usage, 0, "migration cannot invent measured context usage");
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,7 +1339,8 @@ fn assert_upgrade_preserves_rows_and_reaches_the_current_structure(fixture: &Fix
     // (c) The marker is the current one.
     let after = structure(&connection);
     assert_eq!(after.format, Some(migration::CURRENT_FORMAT), "{context}");
-    assert_question_backfill(&connection);
+    assert_question_migration(&connection, fixture.format);
+    assert_legacy_input_receipts(&connection);
 
     // (a) Every pre-existing value reads back byte-for-byte, and the literals the
     // fixture file spells out are still there. Only the marker row may differ.
@@ -1546,7 +1742,7 @@ fn a_failed_format_nine_upgrade_leaves_the_v0_10_21_database_untouched() {
 }
 
 // ---------------------------------------------------------------------------
-// Format 13: marker ordering, rollback after backfill, races, and closed shapes.
+// Format 14: marker ordering, rollback after backfill, races, and closed shapes.
 // ---------------------------------------------------------------------------
 
 fn apply_traced(connection: &mut Connection) -> (Result<(), DbError>, Vec<String>) {
@@ -1583,6 +1779,22 @@ fn schema_rows(connection: &Connection) -> Vec<Vec<Value>> {
     )
 }
 
+fn object_ddl(connection: &Connection, names: &[&str]) -> String {
+    names
+        .iter()
+        .map(|name| {
+            let sql: String = connection
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .expect("current object DDL");
+            format!("{sql};\n")
+        })
+        .collect()
+}
+
 fn assert_rejected_without_mutation(connection: &mut Connection) -> DbError {
     let before = structure(connection);
     let rows_before = snapshot_rows(connection, &before);
@@ -1602,48 +1814,69 @@ fn assert_rejected_without_mutation(connection: &mut Connection) -> DbError {
     error
 }
 
+// Inspect future objects through SQLite's schema/pragma tables. Direct references
+// to question_interaction inside this trigger would invalidate the trigger while
+// format 14 rebuilds that table, aborting ALTER TABLE before the marker is reached.
+const MARKER_SCHEMA_GUARD: &str = "
+    SELECT CASE WHEN NEW.format <> 14
+      THEN RAISE(ABORT,'marker attempted an intermediate format') END;
+    SELECT CASE WHEN
+      (SELECT count(*) FROM sqlite_schema WHERE name IN (
+        'question_interaction','question_action_receipt',
+        'question_interaction_purpose_authorization_idx',
+        'session_input_receipt','session_input_receipt_turn_state_idx',
+        'session_context_usage','session_context_usage_updated_idx')) <> 7
+      THEN RAISE(ABORT,'marker attempted before complete runtime schema') END;
+    SELECT CASE WHEN NOT EXISTS(
+      SELECT 1 FROM pragma_table_info('session_execution_state') WHERE name='scheduling')
+      THEN RAISE(ABORT,'marker attempted before scheduling') END;
+    SELECT CASE WHEN NOT EXISTS(
+      SELECT 1 FROM sqlite_schema WHERE name='question_interaction'
+        AND instr(sql,'''goal_resume''') > 0)
+      THEN RAISE(ABORT,'marker attempted before goal-resume purpose') END;
+";
+
+fn assert_receipt_backfill_precedes_the_only_marker(traced: &[String]) -> usize {
+    let writes: Vec<_> = traced
+        .iter()
+        .enumerate()
+        .filter(|(_, sql)| sql.trim_start().starts_with("UPDATE zuno_schema"))
+        .collect();
+    assert_eq!(writes.len(), 1, "one final marker write: {traced:#?}");
+    let marker = writes[0].0;
+    let backfill = traced
+        .iter()
+        .position(|sql| sql.contains("INSERT INTO session_input_receipt"))
+        .expect("SQLite executed the input-receipt backfill");
+    let begin = traced
+        .iter()
+        .position(|sql| sql.trim() == "BEGIN IMMEDIATE")
+        .expect("the backfill belongs to the migration transaction");
+    assert!(
+        begin < backfill && backfill < marker,
+        "backfill must precede the marker inside the transaction: {traced:#?}"
+    );
+    marker
+}
+
 #[test]
-fn every_supported_upgrade_finishes_question_backfill_before_the_marker_write() {
+fn every_supported_upgrade_finishes_runtime_schema_and_backfills_before_the_marker_write() {
     for fixture in SUPPORTED_FIXTURES {
         let dir = temp_dir();
         let mut connection = load_fixture(&dir.path().join("zuno.db"), fixture);
-        // This trigger can be installed before the companion table exists.
-        // SQLite resolves its body when the migration reaches the marker write.
         connection
-            .execute_batch(
-                "CREATE TRIGGER require_question_backfill BEFORE UPDATE OF format ON zuno_schema
-             BEGIN
-               SELECT CASE WHEN
-                 (SELECT count(*) FROM question_interaction q JOIN human_request h
-                  ON h.id=q.request_id WHERE h.kind='input'
-                  AND json_extract(h.payload,'$.source')='question') <> 6
-                 THEN RAISE(ABORT,'marker attempted before complete question backfill') END;
-               SELECT CASE WHEN
-                 (SELECT count(*) FROM sqlite_schema WHERE type='index'
-                  AND name='question_interaction_purpose_authorization_idx') <> 1
-                 THEN RAISE(ABORT,'marker attempted before question index') END;
-               SELECT CASE WHEN (SELECT count(*) FROM question_action_receipt) <> 0
-                 THEN RAISE(ABORT,'migration invented a command receipt') END;
-             END;",
-            )
+            .execute_batch(&format!(
+                "CREATE TRIGGER require_runtime_schema BEFORE UPDATE OF format ON zuno_schema
+                 BEGIN {MARKER_SCHEMA_GUARD} END;"
+            ))
             .expect("install the marker-order guard");
         let before = snapshot_rows(&connection, &structure(&connection));
         let (outcome, traced) = apply_traced(&mut connection);
         outcome.unwrap_or_else(|error| panic!("format {} marker order: {error:#}", fixture.format));
-        assert_question_backfill(&connection);
+        assert_question_migration(&connection, fixture.format);
+        assert_legacy_input_receipts(&connection);
         assert_rows_preserved(&connection, &before, &["zuno_schema"]);
-        let writes: Vec<_> = traced
-            .iter()
-            .enumerate()
-            .filter(|(_, sql)| sql.trim_start().starts_with("UPDATE zuno_schema"))
-            .collect();
-        assert_eq!(
-            writes.len(),
-            1,
-            "one marker update for format {}",
-            fixture.format
-        );
-        let marker = writes[0].0;
+        let marker = assert_receipt_backfill_precedes_the_only_marker(&traced);
         assert!(
             traced[marker + 1..]
                 .iter()
@@ -1651,27 +1884,22 @@ fn every_supported_upgrade_finishes_question_backfill_before_the_marker_write() 
             "only trigger checks and COMMIT may follow the marker: {traced:#?}"
         );
         assert_eq!(last_top_level_statement(&traced), Some("COMMIT"));
-        assert_eq!(structure(&connection).format, Some(13));
+        assert_eq!(structure(&connection).format, Some(14));
     }
 }
 
 #[test]
-fn a_marker_failure_rolls_back_all_question_metadata_and_every_earlier_step() {
+fn a_marker_failure_rolls_back_runtime_receipts_question_rebuild_and_every_earlier_step() {
     for fixture in SUPPORTED_FIXTURES {
         let dir = temp_dir();
         let mut connection = load_fixture(&dir.path().join("zuno.db"), fixture);
         connection
-            .execute_batch(
-                "CREATE TRIGGER reject_question_marker BEFORE UPDATE OF format ON zuno_schema
-             BEGIN
-               SELECT CASE WHEN
-                 (SELECT count(*) FROM question_interaction q JOIN human_request h
-                  ON h.id=q.request_id WHERE h.kind='input'
-                  AND json_extract(h.payload,'$.source')='question') = 6
-                 THEN RAISE(ABORT,'reject marker after complete question backfill')
-                 ELSE RAISE(ABORT,'marker reached incomplete backfill') END;
-             END;",
-            )
+            .execute_batch(&format!(
+                "CREATE TRIGGER reject_runtime_marker BEFORE UPDATE OF format ON zuno_schema
+                 BEGIN {MARKER_SCHEMA_GUARD}
+                   SELECT RAISE(ABORT,'reject marker after complete runtime schema');
+                 END;"
+            ))
             .expect("install a failure after the real backfill");
         let before = structure(&connection);
         let rows_before = snapshot_rows(&connection, &before);
@@ -1683,27 +1911,29 @@ fn a_marker_failure_rolls_back_all_question_metadata_and_every_earlier_step() {
             std::error::Error::source(&error)
                 .expect("SQLite cause")
                 .to_string()
-                .contains("reject marker after complete question backfill"),
+                .contains("reject marker after complete runtime schema"),
             "format {} did not reach the intended failure: {error:#}",
             fixture.format
         );
+        assert_receipt_backfill_precedes_the_only_marker(&traced);
         assert_eq!(last_top_level_statement(&traced), Some("ROLLBACK"));
         assert!(!traced.iter().any(|sql| sql.trim() == "COMMIT"));
         assert_eq!(structure(&connection), before);
         assert_eq!(schema_rows(&connection), ddl_before);
         assert_rows_preserved(&connection, &rows_before, &[]);
         connection
-            .execute_batch("DROP TRIGGER reject_question_marker")
+            .execute_batch("DROP TRIGGER reject_runtime_marker")
             .expect("remove the deliberate marker failure");
         migration::apply(&mut connection).expect("retry the same database");
-        assert_question_backfill(&connection);
+        assert_question_migration(&connection, fixture.format);
+        assert_legacy_input_receipts(&connection);
         assert_rows_preserved(&connection, &rows_before, &["zuno_schema"]);
     }
 }
 
 #[test]
-fn concurrent_fresh_and_format_twelve_opens_commit_one_complete_schema() {
-    for fixture in [None, Some(&FORMAT_TWELVE)] {
+fn concurrent_fresh_and_every_supported_published_format_open_one_complete_schema() {
+    for fixture in std::iter::once(None).chain(SUPPORTED_FIXTURES.iter().copied().map(Some)) {
         let dir = temp_dir();
         let path = dir.path().join("zuno.db");
         let initial = fixture.map_or_else(
@@ -1735,8 +1965,9 @@ fn concurrent_fresh_and_format_twelve_opens_commit_one_complete_schema() {
             outcome.expect("every opener accepts the single committed upgrade");
             assert_same_structure(&structure(&connection), &expected, "concurrent open");
             assert_rows_preserved(&connection, &before, &["zuno_schema"]);
-            if fixture.is_some() {
-                assert_question_backfill(&connection);
+            if let Some(fixture) = fixture {
+                assert_question_migration(&connection, fixture.format);
+                assert_legacy_input_receipts(&connection);
             }
             let rows = snapshot_rows(&connection, &expected);
             migration::apply(&mut connection).expect("validate again without another backfill");
@@ -1746,43 +1977,81 @@ fn concurrent_fresh_and_format_twelve_opens_commit_one_complete_schema() {
 }
 
 #[test]
-fn unsupported_unmarked_and_marker_only_format_twelve_databases_are_unchanged() {
-    for replacement in [None, Some(4), Some(13), Some(14)] {
-        let dir = temp_dir();
-        let mut connection = load_fixture(&dir.path().join("zuno.db"), &FORMAT_TWELVE);
-        if let Some(format) = replacement {
-            connection
-                .execute("UPDATE zuno_schema SET format=?1", [format])
-                .expect("set the deliberately wrong marker");
-        } else {
-            connection
-                .execute_batch("DROP TABLE zuno_schema")
-                .expect("remove the marker");
-        }
-        let error = assert_rejected_without_mutation(&mut connection);
-        if replacement == Some(13) {
-            assert!(matches!(error, DbError::Schema { .. }), "{error:?}");
-        } else {
-            assert!(
-                matches!(error, DbError::SchemaMismatch {
-                expected: 13, observed
+fn unsupported_unmarked_and_marker_only_published_databases_are_unchanged() {
+    for fixture in SUPPORTED_FIXTURES {
+        for replacement in [None, Some(4), Some(13), Some(14), Some(15), Some(u32::MAX)] {
+            if replacement == Some(fixture.format) {
+                continue;
+            }
+            let dir = temp_dir();
+            let mut connection = load_fixture(&dir.path().join("zuno.db"), fixture);
+            if let Some(format) = replacement {
+                connection
+                    .execute("UPDATE zuno_schema SET format=?1", [format])
+                    .expect("set the deliberately wrong marker");
+            } else {
+                connection
+                    .execute_batch("DROP TABLE zuno_schema")
+                    .expect("remove the marker");
+            }
+            let error = assert_rejected_without_mutation(&mut connection);
+            if matches!(replacement, Some(13 | 14)) {
+                assert!(matches!(error, DbError::Schema { .. }), "{error:?}");
+            } else {
+                assert!(
+                    matches!(error, DbError::SchemaMismatch {
+                expected: 14, observed
             } if observed == replacement),
-                "{error:?}"
-            );
+                    "{error:?}"
+                );
+            }
+        }
+        let dir = temp_dir();
+        let mut connection = load_fixture(&dir.path().join("zuno.db"), fixture);
+        connection
+            .execute("DELETE FROM zuno_schema", [])
+            .expect("remove the marker row");
+        assert!(matches!(
+            assert_rejected_without_mutation(&mut connection),
+            DbError::SchemaMismatch {
+                expected: 14,
+                observed: None
+            }
+        ));
+    }
+}
+
+#[test]
+fn corrupt_published_thirteen_is_rejected_before_any_format_fourteen_object_is_created() {
+    for corruption in [
+        "DROP TABLE question_interaction",
+        "DROP TABLE question_action_receipt",
+        "ALTER TABLE question_interaction DROP COLUMN authorization_input_id",
+        "ALTER TABLE question_action_receipt DROP COLUMN time_created",
+        "DROP INDEX question_interaction_purpose_authorization_idx",
+        "DROP INDEX question_interaction_purpose_authorization_idx;
+         CREATE INDEX question_interaction_purpose_authorization_idx
+           ON question_interaction(authorization,purpose,request_id)",
+        "ALTER TABLE session_execution_state DROP COLUMN scheduling",
+        "ALTER TABLE session_execution_state DROP COLUMN scheduling;
+         ALTER TABLE session_execution_state ADD COLUMN scheduling text",
+    ] {
+        let dir = temp_dir();
+        let mut connection = load_fixture(&dir.path().join("zuno.db"), &FORMAT_THIRTEEN);
+        connection
+            .execute_batch(corruption)
+            .expect("damage the published format-13 shape");
+        let error = assert_rejected_without_mutation(&mut connection);
+        assert!(
+            matches!(error, DbError::Schema { .. }),
+            "{corruption}: {error:?}"
+        );
+        let after = structure(&connection);
+        assert_eq!(after.format, Some(13));
+        for table in RUNTIME_CONSISTENCY.tables {
+            assert!(!after.tables.contains_key(*table), "{corruption}: {table}");
         }
     }
-    let dir = temp_dir();
-    let mut connection = load_fixture(&dir.path().join("zuno.db"), &FORMAT_TWELVE);
-    connection
-        .execute("DELETE FROM zuno_schema", [])
-        .expect("remove the marker row");
-    assert!(matches!(
-        assert_rejected_without_mutation(&mut connection),
-        DbError::SchemaMismatch {
-            expected: 13,
-            observed: None
-        }
-    ));
 }
 
 #[test]
@@ -1859,7 +2128,18 @@ fn current_question_tables_columns_and_required_index_must_exist() {
 
 #[test]
 fn current_question_shapes_reject_weakened_keys_checks_types_and_indexes() {
-    let ddl = include_str!("../src/schema/questions.sql");
+    // Use the actual current DDL as the unmodified control. The frozen format-13
+    // questions.sql intentionally excludes goal_resume and is not a valid current
+    // control; using it would mask every corruption behind that unrelated mismatch.
+    let reference = fresh_current();
+    let ddl = object_ddl(
+        &reference,
+        &[
+            "question_interaction",
+            "question_action_receipt",
+            "question_interaction_purpose_authorization_idx",
+        ],
+    );
     for (original, changed) in [
         ("request_id text PRIMARY KEY", "request_id text"),
         ("purpose text NOT NULL", "purpose text"),
@@ -1876,7 +2156,8 @@ fn current_question_shapes_reject_weakened_keys_checks_types_and_indexes() {
             "REFERENCES human_request(id)",
         ),
         ("REFERENCES human_request(id)", "REFERENCES session(id)"),
-        ("'plan_authorization'))", "'plan_authorization','other'))"),
+        ("'goal_resume'))", "'goal_resume','other'))"),
+        (",'goal_resume'", ""),
         ("'blocking','deferred'", "'blocking','deferred','silent'"),
         ("'approve','decline'", "'approve','decline','maybe'"),
         (
@@ -1941,4 +2222,137 @@ fn current_question_shapes_reject_weakened_keys_checks_types_and_indexes() {
             "{original} -> {changed}: {error:?}"
         );
     }
+}
+
+#[test]
+fn current_runtime_tables_columns_and_required_indexes_must_exist() {
+    for corruption in [
+        "DROP TABLE session_input_receipt",
+        "DROP TABLE session_context_usage",
+        "ALTER TABLE session_input_receipt DROP COLUMN error",
+        "ALTER TABLE session_context_usage DROP COLUMN state_json",
+        "DROP INDEX session_input_receipt_turn_state_idx",
+        "DROP INDEX session_context_usage_updated_idx",
+    ] {
+        let dir = temp_dir();
+        let mut connection = load_fixture(&dir.path().join("zuno.db"), &FORMAT_THIRTEEN);
+        migration::apply(&mut connection).expect("prepare a populated format 14");
+        connection
+            .execute_batch(corruption)
+            .expect("remove a required runtime object");
+        let error = assert_rejected_without_mutation(&mut connection);
+        assert!(
+            matches!(error, DbError::Schema { .. }),
+            "{corruption}: {error:?}"
+        );
+        assert_eq!(structure(&connection).format, Some(14));
+    }
+}
+
+#[test]
+fn current_runtime_shapes_reject_weakened_keys_checks_types_and_indexes() {
+    let reference = fresh_current();
+    let ddl = object_ddl(
+        &reference,
+        &[
+            "session_input_receipt",
+            "session_input_receipt_turn_state_idx",
+            "session_context_usage",
+            "session_context_usage_updated_idx",
+        ],
+    );
+    for (original, changed) in [
+        (
+            "input_id text NOT NULL PRIMARY KEY",
+            "input_id text PRIMARY KEY",
+        ),
+        ("state text NOT NULL", "state text"),
+        ("delivery text NOT NULL", "delivery blob NOT NULL"),
+        ("'admitted','recorded'", "'admitted','RECORDED'"),
+        (
+            "CHECK (state <> 'applied' OR (turn_id IS NOT NULL AND applied_at IS NOT NULL))",
+            "CHECK (1)",
+        ),
+        (
+            "REFERENCES session_input(id) ON DELETE CASCADE",
+            "REFERENCES session_input(id)",
+        ),
+        (
+            "CREATE INDEX session_input_receipt_turn_state_idx",
+            "CREATE UNIQUE INDEX session_input_receipt_turn_state_idx",
+        ),
+        ("(turn_id,state,input_id)", "(state,turn_id,input_id)"),
+        (
+            "(turn_id,state,input_id)",
+            "(turn_id,state,input_id) WHERE state='applied'",
+        ),
+        ("`source` text NOT NULL", "`source` text"),
+        ("`revision` integer NOT NULL", "`revision` text NOT NULL"),
+        ("CHECK (`context_epoch` >= 0)", "CHECK (1)"),
+        ("CHECK (json_valid(`state_json`))", "CHECK (1)"),
+        (
+            "PRIMARY KEY (`session_id`, `source`)",
+            "PRIMARY KEY (`session_id`)",
+        ),
+        (
+            "REFERENCES `session`(`id`) ON DELETE CASCADE",
+            "REFERENCES `session`(`id`)",
+        ),
+        (
+            "(`time_updated`, `session_id`, `source`)",
+            "(`session_id`, `time_updated`, `source`)",
+        ),
+    ] {
+        assert!(ddl.contains(original), "corruption must change {original}");
+        let dir = temp_dir();
+        let mut connection = load_fixture(&dir.path().join("zuno.db"), &FORMAT_THIRTEEN);
+        migration::apply(&mut connection).expect("prepare populated current schema");
+        connection
+            .execute_batch("DROP TABLE session_input_receipt; DROP TABLE session_context_usage;")
+            .expect("replace only runtime DDL");
+        connection
+            .execute_batch(&ddl.replace(original, changed))
+            .unwrap_or_else(|error| panic!("construct {original} -> {changed}: {error}"));
+        let error = assert_rejected_without_mutation(&mut connection);
+        assert!(
+            matches!(error, DbError::Schema { .. }),
+            "{original} -> {changed}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn current_input_receipts_reject_significant_whitespace_in_quoted_column_names() {
+    let mut connection = fresh_current();
+    connection
+        .execute_batch("ALTER TABLE session_input_receipt RENAME COLUMN input_id TO \"input_ id\";")
+        .expect("construct a different parsed column and its updated index");
+    assert!(
+        connection
+            .prepare("SELECT input_id FROM session_input_receipt")
+            .is_err(),
+        "the column rename must break the actual input-receipt query"
+    );
+    assert!(matches!(
+        assert_rejected_without_mutation(&mut connection),
+        DbError::Schema { .. }
+    ));
+}
+
+#[test]
+fn current_context_usage_rejects_significant_whitespace_in_quoted_column_names() {
+    let mut connection = fresh_current();
+    connection
+        .execute_batch("ALTER TABLE session_context_usage RENAME COLUMN source TO \"so urce\";")
+        .expect("construct a different parsed column and its updated key/index");
+    assert!(
+        connection
+            .prepare("SELECT source FROM session_context_usage")
+            .is_err(),
+        "the column rename must break the actual context-usage query"
+    );
+    assert!(matches!(
+        assert_rejected_without_mutation(&mut connection),
+        DbError::Schema { .. }
+    ));
 }

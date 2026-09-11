@@ -53,6 +53,8 @@ const TITLE_CASSETTE: &str = "openai-chat/streams-text";
 
 /// One prelude request plus the two a tool turn takes, which is what the frozen
 /// `completed_tool_turns(captured) = (captured - 1) / 2` scores as exactly one turn.
+/// Automatic Memory runs in a separate native lane, explicitly disabled only
+/// for this three-response recorded fixture by `recorded_turn_variables`.
 const REQUESTS_FOR_ONE_TOOL_TURN: usize = 3;
 
 /// The prompt the frozen harness submits, verbatim.
@@ -381,6 +383,20 @@ fn variables(env: &ScriptedEnv, base_url: &str) -> BTreeMap<String, String> {
     variables
 }
 
+fn recorded_turn_variables(env: &ScriptedEnv, base_url: &str) -> BTreeMap<String, String> {
+    let mut variables = variables(env, base_url);
+    let mut config: serde_json::Value =
+        serde_json::from_str(&provider_config(base_url)).expect("recorded turn config");
+    // The cassette has exactly a title and the foreground tool loop. Native
+    // completed-turn admission now correctly wakes the separate extractor lane;
+    // letting it race this fixture would spend an unrecorded fourth response.
+    // Keep the exact foreground request-count assertion, rather than accepting
+    // an extra request or changing default Memory behavior for the other tests.
+    config["learning"] = serde_json::json!({"generate": false});
+    variables.insert("ZUNO_CONFIG_CONTENT".to_owned(), config.to_string());
+    variables
+}
+
 fn parallel_delegation_variables(env: &ScriptedEnv, base_url: &str) -> BTreeMap<String, String> {
     let mut variables = variables(env, base_url);
     let mut config: serde_json::Value =
@@ -498,7 +514,7 @@ fn run_under_pty(
         ])
         .current_dir(env.working_dir())
         .env_clear()
-        .envs(variables(env, base_url))
+        .envs(recorded_turn_variables(env, base_url))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1753,6 +1769,35 @@ async fn one_turn_through(submission: Submission) {
     .expect("the pty launcher runs");
     let captured = provider.captured().await;
     provider.shutdown().await;
+    if captured.len() != REQUESTS_FOR_ONE_TOOL_TURN {
+        for (index, request) in captured.iter().enumerate() {
+            let body = request.json().expect("captured fixture request is JSON");
+            let messages = body["messages"]
+                .as_array()
+                .map(|messages| {
+                    messages
+                        .iter()
+                        .map(|message| {
+                            serde_json::json!({
+                                "role": message["role"],
+                                "contentPrefix": message["content"].to_string()
+                                    .chars().take(400).collect::<String>(),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            eprintln!(
+                "TUI_REQUEST_SHAPE {}: {}",
+                index + 1,
+                serde_json::json!({
+                    "model": body["model"],
+                    "tools": body["tools"].as_array().map_or(0, Vec::len),
+                    "messages": messages,
+                }),
+            );
+        }
+    }
 
     assert!(
         !captured.is_empty(),
@@ -1781,8 +1826,30 @@ async fn one_turn_through(submission: Submission) {
     assert_eq!(
         captured.len(),
         REQUESTS_FOR_ONE_TOOL_TURN,
-        "the interactive surface must produce the same one-prelude-plus-two shape the \
-         headless one does, so the frozen perf gate scores its turn as completed"
+        "the recorded foreground turn must keep its one-prelude-plus-two shape; \
+         separate Memory generation is explicitly disabled for this fixture"
+    );
+    let continued = captured[2].json().expect("the result continuation is JSON");
+    let messages = continued["messages"]
+        .as_array()
+        .expect("continuation messages");
+    let call_id = messages
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .filter_map(|message| message["tool_calls"].as_array())
+        .flatten()
+        .find(|call| call["function"]["name"] == "get_weather")
+        .and_then(|call| call["id"].as_str())
+        .expect("the recorded tool call remains in the continuation");
+    assert!(
+        messages.iter().any(|message| {
+            message["role"] == "tool"
+                && message["tool_call_id"].as_str() == Some(call_id)
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("Unknown tool: get_weather"))
+        }),
+        "the next foreground request must carry the real result of the same tool call"
     );
     assert!(
         transcript.saw_wanted,

@@ -7,7 +7,8 @@ use std::time::Duration;
 use zuno_pty::{
     BUFFER_LIMIT, BackgroundExecutionError, BackgroundExecutionId, BackgroundExecutionInput,
     BackgroundExecutionPurpose, BackgroundExecutionRetention, BackgroundExecutionService,
-    BackgroundExecutionStatus, MAX_RETAINED_TERMINAL_EXECUTIONS, ReplayCursor,
+    BackgroundExecutionStatus, ForegroundExecutionContext, ForegroundWaitOutcome,
+    MAX_RETAINED_TERMINAL_EXECUTIONS, ReplayCursor,
 };
 use zuno_sandbox::{
     NetworkAccess, PrepareRequest, PreparedCommand, SandboxCapabilities, SandboxMode, SandboxPolicy,
@@ -60,6 +61,293 @@ fn input(
         hard_ceiling,
         retention: BackgroundExecutionRetention::Durable,
     }
+}
+
+fn foreground_context() -> ForegroundExecutionContext {
+    ForegroundExecutionContext {
+        call_id: "original_shell_call".to_owned(),
+        metadata: serde_json::Map::from_iter([("fixture".to_owned(), serde_json::json!(1))]),
+    }
+}
+
+#[tokio::test]
+async fn foreground_observation_preserves_ownership_through_timeout_interruption_and_drop() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let service = BackgroundExecutionService::open(directory.path()).expect("service");
+    let mut callbacks = service.subscribe();
+    let mut launch = input(
+        directory.path(),
+        "while [ ! -f release ]; do sleep 0.01; done; printf continued",
+        Duration::from_secs(10),
+    );
+    launch.retention = BackgroundExecutionRetention::Ephemeral;
+    launch.cycle_id = Some("original_cycle".to_owned());
+    let (started, mut lease) = service.start_leased(launch).expect("start once");
+    let yielded = service
+        .yield_foreground(&started.id, foreground_context())
+        .expect("yield");
+    lease.disarm();
+    assert_eq!(yielded.info.pid, started.pid);
+    assert!(service.list_for_session("ses_background").is_empty());
+    assert!(matches!(
+        service
+            .wait_foreground(
+                &started.id,
+                "another_session",
+                Duration::from_millis(1),
+                std::future::pending(),
+            )
+            .await,
+        Err(BackgroundExecutionError::NotFound(_))
+    ));
+    assert!(matches!(
+        service
+            .wait_foreground(
+                &started.id,
+                "ses_background",
+                Duration::from_millis(1),
+                std::future::pending(),
+            )
+            .await
+            .expect("bounded observation"),
+        ForegroundWaitOutcome::ObservationTimeout(_)
+    ));
+    assert!(matches!(
+        service
+            .wait_foreground(
+                &started.id,
+                "ses_background",
+                Duration::from_secs(60),
+                std::future::ready(()),
+            )
+            .await
+            .expect("interrupted observation"),
+        ForegroundWaitOutcome::Interrupted(_)
+    ));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(1),
+            service.wait_foreground(
+                &started.id,
+                "ses_background",
+                Duration::from_secs(60),
+                std::future::pending(),
+            )
+        )
+        .await
+        .is_err(),
+        "dropping an observation must preserve the process"
+    );
+    assert_eq!(
+        service.get(&started.id).expect("still running").pid,
+        started.pid
+    );
+    assert!(
+        service
+            .drain_foreground("ses_background", Some("original_cycle"))
+            .is_empty()
+    );
+    assert!(matches!(
+        service.consume_foreground(&started.id, "ses_background"),
+        Err(BackgroundExecutionError::ForegroundStillRunning(_))
+    ));
+    std::fs::write(directory.path().join("release"), b"continue").expect("release");
+    let terminal = service
+        .wait_foreground(
+            &started.id,
+            "ses_background",
+            Duration::from_secs(3),
+            std::future::pending(),
+        )
+        .await
+        .expect("terminal observation");
+    assert!(matches!(terminal, ForegroundWaitOutcome::Terminal(_)));
+    assert!(
+        service
+            .drain_foreground("ses_background", Some("later_cycle"))
+            .is_empty()
+    );
+    let ready = service.drain_foreground("ses_background", Some("original_cycle"));
+    assert_eq!(ready.len(), 1);
+    let ready = ready.into_iter().next().expect("ready").expect("read");
+    assert_eq!(ready.output, b"continued");
+    assert_eq!(ready.execution.context.call_id, "original_shell_call");
+    assert_eq!(
+        ready.execution.info.cycle_id.as_deref(),
+        Some("original_cycle")
+    );
+    assert_eq!(
+        service
+            .drain_foreground("ses_background", Some("original_cycle"))
+            .len(),
+        1,
+        "reading is not durable acknowledgement"
+    );
+    assert!(
+        service
+            .consume_foreground(&started.id, "ses_background")
+            .expect("acknowledge")
+    );
+    assert!(
+        !service
+            .consume_foreground(&started.id, "ses_background")
+            .expect("acknowledge once")
+    );
+    assert!(service.foreground_for_session("ses_background").is_empty());
+    assert_eq!(
+        service
+            .output(&started.id, ReplayCursor::From(0), Some(3))
+            .expect("page")
+            .bytes,
+        b"con"
+    );
+    assert!(
+        callbacks.try_recv().is_err(),
+        "foreground completion never publishes callbacks"
+    );
+    let reopened = BackgroundExecutionService::open(directory.path()).expect("reopen");
+    assert!(reopened.foreground_for_session("ses_background").is_empty());
+    assert!(reopened.list().is_empty());
+    assert!(
+        reopened
+            .foreground(&started.id, "ses_background")
+            .expect("inspection")
+            .consumed
+    );
+}
+
+#[tokio::test]
+async fn yielded_foreground_context_is_immutable_and_terminal_consumption_survives_rebinding() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let service = BackgroundExecutionService::open(directory.path()).expect("service");
+    let mut launch = input(directory.path(), "printf ready", Duration::from_secs(3));
+    launch.retention = BackgroundExecutionRetention::Ephemeral;
+    let started = service.start(launch).expect("start");
+    service
+        .wait(&started.id, None)
+        .await
+        .expect("settled before yield");
+    service
+        .yield_foreground(&started.id, foreground_context())
+        .expect("terminal handoff");
+    assert!(
+        service
+            .yield_foreground(&started.id, foreground_context())
+            .is_ok()
+    );
+    let changed = ForegroundExecutionContext {
+        call_id: "another_call".to_owned(),
+        ..foreground_context()
+    };
+    assert!(matches!(
+        service.yield_foreground(&started.id, changed),
+        Err(BackgroundExecutionError::ForegroundContextChanged(_))
+    ));
+    assert!(matches!(
+        service.promote(&started.id),
+        Err(BackgroundExecutionError::ForegroundContextChanged(_))
+    ));
+    let rebound = BackgroundExecutionService::open(directory.path()).expect("rebound host");
+    assert_eq!(rebound.foreground_for_session("ses_background").len(), 1);
+    assert!(
+        service
+            .consume_foreground(&started.id, "ses_background")
+            .expect("first host")
+    );
+    assert!(
+        rebound.foreground_for_session("ses_background").is_empty(),
+        "a rebound host must observe the durable acknowledgement before draining"
+    );
+    assert!(
+        !rebound
+            .consume_foreground(&started.id, "ses_background")
+            .expect("second host")
+    );
+    assert!(rebound.foreground_for_session("ses_background").is_empty());
+    assert!(rebound.list().is_empty());
+}
+
+#[tokio::test]
+async fn pending_foreground_results_survive_detached_retention_pressure() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let service = BackgroundExecutionService::open(directory.path()).expect("service");
+    let mut launch = input(
+        directory.path(),
+        "printf required-result",
+        Duration::from_secs(3),
+    );
+    launch.retention = BackgroundExecutionRetention::Ephemeral;
+    let started = service.start(launch).expect("foreground");
+    service
+        .wait(&started.id, None)
+        .await
+        .expect("foreground settles");
+    service
+        .yield_foreground(&started.id, foreground_context())
+        .expect("foreground handoff");
+    for _ in 0..=MAX_RETAINED_TERMINAL_EXECUTIONS {
+        let detached = service
+            .start(input(directory.path(), "true", Duration::from_secs(3)))
+            .expect("detached");
+        service
+            .wait(&detached.id, None)
+            .await
+            .expect("detached settles");
+    }
+    assert_eq!(service.list().len(), MAX_RETAINED_TERMINAL_EXECUTIONS);
+    assert_eq!(service.foreground_for_session("ses_background").len(), 1);
+    assert_eq!(
+        service
+            .foreground_completion(&started.id, "ses_background")
+            .expect("pending result")
+            .output,
+        b"required-result"
+    );
+}
+
+#[tokio::test]
+async fn a_lost_foreground_owner_restores_uncertain_without_detached_callbacks_or_replay() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let service = BackgroundExecutionService::open(directory.path()).expect("service");
+    let mut launch = input(directory.path(), "printf once", Duration::from_secs(3));
+    launch.retention = BackgroundExecutionRetention::Ephemeral;
+    launch.cycle_id = Some("original_cycle".to_owned());
+    let started = service.start(launch).expect("start");
+    service.wait(&started.id, None).await.expect("settle");
+    service
+        .yield_foreground(&started.id, foreground_context())
+        .expect("yield");
+    let mut row = read_row(&started.status_file);
+    assert_eq!(row["format"], 4, "old builds must skip foreground records");
+    row["info"]["status"] = serde_json::json!("running");
+    row["info"]["exitCode"] = serde_json::Value::Null;
+    row["info"]["pid"] = serde_json::json!(reaped_pid());
+    row["info"]["timeCompleted"] = serde_json::Value::Null;
+    row["claimed"] = serde_json::json!(true);
+    std::fs::write(&started.status_file, serde_json::to_vec(&row).expect("row"))
+        .expect("lost-owner fixture");
+    let reopened =
+        BackgroundExecutionService::open(directory.path()).expect("reconcile lost owner");
+    let mut events = reopened.subscribe();
+    let restored = reopened
+        .foreground(&started.id, "ses_background")
+        .expect("restored handle");
+    assert_eq!(restored.info.status, BackgroundExecutionStatus::Uncertain);
+    assert_eq!(restored.info.exit_code, None);
+    assert_eq!(restored.info.cycle_id.as_deref(), Some("original_cycle"));
+    assert_eq!(restored.context, foreground_context());
+    assert_eq!(
+        reopened
+            .complete_output(&started.id)
+            .expect("original output"),
+        b"once"
+    );
+    assert!(reopened.list().is_empty());
+    assert!(events.try_recv().is_err());
+    assert_eq!(
+        read_row(&started.status_file)["foreground"]["context"]["callId"],
+        "original_shell_call"
+    );
 }
 
 /// An ephemeral command's capture file is created after its `<id>.lock` and has to be

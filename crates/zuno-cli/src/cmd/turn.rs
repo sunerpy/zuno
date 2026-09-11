@@ -94,12 +94,16 @@ use zuno_llm::catalog::{Catalog, CatalogProvenance, CatalogSource, ResolveInput}
 use zuno_llm::event::{RequestContentBlock, StreamEvent};
 use zuno_llm::registry::{ApiSurface, Provider, ProviderRegistry, Spec, generation};
 use zuno_memory::{
-    MemoryObserver, MemoryService, MemoryServiceError, PromotionPolicy, Scope, ScopeLimits,
-    ScopePaths, SessionMemory,
+    MemoryObserver, MemoryService, PromotionPolicy, Scope, ScopeLimits, ScopePaths, SessionMemory,
 };
 
+#[path = "turn/learn_runtime.rs"]
+mod learn_runtime;
 #[path = "turn/learning_worker.rs"]
 mod learning_worker;
+#[cfg(test)]
+#[path = "turn_memory_refresh_tests.rs"]
+mod memory_refresh_tests;
 use zuno_orchestration::{
     AgentAttemptIdentity, AttemptSeed, AttemptSnapshot, CapabilityContents, CapabilitySnapshot,
     CouncilPresetDescriptor, CouncilRetryPolicyDescriptor, CouncilSeatDescriptor,
@@ -117,6 +121,11 @@ use zuno_types::execution::{
 };
 
 use crate::environment::StartupEnvironment;
+
+#[path = "turn/foreground.rs"]
+mod foreground;
+#[path = "turn/input_receipts.rs"]
+mod input_receipts;
 
 const LEARNING_LEASE_MILLIS: i64 = 60 * 60 * 1_000;
 const DURABLE_WORK_CONTEXT_SCHEMA_VERSION: u32 = 3;
@@ -178,13 +187,37 @@ impl DynamicContextRefreshInstruction {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct HostDynamicContextRefresher {
     goal_continuation: GoalContinuation,
     instruction: DynamicContextRefreshInstruction,
+    memory: Option<Arc<MemoryService>>,
+    memory_policy_store: zuno_db::session_memory_policy::SessionMemoryPolicyStore,
+    memory_default_use: bool,
+    memory_allowed: bool,
+    foreground_instruction: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl DynamicContextRefresher for HostDynamicContextRefresher {
+    fn before_request(
+        &self,
+        connection: &zuno_db::Connection,
+        session_id: &str,
+    ) -> Result<Option<DynamicContext>, String> {
+        let refresh = if matches!(
+            self.instruction,
+            DynamicContextRefreshInstruction::Planning(PlanningDecision::Required(_))
+        ) && zuno_tools::WorkStateStore::plan_in(connection, session_id)
+            .map_err(to_string)?
+            .is_some()
+        {
+            ToolDynamicContextRefresh::WorkPlan
+        } else {
+            ToolDynamicContextRefresh::WorkItems
+        };
+        self.refresh(connection, session_id, refresh).map(Some)
+    }
+
     fn refresh(
         &self,
         connection: &zuno_db::Connection,
@@ -192,8 +225,65 @@ impl DynamicContextRefresher for HostDynamicContextRefresher {
         refresh: ToolDynamicContextRefresh,
     ) -> Result<DynamicContext, String> {
         let context = goal_dynamic_context_from(connection, &self.goal_continuation, session_id)?;
-        Ok(self.instruction.apply(context, refresh))
+        let memory = current_resident_memory(
+            self.memory.as_deref(),
+            &self.memory_policy_store,
+            session_id,
+            self.memory_default_use,
+            self.memory_allowed,
+        )?;
+        let mut context = self.instruction.apply(context, refresh).with_memory(memory);
+        if let Some(instruction) = self
+            .foreground_instruction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            context = context.with_runtime_instruction(instruction);
+        }
+        Ok(context)
     }
+}
+
+fn current_resident_memory(
+    memory: Option<&MemoryService>,
+    policy_store: &zuno_db::session_memory_policy::SessionMemoryPolicyStore,
+    session_id: &str,
+    default_use: bool,
+    allowed: bool,
+) -> Result<String, String> {
+    let Some(memory) = memory.filter(|_| allowed) else {
+        return Ok(String::new());
+    };
+    let use_memories = policy_store
+        .get(session_id)
+        .map_err(to_string)?
+        .map_or(default_use, |policy| policy.use_memories);
+    if !use_memories {
+        return Ok(String::new());
+    }
+    Ok(memory
+        .snapshots()
+        .map_err(to_string)?
+        .into_iter()
+        .filter(|snapshot| !snapshot.content.trim().is_empty())
+        .map(|snapshot| {
+            format!(
+                "{}\n[Memory source: {}; revision: {}; digest: {}]",
+                snapshot.content, snapshot.source, snapshot.revision, snapshot.digest,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n"))
+}
+
+fn goal_resume_command_content(
+    resumed: &zuno_session_control::GoalResumeOutcome,
+) -> Result<String, SessionCommandError> {
+    let mut value = serde_json::to_value(&resumed.goal).map_err(SessionCommandError::internal)?;
+    value["resumeInputID"] = json!(resumed.input.as_ref().map(|input| &input.id));
+    value["resumeCycleID"] = json!(resumed.state.cycle_id);
+    serde_json::to_string_pretty(&value).map_err(SessionCommandError::internal)
 }
 
 /// A native session-command failure with enough type information for each client surface.
@@ -480,6 +570,7 @@ pub(crate) struct CouncilChoice {
 struct LearningModelPlan {
     model: EngineModel,
     max_output_tokens: u32,
+    sampling_params: bool,
 }
 
 /// Everything resolved from configuration, with no handle open yet.
@@ -2163,7 +2254,7 @@ fn resolve_learning_model(
         return Ok(None);
     }
 
-    let (model, resolved) = if let Some(qualified) = learning.extractor_model.as_deref() {
+    let (model, mut resolved) = if let Some(qualified) = learning.extractor_model.as_deref() {
         let Some((extractor_provider, extractor_model)) = qualified.split_once('/') else {
             notes.push(format!(
                 "learning disabled: extractor_model must be provider/model, got `{qualified}`"
@@ -2239,6 +2330,24 @@ fn resolve_learning_model(
             None => (session_model, engine_model(catalog, session_model, env)?),
         }
     };
+    // The selected provider spec already retains its SDK/model options and
+    // headers. Request-local reasoning must be lowered for THIS model, not
+    // cleared or copied from a differently configured foreground model.
+    resolved.reasoning_options = session_reasoning_options(None, model, &serde_json::Map::new());
+    // The learning client imposes its own output ceiling. Preserve lower
+    // selected-model limits so that overlay cannot accidentally raise them.
+    for key in [
+        "maxTokens",
+        "max_tokens",
+        "max_output_tokens",
+        "max_completion_tokens",
+    ] {
+        if let Some(value) = resolved.provider.options.get(key) {
+            resolved
+                .reasoning_options
+                .insert(key.to_owned(), value.clone());
+        }
+    }
     let declared_output = token_count(model.limit.output);
     let max_output_tokens = if declared_output == 0 {
         learning.execution_max_output_tokens
@@ -2250,6 +2359,7 @@ fn resolve_learning_model(
     Ok(Some(LearningModelPlan {
         model: resolved,
         max_output_tokens,
+        sampling_params: model.capabilities.temperature,
     }))
 }
 
@@ -2477,6 +2587,7 @@ pub(crate) struct TurnHost {
     runs: SessionRunRegistry,
     background_jobs: super::child_turn::BackgroundJobSupervisor,
     background_executions: Arc<zuno_pty::BackgroundExecutionService>,
+    foreground: foreground::ForegroundWaitCoordinator,
     background_notifications: super::background_notification::BackgroundNotificationRegistry,
     background_notification_directory: PathBuf,
     background_reports: super::child_turn::ChildSessionHost,
@@ -2599,13 +2710,6 @@ impl TurnFailure {
             | LearningServiceError::Evaluation(zuno_eval::EvaluationError::Db(error)) => {
                 Self::Database(error)
             }
-            other => Self::Host(other.to_string()),
-        }
-    }
-
-    fn memory(error: MemoryServiceError) -> Self {
-        match error {
-            MemoryServiceError::Database(error) => Self::Database(error),
             other => Self::Host(other.to_string()),
         }
     }
@@ -3687,6 +3791,14 @@ impl TurnHost {
                         let model = learning_model.model;
                         match providers.resolve(model.provider.clone()) {
                             Ok(provider) => {
+                                let capabilities = zuno_llm::registry::model_capabilities(
+                                    &model.provider,
+                                    &model.model_id,
+                                    zuno_llm::registry::Capabilities {
+                                        sampling_params: learning_model.sampling_params,
+                                        ..provider.capabilities()
+                                    },
+                                );
                                 let client = Arc::new(ProviderLearningExtractor {
                                     provider,
                                     model: LearningModel {
@@ -3694,6 +3806,9 @@ impl TurnHost {
                                         model_id: model.catalog_model_id.clone(),
                                         wire_id: model.model_id.clone(),
                                         surface: model.surface,
+                                        parameters: model.reasoning_options.clone(),
+                                        headers: model.provider.headers.clone(),
+                                        sampling_params: capabilities.sampling_params,
                                     },
                                     limits: zuno_config::ResolvedLearningConfig {
                                         execution_max_output_tokens: learning_model
@@ -3889,6 +4004,13 @@ impl TurnHost {
             let background_executions = environment
                 .background_executions(&plan.directory)
                 .map_err(to_string)?;
+            let foreground = foreground::ForegroundWaitCoordinator::new(
+                Arc::clone(&background_executions),
+                Arc::clone(&database),
+                zuno_tool::ToolOutputStore::in_worktree(&generated_root),
+                zuno_tool::OutputLimits::from_config(plan.config.tool_output.as_ref()),
+                super::verification_ledger::receipt_id,
+            );
             let background_notifications = environment.background_notifications();
             let background_notification_directory = plan.directory.clone();
             let delegation_agents = delegation_agents(&plan.agents, plan.vision_available)?;
@@ -4110,6 +4232,7 @@ impl TurnHost {
                 runs,
                 background_jobs,
                 background_executions,
+                foreground,
                 background_notifications,
                 background_notification_directory,
                 background_reports: child_host,
@@ -4563,34 +4686,20 @@ impl TurnHost {
                 changed = true;
                 serde_json::to_value(goal).map_err(SessionCommandError::internal)?
             }
-            "pause" | "resume" | "cancel" => {
+            "resume" => {
+                if !value.is_empty() {
+                    return Err(SessionCommandError::invalid_arguments(
+                        "usage: /goal resume",
+                    ));
+                }
+                let resumed = self.resume_goal_command(None)?;
+                return goal_resume_command_content(&resumed);
+            }
+            "pause" | "cancel" => {
                 let status = match action {
                     "pause" => zuno_goal::SystemStatus::Paused,
-                    "resume" => zuno_goal::SystemStatus::Active,
                     "cancel" => zuno_goal::SystemStatus::Cancelled,
                     _ => unreachable!("closed goal system action"),
-                };
-                // Resuming is the explicit recovery action an uncertain side effect
-                // waits for, so it retires exactly the calls it can name. Without this
-                // the resume would not resume: the pending obligation is durable, and
-                // the next continuation tick would read it and pause again.
-                //
-                // Pausing and cancelling retire nothing. Neither claims anything was
-                // inspected, and a cancelled goal's evidence is still the evidence.
-                let reconciled = if action == "resume" {
-                    let pending = self
-                        .pending_uncertain_side_effects()
-                        .map_err(SessionCommandError::internal)?;
-                    let part_ids = pending
-                        .iter()
-                        .map(|call| call.part_id.clone())
-                        .collect::<Vec<_>>();
-                    zuno_db::message::MessageStore::new(&self.connection)
-                        .reconcile_uncertain_tool_calls(&part_ids, zuno_db::message::now_millis())
-                        .map_err(SessionCommandError::internal)?;
-                    pending
-                } else {
-                    Vec::new()
                 };
                 let expected_revision = self
                     .goal_store
@@ -4612,22 +4721,7 @@ impl TurnHost {
                         )
                     })?;
                 changed = true;
-                if action == "resume" {
-                    self.session_control
-                        .resume_goal_execution(&self.session_id, zuno_db::message::now_millis())
-                        .map_err(SessionCommandError::internal)?;
-                }
-                let mut output =
-                    serde_json::to_value(goal).map_err(SessionCommandError::internal)?;
-                if !reconciled.is_empty()
-                    && let Some(object) = output.as_object_mut()
-                {
-                    object.insert(
-                        "reconciledUncertainCalls".to_owned(),
-                        serde_json::to_value(&reconciled).map_err(SessionCommandError::internal)?,
-                    );
-                }
-                output
+                serde_json::to_value(goal).map_err(SessionCommandError::internal)?
             }
             "block" => {
                 if value.is_empty() {
@@ -4718,6 +4812,47 @@ impl TurnHost {
             self.work_changes.changed();
         }
         serde_json::to_string_pretty(&output).map_err(SessionCommandError::internal)
+    }
+
+    fn resume_goal_command(
+        &mut self,
+        input_id: Option<String>,
+    ) -> Result<zuno_session_control::GoalResumeOutcome, SessionCommandError> {
+        let goal = self
+            .goal_store
+            .goal(&self.session_id)
+            .map_err(SessionCommandError::goal)?
+            .ok_or_else(|| SessionCommandError::invalid_arguments("no Goal exists to resume"))?;
+        let resumed = self
+            .session_control
+            .resume_goal_with_host_identity(
+                &zuno_types::goal_resume::GoalResumeRequest {
+                    session_id: self.session_id.clone(),
+                    goal_id: goal.goal_id,
+                    expected_revision: goal.revision,
+                    input_id,
+                },
+                if self.agent == "plan" {
+                    CollaborationMode::Plan
+                } else {
+                    CollaborationMode::Work
+                },
+                self.current_turn_identity(),
+                zuno_db::message::now_millis(),
+            )
+            .map_err(|error| match error {
+                error @ zuno_session_control::SessionControlError::ResumeRejected { .. } => {
+                    SessionCommandError::invalid_arguments(error.to_string())
+                }
+                error => SessionCommandError::internal(error),
+            })?;
+        // The transaction is authoritative. A projection failure must not lose
+        // the already committed control or invite a second resume operation.
+        if let Err(error) = self.write_goal_projection() {
+            tracing::warn!(%error, "Goal resume committed but its projection could not be refreshed");
+        }
+        self.work_changes.changed();
+        Ok(resumed)
     }
 
     fn set_goal_objective(
@@ -4873,7 +5008,7 @@ impl TurnHost {
         arguments: &str,
         events: TurnEventSender,
     ) -> Result<(), SessionCommandError> {
-        let _guard = self
+        let guard = self
             .runs
             .begin_turn(self.session_id.clone())
             .map_err(SessionCommandError::internal)?;
@@ -4884,7 +5019,25 @@ impl TurnHost {
             .await
             .map_err(SessionCommandError::internal)?;
         let was_materialized = self.is_session_materialized();
-        match self.goal_command(arguments) {
+        let mut words = arguments.split_whitespace();
+        let is_resume = words.next() == Some("resume");
+        let resumed = if is_resume {
+            Some(if words.next().is_some() {
+                Err(SessionCommandError::invalid_arguments(
+                    "usage: /goal resume",
+                ))
+            } else {
+                self.resume_goal_command(None)
+            })
+        } else {
+            None
+        };
+        let (content, resume_input) = match resumed {
+            Some(Ok(resumed)) => (goal_resume_command_content(&resumed), resumed.input),
+            Some(Err(error)) => (Err(error), None),
+            None => (self.goal_command(arguments), None),
+        };
+        match content {
             Ok(content) => {
                 if !was_materialized && self.is_session_materialized() {
                     events
@@ -4902,6 +5055,20 @@ impl TurnHost {
                     })
                     .await
                     .map_err(SessionCommandError::internal)?;
+                if let Some(input) = resume_input
+                    && let Err(error) = self
+                        .drive_committed_goal_resume(&input, &guard, &events)
+                        .await
+                {
+                    events
+                        .publish(TurnEvent::SessionCommandFailed {
+                            command: SessionCommand::Goal,
+                            message: error.to_string(),
+                        })
+                        .await
+                        .map_err(SessionCommandError::internal)?;
+                    return Err(error);
+                }
                 events
                     .publish(TurnEvent::SessionCommandCompleted {
                         command: SessionCommand::Goal,
@@ -4912,7 +5079,9 @@ impl TurnHost {
                 // with `last_turn_completed = false`, so without this idle edge the durable
                 // active Goal is persisted but the shared continuation driver is never allowed
                 // to prepare its first autonomous turn.
-                self.last_turn_completed = true;
+                if !is_resume {
+                    self.last_turn_completed = true;
+                }
                 Ok(())
             }
             Err(error) => {
@@ -4926,6 +5095,40 @@ impl TurnHost {
                 Err(error)
             }
         }
+    }
+
+    async fn drive_committed_goal_resume(
+        &mut self,
+        input: &zuno_db::inbox::SessionInput,
+        guard: &SessionRunGuard,
+        events: &TurnEventSender,
+    ) -> Result<(), SessionCommandError> {
+        let continuation = serde_json::from_value::<ContinuationToken>(
+            input.prompt.get("continuation").cloned().ok_or_else(|| {
+                SessionCommandError::internal("committed Goal resume control has no continuation")
+            })?,
+        )
+        .map_err(SessionCommandError::internal)?;
+        if continuation.identity != self.current_turn_identity() {
+            return Err(SessionCommandError::invalid_arguments(
+                "Goal resume is committed and queued for its saved Work identity; reopen that identity to drive it",
+            ));
+        }
+        if let Some(promoted) = self
+            .inbox
+            .promote_revision(&self.session_id, &input.id, input.revision)
+            .map_err(SessionCommandError::internal)?
+        {
+            self.drive_promoted_start_work_with_guard(
+                &promoted.id,
+                continuation,
+                guard,
+                events.clone(),
+            )
+            .await
+            .map_err(SessionCommandError::internal)?;
+        }
+        Ok(())
     }
 
     async fn execute_learn_command(
@@ -5038,6 +5241,9 @@ impl TurnHost {
         let value = parts.next().unwrap_or_default().trim();
         let now = zuno_db::message::now_millis();
         let output = match action {
+            "reprocess" => self.learn_reprocess(value)?,
+            "repair-history" => self.learn_repair_history(value)?,
+            "status" if value.is_empty() => self.learn_runtime_status()?,
             "get" | "show" if !value.is_empty() => {
                 let record = zuno_db::experience::ExperienceStore::new(Arc::clone(&self.database))
                     .get(value)
@@ -5499,6 +5705,9 @@ impl TurnHost {
             }
             "help" => {
                 return Ok("/learn
+/learn status
+/learn reprocess <assistant-message-id>
+/learn repair-history [--dry-run]
 /learn list [offset]
 /learn get <experience-id>
 /learn inspect-memory|import-memory <global|project>
@@ -5972,9 +6181,15 @@ impl TurnHost {
 
     fn start_learning_maintenance(&self) {
         let Some(learning) = &self.learning else {
+            self.learning_supervisor.suspend_project(&self.project_id);
             return;
         };
+        if !learning.scheduler.generates() {
+            self.learning_supervisor.suspend_project(&self.project_id);
+            return;
+        }
         let Some(generation) = &learning.generation else {
+            self.learning_supervisor.suspend_project(&self.project_id);
             return;
         };
         self.learning_supervisor.ensure_project(
@@ -7298,35 +7513,68 @@ impl TurnHost {
         guard: &SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<(), String> {
-        self.require_active_extension_composition()?;
-        self.preload_turn_skills(&[prompt], &events).await?;
-        let (message, parts) =
-            self.prepare_turn_user_message(prompt, options.message_id, options.content)?;
-        let materialized = match options.persistence {
-            UserInputPersistence::AdmitAndPromote => self.persist_user_input(&message, &parts)?,
-            UserInputPersistence::AlreadyPromoted => {
-                self.persist_promoted_user_input(&message, &parts)?;
-                false
+        let mut driven_input_id = options.message_id.map(str::to_owned);
+        let result = async {
+            self.require_active_extension_composition()?;
+            self.preload_turn_skills(&[prompt], &events).await?;
+            let (message, parts) =
+                self.prepare_turn_user_message(prompt, options.message_id, options.content)?;
+            driven_input_id = Some(message.id.clone());
+            let materialized = match options.persistence {
+                UserInputPersistence::AdmitAndPromote => {
+                    self.persist_user_input(&message, &parts)?
+                }
+                UserInputPersistence::AlreadyPromoted => {
+                    self.persist_promoted_user_input(&message, &parts)?;
+                    false
+                }
+            };
+            if materialized {
+                events
+                    .publish(TurnEvent::SessionMaterialized {
+                        session_id: self.session_id.clone(),
+                        title: self.session_title.clone(),
+                    })
+                    .await
+                    .map_err(to_string)?;
             }
-        };
-        if materialized {
-            events
-                .publish(TurnEvent::SessionMaterialized {
-                    session_id: self.session_id.clone(),
-                    title: self.session_title.clone(),
-                })
-                .await
-                .map_err(to_string)?;
+            self.drive_prepared(
+                prompt,
+                options.planning_source,
+                options.content,
+                options.routing.as_ref(),
+                guard,
+                events,
+            )
+            .await
         }
-        self.drive_prepared(
-            prompt,
-            options.planning_source,
-            options.content,
-            options.routing.as_ref(),
-            guard,
-            events,
-        )
-        .await
+        .await;
+        if let Some(input_id) = driven_input_id {
+            let receipts =
+                zuno_db::input_receipt::InputReceiptStore::new(Arc::clone(&self.database));
+            if let Err(error) = &result {
+                receipts
+                    .fail_input(
+                        &self.session_id,
+                        &input_id,
+                        &redact_learning_text(error, self.credential.as_deref()),
+                        guard.interrupt_signal().is_set(),
+                        zuno_db::message::now_millis(),
+                    )
+                    .map_err(to_string)?;
+            } else if receipts
+                .get(&self.session_id, &input_id)
+                .map_err(to_string)?
+                .is_some_and(|receipt| !receipt.state.is_terminal())
+            {
+                receipts.fail_input(
+                    &self.session_id, &input_id,
+                    "native processing stopped before this input was applied; its durable record was retained",
+                    guard.interrupt_signal().is_set(), zuno_db::message::now_millis(),
+                ).map_err(to_string)?;
+            }
+        }
+        result
     }
 
     /// Drive every settled report one idle wake claimed as a single provider request.
@@ -7967,12 +8215,43 @@ impl TurnHost {
 
     async fn execute_turn_unaccounted(
         &mut self,
+        dynamic_context: DynamicContext,
+        refresh_instruction: DynamicContextRefreshInstruction,
+        turn_start: TurnStart,
+        routing: Option<&PromptRouting>,
+        guard: &SessionRunGuard,
+        events: TurnEventSender,
+    ) -> Result<Option<TurnOutcome>, TurnFailure> {
+        let mut receipts =
+            input_receipts::ReceiptCycle::new(Arc::clone(&self.database), &self.session_id);
+        let outcome = self
+            .execute_turn_unaccounted_inner(
+                dynamic_context,
+                refresh_instruction,
+                turn_start,
+                routing,
+                guard,
+                events,
+                &mut receipts,
+            )
+            .await;
+        receipts.finish(&outcome, self.credential.as_deref())?;
+        outcome
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one logical operation retains its receipt owner across internal recovery"
+    )]
+    async fn execute_turn_unaccounted_inner(
+        &mut self,
         mut dynamic_context: DynamicContext,
         mut refresh_instruction: DynamicContextRefreshInstruction,
         mut turn_start: TurnStart,
         routing: Option<&PromptRouting>,
         guard: &SessionRunGuard,
         events: TurnEventSender,
+        receipts: &mut input_receipts::ReceiptCycle,
     ) -> Result<Option<TurnOutcome>, TurnFailure> {
         let proposed_cycle_id = match &turn_start {
             TurnStart::UserControl { continuation, .. }
@@ -8037,9 +8316,31 @@ impl TurnHost {
         };
         self.persist_turn_continuation(&cycle_id, &turn_start, false)
             .map_err(TurnFailure::host)?;
+        let foreground_budget = Arc::new(foreground::ForegroundTurnBudget::new(
+            self.session_id.clone(),
+            cycle_id.clone(),
+            self.turn_allowance,
+            Arc::new(
+                zuno_goal::GoalBudgetPolicy::new(Arc::clone(&self.goal_store))
+                    .with_allowance(self.turn_allowance),
+            ),
+        ));
         let mut context_compactions = 0_u32;
         let work = zuno_tools::WorkStateStore::new(Arc::clone(&self.database));
         loop {
+            let engine_turn_id = Uuid::new_v4().simple().to_string();
+            let input_ids = match &turn_start {
+                TurnStart::UserMessage => self
+                    .latest_user_anchor()
+                    .map_err(TurnFailure::host)?
+                    .into_iter()
+                    .collect(),
+                TurnStart::UserControl { continuation, .. } => {
+                    receipts.control_inputs(&continuation.cycle_id)?
+                }
+                _ => Vec::new(),
+            };
+            receipts.begin(&engine_turn_id, &input_ids)?;
             let plan_before = work
                 .plan(&self.session_id)
                 .map_err(TurnFailure::work_state)?
@@ -8047,6 +8348,11 @@ impl TurnHost {
             let dynamic_context_refresher = HostDynamicContextRefresher {
                 goal_continuation: self.goal_continuation.clone(),
                 instruction: refresh_instruction.clone(),
+                memory: self.memory.clone(),
+                memory_policy_store: self.memory_policy_store.clone(),
+                memory_default_use: self.memory_policy.use_memories,
+                memory_allowed: self.can_use_memories,
+                foreground_instruction: foreground_budget.instruction(),
             };
             let (outcome, completed_turn_id) = match self
                 .execute_one_turn_unaccounted(
@@ -8056,6 +8362,8 @@ impl TurnHost {
                     routing,
                     guard,
                     events.clone(),
+                    Arc::clone(&foreground_budget),
+                    &engine_turn_id,
                 )
                 .await
             {
@@ -8119,6 +8427,68 @@ impl TurnHost {
             else {
                 return Ok(Some(outcome));
             };
+            let foreground = self
+                .foreground
+                .wait(&foreground::ForegroundWaitScope {
+                    guard,
+                    turn_id: &completed_turn_id,
+                    budget: &foreground_budget,
+                })
+                .await
+                .map_err(|error| TurnFailure::Engine(error.into_turn_error()))?;
+            for publication in &foreground.publications {
+                events
+                    .publish(publication.event(*steps))
+                    .await
+                    .map_err(TurnFailure::event_consumer)?;
+            }
+            match &foreground.wake {
+                foreground::ForegroundWake::Completed | foreground::ForegroundWake::Steering => {
+                    let instruction = self
+                        .foreground
+                        .resume_instruction(&self.session_id, &foreground)
+                        .map_err(|error| TurnFailure::Engine(error.into_turn_error()))?;
+                    dynamic_context = self.goal_dynamic_context().map_err(TurnFailure::host)?;
+                    if let Some(instruction) = instruction {
+                        dynamic_context =
+                            dynamic_context.with_runtime_instruction(instruction.clone());
+                        refresh_instruction = DynamicContextRefreshInstruction::Fixed(instruction);
+                    } else {
+                        dynamic_context = refresh_instruction
+                            .apply(dynamic_context, ToolDynamicContextRefresh::WorkItems);
+                    }
+                    let continuation = self
+                        .persist_turn_continuation(&cycle_id, &turn_start, false)
+                        .map_err(TurnFailure::host)?;
+                    turn_start = TurnStart::Recovery { continuation };
+                    continue;
+                }
+                foreground::ForegroundWake::Interrupted { request } => {
+                    self.questions
+                        .interrupt_plan_turn(&self.session_id, &completed_turn_id)
+                        .await
+                        .map_err(TurnFailure::host)?;
+                    events
+                        .publish(TurnEvent::TurnInterrupted {
+                            assistant_message_id: Some(assistant_message_id.clone()),
+                            steps: *steps,
+                            request: *request,
+                        })
+                        .await
+                        .map_err(TurnFailure::event_consumer)?;
+                    return Ok(Some(TurnOutcome::Interrupted {
+                        assistant_message_id: Some(assistant_message_id.clone()),
+                        steps: *steps,
+                    }));
+                }
+                foreground::ForegroundWake::BudgetLimited(stop) => {
+                    return Err(TurnFailure::Engine(TurnError::BudgetLimited {
+                        kind: stop.kind,
+                        detail: stop.detail.clone(),
+                    }));
+                }
+                foreground::ForegroundWake::Idle => {}
+            }
             let unsafe_outcome = !self
                 .pending_uncertain_side_effects()
                 .map_err(TurnFailure::host)?
@@ -8402,6 +8772,10 @@ impl TurnHost {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the same logical budget is passed alongside the existing explicit turn dependencies"
+    )]
     async fn execute_one_turn_unaccounted(
         &mut self,
         dynamic_context: DynamicContext,
@@ -8410,6 +8784,8 @@ impl TurnHost {
         routing: Option<&PromptRouting>,
         guard: &SessionRunGuard,
         events: TurnEventSender,
+        foreground_budget: Arc<foreground::ForegroundTurnBudget>,
+        engine_turn_id: &str,
     ) -> Result<(TurnOutcome, String), TurnFailure> {
         self.refresh_memory_policy().map_err(TurnFailure::host)?;
         let mut resolver = self.resolver.clone();
@@ -8422,23 +8798,10 @@ impl TurnHost {
                 .and_then(|state| state.cycle_id);
             resolver.orchestration_seed = Some(Arc::new(seed));
         }
-        if self.memory_policy.use_memories
-            && let Some(memory) = &self.memory
-        {
-            for snapshot in memory.snapshots().map_err(TurnFailure::memory)? {
-                resolver
-                    .upsert_prompt_section(
-                        match snapshot.scope {
-                            zuno_types::MemoryScope::Global => "memory.global",
-                            zuno_types::MemoryScope::Project => "memory.project",
-                        },
-                        snapshot.source,
-                        snapshot.content,
-                    )
-                    .map_err(TurnFailure::host)?;
-            }
-        }
-        apply_session_memory_use(&mut resolver, self.memory_policy.use_memories);
+        // Resident Memory is request-local dynamic context. A startup copy in
+        // the static prompt would remain stale and duplicate the live snapshot.
+        resolver.remove_prompt_section("memory.global");
+        resolver.remove_prompt_section("memory.project");
         let skills = self.skill_catalog.snapshot();
         announce_skills(
             &mut resolver,
@@ -8493,6 +8856,17 @@ impl TurnHost {
         }
         let proactive_compaction_threshold =
             CompactionPolicy::resolve(&self.compaction_config, self.window).proactive_threshold();
+        let turn_id = engine_turn_id.to_owned();
+        let foreground_hooks = Arc::new(
+            foreground::ForegroundTurnHooks::new(foreground_budget.clone(), turn_id.clone())
+                .with_foreground(foreground::ForegroundHookContext {
+                    coordinator: self.foreground.clone(),
+                    interrupt: guard.interrupt_signal().clone(),
+                    steering: guard.soft_interrupt_signal().clone(),
+                    events: events.clone(),
+                    instruction: foreground_budget.instruction(),
+                }),
+        );
         let context = TurnContext::new(
             &mut self.connection,
             &self.providers,
@@ -8514,11 +8888,8 @@ impl TurnHost {
         // unbounded, which is how a run that has stopped making progress keeps paying
         // for requests until a human notices. Read from the runtime rather than
         // constructed here so one default governs every front end.
-        .with_budget_policy(Arc::new(
-            zuno_goal::GoalBudgetPolicy::new(Arc::clone(&self.goal_store))
-                .with_allowance(self.turn_allowance),
-        ));
-        let turn_id = Uuid::new_v4().simple().to_string();
+        .with_budget_policy(foreground_budget.clone())
+        .with_hooks(foreground_hooks.clone());
         let mut request =
             RunTurnRequest::new(self.session_id.clone(), turn_id.clone(), dynamic_context)
                 .with_start(turn_start.clone())
@@ -8527,7 +8898,54 @@ impl TurnHost {
         if let Some(threshold) = proactive_compaction_threshold {
             request = request.with_context_compaction_threshold(threshold);
         }
-        let outcome = self.driver.drive(request, context, events.clone()).await;
+        let mut outcome = self.driver.drive(request, context, events.clone()).await;
+        if !matches!(outcome, Ok(TurnOutcome::Interrupted { .. }))
+            && let Some(failure) = foreground_hooks.take_failure()
+        {
+            outcome = Err(match foreground_budget.current_stop() {
+                Some(stop) => TurnError::BudgetLimited {
+                    kind: stop.kind,
+                    detail: stop.detail,
+                },
+                None => failure.into_turn_error(),
+            });
+        }
+        if matches!(
+            outcome,
+            Ok(TurnOutcome::Interrupted { .. }) | Err(TurnError::BudgetLimited { .. })
+        ) {
+            let stopped = self
+                .foreground
+                .stop(
+                    &foreground::ForegroundWaitScope {
+                        guard,
+                        turn_id: &turn_id,
+                        budget: &foreground_budget,
+                    },
+                    foreground_budget.current_stop(),
+                )
+                .await
+                .map_err(|error| TurnFailure::Engine(error.into_turn_error()))?;
+            for publication in &stopped.publications {
+                events
+                    .publish(publication.event(0))
+                    .await
+                    .map_err(TurnFailure::event_consumer)?;
+            }
+            if !stopped.pending.is_empty() {
+                events.publish(TurnEvent::Notice {
+                    audience: NoticeAudience::User,
+                    severity: NoticeSeverity::Warning,
+                    code: "foreground.observation_incomplete".to_owned(),
+                    detail: format!(
+                        "{} foreground handles still lack a confirmed final observation: {}. \
+                         Inspect these handles and authoritative state; do not rerun their commands.",
+                        stopped.pending.len(),
+                        stopped.pending.iter().take(16).map(ToString::to_string).collect::<Vec<_>>().join(", "),
+                    ),
+                }).await.map_err(TurnFailure::event_consumer)?;
+            }
+        }
         let context_recovery = outcome
             .as_ref()
             .err()
@@ -8759,12 +9177,13 @@ impl TurnHost {
         events: &TurnEventSender,
     ) -> Result<bool, TurnFailure> {
         self.compaction_state.reset_retryable_failure();
+        let internals = self.current_memory_internals().map_err(TurnFailure::host)?;
         let providers = RegistryProviders(&self.providers);
         let noop_hooks = zuno_engine::compaction::NoopCompactionHooks;
         let mut context = PreludeContext {
             connection: &mut self.connection,
             providers: &providers,
-            internals: &self.internals,
+            internals: &internals,
             compaction: &self.compaction_config,
             window: self.window,
             state: &mut self.compaction_state,
@@ -8807,7 +9226,30 @@ impl TurnHost {
     }
 
     fn goal_dynamic_context(&self) -> Result<DynamicContext, String> {
-        goal_dynamic_context_from(&self.connection, &self.goal_continuation, &self.session_id)
+        Ok(
+            goal_dynamic_context_from(&self.connection, &self.goal_continuation, &self.session_id)?
+                .with_memory(self.current_memory_context()?),
+        )
+    }
+
+    fn current_memory_context(&self) -> Result<String, String> {
+        current_resident_memory(
+            self.memory.as_deref(),
+            &self.memory_policy_store,
+            &self.session_id,
+            self.memory_policy.use_memories,
+            self.can_use_memories,
+        )
+    }
+
+    fn current_memory_internals(&self) -> Result<Internals, String> {
+        let mut internals = self.internals.clone();
+        let memory = self.current_memory_context()?;
+        if !memory.is_empty() {
+            internals.compaction.prompt.push_str("\n\n");
+            internals.compaction.prompt.push_str(&memory);
+        }
+        Ok(internals)
     }
 
     fn finish_goal_turn(
@@ -8955,6 +9397,8 @@ impl TurnHost {
             scheduled_at = admitted.scheduled_at,
             "automatic learning extraction queued for the background idle worker"
         );
+        self.start_learning_maintenance();
+        self.learning_supervisor.wake_project(&self.project_id);
         self.work_changes.changed();
     }
 
@@ -9256,12 +9700,13 @@ impl TurnHost {
         automatic: bool,
         guard: &SessionRunGuard,
     ) -> Result<zuno_engine::prelude::PreludeCompactionOutcome, TurnFailure> {
+        let internals = self.current_memory_internals().map_err(TurnFailure::host)?;
         let providers = RegistryProviders(&self.providers);
         let noop_hooks = zuno_engine::compaction::NoopCompactionHooks;
         let mut context = PreludeContext {
             connection: &mut self.connection,
             providers: &providers,
-            internals: &self.internals,
+            internals: &internals,
             compaction: &self.compaction_config,
             window: self.window,
             state: &mut self.compaction_state,
@@ -9292,12 +9737,13 @@ impl TurnHost {
         &mut self,
         guard: &SessionRunGuard,
     ) -> Result<PreludeOutcome, TurnFailure> {
+        let internals = self.current_memory_internals().map_err(TurnFailure::host)?;
         let providers = RegistryProviders(&self.providers);
         let noop_hooks = zuno_engine::compaction::NoopCompactionHooks;
         let mut context = PreludeContext {
             connection: &mut self.connection,
             providers: &providers,
-            internals: &self.internals,
+            internals: &internals,
             compaction: &self.compaction_config,
             window: self.window,
             state: &mut self.compaction_state,
@@ -10941,13 +11387,6 @@ fn configure_resident_memory(
         )?;
     }
     Ok(())
-}
-
-fn apply_session_memory_use(resolver: &mut Resolver, use_memories: bool) {
-    if !use_memories {
-        resolver.remove_prompt_section("memory.global");
-        resolver.remove_prompt_section("memory.project");
-    }
 }
 
 /// Render a failed turn: its category, then every cause it wraps, then what to do.
@@ -13117,3 +13556,7 @@ pub(super) fn finish_with_shutdown<T>(
 #[cfg(test)]
 #[path = "turn_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "turn/tests/foreground_host_tests.rs"]
+mod foreground_host_tests;

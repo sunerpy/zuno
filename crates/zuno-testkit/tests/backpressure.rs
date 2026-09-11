@@ -218,6 +218,19 @@ const CHANNELS: &[ChannelGate] = &[
         "self.sender.send_modify(|generation| {",
     ),
     gate(
+        // ForegroundTurnBudget owns one watch slot for the entire logical
+        // operation, including foreground continuations. The first BudgetStop
+        // is latched; late subscribers read it before waiting for a change.
+        // Observers neither block the sender nor create a queue of stop reasons.
+        "foreground-turn-budget-stop",
+        "zuno-cli/src/cmd/turn/foreground.rs",
+        "let (stop, _) = watch::channel(None);",
+        "latest value (one latched Option<BudgetStop> per logical operation)",
+        Policy::LatestValue,
+        "zuno-cli/src/cmd/turn/foreground.rs",
+        "self.stop.send_if_modified(|current| { if current.is_some() { false } else { *current = Some(reason); true } });",
+    ),
+    gate(
         "plugin-host-completion",
         "zuno-extension/src/host.rs",
         "let (outcome, _receiver) = watch::channel(None);",
@@ -504,7 +517,7 @@ fn source_channel_inventory_matches_the_declared_registry() {
         actual, expected,
         "channel registry differs from production source"
     );
-    assert_eq!(CHANNELS.len(), 46);
+    assert_eq!(CHANNELS.len(), 47);
 
     let crates = crates_root();
     for entry in CHANNELS {
@@ -583,6 +596,10 @@ channel_gate!(
 channel_gate!(
     turn_work_state_changes_keep_latest_value,
     "turn-work-state-changes"
+);
+channel_gate!(
+    foreground_turn_budget_stop_retains_one_snapshot,
+    "foreground-turn-budget-stop"
 );
 channel_gate!(
     learning_project_bindings_keep_latest_value,

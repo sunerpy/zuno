@@ -46,6 +46,52 @@ synthesis.
 directly selected deep-work session can close the same evidence-gated objective it
 implements. Goal ownership and delegation are separate capabilities.
 
+## Verification and test-first changes
+
+Working built-in Agents share one verification rubric for implementation, fixes,
+testing, planning, and review:
+
+1. For an authorized fix to a reproducible bug or a state-machine change, first add or
+   extend a focused behavior test and run it against the old implementation.
+2. Check that the red result demonstrates the intended behavioral failure. A build,
+   dependency, permission, or environment error is not a reproduced regression.
+3. Implement the change, rerun the same test to green, and run the relevant regression
+   checks. Cover observable inputs, outputs, transitions, and applicable interruption,
+   restart, or recovery paths.
+
+Record exact commands, working directory, tested source and inputs, expected and
+observed results, exit status, and authoritative test output or artifact/run receipts.
+Separate completed checks from proposed, blocked, and unrun checks. If reproduction
+is unavailable, explain why and report the strongest verification that was feasible.
+
+Read-only roles gather existing reproduction steps, tests, and receipts without
+editing files or running commands that write. They hand missing tests to an authorized
+writer. Reviewers check the red/green evidence and name gaps; a plan specifies the
+test and expected failure without claiming the test ran.
+
+Documentation, trivial changes, and command/script deliverables use proportional
+checks; not every command needs a new test. Source-string assertions alone do not
+establish runtime behavior. Prompt-output contract tests verify the rendered prompt,
+not whether a model follows it or whether the described runtime behavior works.
+
+Keep serial CI waits on the critical path in the same foreground workflow, with one
+polling owner. Background work is for independent parallel work or an explicit user
+request. A polling timeout does not establish a remote failure; inspect the authoritative
+run status before reporting its outcome.
+
+This is built-in prompt guidance, with no new runtime gate, approval mechanism, or
+authority. Explicit prompt overrides remain authoritative, and existing role and
+delegation boundaries still apply. Hidden tool-free roles keep their output contracts.
+
+The design reference is Codex `eaa8b6d917`: `codex-rs/models-manager/prompt.md`
+("Validating your work"), `codex-rs/prompts/src/review_request.rs::REVIEW_PROMPT`
+with `codex-rs/prompts/templates/review/rubric.md`, and
+`codex-rs/core/tests/suite/prompt_caching.rs::prompt_tools_are_consistent_across_requests`.
+Zuno adopts focused validation and checkable findings, adapting prompt composition
+to one rubric shared by its working roles. The required old-implementation red/green
+sequence for reproducible bugs and state-machine changes is a stricter, user-chosen
+Zuno policy. It is not a claim that Codex enforces a runtime test-first gate.
+
 ## Deep work
 
 The native `deep` definition requires the first-party `deepwork` and

@@ -197,10 +197,22 @@ the provider-visible schema subset. Explicit child-role restrictions narrow this
 authority; a new child invocation does not reuse an obsolete child permission
 snapshot or gain authority from newly discovered global configuration.
 
-Database format 13 adds question definitions/action receipts and scheduling
-metadata. Supported formats 5–12 migrate through one guarded transaction, retain
-original session/message/memory values, and advance the marker last. Legacy
-unbound completions remain evidence; a migration never invents their work cycle.
+The follow-up runtime-consistency work starts from Zuno v0.10.30 and pins Codex
+`eaa8b6d91701d6cabe464141facc677e5915fbfc`. Its per-issue source mapping and
+intentional differences are in [the six-part audit](harness-comparison.md#six-part-runtime-consistency-audit).
+
+Database format 14 retains the published question/scheduling contracts and adds
+`InputAdmissionReceipt`, `GoalResumeRequest` binding and `ContextUsageSnapshot`
+persistence. Supported formats 5–13 migrate through one guarded transaction,
+retain original session/message/memory values, and advance the marker last.
+Legacy unbound completions remain evidence; a migration never invents a work
+cycle, model application, verified Memory source or Goal resume.
+
+Input admission, history recording, model application and terminal processing
+are distinct native facts. Standard ACP prompt waits for its associated outcome;
+steer returns immediate admission. All clients consume the same Context snapshot,
+not independent guesses. A paused Goal is offered a skippable host-owned resume
+choice; its exact Goal revision and original input are validated atomically.
 
 ## TUI
 

@@ -168,6 +168,22 @@ pub(super) fn next_input(
     Ok(None)
 }
 
+pub(super) fn next_input_scope(
+    inbox: &SessionInbox,
+    session_id: &str,
+) -> Result<Option<DurableInputScope>, RpcError> {
+    for scope in [
+        DurableInputScope::Controls,
+        DurableInputScope::Automatic,
+        DurableInputScope::Prompts,
+    ] {
+        if next_input(inbox, session_id, scope)?.is_some() {
+            return Ok(Some(scope));
+        }
+    }
+    Ok(None)
+}
+
 fn db_error(error: zuno_error::DbError) -> RpcError {
     RpcError::internal(error.to_string())
 }
@@ -185,6 +201,7 @@ impl PresentationLedger {
 
 pub(super) struct SessionQuestions {
     tasks: Vec<JoinHandle<()>>,
+    input_pump: Option<JoinHandle<()>>,
 }
 
 impl SessionQuestions {
@@ -223,17 +240,21 @@ impl SessionQuestions {
         // Install the receiver before scanning, so a commit racing startup is
         // either in replay or buffered in this subscription.
         let changes = service.subscribe();
-        tasks.push(tokio::spawn(pump_inputs(
+        let input_pump = tokio::spawn(pump_inputs(
             Arc::downgrade(session),
             Arc::downgrade(state),
             client,
             changes,
-        )));
-        Self { tasks }
+        ));
+        Self {
+            tasks,
+            input_pump: Some(input_pump),
+        }
     }
 
     pub(super) fn is_finished(&self) -> bool {
         self.tasks.iter().all(JoinHandle::is_finished)
+            && self.input_pump.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
     pub(super) async fn shutdown(mut self) {
@@ -247,12 +268,23 @@ impl SessionQuestions {
                 tracing::warn!(%error, "ACP question session task failed");
             }
         }
+        // The session already closed admission and signalled native cancellation.
+        // Unlike presentation, the pump may own an accepted logical turn. Let its
+        // host finish receipt settlement before dropping the drive future.
+        if let Some(task) = self.input_pump.take()
+            && let Err(error) = task.await
+        {
+            tracing::warn!(%error, "ACP native input pump failed during shutdown");
+        }
     }
 }
 
 impl Drop for SessionQuestions {
     fn drop(&mut self) {
         for task in &self.tasks {
+            task.abort();
+        }
+        if let Some(task) = &self.input_pump {
             task.abort();
         }
     }
@@ -363,6 +395,9 @@ async fn pump_inputs(
             if let Err(error) = session.pump_pending_input(state.as_ref(), &client).await {
                 tracing::warn!(session_id = %session.id, %error, "ACP pending input remains durable");
             }
+            if session.closed.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
         }
         // Even Reject and failed delivery park here. Neither is an instruction
         // to retry the same durable row in a tight loop.
@@ -381,15 +416,11 @@ impl AcpSession {
         state: &AcpState,
         client: &ClientConnection,
     ) -> Result<(), RpcError> {
-        if self.has_work_in_flight() {
+        if self.has_native_driver_in_flight() {
             return Ok(());
         }
         let inbox = SessionInbox::new(Arc::clone(&state.question_pool));
-        let scope = if next_input(&inbox, &self.id, DurableInputScope::Controls)?.is_some() {
-            DurableInputScope::Controls
-        } else if next_input(&inbox, &self.id, DurableInputScope::Automatic)?.is_some() {
-            DurableInputScope::Automatic
-        } else {
+        let Some(scope) = next_input_scope(&inbox, &self.id)? else {
             return Ok(());
         };
         self.ensure_active(state, client.clone()).await?;
@@ -403,7 +434,7 @@ impl AcpSession {
                 .await?;
             super::publish_configuration_updates(client, &self.id, &configuration).await?;
         }
-        if self.has_work_in_flight() {
+        if self.has_native_driver_in_flight() {
             return Ok(());
         }
         let Ok(guard) = self.runs.begin_turn(self.id.clone()) else {

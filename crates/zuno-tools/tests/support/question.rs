@@ -202,6 +202,11 @@ impl QuestionPort for DurableQuestionPort {
             .push(spec.clone());
         match spec.purpose {
             QuestionPurpose::Clarification => {}
+            QuestionPurpose::GoalResume => {
+                return Err(QuestionError::Unavailable(
+                    "Goal resume requires the native session-control service".to_owned(),
+                ));
+            }
             QuestionPurpose::PlanAuthorization => {
                 let plan = self
                     .plan

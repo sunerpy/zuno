@@ -149,6 +149,134 @@ fn set_cycle(store: &SessionExecutionStore, cycle_id: &str) {
 }
 
 #[tokio::test]
+async fn a_lost_execution_handle_is_uncertain_and_cannot_spawn_a_replacement() {
+    let directory = tempfile::tempdir().expect("process state");
+    let service = Arc::new(BackgroundExecutionService::open(directory.path()).expect("service"));
+    let missing = BackgroundExecutionId::parse("bg_0123456789abcdef0123456789abcdef").expect("id");
+    for action in [BackgroundAction::Wait, BackgroundAction::Output] {
+        let error = BackgroundTool::new(Arc::clone(&service))
+            .run(read_params(action, &missing), context("ses_owner"))
+            .await
+            .expect_err("lost handle");
+        assert!(matches!(error, zuno_error::ToolError::Uncertain { .. }));
+    }
+    assert!(service.list().is_empty());
+    assert!(service.foreground_for_session("ses_owner").is_empty());
+    assert_eq!(
+        std::fs::read_dir(directory.path())
+            .expect("state directory")
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_failed_durable_foreground_receipt_leaves_the_original_handle_pending() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let background = tempfile::tempdir().expect("process state");
+    let service = Arc::new(BackgroundExecutionService::open(background.path()).expect("service"));
+    let mut callbacks = service.subscribe();
+    let shell = support::sandbox::shell_tool(directory.path())
+        .with_background_executions(Arc::clone(&service));
+    let launched = shell
+        .run(shell_params(false), context("ses_owner"))
+        .await
+        .expect("foreground");
+    let id = BackgroundExecutionId::parse(launched.metadata["task_id"].as_str().expect("id"))
+        .expect("valid");
+    std::fs::write(directory.path().join("release"), b"finish").expect("release");
+    service.wait(&id, None).await.expect("settled");
+    let missing_schema = Arc::new(Pool::open(&DbLocation::Memory).expect("empty test DB"));
+    let tool = BackgroundTool::new(Arc::clone(&service)).with_completion_delivery(missing_schema);
+    assert!(
+        tool.run(
+            read_params(BackgroundAction::Output, &id),
+            context("ses_owner")
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(service.foreground_for_session("ses_owner").len(), 1);
+    assert!(
+        !service
+            .foreground(&id, "ses_owner")
+            .expect("original handle")
+            .consumed
+    );
+    assert_eq!(
+        service.complete_output(&id).expect("recoverable output"),
+        b"origin-result"
+    );
+    assert!(callbacks.try_recv().is_err());
+
+    let pool = completion_pool();
+    let output = BackgroundTool::new(Arc::clone(&service))
+        .with_completion_delivery(Arc::clone(&pool))
+        .run(
+            read_params(BackgroundAction::Wait, &id),
+            context("ses_owner"),
+        )
+        .await
+        .expect("recover delivery");
+    assert_eq!(
+        output.metadata[zuno_tools::bg::BACKGROUND_METADATA_KEY]["completionClaimedInline"],
+        true
+    );
+    assert!(service.foreground_for_session("ses_owner").is_empty());
+    assert!(
+        SessionInbox::new(pool)
+            .pending("ses_owner")
+            .expect("inbox")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn corrupt_foreground_verification_is_not_reconstructed_or_consumed() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let background = tempfile::tempdir().expect("process state");
+    let service = Arc::new(BackgroundExecutionService::open(background.path()).expect("service"));
+    let shell = support::sandbox::shell_tool(directory.path())
+        .with_background_executions(Arc::clone(&service));
+    let launched = shell
+        .run(shell_params(false), context("ses_owner"))
+        .await
+        .expect("foreground");
+    let id = BackgroundExecutionId::parse(launched.metadata["task_id"].as_str().expect("id"))
+        .expect("valid");
+    std::fs::write(directory.path().join("release"), b"finish").expect("release");
+    let settled = service.wait(&id, None).await.expect("settled").info;
+    let mut row: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&settled.status_file).expect("row")).expect("JSON");
+    row["foreground"]["context"]["metadata"]["shell"]["version"] = json!(99);
+    std::fs::write(&settled.status_file, serde_json::to_vec(&row).expect("row"))
+        .expect("corrupt fixture");
+    let restored = Arc::new(BackgroundExecutionService::open(background.path()).expect("reopen"));
+    let pool = completion_pool();
+    let error = BackgroundTool::new(Arc::clone(&restored))
+        .with_completion_delivery(Arc::clone(&pool))
+        .run(
+            read_params(BackgroundAction::Output, &id),
+            context("ses_owner"),
+        )
+        .await
+        .expect_err("unknown receipt version");
+    assert!(matches!(error, zuno_error::ToolError::Uncertain { .. }));
+    assert!(
+        !restored
+            .foreground(&id, "ses_owner")
+            .expect("pending handle")
+            .consumed
+    );
+    assert!(
+        CompletionDeliveryStore::new(pool)
+            .get(&zuno_tools::bg::background_completion_source_key(&settled))
+            .expect("lookup")
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn running_output_and_wait_do_not_publish_or_claim_a_completion() {
     let directory = tempfile::tempdir().expect("workspace");
     let service =
@@ -367,7 +495,7 @@ async fn terminal_reads_supersede_pending_callbacks_but_preserve_promoted_and_co
 }
 
 #[tokio::test]
-async fn shell_preserves_the_origin_cycle_across_later_cycles_for_background_and_promoted_runs() {
+async fn shell_preserves_the_origin_cycle_across_later_cycles_for_background_and_yielded_runs() {
     for background in [true, false] {
         let directory = tempfile::tempdir().expect("workspace");
         let background_dir = tempfile::tempdir().expect("background directory");
@@ -399,7 +527,7 @@ async fn shell_preserves_the_origin_cycle_across_later_cycles_for_background_and
         assert_eq!(running.cycle_id.as_deref(), Some("cycle_origin"));
         assert_eq!(running.status.as_str(), "running");
         if !background {
-            assert_eq!(launched.metadata["timeout_promoted"], true);
+            assert_eq!(launched.metadata["foreground_yielded"], true);
         }
         set_cycle(&execution_store, "cycle_later_before_completion");
         std::fs::write(directory.path().join("release"), b"finish").expect("release command");
@@ -410,6 +538,71 @@ async fn shell_preserves_the_origin_cycle_across_later_cycles_for_background_and
             .info;
         assert_eq!(settled.status.as_str(), "completed");
         assert_eq!(settled.cycle_id.as_deref(), Some("cycle_origin"));
+        if !background {
+            set_cycle(&execution_store, "cycle_later_before_inline_read");
+            let restored = Arc::new(
+                BackgroundExecutionService::open(background_dir.path())
+                    .expect("restored foreground"),
+            );
+            let foreground = restored
+                .foreground(&id, "ses_owner")
+                .expect("original handle");
+            assert!(restored.list_for_session("ses_owner").is_empty());
+            let tool = BackgroundTool::new(Arc::clone(&restored))
+                .with_completion_delivery(Arc::clone(&pool));
+            let output = tool
+                .run(read_params(BackgroundAction::Output, &id), turn_context())
+                .await
+                .expect("inline foreground completion");
+            let receipt = zuno_tool::VerificationReceipt::from_metadata(&output.metadata)
+                .expect("valid receipt")
+                .expect("foreground receipt");
+            assert!(
+                !receipt.proves_success(),
+                "a remote observer cannot prove remote success"
+            );
+            let expected = zuno_tools::bg::foreground_completion_envelope(&foreground, &receipt);
+            let delivery = CompletionDeliveryStore::new(Arc::clone(&pool));
+            let stored = delivery
+                .get(&expected.source_key)
+                .expect("lookup")
+                .expect("stored receipt");
+            assert_eq!(stored.envelope, expected);
+            assert_eq!(stored.owner, Some(CompletionOwner::Inline));
+            assert_eq!(stored.envelope.cycle_id.as_deref(), Some("cycle_origin"));
+            assert_eq!(stored.envelope.payload["originCallID"], "call_bg");
+            assert!(
+                delivery
+                    .unclaimed_for_session("ses_owner")
+                    .expect("unclaimed")
+                    .is_empty()
+            );
+            assert!(
+                SessionInbox::new(Arc::clone(&pool))
+                    .pending("ses_owner")
+                    .expect("inbox")
+                    .is_empty()
+            );
+            assert!(restored.foreground_for_session("ses_owner").is_empty());
+            let repeated = tool
+                .run(read_params(BackgroundAction::Wait, &id), turn_context())
+                .await
+                .expect("repeat observation");
+            assert_eq!(
+                repeated.metadata[zuno_tools::bg::BACKGROUND_METADATA_KEY]["completionClaimedInline"],
+                false
+            );
+            assert_eq!(
+                execution_store
+                    .get("ses_owner")
+                    .expect("state")
+                    .expect("execution")
+                    .cycle_id
+                    .as_deref(),
+                Some("cycle_later_before_inline_read")
+            );
+            continue;
+        }
         let envelope = zuno_tools::bg::background_completion_envelope(&settled);
         let callback = zuno_tools::bg::background_completion_input(&settled);
         assert_eq!(envelope.cycle_id.as_deref(), Some("cycle_origin"));

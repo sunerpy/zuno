@@ -157,11 +157,12 @@ next-step report, or Goal-owned human request remains unfinished.
 
 A pause is only actionable if it names what to look at. `/goal show` reports
 `pendingUncertainCalls`, one entry per uncertain call with the tool, the call id, the paths
-the call reported having applied, the typed cause, and when it was observed. `/goal resume`
-is the explicit statement that those states were inspected: it retires exactly the calls it
-listed, reports them as `reconciledUncertainCalls`, and only then lets the Goal run again.
-`/goal pause` and `/goal cancel` retire nothing, because neither claims an inspection
-happened.
+the call reported having applied, the typed cause, and when it was observed.
+`/goal resume` and the optional Resume goal choice do not attest an inspection:
+they preserve the inspection obligation and reject generic recovery while it is
+unresolved. Inspect the authoritative state and settle the relevant domain's
+reconciliation before resuming. `/goal pause` and `/goal cancel` retire nothing,
+because neither claims an inspection happened.
 
 ### Success criteria and evidence
 
@@ -567,7 +568,7 @@ backfill — and the class takes no new members once this build is the one writi
 A dispatched call whose own record cannot name it still owes an inspection. When a provider
 or gateway supplies an empty call id or tool name, `state.uncertain.tool` and
 `state.uncertain.callID` record `<unnamed>` rather than dropping the obligation, and
-`/goal resume` retires it by part id like any other. `<unnamed>` cannot collide with a real
+generic Goal resume cannot retire it merely by naming the part. `<unnamed>` cannot collide with a real
 tool name, and its presence is itself the report that the provider's tool-call identity was
 unusable.
 

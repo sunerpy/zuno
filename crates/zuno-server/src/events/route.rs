@@ -8,6 +8,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use futures::stream;
 use serde_json::{Value, json};
+use zuno_types::context_usage::ContextUsageSnapshot;
 
 use crate::request_broker::SessionRequestObserver;
 use crate::{Delivery, ServerServices};
@@ -116,6 +117,7 @@ struct SessionStream {
     catch_up_to: Option<i64>,
     service: EventService,
     finished: bool,
+    context_usage: Option<ContextUsageSnapshot>,
     _observer: SessionRequestObserver,
 }
 
@@ -134,6 +136,7 @@ impl SessionStream {
             catch_up_to: None,
             service,
             finished: false,
+            context_usage: subscription.context_usage,
             _observer: observer,
         }
     }
@@ -146,6 +149,11 @@ impl SessionStream {
             if let Some(event) = self.replay.pop_front() {
                 self.last_cursor = Some(event.cursor.clone());
                 return Some(encode_event(&event));
+            }
+            if let Some(snapshot) = self.context_usage.take() {
+                // The row is durable state read at the replay boundary. It is not
+                // a newly appended event and must not invent or advance a cursor.
+                return Some(encode_context_snapshot(&snapshot));
             }
             let after = self
                 .last_cursor
@@ -225,6 +233,18 @@ fn encode_event(event: &StreamEvent) -> Result<SseEvent, EventStreamError> {
         .event("message")
         .id(event.cursor.to_string())
         .data(data))
+}
+
+fn encode_context_snapshot(snapshot: &ContextUsageSnapshot) -> Result<SseEvent, EventStreamError> {
+    Ok(SseEvent::default()
+        .event("message")
+        .data(serde_json::to_string(&json!({
+            "type": "session.context.snapshot",
+            "data": {
+                "sessionID": snapshot.session_id,
+                "snapshot": snapshot,
+            },
+        }))?))
 }
 
 fn encode_connected() -> Result<SseEvent, EventStreamError> {

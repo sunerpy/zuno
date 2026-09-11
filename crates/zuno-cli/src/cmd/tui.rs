@@ -677,6 +677,15 @@ fn execute_once(
         ),
         host.session_id(),
     )?;
+    if host.is_session_materialized() {
+        // Codex offers this on thread resume. Publication is not consent and
+        // must never turn a saved pause into an automatic continuation.
+        if let Err(error) =
+            runtime.block_on(question_broker.offer_goal_resume(host.session_id(), None))
+        {
+            tracing::warn!(%error, "could not offer paused Goal recovery");
+        }
+    }
     let child_restore_diagnostics = if host.is_session_materialized() {
         restore_child_sessions(&host.database_pool(), host.session_id(), &live_sessions)
     } else {
@@ -814,11 +823,25 @@ fn execute_once(
                 source: Some(skill.source),
             }
         }));
+    let mut context_restore_warning = None;
     if host.is_session_materialized() {
         screen
             .transcript_mut()
             .transcript_mut()
             .restore_usage(host.session_usage().snapshot());
+        match zuno_db::context_usage::ContextUsageStore::new(host.database_pool())
+            .get(host.session_id())
+        {
+            Ok(Some(snapshot)) => {
+                screen.set_context_usage(snapshot);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                context_restore_warning = Some(format!(
+                    "warning: saved Context usage could not be loaded: {error}"
+                ));
+            }
+        }
     }
     // Before every notice below, and that order is load-bearing in both directions.
     //
@@ -852,6 +875,12 @@ fn execute_once(
                 .transcript_mut()
                 .push(super::tui_replay::failure_notice(host.session_id(), &error));
         }
+    }
+    if let Some(warning) = context_restore_warning {
+        screen
+            .transcript_mut()
+            .transcript_mut()
+            .push(Message::notice(warning));
     }
     for diagnostic in child_restore_diagnostics {
         screen
@@ -2967,6 +2996,17 @@ async fn apply_selection_with_committed_work(
                     "the Plan-mode Work identity changed in memory but could not be persisted: {error}"
                 ));
             }
+            if host.agent_name() != "plan"
+                && let Err(error) = session_control.record_work_selection(
+                    host.session_id(),
+                    host.execution_identity_for(host.agent_name()),
+                    zuno_db::message::now_millis(),
+                )
+            {
+                return SelectionOutcome::Shutdown(format!(
+                    "the selected Work identity could not be persisted: {error}"
+                ));
+            }
             SelectionOutcome::Rebuilt(rebuild.events.clone())
         }
         Err(ReplacementRefusal::UnsupportedPlatform(message)) => {
@@ -4476,6 +4516,19 @@ async fn drive_one(
                 }
             };
             drop(turn);
+            if turn_outcome.is_ok()
+                && let Err(error) = question_presenter
+                    .offer_goal_resume(host.session_id(), promoted_message_id.as_deref())
+                    .await
+            {
+                // The original input already completed. A presentation error
+                // cannot reclassify it as failed or submit it a second time.
+                report_input_failure(
+                    &admission_events,
+                    format!("paused Goal recovery choice could not be shown: {error}"),
+                )
+                .await;
+            }
             while let Ok(followup) = prompts.try_recv() {
                 match followup.target {
                     PromptTarget::Root => admissions.push(Box::pin(admit_followup(
