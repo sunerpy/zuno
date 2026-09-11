@@ -6,7 +6,7 @@ Baseline: `v0.10.29`, `d1212860dba6a6b420ce81d444ace58feaf0adb5`.
 | --- | --- | --- |
 | P0 | Complete | PR #176 merged into preview; native CI run 34553054820 succeeded |
 | P1 | In progress | Principal propagation implemented; ownership migration validated; local bounded driver and scoped session application validated; local runtime Job/lease port validated; Memory persistence/authority ports validated; backend assembly remains |
-| P2 | Pending | PostgreSQL, identity/approval, leases/checkpoints/completion |
+| P2 | In progress | PostgreSQL session TLS/RLS verified locally; runtime Job/Memory, identity/approval and remote state remain |
 | P3 | Pending | Two workers, Docker gateway, root-task takeover |
 | P4 | Pending | Durable child/Workflow/Council waits, merges and cancellation |
 | P5 | Pending | Web, SDK, remote ACP, common projections |
@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p1-memory`.
+- Current phase branch: `codex/enterprise-p2-postgres`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -78,3 +78,13 @@ verification is pending the next preview CI run. No release is enabled.
 - Memory/Learning tests: 179 passed. Focused Memory tool tests: 4 passed. Documentation contracts: 48 passed.
 - Workspace check, Clippy, formatting and diff checks passed after rebuilding task-owned first-party artifacts.
 - File projection remains local. Organization authorization at commit, managed namespaces and the external data owner/worker API are not certified by this port alone.
+
+## PostgreSQL session persistence
+
+- Memory PR #181 merged at `01300d8b911bf266bac9508b3702cc293a5e0cf9`; CI run 34572195521 succeeded.
+- Runtime PR #180 follow-up CI 34570476046 succeeded, including the Windows Goal test.
+- `PostgresSessionPersistence` implements the same session application port using a separate preview schema, restricted runtime role, verified TLS and transaction-local RLS identity.
+- The real PostgreSQL 18 TLS contract passed locally: role limits, TLS refusal, RLS, connection reuse, isolation, idempotency, paging, rollback and schema-integrity checks.
+- Preview publishing contracts: 11 passed. Documentation/release contracts: 99 passed. Shared workspace check, Clippy, fmt and diff checks passed. Actionlint passed.
+- PostgreSQL 16 CI passed on Linux amd64/arm64 in run 34576215561. Its shared supply-chain gate identified the SQLx CA data package; `webpki-roots` now has an explicit per-package data-license exception, like `webpki-root-certs`.
+- PostgreSQL Job/Memory storage and engine integration, Entra, HITL, gateway, distributed waits and the Web are still required. Publication remains disabled.

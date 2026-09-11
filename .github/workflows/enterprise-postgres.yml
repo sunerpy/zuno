@@ -1,0 +1,42 @@
+name: Enterprise PostgreSQL contracts
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres:
+    name: PostgreSQL TLS and RLS (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    env:
+      CARGO_INCREMENTAL: "0"
+      ZUNO_POSTGRES_BINDIR: /usr/lib/postgresql/16/bin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.98.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: enterprise-preview-postgres
+          key: ${{ runner.os }}-${{ runner.arch }}
+      - name: Ensure the isolated database test dependencies
+        run: |
+          set -euo pipefail
+          if [ ! -x "$ZUNO_POSTGRES_BINDIR/initdb" ]; then
+            sudo apt-get update
+            sudo apt-get install -y postgresql-16 libpq-dev openssl
+          fi
+          "$ZUNO_POSTGRES_BINDIR/postgres" --version
+      - name: Verify the PostgreSQL backend with real TLS and restricted roles
+        run: python3 scripts/check_enterprise_postgres.py

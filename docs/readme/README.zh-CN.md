@@ -133,7 +133,7 @@ let profile = zuno_harness::profile_with_tools(
 Agent、Workflow、Skill、WASI Component 和受控进程工具共用同一套 Profile 生命周期。
 组装后的模型请求会在发往 Provider 前持久化为 `session.prompt.assembled`。
 
-组件模型见 [Harness Runtime](../harness-runtime.md)，50 个 crate 的职责与请求流见
+组件模型见 [Harness Runtime](../harness-runtime.md)，51 个 crate 的职责与请求流见
 [项目结构与执行流](../guide/project-structure.md)，扩展包格式与能力授权见
 [插件与扩展](../plugins.md)，声明式 Agent、WASI guest 与原生 Rust 的完整实现路径见
 [开发 Agent 与扩展](../guide/extension-development.md)。设计取舍记录在
