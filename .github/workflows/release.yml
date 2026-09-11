@@ -51,9 +51,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  reject_preview:
+    if: startsWith(github.ref, 'refs/heads/codex/enterprise-') || startsWith(github.ref, 'refs/tags/enterprise-v')
+    runs-on: ubuntu-24.04
+    steps:
+      - run: |
+          echo "::error::Use enterprise-preview-release.yml for enterprise previews"
+          exit 1
   release_please:
     name: Release Please
-    if: github.event_name == 'push' || inputs.mode == 'orchestrate'
+    if: ${{ !startsWith(github.ref, 'refs/heads/codex/enterprise-') && !startsWith(github.ref, 'refs/tags/enterprise-v') && (github.event_name == 'push' || inputs.mode == 'orchestrate') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -217,7 +224,9 @@ jobs:
     name: Resolve release and candidate
     needs: release_please
     if: |
-      !cancelled() && (
+      !cancelled()
+      && !startsWith(github.ref, 'refs/heads/codex/enterprise-')
+      && !startsWith(github.ref, 'refs/tags/enterprise-v') && (
         (needs.release_please.result == 'success' && needs.release_please.outputs.release_created == 'true')
         || (github.event_name == 'workflow_dispatch' && inputs.mode == 'promote')
       )

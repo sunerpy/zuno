@@ -22,6 +22,10 @@ Zuno 是一个本地编程 Agent，提供内置终端界面、无界面执行、
 
 项目仍处于活跃的 0.x 早期开发阶段。Zuno 使用自己的配置、命令、数据格式、工具参数和扩展协议。
 
+独立[企业预览](../../enterprise/README.md)在 `codex/enterprise-preview` 分支开发。
+[完整计划](../../enterprise/PLAN.zh.md)和[交付状态](../../enterprise/STATUS.md)分别记录目标与实际完成情况；
+预览 tag、安装和数据目录与正式通道隔离。
+
 ## 为什么选择 Zuno
 
 - **工作可以从中断处继续。** Prompt、工具结果、重试、计划和子 Agent 报告都属于持久会话状态；

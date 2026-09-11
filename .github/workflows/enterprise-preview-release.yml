@@ -1,0 +1,161 @@
+name: Enterprise preview release
+
+on:
+  push:
+    branches: [codex/enterprise-preview]
+    paths: [enterprise/preview.json]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: enterprise-preview-release
+  cancel-in-progress: false
+
+jobs:
+  identify:
+    if: github.ref == 'refs/heads/codex/enterprise-preview'
+    runs-on: ubuntu-24.04
+    outputs:
+      publish: ${{ steps.identity.outputs.publish }}
+      version: ${{ steps.identity.outputs.version }}
+      tag: ${{ steps.identity.outputs.tag }}
+      matrix: ${{ steps.identity.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: "3.13"
+      - id: identity
+        run: python scripts/enterprise_preview.py identify
+  checks:
+    needs: identify
+    if: needs.identify.outputs.publish == 'true'
+    uses: ./.github/workflows/ci.yml
+  build:
+    needs: identify
+    if: needs.identify.outputs.publish == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.identify.outputs.matrix) }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.98.0"
+          targets: ${{ matrix.triple }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: enterprise-preview
+          key: ${{ matrix.triple }}
+      - name: Build, package and execute the archive's binary
+        env:
+          TARGET: ${{ matrix.triple }}
+          VERSION: ${{ needs.identify.outputs.version }}
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p zuno-enterprise --bin zuno-enterprise --target "$TARGET"
+          mkdir -p dist unpacked
+          archive="zuno-enterprise-${VERSION}-${TARGET}.tar.gz"
+          tar -czf "dist/$archive" -C "target/$TARGET/release" zuno-enterprise
+          tar -xzf "dist/$archive" -C unpacked
+          test "$(unpacked/zuno-enterprise --version)" = "zuno-enterprise $VERSION"
+          unpacked/zuno-enterprise smoke
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: enterprise-preview-${{ matrix.triple }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+  seal:
+    needs: [identify, checks, build]
+    if: >-
+      !cancelled() &&
+      needs.identify.outputs.publish == 'true' &&
+      needs.checks.result == 'success' &&
+      needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: enterprise-preview-*
+          merge-multiple: true
+          path: dist/enterprise-preview
+      - name: Seal this run's exact candidate
+        run: python scripts/enterprise_preview.py seal
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/enterprise-preview/candidate-manifest.json
+            dist/enterprise-preview/enterprise-docs.zip
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sealed-enterprise-preview
+          path: dist/enterprise-preview
+          if-no-files-found: error
+          retention-days: 30
+  publish:
+    needs: [identify, checks, build, seal]
+    if: >-
+      !cancelled() &&
+      github.ref == 'refs/heads/codex/enterprise-preview' &&
+      needs.identify.outputs.publish == 'true' &&
+      needs.checks.result == 'success' &&
+      needs.build.result == 'success' &&
+      needs.seal.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      attestations: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sealed-enterprise-preview
+          path: dist/enterprise-preview
+      - name: Verify source, artifacts and attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python scripts/enterprise_preview.py verify
+          for artifact in dist/enterprise-preview/*.tar.gz dist/enterprise-preview/enterprise-docs.zip dist/enterprise-preview/candidate-manifest.json; do
+            gh attestation verify "$artifact" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/enterprise-preview-release.yml"
+          done
+      - name: Publish only the independent prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.identify.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python scripts/enterprise_preview.py publish --tag "$TAG"

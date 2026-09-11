@@ -24,6 +24,11 @@ binary; Node and Python are not part of the runtime.
 The project is in active early-stage 0.x development. Zuno defines its own
 configuration, commands, data formats, tool arguments, and extension protocol.
 
+The independent [enterprise preview](enterprise/README.md) is developed on
+`codex/enterprise-preview`. Its [approved plan](enterprise/PLAN.zh.md) and
+[delivery status](enterprise/STATUS.md) distinguish implemented capabilities
+from planned work; preview tags and data remain separate from stable releases.
+
 ## Why Zuno
 
 - **Work survives interruption.** Prompts, tool results, retries, plans, and child-agent

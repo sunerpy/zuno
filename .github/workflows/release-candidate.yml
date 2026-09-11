@@ -46,7 +46,15 @@ env:
   CLI_CRATE: zuno
 
 jobs:
+  reject_preview:
+    if: startsWith(github.ref, 'refs/heads/codex/enterprise-') || startsWith(github.ref, 'refs/tags/enterprise-v')
+    runs-on: ubuntu-24.04
+    steps:
+      - run: |
+          echo "::error::The stable candidate controller cannot certify enterprise previews"
+          exit 1
   prepare:
+    if: ${{ !startsWith(github.ref, 'refs/heads/codex/enterprise-') && !startsWith(github.ref, 'refs/tags/enterprise-v') }}
     name: Validate candidate identity
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -515,7 +523,7 @@ jobs:
 
   gate:
     name: zuno/pr-gate
-    if: always()
+    if: ${{ always() && !startsWith(github.ref, 'refs/heads/codex/enterprise-') && !startsWith(github.ref, 'refs/tags/enterprise-v') }}
     needs: [prepare, test, artifact, aggregate]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
