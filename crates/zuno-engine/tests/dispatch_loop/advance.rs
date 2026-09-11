@@ -602,3 +602,70 @@ async fn resumed_execution_keeps_its_admitted_agent_and_model_identity() {
     ));
     assert_eq!(provider.requests().len(), 2);
 }
+
+struct WallClockLimit;
+#[async_trait]
+impl TurnBudgetPolicy for WallClockLimit {
+    async fn before_request(
+        &self,
+        snapshot: &TurnUsageSnapshot<'_>,
+    ) -> Result<BudgetDecision, BudgetPolicyError> {
+        Ok(if snapshot.elapsed_seconds >= 30 {
+            BudgetDecision::stop_time("the turn wall-clock allowance expired while queued")
+        } else {
+            BudgetDecision::Continue
+        })
+    }
+}
+
+#[tokio::test]
+async fn time_between_checkpoints_counts_toward_the_same_turn_allowance() {
+    let mut connection = seeded();
+    let provider = Arc::new(ScriptedProvider::new(provider_events(&[(
+        "once", "complete",
+    )])));
+    let dispatcher = dispatcher(vec![Arc::new(SequentialTool {
+        active: AtomicUsize::new(0),
+        order: Arc::new(Mutex::new(Vec::new())),
+    })]);
+    let (result, _) = advance(
+        &mut connection,
+        provider.clone(),
+        &dispatcher,
+        request(),
+        Arc::new(NoopBudgetPolicy),
+    )
+    .await;
+    let AdvanceOutcome::Progressed { checkpoint } = result.unwrap() else {
+        panic!("checkpoint")
+    };
+    // Advance the persisted wall-clock age without a slow or timing-sensitive test.
+    connection
+        .execute(
+            "UPDATE event SET data=json_set(data,'$.state.checkpoint.startedAtMs',
+         CAST(unixepoch('subsec')*1000 AS INTEGER)-60000)
+         WHERE aggregate_id=?1 AND seq=?2",
+            (SESSION_ID, checkpoint.sequence()),
+        )
+        .unwrap();
+    let (result, _) = advance(
+        &mut connection,
+        provider.clone(),
+        &dispatcher,
+        request().resume(checkpoint),
+        Arc::new(WallClockLimit),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(AdvanceError::Turn(TurnError::BudgetLimited {
+            kind: zuno_engine::budget::BudgetStopKind::TimeBudget,
+            ..
+        }))
+    ));
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "waiting cannot buy another provider request"
+    );
+}

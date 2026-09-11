@@ -45,6 +45,7 @@ all = "warn"
 # release-please still updates every annotated line.
 zuno-acp = { version = "0.10.29", path = "crates/zuno-acp" } # x-release-please-version
 zuno-agent = { version = "0.10.29", path = "crates/zuno-agent" } # x-release-please-version
+zuno-application = { version = "0.10.29", path = "crates/zuno-application" } # x-release-please-version
 zuno-atomic-file = { version = "0.10.29", path = "crates/zuno-atomic-file" } # x-release-please-version
 zuno-aws-auth = { version = "0.10.29", path = "crates/zuno-aws-auth" } # x-release-please-version
 zuno-attachment = { version = "0.10.29", path = "crates/zuno-attachment" } # x-release-please-version

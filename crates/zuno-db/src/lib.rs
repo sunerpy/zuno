@@ -48,6 +48,7 @@ pub mod event_log;
 pub mod experience;
 mod experience_query;
 pub use experience_query::ExperienceMatch;
+pub mod application;
 pub mod feedback;
 pub mod fts;
 pub mod human_request;

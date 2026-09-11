@@ -7325,6 +7325,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "zuno-application"
+version = "0.10.29"
+dependencies = [
+ "async-trait",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "zuno-runtime",
+ "zuno-types",
+]
+
+[[package]]
 name = "zuno-atomic-file"
 version = "0.10.29"
 dependencies = [
@@ -7466,6 +7480,7 @@ dependencies = [
 name = "zuno-db"
 version = "0.10.29"
 dependencies = [
+ "async-trait",
  "base64 0.23.1",
  "hex",
  "proptest",
@@ -7475,11 +7490,14 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
+ "tokio",
  "uuid",
+ "zuno-application",
  "zuno-attachment",
  "zuno-error",
  "zuno-orchestration",
  "zuno-paths",
+ "zuno-runtime",
  "zuno-snapshot",
  "zuno-testkit",
  "zuno-tool",

@@ -2161,6 +2161,18 @@ async fn run_turn_in_span(
     // One clock for the whole turn, read every time the policy is consulted: a time
     // allowance measured per step would restart on each provider request and could
     // never expire.
+    let wall_now_ms = if max_steps.is_some() {
+        context
+            .connection
+            .query_row(
+                "SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(open::map_error)?
+    } else {
+        0
+    };
     let turn_started = std::time::Instant::now();
     let budget = Arc::clone(&context.budget);
     let events = events.with_hooks(Arc::clone(&context.hooks));
@@ -2205,10 +2217,14 @@ async fn run_turn_in_span(
         last_context_tokens: None,
         reported_historical_tool_repair: false,
         elapsed_millis: 0,
+        started_at_ms: wall_now_ms,
     });
     let mut steps = state.steps;
     let yield_after = max_steps.map(|limit| steps.saturating_add(limit.get()));
-    let elapsed_before_millis = state.elapsed_millis;
+    let started_at_ms = state.started_at_ms;
+    let elapsed_before_millis = state
+        .elapsed_millis
+        .max(u64::try_from(wall_now_ms.saturating_sub(started_at_ms)).unwrap_or(0));
     // Incremented where a dispatch group's results come back, so it counts calls the
     // loop ran and never calls the model merely issued: a call a stop or an urgent
     // input kept from running did no work, and a ceiling on this number is meant to
@@ -2292,6 +2308,7 @@ async fn run_turn_in_span(
                     elapsed_millis: elapsed_before_millis.saturating_add(
                         u64::try_from(turn_started.elapsed().as_millis()).unwrap_or(u64::MAX),
                     ),
+                    started_at_ms,
                 },
             )));
         }

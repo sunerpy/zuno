@@ -1,7 +1,7 @@
 # Project structure and execution flow
 
 Use this page to find the crate that owns a behavior before changing it. Zuno is a
-single Rust workspace with 49 crates. `crates/zuno-cli` builds the `zuno` binary;
+single Rust workspace with 50 crates. `crates/zuno-cli` builds the `zuno` binary;
 the other crates keep protocol, runtime, storage, tool, and client concerns out of
 that entry point.
 
@@ -43,6 +43,7 @@ Every crate opts into the workspace lint policy. First-party code forbids
 
 | Crate | Responsibility |
 | --- | --- |
+| `zuno-application` | Scoped client application services and replaceable persistence ports |
 | `zuno-runtime` | Scoped component runtime, typed service publication, transactional profile replacement, and disposer tracking |
 | `zuno-harness` | `HarnessProfile` and `ProfileBundle` composition for the shipped runtime |
 | `zuno-engine` | Turn loop, prompt assembly, provider streaming, tool dispatch, compaction, retry, and cancellation |

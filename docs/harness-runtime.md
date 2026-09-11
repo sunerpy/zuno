@@ -95,9 +95,13 @@ immutable configuration digest. It does not authorize the caller.
 `AdvanceOutcome` distinguishes a committed checkpoint, completion, interruption
 and a human-request wait. A step yields only after its tool results and history
 repairs are durable. The checkpoint retains step/tool counters, disjoint usage,
-elapsed execution time, dynamic context, prompt receipt identities and unresolved
+elapsed wall-clock time, dynamic context, prompt receipt identities and unresolved
 recovery obligations. Process handles and provider caches are reconstructed.
 Resuming the same turn neither emits another turn start nor resets its limits.
+Checkpoint schema 2 retains a database-clock start anchor, so time between
+advances counts toward the same wall-clock allowance; a clock rollback cannot
+reduce already-accounted time. Unpublished schema-1 checkpoints are conservatively
+refused, with their transcript and evidence retained.
 
 The local journal compares the latest driver event in a short SQLite transaction
 before admitting an advance, then conditionally commits its checkpoint or terminal
@@ -111,6 +115,31 @@ receipts and suspended distributed child calls are subsequent enterprise stages.
 It does not move a running process or prove that an external side effect stopped.
 The host must resolve the recorded configuration and recheck current authorization
 before entering each advance.
+
+### Scoped application service
+
+`zuno-application` owns the `AgentApplication` facade and asynchronous
+`SessionPersistence` port. The current service creates, reads and pages sessions,
+and queues native text inputs. Its client DTOs carry logical session, request and
+workspace IDs; host directories, permission overrides and owner overrides are not
+accepted. A host authenticates and authorizes before constructing a scoped view.
+
+`SqliteSessionPersistence` binds a principal to host-registered local workspaces.
+Views share a connection pool and bounded blocking capacity, while every lookup
+and list applies ownership in SQL. Paging uses both update time and session ID,
+so equal timestamps do not lose rows. Idempotency keys include the principal,
+calling application and operation scope. Reusing a key with different input
+conflicts; retrying after a title edit reads the current resource without replacing
+its original creation receipt.
+
+Session creation, ownership and its audit event commit together. Input admission
+and caller attribution commit with the existing native inbox event. The queued
+payload keeps the existing `user` shape and captures the session's Agent/model
+selection. Admission is not execution: Job scheduling, input-version CAS, steering,
+enterprise authorization and Memory/backend coordination remain separate work.
+This local binding is not an execution sandbox or a multi-user filesystem.
+Cancelling an API future does not release its blocking capacity until the database
+operation actually finishes.
 
 ## Agent and prompt contracts
 

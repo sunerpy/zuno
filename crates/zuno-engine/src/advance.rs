@@ -24,7 +24,7 @@ use crate::r#loop::{
 use crate::prompt::PromptTraceSet;
 
 const EVENT_TYPE: &str = "runtime.driver.advance";
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const MAX_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
 
 /// A durable reference, not a caller-supplied replacement checkpoint body.
@@ -185,6 +185,7 @@ pub(crate) struct LoopCheckpoint {
     pub last_context_tokens: Option<u64>,
     pub reported_historical_tool_repair: bool,
     pub elapsed_millis: u64,
+    pub started_at_ms: i64,
 }
 
 pub(crate) enum LoopOutcome {
