@@ -61,3 +61,12 @@ stays disabled in `preview.json`.
 - Workspace check, Clippy, fmt and diff checks passed.
 - Lease expiry remains conservative: the in-flight Job becomes uncertain; other sessions may continue. External-operation reconciliation and automatic remote takeover are not implemented by this store.
 - No enterprise binary, deployment, preview tag or release has been published.
+
+## Preview CI follow-up
+
+PR #180's first run (34566618169) exposed a cold event-initialization race and a
+Windows Goal suite timeout. A 12-publisher memory-database test reproduces the
+initialization failure. Event initialization now runs once and excludes pool
+writers; 68 Server tests pass. The Goal fixture selects Bash/PowerShell explicitly
+and uses native diagnostic syntax; its Linux end-to-end run passes. Windows
+verification is pending the next preview CI run. No release is enabled.

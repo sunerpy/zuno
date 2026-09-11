@@ -63,6 +63,12 @@ Database opening recognizes these states:
 4. **Any other state.** An older unsupported format, a future format, a missing marker,
    or a marker whose required tables are absent fails closed without modification.
 
+An event service initializes once before publishing. Concurrent first publishers
+share that initialization, and schema validation excludes writes through the same
+pool. This prevents shared-cache memory databases from opening a connection or
+holding schema-read locks while another publisher starts its transaction.
+Only successful initialization is cached; a failed attempt remains retryable.
+
 Two processes that open or upgrade the same database at the same time both decide from
 the format they saw before taking SQLite's write lock. The one that loses the lock does
 not fail: it re-reads the marker and validates, upgrades, or rejects what the winner

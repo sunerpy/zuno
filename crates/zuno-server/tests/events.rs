@@ -32,6 +32,34 @@ fn event_service(capacity: usize) -> (Arc<Pool>, EventService) {
     (pool, events)
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_publications_share_schema_initialization() {
+    let (_pool, events) = event_service(64);
+    let barrier = Arc::new(tokio::sync::Barrier::new(12));
+    let mut publishers = Vec::new();
+    for ordinal in 0..12 {
+        let (events, barrier) = (events.clone(), barrier.clone());
+        publishers.push(tokio::spawn(async move {
+            barrier.wait().await;
+            events.publish("ses_initializing", event(ordinal)).await
+        }));
+    }
+    let mut sequences = Vec::new();
+    for publisher in publishers {
+        let published = publisher
+            .await
+            .unwrap()
+            .expect("initialization must not race a publisher");
+        sequences.push(published.cursor().to_string());
+    }
+    sequences.sort_unstable();
+    let mut expected = (0..12)
+        .map(|index| format!("ses_initializing:{index}"))
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(sequences, expected);
+}
+
 /// Insert the project and session rows a session-scoped stream requires.
 ///
 /// The session route answers `404` for a session the database has never seen, so
