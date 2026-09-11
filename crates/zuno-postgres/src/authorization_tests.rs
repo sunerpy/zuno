@@ -1,5 +1,6 @@
 mod administration;
 mod boundaries;
+mod environment;
 mod lifecycle;
 
 use crate::{
@@ -166,4 +167,5 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
     lifecycle::exercise(backend, admin, migrator).await;
     boundaries::exercise(backend, admin, migrator).await;
     administration::exercise(backend, admin, migrator).await;
+    environment::exercise(backend, admin, migrator).await;
 }

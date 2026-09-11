@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p3-worker-transport`.
+- Current phase branch: `codex/enterprise-p3-environment-gateway`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -149,3 +149,13 @@ verification is pending the next preview CI run. No release is enabled.
 - The isolated script passes real HTTPS/PostgreSQL kernel continuation through two lease identities, certificate/user/redirect refusal, no POST retry and stale-lease rejection. This is one-process network evidence, not independent Worker or Docker execution.
 - Validation: 424 engine/identity/Worker tests, 154 Server tests and 99 documentation/release contracts passed. Workspace check, Clippy, formatting and diff checks passed. The normal `zuno-worker` dependency graph contains neither `zuno-postgres` nor `zuno-server`.
 - Independent Worker startup, model/configuration/environment assembly, Docker operations, distributed waits, public HTTP/ACP/Web integration and enterprise release acceptance remain incomplete. Publication stays disabled.
+
+## Rootless environment backend
+
+- Worker transport PR #190 merged at `3651fc94f293920616915cde2674c7b308091815`; CI 34610725736 passed, including HTTPS/PostgreSQL on Linux amd64/arm64 and shared native gates.
+- `zuno-environment` provides persistent workspace volumes, per-operation Docker containers, a separate single-owner ledger, immutable start admission, late receipt inspection, cancellation, streamed output cursors, verified snapshots, fork isolation and tombstone release.
+- `OrganizationOperationAuthority` reuses existing Job and approval stores. The real PostgreSQL contract verifies no execution before HITL approval and rejects changed commands/resources/leases. There is no production allow-all default.
+- Local rootless Docker 29.7.1 passes actual read-only-root, network-none, memory/CPU/PID limits, command-once recovery, output paging, cancellation, snapshot/fork and release tests. Ledger/archive tests: 5 passed. PostgreSQL/HTTPS contracts, 99 docs/release contracts, 11 preview publisher tests, workspace check, Clippy, fmt, diff and actionlint passed.
+- Preview CI/release now requires a separate rootless Docker gate on Linux amd64 and arm64. Remote platform results are pending this change's CI.
+- Both local validation modes passed: reusing the dedicated task daemon and starting/stopping a fresh isolated rootless daemon. The host needed only `uidmap`/`libsubid4`; the existing rootful Docker service was not restarted. The task daemon uses a separate socket/data/exec directory and the user systemd D-Bus.
+- Gateway service authentication, Worker/Agent tool registration, durable HITL waits, watchdog/cumulative quotas, remote artifact storage and interrupted-fork/retention management remain unfinished. These backend tests do not enable an enterprise runtime command or release.

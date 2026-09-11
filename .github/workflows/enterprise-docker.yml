@@ -1,0 +1,51 @@
+name: Enterprise rootless Docker contracts
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docker:
+    name: Rootless Docker (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.98.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: enterprise-preview-docker
+          key: ${{ runner.os }}-${{ runner.arch }}
+      - name: Ensure rootless prerequisites
+        run: |
+          set -euo pipefail
+          if ! command -v newuidmap || ! command -v newgidmap; then
+            sudo apt-get update
+            sudo env NEEDRESTART_MODE=l apt-get install -y --no-install-recommends uidmap
+          fi
+          if ! command -v dockerd-rootless.sh; then
+            sudo env NEEDRESTART_MODE=l apt-get install -y --no-install-recommends docker-ce-rootless-extras
+          fi
+          runtime="/run/user/$(id -u)"
+          if [ ! -S "$runtime/bus" ]; then
+            sudo loginctl enable-linger "$(id -un)"
+            sudo systemctl start "user@$(id -u).service"
+          fi
+          test -S "$runtime/bus"
+          echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
+          docker --version
+      - name: Verify isolated gateway and native recovery
+        run: python3 scripts/check_enterprise_docker.py

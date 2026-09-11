@@ -54,3 +54,5 @@ Model-visible output remains reconstructable from durable state.
 独立预览通道，不更新正式安装、正式数据库或稳定文档站点。
 
 Organization policy and durable approval contracts: [English](AUTHORIZATION.md), [中文](AUTHORIZATION.zh.md).
+
+Rootless environments and operation recovery: [English](ENVIRONMENTS.md), [中文](ENVIRONMENTS.zh.md).

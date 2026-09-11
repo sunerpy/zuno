@@ -156,6 +156,14 @@ identity_id!(
     "One external operation with stable arguments and receipts."
 );
 identity_id!(
+    EnvironmentId,
+    "An isolated execution workspace, independent of a host path."
+);
+identity_id!(
+    EnvironmentSnapshotId,
+    "A durable execution workspace snapshot."
+);
+identity_id!(
     ApprovalId,
     "One durable approval bound to a logical operation."
 );

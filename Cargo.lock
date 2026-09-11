@@ -7772,6 +7772,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "zuno-environment"
+version = "0.10.29"
+dependencies = [
+ "async-trait",
+ "futures",
+ "hex",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tar",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "uuid",
+ "zuno-application",
+ "zuno-network",
+ "zuno-orchestration",
+ "zuno-permission",
+ "zuno-types",
+]
+
+[[package]]
 name = "zuno-error"
 version = "0.10.29"
 dependencies = [
@@ -8102,6 +8126,7 @@ dependencies = [
  "zuno-application",
  "zuno-db",
  "zuno-engine",
+ "zuno-environment",
  "zuno-error",
  "zuno-llm",
  "zuno-orchestration",
