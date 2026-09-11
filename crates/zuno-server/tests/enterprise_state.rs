@@ -558,14 +558,14 @@ async fn authenticated_workers_resume_the_kernel_over_https_without_database_cre
             .is_none()
     );
     use zuno_engine::wait::WaitCompletionStore;
-    let completion = zuno_engine::wait::WaitCompletion {
-        id: zuno_types::identity::CompletionId::new("wire-completed").unwrap(),
-        reference: dispatcher.reference.lock().unwrap().clone().unwrap(),
-        result: zuno_engine::r#loop::ToolDispatchResult::success(ToolOutput::text(
+    let completion = zuno_engine::wait::WaitCompletion::tool_result(
+        zuno_types::identity::CompletionId::new("wire-completed").unwrap(),
+        dispatcher.reference.lock().unwrap().clone().unwrap(),
+        zuno_engine::r#loop::ToolDispatchResult::success(ToolOutput::text(
             "Remote",
             "Verified completion",
         )),
-    };
+    );
     let fact = runtime.publish(&scope, &completion).await.unwrap();
     assert_eq!(runtime.publish(&scope, &completion).await.unwrap(), fact);
     let second = client

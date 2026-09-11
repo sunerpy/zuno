@@ -2,6 +2,7 @@ mod administration;
 mod boundaries;
 mod environment;
 mod lifecycle;
+mod waiting;
 
 use crate::{
     PostgresBackend, PostgresOrganizationStore, PostgresRuntimeStore, bootstrap_organization,
@@ -168,4 +169,5 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
     boundaries::exercise(backend, admin, migrator).await;
     administration::exercise(backend, admin, migrator).await;
     environment::exercise(backend, admin, migrator).await;
+    waiting::exercise(backend, admin, migrator).await;
 }

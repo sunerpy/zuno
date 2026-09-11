@@ -80,8 +80,31 @@ obligations without spending another provider attempt.
 `WaitCompletionStore` is a host service, not an API for models or arbitrary
 clients. Its provider must share the turn store's transaction domain. The producer
 must verify the actual operation, child or answer before publishing its result.
-Human approval/user-input adapters and cancellation/resume APIs are not completed
-by the presence of their target enum variants.
+Human approval readiness is integrated with the PostgreSQL state owner and shared
+driver. Public approval endpoints, production gateway dispatch, user-input
+adapters and cancellation/resume APIs still require their own consumers.
+
+## Approval readiness
+
+`WaitOutcome::RecheckInvocation` carries no execution result or transferable
+permission. It is valid only for an approval target; an approval target cannot
+publish a `ToolResult`. Consumption retains the exact original pending part and
+provider metadata, removes its wait marker and rewinds only the final undispatched
+call. Earlier completed calls remain settled. The tool-call count advances only
+when the resumed call actually returns a result.
+
+The approval writer holds the same session lock as wait registration. Its answer,
+request receipt, readiness fact and wakeup commit together. Registration checks
+an already answered approval, preventing a lost wakeup. A paused parent retains
+the fact under the ordinary wait rules. The next claimant consumes readiness at
+a separate checkpoint boundary and then prepares the original call under current
+authorization and budgets. Approval cannot revive a superseded lease.
+
+Completion payload schema 2 stores the tagged outcome. Earlier preview result
+facts remain readable and deduplicate against the same logical completion without
+rewriting the stored event. An old fact that confused approval with a tool result
+is refused. The driver checkpoint remains schema 3 and the Worker protocol remains
+version 3; completion publication is a separate state-owner port.
 
 ## Storage and verification
 

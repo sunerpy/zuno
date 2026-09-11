@@ -56,14 +56,200 @@ fn scope() -> TurnStateScope {
 }
 
 fn completion(reference: WaitRef) -> WaitCompletion {
-    WaitCompletion {
-        id: CompletionId::new("completed-once").unwrap(),
+    WaitCompletion::tool_result(
+        CompletionId::new("completed-once").unwrap(),
         reference,
-        result: zuno_engine::r#loop::ToolDispatchResult::success(ToolOutput::text(
+        zuno_engine::r#loop::ToolDispatchResult::success(ToolOutput::text(
             "external operation",
             "authoritative external result",
         )),
+    )
+}
+
+#[test]
+fn legacy_completion_facts_are_preserved_without_becoming_approval_grants() {
+    use zuno_engine::wait::{WaitOutcome, decode_completion};
+    let mut connection = seeded();
+    let reference = WaitRef {
+        id: WaitId::new("legacy-result").unwrap(),
+        turn_id: TurnId::new("turn-bounded").unwrap(),
+        invocation_id: InvocationId::new("wait").unwrap(),
+        arguments_sha256: "a".repeat(64),
+        target: WaitTarget::Operation {
+            operation_id: OperationId::new("legacy-operation").unwrap(),
+        },
+        continuation: WaitContinuation::CurrentTurn,
+    };
+    let fact = completion(reference.clone());
+    let WaitOutcome::ToolResult { result } = &fact.outcome else {
+        panic!("tool result")
+    };
+    let properties = json!({"id":fact.id,"reference":fact.reference,"result":result});
+    let transaction = connection.transaction().unwrap();
+    let original = zuno_db::event_log::append_identified_in(
+        &transaction,
+        SESSION_ID,
+        &zuno_engine::wait::completion_event_id(&scope(), &reference),
+        zuno_db::event_log::NewSessionEvent::new(
+            zuno_engine::wait::COMPLETION_EVENT,
+            properties.as_object().unwrap().clone(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    transaction.commit().unwrap();
+    assert_eq!(
+        decode_completion(original.clone(), &reference).unwrap(),
+        fact
+    );
+    assert_eq!(
+        publish_sqlite_completion(&mut connection, &scope(), &fact).unwrap(),
+        original
+    );
+    assert!(original.properties.get("schemaVersion").is_none());
+    let mut unknown = original.clone();
+    unknown
+        .properties
+        .insert("schemaVersion".to_owned(), json!(99));
+    assert!(decode_completion(unknown, &reference).is_err());
+    let mut approval = reference;
+    approval.target = WaitTarget::Approval {
+        approval_id: zuno_types::identity::ApprovalId::new("not-an-execution").unwrap(),
+    };
+    let mut ambiguous = original;
+    ambiguous
+        .properties
+        .insert("reference".to_owned(), json!(approval));
+    assert!(decode_completion(ambiguous, &approval).is_err());
+    let wrong = WaitCompletion::recheck_invocation(fact.id, fact.reference);
+    assert!(
+        wrong.validate().is_err(),
+        "an operation result cannot authorize replay"
+    );
+}
+
+struct ApprovalDispatcher {
+    inner: DeferredDispatcher,
+    approved: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl ToolDispatcher for ApprovalDispatcher {
+    fn available_tools(&self) -> AvailableTools {
+        self.inner.inner.available_tools()
     }
+
+    async fn prepare(&self, request: DispatchRequest) -> PreparedToolDispatch {
+        if request.call.id == "wait" && !self.approved.load(Ordering::SeqCst) {
+            return PreparedToolDispatch::Pending(WaitRef {
+                id: WaitId::new("approval-wait").unwrap(),
+                turn_id: TurnId::new("turn-bounded").unwrap(),
+                invocation_id: InvocationId::new(&request.call.id).unwrap(),
+                arguments_sha256: zuno_orchestration::sha256_json(&request.call.input),
+                target: WaitTarget::Approval {
+                    approval_id: zuno_types::identity::ApprovalId::new("approval-once").unwrap(),
+                },
+                continuation: WaitContinuation::CurrentTurn,
+            });
+        }
+        self.inner.inner.prepare(request).await
+    }
+}
+
+#[tokio::test]
+async fn approval_readiness_does_not_settle_the_tool_or_spend_its_budget() {
+    let mut connection = seeded();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let dispatcher = ApprovalDispatcher {
+        inner: deferred(&order),
+        approved: std::sync::atomic::AtomicBool::new(false),
+    };
+    let provider = Arc::new(ScriptedProvider::new(provider_events(&[
+        ("before", "before"),
+        ("wait", "approved-command"),
+        ("after", "after"),
+    ])));
+    let budget = Arc::new(BudgetProbe::default());
+    let (outcome, _) = advance(
+        &mut connection,
+        provider.clone(),
+        &dispatcher,
+        request(),
+        budget.clone(),
+    )
+    .await;
+    let AdvanceOutcome::Waiting { checkpoint, waits } = outcome.unwrap() else {
+        panic!("approval wait")
+    };
+    assert_eq!(*order.lock().unwrap(), ["before"]);
+    dispatcher.approved.store(true, Ordering::SeqCst);
+    publish_sqlite_completion(
+        &mut connection,
+        &scope(),
+        &WaitCompletion::recheck_invocation(
+            CompletionId::new("approval-decision").unwrap(),
+            waits[0].clone(),
+        ),
+    )
+    .unwrap();
+    let consume = request().resume(checkpoint);
+    let (outcome, _) = advance(
+        &mut connection,
+        provider.clone(),
+        &dispatcher,
+        consume.clone(),
+        budget.clone(),
+    )
+    .await;
+    let AdvanceOutcome::Progressed { checkpoint } = outcome.unwrap() else {
+        panic!("consumption boundary")
+    };
+    let original = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .unwrap()
+        .into_iter()
+        .flat_map(|message| message.parts)
+        .find(|part| part.data.get("callID").and_then(Value::as_str) == Some("wait"))
+        .unwrap();
+    assert_eq!(
+        original.data["state"]["status"], "pending",
+        "approval is not an execution receipt"
+    );
+    assert!(original.data["state"].get("output").is_none());
+    assert!(original.data["state"].get("waitRef").is_none());
+    assert_eq!(provider.requests().len(), 1);
+    let (repeated, _) = advance(
+        &mut connection,
+        provider.clone(),
+        &dispatcher,
+        consume,
+        budget.clone(),
+    )
+    .await;
+    assert_eq!(
+        repeated.unwrap(),
+        AdvanceOutcome::Progressed {
+            checkpoint: checkpoint.clone()
+        }
+    );
+    let (outcome, _) = advance(
+        &mut connection,
+        provider.clone(),
+        &dispatcher,
+        request().resume(checkpoint),
+        budget.clone(),
+    )
+    .await;
+    assert!(matches!(
+        outcome.unwrap(),
+        AdvanceOutcome::Completed { steps: 2, .. }
+    ));
+    assert_eq!(
+        *order.lock().unwrap(),
+        ["before", "approved-command", "after"]
+    );
+    assert_eq!(budget.0.lock().unwrap().last().unwrap().2, 3);
+    assert_eq!(provider.requests().len(), 2);
 }
 
 #[tokio::test]
@@ -133,7 +319,10 @@ async fn a_wait_releases_the_driver_and_consumes_its_original_result_once_before
     let repeated = publish_sqlite_completion(&mut connection, &scope(), &fact).unwrap();
     assert_eq!(receipt, repeated);
     let mut changed = fact.clone();
-    changed.result.output.output = "a different result".to_owned();
+    let zuno_engine::wait::WaitOutcome::ToolResult { result } = &mut changed.outcome else {
+        panic!("tool result")
+    };
+    result.output.output = "a different result".to_owned();
     assert!(publish_sqlite_completion(&mut connection, &scope(), &changed).is_err());
     drop(first_dispatcher);
     drop(provider);

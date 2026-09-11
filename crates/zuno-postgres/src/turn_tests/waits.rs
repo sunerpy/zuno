@@ -45,21 +45,21 @@ impl ToolDispatcher for Deferred {
 }
 
 fn completed(reference: WaitRef) -> WaitCompletion {
-    WaitCompletion {
-        id: CompletionId::new(format!("completion_{}", reference.turn_id)).unwrap(),
+    WaitCompletion::tool_result(
+        CompletionId::new(format!("completion_{}", reference.turn_id)).unwrap(),
         reference,
-        result: zuno_engine::r#loop::ToolDispatchResult::success(ToolOutput::text(
+        zuno_engine::r#loop::ToolDispatchResult::success(ToolOutput::text(
             "Remote",
             "Verified remote result",
         )),
-    }
+    )
 }
 
-async fn advance(
+pub(super) async fn advance(
     backend: &PostgresBackend,
     claimed: &ClaimedJob,
     providers: &ProviderRegistry,
-    dispatcher: &Deferred,
+    dispatcher: &dyn ToolDispatcher,
 ) -> Result<AdvanceOutcome, zuno_engine::advance::AdvanceError> {
     let mut request = AdvanceRequest::new(
         RunTurnRequest::new(
@@ -97,7 +97,7 @@ async fn advance(
     outcome
 }
 
-async fn seed_job(
+pub(super) async fn seed_job(
     backend: &PostgresBackend,
     admin: &PgPool,
     actor: &PrincipalScope,
@@ -310,7 +310,10 @@ pub(super) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
                 event
             );
             let mut changed = fact.clone();
-            changed.result.output.output = "wrong replacement".to_owned();
+            let zuno_engine::wait::WaitOutcome::ToolResult { result } = &mut changed.outcome else {
+                panic!("tool result")
+            };
+            result.output.output = "wrong replacement".to_owned();
             assert!(
                 runtime
                     .publish_completion(&actor.owner(), &job.id, &changed)
