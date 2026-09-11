@@ -130,6 +130,23 @@ identity_id!(
 );
 identity_id!(RequestId, "A caller's stable idempotency key.");
 identity_id!(InputId, "A durable inbox input identity.");
+identity_id!(
+    JobId,
+    "A logical job identity that survives worker changes."
+);
+identity_id!(TurnId, "The model/tool turn advanced by a job.");
+identity_id!(
+    WorkerInstanceId,
+    "One worker incarnation, regenerated on process startup."
+);
+identity_id!(
+    ExecutionAttemptId,
+    "One claimed job execution, independent of provider retries."
+);
+identity_id!(
+    ConfigurationId,
+    "An immutable, host-resolved runtime definition."
+);
 
 /// How the host obtained a subject. This is diagnostic data, not a permission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]

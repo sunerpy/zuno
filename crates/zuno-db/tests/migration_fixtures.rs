@@ -120,7 +120,7 @@ const FORMAT_TEN: Fixture = Fixture {
 };
 
 /// Every table `sqlite_master` lists once the current schema is in place.
-const CURRENT_TABLE_COUNT: usize = 58;
+const CURRENT_TABLE_COUNT: usize = 62;
 
 const FORMAT_ELEVEN: Fixture = Fixture {
     format: 11,
@@ -147,6 +147,21 @@ const FORMAT_TWELVE: Fixture = Fixture {
         include_str!("fixtures/format-12.sql")
     ),
     table_count: 57,
+};
+
+const FORMAT_THIRTEEN: Fixture = Fixture {
+    format: 13,
+    release: "enterprise preview source b56a2aee",
+    sql: concat!(
+        include_str!("fixtures/format-7.sql"),
+        include_str!("fixtures/format-8.sql"),
+        include_str!("fixtures/format-9.sql"),
+        include_str!("fixtures/format-10.sql"),
+        include_str!("fixtures/format-11.sql"),
+        include_str!("fixtures/format-12.sql"),
+        include_str!("fixtures/format-13.sql")
+    ),
+    table_count: 58,
 };
 
 /// One additive upgrade step, described by what it must leave behind and by the
@@ -284,8 +299,8 @@ const MEMORY_RUNTIME: Step = Step {
 /// transaction. SQLite rejects the duplicate while *preparing* the statement, so
 /// it never reaches `SQLITE_TRACE_STMT`; the statement immediately before it is
 /// therefore the last one the trace can show before the rollback.
-const TRAP_INDEX: &str = "session_ownership_principal_idx";
-const STATEMENT_BEFORE_TRAP: &str = "CREATE TRIGGER session_ownership_insert";
+const TRAP_INDEX: &str = "runtime_attempt_worker_state_idx";
+const STATEMENT_BEFORE_TRAP: &str = "CREATE INDEX runtime_job_ready_idx";
 
 const AUTOMATIC_MEMORY: Step = Step {
     name: "automatic memory (format 11 -> 12)",
@@ -309,6 +324,23 @@ const SESSION_OWNERSHIP: Step = Step {
     columns: &[],
 };
 
+const RUNTIME_JOBS: Step = Step {
+    name: "runtime job authority (format 13 -> 14)",
+    first_statement: "CREATE TABLE runtime_session",
+    tables: &[
+        "runtime_session",
+        "runtime_job",
+        "runtime_attempt",
+        "runtime_owner_schedule",
+    ],
+    indexes: &[
+        "runtime_session_lease_deadline_idx",
+        "runtime_job_ready_idx",
+        "runtime_attempt_worker_state_idx",
+    ],
+    columns: &[],
+};
+
 fn steps_after(format: u32) -> &'static [&'static Step] {
     match format {
         5 => &[
@@ -320,6 +352,7 @@ fn steps_after(format: u32) -> &'static [&'static Step] {
             &MEMORY_RUNTIME,
             &AUTOMATIC_MEMORY,
             &SESSION_OWNERSHIP,
+            &RUNTIME_JOBS,
         ],
         6 => &[
             &PLAN_STACK,
@@ -329,6 +362,7 @@ fn steps_after(format: u32) -> &'static [&'static Step] {
             &MEMORY_RUNTIME,
             &AUTOMATIC_MEMORY,
             &SESSION_OWNERSHIP,
+            &RUNTIME_JOBS,
         ],
         7 => &[
             &VERIFICATION,
@@ -337,6 +371,7 @@ fn steps_after(format: u32) -> &'static [&'static Step] {
             &MEMORY_RUNTIME,
             &AUTOMATIC_MEMORY,
             &SESSION_OWNERSHIP,
+            &RUNTIME_JOBS,
         ],
         8 => &[
             &MEMORY_POLICY,
@@ -344,18 +379,95 @@ fn steps_after(format: u32) -> &'static [&'static Step] {
             &MEMORY_RUNTIME,
             &AUTOMATIC_MEMORY,
             &SESSION_OWNERSHIP,
+            &RUNTIME_JOBS,
         ],
         9 => &[
             &EXECUTION,
             &MEMORY_RUNTIME,
             &AUTOMATIC_MEMORY,
             &SESSION_OWNERSHIP,
+            &RUNTIME_JOBS,
         ],
-        10 => &[&MEMORY_RUNTIME, &AUTOMATIC_MEMORY, &SESSION_OWNERSHIP],
-        11 => &[&AUTOMATIC_MEMORY, &SESSION_OWNERSHIP],
-        12 => &[&SESSION_OWNERSHIP],
+        10 => &[
+            &MEMORY_RUNTIME,
+            &AUTOMATIC_MEMORY,
+            &SESSION_OWNERSHIP,
+            &RUNTIME_JOBS,
+        ],
+        11 => &[&AUTOMATIC_MEMORY, &SESSION_OWNERSHIP, &RUNTIME_JOBS],
+        12 => &[&SESSION_OWNERSHIP, &RUNTIME_JOBS],
+        13 => &[&RUNTIME_JOBS],
         other => panic!("no fixture describes format {other}"),
     }
+}
+
+#[test]
+fn format_thirteen_fixture_matches_the_preview_schema() {
+    assert_fixture_is_the_old_format(&FORMAT_THIRTEEN);
+    assert!(
+        include_str!("fixtures/format-13.sql")
+            .contains(include_str!("../src/schema/session_ownership.sql").trim())
+    );
+}
+
+#[test]
+fn format_thirteen_upgrade_preserves_ownership_history_memory_and_input_order() {
+    assert_upgrade_preserves_rows_and_reaches_the_current_structure(&FORMAT_THIRTEEN);
+    let dir = temp_dir();
+    let mut connection = load_fixture(&dir.path().join("zuno.db"), &FORMAT_THIRTEEN);
+    migration::apply(&mut connection).unwrap();
+    let mismatches: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM runtime_session r WHERE r.input_version <>
+         (SELECT count(*) FROM session_input i WHERE i.session_id=r.session_id)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(mismatches, 0);
+}
+
+#[test]
+fn format_thirteen_failed_upgrade_leaves_the_original_database_untouched() {
+    assert_failed_upgrade_leaves_the_database_untouched(&FORMAT_THIRTEEN);
+}
+
+#[test]
+fn changed_job_constraints_are_rejected_before_replacement() {
+    let dir = temp_dir();
+    let mut connection = load_fixture(&dir.path().join("zuno.db"), &FORMAT_THIRTEEN);
+    connection
+        .execute_batch("ALTER TABLE agent_job ADD COLUMN unknown_state text")
+        .unwrap();
+    let before = structure(&connection);
+    let rows = snapshot_rows(&connection, &before);
+    assert!(matches!(
+        migration::apply(&mut connection),
+        Err(DbError::Schema { .. })
+    ));
+    assert_eq!(structure(&connection), before);
+    assert_rows_preserved(&connection, &rows, &[]);
+}
+
+#[test]
+fn changed_job_literal_semantics_are_not_normalized_away() {
+    let dir = temp_dir();
+    let mut connection = open::open_at(&dir.path().join("zuno.db")).unwrap();
+    connection
+        .execute_batch(
+            &FORMAT_THIRTEEN
+                .sql
+                .replace("= 'childSession'", "= 'childsession'"),
+        )
+        .unwrap();
+    let before = structure(&connection);
+    let rows = snapshot_rows(&connection, &before);
+    assert!(matches!(
+        migration::apply(&mut connection),
+        Err(DbError::Schema { .. })
+    ));
+    assert_eq!(structure(&connection), before);
+    assert_rows_preserved(&connection, &rows, &[]);
 }
 
 #[test]
@@ -968,7 +1080,7 @@ fn assert_fixture_is_the_old_format(fixture: &Fixture) {
         "{context}: table count; tables = {:?}",
         inventory.tables.keys().collect::<Vec<_>>()
     );
-    let expected_other = if fixture.format >= 11 {
+    let mut expected_other = if fixture.format >= 11 {
         [
             "experience_search_fts_insert",
             "experience_search_fts_update",
@@ -983,6 +1095,9 @@ fn assert_fixture_is_the_old_format(fixture: &Fixture) {
     } else {
         BTreeSet::new()
     };
+    if fixture.format >= 13 {
+        expected_other.insert(("trigger".to_owned(), "session_ownership_insert".to_owned()));
+    }
     assert_eq!(
         inventory.other_objects, expected_other,
         "{context}: unexpected non-table objects {:?}",

@@ -5,7 +5,7 @@ Baseline: `v0.10.29`, `d1212860dba6a6b420ce81d444ace58feaf0adb5`.
 | Phase | State | Evidence required before completion |
 | --- | --- | --- |
 | P0 | Complete | PR #176 merged into preview; native CI run 34553054820 succeeded |
-| P1 | In progress | Principal propagation implemented; ownership migration validated; local bounded driver and scoped session application validated; runtime Job/Memory interfaces remain |
+| P1 | In progress | Principal propagation implemented; ownership migration validated; local bounded driver and scoped session application validated; local runtime Job/lease port validated; Memory interfaces and backend assembly remain |
 | P2 | Pending | PostgreSQL, identity/approval, leases/checkpoints/completion |
 | P3 | Pending | Two workers, Docker gateway, root-task takeover |
 | P4 | Pending | Durable child/Workflow/Council waits, merges and cancellation |
@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p1-state`.
+- Current phase branch: `codex/enterprise-p1-jobs`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -51,3 +51,22 @@ stays disabled in `preview.json`.
 - Documentation/release contracts: 99 passed; shared workspace check, Clippy, fmt and diff checks passed.
 - Checkpoint schema 2 includes time between advances in the turn wall-clock allowance. No checkpoint format has been released in this channel yet.
 - Job scheduling/leases, input-version CAS, Memory ports, PostgreSQL, Entra, the gateway and Web are still required.
+
+## Native runtime Job store
+
+- Application PR #179 merged at `102971efdcddfda1d2615015a3ca47222631e8ee`; CI run 34563112608 succeeded.
+- `RuntimeStore`, `SqliteRuntimeStore` and native `JobDispatcher` provide atomic root input/Job admission, separate input CAS, fair owner scheduling, session leases, execution attempts, checkpoint release and fenced settlement.
+- SQLite format 14 preserves prior data and widens the native Job constraint through a guarded transactional replacement. Schema validation preserves case and whitespace inside SQL string literals.
+- Database/application tests: 446 passed. Tool/TUI tests: 1,888 passed. Documentation/release contracts: 99 passed.
+- Workspace check, Clippy, fmt and diff checks passed.
+- Lease expiry remains conservative: the in-flight Job becomes uncertain; other sessions may continue. External-operation reconciliation and automatic remote takeover are not implemented by this store.
+- No enterprise binary, deployment, preview tag or release has been published.
+
+## Preview CI follow-up
+
+PR #180's first run (34566618169) exposed a cold event-initialization race and a
+Windows Goal suite timeout. A 12-publisher memory-database test reproduces the
+initialization failure. Event initialization now runs once and excludes pool
+writers; 68 Server tests pass. The Goal fixture selects Bash/PowerShell explicitly
+and uses native diagnostic syntax; its Linux end-to-end run passes. Windows
+verification is pending the next preview CI run. No release is enabled.

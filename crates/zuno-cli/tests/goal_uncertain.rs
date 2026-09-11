@@ -7,6 +7,7 @@
 //! Goal accounting.
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -28,8 +29,18 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(60);
 /// broke rather than that the command chose that code. Simulating it from the command
 /// itself is what makes an uncertain outcome reproducible: a real guard failure needs a
 /// host whose `pidfd_open` is refused, and that is not something a test can arrange.
+#[cfg(not(windows))]
 const GUARD_FAILURE_COMMAND: &str =
     "printf 'child-process guard failed: pidfd_open: Permission denied\\n'; exit 125";
+#[cfg(windows)]
+const GUARD_FAILURE_COMMAND: &str =
+    "Write-Output 'child-process guard failed: simulated Job Object failure'; exit 125";
+
+fn stage(message: &str) {
+    // Direct stderr remains visible if the outer suite supervisor must stop the
+    // test before libtest flushes captured output.
+    let _ = writeln!(std::io::stderr(), "goal-uncertain: {message}");
+}
 
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_zuno"))
@@ -82,6 +93,7 @@ fn tool_response(call_id: &str, name: &str, arguments: Value) -> MockResponse {
 
 fn provider_config(base_url: &str) -> String {
     trusted_platform_config(json!({
+        "shell": if cfg!(windows) { "pwsh" } else { "bash" },
         "formatter": false,
         "lsp": false,
         "model": "test/test-model",
@@ -171,6 +183,7 @@ async fn acp_request(
     method: &str,
     params: Value,
 ) -> (Value, Vec<Value>) {
+    stage(&format!("ACP {method} request {id}"));
     let frame = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
     let exchange = async {
         let mut encoded = serde_json::to_vec(&frame).expect("encode ACP request");
@@ -217,6 +230,7 @@ fn goal_command_output(updates: &[Value]) -> Value {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lost_side_effect_pauses_the_goal_and_survives_a_pause_that_was_never_written() {
+    stage("start");
     let scenario = Scenario::new("durable-uncertain-outcome")
         .respond(text_response("Uncertain outcome probe"))
         .respond(tool_response(
@@ -263,12 +277,14 @@ async fn a_lost_side_effect_pauses_the_goal_and_survives_a_pause_that_was_never_
         .env_clear()
         .envs(variables.clone());
     command.kill_on_drop(true);
+    stage("run the guard-failure turn");
     let output = tokio::time::timeout(RUN_TIMEOUT, command.output())
         .await
         .expect("the first run must finish inside its budget")
         .expect("launch production CLI");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    stage("guard-failure turn exited");
     assert!(
         output.status.success(),
         "production CLI failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -366,12 +382,14 @@ async fn a_lost_side_effect_pauses_the_goal_and_survives_a_pause_that_was_never_
         .env_clear()
         .envs(variables.clone());
     command.kill_on_drop(true);
+    stage("restart and inspect the durable obligation");
     let output = tokio::time::timeout(RUN_TIMEOUT, command.output())
         .await
         .expect("the restarted run must finish inside its budget")
         .expect("relaunch production CLI");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    stage("restart inspection exited");
     assert!(
         output.status.success(),
         "restarted CLI failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -427,6 +445,7 @@ async fn a_lost_side_effect_pauses_the_goal_and_survives_a_pause_that_was_never_
     );
 
     let working_dir = env.working_dir().to_owned();
+    stage("start ACP recovery");
     let mut child = tokio::process::Command::new(binary())
         .arg("acp")
         .current_dir(env.working_dir())
@@ -482,6 +501,7 @@ async fn a_lost_side_effect_pauses_the_goal_and_survives_a_pause_that_was_never_
     let _ = tokio::time::timeout(Duration::from_secs(5), child.kill())
         .await
         .expect("ACP process cleanup must finish");
+    stage("ACP recovery exited");
     let (shown, resumed) = (goal_command_output(&shown), goal_command_output(&resumed));
 
     assert_eq!(shown["pause"]["reason"], "uncertain_side_effect");
@@ -520,4 +540,5 @@ async fn a_lost_side_effect_pauses_the_goal_and_survives_a_pause_that_was_never_
         "the explicit recovery action is what retires the obligation: {}",
         records[0]["state"]["uncertain"]
     );
+    stage("complete");
 }

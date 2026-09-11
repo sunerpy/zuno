@@ -3056,6 +3056,11 @@ fn work_item_span(item: &zuno_tools::WorkItem) -> zuno_types::ExecutionSpan {
 
 fn project_job_subject(subject: &zuno_db::job::JobSubject) -> zuno_types::JobSubjectProjection {
     match subject {
+        zuno_db::job::JobSubject::RootTurn { turn_id } => {
+            zuno_types::JobSubjectProjection::RootTurn {
+                turn_id: turn_id.clone(),
+            }
+        }
         zuno_db::job::JobSubject::ChildSession { session_id } => {
             zuno_types::JobSubjectProjection::ChildSession {
                 session_id: session_id.clone(),
@@ -5814,7 +5819,8 @@ impl TurnHost {
                             span.elapsed_ms = root_span.elapsed_ms;
                         }
                     }
-                    zuno_db::job::JobSubject::ProductAgent { .. } => {}
+                    zuno_db::job::JobSubject::RootTurn { .. }
+                    | zuno_db::job::JobSubject::ProductAgent { .. } => {}
                 }
                 let subject = project_job_subject(&job.subject);
                 let children = project_job_children(&job.subject, &work.items);

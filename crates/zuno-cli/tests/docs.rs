@@ -1806,7 +1806,7 @@ fn database_docs_describe_the_guarded_chain_to_the_current_format() {
                 zuno_db::migration::CURRENT_FORMAT
             ),
             "Format 5",
-            "Formats 5–12",
+            "Formats 5–13",
             "`BEGIN IMMEDIATE`",
             "exact observed old format",
             "`resident_memory_provenance`",
@@ -1817,7 +1817,7 @@ fn database_docs_describe_the_guarded_chain_to_the_current_format() {
             "fails closed without modification",
             "format marker updated last",
             "A valid format-5, format-6,",
-            "format-10, format-11, or format-12 database should open",
+            "format-10, format-11, format-12, or format-13 database should open",
             "should open and migrate automatically",
         ],
     );

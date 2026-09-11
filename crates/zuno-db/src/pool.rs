@@ -184,6 +184,17 @@ impl Pool {
         })
     }
 
+    /// Initialize or validate schema while excluding this pool's writers.
+    ///
+    /// Schema validation itself reads many tables. In shared-cache memory mode
+    /// those reads must not overlap an event writer opening another connection
+    /// or taking its table locks.
+    pub fn initialize(&self) -> Result<(), DbError> {
+        let _writer = self.lock_writer();
+        let mut connection = self.get()?;
+        crate::migration::apply(&mut connection)
+    }
+
     /// Run `work` inside a write transaction, committing when it succeeds.
     ///
     /// The transaction is `IMMEDIATE`, not SQLite's default `DEFERRED`, and that

@@ -1,8 +1,8 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use rusqlite::OptionalExtension;
 use serde_json::{Map, Value};
-use zuno_db::{Pool, TransactionBehavior, event_log, migration, open};
+use zuno_db::{Pool, TransactionBehavior, event_log, open};
 use zuno_error::DbError;
 
 use super::{EventCursor, EventStreamError, NewEvent, StreamEvent};
@@ -11,6 +11,7 @@ pub(super) struct Store {
     pool: Arc<Pool>,
     subscriber_capacity: usize,
     initialized: OnceLock<()>,
+    initializing: Mutex<()>,
 }
 
 pub(super) struct Snapshot {
@@ -36,6 +37,7 @@ impl Store {
             pool,
             subscriber_capacity,
             initialized: OnceLock::new(),
+            initializing: Mutex::new(()),
         }
     }
 
@@ -217,8 +219,14 @@ impl Store {
         if self.initialized.get().is_some() {
             return Ok(());
         }
-        let mut connection = self.pool.get()?;
-        migration::apply(&mut connection)?;
+        let _initializing = self
+            .initializing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.initialized.get().is_some() {
+            return Ok(());
+        }
+        self.pool.initialize()?;
         self.initialized.get_or_init(|| ());
         Ok(())
     }

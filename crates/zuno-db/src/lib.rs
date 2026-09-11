@@ -70,6 +70,7 @@ pub mod provider_backoff;
 pub mod prune;
 pub mod resident_memory;
 pub mod retention;
+pub mod runtime_store;
 pub mod schema;
 pub mod session;
 pub mod session_execution;

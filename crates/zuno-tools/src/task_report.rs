@@ -158,7 +158,7 @@ fn job_json(job: &AgentJob, result: Option<Value>) -> Value {
         "parentSessionID": job.parent_session_id,
         "taskID": match &job.subject {
             JobSubject::ChildSession { session_id } => Some(session_id.as_str()),
-            JobSubject::ProductAgent { .. } | JobSubject::Workflow { .. } => None,
+            JobSubject::RootTurn { .. } | JobSubject::ProductAgent { .. } | JobSubject::Workflow { .. } => None,
         },
         "subject": job.subject.as_json(),
         "status": job.status.as_str(),

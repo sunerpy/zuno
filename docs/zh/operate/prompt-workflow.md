@@ -345,7 +345,7 @@ Todo、Plan step、pending report 与 Job，并记录 omitted count；稳定 ide
 状态、revision 和 reconciliation 字段优先保留。若权威 identity 本身仍无法放入
 预算，组装会失败关闭。typed tools 仍是进一步查询和修改这些 Store 的唯一入口。
 
-数据库当前格式为 13。format 5 会在一个 `BEGIN IMMEDIATE` 事务中
+数据库当前格式为 14。format 5 会在一个 `BEGIN IMMEDIATE` 事务中
 增加 learning 表、Plan 栈字段、archive 表、`verification_receipt` 账本与
 `session_memory_policy`；format 6 增加 Plan 栈、账本与 policy；format 7 增加账本与
 policy；format 8 增加 policy；format 9 增加 `session_execution_state`、

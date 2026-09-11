@@ -52,6 +52,9 @@ impl ReportDelivery {
 /// The durable subject one background job owns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobSubject {
+    /// A root turn coordinated by RuntimeStore; the owning session is stored in
+    /// the historical parent_session_id column. It never reports to itself.
+    RootTurn { turn_id: String },
     /// A native Zuno child session.
     ChildSession {
         /// The child session that performs the turn.
@@ -78,6 +81,13 @@ pub enum JobSubject {
 }
 
 impl JobSubject {
+    #[must_use]
+    pub fn root_turn(turn_id: impl Into<String>) -> Self {
+        Self::RootTurn {
+            turn_id: turn_id.into(),
+        }
+    }
+
     /// A native child-session subject.
     #[must_use]
     pub fn child_session(session_id: impl Into<String>) -> Self {
@@ -115,6 +125,7 @@ impl JobSubject {
     #[must_use]
     pub const fn kind(&self) -> &'static str {
         match self {
+            Self::RootTurn { .. } => "root-turn",
             Self::ChildSession { .. } => "child-session",
             Self::ProductAgent { .. } => "product-agent",
             Self::Workflow { .. } => "workflow",
@@ -125,6 +136,7 @@ impl JobSubject {
     #[must_use]
     pub fn as_json(&self) -> Value {
         match self {
+            Self::RootTurn { turn_id } => json!({"kind":"rootTurn","turnID":turn_id}),
             Self::ChildSession { session_id } => {
                 json!({"kind":"childSession","sessionID":session_id})
             }
@@ -561,6 +573,11 @@ impl AgentJobStore {
     /// Insert one admitted job in its requested initial state.
     pub fn create(&self, job: NewAgentJob) -> Result<AgentJob, DbError> {
         validate_new_job(&job)?;
+        if matches!(job.subject, JobSubject::RootTurn { .. }) {
+            return Err(query_error(std::io::Error::other(
+                "root jobs require RuntimeStore admission",
+            )));
+        }
         self.pool
             .transaction(|transaction| create_in(transaction, job))
     }
@@ -639,8 +656,10 @@ impl AgentJobStore {
 
     /// Atomically mark one queued job as running after capacity admission.
     pub fn start(&self, job_id: &str, time_started: i64) -> Result<AgentJob, DbError> {
-        self.pool
-            .transaction(|transaction| start_in(transaction, job_id, time_started))
+        self.pool.transaction(|transaction| {
+            reject_unfenced_root(transaction, job_id)?;
+            start_in(transaction, job_id, time_started)
+        })
     }
 
     /// Read one job by id.
@@ -727,8 +746,10 @@ impl AgentJobStore {
 
     /// Settle one active job and atomically admit its parent report.
     pub fn settle(&self, job_id: &str, settlement: JobSettlement) -> Result<SettledJob, DbError> {
-        self.pool
-            .transaction(|transaction| settle_in(transaction, job_id, settlement))
+        self.pool.transaction(|transaction| {
+            reject_unfenced_root(transaction, job_id)?;
+            settle_in(transaction, job_id, settlement)
+        })
     }
 
     /// Replace an uncertain outcome with authoritative external-state evidence.
@@ -737,8 +758,10 @@ impl AgentJobStore {
         job_id: &str,
         reconciliation: JobReconciliation,
     ) -> Result<SettledJob, DbError> {
-        self.pool
-            .transaction(|transaction| reconcile_uncertain_in(transaction, job_id, reconciliation))
+        self.pool.transaction(|transaction| {
+            reject_unfenced_root(transaction, job_id)?;
+            reconcile_uncertain_in(transaction, job_id, reconciliation)
+        })
     }
 
     /// Recover terminal jobs whose promised report has not been consumed.
@@ -837,7 +860,20 @@ impl AgentJobStore {
     }
 }
 
-/// Read every job owned by one parent through a caller-owned SQLite snapshot.
+/// Root Job mutations must pass through runtime execution authority.
+fn reject_unfenced_root(connection: &Connection, job_id: &str) -> Result<(), DbError> {
+    if get_in(connection, job_id)?
+        .is_some_and(|job| matches!(job.subject, JobSubject::RootTurn { .. }))
+    {
+        return Err(query_error(std::io::Error::other(
+            "root job transitions require RuntimeStore authority",
+        )));
+    }
+    Ok(())
+}
+
+/// Read background jobs through a caller-owned SQLite snapshot. Root turns are
+/// exposed through RuntimeStore rather than their own child-job collection.
 pub fn list_for_parent_in(
     connection: &rusqlite::Connection,
     parent_session_id: &str,
@@ -846,7 +882,7 @@ pub fn list_for_parent_in(
         connection,
         &format!(
             "SELECT {SELECT_COLUMNS} FROM agent_job \
-             WHERE parent_session_id = ?1 ORDER BY time_created, id"
+             WHERE parent_session_id = ?1 AND subject_kind <> 'root-turn' ORDER BY time_created, id"
         ),
         parent_session_id,
     )
@@ -870,6 +906,13 @@ fn validate_new_job(job: &NewAgentJob) -> Result<(), DbError> {
         context.validate()?;
     }
     match &job.subject {
+        JobSubject::RootTurn { turn_id } => {
+            if turn_id.trim().is_empty() || job.report_delivery != ReportDelivery::Quiet {
+                return Err(query_error(std::io::Error::other(
+                    "a root turn requires an identity and must not report back to itself",
+                )));
+            }
+        }
         JobSubject::ChildSession { session_id } => {
             if session_id.trim().is_empty() {
                 return Err(query_error(std::io::Error::other(
@@ -908,7 +951,11 @@ fn validate_new_job(job: &NewAgentJob) -> Result<(), DbError> {
     Ok(())
 }
 
-fn create_in(transaction: &Transaction<'_>, job: NewAgentJob) -> Result<AgentJob, DbError> {
+pub(crate) fn create_in(
+    transaction: &Transaction<'_>,
+    job: NewAgentJob,
+) -> Result<AgentJob, DbError> {
+    validate_new_job(&job)?;
     let event = append_in(
         transaction,
         &job.parent_session_id,
@@ -1101,7 +1148,7 @@ fn blocking_logical_job_in(
     stored.map(decode_job).transpose()
 }
 
-fn start_in(
+pub(crate) fn start_in(
     transaction: &Transaction<'_>,
     job_id: &str,
     time_started: i64,
@@ -1151,7 +1198,7 @@ fn start_in(
     })
 }
 
-fn settle_in(
+pub(crate) fn settle_in(
     transaction: &Transaction<'_>,
     job_id: &str,
     settlement: JobSettlement,
@@ -1307,6 +1354,11 @@ fn admit_terminal_report_in(
     let envelope = CompletionEnvelope {
         source_key: source_key.clone(),
         source: match &job.subject {
+            JobSubject::RootTurn { .. } => {
+                return Err(query_error(std::io::Error::other(
+                    "a root job cannot publish a parent completion",
+                )));
+            }
             JobSubject::ChildSession { .. } => CompletionSource::AgentJob,
             JobSubject::ProductAgent { .. } => CompletionSource::ProductAgent,
             JobSubject::Workflow { .. } => CompletionSource::Workflow,
@@ -1588,7 +1640,10 @@ struct StoredJob {
     time_completed: Option<i64>,
 }
 
-fn get_in(connection: &rusqlite::Connection, job_id: &str) -> Result<Option<AgentJob>, DbError> {
+pub(crate) fn get_in(
+    connection: &rusqlite::Connection,
+    job_id: &str,
+) -> Result<Option<AgentJob>, DbError> {
     connection
         .query_row(
             &format!("SELECT {SELECT_COLUMNS} FROM agent_job WHERE id = ?1"),
@@ -1647,6 +1702,7 @@ fn decode_job(stored: StoredJob) -> Result<AgentJob, DbError> {
         context.validate()?;
     }
     let subject = match stored.subject_kind.as_str() {
+        "root-turn" => JobSubject::root_turn(required_json(&payload, "turnID")?),
         "child-session" => JobSubject::child_session(required_json(&payload, "sessionID")?),
         "product-agent" => JobSubject::product_agent(
             required_json(&payload, "runID")?,
