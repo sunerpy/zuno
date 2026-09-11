@@ -557,7 +557,7 @@ async fn durable_backoff_observation_precedes_every_wait_or_wake() {
         },
         {
             let trace = Rc::clone(&trace);
-            move |observation| {
+            move |observation: ProviderAttemptObservation<'_, &'static str>| {
                 trace.borrow_mut().push(match observation {
                     ProviderAttemptObservation::Started { .. } => "started",
                     ProviderAttemptObservation::Finished { .. } => "finished",
@@ -579,6 +579,146 @@ async fn durable_backoff_observation_precedes_every_wait_or_wake() {
         ],
         "the durable deadline hook must run after rollback and before any wait can be interrupted"
     );
+}
+
+struct GatedAttemptObserver {
+    entered: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Semaphore>,
+    reject: bool,
+}
+
+struct SlowRetryObserver;
+
+impl zuno_engine::retry::ProviderAttemptObserver<&'static str, std::io::Error>
+    for SlowRetryObserver
+{
+    fn observe<'a>(
+        &'a mut self,
+        observation: ProviderAttemptObservation<'a, &'static str>,
+    ) -> futures::future::BoxFuture<'a, Result<(), std::io::Error>> {
+        Box::pin(async move {
+            if matches!(
+                observation,
+                ProviderAttemptObservation::Started { attempt: 2, .. }
+            ) {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_state_commit_cannot_start_a_request_after_the_recovery_deadline() {
+    let calls = Cell::new(0);
+    let policy = ProviderRetryPolicy::with_timing(
+        NonZeroU32::new(2).unwrap(),
+        Duration::from_secs(1),
+        Duration::from_millis(1),
+        Duration::from_millis(1),
+        0,
+    )
+    .unwrap();
+    let result = retry_provider_with_wake_observed(
+        policy,
+        |attempt| {
+            calls.set(calls.get() + 1);
+            ready(if attempt == 1 {
+                Err(ProviderError::Transient {
+                    status: Some(503),
+                    source: None,
+                })
+            } else {
+                Ok("late request")
+            })
+        },
+        |_| ready(Ok::<(), std::io::Error>(())),
+        std::future::pending::<&'static str>,
+        SlowRetryObserver,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(zuno_engine::retry::ProviderRetryObservedError::Retry(
+            ProviderRetryError::DeadlineExceeded { attempt: 2, .. }
+        ))
+    ));
+    assert_eq!(calls.get(), 1);
+}
+
+impl zuno_engine::retry::ProviderAttemptObserver<&'static str, std::io::Error>
+    for GatedAttemptObserver
+{
+    fn observe<'a>(
+        &'a mut self,
+        observation: ProviderAttemptObservation<'a, &'static str>,
+    ) -> futures::future::BoxFuture<'a, Result<(), std::io::Error>> {
+        Box::pin(async move {
+            if matches!(observation, ProviderAttemptObservation::Started { .. }) {
+                self.entered.notify_one();
+                self.release
+                    .acquire()
+                    .await
+                    .expect("gate remains open")
+                    .forget();
+                if self.reject {
+                    return Err(std::io::Error::other("state service rejected the attempt"));
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_pending_or_failed_state_commit_cannot_start_the_provider() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    for reject in [false, true] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let handle = tokio::spawn({
+            let calls = Arc::clone(&calls);
+            let observer = GatedAttemptObserver {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                reject,
+            };
+            async move {
+                retry_provider_with_wake_observed(
+                    policy(2),
+                    move |_| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        ready(Ok::<_, ProviderError>("complete"))
+                    },
+                    |_| ready(Ok::<(), std::io::Error>(())),
+                    std::future::pending::<&'static str>,
+                    observer,
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("observation reached the state service");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        release.add_permits(1);
+        let result = handle.await.expect("retry task");
+        if reject {
+            assert!(matches!(
+                result,
+                Err(zuno_engine::retry::ProviderRetryObservedError::Observation { .. })
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        } else {
+            assert_eq!(result.expect("committed attempt"), "complete");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
 }
 
 #[test]

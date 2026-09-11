@@ -41,6 +41,7 @@
 //! ```
 
 pub mod artifact_gc;
+pub mod assistant_commit;
 pub mod completion_delivery;
 pub mod continuity;
 pub mod evaluation;
