@@ -37,6 +37,15 @@ jobs:
             sudo env NEEDRESTART_MODE=l apt-get install -y --no-install-recommends uidmap
           fi
           if ! command -v dockerd-rootless.sh; then
+            sudo install -m 0755 -d /etc/apt/keyrings
+            curl --fail --silent --show-error --location https://download.docker.com/linux/ubuntu/gpg -o "$RUNNER_TEMP/docker.asc"
+            fingerprint="$(gpg --show-keys --with-colons "$RUNNER_TEMP/docker.asc" | awk -F: '$1 == "fpr" { print $10; exit }')"
+            test "$fingerprint" = 9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+            sudo install -m 0644 "$RUNNER_TEMP/docker.asc" /etc/apt/keyrings/zuno-docker.asc
+            arch="$(dpkg --print-architecture)"
+            printf 'deb [arch=%s signed-by=/etc/apt/keyrings/zuno-docker.asc] https://download.docker.com/linux/ubuntu noble stable\n' "$arch" \
+              | sudo tee /etc/apt/sources.list.d/zuno-docker.list > /dev/null
+            sudo apt-get update
             sudo env NEEDRESTART_MODE=l apt-get install -y --no-install-recommends docker-ce-rootless-extras
           fi
           runtime="/run/user/$(id -u)"

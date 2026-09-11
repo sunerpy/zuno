@@ -3,6 +3,7 @@ use reqwest::{Client, Method};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::Path;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 use tokio::io::AsyncReadExt as _;
 use zuno_application::ApplicationError;
