@@ -10,6 +10,9 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true }
+zuno-application = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
@@ -29,6 +32,7 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+zuno-runtime = { workspace = true }
 # The three differentials here run the installed release directly. `zuno-testkit`
 # resolves and screens it, so no test in this crate names a package-manager path.
 # This edge is a cycle only through dev-dependencies (`zuno-testkit`'s own dev-deps

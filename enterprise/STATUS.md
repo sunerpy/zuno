@@ -5,7 +5,7 @@ Baseline: `v0.10.29`, `d1212860dba6a6b420ce81d444ace58feaf0adb5`.
 | Phase | State | Evidence required before completion |
 | --- | --- | --- |
 | P0 | Complete | PR #176 merged into preview; native CI run 34553054820 succeeded |
-| P1 | In progress | Principal propagation implemented; ownership migration validated; local bounded driver validated; application/store interfaces remain |
+| P1 | In progress | Principal propagation implemented; ownership migration validated; local bounded driver and scoped session application validated; runtime Job/Memory interfaces remain |
 | P2 | Pending | PostgreSQL, identity/approval, leases/checkpoints/completion |
 | P3 | Pending | Two workers, Docker gateway, root-task takeover |
 | P4 | Pending | Durable child/Workflow/Council waits, merges and cancellation |
@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p1-driver`.
+- Current phase branch: `codex/enterprise-p1-state`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -42,3 +42,12 @@ capabilities.
 
 No enterprise runtime or preview release has been certified yet. Publication
 stays disabled in `preview.json`.
+
+## Application and checkpoint follow-up
+
+- Driver PR #178 merged at `7ae2b792f650bab9723784d9d23fdf0ddf614110`; CI run 34559371761 succeeded.
+- `zuno-application` supplies the scoped facade and async session persistence port; SQLite supplies its real provider.
+- Application/SQLite regression: 435 passed; bounded driver follow-up: 9 passed.
+- Documentation/release contracts: 99 passed; shared workspace check, Clippy, fmt and diff checks passed.
+- Checkpoint schema 2 includes time between advances in the turn wall-clock allowance. No checkpoint format has been released in this channel yet.
+- Job scheduling/leases, input-version CAS, Memory ports, PostgreSQL, Entra, the gateway and Web are still required.

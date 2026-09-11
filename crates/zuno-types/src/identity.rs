@@ -124,6 +124,12 @@ identity_id!(
     "An owned workspace identity rather than a machine path."
 );
 identity_id!(GroupId, "An organization-managed group identity.");
+identity_id!(
+    SessionId,
+    "A stable session identity, independent of an executor."
+);
+identity_id!(RequestId, "A caller's stable idempotency key.");
+identity_id!(InputId, "A durable inbox input identity.");
 
 /// How the host obtained a subject. This is diagnostic data, not a permission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
