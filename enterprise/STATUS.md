@@ -120,3 +120,5 @@ verification is pending the next preview CI run. No release is enabled.
 - Policy/application/types/database regression: 564 passed. Documentation/release contracts: 99 passed. After baseline synchronization, workspace check, Clippy, formatting, dependency checks and all 11 preview-publisher tests passed.
 - HTTP/BFF, authenticated gateway facts, driver waits/wakeups, operation receipts and distributed execution remain pending. This storage layer does not register enterprise entry points or turn a checked decision into a transferable execution credential.
 - Scope review: English/Chinese authorization guides and preview entry links are updated. The stable documentation site and installation remain untouched.
+
+- Authorization PR #187 first CI (34590730300) passed all runtime/database gates but found a Windows ARM fixture race: cancellation could observe an empty PID file. The process-tree fixture now publishes completed PID files atomically. This is test-only; production process supervision is unchanged.

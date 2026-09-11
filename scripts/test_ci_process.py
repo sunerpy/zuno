@@ -76,11 +76,13 @@ class ProcessTests(unittest.TestCase):
         parent = self.root / "parent.pid"
         child_code = (
             "import os,time;from pathlib import Path;"
-            f"Path({str(leaf)!r}).write_text(str(os.getpid()));time.sleep(120)"
+            f"ready=Path({str(leaf)!r});pending=ready.with_suffix('.pending');"
+            "pending.write_text(str(os.getpid()));pending.replace(ready);time.sleep(120)"
         )
         code = (
             "import os,subprocess,sys,time\nfrom pathlib import Path\n"
-            f"Path({str(parent)!r}).write_text(str(os.getpid()))\n"
+            f"parent=Path({str(parent)!r});pending=parent.with_suffix('.pending')\n"
+            "pending.write_text(str(os.getpid()));pending.replace(parent)\n"
             f"subprocess.Popen([sys.executable,'-c',{child_code!r}])\n"
             f"ready=Path({str(leaf)!r})\n"
             "while not ready.exists(): time.sleep(0.01)\n"
@@ -156,6 +158,8 @@ class ProcessTests(unittest.TestCase):
         def cancel_when_started():
             deadline = time.monotonic() + 10
             while not stop.wait(0.01):
+                # Publication follows a complete write; cancelling on an opened
+                # but still-empty PID file loses the identity we must inspect.
                 if pids[1].exists() or time.monotonic() >= deadline:
                     cancelled.set()
                     return
