@@ -551,6 +551,7 @@ fn refine_from_job_output(tasks: &mut [Delegation], output: &str) {
 fn merge_job_projections(tasks: &mut Vec<Delegation>, jobs: &[zuno_types::JobProjection]) {
     for job in jobs {
         let (tool, product, target, session_id, run_id) = match &job.subject {
+            zuno_types::JobSubjectProjection::RootTurn { .. } => continue,
             zuno_types::JobSubjectProjection::ChildSession { session_id } => (
                 "task".to_owned(),
                 "zuno".to_owned(),

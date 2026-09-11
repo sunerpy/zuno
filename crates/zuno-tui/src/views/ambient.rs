@@ -1437,6 +1437,9 @@ impl SidebarView {
                         _ => ("!", self.context.error()),
                     };
                     let subject = match &job.subject {
+                        zuno_types::JobSubjectProjection::RootTurn { turn_id } => {
+                            format!("turn {turn_id}")
+                        }
                         zuno_types::JobSubjectProjection::ChildSession { session_id } => {
                             format!("child {session_id}")
                         }

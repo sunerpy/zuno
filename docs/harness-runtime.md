@@ -141,6 +141,28 @@ This local binding is not an execution sandbox or a multi-user filesystem.
 Cancelling an API future does not release its blocking capacity until the database
 operation actually finishes.
 
+### Durable runtime store
+
+`RuntimeStore` and the profile-installed `JobDispatcher` extend the existing
+native Job identity with root turns. A root admission commits its input, input
+version, fixed configuration reference, Job and audit facts atomically.
+`SqliteRuntimeStore` keeps a session's logical active Job separate from a worker's
+execution lease. Yielding a checkpoint releases worker capacity without admitting
+a different turn ahead of it.
+
+Claims rotate among owners and preserve session FIFO order. Database time governs
+lease deadlines; every renewal, checkpoint and settlement verifies the worker
+incarnation, attempt, epoch and checkpoint version. Root jobs cannot be mutated
+through the unfenced background-job API or report completion back to themselves.
+An expired in-flight execution becomes uncertain and blocks its own session
+pending inspection, while other sessions remain eligible.
+
+These are local persistence guarantees. The engine still needs scoped remote
+state access, and external-operation receipts, distributed waits, completion
+consumption and Memory coordination must be integrated before a remote runtime
+is registered as available. Store contract tests are not remote-worker or Docker
+execution evidence.
+
 ## Agent and prompt contracts
 
 Agent prompts define role ownership, negative boundaries, a small amount of

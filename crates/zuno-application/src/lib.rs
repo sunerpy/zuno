@@ -4,6 +4,8 @@
 //! persistence provider. Client DTOs contain neither owner overrides nor host
 //! paths. Drivers and clients do not acquire database connections through this API.
 
+pub mod runtime;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -22,6 +24,8 @@ pub enum ApplicationError {
     NotFound,
     #[error("the request conflicts with already committed state")]
     Conflict,
+    #[error("the execution lease is no longer authoritative")]
+    LeaseLost,
     #[error("the state service is temporarily unavailable")]
     Unavailable,
     #[error("the state service failed")]

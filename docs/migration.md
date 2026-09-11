@@ -1,9 +1,9 @@
 # Zuno database lifecycle
 
-Zuno owns its configuration and data roots. The current database format is 13.
+Zuno owns its configuration and data roots. The current database format is 14.
 Empty databases are created at the current format, and supported older formats advance
 through guarded forward migrations. Format 5 is the first supported historical format
-and formats 5 through 12 upgrade in place to format 13 without rebuilding the database.
+and formats 5 through 13 upgrade in place to format 14 without rebuilding the database.
 
 ## The channel database
 
@@ -52,14 +52,14 @@ it opened. See
 
 Database opening recognizes these states:
 
-1. **Empty database.** The complete format-13 schema and the single `zuno_schema`
+1. **Empty database.** The complete format-14 schema and the single `zuno_schema`
    marker are created atomically.
-2. **Format 13.** The marker, tables, constraints, indexes and triggers are validated
+2. **Format 14.** The marker, tables, constraints, indexes and triggers are validated
    before application queries run.
-3. **Formats 5–12.** Every remaining supported additive migration runs in a single
+3. **Formats 5–13.** Every remaining supported additive migration runs in a single
    transaction: learning (6), Plan stack (7), verification receipts (8), session
    memory policy (9), execution/inbox state (10), versioned memory and search (11),
-   automatic-memory provenance and watermarks (12), then session ownership (13).
+   automatic-memory provenance and watermarks (12), session ownership (13), and runtime authority (14).
 4. **Any other state.** An older unsupported format, a future format, a missing marker,
    or a marker whose required tables are absent fails closed without modification.
 
@@ -71,12 +71,12 @@ reported as a schema mismatch; a database whose format keeps changing under the 
 fails closed with a conflict on the `zuno_schema` marker. Neither path writes to the
 database.
 
-### Formats 5–12 to format 13
+### Formats 5–13 to format 14
 
 The supported migration uses one SQLite `BEGIN IMMEDIATE` transaction:
 
 1. Re-read the table inventory and require the marker to be exactly format 5, 6, 7,
-   8, 9, 10, 11, or 12.
+   8, 9, 10, 11, 12, or 13.
 2. Require the historical `session` and `work_plan` tables before changing anything.
 3. From format 5, create all format-6 learning tables and indexes.
 4. From format 5 or 6, add nullable `parent_plan_id`, defaulted `stack_depth`, and
@@ -94,13 +94,16 @@ The supported migration uses one SQLite `BEGIN IMMEDIATE` transaction:
    provenance without reclassifying newer user-authored memory.
 10. Create `session_ownership`, backfill every historical session with the explicit
     local owner, and install the child-inheritance trigger and principal index.
-11. Conditionally update the singleton marker from the exact observed old format to
-    13, last. Commit only after every operation succeeds.
+11. Widen the native Job subject constraint through a guarded transactional copy that
+    preserves every existing column. Add runtime session/input authority, execution
+    attempts, checkpoint pointers and owner scheduling state.
+12. Conditionally update the singleton marker from the exact observed old format to
+    14, last. Commit only after every operation succeeds.
 
 Any failure rolls the transaction back. The migration does not rewrite existing
 `session`, `message`, `memory_candidate`, `learning_job`, `verification_receipt`, or
 `work_plan` values except the documented source-validation/lease backfills.
-Tests use exact format-5 through format-12 release fixtures, compare representative
+Tests use exact format-5 through format-12 release fixtures and the exact format-13 preview fixture, compare representative
 session/message/memory values and preserved rows, then verify new objects and marker.
 Format-12 tests include previously published resident revisions, provenance and maintenance watermarks and rollback of the
 entire additive change if the final index creation fails.
@@ -118,8 +121,30 @@ cannot transfer ownership.
 ownership predicate in SQL before ordering and pagination. These are storage
 primitives, not an authentication service: the host must authenticate and authorize
 before constructing a scoped store. Other local stores remain local-only until
-scoped adapters are implemented. Preview format 13 must only open a separate
+scoped adapters are implemented. Preview format 14 must only open a separate
 preview database; do not point a preview binary at a stable installation's data.
+
+### Runtime authority (enterprise preview)
+
+Format 14 extends the existing `agent_job` identity with root turns. SQLite cannot
+widen its subject CHECK in place, so the migration first verifies the supported
+table and indexes, rejects unexpected inbound references, copies all columns in
+the same transaction, and restores the canonical indexes with foreign keys still
+enabled. A failed replacement or later DDL rolls the whole upgrade back.
+
+`runtime_session` separates input revision, logical active Job and worker lease
+epoch. Native input admission and edits advance the input clock through triggers;
+promotion and consumption do not. `runtime_job` stores a fixed definition
+reference and checkpoint version, `runtime_attempt` records each worker claim,
+and `runtime_owner_schedule` rotates execution among owners.
+
+Claim/renew/checkpoint/settlement use database time and compare worker incarnation,
+attempt, epoch and checkpoint version. A checkpoint releases worker capacity while
+retaining the logical active turn. Expiry marks the in-flight Job uncertain and
+blocks that session until inspection; it does not prove that an external effect
+stopped. Root completion never adds a report back to its own inbox. PostgreSQL,
+remote engine state access, durable distributed waits and authoritative operation
+reconciliation remain separate enterprise implementation stages.
 
 ### Session execution and completion delivery
 
@@ -170,7 +195,7 @@ copy before any operator-led recovery.
 For important data, use the exact older binary to export it or implement and validate an
 explicit forward migration. Do not guess the schema, silently drop rows, or require a
 rebuild for a format that the current binary supports. A valid format-5, format-6,
-format-7, format-8, format-9, format-10, format-11, or format-12 database should open and migrate automatically.
+format-7, format-8, format-9, format-10, format-11, format-12, or format-13 database should open and migrate automatically.
 
 ## Rules for future schema changes
 

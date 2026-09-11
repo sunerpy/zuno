@@ -1058,6 +1058,9 @@ pub struct TodoProjection {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum JobSubjectProjection {
+    RootTurn {
+        turn_id: String,
+    },
     ChildSession {
         session_id: String,
     },

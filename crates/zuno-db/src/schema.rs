@@ -5,11 +5,13 @@ use rusqlite::Transaction;
 use zuno_error::DbError;
 
 /// Number of application tables created by the current schema's single `up`.
-pub const TABLE_COUNT: usize = 47;
+pub const TABLE_COUNT: usize = 51;
 
 const MEMORY_RUNTIME_SCHEMA_SQL: &str = include_str!("schema/memory_runtime.sql");
 const AUTOMATIC_MEMORY_SCHEMA_SQL: &str = include_str!("schema/automatic_memory.sql");
 const SESSION_OWNERSHIP_SCHEMA_SQL: &str = include_str!("schema/session_ownership.sql");
+const RUNTIME_JOBS_SCHEMA_SQL: &str = include_str!("schema/runtime_jobs.sql");
+const ROOT_JOB_SCHEMA_SQL: &str = include_str!("schema/agent_job_root.sql");
 
 const CORE_SCHEMA_SQL: &str = r#"
 CREATE TABLE `workspace` (
@@ -790,6 +792,7 @@ pub(crate) fn declared_tables() -> Vec<&'static str> {
         MEMORY_RUNTIME_SCHEMA_SQL,
         AUTOMATIC_MEMORY_SCHEMA_SQL,
         SESSION_OWNERSHIP_SCHEMA_SQL,
+        RUNTIME_JOBS_SCHEMA_SQL,
     ]
     .into_iter()
     .flat_map(declared_tables_in)
@@ -823,7 +826,8 @@ pub fn up(transaction: &Transaction<'_>) -> Result<(), DbError> {
     up_execution(transaction)?;
     up_memory_runtime(transaction)?;
     up_automatic_memory(transaction)?;
-    up_session_ownership(transaction)
+    up_session_ownership(transaction)?;
+    up_runtime_jobs(transaction)
 }
 
 /// Add the learning-flywheel tables to a format-5 database.
@@ -878,6 +882,133 @@ pub(crate) fn up_session_ownership(transaction: &Transaction<'_>) -> Result<(), 
     transaction
         .execute_batch(SESSION_OWNERSHIP_SCHEMA_SQL)
         .map_err(migration::map_error)
+}
+
+pub(crate) fn up_runtime_jobs(transaction: &Transaction<'_>) -> Result<(), DbError> {
+    rebuild_agent_jobs_for_roots(transaction)?;
+    transaction
+        .execute_batch(RUNTIME_JOBS_SCHEMA_SQL)
+        .map_err(migration::map_error)
+}
+
+/// SQLite cannot widen a CHECK constraint in place. Verify the released shape,
+/// copy every column into the replacement, and restore its indexes in the same
+/// migration transaction. Foreign keys remain enabled throughout.
+fn rebuild_agent_jobs_for_roots(transaction: &Transaction<'_>) -> Result<(), DbError> {
+    use rusqlite::OptionalExtension;
+    let start = CORE_SCHEMA_SQL
+        .find("CREATE TABLE `agent_job` (")
+        .expect("base Job DDL");
+    let end = start
+        + CORE_SCHEMA_SQL[start..]
+            .find("\n);")
+            .expect("base Job DDL end")
+        + 3;
+    let expected = &CORE_SCHEMA_SQL[start..end];
+    let actual: String = transaction
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE name='agent_job'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(migration::map_error)?;
+    if migration::normalized_sql(actual.trim_end_matches(';'))
+        != migration::normalized_sql(expected.trim_end_matches(';'))
+    {
+        return Err(job_upgrade_error(
+            "agent_job does not match its supported pre-runtime schema",
+        ));
+    }
+    let inbound: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+           SELECT 1 FROM sqlite_schema s JOIN pragma_foreign_key_list(s.name) f
+           WHERE s.type='table' AND f.\"table\"='agent_job'
+         )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(migration::map_error)?;
+    if inbound {
+        return Err(job_upgrade_error(
+            "an unexpected foreign key prevents safe agent_job replacement",
+        ));
+    }
+    let index_start = CORE_SCHEMA_SQL
+        .find("CREATE UNIQUE INDEX `agent_job_child_running_idx`")
+        .expect("Job indexes");
+    let index_end = CORE_SCHEMA_SQL[index_start..]
+        .find("CREATE INDEX `session_project_idx`")
+        .expect("Job index end")
+        + index_start;
+    let indexes = &CORE_SCHEMA_SQL[index_start..index_end];
+    let names = [
+        "agent_job_child_running_idx",
+        "agent_job_product_run_idx",
+        "agent_job_workflow_run_idx",
+        "agent_job_parent_status_created_idx",
+        "agent_job_parent_logical_created_idx",
+    ];
+    let count: i64 = transaction.query_row(
+        "SELECT count(*) FROM sqlite_schema WHERE tbl_name='agent_job' AND type IN('index','trigger') AND sql IS NOT NULL",
+        [],|row|row.get(0),
+    ).map_err(migration::map_error)?;
+    if usize::try_from(count).ok() != Some(names.len()) {
+        return Err(job_upgrade_error(
+            "agent_job has missing or unrecognized indexes or triggers",
+        ));
+    }
+    for name in names {
+        let actual: Option<String> = transaction
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(migration::map_error)?;
+        let marker = format!("`{name}`");
+        let expected = indexes
+            .split(';')
+            .find(|ddl| ddl.contains(&marker))
+            .expect("declared Job index");
+        if actual.as_deref().map(migration::normalized_sql)
+            != Some(migration::normalized_sql(expected))
+        {
+            return Err(job_upgrade_error(
+                "agent_job has a changed index definition",
+            ));
+        }
+    }
+    let replacement = ROOT_JOB_SCHEMA_SQL.replacen(
+        "CREATE TABLE `agent_job`",
+        "CREATE TABLE `__zuno_agent_job_v14`",
+        1,
+    );
+    transaction
+        .execute_batch(&replacement)
+        .map_err(migration::map_error)?;
+    transaction.execute_batch(
+        "INSERT INTO __zuno_agent_job_v14(
+           id,parent_session_id,logical_key,subject_kind,subject_payload,orchestration_snapshot,
+           evidence_start_rowid,status,report_delivery,result,error,report_input_id,created_seq,
+           settled_seq,time_created,time_updated,time_completed)
+         SELECT id,parent_session_id,logical_key,subject_kind,subject_payload,orchestration_snapshot,
+           evidence_start_rowid,status,report_delivery,result,error,report_input_id,created_seq,
+           settled_seq,time_created,time_updated,time_completed FROM agent_job;
+         DROP TABLE agent_job;
+         ALTER TABLE __zuno_agent_job_v14 RENAME TO agent_job;"
+    ).map_err(migration::map_error)?;
+    transaction
+        .execute_batch(indexes)
+        .map_err(migration::map_error)
+}
+
+fn job_upgrade_error(detail: &str) -> DbError {
+    DbError::Schema {
+        format: migration::CURRENT_FORMAT,
+        source: Box::new(std::io::Error::other(detail.to_owned())),
+    }
 }
 
 /// Add durable suspended/completed Plan frames to a format-6 database.
