@@ -8093,6 +8093,7 @@ dependencies = [
  "sqlx-postgres",
  "tempfile",
  "tokio",
+ "uuid",
  "zuno-application",
  "zuno-orchestration",
  "zuno-types",

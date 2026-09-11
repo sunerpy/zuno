@@ -275,6 +275,7 @@ impl RuntimeStore for SqliteRuntimeStore {
             }))?;
             Ok(Some(ClaimedJob {
                 lease: ExecutionLease {
+                    owner:job.principal.owner(),
                     job_id:job.id.clone(),session_id:job.session_id.clone(),
                     attempt_id:ExecutionAttemptId::new(attempt_id).map_err(storage)?,
                     worker,epoch:u64::try_from(epoch).map_err(storage)?,
@@ -355,31 +356,7 @@ impl RuntimeStore for SqliteRuntimeStore {
         lease: &ExecutionLease,
         outcome: JobFinish,
     ) -> Result<RuntimeJob, ApplicationError> {
-        match &outcome {
-            JobFinish::Completed { result }
-                if serde_json::to_vec(result)
-                    .map_err(ApplicationError::storage)?
-                    .len()
-                    > 65_536 =>
-            {
-                return Err(ApplicationError::Invalid(
-                    "large results require an artifact reference".to_owned(),
-                ));
-            }
-            JobFinish::Failed { code } if code.trim().is_empty() => {
-                return Err(ApplicationError::Invalid(
-                    "a failure requires a code".to_owned(),
-                ));
-            }
-            JobFinish::Cancelled { reason } | JobFinish::Uncertain { reason }
-                if reason.trim().is_empty() =>
-            {
-                return Err(ApplicationError::Invalid(
-                    "an interrupted outcome requires a reason".to_owned(),
-                ));
-            }
-            _ => {}
-        }
+        outcome.validate()?;
         let lease = lease.clone();
         self.transaction(move |tx| {
             let time = now(tx)?;
@@ -449,9 +426,12 @@ fn verify_lease(
          WHERE s.session_id=?1 AND s.current_job_id=?2 AND s.lease_job_id=?2
          AND s.lease_attempt_id=?3 AND s.lease_worker_id=?4 AND s.lease_epoch=?5
          AND s.lease_expires>?6 AND r.phase='running' AND r.active_attempt_id=?3
-         AND r.checkpoint_version=?7)",
+         AND r.checkpoint_version=?7
+         AND EXISTS(SELECT 1 FROM session_ownership o WHERE o.session_id=s.session_id
+           AND o.tenant_id=?8 AND o.principal_id=?9))",
         params![lease.session_id.as_str(),lease.job_id.as_str(),lease.attempt_id.as_str(),
-            lease.worker.as_str(),integer(lease.epoch)?,time,integer(lease.checkpoint_version)?],
+            lease.worker.as_str(),integer(lease.epoch)?,time,integer(lease.checkpoint_version)?,
+            lease.owner.tenant_id.as_str(),lease.owner.principal_id.as_str()],
         |row| row.get(0),
     ).map_err(sql)?;
     if !valid {

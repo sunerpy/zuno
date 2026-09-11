@@ -1,11 +1,15 @@
 //! PostgreSQL data-owner adapter. Worker credentials never include this pool.
 
 mod migration;
+mod runtime;
+#[cfg(test)]
+mod runtime_tests;
 mod session;
 #[cfg(test)]
 mod tests;
 
 pub use migration::{PREVIEW_SCHEMA, migrate};
+pub use runtime::PostgresRuntimeStore;
 pub use session::PostgresSessionPersistence;
 
 use std::path::PathBuf;
@@ -16,7 +20,7 @@ use sqlx_core::{row::Row, transaction::Transaction};
 use sqlx_postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx_postgres::{PgPool, Postgres};
 use zuno_application::ApplicationError;
-use zuno_types::identity::PrincipalScope;
+use zuno_types::identity::{PrincipalKey, PrincipalScope, TenantId};
 
 /// Connection configuration deliberately has no Debug/Serialize implementation:
 /// its URL may contain a credential and is never a client DTO.
@@ -81,6 +85,12 @@ impl PostgresBackend {
         PostgresSessionPersistence::new(self.pool.clone(), principal)
     }
 
+    /// Tenant routing is selected by the authenticated control-plane deployment,
+    /// not by a worker-supplied principal or a public request body.
+    pub fn runtime(&self, tenant: TenantId) -> PostgresRuntimeStore {
+        PostgresRuntimeStore::new(self.pool.clone(), tenant)
+    }
+
     /// Register a logical workspace through an already authorized host action.
     pub async fn register_workspace(
         &self,
@@ -108,19 +118,34 @@ async fn scoped_transaction(
     pool: &PgPool,
     principal: &PrincipalScope,
 ) -> Result<Transaction<'static, Postgres>, ApplicationError> {
+    owner_transaction(pool, &principal.owner()).await
+}
+
+async fn owner_transaction(
+    pool: &PgPool,
+    owner: &PrincipalKey,
+) -> Result<Transaction<'static, Postgres>, ApplicationError> {
     let mut tx = pool.begin().await.map_err(database_error)?;
+    set_owner(&mut tx, owner).await?;
+    Ok(tx)
+}
+
+async fn set_owner(
+    tx: &mut Transaction<'_, Postgres>,
+    owner: &PrincipalKey,
+) -> Result<(), ApplicationError> {
     // Transaction-local settings cannot leak into the next pool checkout.
     sqlx_core::query::query(
         "SELECT set_config('zuno.tenant_id',$1,true),set_config('zuno.principal_id',$2,true),
                 set_config('statement_timeout','10000',true),set_config('lock_timeout','5000',true),
                 set_config('search_path','pg_catalog',true)",
     )
-    .bind(principal.tenant_id().as_str())
-    .bind(principal.principal_id().as_str())
-    .execute(&mut *tx)
+    .bind(owner.tenant_id.as_str())
+    .bind(owner.principal_id.as_str())
+    .execute(&mut **tx)
     .await
     .map_err(database_error)?;
-    Ok(tx)
+    Ok(())
 }
 
 async fn database_time(tx: &mut Transaction<'_, Postgres>) -> Result<i64, ApplicationError> {

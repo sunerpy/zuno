@@ -125,6 +125,55 @@ fn checkpoint(job: &RuntimeJob) -> RuntimeCheckpoint {
 }
 
 #[tokio::test]
+async fn a_valid_lease_cannot_be_routed_through_another_owner() {
+    let fixture = fixture();
+    fixture
+        .store
+        .submit(&fixture.alice, submission("ses_a", "owner-fence", 0))
+        .await
+        .unwrap();
+    let claimed = fixture
+        .store
+        .claim(&worker("worker"), duration())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.lease.owner, fixture.alice.owner());
+    let mut forged = claimed.lease.clone();
+    forged.owner = fixture.bob.owner();
+    assert!(matches!(
+        fixture.store.renew(&forged, duration()).await,
+        Err(ApplicationError::LeaseLost)
+    ));
+    assert!(matches!(
+        fixture
+            .store
+            .finish(
+                &forged,
+                JobFinish::Cancelled {
+                    reason: "forged owner".to_owned()
+                }
+            )
+            .await,
+        Err(ApplicationError::LeaseLost)
+    ));
+    fixture
+        .store
+        .renew(&claimed.lease, duration())
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .get(&fixture.alice.owner(), &claimed.job.id)
+            .await
+            .unwrap()
+            .phase,
+        JobPhase::Running
+    );
+}
+
+#[tokio::test]
 async fn admission_is_atomic_idempotent_and_checks_the_separate_input_version() {
     let fixture = fixture();
     let request = submission("ses_a", "request", 0);

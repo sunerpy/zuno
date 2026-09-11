@@ -34,6 +34,7 @@ def main():
 
         admin_password = secrets.token_hex(24)
         runtime_password = secrets.token_hex(24)
+        migration_password = secrets.token_hex(24)
         private(root / "admin.password", admin_password)
         run([
             str(bindir / "initdb"), "-D", str(root / "data"), "--no-locale", "--encoding=UTF8",
@@ -94,12 +95,16 @@ def main():
                 input=(
                     "CREATE ROLE zuno_preview_runtime LOGIN NOSUPERUSER NOBYPASSRLS "
                     f"NOCREATEDB NOCREATEROLE PASSWORD '{runtime_password}';\n"
+                    "CREATE ROLE zuno_preview_migrator LOGIN NOSUPERUSER NOBYPASSRLS "
+                    f"NOCREATEDB NOCREATEROLE PASSWORD '{migration_password}';\n"
+                    "GRANT CREATE ON DATABASE postgres TO zuno_preview_migrator;\n"
                 ).encode(),
                 env=environment,
             )
             private(root / "fixture.json", json.dumps({
                 "admin_url": f"postgresql://zuno_preview_admin:{admin_password}@127.0.0.1:{port}/postgres",
                 "runtime_url": f"postgresql://zuno_preview_runtime:{runtime_password}@127.0.0.1:{port}/postgres",
+                "migration_url": f"postgresql://zuno_preview_migrator:{migration_password}@127.0.0.1:{port}/postgres",
                 "root_certificate": str(root / "ca.pem"),
                 "runtime_role": "zuno_preview_runtime",
             }))
@@ -117,11 +122,12 @@ def main():
             if not error.cmd or error.cmd[0] != "cargo":
                 # Never echo connection URLs or generated passwords.
                 text = (root / "setup.log").read_text(errors="replace")
-                text = text.replace(admin_password, "<redacted>").replace(runtime_password, "<redacted>")
+                for password in [admin_password, runtime_password, migration_password]:
+                    text = text.replace(password, "<redacted>")
                 print("\n".join(text.splitlines()[-20:]))
             raise
         finally:
-            if started:
+            if started or (root / "data/postmaster.pid").is_file():
                 subprocess.run(
                     [str(bindir / "pg_ctl"), "-D", str(root / "data"), "-m", "fast", "-w", "-t", "15", "stop"],
                     stdout=setup, stderr=setup, check=False,

@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p2-identity`.
+- Current phase branch: `codex/enterprise-p2-runtime`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -98,3 +98,15 @@ verification is pending the next preview CI run. No release is enabled.
 - Identity tests: 15 passed, using ephemeral real RSA signatures. Documentation/release contracts: 99 passed. Shared workspace check, Clippy, fmt, dependency and diff checks passed.
 - The HTTP login/BFF, organization authority, runtime authorization integration and live IdP validation are still required. No enterprise authentication endpoint or runtime entry point has been advertised.
 - Documentation impact: both language guides and the workspace inventory are updated. These preview docs are packaged with future preview tags; the stable documentation site is not published by this branch.
+
+## PostgreSQL runtime transactions
+
+- PostgreSQL PR #182 merged at `3c82895cf6908df9df4b3378ed5368a73c71fb43`; native CI run 34578776963 passed, including Windows and PostgreSQL on both Linux architectures.
+- `PostgresRuntimeStore` implements root admission, separate input CAS, fair owner scheduling, session leases, execution attempts, checkpoints and fenced settlement over native Job identities.
+- An execution lease carries owner routing; SQLite and PostgreSQL check that owner against durable state. Shared `JobFinish` validation bounds result and error payloads.
+- PostgreSQL format 2 atomically upgrades the exact format-1 DDL and representative data. A NOSUPERUSER/NOBYPASSRLS migration owner and injected mid-DDL failure verify data preservation and marker-last rollback.
+- The real PostgreSQL TLS/RLS suite passed with competing claims, independent sessions, checkpoint handoff, stale/expired lease rejection, uncertain execution, atomic audit rollback and more than one page of inactive owners.
+- Database/application tests: 447 passed, including 7 SQLite runtime-store tests. Documentation/release contracts: 99 passed. Workspace check, Clippy, formatting, dependency and HTTP-construction checks passed after synchronizing onto the preview baseline; all 11 preview-publisher tests passed.
+- Materialization is simulated in the storage tests. Remote engine access, current organization authorization, durable child waits/completion consumption and external operation receipts remain outstanding; no enterprise runtime is registered or released.
+
+- Identity PR #183 merged at `5660d000d2f65c9a9d6885d7ba033e2b87900249`; CI 34580934554 passed, including the unified HTTP-construction contract.
