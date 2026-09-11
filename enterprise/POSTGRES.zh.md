@@ -1,8 +1,8 @@
 # PostgreSQL 预览持久化
 
 当前适配器实现 `SessionPersistence`：逻辑工作区、私有会话、游标分页、幂等文本接纳和持久事件。
-`AgentApplication` 通过同一个接口使用 SQLite 或 PostgreSQL。PostgreSQL Job／Memory、
-远程引擎状态访问和 Entra HTTP 入口仍在后续实施；这个库不单独注册企业服务器或 Worker。
+`AgentApplication` 通过同一个接口使用 SQLite 或 PostgreSQL。PostgreSQL Memory、
+远程引擎状态访问和 OAuth2／OIDC HTTP 入口仍在后续实施；这个库不单独注册企业服务器或 Worker。
 
 ## 数据库边界
 
@@ -50,3 +50,36 @@ SQLx Core 与 PostgreSQL driver 使用精确配对版本。SQLx 总入口的可�
 SQLx 专属类型。
 
 完整能力进度见 [STATUS.md](STATUS.md)。
+
+## Runtime Job 与检查点
+
+`PostgresBackend::runtime` 提供租户绑定的 `RuntimeStore`，复用原生 `agent_job`
+标识和 root-turn subject。输入、输入 CAS、Job、调度状态及事件在一个事务中接纳。
+使用逻辑 ID 和事件游标，不将 SQLite 物理 rowid 作为 PostgreSQL 游标。
+
+领取任务时通过 `FOR UPDATE SKIP LOCKED` 锁定会话，原子提交会话 epoch、Worker
+实例和执行尝试。租约携带归属用于路由，但不是身份凭证。每次更新都会在事务内核对
+实际所有者、Job／会话、Worker、attempt、epoch、检查点版本和数据库时间期限。
+续租不会缩短已经提交的有效期。
+
+控制面账号可以调用固定只读函数 `dispatch_owners`，每次最多返回指定租户的 64 条
+所有者／顺序元数据。函数由 schema 所有者执行，不能返回输入、Job 内容、检查点或
+任意查询；撤销 PUBLIC 执行权限。私有读取和写入仍使用精确的所有者 RLS。空队列
+探测也推进顺序，避免大量闲置所有者阻塞后续任务。Worker 和最终用户不持有数据库
+账号。
+
+提交检查点会释放执行容量，同时保留当前逻辑 Job。下一位 Worker 先续接该 Job，
+再处理同一会话的下一轮。成功结算要求输入已经消费；旧租约不能覆盖结果。租约过期
+会记录 `uncertain` 并保留该会话的逻辑占用，其他会话仍可运行。在途外部操作的自动
+接管还需要网关回执核查，这个适配器不会自行重放副作用。
+
+PostgreSQL 预览格式 2 从已验证的格式 1 原子升级。迁移账号可为
+NOSUPERUSER／NOBYPASSRLS。回填在事务和排他 DDL 锁内临时解除 FORCE RLS，
+随后恢复 FORCE、验证延迟外键、更新权限，最后写格式标记。测试在 DDL 中途注入
+失败，逐项比较原工作区、会话、输入、事件和请求回执，验证回滚和成功升级都保留
+数据；不要求重建受支持数据库。
+
+真实 TLS 用例还覆盖双 Worker 领取、独立会话并行、输入 CAS、检查点交接、拒绝旧
+Worker、执行不确定性、闲置所有者分页、RLS 和审核写入失败的原子回滚。输入实体化
+由测试模拟；远程内核、当前组织授权、子任务完成投递和外部操作恢复仍需接入，
+不能据此注册完整企业运行时为可用功能。

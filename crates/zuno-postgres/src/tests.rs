@@ -17,11 +17,19 @@ use super::*;
 struct Fixture {
     admin_url: String,
     runtime_url: String,
+    migration_url: String,
     root_certificate: PathBuf,
     runtime_role: String,
 }
 
 impl Fixture {
+    fn migration_options(&self) -> PostgresOptions {
+        PostgresOptions {
+            url: self.migration_url.clone(),
+            root_certificate: Some(self.root_certificate.clone()),
+            max_connections: 4,
+        }
+    }
     fn options(&self, admin: bool, connections: u32) -> PostgresOptions {
         PostgresOptions {
             url: if admin {
@@ -59,15 +67,55 @@ async fn real_postgres_enforces_scopes_transactions_role_boundaries_and_schema_i
     let path = std::env::var("ZUNO_POSTGRES_TEST_CONFIG").expect("isolated PostgreSQL fixture");
     let fixture: Fixture = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     let admin = fixture.options(true, 4).connect().await.unwrap();
+    let migrator = fixture.migration_options().connect().await.unwrap();
     assert!(
         PostgresBackend::connect(fixture.options(true, 1))
             .await
             .is_err(),
         "a superuser cannot be a runtime backend"
     );
-    assert!(migrate(&admin, "role;DROP SCHEMA public").await.is_err());
-    migrate(&admin, &fixture.runtime_role).await.unwrap();
-    migrate(&admin, &fixture.runtime_role).await.unwrap();
+    assert!(migrate(&migrator, "role;DROP SCHEMA public").await.is_err());
+    migration::install_format_one_fixture(&migrator, &fixture.runtime_role)
+        .await
+        .unwrap();
+    let preserved = legacy_snapshot(&admin).await;
+    assert!(
+        PostgresBackend::connect(fixture.options(false, 1))
+            .await
+            .is_err()
+    );
+    // Fail after early tables were created, then prove the transaction reverted
+    // the DDL, input rows and marker before retrying the real migration.
+    raw_sql(
+        "CREATE FUNCTION public.zuno_fixture_refuse_migration() RETURNS event_trigger LANGUAGE plpgsql AS $$
+         BEGIN IF TG_TAG='CREATE TABLE' AND to_regclass('zuno_enterprise_preview.runtime_job') IS NOT NULL
+           THEN RAISE EXCEPTION 'injected migration failure'; END IF; END $$;
+         CREATE EVENT TRIGGER zuno_fixture_refuse_migration ON ddl_command_start
+           EXECUTE FUNCTION public.zuno_fixture_refuse_migration();",
+    ).execute(&admin).await.unwrap();
+    assert!(migrate(&migrator, &fixture.runtime_role).await.is_err());
+    raw_sql("DROP EVENT TRIGGER zuno_fixture_refuse_migration; DROP FUNCTION public.zuno_fixture_refuse_migration()")
+        .execute(&admin).await.unwrap();
+    assert_eq!(
+        query_scalar::<_, i32>("SELECT version FROM zuno_enterprise_preview.schema_format")
+            .fetch_one(&admin)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(
+        query_scalar::<_, bool>(
+            "SELECT to_regclass('zuno_enterprise_preview.runtime_job') IS NULL"
+        )
+        .fetch_one(&admin)
+        .await
+        .unwrap()
+    );
+    assert_eq!(legacy_snapshot(&admin).await, preserved);
+    migrate(&migrator, &fixture.runtime_role).await.unwrap();
+    migrate(&migrator, &fixture.runtime_role).await.unwrap();
+    assert_eq!(legacy_snapshot(&admin).await, preserved);
+    assert_eq!(query_scalar::<_,i64>("SELECT input_version FROM zuno_enterprise_preview.runtime_session WHERE session_id='legacy-session'").fetch_one(&admin).await.unwrap(),1);
 
     let mut untrusted_certificate = fixture.options(false, 1);
     untrusted_certificate.root_certificate = None;
@@ -238,6 +286,11 @@ async fn real_postgres_enforces_scopes_transactions_role_boundaries_and_schema_i
     .unwrap();
     a.queue_text(failed).await.unwrap();
 
+    crate::runtime_tests::exercise(&backend, &admin).await;
+    let expected_count: i64 = query_scalar("SELECT count(*) FROM zuno_enterprise_preview.session")
+        .fetch_one(&admin)
+        .await
+        .unwrap();
     // Schema drift and future versions are diagnosed without a destructive repair.
     raw_sql("GRANT TRUNCATE ON zuno_enterprise_preview.session TO zuno_preview_runtime")
         .execute(&admin)
@@ -270,13 +323,14 @@ async fn real_postgres_enforces_scopes_transactions_role_boundaries_and_schema_i
         .execute(&admin)
         .await
         .unwrap();
-    assert!(migrate(&admin, &fixture.runtime_role).await.is_err());
+    assert!(migrate(&migrator, &fixture.runtime_role).await.is_err());
     let count: i64 = query_scalar("SELECT count(*) FROM zuno_enterprise_preview.session")
         .fetch_one(&admin)
         .await
         .unwrap();
-    assert_eq!(count, 8);
-    query("UPDATE zuno_enterprise_preview.schema_format SET version=1")
+    assert_eq!(count, expected_count);
+    query("UPDATE zuno_enterprise_preview.schema_format SET version=$1")
+        .bind(migration::FORMAT)
         .execute(&admin)
         .await
         .unwrap();
@@ -287,7 +341,7 @@ async fn real_postgres_enforces_scopes_transactions_role_boundaries_and_schema_i
         .execute(&admin)
         .await
         .unwrap();
-    assert!(migrate(&admin, &fixture.runtime_role).await.is_err());
+    assert!(migrate(&migrator, &fixture.runtime_role).await.is_err());
     let count_after: i64 = query_scalar("SELECT count(*) FROM zuno_enterprise_preview.session")
         .fetch_one(&admin)
         .await
@@ -295,4 +349,17 @@ async fn real_postgres_enforces_scopes_transactions_role_boundaries_and_schema_i
     assert_eq!(count_after, count);
     assert_eq!(serde_json::to_value(&first).unwrap().get("directory"), None);
     assert_eq!(json!(input.state), "queued");
+}
+
+async fn legacy_snapshot(pool: &sqlx_postgres::PgPool) -> serde_json::Value {
+    use sqlx_core::row::Row;
+    query(
+        "SELECT jsonb_build_object(
+          'workspace',(SELECT to_jsonb(w) FROM zuno_enterprise_preview.workspace w WHERE w.id='legacy-workspace'),
+          'session',(SELECT to_jsonb(s) FROM zuno_enterprise_preview.session s WHERE s.id='legacy-session'),
+          'input',(SELECT to_jsonb(i) FROM zuno_enterprise_preview.input i WHERE i.id='legacy-input'),
+          'event',(SELECT to_jsonb(e) FROM zuno_enterprise_preview.event e WHERE e.id='legacy-event'),
+          'receipt',(SELECT to_jsonb(r) FROM zuno_enterprise_preview.request_receipt r WHERE r.request_id='legacy-request')
+        ) AS snapshot",
+    ).fetch_one(pool).await.unwrap().try_get("snapshot").unwrap()
 }

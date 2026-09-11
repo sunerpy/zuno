@@ -116,6 +116,8 @@ pub struct RuntimeJob {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExecutionLease {
+    /// Ownership routing for the state service; never an authentication grant.
+    pub owner: PrincipalKey,
     pub job_id: JobId,
     pub session_id: SessionId,
     pub attempt_id: ExecutionAttemptId,
@@ -171,6 +173,38 @@ pub enum JobFinish {
     Failed { code: String },
     Cancelled { reason: String },
     Uncertain { reason: String },
+}
+
+impl JobFinish {
+    pub fn validate(&self) -> Result<(), ApplicationError> {
+        match self {
+            Self::Completed { result }
+                if serde_json::to_vec(result)
+                    .map_err(ApplicationError::storage)?
+                    .len()
+                    > 65_536 =>
+            {
+                Err(ApplicationError::Invalid(
+                    "large results require an artifact reference".to_owned(),
+                ))
+            }
+            Self::Failed { code }
+                if code.trim().is_empty() || code.len() > 1_024 || code.contains('\0') =>
+            {
+                Err(ApplicationError::Invalid(
+                    "a failure requires a bounded code".to_owned(),
+                ))
+            }
+            Self::Cancelled { reason } | Self::Uncertain { reason }
+                if reason.trim().is_empty() || reason.len() > 8_192 || reason.contains('\0') =>
+            {
+                Err(ApplicationError::Invalid(
+                    "an interruption requires a bounded reason".to_owned(),
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Runtime business operations are atomic, not a collection of CRUD calls.

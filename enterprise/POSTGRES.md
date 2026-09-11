@@ -3,7 +3,7 @@
 This adapter currently implements `SessionPersistence`: logical workspaces,
 private sessions, cursor paging, idempotent text admission and durable events.
 `AgentApplication` consumes the same port for SQLite and PostgreSQL. PostgreSQL
-Job/Memory state, remote engine access and Entra HTTP entry points are subsequent
+Memory state, remote engine access and OAuth2/OIDC HTTP entry points are subsequent
 work; this library alone does not register an enterprise server or worker.
 
 ## Database boundary
@@ -69,3 +69,46 @@ replace the local SQLite backend. SQLx-specific types remain in the backend,
 outside the application persistence port.
 
 See [the Chinese guide](POSTGRES.zh.md) and [implementation status](STATUS.md).
+
+## Runtime Jobs and checkpoints
+
+`PostgresBackend::runtime` creates a tenant-bound `RuntimeStore`. It reuses native
+`agent_job` identities and root-turn subjects. Admission commits the input, input
+CAS, native Job, scheduling state and events together. Sessions use logical IDs
+and event cursors; no physical SQLite row identifier is used as a PostgreSQL cursor.
+
+Claims acquire the session row with `FOR UPDATE SKIP LOCKED`, then commit a
+session epoch, worker incarnation and execution attempt. Leases include owner
+routing, but that value is not authentication: every mutation checks the stored
+owner, Job/session, worker, attempt, epoch, checkpoint version and database-time
+deadline inside its transaction. Renewal cannot shorten an existing lease.
+
+The control-plane role can call the fixed, read-only `dispatch_owners` function.
+It returns at most 64 owner/order records for its requested tenant. The function
+runs as the schema owner and cannot return prompts, Jobs, checkpoints, or arbitrary
+queries. PUBLIC execution is revoked. Private reads and writes still use exact
+owner RLS. Empty owner probes advance the scheduling order so a page of inactive
+owners cannot starve later work. Workers and end users receive no database role.
+
+A committed checkpoint releases worker execution capacity while retaining the
+logical session Job. The next claimant resumes that Job before another queued
+turn. Completion requires consumed input; stale leases cannot overwrite results.
+Lease expiry records `uncertain` and retains the logical session hold. Other
+sessions remain eligible. Automatic takeover of in-flight operations still needs
+the environment gateway and receipt reconciliation; this adapter does not replay
+side effects.
+
+PostgreSQL preview format 2 advances a verified format-1 schema atomically. The
+schema owner can be NOSUPERUSER/NOBYPASSRLS. Backfill briefly removes FORCE RLS
+under exclusive DDL locks in the migration transaction, restores FORCE, validates
+deferred references, updates privileges, and writes the format marker last. The
+isolated fixture injects failure midway through DDL and compares the original
+workspace, session, input, event and request receipt before/after rollback and
+successful upgrade. Supported preview databases are not rebuilt.
+
+The TLS contract also exercises two concurrent claimants, independent sessions,
+input CAS, checkpoint handoff, old-worker rejection, uncertain execution, empty
+owner pages, RLS and atomic audit failure. Tests simulate input materialization;
+they do not certify a remote engine, current organization authorization, child
+completion delivery, or external-operation recovery. Those integrations remain
+required before the enterprise runtime can be registered as available.

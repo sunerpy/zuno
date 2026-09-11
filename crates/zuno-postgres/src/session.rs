@@ -280,7 +280,7 @@ async fn reserve_request(
     ))
 }
 
-async fn read_session(
+pub(crate) async fn read_session(
     tx: &mut Transaction<'_, Postgres>,
     principal: &PrincipalScope,
     id: &str,
@@ -319,7 +319,7 @@ fn summary(row: &PgRow) -> Result<SessionSummary, ApplicationError> {
     })
 }
 
-async fn emit(
+pub(crate) async fn emit(
     tx: &mut Transaction<'_, Postgres>,
     principal: &PrincipalScope,
     session: &str,
