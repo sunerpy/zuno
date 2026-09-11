@@ -502,6 +502,7 @@ fn request(
         available_tools: dispatcher.available_tools().definitions.into(),
         interrupt: InterruptSignal::new(),
         orchestration_snapshot: None,
+        principal_scope: Arc::new(zuno_types::identity::PrincipalScope::local()),
     }
 }
 

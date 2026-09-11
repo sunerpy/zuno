@@ -4,6 +4,20 @@ Zuno assembles an agent from a native harness profile. A profile is a set of bun
 
 ## Runtime model
 
+### Principal attribution
+
+The preview foundation carries an immutable `PrincipalScope` from `TurnContext`
+through dispatch to tool permission origins and composed calls. Tenant, subject,
+calling application and policy revision are separate from session and tool names.
+Changing a tool's public session fields or argument metadata does not change its
+captured attribution.
+
+The existing local profile constructs an explicit local scope. Enterprise hosts
+must authenticate a caller before supplying another scope; serialized scope data
+is not an authorization grant. Ownership checks do not replace current operation
+policy or shared-resource ACLs. Persistence and remote authentication remain
+separate enterprise implementation stages.
+
 - `Component` is the lifecycle unit. `prepare` is side-effect-free: it stages typed
   services, requirements, and deferred effects in a `PrepareContext`.
 - An effect starts only after the complete candidate composition has prepared. Its

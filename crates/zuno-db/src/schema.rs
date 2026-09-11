@@ -5,10 +5,11 @@ use rusqlite::Transaction;
 use zuno_error::DbError;
 
 /// Number of application tables created by the current schema's single `up`.
-pub const TABLE_COUNT: usize = 46;
+pub const TABLE_COUNT: usize = 47;
 
 const MEMORY_RUNTIME_SCHEMA_SQL: &str = include_str!("schema/memory_runtime.sql");
 const AUTOMATIC_MEMORY_SCHEMA_SQL: &str = include_str!("schema/automatic_memory.sql");
+const SESSION_OWNERSHIP_SCHEMA_SQL: &str = include_str!("schema/session_ownership.sql");
 
 const CORE_SCHEMA_SQL: &str = r#"
 CREATE TABLE `workspace` (
@@ -788,6 +789,7 @@ pub(crate) fn declared_tables() -> Vec<&'static str> {
         EXECUTION_SCHEMA_SQL,
         MEMORY_RUNTIME_SCHEMA_SQL,
         AUTOMATIC_MEMORY_SCHEMA_SQL,
+        SESSION_OWNERSHIP_SCHEMA_SQL,
     ]
     .into_iter()
     .flat_map(declared_tables_in)
@@ -820,7 +822,8 @@ pub fn up(transaction: &Transaction<'_>) -> Result<(), DbError> {
     up_memory_policy(transaction)?;
     up_execution(transaction)?;
     up_memory_runtime(transaction)?;
-    up_automatic_memory(transaction)
+    up_automatic_memory(transaction)?;
+    up_session_ownership(transaction)
 }
 
 /// Add the learning-flywheel tables to a format-5 database.
@@ -869,6 +872,12 @@ pub(crate) fn up_automatic_memory(transaction: &Transaction<'_>) -> Result<(), D
         .execute_batch(AUTOMATIC_MEMORY_SCHEMA_SQL)
         .map_err(migration::map_error)?;
     crate::memory_evidence::backfill_provenance(transaction)
+}
+
+pub(crate) fn up_session_ownership(transaction: &Transaction<'_>) -> Result<(), DbError> {
+    transaction
+        .execute_batch(SESSION_OWNERSHIP_SCHEMA_SQL)
+        .map_err(migration::map_error)
 }
 
 /// Add durable suspended/completed Plan frames to a format-6 database.

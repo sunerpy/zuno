@@ -32,6 +32,114 @@ use zuno_tool::{
 
 const SESSION_ID: &str = "ses_dispatch_loop";
 
+struct ScopedProbe {
+    observed: Arc<Mutex<Vec<zuno_types::identity::PrincipalScope>>>,
+}
+
+#[async_trait]
+impl Tool for ScopedProbe {
+    fn id(&self) -> &str {
+        "scope_probe"
+    }
+
+    fn description(&self) -> &str {
+        "Record the host's immutable principal."
+    }
+
+    fn raw_parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"]
+        })
+    }
+
+    async fn execute(&self, _args: Value, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        self.observed
+            .lock()
+            .expect("observed scopes")
+            .push(ctx.for_subcall("nested").principal_scope().clone());
+        Ok(ToolOutput::text("scope", "scope captured"))
+    }
+}
+
+struct ScopedApproval {
+    observed: Arc<Mutex<Vec<zuno_types::identity::PrincipalScope>>>,
+}
+
+#[async_trait]
+impl zuno_tool::PermissionAsker for ScopedApproval {
+    async fn ask(
+        &self,
+        origin: zuno_tool::PermissionOrigin<'_>,
+        _tool: &str,
+        _ask: zuno_tool::PermissionAsk,
+    ) -> Result<(), ToolError> {
+        self.observed
+            .lock()
+            .expect("approval scopes")
+            .push(origin.principal_scope().clone());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn the_real_turn_preserves_principal_through_dispatch_policy_and_nested_tools() {
+    use std::num::NonZeroU64;
+    use zuno_types::identity::{ClientId, PrincipalId, PrincipalKind, PrincipalScope, TenantId};
+
+    let principal = PrincipalScope::new(
+        TenantId::new("company-a").expect("tenant"),
+        PrincipalId::new("alice").expect("subject"),
+        PrincipalKind::User,
+        Some(ClientId::new("enterprise-client").expect("client")),
+        NonZeroU64::new(9).expect("policy"),
+    );
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let approvals = Arc::new(Mutex::new(Vec::new()));
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(ScopedProbe {
+            observed: observed.clone(),
+        })],
+        Vec::new(),
+        Arc::new(ScopedApproval {
+            observed: approvals.clone(),
+        }),
+        zuno_engine::dispatch::AuthorizationPolicy::Strict,
+        McpToolStatus::Ready,
+    );
+    let provider = Arc::new(ScriptedProvider::new(named_provider_events(
+        "scope_probe",
+        &[("scope-call", "inspect")],
+    )));
+    let providers = registry(provider);
+    let mut connection = seeded();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+    let turn = run_turn(
+        RunTurnRequest::new(SESSION_ID, "scope-turn", DynamicContext::default()),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &Resolver,
+            &dispatcher,
+            &interrupt,
+        )
+        .with_principal_scope(principal.clone()),
+        sender,
+    );
+    let (result, _) = tokio::join!(turn, collect_events(receiver));
+    assert!(matches!(result, Ok(TurnOutcome::Completed { .. })));
+    assert_eq!(
+        observed.lock().expect("observed").as_slice(),
+        std::slice::from_ref(&principal)
+    );
+    assert_eq!(
+        approvals.lock().expect("approvals").as_slice(),
+        &[principal]
+    );
+}
+
 #[derive(Debug)]
 struct ScriptedProvider {
     responses: Mutex<VecDeque<Vec<StreamEvent>>>,

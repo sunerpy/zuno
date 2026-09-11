@@ -380,13 +380,14 @@ impl ToolDispatcher for ToolRegistryDispatcher {
             self.authorization,
         ));
         let permission_for_context: Arc<dyn PermissionAsker> = permission.clone();
-        let mut context = ToolContext::new(
+        let mut context = ToolContext::new_scoped(
             request.session_id.clone(),
             request.message_id.clone(),
             request.call.id.clone(),
             request.agent.clone(),
             permission_for_context,
             Arc::new(interrupt.clone()),
+            request.principal_scope.as_ref().clone(),
         );
         if let Some(snapshot) = request.orchestration_snapshot.as_ref() {
             context = context.with_orchestration_snapshot(Arc::clone(snapshot));

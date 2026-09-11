@@ -2,6 +2,16 @@
 
 Harness 运行时是 Zuno 的核心：它决定一个回合如何组装、如何持久化、如何恢复，以及扩展在什么边界内运行。
 
+## 主体归属
+
+预览基础层通过不可变的 `PrincipalScope`，将租户、主体、调用应用和策略版本从
+`TurnContext` 传递到工具派发、权限来源及组合调用。修改工具的公开会话字段或参数
+metadata 不会改变已经捕获的主体。
+
+现有本地 Profile 使用明确的本地主体。企业宿主必须先验证调用者身份，才能绑定企业
+scope；序列化的 scope 数据不是授权凭证。资源归属检查仍需配合操作策略和共享资源 ACL。
+持久化所有权与远程认证属于后续企业实现阶段。
+
 ::: warning 本页是导读，不是完整译文
 英文版 [Harness Runtime](https://github.com/sunerpy/zuno/blob/main/docs/harness-runtime.md)
 逐节覆盖运行时的每一处契约，是唯一权威来源。本页按相同章节顺序给出每一节要解决的问题和

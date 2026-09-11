@@ -1134,6 +1134,8 @@ pub struct DispatchRequest {
     pub available_tools: Arc<[ToolDefinition]>,
     pub interrupt: InterruptSignal,
     pub orchestration_snapshot: Option<Arc<AttemptSnapshot>>,
+    /// Host-resolved attribution, never read from model arguments.
+    pub principal_scope: Arc<zuno_types::identity::PrincipalScope>,
 }
 
 /// A model-visible dispatch result. Dispatch failures are represented as error
@@ -1425,6 +1427,7 @@ pub struct TurnContext<'a> {
     dynamic_context_refresher: Option<&'a dyn DynamicContextRefresher>,
     tool_concurrency: ToolConcurrencyLimit,
     run_registry: Option<SessionRunRegistry>,
+    principal_scope: Arc<zuno_types::identity::PrincipalScope>,
 }
 
 struct LiveInputs<'a> {
@@ -1454,6 +1457,7 @@ impl<'a> TurnContext<'a> {
             dynamic_context_refresher: None,
             tool_concurrency: ToolConcurrencyLimit::SERIAL,
             run_registry: None,
+            principal_scope: Arc::new(zuno_types::identity::PrincipalScope::local()),
         }
     }
 
@@ -1507,6 +1511,13 @@ impl<'a> TurnContext<'a> {
     #[must_use]
     pub fn with_run_registry(mut self, registry: SessionRunRegistry) -> Self {
         self.run_registry = Some(registry);
+        self
+    }
+
+    /// Bind the immutable principal used by this turn's dispatch and permission calls.
+    #[must_use]
+    pub fn with_principal_scope(mut self, principal: zuno_types::identity::PrincipalScope) -> Self {
+        self.principal_scope = Arc::new(principal);
         self
     }
 }
@@ -3288,7 +3299,7 @@ async fn run_turn_in_span(
                     &assistant_id,
                     &agent.name,
                     &locked_tools,
-                    context.interrupt,
+                    &context,
                     &orchestration_snapshot,
                 );
                 let first_policy = context.dispatcher.concurrency_policy(&first_request);
@@ -3301,7 +3312,7 @@ async fn run_turn_in_span(
                             &assistant_id,
                             &agent.name,
                             &locked_tools,
-                            context.interrupt,
+                            &context,
                             &orchestration_snapshot,
                         );
                         if context.dispatcher.concurrency_policy(&candidate)
@@ -3340,7 +3351,7 @@ async fn run_turn_in_span(
                             &assistant_id,
                             &agent.name,
                             &locked_tools,
-                            context.interrupt,
+                            &context,
                             &orchestration_snapshot,
                         ))
                         .await;
@@ -3766,7 +3777,7 @@ fn dispatch_request(
     message_id: &str,
     agent: &str,
     available_tools: &Arc<[ToolDefinition]>,
-    interrupt: &InterruptSignal,
+    context: &TurnContext<'_>,
     orchestration_snapshot: &Arc<AttemptSnapshot>,
 ) -> DispatchRequest {
     DispatchRequest {
@@ -3775,8 +3786,9 @@ fn dispatch_request(
         message_id: message_id.to_owned(),
         agent: agent.to_owned(),
         available_tools: Arc::clone(available_tools),
-        interrupt: interrupt.clone(),
+        interrupt: context.interrupt.clone(),
         orchestration_snapshot: Some(Arc::clone(orchestration_snapshot)),
+        principal_scope: Arc::clone(&context.principal_scope),
     }
 }
 

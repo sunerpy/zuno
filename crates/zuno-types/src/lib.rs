@@ -1,6 +1,7 @@
 //! Wire and domain types shared across the workspace (sessions, messages, parts, tool payloads).
 
 pub mod execution;
+pub mod identity;
 
 /// One durable Plan step's lifecycle status.
 ///

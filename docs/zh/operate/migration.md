@@ -1,9 +1,9 @@
 # Zuno 数据库生命周期
 
-Zuno 管理自己的配置根目录和数据根目录。当前数据库格式为 12。空数据库直接创建为当前
+Zuno 管理自己的配置根目录和数据根目录。当前数据库格式为 13。空数据库直接创建为当前
 格式；受支持的旧格式通过受保护的前向迁移升级。format 5 是第一个受支持的历史格式，
-format 5 到 format 11 都会原地升级到 format 12，不需要重建数据库。
-迁移链显式覆盖 format 5、format 6、format 7、format 8、format 9、format 10 与 format 11。
+format 5 到 format 13 都会原地升级到 format 13，不需要重建数据库。
+迁移链显式覆盖 format 5、format 6、format 7、format 8、format 9、format 10、format 11 与 format 12。
 
 ## Channel 数据库
 
@@ -49,11 +49,11 @@ zuno session list
 
 数据库打开流程识别以下状态：
 
-1. **空数据库。** 完整的 format-12 schema 与唯一 `zuno_schema` marker 被原子创建。
-2. **Format 12。** 应用查询前校验 marker、表、约束、索引和触发器。
-3. **Format 5–11。** 在同一事务中按顺序执行所有剩余迁移：学习（6）、Plan 栈（7）、
+1. **空数据库。** 完整的 format-13 schema 与唯一 `zuno_schema` marker 被原子创建。
+2. **Format 13。** 应用查询前校验 marker、表、约束、索引和触发器。
+3. **Format 5–12。** 在同一事务中按顺序执行所有剩余迁移：学习（6）、Plan 栈（7）、
    验证账本（8）、会话记忆策略（9）、执行／收件箱状态（10）、记忆版本与检索（11）、
-   自动记忆来源与处理水位（12）。
+   自动记忆来源与处理水位（12）、会话归属（13）。
 4. **其他任何状态。** 不受支持的更旧格式、未来格式、缺少 marker，或 marker 与必需
    表不匹配，都会失败关闭且不修改文件。
 
@@ -62,11 +62,11 @@ zuno session list
 总共最多尝试四次。不支持的 format 仍然报告为 schema 不匹配；如果 format 在打开过程中
 持续变化，则以 `zuno_schema` marker 上的冲突失败关闭。两种路径都不会写库。
 
-### Format 5–11 到 format 12
+### Format 5–12 到 format 13
 
 受支持的迁移使用一个 SQLite `BEGIN IMMEDIATE` 事务：
 
-1. 重新读取表清单，并要求 marker 恰好为 format 5、6、7、8、9、10 或 11。
+1. 重新读取表清单，并要求 marker 恰好为 format 5、6、7、8、9、10、11 或 12。
 2. 在任何变更前要求历史 `session` 与 `work_plan` 表存在。
 3. 从 format 5 出发时，创建全部 format-6 learning 表和索引。
 4. 从 format 5 或 6 出发时，增加可空的 `parent_plan_id`、默认值为 0 的 `stack_depth`
@@ -81,13 +81,25 @@ zuno session list
 9. 增加候选的可空 `base_revision`／`evidence` 字段、`resident_memory_provenance`、
    `memory_maintenance_state` 及其索引。回填可精确关联的自动记忆来源，不把用户后来的修改
    重新归类为自动记忆。
-10. 最后用精确旧值条件把 marker 更新为 12；全部成功后才提交。
+10. 创建 `session_ownership`，把已有会话归属回填为显式本地用户，添加子会话继承触发器和主体索引。
+11. 最后用精确旧值条件把 marker 更新为 13；全部成功后才提交。
 
 任何失败都会回滚整个事务。迁移不会重写已有的 `session`、`message`、
 `memory_candidate`、`verification_receipt` 或 `work_plan` 值；来源验证和租约仅执行已说明的回填。
-测试使用 format-5 到 format-11 的精确发布 fixture，比较 Session、Message、Memory 等保留值，
-再验证新增对象和 marker。Format-11 用例包含已经发布的记忆版本，并验证最后一个索引创建失败时
+测试使用 format-5 到 format-12 的精确发布 fixture，比较 Session、Message、Memory 等保留值，
+再验证新增对象和 marker。Format-12 用例包含已经发布的记忆版本、来源关系和维护水位，并验证最后一个索引创建失败时
 整个升级回滚。不需要重建用户数据库。
+
+### 私有会话归属（企业预览）
+
+`session_ownership` 独立保存租户和用户标识，不能通过会话 metadata 修改。迁移把历史会话
+明确归属到 `local` / `local-user`，不从路径、标题或 OAuth 字段猜测企业所有者。
+可信宿主在创建根会话的同一事务内绑定所有者；子会话继承父会话归属。显式归属不匹配或
+父会话不存在时，作用域化创建整体回滚。重复创建不能转移会话所有权。
+
+`ScopedSessionStore` 固定创建、读取和列表的所有者，SQL 在排序和分页前过滤归属。
+它是存储基础能力，宿主仍须先认证和授权；其他本地 store 需要各自完成作用域适配后才能
+用于企业服务。预览格式 13 只用于独立预览数据库，不能指向正式安装的数据目录。
 
 ### Session execution 与 completion delivery
 

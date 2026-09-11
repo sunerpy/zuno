@@ -138,6 +138,7 @@ struct PermissionCoordinates {
     session_id: String,
     message_id: String,
     call_id: String,
+    principal: Arc<zuno_types::identity::PrincipalScope>,
 }
 
 /// Trusted coordinates for the tool call that raised a permission request.
@@ -151,6 +152,12 @@ pub struct PermissionOrigin<'a> {
 }
 
 impl<'a> PermissionOrigin<'a> {
+    /// Immutable tenant/subject attribution supplied by the host.
+    #[must_use]
+    pub fn principal_scope(self) -> &'a zuno_types::identity::PrincipalScope {
+        &self.coordinates.principal
+    }
+
     /// Session that owns the call.
     #[must_use]
     pub fn session_id(self) -> &'a str {
@@ -285,6 +292,30 @@ impl ToolContext {
         permission: Arc<dyn PermissionAsker>,
         interrupt: Arc<dyn InterruptHandle>,
     ) -> Self {
+        Self::new_scoped(
+            session_id,
+            message_id,
+            call_id,
+            agent,
+            permission,
+            interrupt,
+            zuno_types::identity::PrincipalScope::local(),
+        )
+    }
+
+    /// Create root call coordinates from a host-resolved principal.
+    ///
+    /// No public metadata or tool argument can later replace this attribution.
+    #[must_use]
+    pub fn new_scoped(
+        session_id: impl Into<String>,
+        message_id: impl Into<String>,
+        call_id: impl Into<String>,
+        agent: impl Into<String>,
+        permission: Arc<dyn PermissionAsker>,
+        interrupt: Arc<dyn InterruptHandle>,
+        principal: zuno_types::identity::PrincipalScope,
+    ) -> Self {
         let session_id = session_id.into();
         let message_id = message_id.into();
         let call_id = call_id.into();
@@ -293,6 +324,7 @@ impl ToolContext {
                 session_id: session_id.clone(),
                 message_id: message_id.clone(),
                 call_id: call_id.clone(),
+                principal: Arc::new(principal),
             },
             session_id,
             message_id,
@@ -316,6 +348,12 @@ impl ToolContext {
     #[must_use]
     pub fn orchestration_snapshot(&self) -> Option<&Arc<AttemptSnapshot>> {
         self.orchestration_snapshot.as_ref()
+    }
+
+    /// The captured subject shared by this call and every composed subcall.
+    #[must_use]
+    pub fn principal_scope(&self) -> &zuno_types::identity::PrincipalScope {
+        &self.permission_coordinates.principal
     }
 
     /// Derives the context for a tool call made *by* this tool call.
@@ -342,6 +380,7 @@ impl ToolContext {
                 session_id: self.permission_coordinates.session_id.clone(),
                 message_id: self.permission_coordinates.message_id.clone(),
                 call_id,
+                principal: Arc::clone(&self.permission_coordinates.principal),
             },
             orchestration_snapshot: self.orchestration_snapshot.as_ref().map(Arc::clone),
         }
@@ -403,6 +442,65 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Default)]
+    struct ScopedOrigins(Mutex<Vec<(String, String, zuno_types::identity::PrincipalScope)>>);
+
+    #[async_trait]
+    impl PermissionAsker for ScopedOrigins {
+        async fn ask(
+            &self,
+            origin: PermissionOrigin<'_>,
+            _tool: &str,
+            _ask: PermissionAsk,
+        ) -> Result<(), ToolError> {
+            self.0.lock().expect("origins").push((
+                origin.session_id().to_owned(),
+                origin.call_id().to_owned(),
+                origin.principal_scope().clone(),
+            ));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn composed_calls_keep_the_host_principal_despite_public_metadata_changes() {
+        use std::num::NonZeroU64;
+        use zuno_types::identity::{
+            ClientId, PrincipalId, PrincipalKind, PrincipalScope, TenantId,
+        };
+
+        let principal = PrincipalScope::new(
+            TenantId::new("company-a").expect("tenant"),
+            PrincipalId::new("alice").expect("principal"),
+            PrincipalKind::User,
+            Some(ClientId::new("enterprise-web").expect("client")),
+            NonZeroU64::new(7).expect("policy revision"),
+        );
+        let recorder = Arc::new(ScopedOrigins::default());
+        let mut context = ToolContext::new_scoped(
+            "session-a",
+            "message-a",
+            "call-a",
+            "build",
+            recorder.clone(),
+            Arc::new(NeverInterrupted),
+            principal.clone(),
+        );
+        context.session_id = "forged-session".to_owned();
+        let child = context.for_subcall("child").for_subcall("grandchild");
+        let mut ask = PermissionAsk::new("read", "file");
+        ask.metadata.insert(
+            "principalId".to_owned(),
+            Value::String("mallory".to_owned()),
+        );
+        child.ask("read", ask).await.expect("record");
+        assert_eq!(
+            recorder.0.lock().expect("origins").as_slice(),
+            &[("session-a".to_owned(), "grandchild".to_owned(), principal)]
+        );
+        assert_eq!(child.principal_scope(), context.principal_scope());
+    }
 
     #[derive(Default)]
     struct RecordingOrigins(Mutex<Vec<(String, String, String)>>);
