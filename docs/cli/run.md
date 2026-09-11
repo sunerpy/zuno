@@ -70,6 +70,11 @@ zuno run --continue "now add tests for the new branch"
 
 Emit JSON so a script can parse the result rather than scraping formatted text.
 
+The `context_usage` event carries the native `snapshot`, including confirmed
+usage, estimated tail, cumulative disjoint counters, source and request identity.
+Unknown values stay unknown; scripts should not substitute a raw
+`provider_request_started` estimate for a provider-confirmed baseline.
+
 ```sh
 zuno run --format json "list the failing tests" > result.json
 ```

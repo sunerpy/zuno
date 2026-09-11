@@ -199,7 +199,8 @@ async fn question_notifications_forward_committed_events_without_reappending() {
     let questions = QuestionService::new(Arc::clone(&pool));
     let changes = questions.subscribe();
     let forwarded = events.clone();
-    let forwarder = tokio::spawn(async move { forwarded.forward_question_events(changes).await });
+    let mut forwarder =
+        tokio::spawn(async move { forwarded.forward_question_events(changes).await });
     let app = event_app(events.clone());
     let mut global = open_stream_at(&app, "/api/event", None).await;
     assert_eq!(
@@ -225,9 +226,14 @@ async fn question_notifications_forward_committed_events_without_reappending() {
         .find(|event| event.event_type() == "question.opened")
         .expect("committed question");
     for stream in [&mut global, &mut session] {
-        let frame = tokio::time::timeout(Duration::from_secs(2), next_frame(stream))
-            .await
-            .expect("question event");
+        let frame = tokio::select! {
+            completed = &mut forwarder => {
+                panic!("question forwarder stopped before delivering the commit: {completed:?}");
+            }
+            frame = tokio::time::timeout(Duration::from_secs(2), next_frame(stream)) => {
+                frame.expect("question event")
+            }
+        };
         let (cursor, payload) = decode_frame(&frame);
         assert_eq!(payload["id"], source.id());
         assert_eq!(cursor.as_ref(), Some(source.cursor()));
@@ -305,6 +311,268 @@ async fn question_notifications_forward_committed_events_without_reappending() {
         .expect("forwarder exits")
         .expect("forwarder joins")
         .expect("forwarder succeeds");
+}
+
+#[tokio::test]
+async fn question_forwarding_survives_a_concurrent_read_projection() {
+    let (pool, events) = event_service(16);
+    let session_id = "ses_question_read_projection";
+    create_session(&pool, session_id);
+    events
+        .publish(
+            session_id,
+            NewEvent::new("session.created", Map::new()).expect("creation event"),
+        )
+        .await
+        .expect("initialize the event store");
+    let receipt = QuestionService::new(Arc::clone(&pool))
+        .open(native_question(session_id))
+        .await
+        .expect("commit the question");
+    let before = events.replay(session_id, None).await.expect("replay");
+    let committed = before
+        .iter()
+        .find(|event| event.event_type() == "question.opened")
+        .expect("the question's authoritative event");
+    let app = event_app(events.clone());
+    let mut stream = open_stream_at(&app, "/api/event", None).await;
+    next_frame(&mut stream).await;
+
+    // Replay owns a deferred read transaction. With the only pooled connection
+    // checked out, an unsynchronized history reader opens another connection and
+    // its configured pragmas fail with SQLITE_LOCKED in a shared-memory database.
+    assert_eq!(pool.idle_count(), 1, "one available fixture connection");
+    let (holding, held) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let projection = tokio::task::spawn_blocking({
+        let pool = Arc::clone(&pool);
+        move || {
+            pool.transaction_with_behavior(zuno_db::TransactionBehavior::Deferred, |tx| {
+                let count: i64 = tx
+                    .query_row("SELECT COUNT(*) FROM event", [], |row| row.get(0))
+                    .map_err(zuno_db::map_error)?;
+                holding
+                    .send(count)
+                    .expect("report the active read snapshot");
+                released
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("release the read snapshot");
+                Ok(())
+            })
+        }
+    });
+    assert_eq!(held.await.expect("read snapshot starts"), 2);
+
+    let (changes, receiver) = tokio::sync::broadcast::channel(1);
+    changes.send(receipt).expect("wake the question forwarder");
+    drop(changes);
+    let mut forwarder = tokio::spawn({
+        let events = events.clone();
+        async move { events.forward_question_events(receiver).await }
+    });
+    let early = tokio::time::timeout(Duration::from_millis(100), &mut forwarder).await;
+    release.send(()).expect("release the concurrent read");
+    projection
+        .await
+        .expect("projection worker")
+        .expect("read projection commits");
+    let result = match early {
+        Ok(result) => result,
+        Err(_) => tokio::time::timeout(Duration::from_secs(2), forwarder)
+            .await
+            .expect("forwarder finishes after the read"),
+    };
+    result
+        .expect("forwarder worker")
+        .expect("a concurrent read must not terminate question delivery");
+    let frame = tokio::time::timeout(Duration::from_secs(2), next_frame(&mut stream))
+        .await
+        .expect("the committed question reaches the subscriber");
+    let (cursor, payload) = decode_frame(&frame);
+    assert_eq!(cursor.as_ref(), Some(committed.cursor()));
+    assert_eq!(payload["id"], committed.id());
+    assert_eq!(
+        payload["data"]["question"],
+        committed.properties()["question"]
+    );
+    assert_eq!(
+        events.replay(session_id, None).await.expect("replay"),
+        before,
+        "forwarding must not append or rewrite the committed event"
+    );
+}
+
+#[tokio::test]
+async fn event_publication_waits_for_readers_before_initialization() {
+    publication_waits_for_reader(false).await;
+}
+
+#[tokio::test]
+async fn event_publication_waits_for_readers_after_initialization() {
+    publication_waits_for_reader(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_first_publications_initialize_once_and_preserve_every_event() {
+    let (_pool, events) = event_service(16);
+    let barrier = Arc::new(tokio::sync::Barrier::new(8));
+    let mut writers = tokio::task::JoinSet::new();
+    for ordinal in 0..8 {
+        let events = events.clone();
+        let barrier = Arc::clone(&barrier);
+        writers.spawn(async move {
+            barrier.wait().await;
+            events
+                .publish("ses_first_publication", event(ordinal))
+                .await
+        });
+    }
+    let mut committed = Vec::new();
+    while let Some(result) = writers.join_next().await {
+        committed.push(
+            result
+                .expect("publisher task")
+                .expect("concurrent first publication"),
+        );
+    }
+    committed.sort_by_key(|event| event.sequence());
+    assert_eq!(
+        committed
+            .iter()
+            .map(|event| event.sequence())
+            .collect::<Vec<_>>(),
+        (0..8).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        events
+            .replay("ses_first_publication", None)
+            .await
+            .expect("replay"),
+        committed
+    );
+}
+
+async fn publication_waits_for_reader(initialized: bool) {
+    let (pool, events) = event_service(8);
+    let session_id = "ses_publication_read";
+    create_session(&pool, session_id);
+    if initialized {
+        events.replay(session_id, None).await.expect("initialize");
+    }
+    // The broker's synchronous request-list projection uses Pool::get directly.
+    // Hold that read's only connection while publication has to check out another.
+    let (holding, held) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let reader = tokio::task::spawn_blocking({
+        let pool = Arc::clone(&pool);
+        move || {
+            let mut connection = pool.get().expect("read connection");
+            let transaction = connection
+                .transaction_with_behavior(zuno_db::TransactionBehavior::Deferred)
+                .expect("read transaction");
+            let _: i64 = transaction
+                .query_row("SELECT COUNT(*) FROM human_request", [], |row| row.get(0))
+                .expect("request-list read");
+            holding.send(()).expect("read lock acquired");
+            released
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release the read");
+            transaction.commit().expect("finish the read");
+        }
+    });
+    held.await.expect("reader holds its connection");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut publication = tokio::spawn({
+        let events = events.clone();
+        let calls = Arc::clone(&calls);
+        async move {
+            events
+                .publish_with(session_id, event(1), move |tx| {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tx.execute(
+                        "UPDATE session SET title = 'committed with event' WHERE id = ?1",
+                        [session_id],
+                    )
+                    .map_err(zuno_db::map_error)?;
+                    Ok(())
+                })
+                .await
+        }
+    });
+    let early = tokio::time::timeout(Duration::from_millis(100), &mut publication).await;
+    release.send(()).expect("release the request-list read");
+    reader.await.expect("read worker");
+    let result = match early {
+        Ok(result) => result,
+        Err(_) => tokio::time::timeout(Duration::from_secs(2), publication)
+            .await
+            .expect("publication resumes after the read"),
+    };
+    let committed = result
+        .expect("publication worker")
+        .expect("a temporary read lock must not lose the publication");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        zuno_db::session::Store::new(&pool)
+            .get(session_id)
+            .expect("read committed state")
+            .title,
+        "committed with event"
+    );
+    assert_eq!(
+        events.replay(session_id, None).await.expect("replay"),
+        vec![committed],
+        "exactly one event commits with the mutation"
+    );
+}
+
+#[tokio::test]
+async fn a_checkout_error_inside_the_mutation_is_not_retried() {
+    let (pool, events) = event_service(8);
+    let session_id = "ses_mutation_checkout";
+    create_session(&pool, session_id);
+    events.replay(session_id, None).await.expect("initialize");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let result = events
+        .publish_with(session_id, event(1), {
+            let pool = Arc::clone(&pool);
+            let calls = Arc::clone(&calls);
+            move |tx| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tx.execute(
+                    "UPDATE session SET title = 'must roll back' WHERE id = ?1",
+                    [session_id],
+                )
+                .map_err(zuno_db::map_error)?;
+                // The same SQLite setup error can originate from caller work.
+                // Once that work began, its effects must never be replayed.
+                let _connection = pool.open_connection()?;
+                Ok(())
+            }
+        })
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(EventStreamError::Database(zuno_error::DbError::Open { .. }))
+        ),
+        "the mutation's connection error is returned: {result:?}"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        zuno_db::session::Store::new(&pool)
+            .get(session_id)
+            .expect("read rolled-back state")
+            .title,
+        "events"
+    );
+    assert!(
+        events
+            .replay(session_id, None)
+            .await
+            .expect("replay")
+            .is_empty()
+    );
 }
 
 #[tokio::test]

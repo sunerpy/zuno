@@ -84,6 +84,9 @@ fn provider_config(base_url: &str) -> String {
     trusted_platform_config(json!({
         "formatter": false,
         "lsp": false,
+        // This cassette tests Goal recovery, not the independently scheduled
+        // completed-turn extractor. Its requests must not consume Goal replies.
+        "learning": {"enabled": false},
         "model": "test/test-model",
         // The uncertain outcome has to be the command's, not the sandbox's: a confined
         // backend that refuses to start the command never reaches the guard at all.
@@ -405,13 +408,9 @@ async fn a_lost_side_effect_pauses_the_goal_and_survives_a_pause_that_was_never_
             .is_none(),
         "a turn is not an inspection: only an explicit recovery action retires the call"
     );
-    // The pause is only actionable if a human can see which call to inspect, and only
-    // ends when they say they inspected it. Both of those are surfaces, so they are read
-    // through one — and through durable state neither the test nor the surface authored.
-    // One permanent provider failure, because the resumed turn has to end somewhere and
-    // this test is not about where. What matters is that the turn happens at all: before
-    // reconciliation the guard refused to start one, so a captured request is the proof
-    // that the obligation was retired rather than merely reported.
+    // A generic Goal resume is consent to resume work, not proof that the
+    // uncertain external effect was inspected. The native surface must keep
+    // the obligation and make no new provider request.
     let recovered = Scenario::new("uncertain-outcome-recovery").respond(MockResponse::authored(
         400,
         "application/json",
@@ -468,7 +467,7 @@ async fn a_lost_side_effect_pauses_the_goal_and_survives_a_pause_that_was_never_
         }),
     )
     .await;
-    let (_, resumed) = acp_request(
+    let (resume_response, _) = acp_request(
         &mut acp_stdin,
         &mut acp_stdout,
         4,
@@ -482,7 +481,7 @@ async fn a_lost_side_effect_pauses_the_goal_and_survives_a_pause_that_was_never_
     let _ = tokio::time::timeout(Duration::from_secs(5), child.kill())
         .await
         .expect("ACP process cleanup must finish");
-    let (shown, resumed) = (goal_command_output(&shown), goal_command_output(&resumed));
+    let shown = goal_command_output(&shown);
 
     assert_eq!(shown["pause"]["reason"], "uncertain_side_effect");
     let pending = shown["pendingUncertainCalls"]
@@ -494,16 +493,11 @@ async fn a_lost_side_effect_pauses_the_goal_and_survives_a_pause_that_was_never_
     assert_eq!(pending[0]["cause"], "lost_outcome");
     assert_eq!(pending[0]["appliedPaths"], json!([]));
 
-    assert_eq!(resumed["status"], "active");
-    let reconciled = resumed["reconciledUncertainCalls"]
-        .as_array()
-        .expect("resuming must report what it retired");
-    assert_eq!(reconciled.len(), 1, "{resumed}");
-    assert_eq!(reconciled[0]["callID"], "guard-failure");
+    assert!(resume_response["error"].is_object(), "{resume_response}");
     assert_eq!(
         recovery_provider.captured_count().await,
-        1,
-        "an inspected goal runs again; before the resume the guard refused to start a turn"
+        0,
+        "generic resume cannot waive the authoritative-inspection barrier"
     );
 
     let connection = Connection::open(&database).expect("reopen the session database");
@@ -514,10 +508,16 @@ async fn a_lost_side_effect_pauses_the_goal_and_survives_a_pause_that_was_never_
         "reconciliation records that an inspection happened; it never erases the evidence"
     );
     assert!(
-        records[0]["state"]["uncertain"]["reconciledAtMs"]
-            .as_i64()
-            .is_some_and(|at| at > 0),
-        "the explicit recovery action is what retires the obligation: {}",
         records[0]["state"]["uncertain"]
+            .get("reconciledAtMs")
+            .is_none()
     );
+    let status: String = connection
+        .query_row(
+            "SELECT status FROM goal WHERE session_id=?1",
+            [&session_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "paused");
 }

@@ -1494,6 +1494,10 @@ pub fn commit_revert_at(
         }
     }
 
+    // A rewrite can remove the measured prompt without changing a legacy
+    // epoch-zero checkpoint. Preserve usage, but invalidate that window before
+    // any source rows disappear, in this same transaction.
+    crate::context_usage::invalidate_window_in(transaction, id, millis)?;
     let removed_messages = transaction
         .execute(
             "DELETE FROM session_message WHERE session_id = ?1 \

@@ -19,7 +19,7 @@ use zuno_error::DbError;
 /// Current database format.
 ///
 /// Bump this whenever [`crate::schema`] changes incompatibly.
-pub const CURRENT_FORMAT: u32 = 13;
+pub const CURRENT_FORMAT: u32 = 14;
 const LEARNING_UPGRADE_FROM: u32 = 5;
 const PLAN_STACK_UPGRADE_FROM: u32 = 6;
 const VERIFICATION_UPGRADE_FROM: u32 = 7;
@@ -28,6 +28,7 @@ const EXECUTION_UPGRADE_FROM: u32 = 9;
 const MEMORY_RUNTIME_UPGRADE_FROM: u32 = 10;
 const AUTOMATIC_MEMORY_UPGRADE_FROM: u32 = 11;
 const QUESTIONS_UPGRADE_FROM: u32 = 12;
+const RUNTIME_CONSISTENCY_UPGRADE_FROM: u32 = 13;
 
 const FORMAT_TABLE: &str = "zuno_schema";
 const FORMAT_SQL: &str = "
@@ -119,6 +120,7 @@ fn dispatch_once(connection: &mut Connection) -> Result<Dispatch, DbError> {
         Some(MEMORY_RUNTIME_UPGRADE_FROM) => migrate_memory_runtime(connection),
         Some(AUTOMATIC_MEMORY_UPGRADE_FROM) => migrate_automatic_memory(connection),
         Some(QUESTIONS_UPGRADE_FROM) => migrate_questions(connection),
+        Some(RUNTIME_CONSISTENCY_UPGRADE_FROM) => migrate_runtime_consistency(connection),
         observed => Err(DbError::SchemaMismatch {
             expected: CURRENT_FORMAT,
             observed,
@@ -129,6 +131,13 @@ fn dispatch_once(connection: &mut Connection) -> Result<Dispatch, DbError> {
 fn validate_current(connection: &Connection, tables: &[String]) -> Result<(), DbError> {
     validate_format_twelve(connection, tables)?;
     validate_questions_shape(connection)?;
+    validate_scheduling_shape(connection)?;
+    validate_runtime_consistency_shape(connection)
+}
+
+fn validate_format_thirteen(connection: &Connection, tables: &[String]) -> Result<(), DbError> {
+    validate_format_twelve(connection, tables)?;
+    validate_questions_shape_version(connection, true)?;
     validate_scheduling_shape(connection)
 }
 
@@ -534,8 +543,76 @@ fn add_questions(transaction: &Transaction<'_>) -> Result<(), DbError> {
     schema::up_scheduling(transaction)?;
     crate::question::backfill_legacy_in(transaction)?;
     crate::session_execution::repair_legacy_scheduling_in(transaction)?;
-    validate_questions_shape(transaction)?;
-    validate_scheduling_shape(transaction)
+    validate_questions_shape_version(transaction, true)?;
+    validate_scheduling_shape(transaction)?;
+    schema::up_runtime_consistency(transaction)?;
+    validate_current(transaction, &transaction_table_names(transaction)?)
+}
+
+fn migrate_runtime_consistency(connection: &mut Connection) -> Result<Dispatch, DbError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_error)?;
+    let tables = transaction_table_names(&transaction)?;
+    let observed = observed_format(&transaction, &tables)?;
+    if observed != Some(RUNTIME_CONSISTENCY_UPGRADE_FROM) {
+        return Ok(Dispatch::Moved { observed });
+    }
+    validate_format_thirteen(&transaction, &tables)?;
+    schema::up_runtime_consistency(&transaction)?;
+    validate_current(&transaction, &transaction_table_names(&transaction)?)?;
+    let changed = transaction
+        .execute(
+            "UPDATE zuno_schema SET format=?1 WHERE singleton=1 AND format=?2",
+            params![CURRENT_FORMAT, RUNTIME_CONSISTENCY_UPGRADE_FROM],
+        )
+        .map_err(map_error)?;
+    if changed != 1 {
+        return Err(failure(std::io::Error::other(
+            "format-13 marker changed during runtime migration",
+        )));
+    }
+    transaction.commit().map_err(map_error)?;
+    Ok(Dispatch::Settled)
+}
+
+fn validate_runtime_consistency_shape(connection: &Connection) -> Result<(), DbError> {
+    validate_table_columns(
+        connection,
+        "session_input_receipt",
+        &[
+            ("input_id", "TEXT", true, 1),
+            ("state", "TEXT", true, 0),
+            ("delivery", "TEXT", true, 0),
+            ("turn_id", "TEXT", false, 0),
+            ("applied_at", "INTEGER", false, 0),
+            ("completed_at", "INTEGER", false, 0),
+            ("stop_reason", "TEXT", false, 0),
+            ("error", "TEXT", false, 0),
+            ("time_updated", "INTEGER", true, 0),
+        ],
+    )?;
+    validate_table_columns(
+        connection,
+        "session_context_usage",
+        &[
+            ("session_id", "TEXT", true, 1),
+            ("source", "TEXT", true, 2),
+            ("revision", "INTEGER", true, 0),
+            ("context_epoch", "INTEGER", true, 0),
+            ("state_json", "TEXT", true, 0),
+            ("time_updated", "INTEGER", true, 0),
+        ],
+    )?;
+    validate_sql_objects(
+        connection,
+        &[
+            "session_input_receipt",
+            "session_input_receipt_turn_state_idx",
+            "session_context_usage",
+            "session_context_usage_updated_idx",
+        ],
+    )
 }
 
 /// A current marker must never accept a missing/weakened scheduling column.
@@ -566,7 +643,14 @@ fn validate_scheduling_shape(connection: &Connection) -> Result<(), DbError> {
 }
 
 fn validate_questions_shape(connection: &Connection) -> Result<(), DbError> {
-    validate_question_columns(
+    validate_questions_shape_version(connection, false)
+}
+
+fn validate_questions_shape_version(
+    connection: &Connection,
+    released_thirteen: bool,
+) -> Result<(), DbError> {
+    validate_table_columns(
         connection,
         "question_interaction",
         &[
@@ -580,7 +664,7 @@ fn validate_questions_shape(connection: &Connection) -> Result<(), DbError> {
             ("authorization_input_id", "TEXT", false, 0),
         ],
     )?;
-    validate_question_columns(
+    validate_table_columns(
         connection,
         "question_action_receipt",
         &[
@@ -607,6 +691,40 @@ fn validate_questions_shape(connection: &Connection) -> Result<(), DbError> {
             "current question consent index is missing or malformed",
         )));
     }
+    if released_thirteen {
+        // This literal is frozen at the published format-13 boundary. Current
+        // schema construction also goes through it before the format-14 rebuild.
+        let reference = Connection::open_in_memory().map_err(map_error)?;
+        reference
+            .execute_batch(include_str!("../schema/questions.sql"))
+            .map_err(map_error)?;
+        let expected: String = reference
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name='question_interaction'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(map_error)?;
+        let actual: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name='question_interaction'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(map_error)?;
+        if normalized_sql(&actual) != normalized_sql(&expected) {
+            return Err(failure(std::io::Error::other(
+                "format-13 question companion is malformed",
+            )));
+        }
+        return validate_sql_objects(
+            connection,
+            &[
+                "question_action_receipt",
+                "question_interaction_purpose_authorization_idx",
+            ],
+        );
+    }
     validate_sql_objects(
         connection,
         &[
@@ -619,7 +737,7 @@ fn validate_questions_shape(connection: &Connection) -> Result<(), DbError> {
 
 /// Check parsed column names as well as the stored DDL: whitespace inside a
 /// quoted identifier is significant even when DDL formatting is normalized.
-fn validate_question_columns(
+fn validate_table_columns(
     connection: &Connection,
     table: &str,
     expected: &[(&str, &str, bool, i64)],
@@ -652,7 +770,7 @@ fn validate_question_columns(
             })
     {
         return Err(failure(std::io::Error::other(format!(
-            "current question table `{table}` is missing or has malformed columns"
+            "current table `{table}` is missing or has malformed columns"
         ))));
     }
     Ok(())
@@ -881,15 +999,37 @@ fn validate_sql_objects(connection: &Connection, names: &[&str]) -> Result<(), D
 
 fn normalized_sql(sql: &str) -> String {
     let mut normalized = String::with_capacity(sql.len());
-    let mut in_literal = false;
-    for character in sql.chars() {
-        if character == '\'' {
-            // Doubled quotes toggle twice, preserving escaped literal content.
-            in_literal = !in_literal;
-            normalized.push(character);
-        } else if in_literal {
-            normalized.push(character);
-        } else if !character.is_ascii_whitespace() && !matches!(character, '`' | '"') {
+    let mut quote = None;
+    let mut characters = sql.chars().peekable();
+    while let Some(character) = characters.next() {
+        if let Some(end) = quote {
+            if character == end {
+                if characters.peek() == Some(&end) {
+                    characters.next();
+                    normalized.push(character);
+                    if end == '\'' {
+                        normalized.push(character);
+                    }
+                } else {
+                    quote = None;
+                    if end == '\'' {
+                        normalized.push(character);
+                    }
+                }
+            } else if end == '\'' {
+                normalized.push(character);
+            } else {
+                // Quoting may be normalized, but whitespace *inside* an
+                // identifier is data. Never equate "so urce" with source,
+                // including in FK targets and index expressions.
+                normalized.extend(character.to_lowercase());
+            }
+        } else if matches!(character, '\'' | '`' | '"' | '[') {
+            quote = Some(if character == '[' { ']' } else { character });
+            if character == '\'' {
+                normalized.push(character);
+            }
+        } else if !character.is_ascii_whitespace() {
             normalized.extend(character.to_lowercase());
         }
     }

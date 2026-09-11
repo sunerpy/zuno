@@ -3530,7 +3530,7 @@ fn production_prompt_composition_honours_the_memory_master_switch() {
 }
 
 #[test]
-fn session_memory_policy_removes_only_memory_prompt_sections() {
+fn request_local_memory_removes_static_duplicates_without_removing_instructions() {
     let mut resolver = traced_resolver("AGENT");
     resolver
         .append_prompt_section("memory.global", "global", "GLOBAL_MEMORY")
@@ -3542,12 +3542,8 @@ fn session_memory_policy_removes_only_memory_prompt_sections() {
         .append_prompt_section("instructions", "repo", "PROJECT_INSTRUCTIONS")
         .expect("instructions");
 
-    let mut enabled = resolver.clone();
-    apply_session_memory_use(&mut enabled, true);
-    assert!(enabled.system_prompt.contains("GLOBAL_MEMORY"));
-    assert!(enabled.system_prompt.contains("PROJECT_MEMORY"));
-
-    apply_session_memory_use(&mut resolver, false);
+    resolver.remove_prompt_section("memory.global");
+    resolver.remove_prompt_section("memory.project");
     assert!(!resolver.system_prompt.contains("GLOBAL_MEMORY"));
     assert!(!resolver.system_prompt.contains("PROJECT_MEMORY"));
     assert!(resolver.system_prompt.contains("AGENT"));
@@ -12461,6 +12457,9 @@ mod learning_runtime {
                 model_id: "extractor-model".to_owned(),
                 wire_id: "extractor-model".to_owned(),
                 surface: ApiSurface::Chat,
+                parameters: serde_json::Map::new(),
+                headers: std::collections::BTreeMap::new(),
+                sampling_params: true,
             },
             limits: zuno_config::ResolvedLearningConfig::default(),
             events: zuno_db::event_log::SessionEventLog::new(pool),
@@ -12643,7 +12642,8 @@ mod learning_runtime {
             "id": "msg_learning_assistant",
             "sessionID": session.id,
             "role": "assistant",
-            "time": {"created": now + 1},
+            "time": {"created": now + 1, "completed": now + 6},
+            "finish": "stop",
             "parentID": user.id,
             "modelID": "model",
             "providerID": "provider",
@@ -12804,7 +12804,7 @@ mod learning_runtime {
               INSERT INTO session(id,project_id,slug,directory,title,version,time_created,time_updated)
               VALUES('s','p','s','/work','test','1',1,1);
               INSERT INTO message(id,session_id,time_created,time_updated,data)
-              VALUES('m','s',1,1,'{\"role\":\"assistant\"}');
+              VALUES('m','s',1,1,'{\"role\":\"assistant\",\"finish\":\"stop\",\"time\":{\"completed\":1}}');
               INSERT INTO part(id,message_id,session_id,time_created,time_updated,data)
               VALUES('part','m','s',1,1,'{\"type\":\"tool\"}');").expect("fixture");
         }

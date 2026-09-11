@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zuno_error::DbError;
 use zuno_tool::question::{QuestionError, QuestionResult};
+use zuno_types::goal_resume::GoalResumeRequest;
 use zuno_types::question::{
     PlanAuthorizationState, PlanQuestionBinding, PlanQuestionDecision, QuestionAction,
     QuestionAnswers, QuestionCommand, QuestionItem, QuestionMode, QuestionOrigin, QuestionPurpose,
@@ -35,6 +36,8 @@ struct Definition {
     initial_mode: QuestionMode,
     #[serde(default)]
     handoff_completed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    goal_resume: Option<GoalResumeRequest>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +97,7 @@ pub fn create_in(
             QuestionPurpose::RequiredInput if spec.origin.goal_id.is_some() => "goal_request_input",
             QuestionPurpose::RequiredInput => "question",
             QuestionPurpose::PlanAuthorization => "plan_exit",
+            QuestionPurpose::GoalResume => "goal_resume",
         },
         "questions": spec.questions,
     });
@@ -116,6 +120,16 @@ pub fn create_in(
         plan: spec.plan.clone(),
         initial_mode: spec.mode,
         handoff_completed: false,
+        goal_resume: if spec.purpose == QuestionPurpose::GoalResume {
+            Some(GoalResumeRequest {
+                session_id: spec.origin.session_id.clone(),
+                goal_id: spec.origin.goal_id.clone().expect("validated Goal"),
+                expected_revision: spec.expected_goal_revision.expect("validated revision"),
+                input_id: spec.origin.message_id.clone(),
+            })
+        } else {
+            None
+        },
     };
     insert_definition_in(tx, &request.id, spec.purpose, spec.mode, &definition)?;
     let question = get_in(tx, &spec.origin.session_id, request_id)?;
@@ -248,6 +262,7 @@ pub fn backfill_legacy_in(tx: &Transaction<'_>) -> Result<(), DbError> {
             plan: None,
             initial_mode: QuestionMode::Blocking,
             handoff_completed: false,
+            goal_resume: None,
         };
         insert_definition_in(tx, &id, purpose, QuestionMode::Blocking, &definition)?;
     }
@@ -295,6 +310,18 @@ pub fn get_in(
     if (purpose == QuestionPurpose::PlanAuthorization) != definition.plan.is_some() {
         return Err(corrupt("question purpose and Plan binding disagree").into());
     }
+    if (purpose == QuestionPurpose::GoalResume) != definition.goal_resume.is_some() {
+        return Err(corrupt("question purpose and Goal resume binding disagree").into());
+    }
+    if let Some(binding) = &definition.goal_resume {
+        binding.validate()?;
+        if binding.session_id != definition.origin.session_id
+            || Some(&binding.goal_id) != definition.origin.goal_id.as_ref()
+            || binding.input_id != definition.origin.message_id
+        {
+            return Err(corrupt("Goal resume binding and question owner disagree").into());
+        }
+    }
     let answers = stored_answers(&request, &definition.questions)?;
     let draft_answers = request
         .response
@@ -340,6 +367,74 @@ pub fn pending_in(connection: &Connection, session_id: &str) -> QuestionResult<V
     ids.into_iter()
         .map(|id| get_in(connection, session_id, &id))
         .collect()
+}
+
+/// Native Goal consent is bound in the immutable question definition.
+pub fn goal_resume_request_in(
+    connection: &Connection,
+    session_id: &str,
+    request_id: &str,
+) -> QuestionResult<GoalResumeRequest> {
+    let view = get_in(connection, session_id, request_id)?;
+    if view.purpose != QuestionPurpose::GoalResume {
+        return Err(QuestionError::Invalid(
+            "question is not Goal resume consent".to_owned(),
+        ));
+    }
+    let encoded: String = connection
+        .query_row(
+            "SELECT definition FROM question_interaction WHERE request_id=?1",
+            [request_id],
+            |row| row.get(0),
+        )
+        .map_err(open::map_error)?;
+    let definition: Definition = decode(&encoded)?;
+    definition
+        .goal_resume
+        .ok_or_else(|| QuestionError::Invalid("Goal resume binding is missing".to_owned()))
+}
+
+/// Retire only a pending native offer whose original input can no longer run.
+/// Terminal user choices remain authoritative and must never be superseded.
+pub fn supersede_unusable_goal_resume_in(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    request_id: &str,
+    now: i64,
+) -> QuestionResult<bool> {
+    let view = get_in(tx, session_id, request_id)?;
+    if view.purpose != QuestionPurpose::GoalResume || view.state != QuestionState::Pending {
+        return Ok(false);
+    }
+    let binding = goal_resume_request_in(tx, session_id, request_id)?;
+    let Some(input_id) = binding.input_id.as_deref() else {
+        return Ok(false);
+    };
+    if crate::inbox::read_in(tx, session_id, input_id)?.is_some_and(|input| {
+        !matches!(
+            input.state,
+            crate::inbox::SubmissionState::Cancelled | crate::inbox::SubmissionState::Failed
+        )
+    }) {
+        return Ok(false);
+    }
+    human_request::resolve_in(
+        tx,
+        request_id,
+        human_request::HumanRequestState::Cancelled,
+        Some(&json!({
+            "outcome":"superseded",
+            "reason":"input_unavailable",
+            "resumeSuperseded":true,
+        })),
+        now,
+    )?;
+    record_event(
+        tx,
+        "question.cancelled",
+        &get_in(tx, session_id, request_id)?,
+    )?;
+    Ok(true)
 }
 
 fn stored_answers(
@@ -398,7 +493,8 @@ pub fn apply_in(
     match &command.action {
         QuestionAction::Answer { answers } => {
             view.validate_answers(answers)?;
-            admit_response = answers.values().any(|values| !values.is_empty());
+            admit_response = view.purpose != QuestionPurpose::GoalResume
+                && answers.values().any(|values| !values.is_empty());
             for (id, answers) in answers {
                 // Only explicitly submitted keys leave draft state. Never
                 // promote other saved form values on a partial/empty answer.
@@ -419,7 +515,7 @@ pub fn apply_in(
             view.state = QuestionState::Pending;
         }
         QuestionAction::Cancel => {
-            admit_response = true;
+            admit_response = view.purpose != QuestionPurpose::GoalResume;
             view.state = QuestionState::Cancelled;
             if view.purpose == QuestionPurpose::PlanAuthorization {
                 view.authorization = Some(PlanAuthorizationState::Invalidated);

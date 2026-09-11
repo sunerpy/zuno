@@ -12,27 +12,39 @@ use zuno_config::schema::permission::{
     PermissionAction, PermissionConfig, PermissionMode, PermissionObject, PermissionRule,
 };
 
+// Working roles share one verification rubric. Hidden tool-free roles retain
+// their output-specific prompts, and configured prompt overrides remain intact.
+// Design references at Codex eaa8b6d917: codex-rs/models-manager/prompt.md
+// ("Validating your work"), and codex-rs/prompts/src/review_request.rs::REVIEW_PROMPT
+// with codex-rs/prompts/templates/review/rubric.md. The stricter reproducible-bug
+// red/green sequence is user-chosen Zuno prompt guidance, not a Codex runtime gate.
+macro_rules! working_prompt {
+    ($body:expr) => {
+        concat!($body, "\n\n", include_str!("prompt/verification.txt"))
+    };
+}
+
 macro_rules! specialist_prompt {
     ($path:literal) => {
-        concat!(
+        working_prompt!(concat!(
             include_str!($path),
             "\n\nReturn concise natural Markdown. Use these headings when they add value: \
              Outcome, Evidence, Inspected/Changed, Risks/Blocker. Omit empty headings. Do not \
              emit JSON or XML unless the caller explicitly requires machine-readable output."
-        )
+        ))
     };
 }
 
 /// Default multi-agent coordinator.
-pub const PROMPT_ORCHESTRATOR: &str = include_str!("prompt/orchestrator.txt");
+pub const PROMPT_ORCHESTRATOR: &str = working_prompt!(include_str!("prompt/orchestrator.txt"));
 /// Direct end-to-end implementation agent.
-pub const PROMPT_BUILD: &str = include_str!("prompt/build.txt");
+pub const PROMPT_BUILD: &str = working_prompt!(include_str!("prompt/build.txt"));
 /// Read-only planning agent.
-pub const PROMPT_PLAN: &str = include_str!("prompt/plan.txt");
+pub const PROMPT_PLAN: &str = working_prompt!(include_str!("prompt/plan.txt"));
 /// Read-only high-assurance review agent.
-pub const PROMPT_REVIEW: &str = include_str!("prompt/review.txt");
+pub const PROMPT_REVIEW: &str = working_prompt!(include_str!("prompt/review.txt"));
 /// Thorough cross-cutting implementation agent.
-pub const PROMPT_DEEP: &str = include_str!("prompt/deep.txt");
+pub const PROMPT_DEEP: &str = working_prompt!(include_str!("prompt/deep.txt"));
 /// Focused local implementation specialist.
 pub const PROMPT_FIXER: &str = specialist_prompt!("prompt/fixer.txt");
 /// Bounded miscellaneous implementation specialist.
@@ -1039,6 +1051,159 @@ mod tests {
         }
     }
 
+    const VERIFICATION_SECTION: &str = "\n\n## Verification\n";
+
+    fn verification_rubric(prompt: &str) -> &str {
+        prompt
+            .split_once(VERIFICATION_SECTION)
+            .expect("the assembled working prompt must include shared verification guidance")
+            .1
+    }
+
+    fn role_prompt_words(prompt: &str) -> usize {
+        prompt
+            .split_once(VERIFICATION_SECTION)
+            .map_or(prompt, |(role, _)| role)
+            .split_whitespace()
+            .count()
+    }
+
+    // These assertions exercise the catalog's rendered prompt contract. They do
+    // not prove that a model followed the instructions or that runtime behavior
+    // is correct merely because its source contains particular strings.
+    #[test]
+    fn verification_rubric_is_shared_once_by_working_agents_only() {
+        let shared = verification_rubric(PROMPT_BUILD);
+        assert!(
+            shared.split_whitespace().count() <= 320,
+            "keep the common rubric compact independently of each role's word budget"
+        );
+
+        for agent in crate::agent::resolve(&OrderedMap::new(), &[]) {
+            let prompt = agent.prompt.as_deref().expect("a native prompt");
+            if agent.hidden == Some(true) {
+                assert!(
+                    !prompt.contains(VERIFICATION_SECTION),
+                    "{} must keep its tool-free output contract",
+                    agent.name
+                );
+                continue;
+            }
+            assert_eq!(
+                prompt.matches(VERIFICATION_SECTION).count(),
+                1,
+                "{} must receive exactly one verification rubric",
+                agent.name
+            );
+            assert_eq!(
+                verification_rubric(prompt),
+                shared,
+                "{} must receive the same rubric as the writing and testing roles",
+                agent.name
+            );
+        }
+    }
+
+    #[test]
+    fn verification_rubric_orders_behavior_red_before_implementation_and_green() {
+        let rubric = verification_rubric(PROMPT_BUILD);
+        let phases = [
+            "fixing a reproducible bug or changing a state machine",
+            "first add or extend a focused behavior test",
+            "against the old implementation",
+            "Confirm it fails for the target behavior",
+            "Then implement the change",
+            "rerun that test to green",
+            "relevant regression checks",
+        ];
+        let mut previous = 0;
+        for phase in phases {
+            let position = rubric
+                .find(phase)
+                .unwrap_or_else(|| panic!("missing verification phase: {phase}"));
+            assert!(position >= previous, "{phase} is out of order");
+            previous = position + phase.len();
+        }
+        for clause in [
+            "build, dependency, permission, or environment error is not a red regression",
+            "observable inputs, outputs, transitions",
+            "interruption, restart, or recovery",
+        ] {
+            assert!(rubric.contains(clause), "missing behavior scope: {clause}");
+        }
+    }
+
+    #[test]
+    fn verification_rubric_scopes_read_only_evidence_and_requires_checkable_receipts() {
+        let rubric = verification_rubric(PROMPT_REVIEW);
+        for clause in [
+            "when writing, fixing, testing, or reviewing",
+            "Read-only roles collect existing reproduction steps, tests, and receipts",
+            "without editing files or running commands that write",
+            "hand missing tests to an authorized writer",
+            "Reviewers check the red/green evidence",
+            "a plan identifies the test and expected failure without claiming it ran",
+            "exact commands",
+            "working directory",
+            "tested source/input identity",
+            "expected versus observed results",
+            "exit status",
+            "authoritative test output or artifact/run receipts",
+            "completed checks from proposed, blocked, and unrun checks",
+        ] {
+            assert!(
+                rubric.contains(clause),
+                "missing evidence boundary: {clause}"
+            );
+        }
+    }
+
+    #[test]
+    fn verification_rubric_keeps_checks_proportional_and_serial_waits_in_foreground() {
+        let rubric = verification_rubric(PROMPT_ORCHESTRATOR);
+        for clause in [
+            "If reproduction is unavailable, explain the limitation",
+            "proportional checks for documentation, trivial changes, and command/script deliverables",
+            "do not manufacture tests for every command",
+            "Source-string assertions alone do not establish runtime behavior",
+            "prompt-output contract tests establish only the rendered prompt contract",
+            "serial CI waits in the same foreground workflow",
+            "Background work is for independent parallel work or an explicit user request",
+            "A polling timeout is not remote failure",
+            "inspect the authoritative run status",
+            "no tool authority, runtime gate, or approval requirement",
+        ] {
+            assert!(rubric.contains(clause), "missing proportionality: {clause}");
+        }
+    }
+
+    #[test]
+    fn verification_rubric_does_not_override_configured_prompts() {
+        use zuno_config::schema::agent::AgentConfig;
+
+        let mut overrides = OrderedMap::new();
+        for name in ["build", "review", "fixer", "custom-test"] {
+            overrides.insert(
+                name,
+                AgentConfig {
+                    prompt: Some("Use the supplied acceptance criteria.".to_owned()),
+                    ..AgentConfig::default()
+                },
+            );
+        }
+        for agent in crate::agent::resolve(&overrides, &[])
+            .into_iter()
+            .filter(|agent| overrides.contains_key(&agent.name))
+        {
+            assert_eq!(
+                agent.prompt.as_deref(),
+                Some("Use the supplied acceptance criteria."),
+                "{} must preserve an explicit prompt override",
+                agent.name
+            );
+        }
+    }
+
     #[test]
     fn delivery_prompts_require_evidence_without_becoming_policy_dumps() {
         let cases: [(&str, &str, usize, &[&str]); 4] = [
@@ -1056,7 +1221,7 @@ mod tests {
                     "Run shared verification once",
                     "After a second failure at one integration boundary",
                     "producer-artifact-consumer contract",
-                    "one authoritative observer",
+                    "Keep one polling owner",
                 ],
             ),
             (
@@ -1111,7 +1276,7 @@ mod tests {
                     "{name} prompt is missing `{clause}`:\n{prompt}"
                 );
             }
-            let words = prompt.split_whitespace().count();
+            let words = role_prompt_words(prompt);
             assert!(
                 words <= word_limit,
                 "{name} prompt grew to {words} words; concise role policy belongs here, not a \
@@ -1224,7 +1389,7 @@ mod tests {
                     "{name} prompt is missing `{clause}`:\n{prompt}"
                 );
             }
-            let words = prompt.split_whitespace().count();
+            let words = role_prompt_words(prompt);
             assert!(
                 words <= word_limit,
                 "{name} prompt grew to {words} words; keep role guidance compact"

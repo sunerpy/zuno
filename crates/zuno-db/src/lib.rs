@@ -42,6 +42,7 @@
 
 pub mod artifact_gc;
 pub mod completion_delivery;
+pub mod context_usage;
 pub mod continuity;
 pub mod evaluation;
 pub mod event_log;
@@ -52,6 +53,7 @@ pub mod feedback;
 pub mod fts;
 pub mod human_request;
 pub mod inbox;
+pub mod input_receipt;
 pub mod job;
 pub mod learning_job;
 pub mod learning_pattern;

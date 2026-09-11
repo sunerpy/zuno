@@ -1,15 +1,15 @@
 //! Process-owned command execution with bounded live output and durable background retention.
 //!
 //! A command enters this service before it is spawned. Foreground callers may
-//! wait for it, detach after an attention deadline, or cancel it, but they never
+//! wait for it, yield a foreground handle, explicitly detach it, or cancel it, but they never
 //! transfer an already-running [`tokio::task::JoinHandle`] between owners. That
 //! single-owner shape is what makes cancellation and at-most-once execution hold
-//! across explicit background mode and foreground timeout promotion.
+//! across explicit background mode and foreground attention deadlines.
 //!
-//! Foreground commands are ephemeral and disappear after their caller consumes
-//! the terminal output. Explicit or timeout-promoted background commands persist
-//! status/output for restart reconciliation, with terminal history bounded by
-//! [`MAX_RETAINED_TERMINAL_EXECUTIONS`].
+//! A yielded foreground command keeps its origin and terminal output until its
+//! caller acknowledges durable delivery. Persisting that handle never opts it
+//! into background callbacks. Explicitly detached commands retain their existing
+//! callback and restart contract.
 
 use crate::{BUFFER_LIMIT, ReplayCursor, ScrollbackBuffer};
 use schemars::JsonSchema;
@@ -28,6 +28,8 @@ use uuid::Uuid;
 use zuno_sandbox::{ExecutionAuthority, PreparedCommand};
 
 const STATE_FORMAT: u32 = 3;
+/// A foreground row must be skipped by older builds, never replayed as detached.
+const FOREGROUND_STATE_FORMAT: u32 = 4;
 const OUTPUT_SUFFIX: &str = ".output";
 const STATUS_SUFFIX: &str = ".status.json";
 const STATUS_TEMP_SUFFIX: &str = ".status.json.tmp";
@@ -240,6 +242,51 @@ pub struct BackgroundWaitOutcome {
     pub timed_out: bool,
 }
 
+/// Tool-owned context saved with a resumable foreground execution.
+///
+/// The process service owns identity, lifetime and delivery; the originating tool
+/// owns and validates the versioned metadata used to render its terminal result.
+/// Environment values must never be put here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ForegroundExecutionContext {
+    pub call_id: String,
+    pub metadata: serde_json::Map<String, serde_json::Value>,
+}
+
+/// A foreground handle, including the original work cycle in [`Self::info`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForegroundExecution {
+    pub info: BackgroundExecutionInfo,
+    pub context: ForegroundExecutionContext,
+    /// True only after the consumer acknowledged recording the terminal result.
+    pub consumed: bool,
+}
+
+/// Observation can end without the execution ending.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForegroundWaitOutcome {
+    Terminal(ForegroundExecution),
+    ObservationTimeout(ForegroundExecution),
+    /// Stops observing; explicit cancellation is a separate operation.
+    Interrupted(ForegroundExecution),
+}
+
+/// A ready result. Reading/draining it does not acknowledge model-visible delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForegroundExecutionCompletion {
+    pub execution: ForegroundExecution,
+    pub output: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ForegroundState {
+    context: ForegroundExecutionContext,
+    consumed: bool,
+}
+
 /// Failures at the process/service boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum BackgroundExecutionError {
@@ -251,6 +298,16 @@ pub enum BackgroundExecutionError {
     ForegroundStillRunning(BackgroundExecutionId),
     #[error("background execution `{0}` is durable and cannot be consumed as foreground output")]
     DurableForeground(BackgroundExecutionId),
+    #[error("execution `{0}` is not a resumable foreground handle")]
+    NotForeground(BackgroundExecutionId),
+    #[error("foreground execution `{0}` cannot change its original delivery context")]
+    ForegroundContextChanged(BackgroundExecutionId),
+    #[error(
+        "observation of execution `{0}` was lost without a terminal result; inspect authoritative state before any replay"
+    )]
+    ObservationLost(BackgroundExecutionId),
+    #[error("a foreground observation timeout must be positive")]
+    InvalidObservationTimeout,
     #[error("background execution `{0}` is owned by another live Zuno process in this workspace")]
     Foreign(BackgroundExecutionId),
     #[error("could not create background execution state at `{path}`")]
@@ -286,8 +343,8 @@ pub struct BackgroundExecutionLease {
 }
 
 impl BackgroundExecutionLease {
-    /// Stops drop-driven cancellation after ownership was deliberately transferred
-    /// to durable background execution or after the command settled.
+    /// Stops drop-driven cancellation after the service retained the foreground
+    /// handle, after explicit detachment, or after the command settled.
     pub fn disarm(&mut self) {
         self.armed = false;
     }
@@ -324,6 +381,10 @@ struct PersistedExecution {
     /// row without it still decodes, so no state file has to be rewritten to be readable.
     #[serde(default)]
     claimed: Option<bool>,
+    /// Absent on existing detached records. Foreground records use a distinct
+    /// format so an older reader cannot mistake them for callback-eligible work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    foreground: Option<ForegroundState>,
     info: BackgroundExecutionInfo,
 }
 
@@ -415,6 +476,7 @@ struct ExecutionState {
     output: Mutex<ScrollbackBuffer>,
     cancel: watch::Sender<bool>,
     durable: AtomicBool,
+    foreground: Mutex<Option<ForegroundState>>,
     transition: Mutex<()>,
     /// Held while this process owns the execution's row and files.
     claim: Mutex<Option<OwnershipClaim>>,
@@ -459,6 +521,26 @@ impl ExecutionState {
 
     fn is_durable(&self) -> bool {
         self.durable.load(Ordering::Acquire)
+    }
+
+    fn foreground(&self) -> MutexGuard<'_, Option<ForegroundState>> {
+        self.foreground
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn is_detached(&self) -> bool {
+        self.is_durable() && self.foreground().is_none()
+    }
+
+    fn foreground_info(&self) -> Option<ForegroundExecution> {
+        self.foreground()
+            .as_ref()
+            .map(|foreground| ForegroundExecution {
+                info: self.info(),
+                context: foreground.context.clone(),
+                consumed: foreground.consumed,
+            })
     }
 
     fn transition(&self) -> MutexGuard<'_, ()> {
@@ -568,6 +650,7 @@ impl BackgroundExecutionService {
             }
         };
         let evidence = row.claim_evidence();
+        let foreground = row.foreground;
         let mut info = row.info;
         let output_file = self.output_path(id);
         info.output_file = output_file.clone();
@@ -663,6 +746,7 @@ impl BackgroundExecutionService {
                 )),
                 cancel,
                 durable: AtomicBool::new(true),
+                foreground: Mutex::new(foreground),
                 transition: Mutex::new(()),
                 claim: Mutex::new(None),
                 foreign: AtomicBool::new(foreign),
@@ -676,8 +760,8 @@ impl BackgroundExecutionService {
     /// releases its claim by settling *or* by dying, so the status file is re-read inside
     /// the claim rather than trusted from before: a recorded outcome wins, and only a row
     /// still marked `running` becomes `uncertain`. `evidence` is what the caller's read of
-    /// the row said about [`PersistedExecution::claimed`]; the re-read replaces it when it
-    /// succeeds, because that is the value written closest to the decision.
+    /// the row said about [`PersistedExecution::claimed`]. The re-read must succeed:
+    /// its claim evidence and foreground context are the authority for any write.
     ///
     /// [`settlable`] is consulted *before* the claim as well as after it. A claim proves
     /// nothing about a row no claim ever backed, and creating, locking and unlinking
@@ -695,25 +779,27 @@ impl BackgroundExecutionService {
             Ok(None) => return Err(Unsettled::LivePeer),
             Err(error) => return Err(Unsettled::Unprovable(error)),
         };
-        let mut evidence = evidence;
-        if let Ok(current) = read_persisted(&self.status_path(id), id) {
-            evidence = current.claim_evidence();
-            let recorded = current.info;
-            info.status = recorded.status;
-            info.pid = recorded.pid;
-            info.exit_code = recorded.exit_code;
-            info.timed_out = recorded.timed_out;
-            info.time_updated = recorded.time_updated;
-            info.time_completed = recorded.time_completed;
-            info.error = recorded.error;
-        }
+        // A failed re-read is not permission to restore an older snapshot. That
+        // could erase the foreground context or overwrite newer/corrupt evidence
+        // with a callback-eligible detached record.
+        let current = read_persisted(&self.status_path(id), id).map_err(Unsettled::NotRecorded)?;
+        let evidence = current.claim_evidence();
+        let foreground = current.foreground;
+        let recorded = current.info;
+        info.status = recorded.status;
+        info.pid = recorded.pid;
+        info.exit_code = recorded.exit_code;
+        info.timed_out = recorded.timed_out;
+        info.time_updated = recorded.time_updated;
+        info.time_completed = recorded.time_completed;
+        info.error = recorded.error;
         if info.status == BackgroundExecutionStatus::Running {
             if let Err(refusal) = settlable(evidence, info.pid) {
                 drop(claim);
                 return Err(refusal);
             }
             settle_as_uncertain(info);
-            if let Err(error) = persist_info(info, true) {
+            if let Err(error) = persist_execution(info, true, foreground.as_ref()) {
                 drop(claim);
                 return Err(Unsettled::NotRecorded(error));
             }
@@ -762,6 +848,7 @@ impl BackgroundExecutionService {
             return true;
         }
         let evidence = row.claim_evidence();
+        let foreground = row.foreground;
         let mut info = row.info;
         info.output_file = self.output_path(id);
         info.status_file = status_file;
@@ -779,15 +866,18 @@ impl BackgroundExecutionService {
             }
         }
         self.sync_foreign_output(state, &info.output_file);
+        *state.foreground() = foreground;
         // Ordered so a concurrent `prune_retained` can only ever see this row as
         // "foreign" (skipped) or as "terminal and adopted" (prunable), never as a
         // terminal row whose files another process is still writing.
         state.info.send_replace(info.clone());
         state.foreign.store(false, Ordering::Release);
-        let _delivered = self
-            .inner
-            .events
-            .send(BackgroundExecutionEvent::Settled(info));
+        if state.is_detached() {
+            let _delivered = self
+                .inner
+                .events
+                .send(BackgroundExecutionEvent::Settled(info));
+        }
         true
     }
 
@@ -1022,6 +1112,7 @@ impl BackgroundExecutionService {
             output: Mutex::new(ScrollbackBuffer::new()),
             cancel: cancel_sender,
             durable: AtomicBool::new(durable),
+            foreground: Mutex::new(None),
             transition: Mutex::new(()),
             claim: Mutex::new(claim),
             foreign: AtomicBool::new(false),
@@ -1070,7 +1161,7 @@ impl BackgroundExecutionService {
         let durable = self
             .executions()
             .iter()
-            .filter(|(_, state)| state.is_durable())
+            .filter(|(_, state)| state.is_detached())
             .map(|(id, state)| (id.clone(), Arc::clone(state)))
             .collect::<Vec<_>>();
         let mut values = durable
@@ -1110,7 +1201,7 @@ impl BackgroundExecutionService {
         self.state(id).map(|state| state.info())
     }
 
-    /// Makes a live foreground execution durable after its attention deadline.
+    /// Explicitly detaches an ephemeral execution.
     ///
     /// The status snapshot is written before the execution becomes observable,
     /// so a failed promotion cannot invite the caller to rerun a command whose
@@ -1122,6 +1213,11 @@ impl BackgroundExecutionService {
         let state = self.state(id)?;
         let info = {
             let _transition = state.transition();
+            if state.foreground().is_some() {
+                return Err(BackgroundExecutionError::ForegroundContextChanged(
+                    id.clone(),
+                ));
+            }
             if state.is_durable() {
                 return Ok(state.info());
             }
@@ -1145,6 +1241,258 @@ impl BackgroundExecutionService {
         };
         self.prune_retained();
         Ok(info)
+    }
+
+    /// Saves a resumable foreground handle without publishing background events.
+    ///
+    /// The context is immutable. Repeated handoff of the same handle is idempotent,
+    /// including when the command settles while the caller reaches its deadline.
+    pub fn yield_foreground(
+        &self,
+        id: &BackgroundExecutionId,
+        context: ForegroundExecutionContext,
+    ) -> Result<ForegroundExecution, BackgroundExecutionError> {
+        let state = self.state(id)?;
+        let _transition = state.transition();
+        if state.is_foreign() {
+            return Err(BackgroundExecutionError::Foreign(id.clone()));
+        }
+        if let Some(existing) = state.foreground_info() {
+            return if existing.context == context {
+                Ok(existing)
+            } else {
+                Err(BackgroundExecutionError::ForegroundContextChanged(
+                    id.clone(),
+                ))
+            };
+        }
+        if state.is_durable() {
+            return Err(BackgroundExecutionError::DurableForeground(id.clone()));
+        }
+        if context.call_id.is_empty() {
+            return Err(state_error(
+                &state.info().status_file,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "foreground call id is empty",
+                ),
+            ));
+        }
+        let foreground = ForegroundState {
+            context,
+            consumed: false,
+        };
+        let info = state.info();
+        persist_execution(&info, state.holds_claim(), Some(&foreground))?;
+        let execution = ForegroundExecution {
+            info: info.clone(),
+            context: foreground.context.clone(),
+            consumed: false,
+        };
+        *state.foreground() = Some(foreground);
+        state.durable.store(true, Ordering::Release);
+        if info.status.is_terminal() {
+            state.release_claim();
+        }
+        Ok(execution)
+    }
+
+    /// All unconsumed foreground handles for a session, in creation order.
+    ///
+    /// The original cycle is returned, never inferred from the caller's current
+    /// turn. Hosts must match that cycle before resuming the logical task.
+    #[must_use]
+    pub fn foreground_for_session(&self, session_id: &str) -> Vec<ForegroundExecution> {
+        let states = self
+            .executions()
+            .iter()
+            .filter(|(_, state)| state.foreground().is_some())
+            .map(|(id, state)| (id.clone(), Arc::clone(state)))
+            .collect::<Vec<_>>();
+        let mut values = states
+            .into_iter()
+            .filter_map(|(id, state)| {
+                if !self.refresh_foreign(&id, &state) {
+                    return None;
+                }
+                self.refresh_foreground_consumption(&id, &state);
+                state.foreground_info()
+            })
+            .filter(|execution| execution.info.session_id == session_id && !execution.consumed)
+            .collect::<Vec<_>>();
+        values.sort_by(|left, right| {
+            left.info
+                .time_created
+                .cmp(&right.info.time_created)
+                .then_with(|| left.info.id.cmp(&right.info.id))
+        });
+        values
+    }
+
+    /// Reads a foreground handle only for its owning session.
+    pub fn foreground(
+        &self,
+        id: &BackgroundExecutionId,
+        session_id: &str,
+    ) -> Result<ForegroundExecution, BackgroundExecutionError> {
+        let state = self.state(id)?;
+        if state.info().session_id != session_id {
+            return Err(BackgroundExecutionError::NotFound(id.clone()));
+        }
+        self.refresh_foreground_consumption(id, &state);
+        state
+            .foreground_info()
+            .ok_or_else(|| BackgroundExecutionError::NotForeground(id.clone()))
+    }
+
+    /// A rebound host may acknowledge a terminal handle this instance already
+    /// loaded. Adopt only the monotonic acknowledgement of the identical result;
+    /// an unreadable or conflicting row must leave the pending evidence intact.
+    fn refresh_foreground_consumption(&self, id: &BackgroundExecutionId, state: &ExecutionState) {
+        let Some(snapshot) = state.foreground_info() else {
+            return;
+        };
+        if snapshot.consumed || !snapshot.info.status.is_terminal() {
+            return;
+        }
+        let _transition = state.transition();
+        let Ok(recorded) = read_persisted(&self.status_path(id), id) else {
+            return;
+        };
+        if let Some(consumed) = recorded.foreground
+            && consumed.consumed
+            && consumed.context == snapshot.context
+            && recorded.info == snapshot.info
+        {
+            *state.foreground() = Some(consumed);
+        }
+    }
+
+    /// A bounded, cancellation-safe observation of the same process.
+    ///
+    /// Dropping this future or firing `interrupt` stops observation and preserves
+    /// the handle. To terminate it, the owner explicitly calls [`Self::cancel`].
+    /// No observation call ever spawns or mechanically retries a command.
+    pub async fn wait_foreground(
+        &self,
+        id: &BackgroundExecutionId,
+        session_id: &str,
+        timeout: Duration,
+        interrupt: impl std::future::Future<Output = ()>,
+    ) -> Result<ForegroundWaitOutcome, BackgroundExecutionError> {
+        self.foreground(id, session_id)?;
+        if timeout.is_zero() {
+            return Err(BackgroundExecutionError::InvalidObservationTimeout);
+        }
+        let timeout = timeout.min(Duration::from_secs(60));
+        tokio::select! {
+            biased;
+            outcome = self.wait(id, Some(timeout)) => {
+                let outcome = outcome?;
+                let mut execution = self.foreground(id, session_id)?;
+                execution.info = outcome.info;
+                if execution.info.status.is_terminal() {
+                    Ok(ForegroundWaitOutcome::Terminal(execution))
+                } else {
+                    Ok(ForegroundWaitOutcome::ObservationTimeout(execution))
+                }
+            }
+            () = interrupt => {
+                Ok(ForegroundWaitOutcome::Interrupted(self.foreground(id, session_id)?))
+            }
+        }
+    }
+
+    /// Reads a terminal foreground result without acknowledging delivery.
+    pub fn foreground_completion(
+        &self,
+        id: &BackgroundExecutionId,
+        session_id: &str,
+    ) -> Result<ForegroundExecutionCompletion, BackgroundExecutionError> {
+        let execution = self.foreground(id, session_id)?;
+        if !execution.info.status.is_terminal() {
+            return Err(BackgroundExecutionError::ForegroundStillRunning(id.clone()));
+        }
+        let output = self.complete_output(id)?;
+        Ok(ForegroundExecutionCompletion { execution, output })
+    }
+
+    /// Reads ready results for exactly one session and original cycle.
+    ///
+    /// This is the read phase of a drain: persist each result through the host's
+    /// durable completion contract, then call [`Self::consume_foreground`]. A
+    /// failed host write, steering, or interruption leaves unread results pending.
+    pub fn drain_foreground(
+        &self,
+        session_id: &str,
+        cycle_id: Option<&str>,
+    ) -> Vec<Result<ForegroundExecutionCompletion, BackgroundExecutionError>> {
+        self.foreground_for_session(session_id)
+            .into_iter()
+            .filter(|execution| {
+                execution.info.cycle_id.as_deref() == cycle_id
+                    && execution.info.status.is_terminal()
+            })
+            .map(|execution| self.foreground_completion(&execution.info.id, session_id))
+            .collect()
+    }
+
+    /// Acknowledges one durably delivered terminal result, at most once.
+    ///
+    /// The caller must record its completion/receipt before this acknowledgement.
+    /// Output remains available for bounded `bg` paging. Acknowledged records join
+    /// bounded terminal retention; pending foreground results are never evicted.
+    pub fn consume_foreground(
+        &self,
+        id: &BackgroundExecutionId,
+        session_id: &str,
+    ) -> Result<bool, BackgroundExecutionError> {
+        let state = self.state(id)?;
+        let _transition = state.transition();
+        let info = state.info();
+        if info.session_id != session_id {
+            return Err(BackgroundExecutionError::NotFound(id.clone()));
+        }
+        if state.is_foreign() {
+            return Err(BackgroundExecutionError::Foreign(id.clone()));
+        }
+        let mut foreground = state.foreground();
+        let current = foreground
+            .as_ref()
+            .ok_or_else(|| BackgroundExecutionError::NotForeground(id.clone()))?;
+        if !info.status.is_terminal() {
+            return Err(BackgroundExecutionError::ForegroundStillRunning(id.clone()));
+        }
+        if current.consumed {
+            return Ok(false);
+        }
+        // Terminal commands have released their process claim. Reacquire it and
+        // reread the acknowledgement so two rebound hosts cannot both consume
+        // the same result from stale in-memory snapshots.
+        let claim = OwnershipClaim::acquire(&self.claim_path(id))
+            .map_err(|source| state_error(&self.claim_path(id), source))?
+            .ok_or_else(|| BackgroundExecutionError::Foreign(id.clone()))?;
+        let recorded = read_persisted(&self.status_path(id), id)?;
+        let Some(mut consumed) = recorded.foreground else {
+            return Err(BackgroundExecutionError::NotForeground(id.clone()));
+        };
+        if consumed.context != current.context || recorded.info != info {
+            return Err(BackgroundExecutionError::ForegroundContextChanged(
+                id.clone(),
+            ));
+        }
+        if consumed.consumed {
+            *foreground = Some(consumed);
+            return Ok(false);
+        }
+        consumed.consumed = true;
+        persist_execution(&info, true, Some(&consumed))?;
+        *foreground = Some(consumed);
+        drop(claim);
+        drop(foreground);
+        drop(_transition);
+        self.prune_retained();
+        Ok(true)
     }
 
     /// Replays one bounded window of output from an absolute cursor.
@@ -1266,26 +1614,27 @@ impl BackgroundExecutionService {
             loop {
                 let info = receiver.borrow().clone();
                 if info.status.is_terminal() {
-                    return info;
+                    return Ok(info);
                 }
                 if receiver.changed().await.is_err() {
-                    return receiver.borrow().clone();
+                    return Err(BackgroundExecutionError::ObservationLost(id.clone()));
                 }
             }
         };
         match timeout {
             Some(timeout) => match tokio::time::timeout(timeout, wait).await {
                 Ok(info) => Ok(BackgroundWaitOutcome {
-                    info,
+                    info: info?,
                     timed_out: false,
                 }),
-                Err(_) => Ok(BackgroundWaitOutcome {
-                    info: state.info(),
-                    timed_out: true,
-                }),
+                Err(_) => {
+                    let info = state.info();
+                    let timed_out = !info.status.is_terminal();
+                    Ok(BackgroundWaitOutcome { info, timed_out })
+                }
             },
             None => Ok(BackgroundWaitOutcome {
-                info: wait.await,
+                info: wait.await?,
                 timed_out: false,
             }),
         }
@@ -1377,8 +1726,15 @@ impl BackgroundExecutionService {
                 // load-bearing exactly once a row can be both terminal and foreign:
                 // `refresh_foreign` publishes the adopted terminal row before it clears
                 // the flag, and a prune interleaved between the two must skip it.
-                (state.is_durable() && !state.is_foreign() && info.status.is_terminal())
-                    .then(|| (id.clone(), Arc::clone(state), info))
+                let delivered = state
+                    .foreground()
+                    .as_ref()
+                    .is_none_or(|foreground| foreground.consumed);
+                (state.is_durable()
+                    && delivered
+                    && !state.is_foreign()
+                    && info.status.is_terminal())
+                .then(|| (id.clone(), Arc::clone(state), info))
             })
             .collect::<Vec<_>>();
         if terminal.len() <= MAX_RETAINED_TERMINAL_EXECUTIONS {
@@ -1501,7 +1857,10 @@ async fn run_execution(
     let durable = {
         let _transition = state.transition();
         let durable = state.is_durable();
-        if durable && let Err(error) = persist_info(&info, state.holds_claim()) {
+        if durable
+            && let Err(error) =
+                persist_execution(&info, state.holds_claim(), state.foreground().as_ref())
+        {
             info.status = BackgroundExecutionStatus::Failed;
             info.error = Some(error.to_string());
         }
@@ -1513,7 +1872,7 @@ async fn run_execution(
             state.release_claim();
         }
         state.info.send_replace(info.clone());
-        if durable {
+        if state.is_detached() {
             let _delivered = service
                 .inner
                 .events
@@ -1738,13 +2097,18 @@ fn read_persisted(
             path: status_file.to_owned(),
             source,
         })?;
-    if persisted.format != STATE_FORMAT {
+    let expected_format = if persisted.foreground.is_some() {
+        FOREGROUND_STATE_FORMAT
+    } else {
+        STATE_FORMAT
+    };
+    if persisted.format != expected_format {
         return Err(state_error(
             status_file,
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "unsupported background state format {}; expected {STATE_FORMAT}",
+                    "unsupported execution state format {}; expected {expected_format}",
                     persisted.format
                 ),
             ),
@@ -1756,6 +2120,19 @@ fn read_persisted(
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("background state names execution `{}`", persisted.info.id),
+            ),
+        ));
+    }
+    if persisted
+        .foreground
+        .as_ref()
+        .is_some_and(|foreground| foreground.context.call_id.is_empty())
+    {
+        return Err(state_error(
+            status_file,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "foreground call id is empty",
             ),
         ));
     }
@@ -1772,12 +2149,25 @@ fn persist_info(
     info: &BackgroundExecutionInfo,
     claimed: bool,
 ) -> Result<(), BackgroundExecutionError> {
+    persist_execution(info, claimed, None)
+}
+
+fn persist_execution(
+    info: &BackgroundExecutionInfo,
+    claimed: bool,
+    foreground: Option<&ForegroundState>,
+) -> Result<(), BackgroundExecutionError> {
     // A workspace path that is not valid UTF-8 makes this encoding fail. It must reach
     // the caller as an error: the child is already running by the time a durable row is
     // written, and an abort here would leave that side effect with no record.
     let encoded = serde_json::to_vec_pretty(&PersistedExecution {
-        format: STATE_FORMAT,
+        format: if foreground.is_some() {
+            FOREGROUND_STATE_FORMAT
+        } else {
+            STATE_FORMAT
+        },
         claimed: Some(claimed),
+        foreground: foreground.cloned(),
         info: info.clone(),
     })
     .map_err(|source| {
@@ -1962,6 +2352,44 @@ mod tests {
     fn ids_reject_path_material() {
         assert!(BackgroundExecutionId::parse("../escape").is_err());
         assert!(BackgroundExecutionId::parse("bg_0123456789abcdef0123456789abcdef").is_ok());
+    }
+
+    #[test]
+    fn foreground_reconciliation_never_rewrites_a_failed_authoritative_reread() {
+        for corrupted in [false, true] {
+            let directory = tempfile::tempdir().expect("process state");
+            let service = BackgroundExecutionService::open(directory.path()).expect("service");
+            let id =
+                BackgroundExecutionId::parse("bg_0123456789abcdef0123456789abcdef").expect("id");
+            let mut info = running_row(&service, &id, directory.path());
+            let before = info.clone();
+            let foreground = ForegroundState {
+                context: ForegroundExecutionContext {
+                    call_id: "original".to_owned(),
+                    metadata: serde_json::Map::new(),
+                },
+                consumed: false,
+            };
+            persist_execution(&info, true, Some(&foreground)).expect("foreground state");
+            if corrupted {
+                std::fs::write(&info.status_file, b"broken row").expect("corrupt fixture");
+            } else {
+                std::fs::remove_file(&info.status_file).expect("remove fixture");
+            }
+            assert!(matches!(
+                service.settle_unowned(&id, &mut info, ClaimEvidence::Backed),
+                Err(Unsettled::NotRecorded(_))
+            ));
+            assert_eq!(info, before);
+            if corrupted {
+                assert_eq!(
+                    std::fs::read(&info.status_file).expect("original evidence"),
+                    b"broken row"
+                );
+            } else {
+                assert!(!info.status_file.exists());
+            }
+        }
     }
 
     /// The ordering inside `claim_capture` is the whole protection for an in-flight

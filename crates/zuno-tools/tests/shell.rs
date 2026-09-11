@@ -1804,7 +1804,7 @@ async fn only_a_real_pass_produces_a_receipt_that_proves_success() {
     assert_eq!(evidence.outcome, ReceiptOutcome::Failed);
     assert_eq!(evidence.exit_code, Some(3));
 
-    let promoted = tool
+    let yielded = tool
         .run(
             ShellParams {
                 timeout: Some(40),
@@ -1813,8 +1813,8 @@ async fn only_a_real_pass_produces_a_receipt_that_proves_success() {
             context(Arc::new(zuno_tool::NeverInterrupted)),
         )
         .await
-        .expect("the foreground deadline promotes rather than fails");
-    let evidence = receipt(&promoted);
+        .expect("the foreground deadline yields rather than fails");
+    let evidence = receipt(&yielded);
     assert!(
         !evidence.proves_success(),
         "a command that has not finished proves nothing"

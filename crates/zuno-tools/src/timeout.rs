@@ -1,9 +1,9 @@
-//! Foreground attention deadlines for commands owned by the background service.
+//! Foreground attention deadlines for commands owned by the shared process service.
 //!
 //! The process is registered with [`zuno_pty::BackgroundExecutionService`] before
 //! the shell waits. Reaching the foreground deadline therefore only detaches the
-//! caller; it does not move ownership, restart the command, or weaken process-tree
-//! cancellation.
+//! caller's observation; the same foreground handle keeps its task ownership,
+//! hard ceiling and process-tree cancellation.
 
 use serde_json::json;
 use std::time::Duration;
@@ -22,26 +22,27 @@ pub fn normalize_foreground_timeout(requested_ms: Option<u64>) -> u64 {
 }
 
 #[must_use]
-pub fn timeout_promoted_output(
+pub fn foreground_yielded_output(
     command: String,
     timeout_ms: u64,
     execution: &BackgroundExecutionInfo,
 ) -> ToolOutput {
     let output = format!(
-        "Command exceeded the foreground timeout after {:.1}s and is continuing in background \
-         (not killed).\n\n\
+        "Command reached its foreground attention deadline after {:.1}s and is still owned \
+         by this foreground task.\n\n\
          Task ID: {}\n\
          Command: {}\n\
          Output file: {}\n\
          Status file: {}\n\n\
          The command is still running; do not rerun it unless you intentionally want a second \
          copy.\n\
-         Completion normally wakes the parent automatically. Use `bg` with action=\"wait\" and \
-         taskID=\"{}\" only when this same step synchronously depends on the result; one wait is \
-         capped at 60 seconds, so do not loop it across turns.\n\
+         Serial critical-path work stays foreground. Continue this SAME handle with `bg` \
+         action=\"wait\" and taskID=\"{}\"; each observation is capped at 60 seconds. \
+         An observation timeout is not command completion. Keep polling bounded and service \
+         steering or interruption between observations; no observer agent is needed.\n\
          Use `bg` with action=\"output\" and taskID=\"{}\" to inspect output.\n\
-         If you expected it to finish quickly and it did not, the `timeout` parameter is in \
-         MILLISECONDS; pass a larger value or omit it.",
+         No detached callback was scheduled. If this command is a remoteObserver, its eventual \
+         exit still requires an authoritative remote-state recheck by stable identifier.",
         timeout_ms as f64 / 1000.0,
         execution.id,
         command,
@@ -52,7 +53,7 @@ pub fn timeout_promoted_output(
     );
 
     ToolOutput::text(command.clone(), output)
-        .with_metadata("background", true)
+        .with_metadata("background", false)
         .with_metadata("background_purpose", execution.purpose.as_str())
         .with_metadata(
             "requires_authoritative_refresh",
@@ -68,7 +69,7 @@ pub fn timeout_promoted_output(
             "status_file",
             execution.status_file.to_string_lossy().into_owned(),
         )
-        .with_metadata("timeout_promoted", true)
+        .with_metadata("foreground_yielded", true)
         .with_metadata("foreground_timeout_ms", json!(timeout_ms))
 }
 

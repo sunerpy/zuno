@@ -155,6 +155,92 @@ fn plan_view() -> QuestionView {
     view
 }
 
+fn goal_resume_view() -> QuestionView {
+    let mut view = view();
+    view.purpose = QuestionPurpose::GoalResume;
+    view.origin.goal_id = Some("goal-paused".to_owned());
+    view.origin.message_id = Some("input-already-accepted".to_owned());
+    view.origin.call_id = None;
+    view.questions = vec![QuestionItem {
+        id: "resume-goal".to_owned(),
+        question: QuestionRequest::closed(
+            "Resume the paused Goal?",
+            "Goal",
+            vec![
+                QuestionOption::new("Resume goal", "Resume this Goal"),
+                QuestionOption::new("Keep paused", "Keep the Goal paused"),
+            ],
+        ),
+    }];
+    view
+}
+
+#[tokio::test]
+async fn goal_resume_native_form_keeps_closed_choices_optional_without_a_default() {
+    let view = goal_resume_view();
+    let port = port_for(&view);
+    let client = ScriptedClient::new(|method, params| {
+        assert_eq!(method, "elicitation/create");
+        assert_eq!(params["_meta"]["zuno"]["questionPurpose"], "goal_resume");
+        let schema = &params["requestedSchema"];
+        let field = &schema["properties"]["answer:resume-goal"];
+        assert_eq!(
+            field["oneOf"]
+                .as_array()
+                .expect("native closed choices")
+                .iter()
+                .map(|choice| choice["const"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!("Resume goal"), json!("Keep paused")]
+        );
+        assert!(field.get("default").is_none());
+        assert!(schema.get("required").is_none());
+        Ok(json!({"action":"accept","content":{}}))
+    });
+    AcpQuestionPresenter::new(port.clone(), client.connection())
+        .present(view.clone())
+        .await
+        .expect("present Goal resume")
+        .expect("fixture callback submits the optional form");
+    assert!(matches!(
+        port.commands()[0].2.action,
+        QuestionAction::Defer { .. }
+    ));
+    assert_eq!(port.stored.origin, view.origin);
+}
+
+#[tokio::test]
+async fn goal_resume_native_answers_preserve_the_explicit_label_and_revision() {
+    let view = goal_resume_view();
+    for choice in ["Resume goal", "Keep paused"] {
+        let (_, command) = apply_response(
+            &view,
+            json!({"action":"accept","content":{"answer:resume-goal":choice}}),
+        )
+        .await;
+        assert_eq!(command.expected_revision, view.revision);
+        assert_eq!(
+            command.action,
+            QuestionAction::Answer {
+                answers: BTreeMap::from([("resume-goal".to_owned(), vec![choice.to_owned()])]),
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn goal_resume_native_cancel_and_decline_never_become_resume_answers() {
+    let view = goal_resume_view();
+    let (_, cancelled) = apply_response(
+        &view,
+        json!({"action":"cancel","content":{"answer:resume-goal":"Resume goal"}}),
+    )
+    .await;
+    assert!(matches!(cancelled.action, QuestionAction::Defer { .. }));
+    let (_, declined) = apply_response(&view, json!({"action":"decline"})).await;
+    assert_eq!(declined.action, QuestionAction::Cancel);
+}
+
 fn receipt(view: &QuestionView) -> QuestionReceipt {
     let mut question = view.clone();
     question.revision += 1;

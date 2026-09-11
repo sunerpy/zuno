@@ -334,6 +334,21 @@ impl CompatibleProvider {
         // `/chat/completions` or `/responses`. The endpoint is built from the same
         // resolved value on the next line of `http_request`.
         request.apply_parameters(&mut body, quirks.surface);
+        if !quirks.accepts_sampling_params()
+            && let Some(parameters) = body.as_object_mut()
+        {
+            for key in [
+                "temperature",
+                "top_p",
+                "topP",
+                "frequency_penalty",
+                "frequencyPenalty",
+                "presence_penalty",
+                "presencePenalty",
+            ] {
+                parameters.remove(key);
+            }
+        }
         // Rule 5 again, and this is the pass that decides it: a per-request
         // parameter bag is a `Record<string, any>`, so a model variant may carry its
         // own `include` and `apply_parameters` replaces a non-object value outright.
@@ -367,12 +382,7 @@ impl CompatibleProvider {
     /// Capabilities for one model: the per-model override, else the provider set.
     #[must_use]
     pub fn capabilities_for(&self, model_id: &str) -> Capabilities {
-        self.spec
-            .options
-            .get(MODEL_CAPABILITIES_OPTION)
-            .and_then(|map| map.get(model_id))
-            .and_then(|value| read_capabilities(Some(value)))
-            .unwrap_or(self.capabilities)
+        zuno_llm::registry::model_capabilities(&self.spec, model_id, self.capabilities)
     }
 
     fn headers(&self) -> BTreeMap<String, String> {
@@ -410,6 +420,13 @@ impl Provider for CompatibleProvider {
             return Box::pin(futures::stream::once(async move { Err(error) }));
         }
         let surface = quirks.surface;
+        let secrets = self
+            .credential
+            .iter()
+            .chain(self.spec.headers.values())
+            .chain(request.headers.values())
+            .cloned()
+            .collect::<Vec<_>>();
         let http = match self.http_request(&request) {
             Ok(http) => http,
             Err(error) => return Box::pin(futures::stream::once(async move { Err(error) })),
@@ -426,7 +443,12 @@ impl Provider for CompatibleProvider {
                     Err(error) => futures::stream::once(async move { Err(error) }).right_stream(),
                 }
             })
-            .flatten(),
+            .flatten()
+            .map(move |event| {
+                event.map_err(|error| {
+                    error.redacted(&secrets.iter().map(String::as_str).collect::<Vec<_>>())
+                })
+            }),
         )
     }
 }
@@ -790,6 +812,33 @@ mod tests {
 
     fn groq() -> CompatibleProvider {
         build(Spec::new("groq").with_base_url("https://api.groq.com/openai/v1")).expect("claimed")
+    }
+
+    #[test]
+    fn model_sampling_capability_applies_after_per_request_parameters() {
+        let provider = build(
+            Spec::new("groq")
+                .with_base_url("https://api.groq.com/openai/v1")
+                .with_option(
+                    MODEL_CAPABILITIES_OPTION,
+                    json!({"reasoning-model":{"sampling_params":false}}),
+                ),
+        )
+        .unwrap();
+        assert!(!provider.capabilities_for("reasoning-model").sampling_params);
+        let parameters = serde_json::from_value(json!({
+            "temperature":0, "top_p":0.8, "frequency_penalty":0.5,
+            "presence_penalty":0.25, "reasoning_effort":"high"
+        }))
+        .unwrap();
+        let request =
+            CompletionRequest::new("reasoning-model", Vec::new()).with_parameters(parameters);
+        let body = provider.body_for(&request);
+        assert!(body.get("temperature").is_none(), "{body}");
+        assert!(body.get("top_p").is_none(), "{body}");
+        assert!(body.get("frequency_penalty").is_none(), "{body}");
+        assert!(body.get("presence_penalty").is_none(), "{body}");
+        assert_eq!(body["reasoning_effort"], "high");
     }
 
     fn responses_provider() -> CompatibleProvider {

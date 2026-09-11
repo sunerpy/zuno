@@ -1212,11 +1212,14 @@ decisions fence future automatic rewrites. Recall is fallible data, not an
 authorization or an enforced instruction. Format 12 adds this state through the
 guarded migration of formats 5–11; no database rebuild is required.
 
-Automatic extraction itself is background idle work. Its default six-hour
-deadline, 60-second poll, and two-job wake cap are configurable under
-`learning.post_turn`. The claim transaction checks session activity, pending
-input, the process-local live-turn registry, and session policy before spending
-an attempt. Web and MCP results carry a durable external-context marker; when
+Automatic extraction is bounded background work. `learning.post_turn.idle_delay_ms`
+defaults to zero: completing an eligible logical turn saves a bounded, closed
+source snapshot, enqueues an idempotent job and wakes its worker. A new foreground
+turn does not invalidate or block the previous completed-turn snapshot. Explicit
+positive delays retain the idle/activity gate. The 60-second recovery poll,
+two-job wake cap, project concurrency bound and session-policy checks remain;
+newly completed work takes precedence over historical repair.
+Web and MCP results carry a durable external-context marker; when
 configured, consuming one excludes the session from automatic generation.
 Bounded source values are scrubbed at secret-value granularity before clipping and
 before they enter a learning job or extraction event, while the original durable Message and
@@ -1224,9 +1227,22 @@ non-secret evidence are preserved. Retryable extractor failures return the same
 durable job to a positive, capped and jittered exponential-backoff deadline. Typed provider rate
 limits preserve `Retry-After`; authentication, context-limit, protocol, and
 other permanent failures settle instead of replaying the unchanged request.
+The extractor reuses the selected model's resolved parameters and capabilities,
+including sampling support and output limits. Diagnostic records retain bounded,
+redacted provider response details, HTTP status and request identity. A historical
+400 is a diagnostic task, not authorization to retry unchanged input or select
+another model blindly.
 There is no quota-percentage, daily-token, or currency budget; eligibility,
 idempotency, the wake cap, the three-attempt ceiling, and `learning.execution`
 input/output/step and total-time limits bound background work.
+
+`/learn reprocess <assistant-message-id>` explicitly schedules the current
+extractor version for an exact bounded source. `/learn repair-history [--dry-run]`
+checks old evidence against its original source before planning reprocessing.
+Missing, policy-excluded or forgotten source data remains unverified. Neither
+format migration nor repair may mass-promote `verified` flags. Memory updates and
+corrections use the managed mutation service; the next provider request refreshes
+its resident-memory sections and preserves the old prompt receipt unchanged.
 
 Retrieved experience enters the stable `learning.experiences` prompt section.
 The post-hook prompt receipt stores each source identity, content, and digest, so
@@ -1254,6 +1270,18 @@ guide, [resident Memory](design/memory-learning.md), and the
 ## Durable inputs
 
 Every model-visible external input is admitted to the session event log and durable inbox in one SQLite transaction before execution is attempted. The inbox is the source of truth across active turns, idle sessions, process restarts, and competing drivers.
+
+Format 14 adds a native `InputAdmissionReceipt` alongside each input. `admitted`,
+`recorded`, `applied`, and terminal `completed`/`failed`/`cancelled` are separate
+facts: recording a background report is not provider application. The actual
+post-hook request establishes application, and the owning logical execution
+settles completion. Same-cycle recovery transfers receipt ownership explicitly;
+an unrelated turn cannot complete a receipt. Optional client message IDs are
+session-scoped and payload-validated, never derived by deduplicating text.
+
+Standard ACP prompt requests observe that receipt until the associated outcome,
+while `session/steer` returns immediate admission. Disconnect drops an observer;
+it is not implicit withdrawal or evidence that an old owner has stopped.
 
 Every multi-statement write transaction reserves SQLite's writer with `BEGIN IMMEDIATE`,
 including transactions opened through a caller-owned turn connection. This lets the configured
@@ -1491,10 +1519,21 @@ the next turn; the dock resolves and shows the user's actual
 binding. Promotion removes the entry from the dock and adds it to transcript
 history; cancellation removes it without fabricating a sent message.
 
-Context occupancy is the most recent complete provider prompt divided by the catalog
-context limit. It is replaced on each provider report rather than accumulated across
-the session; cumulative disjoint token buckets remain available in the usage
-projection and sidebar.
+Context occupancy is produced once by the native `ContextUsageSnapshot` tracker:
+the most recent applicable provider confirmation plus an estimate of normalized
+content not yet included in that request. A new request's lower whole-prompt
+estimate must not replace this baseline. For example, a `73,948` estimate cannot
+overwrite a provider-confirmed `149,501` input count. Confirmation includes its
+accounting mode and request identity; partial frames merge instead of zero-filling
+missing fields or adding repeated snapshots.
+
+Cumulative disjoint usage, the last confirmation and the estimated tail remain
+separate. Cache and reasoning subsets are not double-counted. Snapshots include
+source, request/attempt identity, epoch, revision, freshness and update time;
+unknown is not zero. Main, child, learning, compaction and auxiliary work cannot
+overwrite each other's context window. ACP, TUI, HTTP and recovery consume this
+same state. Estimates cover actual normalized messages, developer context and
+tool schemas, not unread file sizes or duplicated raw tool arguments.
 
 Compaction advances the durable `context_epoch`, recomputes the retained prompt
 window, and restarts the same execution cycle as `TurnStartKind::Recovery`.
@@ -1814,6 +1853,18 @@ provider, and catalog model. Retained user history supplies only the causal tran
 and grants no authority. It is never rewritten to make a reconfigured host look historical,
 and its old Agent/model fields cannot route an automatic Goal turn. Ordinary user turns
 continue to use their own message identity.
+
+Interruption preserves a paused Goal. Like the inspected Codex Goal menu,
+the host offers explicit Resume goal / Keep paused consent; skipping is inert.
+Zuno persists that choice through `QuestionPort`, bound to `GoalResumeRequest`
+(session, Goal ID, expected revision and optional existing input ID).
+One transaction validates the binding, changes Goal/execution eligibility and
+routes the existing input or a native control. Already processed text is not
+submitted twice. Plan, approval, budget, authentication and uncertain-effect
+barriers remain owned by their controls; a Goal choice does not clear them.
+Background reports may be recorded while paused, but apply only on a legitimately
+eligible request. The rendered Goal context names its actual status and pause
+reason, rather than describing every existing Goal as active.
 
 Goal completion reads Plan step statuses through the same shared type as the Plan
 writer. `completed` and `superseded` are terminal; missing, unknown, or legacy
@@ -2332,9 +2383,25 @@ process tree; neither path adopts a detached task or starts a second command.
 An ordinary foreground command is ephemeral: while it runs, its complete output
 is spooled so the normal output policy can inspect it, but its state is hidden
 from `/ps` and both the in-memory row and spool file are removed as soon as the
-caller consumes the terminal result. A command is made durable only when
-`background: true` was requested or the foreground attention deadline promotes
-the still-running process.
+caller consumes the terminal result. A command enters detached background delivery
+only when `background: true` was requested. Expiring a foreground observation
+deadline returns the same foreground handle; it does not promote the process to
+detached delivery. Existing `bg wait/output` can observe that handle without
+relaunching it.
+
+The native host keeps the logical foreground operation, its original cycle and
+one budget alive across waits. It waits on process/control notifications before
+asking the model to poll unchanged work. Accepted steering and interruption stay
+responsive; a real completion makes the final output available to the next
+request. Process observation timeout is not remote failure, and a missing process
+is not proof of a successful exit. Original hard process ceilings and turn/Goal
+budgets still apply.
+
+Foreground terminal output, completion ownership and the original tool's
+verification receipt commit together before the handle is consumed. It does not
+also produce a detached callback. Serial CI/status dependencies therefore remain
+foreground by default; independent parallel work or an explicit user request
+can select detached execution.
 
 Durable commands keep a bounded 2 MiB live tail, persist complete output
 separately, and record status under `.zuno/background`. Each execution owns

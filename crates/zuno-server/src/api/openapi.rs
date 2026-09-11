@@ -303,6 +303,9 @@ pub(super) fn document_for(has_questions: bool, has_controls: bool) -> Value {
                 "SessionCreate": schemars::schema_for!(super::session::CreateSessionBody),
                 "SessionResponse": schemars::schema_for!(super::Data<super::session::SessionInfo>),
                 "LearningStateResponse": schemars::schema_for!(super::Data<zuno_types::LearningStateProjection>),
+                "InputAdmissionReceipt": question_schema::<zuno_types::admission::InputAdmissionReceipt>("InputAdmissionReceipt"),
+                "ContextUsageSnapshot": question_schema::<zuno_types::context_usage::ContextUsageSnapshot>("ContextUsageSnapshot"),
+                "GoalResumeRequest": question_schema::<zuno_types::goal_resume::GoalResumeRequest>("GoalResumeRequest"),
                 "SessionListResponse": schemars::schema_for!(super::session::SessionListResponse),
                 "SessionActive": schemars::schema_for!(super::session::SessionActive),
                 "SessionActiveResponse": schemars::schema_for!(super::session::SessionActiveResponse),
@@ -354,6 +357,15 @@ pub(super) fn document_for(has_questions: bool, has_controls: bool) -> Value {
         document["components"]["schemas"]["SessionResumeResponse"] =
             question_schema::<super::Data<super::session::ResumeAdmitted>>("SessionResumeResponse");
     }
+    // Session projections now contain the same nested Context/receipt schemas
+    // as dedicated responses. Every component's local definitions must resolve
+    // relative to that component, not the OpenAPI document root.
+    for (name, schema) in document["components"]["schemas"]
+        .as_object_mut()
+        .expect("schema object")
+    {
+        rebase_schema_refs(schema, &format!("#/components/schemas/{name}"));
+    }
     document
 }
 
@@ -367,10 +379,12 @@ fn question_schema<T: JsonSchema>(name: &str) -> Value {
 fn rebase_schema_refs(value: &mut Value, base: &str) {
     match value {
         Value::Object(fields) => {
-            if let Some(Value::String(reference)) = fields.get_mut("$ref")
-                && let Some(local) = reference.strip_prefix('#')
-            {
-                *reference = format!("{base}{local}");
+            if let Some(Value::String(reference)) = fields.get_mut("$ref") {
+                if reference == "#" {
+                    *reference = base.to_owned();
+                } else if let Some(local) = reference.strip_prefix("#/$defs/") {
+                    *reference = format!("{base}/$defs/{local}");
+                }
             }
             for child in fields.values_mut() {
                 rebase_schema_refs(child, base);
@@ -546,6 +560,35 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    #[test]
+    fn context_and_receipt_schema_references_resolve_in_the_whole_openapi_document() {
+        fn check(document: &Value, value: &Value) {
+            match value {
+                Value::Object(fields) => {
+                    if let Some(Value::String(reference)) = fields.get("$ref")
+                        && let Some(pointer) = reference.strip_prefix('#')
+                    {
+                        assert!(
+                            document.pointer(pointer).is_some(),
+                            "unresolved schema ref {reference}"
+                        );
+                    }
+                    for value in fields.values() {
+                        check(document, value);
+                    }
+                }
+                Value::Array(values) => {
+                    for value in values {
+                        check(document, value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let document = document_for(true, true);
+        check(&document, &document);
+    }
 
     #[test]
     fn every_operation_is_bound_bodyless_or_a_reasoned_frozen_gap() {

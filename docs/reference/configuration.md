@@ -1453,7 +1453,7 @@ store:
   "learning": {
     "post_turn": {
       "enabled": true,
-      "idle_delay_ms": 21600000,
+      "idle_delay_ms": 0,
       "poll_interval_ms": 60000,
       "max_jobs_per_wake": 2,
       "disable_on_external_context": false
@@ -1508,9 +1508,12 @@ store:
 - `post_turn.enabled` controls only automatic extraction after eligible
   completed tasks. It does not disable existing-Experience use, and disabling it
   does not turn off generation paths invoked explicitly.
-- `post_turn.idle_delay_ms` defaults to `21600000` (six hours), may be `0` for
-  immediate eligibility, and delays only automatic extraction jobs.
-- `post_turn.poll_interval_ms` defaults to `60000` and must be positive.
+- `post_turn.idle_delay_ms` defaults to `0`. An eligible completed turn immediately
+  queues its bounded source snapshot and wakes the worker; a later live turn does
+  not block that snapshot. An explicit positive value retains delayed idle work
+  and applies only to automatic extraction jobs.
+- `post_turn.poll_interval_ms` defaults to `60000` and must be positive. Polling
+  recovers missed work; normal completed-turn admission also wakes the worker.
 - `post_turn.max_jobs_per_wake` defaults to `2` and must be positive.
 - Automatic learning has no quota-percentage, daily-token, or currency budget.
   Provider rate limits retain their typed `Retry-After` value, while the idle

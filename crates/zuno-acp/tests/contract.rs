@@ -1225,29 +1225,37 @@ fn usage_updates_require_an_explicit_context_window() {
     assert_eq!(estimated["sessionUpdate"], "usage_update");
     assert_eq!(estimated["used"], 80);
     assert_eq!(estimated["size"], 200_000);
+    assert_eq!(
+        estimated["_meta"]["zuno"]["contextUsage"]["freshness"],
+        "estimated"
+    );
     let measured = TurnEventProjector::with_context_size(200_000)
         .project(&usage)
         .expect("known context size enables usage projection");
     assert_eq!(measured["sessionUpdate"], "usage_update");
     assert_eq!(measured["used"], 175);
     assert_eq!(measured["size"], 200_000);
+    assert_eq!(
+        measured["_meta"]["zuno"]["contextUsage"]["freshness"],
+        "confirmed"
+    );
 }
 
 #[test]
 fn attempt_buffering_discards_failed_partial_output_before_acp_commit() {
     let mut projector = AttemptBufferedTurnEventProjector::with_context_size(200_000);
+    let started = projector.project(&TurnEvent::ProviderRequestStarted {
+        step: 1,
+        message_count: 1,
+        estimated_prompt_tokens: 12,
+    });
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0]["sessionUpdate"], "usage_update");
+    assert_eq!(started[0]["used"], 12);
+    assert_eq!(started[0]["size"], 200_000);
     assert_eq!(
-        projector.project(&TurnEvent::ProviderRequestStarted {
-            step: 1,
-            message_count: 1,
-            estimated_prompt_tokens: 12,
-        }),
-        vec![json!({
-            "sessionUpdate": "usage_update",
-            "used": 12,
-            "size": 200_000,
-        })],
-        "request occupancy must reset immediately instead of waiting for the response"
+        started[0]["_meta"]["zuno"]["contextUsage"]["freshness"],
+        "estimated"
     );
     assert!(
         projector
@@ -1281,13 +1289,16 @@ fn attempt_buffering_discards_failed_partial_output_before_acp_commit() {
             .is_empty(),
         "a failed attempt must not create a visible ACP tool row"
     );
-    assert!(
-        projector
-            .project(&TurnEvent::Provider {
-                step: 1,
-                event: StreamEvent::RetryRollback { attempt: 2, max: 3 },
-            })
-            .is_empty()
+    let rollback = projector.project(&TurnEvent::Provider {
+        step: 1,
+        event: StreamEvent::RetryRollback { attempt: 2, max: 3 },
+    });
+    assert_eq!(rollback.len(), 1, "usage state can be revised immediately");
+    assert_eq!(rollback[0]["sessionUpdate"], "usage_update");
+    assert_eq!(rollback[0]["used"], 12);
+    assert_eq!(
+        rollback[0]["_meta"]["zuno"]["contextUsage"]["request"]["attempt"],
+        2
     );
     assert!(
         projector

@@ -1806,7 +1806,7 @@ fn database_docs_describe_the_guarded_chain_to_the_current_format() {
                 zuno_db::migration::CURRENT_FORMAT
             ),
             "Format 5",
-            "Formats 5–12",
+            "Formats 5–13",
             "`BEGIN IMMEDIATE`",
             "exact observed old format",
             "`resident_memory_provenance`",
@@ -1817,7 +1817,7 @@ fn database_docs_describe_the_guarded_chain_to_the_current_format() {
             "fails closed without modification",
             "format marker updated last",
             "A valid format-5, format-6,",
-            "format-12 database should open",
+            "format-13 database should open",
             "should open and migrate automatically",
         ],
     );
@@ -1831,7 +1831,7 @@ fn database_docs_describe_the_guarded_chain_to_the_current_format() {
             "format 8",
             "format 9",
             "`BEGIN IMMEDIATE`",
-            "把 marker 更新为 13",
+            &format!("把 marker 更新为 {}", zuno_db::migration::CURRENT_FORMAT),
             "`resident_memory_provenance`",
             "`session`、`message`、",
             "`work_plan` 值",
@@ -2321,10 +2321,11 @@ fn acp_context_compaction_docs_pin_between_request_checks_and_usage_recalculatio
     for relative in ["docs/reference/zed-acp.md", "docs/cli/acp.md"] {
         let text = read(relative);
         for needle in [
-            "`ProviderRequestStarted`",
+            "`ContextUsageSnapshot`",
             "`usage_update`",
-            "assembled prompt estimate",
-            "measured",
+            "`_meta.zuno.contextUsage`",
+            "provider-confirmed",
+            "unknown",
             "`context.compact`",
             "`_meta.zuno.kind: \"compaction_summary\"`",
             "same durable summary",
@@ -2335,20 +2336,14 @@ fn acp_context_compaction_docs_pin_between_request_checks_and_usage_recalculatio
             );
         }
     }
-    for (relative, estimate, measured) in [
-        (
-            "docs/zh/guide/editors.md",
-            "刚组装完成的 prompt 估算",
-            "真实 provider 用量",
-        ),
-        ("docs/zh/cli/acp.md", "assembled prompt estimate", "真实值"),
-    ] {
+    for relative in ["docs/zh/guide/editors.md", "docs/zh/cli/acp.md"] {
         let text = read(relative);
         for needle in [
-            "`ProviderRequestStarted`",
+            "`ContextUsageSnapshot`",
             "`usage_update`",
-            estimate,
-            measured,
+            "`_meta.zuno.contextUsage`",
+            "确认基线",
+            "未知",
             "`context.compact`",
             "`_meta.zuno.kind: \"compaction_summary\"`",
             "同一份",
@@ -2358,6 +2353,50 @@ fn acp_context_compaction_docs_pin_between_request_checks_and_usage_recalculatio
                 "{relative} must document {needle:?}"
             );
         }
+    }
+}
+
+#[test]
+fn runtime_consistency_guides_publish_the_native_contracts_and_source_mapping() {
+    for relative in [
+        "docs/harness-runtime.md",
+        "docs/zh/operate/harness-runtime.md",
+    ] {
+        contains_all(
+            relative,
+            &[
+                "InputAdmissionReceipt",
+                "GoalResumeRequest",
+                "ContextUsageSnapshot",
+                "73,948",
+                "149,501",
+                "repair-history",
+                "reprocess",
+            ],
+        );
+    }
+    contains_all(
+        "docs/design/harness-comparison.md",
+        &[
+            "eaa8b6d91701d6cabe464141facc677e5915fbfc",
+            "get_total_token_usage",
+            "TurnInputSubmission",
+            "phase1.rs",
+            "show_resume_paused_goal_prompt",
+            "collect_output_until_deadline",
+            "Red-before-fix",
+        ],
+    );
+    for relative in ["docs/cli/acp.md", "docs/zh/cli/acp.md"] {
+        contains_all(
+            relative,
+            &[
+                "_meta.zuno.messageId",
+                "_meta.zuno.receipt",
+                "stopReason",
+                "Resume goal / Keep paused",
+            ],
+        );
     }
 }
 
@@ -2686,7 +2725,7 @@ fn plan_mode_docs_do_not_claim_a_shell_free_boundary() {
 }
 
 /// The claim a reader depends on is that the obligation outlives the pause row, and that
-/// one named action is what retires it. Both languages have to make it.
+/// generic Goal consent cannot waive the inspection. Both languages must say so.
 #[test]
 fn uncertain_side_effect_docs_pin_the_durable_obligation_and_its_recovery_action() {
     contains_all(
@@ -2712,8 +2751,8 @@ fn uncertain_side_effect_docs_pin_the_durable_obligation_and_its_recovery_action
         "docs/guide/durable-state.md",
         &[
             "`pendingUncertainCalls`, one entry per uncertain call",
-            "`/goal resume`\nis the explicit statement that those states were inspected",
-            "retire nothing, because neither claims an inspection\nhappened",
+            "`/goal resume` and the optional Resume goal choice do not attest an inspection",
+            "preserve the inspection obligation",
             "`interrupted` for a claim the interruption left unsettled",
             "leaves the pause missing and the obligation intact",
         ],
@@ -2722,7 +2761,7 @@ fn uncertain_side_effect_docs_pin_the_durable_obligation_and_its_recovery_action
         "docs/zh/guide/durable-state.md",
         &[
             "`/goal show` 给出 `pendingUncertainCalls`",
-            "就是“这些状态已经检查过了”这句话本身",
+            "都不代表检查已完成",
             "不结清任何一条，因为它们都没有声称检查已经发生",
             "中断留下未结算声明是 `interrupted`",
             "pause 缺失而\n义务仍在",

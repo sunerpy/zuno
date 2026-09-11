@@ -11,6 +11,7 @@ mod execution;
 mod experience;
 mod extraction;
 mod feedback;
+mod history;
 mod ingestion;
 mod memory;
 mod model;
@@ -40,6 +41,7 @@ pub use crate::extraction::{
     decode_extraction_job_payload,
 };
 pub use crate::feedback::FeedbackService;
+pub use crate::history::{LearningHistoryAction, LearningHistoryItem, LearningHistoryRepair};
 pub use crate::ingestion::LearningIngestion;
 pub use crate::memory::{
     MemoryConsolidation, MemoryConsolidationRequest, MemoryConsolidationUpdate, MemoryConsolidator,
@@ -87,6 +89,21 @@ pub enum LearningServiceError {
 }
 
 impl LearningServiceError {
+    /// Credential-safe, bounded causes for durable worker status and request outcomes.
+    #[must_use]
+    pub fn diagnostic(&self) -> String {
+        match self {
+            Self::ExtractorProvider { version, source } => ProviderError::sanitize_diagnostic(
+                &format!(
+                    "learning extractor `{version}` provider failed: {}",
+                    source.diagnostic()
+                ),
+                &[],
+            ),
+            _ => ProviderError::sanitize_diagnostic(&self.to_string(), &[]),
+        }
+    }
+
     /// What a caller should do next, decided from this error's shape alone.
     #[must_use]
     pub fn recovery(&self) -> Recovery {

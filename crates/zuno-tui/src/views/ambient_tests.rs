@@ -86,7 +86,7 @@ fn views_sidebar_states_tokens_servers_and_skills() {
     let joined = drawn(&mut view);
     for needle in [
         "Context",
-        "64.0k / 100.0k current prompt",
+        "64.0k / 100.0k used",
         "LSP",
         "rust-analyzer",
         "MCP",
@@ -103,8 +103,8 @@ fn views_sidebar_prioritizes_the_live_context_over_cumulative_accounting() {
     let joined = drawn(&mut view);
 
     assert!(
-        joined.contains("64.0k / 100.0k current prompt"),
-        "the live prompt size is missing:\n{joined}"
+        joined.contains("64.0k / 100.0k used"),
+        "the live context size is missing:\n{joined}"
     );
     assert!(
         joined.contains("64.0% of model window"),

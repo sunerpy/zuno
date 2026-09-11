@@ -116,6 +116,36 @@ pub use crate::registry::spec::{ApiSurface, Spec, generation};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Resolve a model's declared capabilities over the constructed provider defaults.
+/// Auxiliary clients use the same model override as the provider request builder.
+#[must_use]
+pub fn model_capabilities(spec: &Spec, model_id: &str, provider: Capabilities) -> Capabilities {
+    let mut capabilities = provider;
+    for object in [
+        spec.options.get("capabilities"),
+        spec.options
+            .get("modelCapabilities")
+            .and_then(|models| models.get(model_id)),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(serde_json::Value::as_object)
+    {
+        for (name, flag) in [
+            ("reasoning", &mut capabilities.reasoning),
+            ("tool_calls", &mut capabilities.tool_calls),
+            ("prompt_cache", &mut capabilities.prompt_cache),
+            ("attachments", &mut capabilities.attachments),
+            ("sampling_params", &mut capabilities.sampling_params),
+        ] {
+            if let Some(value) = object.get(name).and_then(serde_json::Value::as_bool) {
+                *flag = value;
+            }
+        }
+    }
+    capabilities
+}
+
 /// A constructor for one provider, parameterized by its [`Spec`].
 ///
 /// `Arc` rather than `Box` so the registry can be cloned and handed to concurrent

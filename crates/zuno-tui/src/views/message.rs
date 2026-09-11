@@ -50,9 +50,12 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use zuno_engine::r#loop::{INTERRUPTED_TURN_NOTICE, NoticeSeverity, TurnEvent};
 use zuno_engine::session_command::SessionCommand;
-use zuno_llm::event::{PromptAccounting, StreamEvent};
+use zuno_llm::event::StreamEvent;
 pub use zuno_types::TokenUsage;
 use zuno_types::UsageSnapshot;
+use zuno_types::context_usage::{
+    ContextUsageCounters, ContextUsageFreshness, ContextUsageSnapshot, ContextUsageSource,
+};
 
 #[cfg(test)]
 #[path = "message_tests.rs"]
@@ -667,44 +670,21 @@ struct RequestUsage {
     before_prompt: Option<u64>,
     before_estimate: Option<u64>,
     before_state: UsageState,
-    input: u64,
-    output: u64,
-    reasoning: u64,
-    cache_read: u64,
-    cache_write: u64,
+    counters: ContextUsageCounters,
 }
 
 impl RequestUsage {
-    fn update(
-        &mut self,
-        input: Option<u64>,
-        output: Option<u64>,
-        reasoning: Option<u64>,
-        cache_read: Option<u64>,
-        cache_write: Option<u64>,
-    ) {
-        for (slot, value) in [
-            (&mut self.input, input),
-            (&mut self.output, output),
-            (&mut self.reasoning, reasoning),
-            (&mut self.cache_read, cache_read),
-            (&mut self.cache_write, cache_write),
-        ] {
-            if let Some(value) = value {
-                *slot = value;
-            }
-        }
-    }
-
-    fn cumulative(&self, accounting: PromptAccounting) -> TokenUsage {
+    fn cumulative(&self) -> TokenUsage {
         let mut total = self.before;
-        total.add(
-            accounting.uncached_input(self.input, self.cache_read, self.cache_write),
-            self.output.saturating_sub(self.reasoning),
-            self.reasoning,
-            self.cache_read,
-            self.cache_write,
-        );
+        let usage = self.counters.disjoint();
+        total.add_usage(TokenUsage {
+            input: usage.input,
+            output: usage.output,
+            reasoning: usage.reasoning,
+            cache_read: usage.cache_read,
+            cache_write: usage.cache_write,
+            unclassified: usage.unclassified,
+        });
         total
     }
 }
@@ -748,6 +728,10 @@ pub struct Transcript {
     estimated_pending_prompt_tokens: Option<u64>,
     /// The model's context ceiling, when the catalog states one.
     context_limit: u64,
+    /// Authoritative host projection. Raw provider frames cannot replace it.
+    context_usage: Option<ContextUsageSnapshot>,
+    context_session_id: Option<String>,
+    context_source: ContextUsageSource,
     /// How many animation-clock frames have elapsed.
     ///
     /// Provider and tool events deliberately do not advance this. A slow request can
@@ -784,6 +768,68 @@ impl Transcript {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Bind a projection to one durable session and foreground request source.
+    #[must_use]
+    pub fn for_session(session_id: impl Into<String>, source: ContextUsageSource) -> Self {
+        Self {
+            context_session_id: Some(session_id.into()),
+            context_source: source,
+            ..Self::default()
+        }
+    }
+
+    /// Consume one validated, revisioned host snapshot. Returns whether to redraw.
+    ///
+    /// This is a read-model setter: no database access, model requests, retry
+    /// decisions or private runtime-controller state belong in the TUI.
+    pub fn set_context_usage(&mut self, snapshot: ContextUsageSnapshot) -> bool {
+        if snapshot.validate().is_err()
+            || snapshot.source != self.context_source
+            || self
+                .context_session_id
+                .as_ref()
+                .is_some_and(|session_id| session_id != &snapshot.session_id)
+            || self.context_usage.as_ref().is_some_and(|current| {
+                snapshot.revision <= current.revision
+                    || snapshot.context_epoch < current.context_epoch
+            })
+        {
+            return false;
+        }
+        self.context_session_id = Some(snapshot.session_id.clone());
+        self.request_usage = None;
+        let usage = snapshot.cumulative_usage;
+        self.tokens = TokenUsage {
+            input: usage.input,
+            output: usage.output,
+            reasoning: usage.reasoning,
+            cache_read: usage.cache_read,
+            cache_write: usage.cache_write,
+            unclassified: usage.unclassified,
+        };
+        self.usage_state = if snapshot.cumulative_known {
+            UsageState::Known
+        } else if snapshot.request.is_some() || !self.tokens.is_empty() {
+            UsageState::Unavailable
+        } else {
+            UsageState::NotReported
+        };
+        self.last_prompt_tokens = snapshot
+            .last_confirmed
+            .as_ref()
+            .and_then(|confirmed| confirmed.usage.prompt_tokens());
+        self.estimated_pending_prompt_tokens = snapshot.request_estimate_tokens;
+        self.context_limit = snapshot.context_limit.unwrap_or_default();
+        self.context_usage = Some(snapshot);
+        true
+    }
+
+    /// Full provenance for a context value, including unknown and estimated state.
+    #[must_use]
+    pub fn context_usage(&self) -> Option<&ContextUsageSnapshot> {
+        self.context_usage.as_ref()
     }
 
     /// Restore selected Skill identities from durable prompt receipts before the first
@@ -872,11 +918,14 @@ impl Transcript {
 
     /// Restore durable usage before replaying an existing session.
     pub fn restore_usage(&mut self, snapshot: UsageSnapshot) {
+        self.failed_turns = snapshot.failed_turns;
+        if self.context_usage.is_some() {
+            return;
+        }
         self.request_usage = None;
         self.tokens = snapshot.confirmed;
         self.last_prompt_tokens = snapshot.last_prompt_tokens;
         self.estimated_pending_prompt_tokens = snapshot.estimated_pending_prompt_tokens;
-        self.failed_turns = snapshot.failed_turns;
         if let Some(context_limit) = snapshot.context_limit {
             self.context_limit = context_limit;
         }
@@ -928,11 +977,27 @@ impl Transcript {
     /// rather than dividing.
     #[must_use]
     pub const fn context_window(&self) -> Option<ContextWindowUsage> {
+        if let Some(snapshot) = &self.context_usage {
+            return match (snapshot.used_tokens, snapshot.context_limit) {
+                (Some(used), Some(limit)) if limit > 0 => Some(ContextWindowUsage {
+                    prompt_tokens: used,
+                    limit,
+                    estimated: !matches!(snapshot.freshness, ContextUsageFreshness::Confirmed),
+                }),
+                _ => None,
+            };
+        }
         if self.context_limit == 0 {
             return None;
         }
         let (prompt_tokens, estimated) = match self.estimated_pending_prompt_tokens {
-            Some(prompt_tokens) => (prompt_tokens, true),
+            Some(prompt_tokens) => (
+                match self.last_prompt_tokens {
+                    Some(confirmed) if confirmed > prompt_tokens => confirmed,
+                    _ => prompt_tokens,
+                },
+                true,
+            ),
             None => match self.last_prompt_tokens {
                 Some(prompt_tokens) => (prompt_tokens, false),
                 None => return None,
@@ -1046,6 +1111,9 @@ impl Transcript {
     /// into a redraw request.
     pub fn observe(&mut self, event: &TurnEvent) -> bool {
         match event {
+            TurnEvent::ContextUsageUpdated { snapshot } => {
+                self.set_context_usage(snapshot.as_ref().clone())
+            }
             TurnEvent::SkillLoaded { name, source } => {
                 self.loaded_skills.insert(LoadedSkillIdentity {
                     name: name.clone(),
@@ -1071,7 +1139,18 @@ impl Transcript {
                 ));
                 true
             }
-            TurnEvent::TurnStarted { turn_id, .. } => {
+            TurnEvent::TurnStarted {
+                session_id,
+                turn_id,
+            } => {
+                if self
+                    .context_session_id
+                    .as_ref()
+                    .is_some_and(|current| current != session_id)
+                {
+                    return false;
+                }
+                self.context_session_id = Some(session_id.clone());
                 self.mark_running();
                 self.active_turn_id = Some(turn_id.clone());
                 true
@@ -1121,6 +1200,11 @@ impl Transcript {
                 self.streaming = None;
                 self.close_reasoning();
                 if let SessionCommand::Compact = command {
+                    if self.context_usage.is_none() {
+                        self.last_prompt_tokens = None;
+                        self.estimated_pending_prompt_tokens = None;
+                        self.request_usage = None;
+                    }
                     self.messages.push(Message::noticed(
                         crate::views::toast::ToastLevel::Success,
                         "context compacted; older history was summarized",
@@ -1141,6 +1225,9 @@ impl Transcript {
                 estimated_prompt_tokens,
                 ..
             } => {
+                if self.context_usage.is_some() {
+                    return false;
+                }
                 self.request_usage = None;
                 self.estimated_pending_prompt_tokens = Some(*estimated_prompt_tokens);
                 true
@@ -1155,6 +1242,10 @@ impl Transcript {
                 self.streaming = Some(self.messages.len() - 1);
                 true
             }
+            TurnEvent::Provider {
+                step: 0,
+                event: StreamEvent::TokenUsage { .. },
+            } => false,
             TurnEvent::Provider { event, .. } => self.observe_stream(event),
             TurnEvent::ToolCallStarted {
                 call_id,
@@ -1432,41 +1523,38 @@ impl Transcript {
                 });
                 true
             }
-            StreamEvent::TokenUsage {
-                input_tokens,
-                output_tokens,
-                reasoning_tokens,
-                cache_read_input_tokens,
-                cache_write_input_tokens,
-                accounting,
-            } => {
+            frame @ StreamEvent::TokenUsage { .. } => {
+                if self.context_usage.is_some() {
+                    return false;
+                }
                 let usage = self.request_usage.get_or_insert(RequestUsage {
                     before: self.tokens,
                     before_prompt: self.last_prompt_tokens,
                     before_estimate: self.estimated_pending_prompt_tokens,
                     before_state: self.usage_state,
-                    input: 0,
-                    output: 0,
-                    reasoning: 0,
-                    cache_read: 0,
-                    cache_write: 0,
+                    counters: ContextUsageCounters::default(),
                 });
-                usage.update(
-                    *input_tokens,
-                    *output_tokens,
-                    *reasoning_tokens,
-                    *cache_read_input_tokens,
-                    *cache_write_input_tokens,
-                );
-                self.tokens = usage.cumulative(*accounting);
-                self.last_prompt_tokens =
-                    Some(accounting.prompt_total(usage.input, usage.cache_read, usage.cache_write));
-                self.usage_state = UsageState::Known;
-                self.estimated_pending_prompt_tokens = None;
+                let counters = zuno_engine::context_usage::counters_from_stream_event(frame)
+                    .expect("matched a provider usage frame");
+                if !usage.counters.merge_snapshot(counters) {
+                    return false;
+                }
+                self.tokens = usage.cumulative();
+                if let Some(prompt) = usage.counters.prompt_tokens() {
+                    self.last_prompt_tokens = Some(prompt);
+                    self.estimated_pending_prompt_tokens = None;
+                }
+                self.usage_state = if usage.counters.is_complete() {
+                    UsageState::Known
+                } else {
+                    UsageState::Unavailable
+                };
                 true
             }
             StreamEvent::RetryRollback { attempt, max } => {
-                if let Some(usage) = self.request_usage.take() {
+                if self.context_usage.is_none()
+                    && let Some(usage) = self.request_usage.take()
+                {
                     self.tokens = usage.before;
                     self.last_prompt_tokens = usage.before_prompt;
                     self.estimated_pending_prompt_tokens = usage.before_estimate;
@@ -3667,7 +3755,8 @@ pub struct StatusView {
 /// Occupancy of the model window for the most recent provider request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextWindowUsage {
-    /// Tokens in the complete most recent prompt, using provider accounting semantics.
+    /// Context occupancy from the shared snapshot, including generated output and
+    /// estimated unaccounted tail. Legacy hosts can provide only the known prompt.
     pub prompt_tokens: u64,
     /// Model-declared maximum prompt window.
     pub limit: u64,

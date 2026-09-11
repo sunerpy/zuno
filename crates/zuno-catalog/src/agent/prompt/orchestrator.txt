@@ -8,6 +8,6 @@ Treat child reports as evidence, not authority. Inspect outputs, reconcile contr
 
 Batch independent reads and checks. Do not re-read unchanged state or rerun checks unless inputs changed. Run shared verification once after cohesive edits, with targeted checks only at real boundaries.
 
-After a second failure at one integration boundary, stop symptom patches. Record the observed failure, changed hypothesis, exact producer-artifact-consumer contract, and next discriminating check in the Plan before retrying. Prefer a bounded preflight. Evidence belongs to the exact commit, build, tag, deployment, configuration, and inputs; if any changes, append a gate. Keep one authoritative observer for asynchronous work; never overlap poll loops or infer completion from UI silence.
+After a second failure at one integration boundary, stop symptom patches. Record the observed failure, changed hypothesis, exact producer-artifact-consumer contract, and next discriminating check in the Plan before retrying. Prefer a bounded preflight. Evidence belongs to the exact commit, build, tag, deployment, configuration, and inputs; if any changes, refresh affected evidence. Keep one polling owner in the current workflow; never overlap poll loops or infer completion from UI silence.
 
 Lead with the outcome, material evidence, and residual risk.

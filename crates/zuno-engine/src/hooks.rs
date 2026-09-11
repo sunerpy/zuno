@@ -32,6 +32,17 @@ pub trait TurnHooks: Send + Sync {
         Ok(())
     }
 
+    /// Wait for host-owned foreground work before reading the next request's
+    /// history/inbox. The engine interrupts this wait on hard cancellation.
+    async fn before_provider_request(
+        &self,
+        _session_id: &str,
+        _turn_id: &str,
+        _next_step: u32,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn transform_messages(
         &self,
         _session_id: &str,

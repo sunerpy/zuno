@@ -717,8 +717,74 @@ mod tests {
     use zuno_llm::event::RequestContentBlock;
     use zuno_llm::registry::{
         ProviderRequestContext, ProviderSessionIdentity, ReasoningReplay, ReasoningReplayPolicy,
-        RequestMessage, ResponsesInputBoundary,
+        RequestMessage, ResponsesInputBoundary, Spec, generation,
     };
+
+    fn assert_learning_output_limit_uses_foreground_normalization(
+        surface: ApiSurface,
+        wire_key: &str,
+    ) {
+        let config = OpenAiConfig::try_from_spec(
+            Spec::new("configured-provider")
+                .with_option(generation::MAX_TOKENS, json!(8192))
+                .with_option("text", json!({"verbosity":"low"})),
+        )
+        .expect("foreground native configuration");
+        let request = CompletionRequest::new(
+            "configured-model",
+            vec![Message::new(Role::User, "Return one small JSON object.")],
+        )
+        .on_surface(surface)
+        .with_request_context(ProviderRequestContext::Learning)
+        .with_parameters(Map::from_iter([(
+            generation::MAX_TOKENS.to_owned(),
+            json!(2048),
+        )]));
+
+        let body = build_request_body(&request, &config).expect("native learning request body");
+        assert!(
+            body.get(generation::MAX_TOKENS).is_none(),
+            "SDK maxTokens must not leak into the native {surface:?} wire body: {body}"
+        );
+        assert_eq!(body[wire_key], 2048, "keep the smaller execution ceiling");
+        for other in ["max_tokens", "max_output_tokens", "max_completion_tokens"] {
+            if other != wire_key {
+                assert!(
+                    body.get(other).is_none(),
+                    "unexpected output-limit alias {other}"
+                );
+            }
+        }
+        assert!(body.get("tools").is_none());
+        assert!(
+            body.get("metadata").is_none(),
+            "learning must stay detached"
+        );
+
+        let mut foreground = request.clone();
+        foreground.parameters.remove(generation::MAX_TOKENS);
+        let expected = build_request_body(&foreground, &config.clone().with_max_tokens(2048))
+            .expect("same limit through the foreground native configuration");
+        assert_eq!(body, expected, "reuse the foreground wire vocabulary");
+        assert_eq!(
+            config.max_tokens(),
+            Some(8192),
+            "do not mutate provider defaults"
+        );
+    }
+
+    #[test]
+    fn native_responses_learning_output_limit_uses_foreground_normalization() {
+        assert_learning_output_limit_uses_foreground_normalization(
+            ApiSurface::Responses,
+            "max_output_tokens",
+        );
+    }
+
+    #[test]
+    fn native_chat_learning_output_limit_uses_foreground_normalization() {
+        assert_learning_output_limit_uses_foreground_normalization(ApiSurface::Chat, "max_tokens");
+    }
 
     fn main_turn_context() -> ProviderRequestContext {
         ProviderRequestContext::MainTurn(

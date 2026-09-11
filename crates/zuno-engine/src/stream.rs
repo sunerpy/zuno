@@ -13,6 +13,7 @@ use zuno_db::{Connection, open, session};
 use zuno_error::{DbError, ProviderError};
 use zuno_llm::event::{FinishReason, PromptAccounting, StreamEvent, ThoughtSignature};
 use zuno_llm::sse::{StreamLimits, append_tool_input};
+use zuno_types::context_usage::{ContextTokenAccounting, ContextUsageCounters};
 
 /// Dirty delta bytes accumulated before live text/reasoning is upserted.
 pub const DELTA_BATCH_BYTES: usize = 4 * 1024;
@@ -75,7 +76,7 @@ impl ProjectionContext {
 /// Token accounting persisted on both the assistant message and step-finish part.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StepUsage {
-    /// Input tokens billed for the request.
+    /// Uncached input tokens; the buckets in this type are disjoint.
     pub input: u64,
     /// Output tokens emitted by the provider.
     pub output: u64,
@@ -233,6 +234,7 @@ where
     effects: &'effects mut Effects,
     snapshot_before: Option<String>,
     usage: StepUsage,
+    raw_usage: ContextUsageCounters,
     accounting: Option<PromptAccounting>,
     text: Option<TextBuffer>,
     reasoning: Option<ReasoningBuffer>,
@@ -246,6 +248,10 @@ where
     stats: ProjectionStats,
     outcome: ProjectionOutcome,
     finished: bool,
+    finish_payload: Option<Value>,
+    finish_reason: Option<FinishReason>,
+    base_cost: f64,
+    attempt: u32,
 }
 
 impl<'connection, 'effects, Effects> StreamProjector<'connection, 'effects, Effects>
@@ -259,12 +265,19 @@ where
         effects: &'effects mut Effects,
     ) -> Result<Self, ProjectionError> {
         let snapshot_before = effects.track_snapshot();
+        let base_cost = MessageStore::new(connection)
+            .message(&context.message_id)?
+            .data
+            .get("cost")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
         let mut projector = Self {
             connection,
             context,
             effects,
             snapshot_before,
             usage: StepUsage::default(),
+            raw_usage: ContextUsageCounters::default(),
             accounting: None,
             text: None,
             reasoning: None,
@@ -278,6 +291,10 @@ where
             stats: ProjectionStats::default(),
             outcome: ProjectionOutcome::default(),
             finished: false,
+            finish_payload: None,
+            finish_reason: None,
+            base_cost,
+            attempt: 1,
         };
         projector.persist_step_start()?;
         Ok(projector)
@@ -297,7 +314,7 @@ where
 
     /// Apply one provider-neutral event.
     pub fn apply(&mut self, event: StreamEvent) -> Result<(), ProjectionError> {
-        if self.finished {
+        if self.finished && !matches!(event, StreamEvent::TokenUsage { .. }) {
             return Err(ProjectionError::AlreadyFinished);
         }
         match event {
@@ -361,33 +378,32 @@ where
             }
             StreamEvent::MessageEnd { stop_reason } => self.finish_step(stop_reason)?,
             StreamEvent::RetryRollback { attempt, max } => self.rollback(attempt, max)?,
-            StreamEvent::TokenUsage {
-                input_tokens,
-                output_tokens,
-                reasoning_tokens,
-                cache_read_input_tokens,
-                cache_write_input_tokens,
-                accounting,
-            } => {
-                if let Some(value) = input_tokens {
-                    self.usage.input = value;
+            frame @ StreamEvent::TokenUsage { .. } => {
+                if !self.raw_usage.merge_snapshot(
+                    crate::context_usage::counters_from_stream_event(&frame).expect("usage frame"),
+                ) {
+                    return Ok(());
                 }
-                // The frame's `output_tokens` includes its `reasoning_tokens`, while
-                // `StepUsage::total` sums the two buckets independently. The reasoning
-                // part therefore comes out of the output figure rather than being
-                // recorded beside an unchanged one, which would count it twice.
-                let reasoning = reasoning_tokens.unwrap_or(0);
-                if let Some(value) = output_tokens {
-                    self.usage.output = value.saturating_sub(reasoning);
+                let observed = self.raw_usage.disjoint();
+                self.usage = StepUsage {
+                    input: observed.input,
+                    output: observed.output,
+                    reasoning: observed.reasoning,
+                    cache_read: observed.cache_read,
+                    cache_write: observed.cache_write,
+                };
+                self.accounting = match self.raw_usage.accounting {
+                    ContextTokenAccounting::CacheInsideInput => {
+                        Some(PromptAccounting::CacheInsideInput)
+                    }
+                    ContextTokenAccounting::CacheBesideInput => {
+                        Some(PromptAccounting::CacheBesideInput)
+                    }
+                    ContextTokenAccounting::Unknown => None,
+                };
+                if self.finished {
+                    self.revise_finished_usage()?;
                 }
-                self.usage.reasoning = reasoning;
-                if let Some(value) = cache_read_input_tokens {
-                    self.usage.cache_read = value;
-                }
-                if let Some(value) = cache_write_input_tokens {
-                    self.usage.cache_write = value;
-                }
-                self.accounting = Some(accounting);
             }
             StreamEvent::Compaction {
                 trigger,
@@ -854,6 +870,12 @@ where
     }
 
     fn rollback(&mut self, attempt: u32, max: u32) -> Result<(), ProjectionError> {
+        if attempt <= self.attempt {
+            return Ok(());
+        }
+        let failed_attempt = self.attempt;
+        self.attempt = attempt;
+        let observed_usage = self.raw_usage;
         for part_id in std::mem::take(&mut self.attempt_part_ids) {
             self.connection
                 .execute("DELETE FROM part WHERE id = ?1", [part_id.as_str()])
@@ -867,6 +889,7 @@ where
         self.last_tool_id = None;
         self.dirty_delta_bytes = 0;
         self.usage = StepUsage::default();
+        self.raw_usage = ContextUsageCounters::default();
         self.accounting = None;
 
         let part_id = self.next_part_id("retry");
@@ -878,6 +901,9 @@ where
                 "messageID": self.context.message_id,
                 "type": "retry",
                 "attempt": attempt,
+                "failedAttempt": failed_attempt,
+                "observedUsage": observed_usage,
+                "usageKnown": false,
                 "error": {
                     "name": "APIError",
                     "data": {
@@ -920,7 +946,7 @@ where
             "cost": self.context.cost,
             "tokens": {
                 "total": self.usage.total(),
-                "input": self.usage.input,
+                "input": self.raw_usage.input_tokens,
                 "output": self.usage.output,
                 "reasoning": self.usage.reasoning,
                 "cache": {
@@ -932,6 +958,9 @@ where
         if let Some(snapshot) = completed_snapshot {
             finish_payload["snapshot"] = Value::String(snapshot);
         }
+        finish_payload["tokens"] = self.token_payload(true);
+        self.finish_payload = Some(finish_payload.clone());
+        self.finish_reason = Some(reason);
         self.persist_part(finish_payload, now, false)?;
         self.update_assistant_message(reason, now)?;
 
@@ -967,20 +996,27 @@ where
         now: i64,
     ) -> Result<(), ProjectionError> {
         let transaction = open::immediate_transaction(self.connection)?;
-        let store = MessageStore::new(&transaction);
+        self.update_assistant_message_in(&transaction, reason, now)?;
+        transaction.commit().map_err(open::map_error)?;
+        self.stats.total_writes = self.stats.total_writes.saturating_add(1);
+        Ok(())
+    }
+
+    fn update_assistant_message_in(
+        &self,
+        transaction: &zuno_db::Transaction<'_>,
+        reason: FinishReason,
+        now: i64,
+    ) -> Result<(), ProjectionError> {
+        let store = MessageStore::new(transaction);
         let mut message = store.message(&self.context.message_id)?;
         let previous = session::MessageUsage::from_data(&message.data);
         message
             .data
             .insert("finish".to_owned(), Value::String(reason.to_string()));
-        let current_cost = message
-            .data
-            .get("cost")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
         message.data.insert(
             "cost".to_owned(),
-            Value::from(current_cost + self.context.cost),
+            Value::from(self.base_cost + self.context.cost),
         );
         let time = message
             .data
@@ -989,22 +1025,12 @@ where
         if let Some(time) = time.as_object_mut() {
             time.insert("completed".to_owned(), Value::from(now));
         }
-        message.data.insert(
-            "tokens".to_owned(),
-            json!({
-                "input": self.usage.input,
-                "output": self.usage.output,
-                "reasoning": self.usage.reasoning,
-                "cache": {
-                    "read": self.usage.cache_read,
-                    "write": self.usage.cache_write,
-                },
-                "accounting": self.accounting.map(PromptAccounting::as_str),
-            }),
-        );
+        message
+            .data
+            .insert("tokens".to_owned(), self.token_payload(false));
         store.put_message_at(&message, now)?;
         session::reconcile_usage(
-            &transaction,
+            transaction,
             &self.context.session_id,
             Some(previous),
             session::MessageUsage::from_data(&message.data),
@@ -1012,8 +1038,45 @@ where
                 .context_limit
                 .and_then(|limit| i64::try_from(limit).ok()),
         )?;
+        Ok(())
+    }
+
+    fn token_payload(&self, include_total: bool) -> Value {
+        let mut payload = json!({
+            "input": self.raw_usage.input_tokens,
+            "output": self.raw_usage.output_tokens.map(|_| self.usage.output),
+            "reasoning": self.raw_usage.reasoning_tokens,
+            "cache": {
+                "read": self.raw_usage.cache_read_input_tokens,
+                "write": self.raw_usage.cache_write_input_tokens,
+            },
+            "accounting": self.accounting.map(PromptAccounting::as_str),
+        });
+        if include_total {
+            payload["total"] = json!(self.usage.total());
+            payload["known"] = json!(self.raw_usage.is_complete());
+        }
+        payload
+    }
+
+    /// Usage can follow the generation stop. Revise bookkeeping without adding
+    /// cost again or repeating snapshot/summary side effects.
+    fn revise_finished_usage(&mut self) -> Result<(), ProjectionError> {
+        let (Some(mut payload), Some(reason)) = (self.finish_payload.clone(), self.finish_reason)
+        else {
+            return Ok(());
+        };
+        payload["tokens"] = self.token_payload(true);
+        let now = now_millis();
+        let connection = self.connection;
+        let transaction = open::immediate_transaction(connection)?;
+        let part = PartRecord::from_json(payload.clone(), now)?;
+        MessageStore::new(&transaction).put_part_at(&part, now)?;
+        self.update_assistant_message_in(&transaction, reason, now)?;
         transaction.commit().map_err(open::map_error)?;
-        self.stats.total_writes = self.stats.total_writes.saturating_add(1);
+        self.finish_payload = Some(payload);
+        self.stats.total_writes = self.stats.total_writes.saturating_add(2);
+        self.outcome.needs_compaction = self.effects.is_overflow(&self.usage);
         Ok(())
     }
 

@@ -5,7 +5,9 @@
 //! bound review revision, updates Goal state, freezes the execution identity,
 //! and admits the control input before any of those facts become visible.
 
+mod goal_resume;
 mod question;
+pub use goal_resume::GoalResumeOutcome;
 pub use question::QuestionService;
 
 use std::sync::Arc;
@@ -205,6 +207,42 @@ impl SessionControlService {
         }
         transaction.commit().map_err(open::map_error)?;
         Ok(state)
+    }
+
+    /// Record an explicit selector's resolved identity without granting execution.
+    /// Ephemeral panels remain unmaterialized; all existing wait/authorization
+    /// and Goal state remains intact in either collaboration mode.
+    pub fn record_work_selection(
+        &self,
+        session_id: &str,
+        identity: TurnExecutionIdentity,
+        at_ms: i64,
+    ) -> Result<Option<SessionExecutionState>, SessionControlError> {
+        self.pool.try_transaction(|tx| {
+            let exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM session WHERE id=?1)",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .map_err(zuno_db::map_error)?;
+            if !exists {
+                return Ok(None);
+            }
+            let mut state = seed_in(
+                tx,
+                session_id,
+                CollaborationMode::Work,
+                Some(identity.clone()),
+                at_ms,
+            )?;
+            if state.work_identity.as_ref() != Some(&identity) {
+                state.work_identity = Some(identity);
+                state.time_updated = state.time_updated.max(at_ms);
+                state = update_in(tx, state.revision, state)?;
+            }
+            Ok(Some(state))
+        })
     }
 
     /// Mark the exact current Plan revision as ready for an explicit handoff.

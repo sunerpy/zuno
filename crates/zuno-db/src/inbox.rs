@@ -670,6 +670,7 @@ impl SessionInbox {
 }
 
 pub(crate) fn validate_input(input: &NewSessionInput) -> Result<(), DbError> {
+    crate::input_receipt::validate_client_key(input)?;
     if input.id.trim().is_empty() || input.session_id.trim().is_empty() {
         return Err(query_error(std::io::Error::other(
             "input id and session id must not be empty",
@@ -709,6 +710,8 @@ pub fn admit_in(
     if let Some(source_key) = input.source_key.as_deref()
         && let Some(existing) = select_by_source_key(transaction, &input.session_id, source_key)?
     {
+        crate::input_receipt::validate_client_replay(&existing, &input)?;
+        crate::input_receipt::ensure_in(transaction, &existing)?;
         return Ok(existing);
     }
     let event = append_in(
@@ -738,7 +741,7 @@ pub fn admit_in(
             ],
         )
         .map_err(open::map_error)?;
-    Ok(SessionInput {
+    let admitted = SessionInput {
         id: input.id,
         session_id: input.session_id,
         prompt: input.prompt,
@@ -753,7 +756,9 @@ pub fn admit_in(
         error: None,
         time_created: input.time_created,
         time_updated: input.time_created,
-    })
+    };
+    crate::input_receipt::ensure_in(transaction, &admitted)?;
+    Ok(admitted)
 }
 
 /// Admit and immediately promote one driver-owned input in the caller's transaction.
@@ -1174,6 +1179,7 @@ fn cancel_pending_in(
         )
         .map_err(open::map_error)?;
     require_changed(input_id, changed)?;
+    crate::input_receipt::sync_input_in(transaction, &input)?;
     Ok(input)
 }
 
@@ -1254,6 +1260,7 @@ pub(crate) fn transition_in(
         )
         .map_err(open::map_error)?;
     require_changed(input_id, changed)?;
+    crate::input_receipt::sync_input_in(transaction, &input)?;
     Ok(Some(input))
 }
 

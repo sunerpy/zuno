@@ -37,10 +37,13 @@ handoff-ready；绑定 review 时默认要求 Ready，除非用户通过
 runtime，避免重复网络或子进程握手。结构性 MCP 配置发生变化时仍会重新连接。重配置
 日志会记录锁等待、解析、关闭、打开和总耗时，但不会记录所选值或凭据。
 
-会话已经在跑一个回合时到达的 `session/prompt`，会先被提交进持久输入 inbox，再被转向
-进那个回合，因此模型能收到它，而正在进行的工作不会被打断。第二个请求以 JSON-RPC 错误
-`-32001` 回答，其 `data` 报告 `admission`（`steered`、`queued` 或 `rejected`）、
-`sessionId` 与持久的 `inputId`；流式输出与 `stopReason` 仍留在拥有该回合的那个请求上。
+忙碌时到达的 `session/prompt` 先进入持久 inbox，再于安全点 steer 或保留排队。
+该 RPC 等待这条输入的关联处理结果，返回合法 `stopReason`，不再用 `-32001` busy
+表示接收成功。执行由会话持有，不依赖某个 RPC 观察者存活；`_meta.zuno.receipt`
+区分已接收、已写入历史、已进入模型与执行终态。
+
+普通 prompt 可提供 `_meta.zuno.messageId`（1–256 字节）。同一会话重试同一 ID
+只观察原回执，内容冲突则拒绝；文本相同但 ID 不同仍是两条用户输入。
 
 支持 Zuno 扩展的客户端可以改用 `session/steer`。初始化响应通过
 `_meta.zuno.steering` 宣告能力；回合内 `session/update` 通过
@@ -50,14 +53,13 @@ runtime，避免重复网络或子进程握手。结构性 MCP 配置发生变�
 `reason` 为 `noActiveTurn`、`expectedTurnMismatch`、
 `activeTurnNotSteerable` 或 `emptyInput`。目标回合会在 inbox 事务提交前再次校验；
 如果等待 SQLite 期间原回合结束或已被替换，输入行与准入事件一起回滚，被拒绝的 steer
-不会进入后续回合。既有 `session/prompt` 与
-`session/cancel` 的 ACP V1 语义保持不变。
+不会进入后续回合。`session/cancel` 仍是显式停止整个会话当前执行的控制。
 
 斜杠命令无法被转向，会以 `reason: "commandRequiresIdleSession"` 被拒绝，且不写入任何
 持久内容；只有能解析到真实命令、Skill 或原生控制项的文本才算斜杠命令，因此仅以 `/`
-开头的提示词会作为普通内容被接纳。在一个 prompt 请求返回之前用 `$/cancel_request`
-撤回它，会取消该请求接纳的那条持久行，使被撤回的文本永不到达模型，并以 `-32800`
-与 `data.admission: "withdrawn"` 回答该请求。完整形态见
+开头的提示词会作为普通内容被接纳。`$/cancel_request` 只在尚未进入模型时撤回该请求
+贡献的输入，不能抹掉已处理内容，也不能由重复 ID 的观察者撤回原输入。
+断线不等于撤回：已接收输入与处理回执继续持久保留。完整形态见
 [Zed ACP 集成](/zh/guide/editors)。
 
 后台完成不是斜杠命令。终态命令、子 Agent、workflow 与 product Agent 会发布确定性的
@@ -95,10 +97,10 @@ failed 状态，保留已观察到的路径/diff，并设置 `_meta.zuno.outcome
 重试之前发送该摘要，因此编辑器不会先收到终端 prompt 失败，也不必等待下一次 wake。
 历史 load/resume replay 的是同一份摘要和同一标记。
 
-模型上下文窗口已知时，`ProviderRequestStarted` 会立即发布一条带 assembled prompt
-estimate 的 ACP `usage_update`；provider token usage 到达后，再发第二条用真实值更新。
-它们都是当前请求占用量的绝对值，而不是累计百分比，因此压缩后的请求可以立即让编辑器
-重新计算上下文指示器。
+ACP `usage_update` 使用原生 `ContextUsageSnapshot`：最近供应商确认基线，加尚未计入内容的估算。
+较小的粗估值不能覆盖确认基线；分批 usage 按快照合并，压缩通过新 epoch 表达。
+`_meta.zuno.contextUsage` 携带来源、请求标识、freshness 和更新时间。
+累计非重叠用量与当前窗口分开，未知值保持未知。
 
 运行中的 ACP 会话会订阅统一 Skill catalog generation。新增、修改、删除或重命名
 Skill 后，会发送新的 `available_commands_update`，无需重启会话。
@@ -121,7 +123,10 @@ Agent、provider 与模型会落盘到 `session.turn.started.1`。
 
 `/goal budget <正整数 token|none>` 修改单个 Goal 的显式上限。`goal_update` 的
 `in_progress` 与 `active` 仅用于幂等确认一个已经 active 的 Goal；paused 或 blocked Goal
-仍必须由用户执行 `/goal resume`。
+仍必须由用户执行 `/goal resume`，或明确选择原生 **Resume goal / Keep paused** 中的恢复。
+中断继续保持暂停；新普通输入、跳过选择或记录后台报告都不构成恢复授权。
+事务校验 Goal ID/revision，并保留 Plan、审批、认证、未知副作用和预算门禁；
+已经处理的用户输入不会重投。
 
 ## 进程环境与代理
 

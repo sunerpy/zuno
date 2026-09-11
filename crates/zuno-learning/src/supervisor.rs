@@ -24,6 +24,7 @@ struct Binding {
 
 struct Worker {
     binding: watch::Sender<Binding>,
+    cancel: CancellationToken,
     task: JoinHandle<()>,
 }
 
@@ -99,20 +100,24 @@ impl LearningSupervisor {
             .workers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(worker) = workers.get(&project_id)
-            && !worker.task.is_finished()
-        {
-            worker.binding.send_replace(binding);
-            return;
+        if let Some(worker) = workers.get(&project_id) {
+            if !worker.task.is_finished() && !worker.cancel.is_cancelled() {
+                worker.binding.send_replace(binding);
+                return;
+            }
+            // A new enabled binding cannot overlap a previously suspended task
+            // that has not yet observed its cooperative cancellation.
+            worker.task.abort();
         }
         let (sender, receiver) = watch::channel(binding);
         let cancel = self.inner.cancel.child_token();
         let permits = Arc::clone(&self.inner.permits);
-        let task = tokio::spawn(run_project(receiver, cancel, permits));
+        let task = tokio::spawn(run_project(receiver, cancel.clone(), permits));
         workers.insert(
             project_id,
             Worker {
                 binding: sender,
+                cancel,
                 task,
             },
         );
@@ -124,7 +129,48 @@ impl LearningSupervisor {
             .workers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+            .values()
+            .filter(|worker| !worker.cancel.is_cancelled() && !worker.task.is_finished())
+            .count()
+    }
+
+    /// Stop the existing binding when generation is disabled or the selected
+    /// model is unavailable. Keep its task owned until shutdown or replacement.
+    pub fn suspend_project(&self, project_id: &str) -> bool {
+        let workers = self
+            .inner
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(worker) = workers.get(project_id) else {
+            return false;
+        };
+        if worker.cancel.is_cancelled() || worker.task.is_finished() {
+            return false;
+        }
+        worker.cancel.cancel();
+        true
+    }
+
+    /// Notify only the existing project worker. No session input or foreground
+    /// agent turn is created, and simultaneous notifications are coalesced.
+    pub fn wake_project(&self, project_id: &str) -> bool {
+        if self.inner.cancel.is_cancelled() {
+            return false;
+        }
+        let workers = self
+            .inner
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(worker) = workers.get(project_id) else {
+            return false;
+        };
+        if worker.task.is_finished() || worker.cancel.is_cancelled() {
+            return false;
+        }
+        worker.binding.send_modify(|_| {});
+        true
     }
 
     #[must_use]

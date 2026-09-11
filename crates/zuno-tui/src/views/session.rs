@@ -1533,6 +1533,16 @@ impl SessionScreen {
         &mut self.transcript
     }
 
+    /// Restore or update canonical Context state from the host's durable projection.
+    ///
+    /// The host uses the returned change flag to request a redraw.
+    pub fn set_context_usage(
+        &mut self,
+        snapshot: zuno_types::context_usage::ContextUsageSnapshot,
+    ) -> bool {
+        self.transcript.transcript_mut().set_context_usage(snapshot)
+    }
+
     #[must_use]
     pub fn with_background_executions(
         mut self,

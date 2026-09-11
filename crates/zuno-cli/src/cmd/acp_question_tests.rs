@@ -301,6 +301,11 @@ fn rejected_reports_are_retained_and_do_not_starve_an_admissible_query() {
         .expect("query can be answered without resuming work");
     assert_eq!(selected.id, query.id);
     assert_eq!(
+        durable_questions::next_input_scope(&inbox, SESSION).expect("session pump selection"),
+        Some(DurableInputScope::Prompts),
+        "a resumed or reconnected input needs no surviving RPC waiter"
+    );
+    assert_eq!(
         inbox
             .get(SESSION, &report.id)
             .expect("report")
@@ -339,6 +344,10 @@ fn explicit_resume_work_without_a_plan_is_a_drivable_control() {
         .expect("control gate")
         .expect("resume is admitted");
     assert_eq!(input.id, resumed.input.id);
+    assert_eq!(
+        durable_questions::next_input_scope(&inbox, SESSION).expect("native control selection"),
+        Some(DurableInputScope::Controls)
+    );
 }
 
 #[test]

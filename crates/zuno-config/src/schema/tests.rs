@@ -631,7 +631,7 @@ fn learning_is_enabled_by_default_and_resolves_native_thresholds() {
     assert!(learning.generate);
     assert_eq!(learning.extractor_model, None);
     assert!(learning.post_turn_enabled);
-    assert_eq!(learning.post_turn_idle_delay_ms, 21_600_000);
+    assert_eq!(learning.post_turn_idle_delay_ms, 0);
     assert_eq!(learning.post_turn_poll_interval_ms, 60_000);
     assert_eq!(learning.post_turn_max_jobs_per_wake, 2);
     assert!(!learning.disable_on_external_context);
@@ -644,6 +644,17 @@ fn learning_is_enabled_by_default_and_resolves_native_thresholds() {
     assert_eq!(learning.skill_min_independent_sessions, 3);
     assert_eq!(learning.skill_max_learned_rules, 15);
     assert!(learning.skill_require_review);
+}
+
+#[test]
+fn learning_explicit_idle_delay_and_disabled_generation_are_preserved() {
+    let learning =
+        parse(r#"{"learning":{"generate":false,"post_turn":{"idle_delay_ms":21600000}}}"#)
+            .expect("explicit policy")
+            .resolved_learning();
+    assert_eq!(learning.post_turn_idle_delay_ms, 21_600_000);
+    assert!(!learning.generate);
+    assert!(!learning.post_turn_enabled);
 }
 
 #[test]

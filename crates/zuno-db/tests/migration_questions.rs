@@ -1,4 +1,5 @@
-//! Format-13 DDL boundaries, independent of the question store's validation.
+//! Current format-14 question DDL and its published format-13 boundary,
+//! independent of the question store's validation or any Goal execution.
 
 use rusqlite::{Connection, params};
 use zuno_db::{migration, open};
@@ -6,7 +7,7 @@ use zuno_paths::DbLocation;
 
 fn current() -> Connection {
     let mut connection = open::open(&DbLocation::Memory).expect("open database");
-    migration::apply(&mut connection).expect("create format 13");
+    migration::apply(&mut connection).expect("create format 14");
     connection
         .execute_batch(
             "INSERT INTO human_request
@@ -30,7 +31,7 @@ fn insert_question(connection: &Connection, request_id: &str) -> rusqlite::Resul
 }
 
 #[test]
-fn format_thirteen_question_columns_keys_and_lookup_index_match_the_contract() {
+fn format_fourteen_question_columns_keys_and_lookup_index_match_the_contract() {
     let connection = current();
     type Column<'a> = (&'a str, &'a str, bool, i64);
     let tables: &[(&str, &[Column<'_>])] = &[
@@ -138,13 +139,18 @@ fn format_thirteen_question_columns_keys_and_lookup_index_match_the_contract() {
 }
 
 #[test]
-fn format_thirteen_enforces_closed_question_domains_and_object_definitions() {
+fn format_fourteen_enforces_closed_question_domains_and_object_definitions() {
     let connection = current();
     insert_question(&connection, "request-1").expect("insert valid companion");
     for (column, allowed, nullable) in [
         (
             "purpose",
-            &["clarification", "required_input", "plan_authorization"][..],
+            &[
+                "clarification",
+                "required_input",
+                "plan_authorization",
+                "goal_resume",
+            ][..],
             false,
         ),
         ("mode", &["blocking", "deferred"][..], false),
@@ -204,7 +210,7 @@ fn format_thirteen_enforces_closed_question_domains_and_object_definitions() {
 }
 
 #[test]
-fn format_thirteen_receipts_require_json_and_non_null_command_fields() {
+fn format_fourteen_receipts_require_json_and_non_null_command_fields() {
     let connection = current();
     connection.execute(
         "INSERT INTO question_action_receipt(request_id,command_id,command_json,receipt,time_created)
@@ -251,7 +257,7 @@ fn format_thirteen_receipts_require_json_and_non_null_command_fields() {
 }
 
 #[test]
-fn format_thirteen_receipt_identity_and_both_cascades_are_request_scoped() {
+fn format_fourteen_receipt_identity_and_both_cascades_are_request_scoped() {
     let connection = current();
     insert_question(&connection, "request-1").expect("insert companion");
     assert!(
@@ -297,4 +303,50 @@ fn format_thirteen_receipt_identity_and_both_cascades_are_request_scoped() {
         .expect("read receipts");
     assert_eq!(companions, 0);
     assert_eq!(receipts, ["request-2"]);
+}
+
+#[test]
+fn goal_resume_purpose_is_added_only_after_the_published_thirteen_upgrade() {
+    let mut connection = open::open(&DbLocation::Memory).expect("open published fixture");
+    connection
+        .execute_batch(concat!(
+            include_str!("fixtures/format-7.sql"),
+            include_str!("fixtures/format-8.sql"),
+            include_str!("fixtures/format-9.sql"),
+            include_str!("fixtures/format-10.sql"),
+            include_str!("fixtures/format-11.sql"),
+            include_str!("fixtures/format-12.sql"),
+            include_str!("fixtures/format-13.sql"),
+        ))
+        .expect("load exact released format-13 DDL");
+    assert!(
+        connection
+            .execute("UPDATE question_interaction SET purpose='goal_resume'", [])
+            .is_err(),
+        "published format 13 did not include goal_resume"
+    );
+    migration::apply(&mut connection).expect("upgrade to format 14");
+    let purpose: String = connection
+        .query_row(
+            "SELECT purpose FROM question_interaction WHERE request_id='req_format13'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("preserved purpose");
+    assert_eq!(
+        purpose, "clarification",
+        "migration must not invent a resume request"
+    );
+    // This only tests the expanded storage domain. It does not run a Goal,
+    // authorize a resume, or invoke a model.
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE question_interaction SET purpose='goal_resume' WHERE request_id='req_format13'",
+                [],
+            )
+            .expect("current purpose accepts an explicitly stored goal-resume question"),
+        1
+    );
+    migration::apply(&mut connection).expect("validate the current format again");
 }

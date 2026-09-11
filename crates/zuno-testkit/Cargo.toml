@@ -46,6 +46,7 @@ rustix = { workspace = true }
 zuno-server = { workspace = true }
 zuno-tool = { workspace = true }
 zuno-tools = { workspace = true }
+zuno-types = { workspace = true }
 zuno-watch = { workspace = true }
 # The self-tests speak raw HTTP/1.1 over a `tokio::net::TcpStream` on purpose.
 # Using the production client to test the mock would repeat the exact mistake

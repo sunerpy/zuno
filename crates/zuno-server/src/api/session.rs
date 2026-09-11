@@ -23,6 +23,8 @@ use zuno_engine::status::{SessionRunGuard, SessionStatus};
 use zuno_error::DbError;
 use zuno_llm::event::RequestContentBlock;
 use zuno_paths::GLOBAL_PROJECT_ID;
+use zuno_types::admission::InputAdmissionReceipt;
+use zuno_types::context_usage::{ContextUsageSnapshot, ContextUsageSource};
 use zuno_types::execution::{
     CollaborationMode, ContinuationToken, InputTriggerKind, WakeAdmission,
 };
@@ -159,6 +161,10 @@ pub struct SessionInfo {
     pub title: String,
     pub version: String,
     pub time: SessionTime,
+    /// Detail responses include canonical state or an explicit legacy/unknown
+    /// projection. Lists include already persisted state without hydrating history.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<ContextUsageSnapshot>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -267,7 +273,7 @@ pub struct ModelBody {
     model: ModelRefBody,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct PromptInputBody {
     pub(crate) text: String,
     #[serde(default)]
@@ -276,7 +282,7 @@ pub struct PromptInputBody {
     pub(crate) agents: Vec<Value>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum PromptDelivery {
     Queue,
@@ -302,7 +308,7 @@ pub struct PromptBody {
     pub(crate) model: Option<ModelRefBody>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptAdmitted {
     admitted_seq: u64,
@@ -312,6 +318,8 @@ pub struct PromptAdmitted {
     prompt: PromptInputBody,
     delivery: PromptDelivery,
     time_created: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt: Option<InputAdmissionReceipt>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -481,8 +489,24 @@ impl From<Session> for SessionInfo {
                 created: session.time_created,
                 updated: session.time_updated,
             },
+            context_usage: None,
         }
     }
+}
+
+async fn session_info_with_context(
+    state: &ApiState,
+    session: Session,
+) -> Result<SessionInfo, ApiError> {
+    let pool = state.pool_arc();
+    super::blocking::run(super::blocking::Budget::Maintenance, move || {
+        let connection = pool.get()?;
+        let context_usage = zuno_engine::context_usage::read_context_usage(&connection, &session)?;
+        let mut info = SessionInfo::from(session);
+        info.context_usage = Some(context_usage);
+        Ok(info)
+    })
+    .await
 }
 
 pub async fn list(
@@ -525,12 +549,42 @@ pub async fn list(
         Some(SessionOrderBy::Created) => query.created_order(),
         Some(SessionOrderBy::Updated) | None => query,
     };
-    let data = state
-        .sessions()
-        .list(&query)?
-        .into_iter()
-        .map(SessionInfo::from)
-        .collect();
+    let sessions = state.sessions().list(&query)?;
+    let pool = state.pool_arc();
+    let data = super::blocking::run(super::blocking::Budget::Maintenance, move || {
+        let connection = pool.get()?;
+        let main_ids = sessions
+            .iter()
+            .filter(|session| session.parent_id.is_none())
+            .map(|session| session.id.as_str())
+            .collect::<Vec<_>>();
+        let child_ids = sessions
+            .iter()
+            .filter(|session| session.parent_id.is_some())
+            .map(|session| session.id.as_str())
+            .collect::<Vec<_>>();
+        let mut main =
+            zuno_db::context_usage::read_many_in(&connection, &main_ids, ContextUsageSource::Main)?;
+        let mut children = zuno_db::context_usage::read_many_in(
+            &connection,
+            &child_ids,
+            ContextUsageSource::Child,
+        )?;
+        Ok(sessions
+            .into_iter()
+            .map(|session| {
+                let context = if session.parent_id.is_some() {
+                    children.remove(&session.id)
+                } else {
+                    main.remove(&session.id)
+                };
+                let mut info = SessionInfo::from(session);
+                info.context_usage = context.map(|tracker| tracker.snapshot().clone());
+                info
+            })
+            .collect())
+    })
+    .await?;
     Ok(Json(SessionListResponse {
         data,
         cursor: SessionCursor {
@@ -616,7 +670,7 @@ pub(crate) async fn create_session(
         }
         Ok(creation.into_session())
     })?;
-    let info = SessionInfo::from(session);
+    let info = session_info_with_context(state, session).await?;
     if let Some(events) = state.events() {
         let properties = json!({"sessionID": id, "info": &info})
             .as_object()
@@ -654,7 +708,9 @@ pub async fn get(
     Path(session_id): Path<String>,
 ) -> Result<Json<Data<SessionInfo>>, ApiError> {
     let session = state.sessions().get(&session_id)?;
-    Ok(Json(Data::new(SessionInfo::from(session))))
+    Ok(Json(Data::new(
+        session_info_with_context(&state, session).await?,
+    )))
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -1096,11 +1152,13 @@ pub async fn prompt(
         .map_err(|_| ApiError::MutationFailed("negative admission sequence".to_owned()))?;
     let admitted = PromptAdmitted {
         admitted_seq,
-        id: message_id,
+        id: admitted_input.input().id.clone(),
         session_id: session_id.clone(),
         prompt,
         delivery,
         time_created: created,
+        receipt: zuno_db::input_receipt::InputReceiptStore::new(state.pool_arc())
+            .get(&session_id, &admitted_input.input().id)?,
     };
     if let InputAdmission::Drive { guard, .. } = admitted_input {
         spawn_prompt_driver(state, services, executor, session_id, guard);

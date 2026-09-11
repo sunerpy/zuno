@@ -8138,6 +8138,7 @@ dependencies = [
  "zuno-server",
  "zuno-tool",
  "zuno-tools",
+ "zuno-types",
  "zuno-watch",
 ]
 

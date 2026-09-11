@@ -5,7 +5,7 @@ Zuno 自动提取并维护可复用记忆。普通 Memory 默认不需要逐条 
 
 | 类型 | 保存什么 | 出现在哪里 | 谁能应用 |
 | --- | --- | --- | --- |
-| 常驻 Memory | 一条简短的全局偏好或项目规则 | 带版本的 `memory.global`、`memory.project` Prompt section | 默认自动应用，保留可审计的 `MemoryCandidate` |
+| 常驻 Memory | 一条简短的全局偏好或项目规则 | 模型请求中带版本的 global/project 上下文 | 默认自动应用，保留可审计的 `MemoryCandidate` |
 | Experience | 一次结果、纠正、失败或已验证流程的证据 | 检索得到的 `learning.experiences` section 与 `/learn` | Learning 服务写入证据，不直接修改 Memory |
 | Skill candidate | 带完整 `SKILL.md`、diff 与证据的可复用方法提案 | `/learn` 复核状态 | 用户复核且离线 evaluation 通过后才能应用 |
 
@@ -26,8 +26,11 @@ TUI 提供四个原生命令：
 
 ```text
 /learn
+/learn status
 /learn list [offset]
 /learn get <experience-id>
+/learn reprocess <assistant-message-id>
+/learn repair-history [--dry-run]
 /learn inspect-memory|import-memory <global|project>
 /learn remember <stable fact, preference, or project rule>
 /learn issue <unresolved issue>
@@ -127,8 +130,10 @@ Global 与 project Markdown 文件是可读投影。已有文件只导入一次�
 静默替换已接受的 Memory。投影失败不会丢失已提交条目。启动时可以从记录的版本修复丢失的
 投影，但会保留并报告内容不同的外部文件。协作写入者使用操作系统共享锁保护比较与原子替换。
 
-每个前台回合捕获当前 Memory revision。另一个会话的修改在下一回合边界可见；已经持久化
-的 Prompt receipt 仍能重建当时使用的原版本。
+宿主在下一个 provider 请求或 compaction 安全点刷新已接受的 Memory，包括同一个前台回合
+的模型步骤之间。因此后台维护或其他会话提交的新版本可以进入下一次请求，不需要另起一个
+前台回合。当前 `/memories` 的使用策略仍然生效。已经发出的请求及其持久 Prompt receipt
+保留实际使用的版本和内容。
 
 旧版本可能遗留 `applying` 或 `undoing` candidate。启动恢复继续按其精确快照分类：
 
@@ -150,12 +155,21 @@ Learning 默认启用。`learning.enabled` 是总上限；其下的 `learning.us
 `learning.generate` 可以独立控制。因此项目可以在不启动 extractor 的情况下检索旧证据，
 也可以记录新证据但不放进前台 Prompt。
 
-已完成回合至少包含一项工具调用、产物、错误恢复、显式纠正或反馈时，才符合自动提取条件。
-默认 scheduler 等待六小时空闲，每 60 秒轮询一次，每次唤醒最多领取两个 job。Job identity 是
+成功完成的 assistant 回合至少包含一项工具调用、产物、错误恢复、显式纠正或反馈时，
+才符合自动提取条件。尚未完成、失败、输出被截断的回合，以及工具仍在执行的回合，
+都不能作为已闭合的学习来源。
+
+`learning.post_turn.idle_delay_ms` 默认是 `0`。已完成回合会被捕获为有大小上限的来源快照，
+对应提取任务立即到期。后续回合仍在执行，不会阻塞对这份已闭合快照的处理，也不会把新消息
+混入它的输入。入队、领取、心跳和结算都会重新核验来源；排队期间来源变化或不可用时，
+在消耗新的尝试次数之前跳过任务。执行期间失去来源或租约权限，则不能提交旧结果。
+显式配置正数空闲延迟时，仍要求来源会话满足空闲条件。
+
+worker 每 60 秒轮询一次以恢复遗漏工作，每次唤醒最多领取两个 job。Job identity 是
 `(session_id, source_message_id, extractor_version)`，重试和重启不会产生第二批记录。
-项目学习由进程级 supervisor 持有，ACP 会话释放前台宿主后仍可继续，不需要保留整个前台运行时。
-新进程会检查最近七天内最多 64 个尚未入队的完成回合，并从 SQLite 恢复待处理任务。
-进程退出后不会继续在后台执行。
+新的已闭合回合任务优先于旧版积压。项目学习由进程级 supervisor 持有，ACP 会话释放前台宿主
+后仍可继续，不需要保留整个前台运行时。新进程会检查最近七天内最多 64 个尚未入队的完成回合，
+并从 SQLite 恢复待处理任务；进程退出后不会继续在后台执行。
 
 `/reflect turn` 选择最近完成的 assistant 回合；`/reflect session` 在整个持久 Session 中选择有上限的来源。
 手工 reflection 会立即到期，但仍遵守 Session generation policy 与 external-context 规则。手工任务还包含精确来源输入的 digest，因此新增反馈或扩大到整个 Session 会成为新任务，
@@ -166,11 +180,72 @@ Extractor：
 
 - 优先使用 `learning.extractor_model`；未配置时使用当前 Provider 可达的 `small_model`，再使用
   Session model；
-- 接收有上限的脱敏来源记录，带精确的 Part/Feedback 地址、source digest 与权威验证标记；
+- 接收有上限的脱敏来源记录，每条只提供一个规范引用 ID 和权威验证标记；
+  原始存储 ID 与 digest 保留在宿主持久化的来源清单中；
 - 限制输入、输出与请求总时长；无效 JSON 最多修复一次，且共用原请求期限；
 - 没有工具、网络、文件系统 authority 或前台 Session identity；
 - 持久化精确请求与终态；
 - 一个持久 job 最多尝试三次。
+
+### 模型参数与诊断
+
+Learning 使用选中模型解析后的请求参数和请求头，包括 reasoning 控制及对应 endpoint
+支持的选项，不强制设置 temperature。显式采样参数只在选中模型支持时保留，
+不支持的采样参数会被移除。请求头会传给 provider，其值不会复制到学习回执中。
+
+`learning.execution.max_output_tokens` 默认是 `4096`。实际输出上限取学习配置、
+模型声明的输出容量，以及模型请求中显式设置的更小上限中的最小值；提高其中一个值不能绕过
+其他上限。序列化后的请求受 `max_input_bytes` 限制，默认 `131072`；模型工作受总
+`timeout_ms` 限制，默认 `120000`，JSON 修复也共用原始期限。
+
+Provider 级 `maxTokens: 0` 表示没有额外配置的上限，不会禁用 Learning 的输出预算。
+原生请求会把这个预算转换为选中 API 对应的输出上限字段。如果 endpoint 拒绝为选中模型
+设置有界输出，Learning 会保留并报告失败，不会静默删除上限或切换模型。
+
+`learning.execution.structured_output` 默认是 `false`：把输出 schema 放进提示词，
+再在本地解码答案。只有选中的 endpoint 确实支持 Chat、Responses 或 Messages 对应的
+JSON-schema 格式时，才启用原生结构化输出。Provider 拒绝某个选项属于请求失败，
+不表示已完成的来源回合丢失。
+
+持久的 request/outcome 事件保存请求 ID、选中的 provider/model、实际参数、提示词 digest
+和终态。Provider 失败保留经过限长和脱敏的原因，以及上游提供的 HTTP status、错误码和
+provider request ID。`/learn` 展示任务状态、尝试次数、下次到期时间和近期错误。
+除 provider outcome 外，还要检查 job 结果：provider 已返回完整响应，仍可能未通过 JSON
+或证据验证。
+
+### 检查和修复学习历史
+
+历史修复只处理当前项目的旧提取任务，保留旧请求、错误和审计历史；
+不会把过去的一条 HTTP 400 错误改写成现在才推断出的原因。
+
+| 操作 | 效果 |
+| --- | --- |
+| `/learn status` | 读取队列状态、近期错误、最近召回、当前 extractor 版本，以及生成能力和策略 |
+| `/learn repair-history --dry-run` | 预览最多 32 个旧任务，不改证据、队列、文件或尝试次数 |
+| `/learn repair-history` | 重新验证符合条件的旧证据，必要时入队一个带版本的新提取任务 |
+| `/learn reprocess <assistant-message-id>` | 选择当前项目的一条已完成 assistant Message，入队或复用当前版本的提取任务 |
+
+先运行 dry run。报告区分 `would_revalidate`、`would_queue`、`existing`、`excluded` 和
+`unavailable`，汇总字段包括 `wouldQueue` 与 `hasMore`；dry-run 计数表示拟执行的工作。
+检查报告后，运行不带参数的
+`/learn repair-history` 应用修复；`hasMore` 为 true 时，后续调用继续处理下一批有上限的记录。
+
+旧引用能与来源地址、原文片段及已记录 digest 匹配时，可以不调用付费 extractor 就恢复验证。
+缺失或已经变化的证据仍不可信。旧引用片段即使仍出现在修改后的文本中，也不能消除已记录的
+source digest 不匹配。只有来源仍可用且符合策略时，服务才会入队新的提取。
+
+`reprocess` 接受 assistant-message ID，不是 Experience ID。已有当前版本任务时，
+无论它已完成还是失败，都会原样返回；重复命令不会重置尝试次数，也不会重跑已完成提取。
+该来源已有正在运行的提取时，也会复用该任务。Extractor 版本升级可以入队一次升级任务，
+同时保留旧错误；新持久任务仍最多尝试三次。
+修复不会改写正在运行或结果不确定的旧任务。
+
+这些操作继续遵守项目归属、会话 generation、外部上下文和显式遗忘限制。
+已遗忘的来源不能重新入队或恢复验证。关闭生成或模型构造不可用时，仍可读取 `status`。
+修复返回 `queued` 只表示后台入队，不表示学习完成或 Memory 已接受：命令本身不会调用
+前台模型、插入前台输入或恢复 Goal；后续被领取的后台提取任务可能产生 provider 请求。
+
+### 证据验证
 
 Settlement 在一个 transaction 中保存可接受的 Experience 与 evidence。某一项含有无法解析成
 模型可见文本的编码时，只拒绝该项，不丢弃同批干净条目；job 结果用 `refusedItems` 记录原因。
