@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.31](https://github.com/sunerpy/zuno/compare/v0.10.30...v0.10.31) (2026-09-11)
+
+
+### Bug Fixes
+
+* **runtime:** 修复六项运行时一致性与自动 Memory 维护 ([1518f0e](https://github.com/sunerpy/zuno/commit/1518f0ef5448a7016f67e74f9ddd026501b645be))
+
 ## [0.10.30](https://github.com/sunerpy/zuno/compare/v0.10.29...v0.10.30) (2026-09-11)
 
 
