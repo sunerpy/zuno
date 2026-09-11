@@ -212,7 +212,8 @@ impl ToolEffect {
 /// `Never` is the default because a lost response does not prove a mutation failed:
 /// the external side effect may already exist. `Safe` is reserved for idempotent,
 /// read-only operations whose implementation owns that guarantee.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolReplayPolicy {
     /// Verify authoritative external state before issuing another call.
     #[default]

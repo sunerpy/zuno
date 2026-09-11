@@ -32,6 +32,9 @@ use zuno_tool::{
 
 const SESSION_ID: &str = "ses_dispatch_loop";
 
+#[path = "dispatch_loop/advance.rs"]
+mod advance_cases;
+
 struct ScopedProbe {
     observed: Arc<Mutex<Vec<zuno_types::identity::PrincipalScope>>>,
 }
@@ -615,7 +618,10 @@ impl Tool for RetryableThenTerminalTool {
 }
 
 fn seeded() -> Connection {
-    let mut connection = open::open(&zuno_paths::DbLocation::Memory).expect("open memory database");
+    seed_connection(open::open(&zuno_paths::DbLocation::Memory).expect("open memory database"))
+}
+
+fn seed_connection(mut connection: Connection) -> Connection {
     migration::apply(&mut connection).expect("apply schema");
     connection
         .execute_batch(&format!(

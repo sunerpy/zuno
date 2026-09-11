@@ -60,7 +60,8 @@ impl StaticSystemPrompt {
 }
 
 /// Volatile context for one turn, deliberately distinct from the static prompt.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DynamicContext {
     turn_context: String,
     memory: Option<String>,

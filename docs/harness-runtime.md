@@ -4,20 +4,6 @@ Zuno assembles an agent from a native harness profile. A profile is a set of bun
 
 ## Runtime model
 
-### Principal attribution
-
-The preview foundation carries an immutable `PrincipalScope` from `TurnContext`
-through dispatch to tool permission origins and composed calls. Tenant, subject,
-calling application and policy revision are separate from session and tool names.
-Changing a tool's public session fields or argument metadata does not change its
-captured attribution.
-
-The existing local profile constructs an explicit local scope. Enterprise hosts
-must authenticate a caller before supplying another scope; serialized scope data
-is not an authorization grant. Ownership checks do not replace current operation
-policy or shared-resource ACLs. Persistence and remote authentication remain
-separate enterprise implementation stages.
-
 - `Component` is the lifecycle unit. `prepare` is side-effect-free: it stages typed
   services, requirements, and deferred effects in a `PrepareContext`.
 - An effect starts only after the complete candidate composition has prepared. Its
@@ -82,6 +68,49 @@ The background TUI supervisor is a process-lifetime owner outside the agent loop
 binds a password-protected loopback server, creates the normal TUI as a retained PTY
 child, and lets attachments come and go without closing that child. Detach is not session
 close; explicit PTY removal or supervisor shutdown is.
+
+### Principal attribution
+
+The preview foundation carries an immutable `PrincipalScope` from `TurnContext`
+through dispatch to tool permission origins and composed calls. Tenant, subject,
+calling application and policy revision are separate from session and tool names.
+Changing a tool's public session fields or argument metadata does not change its
+captured attribution.
+
+The existing local profile constructs an explicit local scope. Enterprise hosts
+must authenticate a caller before supplying another scope; serialized scope data
+is not an authorization grant. Ownership checks do not replace current operation
+policy or shared-resource ACLs. Format 13 stores private session ownership
+independently from editable metadata. Remote authentication remains a separate
+enterprise implementation stage.
+
+### Bounded driver checkpoints
+
+The preview adds `AgentDriver::advance` to the same provider/tool loop used by
+`drive`. The default driver advertises `supports_advance`; hosts must select a
+compatible driver before admitting recoverable work. `AdvanceRequest` bounds the
+number of provider steps and binds the original turn request to a resolved,
+immutable configuration digest. It does not authorize the caller.
+
+`AdvanceOutcome` distinguishes a committed checkpoint, completion, interruption
+and a human-request wait. A step yields only after its tool results and history
+repairs are durable. The checkpoint retains step/tool counters, disjoint usage,
+elapsed execution time, dynamic context, prompt receipt identities and unresolved
+recovery obligations. Process handles and provider caches are reconstructed.
+Resuming the same turn neither emits another turn start nor resets its limits.
+
+The local journal compares the latest driver event in a short SQLite transaction
+before admitting an advance, then conditionally commits its checkpoint or terminal
+outcome. A repeated request after a lost response returns that committed result.
+Wrong owners, changed configuration, stale references, unsupported schemas and
+in-flight advances without a completed checkpoint fail closed. Checkpoint bodies
+are internal state, limited to 8 MiB; clients carry stable references.
+
+This is a local driver boundary. PostgreSQL leases, remote state APIs, environment
+receipts and suspended distributed child calls are subsequent enterprise stages.
+It does not move a running process or prove that an external side effect stopped.
+The host must resolve the recorded configuration and recheck current authorization
+before entering each advance.
 
 ## Agent and prompt contracts
 

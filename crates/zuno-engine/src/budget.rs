@@ -31,7 +31,8 @@ use zuno_llm::event::PromptAccounting;
 /// still known — [`Self::reported`] — and never in the policies downstream.
 /// [`Self::saturating_add`] can then accumulate requests answered under different
 /// conventions, which a single retained accounting mode could not.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderRequestUsage {
     /// Prompt tokens that were neither read from nor written to the provider cache.
     pub input_tokens: u64,
@@ -147,7 +148,8 @@ pub struct TurnUsageSnapshot<'a> {
 }
 
 /// Why a turn must stop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BudgetStopKind {
     /// The token allowance is spent.
     TokenBudget,
@@ -185,7 +187,8 @@ impl BudgetStopKind {
 }
 
 /// A budget stop, with the reason a human needs to decide what to do next.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BudgetStop {
     pub kind: BudgetStopKind,
     pub detail: String,

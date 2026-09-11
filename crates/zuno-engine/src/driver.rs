@@ -1,7 +1,8 @@
 //! Replaceable drivers for one agent turn.
 
+use crate::advance::{AdvanceError, AdvanceOutcome, AdvanceRequest};
 use crate::r#loop::{
-    RunTurnRequest, TurnContext, TurnError, TurnEventSender, TurnOutcome, run_turn,
+    RunTurnRequest, TurnContext, TurnError, TurnEventSender, TurnOutcome, advance_turn, run_turn,
 };
 use async_trait::async_trait;
 use futures::future::BoxFuture;
@@ -15,6 +16,22 @@ pub const AGENT_DRIVER_COMPONENT_ID: &str = "agent-driver";
 pub trait AgentDriver: Send + Sync {
     /// Human-readable implementation name used in diagnostics.
     fn name(&self) -> &str;
+
+    /// Whether this driver can issue and consume the bounded checkpoint contract.
+    fn supports_advance(&self) -> bool {
+        false
+    }
+
+    /// Execute a bounded segment. Hosts must reject incompatible drivers before
+    /// dispatching a recoverable job; whole-turn drivers remain available locally.
+    fn advance<'a>(
+        &'a self,
+        _request: AdvanceRequest,
+        _context: TurnContext<'a>,
+        _events: TurnEventSender,
+    ) -> BoxFuture<'a, Result<AdvanceOutcome, AdvanceError>> {
+        Box::pin(async { Err(AdvanceError::UnsupportedDriver(self.name().to_owned())) })
+    }
 
     /// Execute one turn.
     fn drive<'a>(
@@ -32,6 +49,19 @@ pub struct DefaultAgentDriver;
 impl AgentDriver for DefaultAgentDriver {
     fn name(&self) -> &str {
         "default"
+    }
+
+    fn supports_advance(&self) -> bool {
+        true
+    }
+
+    fn advance<'a>(
+        &'a self,
+        request: AdvanceRequest,
+        context: TurnContext<'a>,
+        events: TurnEventSender,
+    ) -> BoxFuture<'a, Result<AdvanceOutcome, AdvanceError>> {
+        Box::pin(advance_turn(request, context, events))
     }
 
     fn drive<'a>(
