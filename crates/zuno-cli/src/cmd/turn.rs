@@ -109,22 +109,27 @@ use zuno_orchestration::{
 };
 use zuno_provider_compatible::{ReqwestTransport, Transport};
 use zuno_runtime::HarnessRuntime;
-use zuno_session_control::SessionControlService;
+use zuno_session_control::{QuestionService, SessionControlService};
 use zuno_tool::{PermissionAsker, ToolDynamicContextRefresh, ToolReplayPolicy, erase};
-use zuno_types::execution::{CollaborationMode, ContinuationToken};
+use zuno_types::execution::{
+    CollaborationMode, ContinuationToken, SessionReadiness, SessionWaitReference,
+    SessionWakeSignal, WakeAdmission,
+};
 
 use crate::environment::StartupEnvironment;
 
 const LEARNING_LEASE_MILLIS: i64 = 60 * 60 * 1_000;
-const DURABLE_WORK_CONTEXT_SCHEMA_VERSION: u32 = 2;
+const DURABLE_WORK_CONTEXT_SCHEMA_VERSION: u32 = 3;
 const DURABLE_WORK_CONTEXT_MAX_ENTRIES: usize = 64;
 const DURABLE_WORK_CONTEXT_MAX_BYTES: usize = 16 * 1024;
 const DURABLE_WORK_CONTEXT_TEXT_MAX_BYTES: usize = 512;
 const DURABLE_WORK_CONTEXT_FINAL_TEXT_MAX_BYTES: usize = 1_024;
 const DURABLE_WORK_CONTEXT_HEADER: &str = "runtime.work_state\n\
 This is an authoritative SQLite snapshot regenerated after compaction or restart. \
-Preserve these identities, reconcile uncertain work before retrying side effects, and \
-do not complete the parent while active jobs or unconsumed reports remain.\n";
+Preserve these identities and reconcile uncertain work before retrying side effects. \
+Unfinished work is not necessarily executable: record a typed human/external wait or \
+pause when appropriate, finish the current summary, and never manufacture another \
+turn or user approval merely because a Plan remains unfinished.\n";
 
 const COMPATIBLE_PROVIDER: &str = "openai-compatible";
 
@@ -438,6 +443,7 @@ pub(crate) struct TurnOptions {
     pub(crate) thinking: bool,
     /// Exact provider-visible tools from the parent Attempt for a delegated turn.
     pub(crate) tool_authority: Option<Arc<[ToolSchemaIdentity]>>,
+    pub(crate) parent_authority: Option<Arc<zuno_orchestration::ParentAuthoritySnapshot>>,
     /// Whether this host consumes the committed extension composition or the one
     /// pending transaction prepared for a quiescent replacement.
     pub(crate) extension_composition: ExtensionComposition,
@@ -638,7 +644,7 @@ impl TurnPlan {
         let project = zuno_paths::project::resolve_project(&directory);
         let worktree = project.vcs.as_ref().map(|_| project.directory.clone());
         let layout = zuno_paths::Layout::resolve(env);
-        let config =
+        let mut config =
             zuno_config::discovery::discover_with(&zuno_config::discovery::DiscoveryOptions::new(
                 &directory,
                 worktree.as_deref(),
@@ -834,6 +840,16 @@ impl TurnPlan {
             .find(|profile| profile.name() == agent_name)
             .cloned()
             .ok_or_else(|| format!("Agent profile not found after resolution: {agent_name}"))?;
+        // Capability generation describes the discovered catalog. The child
+        // authority overlay below is a per-invocation restriction, not a new
+        // catalog generation (notably auto -> resolved native sandbox backend).
+        let capability_config = config.clone();
+        let agent = match options.parent_authority.as_deref() {
+            Some(authority) => {
+                super::child_turn::inherit_parent_authority(&mut config, agent, authority)?
+            }
+            None => agent,
+        };
         let agent = match options.tool_authority.as_deref() {
             Some(authority) => {
                 agent.with_tool_authority(authority.iter().map(|tool| tool.name.clone()))
@@ -1010,7 +1026,7 @@ impl TurnPlan {
             .await
             .with_overlay(extension_skills.iter().cloned());
         let capability = Arc::new(orchestration_capability(
-            &config,
+            &capability_config,
             extension_revision,
             &resolved_profiles,
             &presets,
@@ -1025,6 +1041,8 @@ impl TurnPlan {
             parent_attempt: None,
             workflow: None,
             workflow_node: None,
+            parent_authority: None,
+            cycle_id: None,
         }));
         let skills = Arc::new(all_skills.retaining(|skill| {
             zuno_catalog::skill::builtin::visible_to(
@@ -1809,7 +1827,7 @@ impl TurnPlan {
                 "policyVisible": policy_visible,
                 "unavailable": unavailable,
                 "surfaceConditions": {
-                    "question": "requires an interactive QuestionAsker",
+                    "question": "requires a durable QuestionPort",
                     "mcp": "tool ids are discovered only after a live MCP connection",
                 },
                 "parentAuthority": parent_authority,
@@ -2333,7 +2351,7 @@ impl<'a> DriveInputOptions<'a> {
 /// turning the host constructor into an order-dependent argument list.
 pub(super) struct TurnHostDependencies {
     pub(super) approval: Arc<dyn PermissionAsker>,
-    pub(super) question: Option<Arc<dyn zuno_tools::question::QuestionAsker>>,
+    pub(super) question: Option<Arc<dyn zuno_tool::question::QuestionPort>>,
     pub(super) runs: SessionRunRegistry,
     pub(super) mcp: Option<zuno_mcp::Catalog>,
     pub(super) database: Arc<zuno_db::pool::Pool>,
@@ -2343,7 +2361,7 @@ pub(super) struct TurnHostDependencies {
 
 pub(super) struct TurnHostRuntimeDependencies {
     pub(super) approval: Arc<dyn PermissionAsker>,
-    pub(super) question: Option<Arc<dyn zuno_tools::question::QuestionAsker>>,
+    pub(super) question: Option<Arc<dyn zuno_tool::question::QuestionPort>>,
     pub(super) runs: SessionRunRegistry,
     pub(super) mcp: Option<zuno_mcp::Catalog>,
     pub(super) child_observer: Option<Arc<dyn super::child_turn::ChildTurnObserver>>,
@@ -2455,6 +2473,7 @@ pub(crate) struct TurnHost {
     goal_continuation: GoalContinuation,
     plan_reconciliation: PlanReconciliationDriver,
     session_control: SessionControlService,
+    questions: QuestionService,
     runs: SessionRunRegistry,
     background_jobs: super::child_turn::BackgroundJobSupervisor,
     background_executions: Arc<zuno_pty::BackgroundExecutionService>,
@@ -3552,11 +3571,7 @@ impl TurnHost {
             } else {
                 None
             };
-            let interaction_policy = if plan.is_delegated
-                || matches!(
-                    plan.agent.definition().mode,
-                    zuno_catalog::agent::AgentMode::Subagent
-                ) {
+            let interaction_policy = if plan.is_delegated {
                 zuno_goal::InteractionPolicy::SubagentReportOnly
             } else if plan.agent.name() == "plan" {
                 zuno_goal::InteractionPolicy::PlanClarification
@@ -4000,6 +4015,11 @@ impl TurnHost {
             } else {
                 zuno_tools::shell::ShellSyntax::Bash
             };
+            if let Some(seed) = plan.resolver.orchestration_seed.as_ref() {
+                let mut seed = seed.as_ref().clone();
+                seed.parent_authority = Some(runtime_tools.parent_authority.clone());
+                plan.resolver.orchestration_seed = Some(Arc::new(seed));
+            }
             let dispatcher = ToolRegistryDispatcher::new(
                 runtime_tools.tools,
                 runtime_tools.rules,
@@ -4034,6 +4054,7 @@ impl TurnHost {
             let attachments = open_attachment_store(&plan.config, database.as_ref())?;
             let plan_reconciliation = PlanReconciliationDriver::new(Arc::clone(&database));
             let session_control = SessionControlService::new(Arc::clone(&database));
+            let questions = QuestionService::new(Arc::clone(&database)).with_runs(runs.clone());
             let mut host = Self {
                 profile_runtime: profile_runtime.clone(),
                 runtime,
@@ -4085,6 +4106,7 @@ impl TurnHost {
                 goal_continuation,
                 plan_reconciliation,
                 session_control,
+                questions,
                 runs,
                 background_jobs,
                 background_executions,
@@ -4112,6 +4134,9 @@ impl TurnHost {
                 goal_for_host_open(&host.goal_store, &host.session_id, &host.agent, goal_open)?;
             host.last_turn_completed =
                 goal.is_some_and(|goal| goal.status == zuno_goal::GoalStatus::Active);
+            if host.is_session_materialized() {
+                host.pause_for_uncertain_side_effects()?;
+            }
             host.start_learning_maintenance();
             Ok(host)
         })();
@@ -4156,6 +4181,28 @@ impl TurnHost {
 
     pub(crate) fn session_control_service(&self) -> SessionControlService {
         self.session_control.clone()
+    }
+
+    /// A real user command, not a callback, requests another authorized Work cycle.
+    pub(crate) fn resume_work(&mut self) -> Result<String, String> {
+        let state = self
+            .session_control
+            .state(&self.session_id)
+            .map_err(to_string)?
+            .ok_or_else(|| "this session has no paused execution".to_owned())?;
+        let outcome = self
+            .session_control
+            .resume_session(
+                &self.session_id,
+                state.revision,
+                zuno_db::message::now_millis(),
+            )
+            .map_err(to_string)?;
+        self.work_changes.changed();
+        serde_json::to_string(&json!({
+            "status": "queued", "inputID": outcome.input.id, "execution": outcome.state,
+        }))
+        .map_err(to_string)
     }
 
     pub(crate) fn latest_user_anchor_id(&self) -> Result<Option<String>, String> {
@@ -4565,6 +4612,11 @@ impl TurnHost {
                         )
                     })?;
                 changed = true;
+                if action == "resume" {
+                    self.session_control
+                        .resume_goal_execution(&self.session_id, zuno_db::message::now_millis())
+                        .map_err(SessionCommandError::internal)?;
+                }
                 let mut output =
                     serde_json::to_value(goal).map_err(SessionCommandError::internal)?;
                 if !reconciled.is_empty()
@@ -4656,6 +4708,9 @@ impl TurnHost {
         if changed {
             if let Some((goal_id, objective)) = goal_for_plan {
                 self.ensure_goal_objective_plan(&goal_id, &objective)
+                    .map_err(SessionCommandError::internal)?;
+                self.session_control
+                    .resume_goal_execution(&self.session_id, zuno_db::message::now_millis())
                     .map_err(SessionCommandError::internal)?;
             }
             self.write_goal_projection()
@@ -4786,12 +4841,30 @@ impl TurnHost {
             SessionCommand::Goal => self.execute_goal_command(arguments, events).await,
             SessionCommand::Learn => self.execute_learn_command(arguments, events).await,
             SessionCommand::Reflect => self.execute_reflect_command(arguments, events).await,
-            SessionCommand::Plan | SessionCommand::StartPlan | SessionCommand::StartWork => {
-                Err(SessionCommandError::internal(format!(
-                    "/{} replaces the collaboration host and must be handled by the client surface",
-                    command.name()
-                )))
+            SessionCommand::Questions => {
+                let result = zuno_db::question::QuestionStore::new(Arc::clone(&self.database))
+                    .pending(&self.session_id)
+                    .map_err(SessionCommandError::internal)
+                    .and_then(|questions| serde_json::to_string_pretty(&questions.iter().map(|question| json!({
+                        "id":question.id, "revision":question.revision, "purpose":question.purpose,
+                        "state":question.state, "headers":question.questions.iter().map(|item| &item.question.header).collect::<Vec<_>>(),
+                        "draftSaved":!question.draft_answers.is_empty(),
+                    })).collect::<Vec<_>>()).map_err(SessionCommandError::internal));
+                self.publish_session_command_result(
+                    command,
+                    self.is_session_materialized(),
+                    result,
+                    &events,
+                )
+                .await
             }
+            SessionCommand::Plan
+            | SessionCommand::StartPlan
+            | SessionCommand::StartWork
+            | SessionCommand::ResumeWork => Err(SessionCommandError::internal(format!(
+                "/{} replaces the collaboration host and must be handled by the client surface",
+                command.name()
+            ))),
         }
     }
 
@@ -6951,6 +7024,22 @@ impl TurnHost {
         events: TurnEventSender,
     ) -> Result<(), String> {
         self.require_active_extension_composition()?;
+        let input = self
+            .inbox
+            .get(&self.session_id, input_id)
+            .map_err(to_string)?
+            .ok_or_else(|| "Work control input disappeared".to_owned())?;
+        let resume = input.prompt.get("control").and_then(Value::as_str) == Some("resume_work");
+        let state = self
+            .session_control
+            .state(&self.session_id)
+            .map_err(to_string)?
+            .ok_or_else(|| "Work control has no execution state".to_owned())?;
+        if state.mode != CollaborationMode::Work
+            || state.continuation.as_ref() != Some(&continuation)
+        {
+            return Err("Work control no longer matches the authorized execution state".to_owned());
+        }
         if continuation.mode != CollaborationMode::Work {
             return Err("Start Work continuation is not authorized for Work mode".to_owned());
         }
@@ -6968,15 +7057,14 @@ impl TurnHost {
         }
         let plan = zuno_tools::WorkStateStore::new(Arc::clone(&self.database))
             .plan(&self.session_id)
-            .map_err(to_string)?
-            .ok_or_else(|| "Start Work requires a durable Plan".to_owned())?;
-        if continuation.plan_id.as_deref() != Some(plan.id.as_str())
-            || continuation.plan_revision != Some(plan.revision)
+            .map_err(to_string)?;
+        if !resume && plan.is_none() {
+            return Err("Start Work requires a durable Plan".to_owned());
+        }
+        if continuation.plan_id.as_deref() != plan.as_ref().map(|plan| plan.id.as_str())
+            || continuation.plan_revision != plan.as_ref().map(|plan| plan.revision)
         {
-            return Err(format!(
-                "Start Work continuation names a stale Plan; current is `{}` revision {}",
-                plan.id, plan.revision
-            ));
+            return Err("Work continuation names a stale Plan".to_owned());
         }
         let continuation = self
             .session_control
@@ -6985,8 +7073,8 @@ impl TurnHost {
                 &continuation.cycle_id,
                 continuation.identity,
                 CollaborationMode::Work,
-                Some(plan.id.clone()),
-                Some(plan.revision),
+                plan.as_ref().map(|plan| plan.id.clone()),
+                plan.as_ref().map(|plan| plan.revision),
                 continuation.anchor_message_id,
                 zuno_db::message::now_millis(),
             )
@@ -7004,14 +7092,19 @@ impl TurnHost {
                 consumed.trigger_kind.as_str()
             ));
         }
-        let planning = self.ensure_durable_plan(
-            &format!(
-                "Implement durable Plan `{}` revision {}.",
-                plan.id, plan.revision
-            ),
-            PlanningInputSource::Retry,
-            None,
-        )?;
+        let objective = plan.as_ref().map_or_else(
+            || {
+                "Resume the existing authorized work after the user's explicit resume command."
+                    .to_owned()
+            },
+            |plan| {
+                format!(
+                    "Implement durable Plan `{}` revision {}.",
+                    plan.id, plan.revision
+                )
+            },
+        );
+        let planning = self.ensure_durable_plan(&objective, PlanningInputSource::Retry, None)?;
         let usage_before = goal_usage(&self.connection, &self.session_id)?;
         let started = Instant::now();
         let result = async {
@@ -7024,10 +7117,9 @@ impl TurnHost {
             }
             let mut dynamic_context = self.goal_dynamic_context().map_err(TurnFailure::host)?;
             let instruction = format!(
-                "The user explicitly authorized Start Work for durable Plan `{}` revision {}. \
-                 Implement that exact Plan with the saved Work Agent and model. Do not return to \
-                 Plan mode unless the user explicitly requests it.",
-                plan.id, plan.revision
+                "The user explicitly authorized this Work control. {objective} \
+                 Use the saved Work identity and inspect authoritative state before any uncertain \
+                 side effect. This does not approve unrelated operations or change tool permissions."
             );
             dynamic_context = dynamic_context.with_runtime_instruction(instruction.clone());
             if let Some(planning) = planning_runtime_instruction(&planning) {
@@ -7037,7 +7129,8 @@ impl TurnHost {
                 dynamic_context,
                 DynamicContextRefreshInstruction::Fixed(instruction),
                 TurnStart::UserControl {
-                    control: zuno_types::execution::UserControlKind::StartWork,
+                    control: if resume { zuno_types::execution::UserControlKind::ResumeWork }
+                        else { zuno_types::execution::UserControlKind::StartWork },
                     continuation,
                 },
                 None,
@@ -7075,7 +7168,10 @@ impl TurnHost {
         let Some(input) = pending.into_iter().find(|input| {
             zuno_db::inbox::DurableInputKind::classify(&input.prompt)
                 == Some(zuno_db::inbox::DurableInputKind::SessionControl)
-                && input.prompt.get("control").and_then(Value::as_str) == Some("start_work")
+                && matches!(
+                    input.prompt.get("control").and_then(Value::as_str),
+                    Some("start_work" | "resume_work")
+                )
         }) else {
             return Ok(false);
         };
@@ -7091,15 +7187,20 @@ impl TurnHost {
                     input.id
                 )
             })?;
-        let promoted = self
-            .inbox
-            .promote_id(&self.session_id, &input.id)
-            .map_err(to_string)?
-            .ok_or_else(|| format!("Start Work input `{}` changed before promotion", input.id))?;
+        if continuation.identity != self.current_turn_identity() {
+            return Ok(false);
+        }
         let guard = self
             .runs
             .begin_turn(self.session_id.clone())
             .map_err(to_string)?;
+        let Some(promoted) = self
+            .inbox
+            .promote_id(&self.session_id, &input.id)
+            .map_err(to_string)?
+        else {
+            return Ok(false);
+        };
         self.drive_promoted_start_work_with_guard(&promoted.id, continuation, &guard, events)
             .await?;
         Ok(true)
@@ -7255,11 +7356,32 @@ impl TurnHost {
         let planning_prompt = newest.text.clone();
         let planning_source = newest.source;
         self.require_active_extension_composition()?;
+        let mut admitted_completion = None;
         for report in reports {
+            let Some(input) = self
+                .inbox
+                .get(&self.session_id, &report.input_id)
+                .map_err(to_string)?
+            else {
+                continue;
+            };
+            if input.state != zuno_db::inbox::SubmissionState::Promoted {
+                continue;
+            }
+            if zuno_db::session_wake::admission_in(&self.connection, &input).map_err(to_string)?
+                != WakeAdmission::Reject
+            {
+                admitted_completion = Some(input);
+            }
             let (message, parts) =
                 self.prepare_turn_user_message(&report.text, Some(report.input_id.as_str()), None)?;
             self.persist_promoted_user_input(&message, &parts)?;
         }
+        let Some(admitted_completion) = admitted_completion else {
+            // The facts are durable, but a callback is not permission to reopen a
+            // paused/completed cycle or invent a new legacy completion cycle.
+            return Ok(());
+        };
         if self
             .goal_store
             .goal(&self.session_id)
@@ -7280,6 +7402,19 @@ impl TurnHost {
                 .map_err(to_string)?;
             return Ok(());
         }
+        let wake = zuno_db::session_wake::signal_in(&self.connection, &admitted_completion)
+            .map_err(to_string)?
+            .ok_or_else(|| "completion lost its durable wake identity".to_owned())?;
+        self.database
+            .transaction(|tx| {
+                zuno_db::session_execution::admit_wake_in(
+                    tx,
+                    &self.session_id,
+                    &wake,
+                    zuno_db::message::now_millis(),
+                )
+            })
+            .map_err(to_string)?;
         let prompts = reports
             .iter()
             .map(|report| report.text.as_str())
@@ -7303,12 +7438,9 @@ impl TurnHost {
         let plan = zuno_tools::WorkStateStore::new(Arc::clone(&self.database))
             .plan(&self.session_id)
             .map_err(to_string)?;
-        let cycle_id = self
-            .inbox
-            .get(&self.session_id, &newest.input_id)
-            .map_err(to_string)?
-            .and_then(|input| input.cycle_id)
-            .unwrap_or_else(|| format!("completion_{}", Uuid::now_v7().simple()));
+        let cycle_id = admitted_completion
+            .cycle_id
+            .ok_or_else(|| "completion has no original work cycle".to_owned())?;
         let continuation = self
             .session_control
             .record_continuation(
@@ -7647,6 +7779,16 @@ impl TurnHost {
         if !self.last_turn_completed {
             return Ok(false);
         }
+        if self
+            .session_control
+            .state(&self.session_id)
+            .map_err(to_string)?
+            .is_some_and(|state| {
+                state.wake_admission(&SessionWakeSignal::Automatic) == WakeAdmission::Reject
+            })
+        {
+            return Ok(false);
+        }
         if self.waiting_for_remote_observer()? {
             return Ok(false);
         }
@@ -7840,10 +7982,61 @@ impl TurnHost {
                 format!("driver_{}", Uuid::now_v7().simple())
             }
         };
-        let cycle_id = self
-            .plan_reconciliation
-            .begin(&self.session_id, &proposed_cycle_id)
+        let mode = self
+            .session_control
+            .state(&self.session_id)
+            .map_err(TurnFailure::host)?
+            .map_or(
+                if self.agent == "plan" {
+                    CollaborationMode::Plan
+                } else {
+                    CollaborationMode::Work
+                },
+                |state| state.mode,
+            );
+        self.database
+            .transaction(|tx| {
+                zuno_db::session_execution::seed_in(
+                    tx,
+                    &self.session_id,
+                    mode,
+                    Some(if mode == CollaborationMode::Plan {
+                        self.execution_identity_for("build")
+                    } else {
+                        self.current_turn_identity()
+                    }),
+                    zuno_db::message::now_millis(),
+                )
+                .map(|_| ())
+            })
             .map_err(TurnFailure::Database)?;
+        if mode == CollaborationMode::Plan {
+            self.goal_store
+                .enter_plan_mode(&self.session_id)
+                .map_err(TurnFailure::goal)?;
+        }
+        let wake = match &turn_start {
+            TurnStart::UserMessage => SessionWakeSignal::UserQuery,
+            TurnStart::UserControl { .. } => SessionWakeSignal::ExplicitResume,
+            TurnStart::Automatic { .. } => SessionWakeSignal::Automatic,
+            TurnStart::Recovery { .. } | TurnStart::GoalContinuation { .. } => {
+                SessionWakeSignal::Recovery
+            }
+        };
+        let Some(cycle_id) = self
+            .plan_reconciliation
+            .begin_with_wake(
+                &self.session_id,
+                &proposed_cycle_id,
+                &wake,
+                zuno_db::message::now_millis(),
+            )
+            .map_err(TurnFailure::Database)?
+        else {
+            return Ok(None);
+        };
+        self.persist_turn_continuation(&cycle_id, &turn_start, false)
+            .map_err(TurnFailure::host)?;
         let mut context_compactions = 0_u32;
         let work = zuno_tools::WorkStateStore::new(Arc::clone(&self.database));
         loop {
@@ -7855,7 +8048,7 @@ impl TurnHost {
                 goal_continuation: self.goal_continuation.clone(),
                 instruction: refresh_instruction.clone(),
             };
-            let outcome = match self
+            let (outcome, completed_turn_id) = match self
                 .execute_one_turn_unaccounted(
                     dynamic_context.clone(),
                     &dynamic_context_refresher,
@@ -7872,6 +8065,10 @@ impl TurnHost {
                         return Err(failure);
                     };
                     if context_compactions >= MAX_CONTEXT_LIMIT_RETRIES {
+                        self.questions
+                            .interrupt_plan_turn(&self.session_id, "")
+                            .await
+                            .map_err(TurnFailure::host)?;
                         return Err(TurnFailure::goal_recovery(
                             format!(
                                 "automatic context compaction exhausted after \
@@ -7882,6 +8079,10 @@ impl TurnHost {
                     }
                     context_compactions = context_compactions.saturating_add(1);
                     if !self.recover_context(trigger, guard, &events).await? {
+                        self.questions
+                            .interrupt_plan_turn(&self.session_id, "")
+                            .await
+                            .map_err(TurnFailure::host)?;
                         return Ok(compaction_stop_outcome(guard));
                     }
                     let plan_after = work
@@ -7912,11 +8113,29 @@ impl TurnHost {
             let TurnOutcome::Completed {
                 assistant_message_id,
                 steps,
+                unresolved_tool_failures,
                 ..
             } = &outcome
             else {
                 return Ok(Some(outcome));
             };
+            let unsafe_outcome = !self
+                .pending_uncertain_side_effects()
+                .map_err(TurnFailure::host)?
+                .is_empty()
+                || matches!(
+                    goal_tool_failure(unresolved_tool_failures),
+                    Some(GoalTerminalFailure::Pause(_))
+                );
+            let no_active_goal = self
+                .goal_store
+                .goal(&self.session_id)
+                .map_err(TurnFailure::goal)?
+                .is_none_or(|goal| goal.status != GoalStatus::Active);
+            if unsafe_outcome || (no_active_goal && !unresolved_tool_failures.is_empty()) {
+                self.pause_execution(PlanPauseReason::Blocked)
+                    .map_err(TurnFailure::host)?;
+            }
             let (input, work_authorized, progress_fingerprint) = self
                 .plan_reconciliation_state()
                 .map_err(TurnFailure::host)?;
@@ -7925,16 +8144,15 @@ impl TurnHost {
                 .reconcile_with_progress(
                     &self.session_id,
                     &cycle_id,
-                    input,
+                    &input,
                     work_authorized,
                     &progress_fingerprint,
+                    zuno_db::message::now_millis(),
                 )
                 .map_err(TurnFailure::Database)?
             {
                 PlanReconciliationOutcome::Decision(
-                    PlanReconciliationDecision::Finish
-                    | PlanReconciliationDecision::ContinueGoal
-                    | PlanReconciliationDecision::WaitForBackground,
+                    PlanReconciliationDecision::Finish | PlanReconciliationDecision::ContinueGoal,
                 ) => {
                     if input.planning_handoff && input.plan_exists {
                         if self
@@ -7951,8 +8169,9 @@ impl TurnHost {
                                 })
                                 .map_err(|error| TurnFailure::host(error.to_string()))?;
                         }
-                        self.session_control
-                            .mark_plan_handoff(&self.session_id, zuno_db::message::now_millis())
+                        self.questions
+                            .complete_plan_turn(&self.session_id, &completed_turn_id)
+                            .await
                             .map_err(|error| TurnFailure::host(error.to_string()))?;
                     }
                     self.cancel_reconciled_plan_requests(&cycle_id)
@@ -7986,22 +8205,43 @@ impl TurnHost {
                         .map_err(TurnFailure::host)?;
                     turn_start = TurnStart::Recovery { continuation };
                 }
-                PlanReconciliationOutcome::Paused {
-                    reason: PlanPauseReason::NoProgress,
-                } => {
-                    self.goal_store
-                        .pause_with_reason(&self.session_id, zuno_goal::GoalPauseReason::NoProgress)
-                        .map_err(TurnFailure::goal)?;
+                PlanReconciliationOutcome::Paused { reason } => {
+                    if input.planning_handoff {
+                        self.questions
+                            .interrupt_plan_turn(&self.session_id, &completed_turn_id)
+                            .await
+                            .map_err(TurnFailure::host)?;
+                    }
+                    if reason == PlanPauseReason::NoProgress {
+                        self.goal_store
+                            .pause_with_reason(
+                                &self.session_id,
+                                zuno_goal::GoalPauseReason::NoProgress,
+                            )
+                            .map_err(TurnFailure::goal)?;
+                    }
+                    let (code, detail) = if reason == PlanPauseReason::NoExecutableWork {
+                        (
+                            "no_executable_work",
+                            "Automatic recovery paused: unfinished Plan or blocked Todo state does not identify executable work. Resolve the recorded wait or explicitly resume.",
+                        )
+                    } else {
+                        (
+                            "execution_paused",
+                            "Automatic execution is paused. No callback or repeated recovery can clear this gate; satisfy its recorded resume condition or explicitly resume.",
+                        )
+                    };
                     events
                         .publish(TurnEvent::Notice {
                             audience: NoticeAudience::User,
                             severity: NoticeSeverity::Warning,
-                            code: "no_progress".to_owned(),
-                            detail: "Automatic recovery paused after three consecutive durable \
-                                     state snapshots showed no progress. No user confirmation was \
-                                     manufactured; resume explicitly after changing the blocking \
-                                     condition."
-                                .to_owned(),
+                            code: if reason == PlanPauseReason::NoProgress {
+                                "no_progress"
+                            } else {
+                                code
+                            }
+                            .to_owned(),
+                            detail: detail.to_owned(),
                         })
                         .await
                         .map_err(TurnFailure::event_consumer)?;
@@ -8014,9 +8254,16 @@ impl TurnHost {
                         .map_err(TurnFailure::event_consumer)?;
                     return Ok(Some(outcome));
                 }
-                PlanReconciliationOutcome::Decision(PlanReconciliationDecision::WaitForHuman {
-                    ..
-                }) => unreachable!("the new reconciliation driver never requests human input"),
+                PlanReconciliationOutcome::Waiting { .. } => {
+                    events
+                        .publish(TurnEvent::TurnCompleted {
+                            assistant_message_id: assistant_message_id.clone(),
+                            steps: *steps,
+                        })
+                        .await
+                        .map_err(TurnFailure::event_consumer)?;
+                    return Ok(Some(outcome));
+                }
             }
         }
     }
@@ -8163,9 +8410,18 @@ impl TurnHost {
         routing: Option<&PromptRouting>,
         guard: &SessionRunGuard,
         events: TurnEventSender,
-    ) -> Result<TurnOutcome, TurnFailure> {
+    ) -> Result<(TurnOutcome, String), TurnFailure> {
         self.refresh_memory_policy().map_err(TurnFailure::host)?;
         let mut resolver = self.resolver.clone();
+        if let Some(seed) = resolver.orchestration_seed.as_ref() {
+            let mut seed = seed.as_ref().clone();
+            seed.cycle_id = self
+                .session_control
+                .state(&self.session_id)
+                .map_err(TurnFailure::host)?
+                .and_then(|state| state.cycle_id);
+            resolver.orchestration_seed = Some(Arc::new(seed));
+        }
         if self.memory_policy.use_memories
             && let Some(memory) = &self.memory
         {
@@ -8262,19 +8518,29 @@ impl TurnHost {
             zuno_goal::GoalBudgetPolicy::new(Arc::clone(&self.goal_store))
                 .with_allowance(self.turn_allowance),
         ));
-        let mut request = RunTurnRequest::new(
-            self.session_id.clone(),
-            Uuid::new_v4().simple().to_string(),
-            dynamic_context,
-        )
-        .with_start(turn_start.clone())
-        .with_context_limit(self.window.context)
-        .with_deferred_success_terminal_event(true);
+        let turn_id = Uuid::new_v4().simple().to_string();
+        let mut request =
+            RunTurnRequest::new(self.session_id.clone(), turn_id.clone(), dynamic_context)
+                .with_start(turn_start.clone())
+                .with_context_limit(self.window.context)
+                .with_deferred_success_terminal_event(true);
         if let Some(threshold) = proactive_compaction_threshold {
             request = request.with_context_compaction_threshold(threshold);
         }
         let outcome = self.driver.drive(request, context, events.clone()).await;
-        outcome.map_err(TurnFailure::Engine)
+        let context_recovery = outcome
+            .as_ref()
+            .err()
+            .is_some_and(|error| matches!(error.recovery(), TurnRecovery::Compact));
+        if !matches!(outcome, Ok(TurnOutcome::Completed { .. })) && !context_recovery {
+            self.questions
+                .interrupt_plan_turn(&self.session_id, &turn_id)
+                .await
+                .map_err(|error| TurnFailure::host(error.to_string()))?;
+        }
+        outcome
+            .map(|outcome| (outcome, turn_id))
+            .map_err(TurnFailure::Engine)
     }
 
     fn plan_reconciliation_state(&self) -> Result<(PlanReconciliationInput, bool, String), String> {
@@ -8291,6 +8557,21 @@ impl TurnHost {
                 item.status,
                 zuno_tools::WorkItemStatus::Completed | zuno_tools::WorkItemStatus::Cancelled
             )
+        });
+        let executable_work = work.items.iter().any(|item| {
+            matches!(
+                item.status,
+                zuno_tools::WorkItemStatus::Pending | zuno_tools::WorkItemStatus::InProgress
+            ) && item
+                .owner
+                .as_deref()
+                .is_none_or(|owner| owner == self.session_id || owner == self.agent)
+                && item.dependencies.iter().all(|dependency| {
+                    work.items.iter().any(|candidate| {
+                        candidate.id == *dependency
+                            && candidate.status == zuno_tools::WorkItemStatus::Completed
+                    })
+                })
         });
         let jobs = zuno_db::job::AgentJobStore::new(Arc::clone(&self.database))
             .list_for_parent(&self.session_id)
@@ -8361,10 +8642,67 @@ impl TurnHost {
             plan_exists,
             plan_terminal,
             active_todo,
+            executable_work,
             active_job,
-            remote_observer_running: self.remote_observer_running(),
+            background_wait: self
+                .background_executions
+                .list_for_session(&self.session_id)
+                .into_iter()
+                .find(|info| {
+                    info.status == zuno_pty::BackgroundExecutionStatus::Running
+                        && info.cycle_id.is_some()
+                })
+                .map(|info| SessionWaitReference::External {
+                    source_id: info.id.as_str().to_owned(),
+                    origin_cycle_id: info.cycle_id.expect("filtered bound cycle"),
+                })
+                .or_else(|| {
+                    (!executable_work)
+                        .then(|| {
+                            jobs.iter().find_map(|job| {
+                                if !matches!(
+                                    job.status,
+                                    zuno_db::job::JobStatus::Queued
+                                        | zuno_db::job::JobStatus::Running
+                                ) {
+                                    return None;
+                                }
+                                Some(SessionWaitReference::External {
+                                    source_id: job.id.clone(),
+                                    origin_cycle_id: job
+                                        .orchestration_snapshot
+                                        .as_ref()?
+                                        .cycle_id
+                                        .clone()?,
+                                })
+                            })
+                        })
+                        .flatten()
+                }),
             goal_active,
             planning_handoff: mode == CollaborationMode::Plan && plan_exists,
+            plan_authorization_wait: execution
+                .as_ref()
+                .and_then(|state| state.scheduling.as_ref())
+                .and_then(|scheduling| match &scheduling.readiness {
+                    SessionReadiness::WaitingHuman { request_id } => Some(request_id),
+                    _ => None,
+                })
+                .map(|request_id| {
+                    zuno_db::question::QuestionStore::new(Arc::clone(&self.database))
+                        .get(&self.session_id, request_id)
+                        .map_err(to_string)
+                })
+                .transpose()?
+                .filter(|question| {
+                    question.purpose == zuno_types::question::QuestionPurpose::PlanAuthorization
+                        && question.plan.as_ref().is_some_and(|binding| {
+                            work.plan.as_ref().is_some_and(|plan| {
+                                plan.id == binding.plan_id && plan.revision == binding.plan_revision
+                            })
+                        })
+                })
+                .map(|question| question.id),
         };
         let progress_fingerprint = sha256_json(&json!({
             "plan": work.plan.as_ref().map(|plan| json!({
@@ -8503,6 +8841,7 @@ impl TurnHost {
                 self.compaction_state.reset_after_turn_success();
             }
             Some(TurnOutcome::Interrupted { .. }) => {
+                self.pause_execution(PlanPauseReason::User)?;
                 self.goal_continuation
                     .record_terminal_failure(
                         &self.session_id,
@@ -8672,10 +9011,53 @@ impl TurnHost {
             GoalFailureDisposition::Paused(_)
             | GoalFailureDisposition::Blocked(_)
             | GoalFailureDisposition::NoActiveGoal => {
+                self.questions
+                    .interrupt_plan_turn(&self.session_id, "")
+                    .await
+                    .map_err(to_string)?;
+                let reason = match failure.goal_failure() {
+                    GoalTerminalFailure::Pause(zuno_goal::GoalPauseReason::Authentication) => {
+                        PlanPauseReason::Authentication
+                    }
+                    GoalTerminalFailure::Pause(zuno_goal::GoalPauseReason::NoProgress) => {
+                        PlanPauseReason::NoProgress
+                    }
+                    GoalTerminalFailure::Pause(zuno_goal::GoalPauseReason::TurnBudget) => {
+                        PlanPauseReason::TurnBudget
+                    }
+                    GoalTerminalFailure::Pause(zuno_goal::GoalPauseReason::UserInterruption) => {
+                        PlanPauseReason::User
+                    }
+                    _ => PlanPauseReason::Blocked,
+                };
+                self.pause_execution(reason)?;
                 self.last_turn_completed = false;
                 Err(rendered)
             }
         }
+    }
+
+    fn pause_execution(&self, reason: PlanPauseReason) -> Result<(), String> {
+        self.database
+            .transaction(|tx| {
+                let Some(state) = zuno_db::session_execution::read_in(tx, &self.session_id)? else {
+                    return Ok(());
+                };
+                if state.scheduling.as_ref().is_some_and(|scheduling| {
+                    scheduling.readiness == SessionReadiness::Paused { reason }
+                }) {
+                    return Ok(());
+                }
+                zuno_db::session_execution::set_paused_in(
+                    tx,
+                    &self.session_id,
+                    state.revision,
+                    reason,
+                    zuno_db::message::now_millis(),
+                )
+                .map(|_| ())
+            })
+            .map_err(to_string)
     }
 
     /// Charge the goal for the turn: the tokens no request accounted for, and the time.
@@ -8709,18 +9091,18 @@ impl TurnHost {
     /// truth that can disagree with the record — the failure this whole path exists
     /// to prevent.
     ///
-    /// Empty when no goal is active: an uncertain call still demands inspection, but
-    /// it demands it of the human reading the transcript, and there is no automatic
-    /// execution to suspend. Scoped to the goal instance so a fresh objective does
-    /// not inherit an obligation the previous one incurred.
+    /// Ordinary sessions have the same inspection obligation. A Goal scopes the
+    /// lookup to its own objective; goalless Work uses the session's unsettled calls.
     fn pending_uncertain_side_effects(
         &self,
     ) -> Result<Vec<zuno_db::message::UncertainToolCall>, String> {
-        let Some(goal) = self.goal_store.goal(&self.session_id).map_err(to_string)? else {
-            return Ok(Vec::new());
-        };
+        let since = self
+            .goal_store
+            .goal(&self.session_id)
+            .map_err(to_string)?
+            .map_or(0, |goal| goal.created_at_ms);
         zuno_db::message::MessageStore::new(&self.connection)
-            .pending_uncertain_tool_calls(&self.session_id, goal.created_at_ms)
+            .pending_uncertain_tool_calls(&self.session_id, since)
             .map_err(to_string)
     }
 
@@ -8745,9 +9127,27 @@ impl TurnHost {
             .pause_state(&self.session_id)
             .map_err(to_string)?
             .is_some_and(|pause| pause.reason == zuno_goal::GoalPauseReason::UncertainSideEffect);
-        if recorded {
+        let execution_recorded = self
+            .session_control
+            .state(&self.session_id)
+            .map_err(to_string)?
+            .is_some_and(|state| {
+                state.scheduling.as_ref().is_some_and(|scheduling| {
+                    scheduling.readiness
+                        == SessionReadiness::Paused {
+                            reason: PlanPauseReason::Blocked,
+                        }
+                })
+            });
+        let no_goal = self
+            .goal_store
+            .goal(&self.session_id)
+            .map_err(to_string)?
+            .is_none();
+        if execution_recorded && (recorded || no_goal) {
             return Ok(UncertainSideEffects::AlreadyPaused);
         }
+        self.pause_execution(PlanPauseReason::Blocked)?;
         self.goal_continuation
             .record_terminal_failure(
                 &self.session_id,
@@ -9056,6 +9456,9 @@ fn goal_tool_failure(recoveries: &[ToolFailureRecovery]) -> Option<GoalTerminalF
 #[serde(rename_all = "camelCase")]
 struct DurableWorkContextSnapshot {
     schema_version: u32,
+    execution: Option<DurableExecutionContext>,
+    questions: Vec<DurableQuestionContext>,
+    omitted_questions: usize,
     plan: Option<DurablePlanContext>,
     todos: Vec<DurableTodoContext>,
     jobs: Vec<DurableJobContext>,
@@ -9064,6 +9467,32 @@ struct DurableWorkContextSnapshot {
     omitted_todos: usize,
     omitted_jobs: usize,
     omitted_pending_reports: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DurableExecutionContext {
+    mode: CollaborationMode,
+    phase: zuno_types::execution::SessionExecutionPhase,
+    cycle_id: Option<String>,
+    scheduling: Option<zuno_types::execution::SessionScheduling>,
+    authorized_plan_id: Option<String>,
+    authorized_plan_revision: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DurableQuestionContext {
+    id: String,
+    revision: i64,
+    purpose: zuno_types::question::QuestionPurpose,
+    mode: zuno_types::question::QuestionMode,
+    state: zuno_types::question::QuestionState,
+    header: String,
+    answered_items: usize,
+    total_items: usize,
+    decision: Option<zuno_types::question::PlanQuestionDecision>,
+    authorization: Option<zuno_types::question::PlanAuthorizationState>,
 }
 
 #[derive(Debug, Serialize)]
@@ -9150,6 +9579,9 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) {
 }
 
 fn render_durable_work_context(mut snapshot: DurableWorkContextSnapshot) -> Result<String, String> {
+    for question in &mut snapshot.questions {
+        truncate_utf8(&mut question.header, DURABLE_WORK_CONTEXT_TEXT_MAX_BYTES);
+    }
     if let Some(plan) = snapshot.plan.as_mut() {
         truncate_utf8(&mut plan.title, DURABLE_WORK_CONTEXT_TEXT_MAX_BYTES);
         for step in &mut plan.steps {
@@ -9186,6 +9618,10 @@ fn render_durable_work_context(mut snapshot: DurableWorkContextSnapshot) -> Resu
         }
         if snapshot.todos.pop().is_some() {
             snapshot.omitted_todos = snapshot.omitted_todos.saturating_add(1);
+            continue;
+        }
+        if snapshot.questions.pop().is_some() {
+            snapshot.omitted_questions = snapshot.omitted_questions.saturating_add(1);
             continue;
         }
         if let Some(plan) = snapshot.plan.as_mut()
@@ -9358,7 +9794,58 @@ fn durable_work_context(
         .collect::<Vec<_>>();
     let (jobs, omitted_jobs) = capped(relevant_jobs);
 
-    if plan.is_none() && todos.is_empty() && jobs.is_empty() && pending_reports.is_empty() {
+    let execution = zuno_db::session_execution::read_in(&transaction, session_id)
+        .map_err(to_string)?
+        .filter(|state| {
+            matches!(
+                state.phase,
+                zuno_types::execution::SessionExecutionPhase::Waiting
+                    | zuno_types::execution::SessionExecutionPhase::Paused
+                    | zuno_types::execution::SessionExecutionPhase::Blocked
+            )
+        });
+    let mut questions =
+        zuno_db::question::pending_in(&transaction, session_id).map_err(to_string)?;
+    if let Some(SessionReadiness::WaitingHuman { request_id }) = execution
+        .as_ref()
+        .and_then(|state| state.scheduling.as_ref())
+        .map(|s| &s.readiness)
+        && !questions.iter().any(|question| question.id == *request_id)
+    {
+        // Early Plan approval is answered but still awaits its source handoff.
+        match zuno_db::question::get_in(&transaction, session_id, request_id) {
+            Ok(question) => questions.push(question),
+            Err(zuno_tool::question::QuestionError::NotFound { .. }) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    let (questions, omitted_questions) = capped(
+        questions
+            .into_iter()
+            .map(|question| DurableQuestionContext {
+                id: question.id,
+                revision: question.revision,
+                purpose: question.purpose,
+                mode: question.mode,
+                state: question.state,
+                header: question
+                    .questions
+                    .first()
+                    .map_or_else(String::new, |item| item.question.header.clone()),
+                answered_items: question.answers.len(),
+                total_items: question.questions.len(),
+                decision: question.decision,
+                authorization: question.authorization,
+            })
+            .collect(),
+    );
+    if plan.is_none()
+        && todos.is_empty()
+        && jobs.is_empty()
+        && pending_reports.is_empty()
+        && execution.is_none()
+        && questions.is_empty()
+    {
         transaction.commit().map_err(to_string)?;
         return Ok(None);
     }
@@ -9375,6 +9862,16 @@ fn durable_work_context(
         .map_err(to_string)?;
     let snapshot = DurableWorkContextSnapshot {
         schema_version: DURABLE_WORK_CONTEXT_SCHEMA_VERSION,
+        execution: execution.map(|state| DurableExecutionContext {
+            mode: state.mode,
+            phase: state.phase,
+            cycle_id: state.cycle_id,
+            scheduling: state.scheduling,
+            authorized_plan_id: state.authorized_plan_id,
+            authorized_plan_revision: state.authorized_plan_revision,
+        }),
+        questions,
+        omitted_questions,
         plan,
         todos,
         jobs,

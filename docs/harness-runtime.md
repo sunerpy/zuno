@@ -236,12 +236,14 @@ tool-result, and verification state:
 - terminal Plan state with no active Todo or Job may finish;
 - a completed answer from the built-in read-only `plan` Agent is a typed
   planning handoff: its current Plan and Todos remain durable for Start Work
-  and do not trigger execution reconciliation; an active Job still prevents
-  handoff;
-- unfinished durable work with a live `remoteObserver` waits for its durable
-  completion wake without consuming reconciliation attempts;
+  and do not trigger execution reconciliation. A matching Plan-authorization
+  wait permits the source turn to finish its summary without authorizing Work;
+- a live background execution or required child Job can register an exact
+  external source/cycle wait without consuming reconciliation attempts;
 - an active Goal owns the next durable continuation;
-- authorized ordinary Work continues from a durable `Recovery` token;
+- authorized ordinary Work continues from a durable `Recovery` token only when
+  the host proves executable Todo/dependency work. Unfinished Plan steps and
+  blocked Todos alone produce `no_executable_work`, not another provider call;
 - the driver hashes authoritative Plan, Todo, Job, and Goal revisions into a
   progress fingerprint; three consecutive identical fingerprints pause with
   typed `no_progress`;
@@ -251,8 +253,14 @@ Unreconciled work means durably recorded work. A Work-mode `Optional` decision
 is not recorded work, so a request that creates no Plan, Todo, or Job settles
 rather than being driven again.
 
-A process restart resumes an interrupted reconciliation cycle and its attempt
-count. Assistant prose is never parsed as evidence that work completed. Hiding
+A process restart preserves the session-level fingerprint and unchanged-progress
+count, even across callback cycles. `session_execution_state.scheduling` owns the
+ready, exact human/external wait, paused and completed gates for ordinary sessions
+and Goals alike. A pause is committed to that row, not only a Goal store or an
+event projection. Callbacks may be recorded while paused but cannot reopen it.
+A status query can run without resuming work; explicit `/resume` queues a Work
+control but cannot waive a pending wait or approve a Plan. Assistant prose is
+never parsed as evidence that work completed or as a substitute for a typed wait. Hiding
 `plan_update` prevents the model from creating or mutating a new strategic Plan;
 existing Plans remain durable, projected, and recoverable.
 
@@ -1424,27 +1432,38 @@ larger overlay. Questions show `Question i/n`, the remaining unanswered count,
 numbered choices, and a numbered `Other` input. They support Up/Down and `j/k`
 within a question, Left/Right and `h/l` across questions, number-key selection,
 Enter, Space for multi-select, and mouse selection. Per-question cursors and
-custom drafts survive navigation. Cancelling either interaction resolves the
-tool as a typed denial and never fabricates an answer.
+custom drafts survive navigation. Merely highlighting a choice does not select
+it. Ctrl+S defers a question, preserving partial answers; `/questions` reopens the
+pending set. Deferral, cancellation and an empty submission never fabricate an answer.
 
-Goal-owned interaction is durable rather than a parked tool future. The
-`goal_request_input` tool commits a `human_request` row and the exact
-`goal_pause(human_input)` state in one transaction, then returns
-`TurnOutcome::WaitingForHuman`. Permission requests tied to an active Goal use
-the same table with kind `permission`. Answering atomically settles the request
-and admits a model-visible FIFO inbox item; resuming the Goal is a separate
-idempotent transition, so a crash between those operations remains recoverable.
-TUI, server, and ACP re-present pending rows after restart. Their process-local
-channels only wake consumers after durable state exists.
+`runtime.work_state` version 3 includes the session scheduling gate and bounded
+pending-question summaries, including early approvals awaiting handoff. They are
+restored after compaction/restart even when no Goal exists. These state summaries
+do not manufacture answers or repeat answer content already delivered by inbox.
 
-Interaction registration is host policy. Plan may receive synchronous
-`question`; ordinary non-Goal Work does not park a tool future and instead
-finishes with one direct question only when evidence and safe reversible defaults
-cannot resolve a material choice. Autonomous Goal turns receive only
-`goal_request_input`; delegated children receive neither and must report their
-blocker to the parent. A headless Goal without a human-request surface does not
-receive a request tool it cannot complete. Permission and destructive-operation
-approval remain separate typed interactions and must occur before the side effect.
+`QuestionPort` is shared by tools, TUI, HTTP and ACP. `QuestionService` commits
+the request definition, revision, keyed partial answers, command receipt, FIFO
+input and matching session/Goal transition together. `question_async` publishes
+optional input without parking a tool; `question` may wait until answered or
+deferred. Both return receipts, while response content is delivered only through
+the inbox. `goal_request_input` uses the same provider and returns
+`TurnOutcome::WaitingForHuman`. Requests outlive their originating turn and
+client connection. Permission requests remain a distinct kind; closing a
+question never supplies a permission approval.
+
+Interaction registration depends on an actual QuestionPort consumer, not a
+client-name or experimental Plan flag. Plan supports synchronous clarification
+and deferred `plan_exit`; ordinary Work can register required human input even
+without a Goal. Root turns support optional `question_async`; delegated children
+report blockers to their parent. A headless host without the consumer advertises
+none of these tools. `question_async` shares the `question` permission key.
+
+`plan_exit` freezes the exact Plan/review revision and saved Work identity in a
+host-created request. Only typed approve/decline actions are accepted, never
+generic answer arrays. Early approval waits for successful source-turn handoff;
+the handoff and queued Start Work control are transactional. Interruption or
+changed Plan, review or identity invalidates stale consent. Draft risk acceptance
+must come from the user. The tool itself cannot switch collaboration mode.
 
 The conversation surface separates reply identity from transient work state. The
 identity row contains the resolved agent, catalog model display name, and configured
@@ -1528,7 +1547,8 @@ boundary without inventing a user message.
 ## Native session commands, compaction, and hard interruption
 
 The typed `SessionCommand` registry is shared by client surfaces and currently
-contains `/compact`, `/goal`, `/plan`, `/start-plan`, and `/start-work`.
+contains `/compact`, `/goal`, `/plan`, `/start-plan`, `/start-work`, `/questions`,
+and `/resume`.
 Native discovery resolves before Markdown commands and Skills, so a same-named
 user workflow cannot shadow a runtime control.
 

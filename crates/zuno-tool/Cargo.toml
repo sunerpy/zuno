@@ -19,8 +19,10 @@ zuno-permission = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+zuno-types = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

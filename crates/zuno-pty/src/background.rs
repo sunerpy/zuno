@@ -155,6 +155,9 @@ impl BackgroundExecutionPurpose {
 pub struct BackgroundExecutionInfo {
     pub id: BackgroundExecutionId,
     pub session_id: String,
+    /// Work cycle captured before launch. Older records remain explicitly unbound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycle_id: Option<String>,
     pub title: String,
     pub command: String,
     /// The completion authority selected at the tool boundary.
@@ -206,6 +209,8 @@ pub struct BackgroundExecutionInput {
     /// Opaque launch produced by a sandbox backend.
     pub prepared: PreparedCommand,
     pub session_id: String,
+    /// Originating work cycle, not a turn id or a later completion-time cycle.
+    pub cycle_id: Option<String>,
     pub title: String,
     pub command: String,
     pub purpose: BackgroundExecutionPurpose,
@@ -978,6 +983,7 @@ impl BackgroundExecutionService {
         let info = BackgroundExecutionInfo {
             id: id.clone(),
             session_id: input.session_id,
+            cycle_id: input.cycle_id,
             title: input.title,
             command: input.command,
             purpose: input.purpose,
@@ -1933,6 +1939,7 @@ mod tests {
         BackgroundExecutionInfo {
             id: id.clone(),
             session_id: "ses_claim".to_owned(),
+            cycle_id: None,
             title: "fixture".to_owned(),
             command: "fixture".to_owned(),
             purpose: BackgroundExecutionPurpose::Command,

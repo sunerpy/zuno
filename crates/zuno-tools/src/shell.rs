@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
 use tree_sitter::{Node, Parser};
+use zuno_db::session_execution::SessionExecutionStore;
 use zuno_error::ToolError;
 use zuno_paths::GeneratedDirectory;
 use zuno_process::GuardExit;
@@ -439,6 +440,7 @@ pub struct ShellTool {
     hard_ceiling: Duration,
     git_ceiling: Duration,
     background_executions: Arc<BackgroundExecutionService>,
+    execution_store: Option<SessionExecutionStore>,
     /// The generated directory the background service writes into, when its root is
     /// one. `None` for a service a caller rooted somewhere of its own choosing, which
     /// is not Zuno's generated state and not Zuno's to exclude.
@@ -532,6 +534,7 @@ impl ShellTool {
             hard_ceiling: crate::timeout::DEFAULT_HARD_CEILING,
             git_ceiling: GIT_READ_CEILING,
             background_executions,
+            execution_store: None,
             background_directory: Some(background_directory),
             sandbox,
             sandbox_policy,
@@ -581,6 +584,16 @@ impl ShellTool {
             &zuno_paths::generated::BACKGROUND_EXECUTIONS,
         );
         self.background_executions = service;
+        self
+    }
+
+    /// Bind process completion to the session's work cycle before launch, including
+    /// foreground commands that may later be promoted to background execution.
+    ///
+    /// Missing execution state stays unbound. A turn id is not a work cycle.
+    #[must_use]
+    pub fn with_execution_store(mut self, pool: Arc<zuno_db::Pool>) -> Self {
+        self.execution_store = Some(SessionExecutionStore::new(pool));
         self
     }
 
@@ -1051,9 +1064,17 @@ impl ShellTool {
                 policy,
             })
             .map_err(failed)?;
+        let cycle_id = match &self.execution_store {
+            Some(store) => store
+                .get(&ctx.session_id)
+                .map_err(failed)?
+                .and_then(|state| state.cycle_id),
+            None => None,
+        };
         Ok(BackgroundExecutionInput {
             prepared,
             session_id: ctx.session_id.clone(),
+            cycle_id,
             title: request.command.to_owned(),
             command: request.command.to_owned(),
             purpose: lifecycle.purpose,
@@ -3953,6 +3974,7 @@ mod tests {
             id: zuno_pty::BackgroundExecutionId::parse(format!("bg_{}", "a".repeat(32)))
                 .expect("a well-formed execution id"),
             session_id: "ses_cancel".to_owned(),
+            cycle_id: None,
             title: "cargo test --workspace".to_owned(),
             command: "cargo test --workspace".to_owned(),
             purpose: BackgroundExecutionPurpose::Command,

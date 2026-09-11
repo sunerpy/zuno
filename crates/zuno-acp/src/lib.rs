@@ -1,10 +1,10 @@
 //! Agent Client Protocol adapter for external editor clients.
 
+mod durable_question;
 mod mcp;
 mod permission;
 mod presentation;
 mod projection;
-mod question;
 mod replay;
 mod routing;
 mod settlement;
@@ -12,12 +12,12 @@ mod transport;
 
 pub mod conformance;
 
+pub use durable_question::AcpQuestionPresenter;
 pub use mcp::{
     AcpHttpMcpServer, AcpMcpConfigError, AcpMcpServer, AcpStdioMcpServer, parse_mcp_servers,
 };
 pub use permission::{AcpPermissionAsker, AcpPermissionGrants};
 pub use projection::{AttemptBufferedTurnEventProjector, TurnEventProjector, turn_event_update};
-pub use question::AcpQuestionAsker;
 pub use replay::{
     DurableReplay, REPLAY_MESSAGE_CAP, REPLAY_TRANSCRIPT_BYTE_CAP, ReplayPolicy,
     durable_learning_update, durable_plan_clear_update, durable_plan_update, durable_updates,

@@ -302,13 +302,13 @@ fn no_agent_names_a_model() {
 }
 
 #[test]
-fn only_orchestrator_may_delegate() {
+fn orchestrator_and_deep_declare_general_delegation() {
     let may_delegate: Vec<&str> = roster(true)
         .iter()
         .filter(|agent| agent.delegation == Delegation::MayDelegate)
         .map(|agent| agent.name)
         .collect();
-    assert_eq!(may_delegate, vec!["orchestrator"]);
+    assert_eq!(may_delegate, vec!["orchestrator", "deep"]);
 
     for agent in roster(true) {
         if agent.delegation == Delegation::NoChildren {
@@ -320,6 +320,7 @@ fn only_orchestrator_may_delegate() {
         }
     }
     assert!(!is_tool_hidden("task", &ORCHESTRATOR.rules()));
+    assert!(!is_tool_hidden("task", &DEEP.rules()));
     assert!(is_tool_hidden("task", &BUILD.rules()));
 }
 
@@ -337,7 +338,7 @@ fn background_and_job_authority_match_between_the_roster_and_the_enforced_overla
         let roster = agent.rules();
         let enforced = enforced_rules(agent.name);
 
-        for tool in ["shell", "bg", "job"] {
+        for tool in ["shell", "bg", "task", "job"] {
             assert_eq!(
                 is_tool_hidden(tool, &roster),
                 is_tool_hidden(tool, &enforced),
@@ -429,13 +430,12 @@ fn every_delegable_agent_has_a_real_catalog_definition() {
 }
 
 #[test]
-fn deep_owns_cross_cutting_implementation_without_children() {
+fn deep_owns_causal_work_and_can_delegate_bounded_tasks() {
     assert_eq!(DEEP.mode, AgentMode::All);
     assert_eq!(DEEP.role, Role::Subagent);
     assert_eq!(DEEP.write, Write::Capable);
     assert_eq!(DEEP.research, Research::Allowed);
-    assert_eq!(DEEP.delegation, Delegation::NoChildren);
-    assert!(is_tool_hidden("task", &DEEP.rules()));
+    assert_eq!(DEEP.delegation, Delegation::MayDelegate);
     for capability in [
         "edit",
         "shell",
@@ -443,12 +443,32 @@ fn deep_owns_cross_cutting_implementation_without_children() {
         "plan_update",
         "todo_update",
         "question",
+        "task",
+        "job",
     ] {
         assert!(
             !is_tool_hidden(capability, &DEEP.rules()),
             "deep needs `{capability}`"
         );
     }
+}
+
+#[test]
+fn deep_delegation_still_requires_parent_authority_and_effective_permission() {
+    let definition = zuno_catalog::agent::resolve(&Default::default(), &[])
+        .into_iter()
+        .find(|agent| agent.name == "deep")
+        .expect("deep resolves");
+    let mut rules = enforced_rules("deep");
+    let profile = crate::profile::AgentProfile::resolve(definition.clone(), rules.clone(), true);
+    assert!(profile.capabilities().can_delegate());
+
+    let bounded = profile.with_tool_authority(["read", "shell", "bg"].map(str::to_owned));
+    assert!(!bounded.capabilities().can_delegate());
+
+    rules.push(rule("task", PermissionAction::Deny));
+    let denied = crate::profile::AgentProfile::resolve(definition, rules, true);
+    assert!(!denied.capabilities().can_delegate());
 }
 
 #[test]
@@ -680,7 +700,7 @@ fn oracle_is_the_only_agent_above_the_low_band() {
 }
 
 #[test]
-fn the_internals_are_the_engines_hidden_agents_carried_unchanged() {
+fn the_internals_use_the_canonical_hidden_no_tool_contracts() {
     let internals = internals();
     let names: Vec<&str> = internals.iter().map(|agent| agent.name).collect();
     assert_eq!(names, INTERNAL_NAMES.to_vec());
@@ -714,8 +734,7 @@ fn the_internals_are_the_engines_hidden_agents_carried_unchanged() {
         }
     }
 
-    // Upstream sets a temperature only for `title`; the other two inherit it from
-    // this roster's requirement that every agent declare one.
+    // Sampling policy also comes from the native catalog.
     let by_name = |name: &str| {
         internals
             .iter()
@@ -725,16 +744,28 @@ fn the_internals_are_the_engines_hidden_agents_carried_unchanged() {
     assert_eq!(by_name("title"), Some(0.5));
     assert_eq!(by_name("compaction"), Some(0.1));
     assert_eq!(by_name("summary"), Some(0.1));
+    assert_eq!(by_name("council-synth"), Some(0.1));
 }
 
 #[test]
-fn plan_mode_is_not_reproduced_and_no_agent_can_leave_it() {
-    // `plan` is the fourth upstream native this roster does not carry; see
-    // `internals`'s doc comment for the reasoning. The observable consequence is
-    // asserted here so a later todo that promotes this roster to the only source of
-    // agents trips over it.
-    assert!(get("plan", true).is_none());
-    assert!(zuno_catalog::agent::builtin::get("plan").is_some());
+fn plan_and_review_remain_catalog_owned_primary_modes() {
+    for name in ["plan", "review"] {
+        assert!(get(name, true).is_none());
+        let native = zuno_catalog::agent::builtin::get(name).expect("native mode");
+        assert_eq!(native.mode, AgentMode::Primary);
+    }
+    let mut names = roster(true)
+        .into_iter()
+        .map(|agent| agent.name)
+        .collect::<BTreeSet<_>>();
+    names.extend(["plan", "review"]);
+    assert_eq!(
+        names,
+        zuno_catalog::agent::builtin::BUILTIN_NAMES
+            .into_iter()
+            .collect(),
+        "the execution roster and catalog-owned modes must cover all 15 native roles"
+    );
     for agent in roster(true) {
         assert!(
             is_tool_hidden("plan_exit", &agent.rules()),

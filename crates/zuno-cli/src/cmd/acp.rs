@@ -20,6 +20,13 @@ use zuno_engine::status::{
 };
 use zuno_llm::event::{FinishReason, RequestContentBlock};
 use zuno_tool::PermissionAsker;
+use zuno_tool::question::QuestionPort;
+
+#[cfg(test)]
+#[path = "acp_question_tests.rs"]
+mod durable_question_tests;
+#[path = "acp_question.rs"]
+mod durable_questions;
 
 use super::acp_session_registry::AcpSessionRegistry;
 use super::child_turn::{ChildTurnObserver, DetachedTurnObserver};
@@ -96,6 +103,7 @@ pub(super) struct AcpState {
     elicitation_form: AtomicBool,
     native_subagents: AtomicBool,
     permission_grants: Arc<zuno_acp::AcpPermissionGrants>,
+    question_pool: Arc<zuno_db::Pool>,
 }
 
 #[async_trait]
@@ -119,6 +127,16 @@ impl zuno_acp::Agent for ProductionAcpAgent {
             "session/list" => self.list_sessions(&params),
             "session/close" => self.close_session(&params).await,
             "session/delete" => self.delete_session(&params).await,
+            durable_questions::LIST_METHOD => {
+                let session_id = required_string(&params, "sessionId")?;
+                let session = self.question_session(&session_id).await?;
+                durable_questions::list(session.questions.as_ref(), &params).await
+            }
+            durable_questions::RESPOND_METHOD => {
+                let session_id = required_string(&params, "sessionId")?;
+                let session = self.question_session(&session_id).await?;
+                durable_questions::respond(session.questions.as_ref(), &params).await
+            }
             _ => Err(zuno_acp::RpcError::method_not_found(method)),
         }
     }
@@ -204,6 +222,7 @@ fn initialize(params: &Value) -> Result<Value, zuno_acp::RpcError> {
     if supports_native_subagents(params) {
         response["agentCapabilities"]["sessionCapabilities"]["subagents"] = json!({});
     }
+    response["_meta"]["zuno"]["questions"] = durable_questions::capabilities();
     Ok(response)
 }
 
@@ -230,16 +249,19 @@ impl ProductionAcpAgent {
 
     fn new(environment: StartupEnvironment) -> Result<Self, String> {
         let runtime = discover_acp_runtime_config(&environment)?;
+        let runs = SessionRunRegistry::new();
+        let question_pool = Arc::new(durable_pool().map_err(|error| error.to_string())?);
         Ok(Self {
             state: Arc::new(AcpState {
                 environment,
-                runs: SessionRunRegistry::new(),
+                runs,
                 registry: AcpSessionRegistry::new(runtime),
                 idle_reaper: std::sync::Mutex::new(None),
                 composition_gate: Mutex::new(()),
                 elicitation_form: AtomicBool::new(false),
                 native_subagents: AtomicBool::new(false),
                 permission_grants: Arc::new(zuno_acp::AcpPermissionGrants::default()),
+                question_pool,
             }),
         })
     }
@@ -312,6 +334,7 @@ impl ProductionAcpAgent {
             variant: None,
             thinking: false,
             tool_authority: None,
+            parent_authority: None,
             extension_composition: ExtensionComposition::Active,
         };
         let session_slot = self.reserve_session_slot()?;
@@ -343,6 +366,7 @@ impl ProductionAcpAgent {
             let _shutdown = session.shutdown().await;
             return Err(error);
         }
+        session.start_question_runtime(&self.state, client);
         Ok(with_session_id(response, &session_id))
     }
 
@@ -383,6 +407,7 @@ impl ProductionAcpAgent {
             variant: None,
             thinking: false,
             tool_authority: None,
+            parent_authority: None,
             extension_composition: ExtensionComposition::Active,
         };
         let (session, created) = match self.state.registry.get(&session_id).await {
@@ -449,6 +474,7 @@ impl ProductionAcpAgent {
             }
             session.spawn_goal_recovery();
         }
+        session.start_question_runtime(&self.state, client);
         Ok(response)
     }
 
@@ -639,6 +665,10 @@ impl ProductionAcpAgent {
         let background_notification_directory = plan.directory().to_path_buf();
         let background_notifications = self.state.environment.background_notifications();
         let plan_projection = Arc::new(AcpPlanProjection::default());
+        let questions = Arc::new(
+            zuno_session_control::QuestionService::new(Arc::clone(&self.state.question_pool))
+                .with_runs(self.state.runs.clone()),
+        );
         let resources = open_session_resources(
             plan,
             &self.state.environment,
@@ -647,6 +677,7 @@ impl ProductionAcpAgent {
                 self.state.as_ref(),
                 client,
                 Arc::clone(&plan_projection),
+                Arc::clone(&questions),
             ),
             None,
             &mcp_servers,
@@ -696,6 +727,8 @@ impl ProductionAcpAgent {
             lifecycle: std::sync::Mutex::new(AcpSessionLifecycle::Active),
             last_used_tick: AtomicU64::new(runtime_tick()),
             goal_recovery_running: AtomicBool::new(false),
+            question_runtime: std::sync::Mutex::new(None),
+            questions,
             mcp_servers: Mutex::new(Arc::from(mcp_servers)),
             mcp_manager,
             mcp_cache: Mutex::new(mcp_cache),
@@ -783,6 +816,11 @@ impl ProductionAcpAgent {
             lifecycle: std::sync::Mutex::new(AcpSessionLifecycle::Dormant),
             last_used_tick: AtomicU64::new(runtime_tick()),
             goal_recovery_running: AtomicBool::new(false),
+            question_runtime: std::sync::Mutex::new(None),
+            questions: Arc::new(
+                zuno_session_control::QuestionService::new(Arc::clone(&self.state.question_pool))
+                    .with_runs(self.state.runs.clone()),
+            ),
             mcp_servers: Mutex::new(Arc::from(mcp_servers)),
             mcp_manager: zuno_mcp::McpRuntimeManager::new(),
             mcp_cache: Mutex::new(McpToolDirectoryCache::new()),
@@ -882,6 +920,8 @@ pub(super) struct AcpSession {
     lifecycle: std::sync::Mutex<AcpSessionLifecycle>,
     last_used_tick: AtomicU64,
     goal_recovery_running: AtomicBool,
+    question_runtime: std::sync::Mutex<Option<durable_questions::SessionQuestions>>,
+    questions: Arc<zuno_session_control::QuestionService>,
     mcp_servers: Mutex<Arc<[zuno_acp::AcpMcpServer]>>,
     mcp_manager: zuno_mcp::McpRuntimeManager,
     mcp_cache: Mutex<McpToolDirectoryCache>,
@@ -908,7 +948,6 @@ struct SessionResources {
     mcp: Option<McpRuntime>,
     subagents: Option<super::acp_subagent::AcpSubagentBridge>,
     subagent_flush: Option<super::acp_subagent::AcpSubagentFlush>,
-    question_asker: Option<Arc<zuno_acp::AcpQuestionAsker>>,
     permission_asker: Arc<zuno_acp::AcpPermissionAsker>,
     configuration: SessionConfiguration,
     mcp_configuration_digest: String,
@@ -1114,7 +1153,7 @@ impl AcpPlanProjection {
 struct AcpSurfaceContext {
     client: zuno_acp::ClientConnection,
     permission_grants: Arc<zuno_acp::AcpPermissionGrants>,
-    elicitation_form: bool,
+    questions: Arc<zuno_session_control::QuestionService>,
     native_subagents: bool,
     plan_projection: Arc<AcpPlanProjection>,
 }
@@ -1189,11 +1228,12 @@ impl AcpSurfaceContext {
         state: &AcpState,
         client: zuno_acp::ClientConnection,
         plan_projection: Arc<AcpPlanProjection>,
+        questions: Arc<zuno_session_control::QuestionService>,
     ) -> Self {
         Self {
             client,
             permission_grants: Arc::clone(&state.permission_grants),
-            elicitation_form: state.elicitation_form.load(Ordering::Acquire),
+            questions,
             native_subagents: state.native_subagents.load(Ordering::Acquire),
             plan_projection,
         }
@@ -1285,7 +1325,7 @@ async fn open_session_resources_with_mcp(
     let AcpSurfaceContext {
         client,
         permission_grants,
-        elicitation_form,
+        questions,
         native_subagents,
         plan_projection,
     } = surface;
@@ -1322,15 +1362,7 @@ async fn open_session_resources_with_mcp(
         SessionMcpOpening::Reuse(catalog) => (None, Vec::new(), catalog),
     };
     let session_route = Arc::new(zuno_acp::AcpSessionRoute::new(native_subagents));
-    let question_asker = elicitation_form.then(|| {
-        Arc::new(zuno_acp::AcpQuestionAsker::with_route(
-            client.clone(),
-            Arc::clone(&session_route),
-        ))
-    });
-    let question = question_asker
-        .as_ref()
-        .map(|asker| Arc::clone(asker) as Arc<dyn zuno_tools::question::QuestionAsker>);
+    let question = Some(questions as Arc<dyn QuestionPort>);
     let permission_asker = Arc::new(zuno_acp::AcpPermissionAsker::with_grants_and_route(
         client.clone(),
         "Approve Zuno tool call",
@@ -1458,10 +1490,7 @@ async fn open_session_resources_with_mcp(
     host.push_notes(notes);
     let goals = host.goal_store();
     let human_requests = goals.human_requests();
-    permission_asker.attach_durable(human_requests.clone(), Arc::clone(&goals));
-    if let Some(question_asker) = &question_asker {
-        question_asker.attach_durable(human_requests, goals);
-    }
+    permission_asker.attach_durable(human_requests, goals);
     host.activate_background_notifications(&tokio::runtime::Handle::current());
     let slash_catalog = SlashCatalog::new(
         host.commands().cloned().collect::<Vec<_>>(),
@@ -1556,7 +1585,6 @@ async fn open_session_resources_with_mcp(
         mcp,
         subagents,
         subagent_flush,
-        question_asker,
         permission_asker,
         configuration,
         mcp_configuration_digest,
@@ -1640,6 +1668,26 @@ fn persist_dormant_configuration(
 }
 
 impl AcpSession {
+    fn start_question_runtime(
+        self: &Arc<Self>,
+        state: &Arc<AcpState>,
+        client: zuno_acp::ClientConnection,
+    ) {
+        let mut runtime = self
+            .question_runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if runtime
+            .as_ref()
+            .is_some_and(|runtime| !runtime.is_finished())
+        {
+            return;
+        }
+        *runtime = Some(durable_questions::SessionQuestions::start(
+            self, state, client,
+        ));
+    }
+
     pub(super) fn id(&self) -> &str {
         &self.id
     }
@@ -2044,6 +2092,7 @@ impl AcpSession {
                     state,
                     rollback_context.client,
                     Arc::clone(&self.plan_projection),
+                    Arc::clone(&self.questions),
                 ),
                 Some(&rollback_context.build_agent),
                 mcp_servers.as_ref(),
@@ -2313,7 +2362,12 @@ impl AcpSession {
             plan,
             &state.environment,
             state.runs.clone(),
-            AcpSurfaceContext::from_state(state, client.clone(), Arc::clone(&self.plan_projection)),
+            AcpSurfaceContext::from_state(
+                state,
+                client.clone(),
+                Arc::clone(&self.plan_projection),
+                Arc::clone(&self.questions),
+            ),
             Some(&build_agent),
             mcp_servers.as_ref(),
             opening,
@@ -2684,7 +2738,7 @@ impl AcpSession {
             let guard = self
                 .begin_turn()
                 .map_err(|_| command_requires_idle_session(&self.id))?;
-            self.recover_pending_human_requests(client, &guard).await?;
+            self.recover_pending_permissions(client, &guard).await?;
         }
         let context_size = self.context_size().await?;
         let (events, receiver) = event_channel();
@@ -2696,14 +2750,16 @@ impl AcpSession {
                     SessionCommand::Compact
                     | SessionCommand::Goal
                     | SessionCommand::Learn
-                    | SessionCommand::Reflect => resources
+                    | SessionCommand::Reflect
+                    | SessionCommand::Questions => resources
                         .host
                         .execute_session_command(*command, arguments, events.clone())
                         .await
                         .map_err(session_command_rpc_error),
                     SessionCommand::Plan
                     | SessionCommand::StartPlan
-                    | SessionCommand::StartWork => Err(zuno_acp::RpcError::internal(format!(
+                    | SessionCommand::StartWork
+                    | SessionCommand::ResumeWork => Err(zuno_acp::RpcError::internal(format!(
                         "/{} mode control was not handled before host execution",
                         command.name()
                     ))),
@@ -2805,7 +2861,7 @@ impl AcpSession {
         };
         // `owner` is held for the rest of this request: releasing it earlier would
         // let a second prompt claim the session between this request's turns.
-        self.recover_pending_human_requests(client, &guard).await?;
+        self.recover_pending_permissions(client, &guard).await?;
         // The turn is driven from the durable row rather than from the request
         // that wrote it, and the oldest queued prompt is promoted first. A prompt
         // admitted while this session was busy is therefore delivered in
@@ -2858,7 +2914,7 @@ impl AcpSession {
                 }
                 ProjectedTurn::WaitingForHuman(request_id) => {
                     driven?;
-                    if !self.answer_pending_human_request(&request_id).await? {
+                    if !self.answer_pending_permission(&request_id).await? {
                         return Ok(json!({ "stopReason": "end_turn" }));
                     }
                     let guard = self.begin_turn()?;
@@ -2894,11 +2950,11 @@ impl AcpSession {
         }
     }
 
-    async fn answer_pending_human_request(
+    async fn answer_pending_permission(
         &self,
         request_id: &str,
     ) -> Result<bool, zuno_acp::RpcError> {
-        let (request, question, permission) = {
+        let (request, permission) = {
             let resources = self.resources.lock().await;
             let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
             let request = resources
@@ -2912,22 +2968,12 @@ impl AcpSession {
                         "human request `{request_id}` disappeared before presentation"
                     ))
                 })?;
-            (
-                request,
-                resources.question_asker.as_ref().map(Arc::clone),
-                Arc::clone(&resources.permission_asker),
-            )
+            (request, Arc::clone(&resources.permission_asker))
         };
         match request.kind {
-            zuno_db::human_request::HumanRequestKind::Input => {
-                let Some(question) = question else {
-                    return Ok(false);
-                };
-                question
-                    .answer_pending(request_id)
-                    .await
-                    .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))
-            }
+            // Questions are presented by the session task. A prompt reaching this
+            // boundary hands off; neither its lease nor RPC owns the human wait.
+            zuno_db::human_request::HumanRequestKind::Input => Ok(false),
             zuno_db::human_request::HumanRequestKind::Permission => permission
                 .answer_pending(request_id)
                 .await
@@ -2939,7 +2985,7 @@ impl AcpSession {
     ///
     /// `guard` is the caller's live-turn lease. Recovery runs inside it so a
     /// recovered input cannot race the prompt that triggered recovery.
-    async fn recover_pending_human_requests(
+    async fn recover_pending_permissions(
         &self,
         client: &zuno_acp::ClientConnection,
         guard: &SessionRunGuard,
@@ -2955,12 +3001,15 @@ impl AcpSession {
                     .pending(Some(resources.host.session_id()))
                     .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?
                     .into_iter()
-                    .next()
+                    .find(|request| {
+                        request.kind == zuno_db::human_request::HumanRequestKind::Permission
+                    })
                     .map(|request| request.id)
             };
-            if let Some(request_id) = pending_request_id
-                && !self.answer_pending_human_request(&request_id).await?
-            {
+            let Some(request_id) = pending_request_id else {
+                return Ok(());
+            };
+            if !self.answer_pending_permission(&request_id).await? {
                 return Ok(());
             }
 
@@ -2974,7 +3023,7 @@ impl AcpSession {
                 ProjectedTurn::Completed(_) => driven?,
                 ProjectedTurn::WaitingForHuman(request_id) => {
                     driven?;
-                    if !self.answer_pending_human_request(&request_id).await? {
+                    if !self.answer_pending_permission(&request_id).await? {
                         return Ok(());
                     }
                 }
@@ -3009,42 +3058,24 @@ impl AcpSession {
             let resources = self.resources.lock().await;
             let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
             let inbox = resources.host.session_inbox();
-            let pending = inbox
-                .pending(resources.host.session_id())
-                .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
-            let Some((input, drivable)) = pending.into_iter().find_map(|input| {
-                match scope.admits(&input) {
-                    Some(drivable) => Some((input, drivable)),
-                    None => {
-                        tracing::debug!(
-                            target: "zuno::acp::inbox",
-                            session_id = %self.id,
-                            input_id = %input.id,
-                            scope = ?scope,
-                            "pending durable input is outside this drive's scope; leaving it queued"
-                        );
-                        None
-                    }
-                }
-            }) else {
+            let Some((input, drivable)) =
+                durable_questions::next_input(&inbox, resources.host.session_id(), scope)?
+            else {
                 return Ok(None);
             };
-            let promoted = inbox
+            let Some(promoted) = inbox
                 .promote_id(resources.host.session_id(), &input.id)
                 .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?
-                .ok_or_else(|| {
-                    zuno_acp::RpcError::internal(format!(
-                        "durable input `{}` changed before ACP promotion",
-                        input.id
-                    ))
-                })?;
+            else {
+                return Ok(None);
+            };
             (promoted.id, drivable, resources.configuration.context_size)
         };
         let (events, receiver) = event_channel();
         let drive = async {
             let mut resources = self.resources.lock().await;
             let resources = resources.as_mut().ok_or_else(|| self.closed_error())?;
-            let outcome = if let Some(continuation) = drivable.start_work {
+            let outcome = if let Some(continuation) = drivable.work_control {
                 resources
                     .host
                     .drive_promoted_start_work_with_guard(
@@ -3106,14 +3137,12 @@ impl AcpSession {
     async fn has_queued_prompt(&self) -> Result<bool, zuno_acp::RpcError> {
         let resources = self.resources.lock().await;
         let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
-        let pending = resources
-            .host
-            .session_inbox()
-            .pending(resources.host.session_id())
-            .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
-        Ok(pending
-            .iter()
-            .any(|input| DurableInputScope::Prompts.admits(input).is_some()))
+        Ok(durable_questions::next_input(
+            &resources.host.session_inbox(),
+            resources.host.session_id(),
+            DurableInputScope::Prompts,
+        )?
+        .is_some())
     }
 
     async fn drive_goal_continuation(
@@ -3212,6 +3241,25 @@ impl AcpSession {
         }
         self.materialize_for_control().await?;
         match command {
+            SessionCommand::ResumeWork => {
+                let service =
+                    zuno_session_control::SessionControlService::new(Arc::new(durable_pool()?));
+                let execution = service
+                    .state(&self.id)
+                    .map_err(session_control_rpc_error)?
+                    .ok_or_else(|| {
+                        zuno_acp::RpcError::invalid_params("session has no paused execution")
+                    })?;
+                let outcome = service
+                    .resume_session(&self.id, execution.revision, zuno_db::message::now_millis())
+                    .map_err(session_control_rpc_error)?;
+                let response = json!({
+                    "stopReason":"end_turn", "inputId":outcome.input.id,
+                    "cycleId":outcome.state.cycle_id, "started":"queued",
+                });
+                self.spawn_start_work_recovery(state, client);
+                Ok(response)
+            }
             SessionCommand::StartWork => {
                 let risk_reason = parse_start_work_risk(arguments)?;
                 let owner = self.claim_turn(request);
@@ -3278,6 +3326,7 @@ impl AcpSession {
             | SessionCommand::Goal
             | SessionCommand::Learn
             | SessionCommand::Reflect
+            | SessionCommand::Questions
             | SessionCommand::Plan
             | SessionCommand::StartPlan => Err(zuno_acp::RpcError::internal(format!(
                 "/{} is not a mode control",
@@ -3504,7 +3553,12 @@ impl AcpSession {
             plan,
             &state.environment,
             state.runs.clone(),
-            AcpSurfaceContext::from_state(state, client, Arc::clone(&self.plan_projection)),
+            AcpSurfaceContext::from_state(
+                state,
+                client,
+                Arc::clone(&self.plan_projection),
+                Arc::clone(&self.questions),
+            ),
             Some(&dormant.configuration.build_agent),
             mcp_servers.as_ref(),
             SessionMcpOpening::Fresh(mcp_cache),
@@ -3897,6 +3951,14 @@ impl AcpSession {
                 HardInterruptReason::SessionClose,
             ));
         }
+        let question_runtime = self
+            .question_runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(runtime) = question_runtime {
+            runtime.shutdown().await;
+        }
         let _replay = self.replay_gate.lock().await;
         let _mount = self.mount_gate.lock().await;
         let notification_task = self
@@ -4183,6 +4245,7 @@ fn host_options(host: &TurnHost, model: Option<String>) -> TurnOptions {
         variant: None,
         thinking: false,
         tool_authority: None,
+        parent_authority: None,
         extension_composition: ExtensionComposition::Active,
     }
 }
@@ -4592,6 +4655,7 @@ fn session_control_rpc_error(
         | zuno_session_control::SessionControlError::PlanRevisionConflict { .. }
         | zuno_session_control::SessionControlError::ExecutionRevisionConflict { .. }
         | zuno_session_control::SessionControlError::HandoffRequired { .. }
+        | zuno_session_control::SessionControlError::ResumeRejected { .. }
         | zuno_session_control::SessionControlError::DraftReview { .. } => {
             zuno_acp::RpcError::invalid_params(error.to_string())
         }
@@ -5312,7 +5376,7 @@ fn command_requires_idle_session(session_id: &str) -> zuno_acp::RpcError {
 struct AcpDurableInput {
     text: String,
     content: Vec<RequestContentBlock>,
-    start_work: Option<zuno_types::execution::ContinuationToken>,
+    work_control: Option<zuno_types::execution::ContinuationToken>,
 }
 
 /// Which pending durable rows one ACP drive is entitled to claim.
@@ -5328,6 +5392,8 @@ enum DurableInputScope {
     Prompts,
     /// Host-owned collaboration controls admitted by ACP mode commands.
     Controls,
+    /// Settled reports and durable question answers, never ordinary user queries.
+    Automatic,
 }
 
 impl DurableInputScope {
@@ -5339,7 +5405,10 @@ impl DurableInputScope {
         let kind = zuno_db::inbox::DurableInputKind::classify(&input.prompt)?;
         if self == Self::Controls {
             if kind != zuno_db::inbox::DurableInputKind::SessionControl
-                || input.prompt.get("control").and_then(Value::as_str) != Some("start_work")
+                || !matches!(
+                    input.prompt.get("control").and_then(Value::as_str),
+                    Some("start_work" | "resume_work")
+                )
             {
                 return None;
             }
@@ -5348,7 +5417,7 @@ impl DurableInputScope {
             return Some(AcpDurableInput {
                 text: String::new(),
                 content: Vec::new(),
-                start_work: Some(continuation),
+                work_control: Some(continuation),
             });
         }
         let owned = match self {
@@ -5359,6 +5428,10 @@ impl DurableInputScope {
                     | zuno_db::inbox::DurableInputKind::SessionMessage
             ),
             Self::Controls => unreachable!("controls returned above"),
+            Self::Automatic => {
+                kind == zuno_db::inbox::DurableInputKind::HumanRequestAnswer
+                    || kind.is_asynchronous_report()
+            }
         };
         if !owned {
             return None;
@@ -5371,7 +5444,7 @@ impl DurableInputScope {
         Some(AcpDurableInput {
             text,
             content,
-            start_work: None,
+            work_control: None,
         })
     }
 }
@@ -5810,7 +5883,9 @@ mod tests {
                 "goal",
                 "learn",
                 "plan",
+                "questions",
                 "reflect",
+                "resume",
                 "start-plan",
                 "start-work",
                 "review",
@@ -5827,8 +5902,8 @@ mod tests {
             advertised[2]["input"]["hint"],
             "remember|issue|solved|forget|promote|feedback ..."
         );
-        assert_eq!(advertised[4]["input"]["hint"], "turn | session");
-        assert_eq!(advertised[7]["input"]["hint"], "question");
+        assert_eq!(advertised[5]["input"]["hint"], "turn | session");
+        assert_eq!(advertised[9]["input"]["hint"], "question");
     }
 
     #[test]

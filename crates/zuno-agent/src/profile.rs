@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 
 use zuno_catalog::agent::Agent;
-use zuno_permission::visibility::is_tool_hidden;
+use zuno_permission::visibility::{is_tool_hidden, permission_key};
 use zuno_permission::{PermissionAction, Rule};
 
 use crate::builtin::{self, ExtensionTools};
@@ -28,6 +28,7 @@ pub struct CapabilityPolicy {
     rules: Vec<Rule>,
     delegation_targets: Option<Vec<String>>,
     tool_authority: Option<BTreeSet<String>>,
+    inherited_shell_access: Option<ShellFilesystemAccess>,
 }
 
 impl CapabilityPolicy {
@@ -42,6 +43,7 @@ impl CapabilityPolicy {
                     .collect()
             }),
             tool_authority: None,
+            inherited_shell_access: None,
         }
     }
 
@@ -89,12 +91,16 @@ impl CapabilityPolicy {
             .any(|tool| self.tool_available(tool))
     }
 
-    /// Filesystem authority derived from the effective edit capability.
+    /// Filesystem authority for Shell.
     ///
-    /// This uses the frozen rules and parent-attempt authority, so a custom or
-    /// delegated Agent cannot regain write access merely by retaining Shell.
+    /// Root profiles derive this from edit capability. Delegated profiles retain
+    /// the parent's actual contract, further narrowed by an explicit read-only
+    /// role; missing edit schemas alone do not prohibit writing Shell scripts.
     #[must_use]
     pub fn shell_filesystem_access(&self) -> ShellFilesystemAccess {
+        if let Some(inherited) = self.inherited_shell_access {
+            return inherited;
+        }
         if self.can_edit() {
             ShellFilesystemAccess::WorkspaceWrite
         } else {
@@ -154,14 +160,139 @@ impl AgentProfile {
         }
     }
 
-    /// Restrict this profile to the tools visible in the delegating attempt.
+    /// Restrict this profile to the tools authorized by the delegating attempt.
     ///
     /// Role rules remain intact for auditability, but every runtime and prompt
     /// capability query observes the intersection. A child can therefore reduce
-    /// authority further and can never regain a tool omitted from its parent request.
+    /// authority further and can never regain a tool omitted from its parent authority.
     #[must_use]
     pub fn with_tool_authority(mut self, tools: impl IntoIterator<Item = String>) -> Self {
-        self.capabilities.tool_authority = Some(tools.into_iter().collect());
+        let mut authority = tools.into_iter().collect::<BTreeSet<_>>();
+        if let Some(previous) = &self.capabilities.tool_authority {
+            authority.retain(|tool| previous.contains(tool));
+        }
+        self.capabilities.tool_authority = Some(authority);
+        self
+    }
+
+    /// Derive delegated authority from the parent's effective policy.
+    ///
+    /// Parent rules retain their original order, sources, and resource patterns.
+    /// Ordinary children inherit the authorized tool set, including deferred
+    /// tools; native read-only roles and explicit tool allowlists narrow it.
+    /// Native no-children responsibilities remain terminal delegation denials.
+    ///
+    /// `shell_access` describes the parent's actual filesystem contract. Shell
+    /// may run writing scripts without a separate edit tool, so the delegated
+    /// contract must not be reconstructed from provider-visible edit schemas.
+    #[must_use]
+    pub fn with_parent_authority(
+        mut self,
+        rules: Vec<Rule>,
+        tools: impl IntoIterator<Item = String>,
+        shell_access: ShellFilesystemAccess,
+    ) -> Self {
+        self = self.with_tool_authority(tools);
+        let native = self
+            .definition
+            .source
+            .is_native()
+            .then(|| builtin::get(&self.definition.name, self.vision_available))
+            .flatten();
+        let catalog_role = self
+            .definition
+            .source
+            .is_native()
+            .then(|| zuno_catalog::agent::builtin::get(&self.definition.name))
+            .flatten();
+        let readonly = native.is_some_and(|role| role.write == builtin::Write::ReadOnly)
+            || catalog_role
+                .as_ref()
+                .is_some_and(|role| matches!(role.name, "plan" | "review"));
+        let role_rules = catalog_role
+            .and_then(|role| role.permission_overlay())
+            .map(|permissions| zuno_permission::rules_from_config(&permissions));
+        let no_children =
+            native.is_some_and(|role| role.delegation == builtin::Delegation::NoChildren);
+        let authority = self
+            .capabilities
+            .tool_authority
+            .as_mut()
+            .expect("parent tool authority was installed");
+        let mut denied = BTreeSet::new();
+        authority.retain(|tool| {
+            let allowed = self
+                .definition
+                .tools
+                .as_ref()
+                .is_none_or(|allowed| allowed.iter().any(|declared| declared == tool))
+                && (!readonly
+                    || role_rules
+                        .as_ref()
+                        .is_some_and(|role_rules| !is_tool_hidden(tool, role_rules)))
+                && (!no_children
+                    || !matches!(
+                        tool.as_str(),
+                        "task"
+                            | "job"
+                            | "job_cancel"
+                            | "job_reconcile"
+                            | "workflow"
+                            | "council_run"
+                    ));
+            if !allowed {
+                denied.insert(permission_key(tool).to_owned());
+            }
+            allowed
+        });
+        let retained_keys = authority
+            .iter()
+            .map(|tool| permission_key(tool).to_owned())
+            .collect::<BTreeSet<_>>();
+        denied.retain(|key| !retained_keys.contains(key));
+        if readonly {
+            // Deny the whole alias family even if no edit schema happened to be
+            // exposed by the parent. allow_all cannot bypass explicit denies.
+            denied.insert("edit".to_owned());
+            denied.insert("memory_update".to_owned());
+        }
+        if no_children {
+            denied.insert("task".to_owned());
+        }
+        self.capabilities.rules = rules;
+        if !matches!(
+            &self.definition.source,
+            zuno_catalog::agent::AgentSource::Native
+        ) && let Some(permission) = &self.definition.permission
+        {
+            // A role cannot supply new grants over its parent. Its explicit
+            // user prohibitions still bind, including resource-specific denials.
+            // A materialized native '*':deny baseline is not a user override.
+            self.capabilities.rules.extend(
+                zuno_permission::rules_from_config(permission)
+                    .into_iter()
+                    .filter(|rule| rule.action == PermissionAction::Deny)
+                    .map(|rule| {
+                        rule.with_source(format!("agent:{}.permission", self.definition.name))
+                    }),
+            );
+        }
+        self.capabilities
+            .rules
+            .extend(denied.into_iter().map(|permission| Rule {
+                source: Some(format!("child_role:{}", self.definition.name)),
+                permission,
+                pattern: "*".to_owned(),
+                action: PermissionAction::Deny,
+            }));
+        self.capabilities.inherited_shell_access = Some(if readonly {
+            ShellFilesystemAccess::ReadOnly
+        } else {
+            shell_access
+        });
+        // The parent already resolved extension grants and user overrides.
+        // Reapplying that composition here could turn an inherited ask into allow.
+        self.extension_rule_index = None;
         self
     }
 

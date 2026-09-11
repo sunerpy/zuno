@@ -235,6 +235,30 @@ impl BackgroundTool {
             )
             .map_err(failed)
     }
+
+    /// Claim only the terminal state this read actually exposes, after its output
+    /// window was read successfully. Running snapshots must leave callback delivery
+    /// available even if the process settles immediately after the snapshot.
+    fn consume_terminal_inline(&self, info: &BackgroundExecutionInfo) -> Result<bool, ToolError> {
+        if !info.status.is_terminal() {
+            return Ok(false);
+        }
+        let Some(delivery) = &self.completion_delivery else {
+            return Ok(false);
+        };
+        let envelope = background_completion_envelope(info);
+        let completed_at = completion_time(info);
+        delivery
+            .publish(envelope.clone(), completed_at)
+            .map_err(failed)?;
+        delivery
+            .claim_inline(
+                &envelope.source_key,
+                zuno_db::message::now_millis().max(completed_at),
+            )
+            .map(|claimed| claimed.is_some())
+            .map_err(failed)
+    }
 }
 
 #[async_trait]
@@ -293,6 +317,10 @@ impl TypedTool for BackgroundTool {
                 let window = self.window(&id, params.cursor, params.limit)?;
                 let title = format!("{}: {}", id, info.status.as_str());
                 let mut fields = render_window(&window);
+                fields.insert(
+                    "completionClaimedInline".to_owned(),
+                    Value::Bool(self.consume_terminal_inline(&info)?),
+                );
                 fields.insert("execution".to_owned(), render_info(info));
                 render(title, BACKGROUND_METADATA_KEY, Value::Object(fields))
             }
@@ -314,26 +342,9 @@ impl TypedTool for BackgroundTool {
                 let title = format!("{}: {}", id, waited.info.status.as_str());
                 let mut fields = render_window(&window);
                 fields.insert("waitTimedOut".to_owned(), Value::Bool(waited.timed_out));
-                let claimed_inline = if waited.info.status.is_terminal() {
-                    match &self.completion_delivery {
-                        Some(delivery) => {
-                            let envelope = background_completion_envelope(&waited.info);
-                            delivery
-                                .publish(envelope.clone(), completion_time(&waited.info))
-                                .map_err(failed)?;
-                            delivery
-                                .claim_inline(&envelope.source_key, completion_time(&waited.info))
-                                .map_err(failed)?
-                                .is_some()
-                        }
-                        None => false,
-                    }
-                } else {
-                    false
-                };
                 fields.insert(
                     "completionClaimedInline".to_owned(),
-                    Value::Bool(claimed_inline),
+                    Value::Bool(self.consume_terminal_inline(&waited.info)?),
                 );
                 fields.insert("execution".to_owned(), render_info(waited.info));
                 render(title, BACKGROUND_METADATA_KEY, Value::Object(fields))
@@ -411,7 +422,7 @@ impl TypedTool for BackgroundTool {
     }
 }
 
-/// Deterministic terminal identity shared by synchronous wait and callback delivery.
+/// Deterministic terminal identity shared by explicit reads and callback delivery.
 #[must_use]
 pub fn background_completion_source_key(info: &BackgroundExecutionInfo) -> String {
     format!("background:{}:{}", info.id.as_str(), info.time_updated)
@@ -425,7 +436,7 @@ pub fn background_completion_envelope(info: &BackgroundExecutionInfo) -> Complet
         source: CompletionSource::BackgroundExecution,
         terminal_revision: u64::try_from(info.time_updated).unwrap_or_default(),
         parent_session_id: info.session_id.clone(),
-        cycle_id: None,
+        cycle_id: info.cycle_id.clone(),
         payload: background_completion_payload(info),
     }
 }
@@ -442,6 +453,7 @@ pub fn background_completion_input(info: &BackgroundExecutionInfo) -> NewSession
     )
     .with_source_key(background_completion_source_key(info))
     .with_trigger_kind(InputTriggerKind::Automatic)
+    .with_cycle_id(info.cycle_id.clone())
 }
 
 fn background_completion_payload(info: &BackgroundExecutionInfo) -> Value {
@@ -570,6 +582,7 @@ fn render_info(info: BackgroundExecutionInfo) -> Value {
     json!({
         "taskID": info.id.as_str(),
         "sessionID": info.session_id,
+        "cycleID": info.cycle_id,
         "title": info.title,
         "command": info.command,
         "purpose": info.purpose.as_str(),

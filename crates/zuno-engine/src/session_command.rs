@@ -13,6 +13,10 @@ pub enum SessionCommand {
     Reflect,
     /// Enter Plan mode idempotently.
     Plan,
+    /// List pending durable questions without exposing unsubmitted draft contents.
+    Questions,
+    /// Explicitly resume previously authorized Work without approving a Plan.
+    ResumeWork,
     /// Enter the read-only planning Agent immediately.
     StartPlan,
     /// Resume implementation from the durable plan.
@@ -21,12 +25,14 @@ pub enum SessionCommand {
 
 impl SessionCommand {
     /// Every native session command clients may advertise.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::Compact,
         Self::Goal,
         Self::Learn,
         Self::Plan,
+        Self::Questions,
         Self::Reflect,
+        Self::ResumeWork,
         Self::StartPlan,
         Self::StartWork,
     ];
@@ -40,6 +46,8 @@ impl SessionCommand {
             Self::Learn => "learn",
             Self::Reflect => "reflect",
             Self::Plan => "plan",
+            Self::Questions => "questions",
+            Self::ResumeWork => "resume",
             Self::StartPlan => "start-plan",
             Self::StartWork => "start-work",
         }
@@ -54,6 +62,8 @@ impl SessionCommand {
             Self::Learn => "View or manage durable user experiences and reviewed Skill candidates",
             Self::Reflect => "Extract learning from the latest turn or the durable session",
             Self::Plan => "Enter read-only Plan mode idempotently",
+            Self::Questions => "List or reopen pending durable questions",
+            Self::ResumeWork => "Explicitly resume paused authorized Work",
             Self::StartPlan => "Enter read-only Plan mode immediately",
             Self::StartWork => "Resume implementation from the durable plan",
         }
@@ -76,14 +86,19 @@ impl SessionCommand {
             Self::Learn => Some("remember|issue|solved|forget|promote|feedback ..."),
             Self::Reflect => Some("turn | session"),
             Self::StartWork => Some("[--accept-draft-risk <reason>]"),
-            Self::Compact | Self::Plan | Self::StartPlan => None,
+            Self::Compact | Self::Plan | Self::StartPlan | Self::Questions | Self::ResumeWork => {
+                None
+            }
         }
     }
 
     /// Whether the command replaces the active collaboration-mode host.
     #[must_use]
     pub const fn is_mode_control(self) -> bool {
-        matches!(self, Self::Plan | Self::StartPlan | Self::StartWork)
+        matches!(
+            self,
+            Self::Plan | Self::StartPlan | Self::StartWork | Self::ResumeWork
+        )
     }
 
     /// Resolve one exact native command name.
@@ -115,7 +130,9 @@ mod tests {
                 "goal",
                 "learn",
                 "plan",
+                "questions",
                 "reflect",
+                "resume",
                 "start-plan",
                 "start-work"
             ]

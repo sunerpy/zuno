@@ -19,6 +19,12 @@ use zuno_server::{
 };
 
 use zuno_server::api::{self, ApiState};
+use zuno_session_control::QuestionService;
+use zuno_tool::question::QuestionPort;
+use zuno_types::question::{
+    QuestionAction, QuestionCommand, QuestionMode, QuestionOrigin, QuestionPrompt, QuestionPurpose,
+    QuestionSpec,
+};
 
 fn event(ordinal: u64) -> NewEvent {
     let mut properties = Map::new();
@@ -158,6 +164,252 @@ async fn global_event_stream_emits_connected_then_published_events() {
     // Then: the global stream carries asynchronous events, not only a route or heartbeat.
     assert_eq!(published["type"], "test.event");
     assert_eq!(published["data"]["ordinal"], json!(7));
+}
+
+fn native_question(session_id: &str) -> QuestionSpec {
+    QuestionSpec {
+        origin: QuestionOrigin {
+            session_id: session_id.to_owned(),
+            message_id: None,
+            call_id: None,
+            turn_id: None,
+            goal_id: None,
+        },
+        mode: QuestionMode::Deferred,
+        purpose: QuestionPurpose::Clarification,
+        questions: vec![
+            QuestionPrompt::new("Which environment?", "Environment", Vec::new()).into_request(),
+        ],
+        expected_goal_revision: None,
+        plan: None,
+    }
+}
+
+#[tokio::test]
+async fn question_notifications_forward_committed_events_without_reappending() {
+    let (pool, events) = event_service(16);
+    create_session(&pool, "ses_question_events");
+    events
+        .publish(
+            "ses_question_events",
+            NewEvent::new("session.created", Map::new()).expect("creation event"),
+        )
+        .await
+        .expect("publish creation");
+    let questions = QuestionService::new(Arc::clone(&pool));
+    let changes = questions.subscribe();
+    let forwarded = events.clone();
+    let forwarder = tokio::spawn(async move { forwarded.forward_question_events(changes).await });
+    let app = event_app(events.clone());
+    let mut global = open_stream_at(&app, "/api/event", None).await;
+    assert_eq!(
+        decode_frame(&next_frame(&mut global).await).1["type"],
+        "server.connected"
+    );
+    let mut session = open_stream(&app, "ses_question_events", None).await;
+    assert_eq!(
+        decode_frame(&next_frame(&mut session).await).1["type"],
+        "session.created"
+    );
+
+    let opened = questions
+        .open(native_question("ses_question_events"))
+        .await
+        .expect("question");
+    let persisted = events
+        .replay("ses_question_events", None)
+        .await
+        .expect("replay");
+    let source = persisted
+        .iter()
+        .find(|event| event.event_type() == "question.opened")
+        .expect("committed question");
+    for stream in [&mut global, &mut session] {
+        let frame = tokio::time::timeout(Duration::from_secs(2), next_frame(stream))
+            .await
+            .expect("question event");
+        let (cursor, payload) = decode_frame(&frame);
+        assert_eq!(payload["id"], source.id());
+        assert_eq!(cursor.as_ref(), Some(source.cursor()));
+        assert_eq!(payload["type"], source.event_type());
+        assert_eq!(payload["data"]["question"], json!(opened.question));
+    }
+    assert_eq!(
+        events
+            .replay("ses_question_events", None)
+            .await
+            .expect("replay")
+            .len(),
+        persisted.len()
+    );
+
+    let command = QuestionCommand {
+        command_id: "defer".to_owned(),
+        expected_revision: opened.question.revision,
+        action: QuestionAction::Defer {
+            draft_answers: std::collections::BTreeMap::from([(
+                opened.question.questions[0].id.clone(),
+                vec!["client-only-draft".to_owned()],
+            )]),
+        },
+    };
+    let deferred = questions
+        .apply("ses_question_events", &opened.question.id, command.clone())
+        .await
+        .expect("defer");
+    assert!(deferred.input_id.is_none());
+    assert!(
+        zuno_db::inbox::SessionInbox::new(Arc::clone(&pool))
+            .pending("ses_question_events")
+            .expect("inbox")
+            .is_empty()
+    );
+    for stream in [&mut global, &mut session] {
+        let frame = tokio::time::timeout(Duration::from_secs(2), next_frame(stream))
+            .await
+            .expect("update event");
+        let (_, payload) = decode_frame(&frame);
+        assert_eq!(payload["type"], "question.updated");
+        assert_eq!(payload["data"]["question"]["id"], opened.question.id);
+        assert_eq!(
+            payload["data"]["question"]["draftAnswers"],
+            json!(deferred.question.draft_answers)
+        );
+    }
+    let before = events
+        .replay("ses_question_events", None)
+        .await
+        .expect("replay")
+        .len();
+    let duplicate = questions
+        .apply("ses_question_events", &opened.question.id, command)
+        .await
+        .expect("duplicate");
+    assert!(duplicate.duplicate);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), next_frame(&mut global))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        events
+            .replay("ses_question_events", None)
+            .await
+            .expect("replay")
+            .len(),
+        before
+    );
+    drop(questions);
+    tokio::time::timeout(Duration::from_secs(2), forwarder)
+        .await
+        .expect("forwarder exits")
+        .expect("forwarder joins")
+        .expect("forwarder succeeds");
+}
+
+#[tokio::test]
+async fn lagged_question_notifications_recover_even_a_missed_sessions_commits() {
+    let (pool, events) = event_service(16);
+    for session in ["ses_question_a", "ses_question_b"] {
+        create_session(&pool, session);
+    }
+    let questions = QuestionService::new(pool);
+    let first = questions
+        .open(native_question("ses_question_a"))
+        .await
+        .expect("first");
+    let second = questions
+        .open(native_question("ses_question_b"))
+        .await
+        .expect("second");
+    let (changes, receiver) = tokio::sync::broadcast::channel(1);
+    changes.send(first.clone()).expect("first hint");
+    changes
+        .send(second.clone())
+        .expect("second hint replaces the retained first hint");
+    let app = event_app(events.clone());
+    let mut global = open_stream_at(&app, "/api/event", None).await;
+    next_frame(&mut global).await;
+    let forwarded = events.clone();
+    let forwarder = tokio::spawn(async move { forwarded.forward_question_events(receiver).await });
+    let mut ids = std::collections::BTreeSet::new();
+    for _ in 0..2 {
+        let frame = tokio::time::timeout(Duration::from_secs(2), next_frame(&mut global))
+            .await
+            .expect("catch-up event");
+        ids.insert(
+            decode_frame(&frame).1["data"]["question"]["id"]
+                .as_str()
+                .expect("question ID")
+                .to_owned(),
+        );
+    }
+    assert_eq!(
+        ids,
+        std::collections::BTreeSet::from([first.question.id, second.question.id.clone()])
+    );
+    changes.send(second).expect("repeated hint");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), next_frame(&mut global))
+            .await
+            .is_err()
+    );
+    drop(changes);
+    tokio::time::timeout(Duration::from_secs(2), forwarder)
+        .await
+        .expect("forwarder exits")
+        .expect("forwarder joins")
+        .expect("forwarder succeeds");
+}
+
+#[tokio::test]
+async fn session_stream_fills_a_question_gap_and_ignores_its_delayed_notification() {
+    let (pool, events) = event_service(16);
+    create_session(&pool, "ses_question_gap");
+    events
+        .publish(
+            "ses_question_gap",
+            NewEvent::new("session.created", Map::new()).expect("creation event"),
+        )
+        .await
+        .expect("publish creation");
+    let app = event_app(events.clone());
+    let mut stream = open_stream(&app, "ses_question_gap", None).await;
+    next_frame(&mut stream).await;
+    let questions = QuestionService::new(Arc::clone(&pool));
+    questions
+        .open(native_question("ses_question_gap"))
+        .await
+        .expect("commit without a live forwarder");
+    let next = events
+        .publish("ses_question_gap", event(2))
+        .await
+        .expect("later producer publishes");
+    let first = tokio::time::timeout(Duration::from_secs(2), next_frame(&mut stream))
+        .await
+        .expect("fill gap");
+    assert_eq!(decode_frame(&first).1["type"], "question.opened");
+    let second = tokio::time::timeout(Duration::from_secs(2), next_frame(&mut stream))
+        .await
+        .expect("later event");
+    assert_eq!(decode_frame(&second).0.as_ref(), Some(next.cursor()));
+    let log = zuno_db::event_log::SessionEventLog::new(pool);
+    let before = log.read_after("ses_question_gap", None).expect("log");
+    let delayed = before
+        .iter()
+        .find(|event| event.event_type == "question.opened")
+        .expect("question")
+        .clone();
+    events.announce_committed(delayed);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), next_frame(&mut stream))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        log.read_after("ses_question_gap", None).expect("log"),
+        before
+    );
 }
 
 #[tokio::test]

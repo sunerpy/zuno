@@ -1,9 +1,9 @@
 # Zuno 数据库生命周期
 
-Zuno 管理自己的配置根目录和数据根目录。当前数据库格式为 12。空数据库直接创建为当前
+Zuno 管理自己的配置根目录和数据根目录。当前数据库格式为 13。空数据库直接创建为当前
 格式；受支持的旧格式通过受保护的前向迁移升级。format 5 是第一个受支持的历史格式，
-format 5 到 format 11 都会原地升级到 format 12，不需要重建数据库。
-迁移链显式覆盖 format 5、format 6、format 7、format 8、format 9、format 10 与 format 11。
+format 5 到 format 12 都会原地升级到 format 13，不需要重建数据库。
+迁移链显式覆盖 format 5、format 6、format 7、format 8、format 9、format 10、format 11 与 format 12。
 
 ## Channel 数据库
 
@@ -49,11 +49,11 @@ zuno session list
 
 数据库打开流程识别以下状态：
 
-1. **空数据库。** 完整的 format-12 schema 与唯一 `zuno_schema` marker 被原子创建。
-2. **Format 12。** 应用查询前校验 marker、表、约束、索引和触发器。
-3. **Format 5–11。** 在同一事务中按顺序执行所有剩余迁移：学习（6）、Plan 栈（7）、
+1. **空数据库。** 完整的 format-13 schema 与唯一 `zuno_schema` marker 被原子创建。
+2. **Format 13。** 应用查询前校验 marker、表、约束、索引和触发器。
+3. **Format 5–12。** 在同一事务中按顺序执行所有剩余迁移：学习（6）、Plan 栈（7）、
    验证账本（8）、会话记忆策略（9）、执行／收件箱状态（10）、记忆版本与检索（11）、
-   自动记忆来源与处理水位（12）。
+   自动记忆来源与处理水位（12）、持久问题与会话调度（13）。
 4. **其他任何状态。** 不受支持的更旧格式、未来格式、缺少 marker，或 marker 与必需
    表不匹配，都会失败关闭且不修改文件。
 
@@ -62,11 +62,11 @@ zuno session list
 总共最多尝试四次。不支持的 format 仍然报告为 schema 不匹配；如果 format 在打开过程中
 持续变化，则以 `zuno_schema` marker 上的冲突失败关闭。两种路径都不会写库。
 
-### Format 5–11 到 format 12
+### Format 5–12 到 format 13
 
 受支持的迁移使用一个 SQLite `BEGIN IMMEDIATE` 事务：
 
-1. 重新读取表清单，并要求 marker 恰好为 format 5、6、7、8、9、10 或 11。
+1. 重新读取表清单，并要求 marker 恰好为 format 5、6、7、8、9、10、11 或 12。
 2. 在任何变更前要求历史 `session` 与 `work_plan` 表存在。
 3. 从 format 5 出发时，创建全部 format-6 learning 表和索引。
 4. 从 format 5 或 6 出发时，增加可空的 `parent_plan_id`、默认值为 0 的 `stack_depth`
@@ -81,11 +81,15 @@ zuno session list
 9. 增加候选的可空 `base_revision`／`evidence` 字段、`resident_memory_provenance`、
    `memory_maintenance_state` 及其索引。回填可精确关联的自动记忆来源，不把用户后来的修改
    重新归类为自动记忆。
-10. 最后用精确旧值条件把 marker 更新为 12；全部成功后才提交。
+10. 创建 `question_interaction`、`question_action_receipt` 及索引；为有效旧问题添加带稳定
+    问题项 ID 的 companion row，不改写原 `human_request` payload/response。
+11. 为 `session_execution_state` 添加可空 `scheduling`。仅在最新结构化 driver event
+    确切为 `paused/no_progress` 时修复错误保留 `running` 的旧行，保留周期和进度。
+12. 最后用精确旧值条件把 marker 更新为 13；全部成功后才提交。
 
 任何失败都会回滚整个事务。迁移不会重写已有的 `session`、`message`、
 `memory_candidate`、`verification_receipt` 或 `work_plan` 值；来源验证和租约仅执行已说明的回填。
-测试使用 format-5 到 format-11 的精确发布 fixture，比较 Session、Message、Memory 等保留值，
+测试使用 format-5 到 format-12 的精确发布 fixture，比较 Session、Message、Memory 等保留值，
 再验证新增对象和 marker。Format-11 用例包含已经发布的记忆版本，并验证最后一个索引创建失败时
 整个升级回滚。不需要重建用户数据库。
 
@@ -97,10 +101,18 @@ zuno session list
 读取 Plan 与 review gate、更新 Goal、写入 Work authorization，并接纳 `UserControl` 输入。
 
 `completion_delivery` 是后台命令、子 Agent、workflow 与 product Agent 的 exactly-once
-消费权账本。同步 `bg wait` 与异步 callback 竞争唯一的 `inline` 或 `callback` owner；
+消费权账本。终态 `bg output`、同步 `bg wait` 与异步 callback 竞争唯一的 `inline` 或 `callback` owner；
 失败的一方不能再接纳第二个 turn。`session_input.source_key` 保证重启后的 producer
 幂等接纳，`trigger_kind` 则区分 user、control、automatic 与 recovery turn，无需伪造
 user message。
+
+没有 Goal 的普通会话也使用可执行、指定人工/外部等待、暂停、完成这套调度状态。
+callback 不能解除无关等待，也不能伪造来源周期。经验证的回答和显式恢复控制通过同一个
+事务性 inbox 消费门控进入模型。
+
+问题把已提交回答与 `draftAnswers` 分开保存；“稍后”和空回答不产生模型输入。
+revision 与 command receipt 保障幂等。Plan 批准绑定精确 Plan/review/Work 身份与
+来源周期，提前批准只有在该逻辑周期正常交接后才可生效。
 
 ### Per-session memory policy
 

@@ -334,7 +334,7 @@ impl Tool for WaitingForHumanTool {
     }
 }
 
-struct PresentedResultTool;
+struct PresentedResultTool(QuestionResultStatus);
 
 #[async_trait]
 impl Tool for PresentedResultTool {
@@ -355,14 +355,12 @@ impl Tool for PresentedResultTool {
     }
 
     async fn execute(&self, _args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
-        Ok(ToolOutput::text("Answered", "accepted").with_presentation(
-            ToolResultPresentation::Question(QuestionResultPresentation::new(
-                QuestionResultStatus::Answered,
-                Some(vec![vec!["SQLite".to_owned()]]),
-                1,
-                12,
-            )),
-        ))
+        Ok(ToolOutput::text(self.0.label(), "Question receipt")
+            .with_metadata(METADATA_HUMAN_REQUEST_ID_KEY, "que_dispatch_receipt")
+            .with_metadata("questionStatus", self.0.as_str())
+            .with_presentation(ToolResultPresentation::Question(
+                QuestionResultPresentation::new(self.0, None, 1, 12),
+            )))
     }
 }
 
@@ -941,6 +939,19 @@ async fn a_human_request_stops_after_its_result_is_durable() {
 
 #[tokio::test]
 async fn typed_result_presentation_precedes_the_completed_dispatch_event() {
+    for status in [
+        QuestionResultStatus::Pending,
+        QuestionResultStatus::Deferred,
+        QuestionResultStatus::Answered,
+        QuestionResultStatus::Cancelled,
+        QuestionResultStatus::Expired,
+        QuestionResultStatus::Failed,
+    ] {
+        assert_question_receipt_precedes_completion(status).await;
+    }
+}
+
+async fn assert_question_receipt_precedes_completion(status: QuestionResultStatus) {
     let mut connection = seeded();
     let provider = Arc::new(ScriptedProvider::new(named_provider_events(
         "presented",
@@ -948,7 +959,7 @@ async fn typed_result_presentation_precedes_the_completed_dispatch_event() {
     )));
     let providers = registry(provider);
     let dispatcher = ToolRegistryDispatcher::new(
-        vec![Arc::new(PresentedResultTool)],
+        vec![Arc::new(PresentedResultTool(status))],
         vec![Rule {
             source: None,
             permission: "*".to_owned(),
@@ -993,8 +1004,8 @@ async fn typed_result_presentation_precedes_the_completed_dispatch_event() {
                     presentation: ToolResultPresentation::Question(question),
                     ..
                 } if call_id == "call-presented"
-                    && question.status() == QuestionResultStatus::Answered
-                    && question.answers() == Some(&[vec!["SQLite".to_owned()]][..])
+                    && question.status() == status
+                    && question.answers().is_none()
             )
         })
         .expect("typed presentation event");

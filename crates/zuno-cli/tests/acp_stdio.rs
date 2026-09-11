@@ -1316,7 +1316,12 @@ fn request_with_elicitation(
                     .expect("elicitation request id must be a string");
                 let request = response["params"].clone();
                 assert_eq!(request["sessionId"], expected_session_id);
-                assert_eq!(request["toolCallId"], "call_question");
+                assert!(
+                    request.get("toolCallId").is_none(),
+                    "a durable form is not owned by a tool RPC"
+                );
+                assert!(request["_meta"]["zuno"]["questionId"].as_str().is_some());
+                assert_eq!(request["_meta"]["zuno"]["questionRevision"], 1);
                 assert_eq!(request["mode"], "form");
                 assert_eq!(request["message"], "Which database?");
 
@@ -1334,7 +1339,7 @@ fn request_with_elicitation(
                         .len(),
                     2
                 );
-                let choice = &schema["properties"]["q0_choice"];
+                let choice = &schema["properties"]["choice:q1"];
                 assert_eq!(choice["type"], "string");
                 assert_eq!(choice["title"], "Database");
                 assert_eq!(choice["description"], "Which database?");
@@ -1345,10 +1350,13 @@ fn request_with_elicitation(
                 assert_eq!(options[1]["const"], "SQLite");
                 assert_eq!(options[1]["description"], "Embedded database");
 
-                let custom = &schema["properties"]["q0_custom"];
+                let custom = &schema["properties"]["custom:q1"];
                 assert_eq!(custom["type"], "string");
                 assert_eq!(custom["title"], "Database — Other");
-                assert_eq!(custom["minLength"], 1);
+                assert!(
+                    custom.get("minLength").is_none(),
+                    "empty input may be deferred"
+                );
                 assert!(custom["description"].as_str().is_some_and(|description| {
                     description.contains("Which database?") && description.contains("custom answer")
                 }));
@@ -1358,7 +1366,7 @@ fn request_with_elicitation(
                     "id": request_id,
                     "result": {
                         "action": "accept",
-                        "content": {"q0_choice": "SQLite"}
+                        "content": {"choice:q1": "SQLite"}
                     }
                 });
                 writeln!(
@@ -2704,7 +2712,7 @@ async fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
         .as_array()
         .expect("available commands")
         .iter()
-        .take(7)
+        .take(9)
         .map(|command| command["name"].as_str().expect("command name"))
         .collect::<Vec<_>>();
     assert_eq!(
@@ -2714,7 +2722,9 @@ async fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
             "goal",
             "learn",
             "plan",
+            "questions",
             "reflect",
+            "resume",
             "start-plan",
             "start-work"
         ]
@@ -5238,7 +5248,10 @@ async fn acp_plan_round_trips_question_tool_through_stable_elicitation() {
         &session_id,
     );
     assert_eq!(completed["stopReason"], "end_turn");
-    assert_eq!(elicitation["toolCallId"], "call_question");
+    assert!(elicitation.get("toolCallId").is_none());
+    let question_id = elicitation["_meta"]["zuno"]["questionId"]
+        .as_str()
+        .expect("durable question id");
     let continuing_index = updates
         .iter()
         .position(|update| {
@@ -5282,15 +5295,43 @@ async fn acp_plan_round_trips_question_tool_through_stable_elicitation() {
             let body: Value = serde_json::from_slice(&request.body).expect("provider request JSON");
             body["messages"].as_array().is_some_and(|messages| {
                 messages.iter().any(|message| {
-                    message["role"] == "tool"
-                        && message["tool_call_id"] == "call_question"
+                    message["role"] == "user"
                         && message["content"].as_str().is_some_and(|content| {
-                            content.contains(r#""Which database?"="SQLite""#)
+                            content.contains(question_id) && content.contains("SQLite")
                         })
                 })
             })
         }),
-        "provider never received the accepted question answer: {received:?}"
+        "provider never received the durable inbox answer: {received:?}"
+    );
+    let final_request: Value =
+        serde_json::from_slice(&received.last().expect("final provider request").body)
+            .expect("provider request");
+    let messages = final_request["messages"].as_array().expect("messages");
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| {
+                message["role"] == "user"
+                    && message["content"].as_str().is_some_and(|content| {
+                        content.contains(question_id) && content.contains("SQLite")
+                    })
+            })
+            .count(),
+        1,
+        "one accepted answer enters the provider once"
+    );
+    assert!(
+        messages
+            .iter()
+            .filter(
+                |message| message["role"] == "tool" && message["tool_call_id"] == "call_question"
+            )
+            .all(|message| !message["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("SQLite")),
+        "the question tool result is a receipt, not another delivery of the answer"
     );
 
     drop(stdin);

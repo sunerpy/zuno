@@ -88,7 +88,8 @@ async fn the_default_profile_publishes_only_complete_default_host_tools() {
     assert_eq!(tools.slots(), zuno_tools::registry::DEFAULT_BUILTINS);
     assert!(!tools.contains(BuiltinSlot::Execute));
     assert!(!tools.contains(BuiltinSlot::Lsp));
-    assert!(!tools.contains(BuiltinSlot::Plan));
+    assert!(tools.contains(BuiltinSlot::Plan));
+    assert!(tools.contains(BuiltinSlot::QuestionAsync));
     assert!(
         runtime
             .service::<ToolContributions>()

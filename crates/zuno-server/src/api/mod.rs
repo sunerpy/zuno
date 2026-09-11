@@ -10,12 +10,16 @@ mod request;
 pub(crate) mod session;
 mod state;
 
+use std::sync::Arc;
+
+use axum::Extension;
 use axum::Json;
 use axum::Router;
 use axum::routing::{get, post};
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::{Value, json};
+use zuno_tool::question::QuestionPort;
 
 pub use state::ApiState;
 
@@ -38,10 +42,26 @@ struct LocationInfo {
 }
 
 pub fn router(state: ApiState) -> Router {
-    Router::new()
-        .route("/doc", get(document))
-        .route("/openapi.json", get(document))
-        .route("/api/doc", get(document))
+    router_with_question_port(state, None)
+}
+
+/// Register durable question operations only with a real provider.
+///
+/// Production injects the same `QuestionPort` used by tools and other clients.
+/// The provider owns persistence, consent, continuation, and committed events.
+pub fn router_with_questions(state: ApiState, questions: Arc<dyn QuestionPort>) -> Router {
+    router_with_question_port(state, Some(questions))
+}
+
+fn router_with_question_port(state: ApiState, questions: Option<Arc<dyn QuestionPort>>) -> Router {
+    let has_questions = questions.is_some();
+    let has_controls = state.session_controls().is_some();
+    let document =
+        get(move || async move { Json(openapi::document_for(has_questions, has_controls)) });
+    let mut router = Router::new()
+        .route("/doc", document.clone())
+        .route("/openapi.json", document.clone())
+        .route("/api/doc", document)
         .route("/api/health", get(health))
         .route("/api/location", get(location))
         .route("/api/session", get(session::list).post(session::create))
@@ -102,10 +122,6 @@ pub fn router(state: ApiState) -> Router {
             post(session::interrupt),
         )
         .route(
-            "/api/session/{sessionID}/question",
-            get(request::session_questions),
-        )
-        .route(
             "/api/session/{sessionID}/permission",
             get(request::session_permission_requests),
         )
@@ -113,24 +129,41 @@ pub fn router(state: ApiState) -> Router {
             "/api/session/{sessionID}/permission/{requestID}/reply",
             post(request::permission_reply),
         )
-        .route(
-            "/api/session/{sessionID}/question/{requestID}/reply",
-            post(request::question_reply),
-        )
-        .route(
-            "/api/session/{sessionID}/question/{requestID}/reject",
-            post(request::question_reject),
-        )
         .route("/api/permission/request", get(request::permission_requests))
-        .route("/api/question/request", get(request::question_requests))
         .route("/api/pty", get(pty::list).post(pty::create))
         .route(
             "/api/pty/{ptyID}",
             get(pty::get).put(pty::update).delete(pty::remove),
         )
         .route("/api/pty/{ptyID}/connect-token", post(pty::connect_token))
-        .route("/api/pty/{ptyID}/connect", get(pty::connect))
-        .with_state(state)
+        .route("/api/pty/{ptyID}/connect", get(pty::connect));
+    if has_controls {
+        router = router.route("/api/session/{sessionID}/resume", post(session::resume));
+    }
+    if let Some(questions) = questions {
+        router = router.merge(
+            Router::new()
+                .route("/api/question/request", get(request::question_requests))
+                .route(
+                    "/api/session/{sessionID}/question",
+                    get(request::session_questions),
+                )
+                .route(
+                    "/api/session/{sessionID}/question/{requestID}/reply",
+                    post(request::question_reply),
+                )
+                .route(
+                    "/api/session/{sessionID}/question/{requestID}/reject",
+                    post(request::question_reject),
+                )
+                .route(
+                    "/api/session/{sessionID}/question/{requestID}/defer",
+                    post(request::question_defer),
+                )
+                .layer(Extension(questions)),
+        );
+    }
+    router.with_state(state)
 }
 
 #[must_use]
@@ -138,13 +171,15 @@ pub fn openapi() -> Value {
     openapi::document()
 }
 
+/// OpenAPI for a router assembled with [`router_with_questions`].
+#[must_use]
+pub fn openapi_with_questions() -> Value {
+    openapi::document_with_questions()
+}
+
 #[must_use]
 pub const fn openapi_body_schema_gaps() -> &'static [(&'static str, &'static str, &'static str)] {
     openapi::body_schema_gaps()
-}
-
-async fn document() -> Json<Value> {
-    Json(openapi())
 }
 
 async fn health() -> Json<Value> {

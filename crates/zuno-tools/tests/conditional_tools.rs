@@ -1,193 +1,133 @@
-//! Conditional-tool exposure against the measured client/plan-mode matrix.
-//!
-//! Durable plans and work items are regular Zuno tools now; their database and
-//! optimistic-concurrency coverage lives in `work_state`. This file is deliberately
-//! limited to the three tools whose model visibility still depends on runtime flags.
+//! Native question tools share a durable port and one host capability gate.
+
+mod support;
 
 use std::sync::Arc;
-use zuno_tool::{Tool, erase};
-use zuno_tools::exposure::{
-    ENV_CLIENT, ENV_ENABLE_QUESTION_TOOL, ENV_EXPERIMENTAL, ENV_EXPERIMENTAL_PLAN_MODE,
-    ExposureFlags, exposed_conditional_tools,
-};
+
+use serde_json::json;
+use support::question::{QuestionFixture, SESSION_ID, context, plan_binding};
+use zuno_tool::question::QuestionPort;
+use zuno_tool::{Tool, ToolEffect, ToolReplayPolicy, erase};
+use zuno_tools::exposure::{ExposureFlags, exposed_conditional_tools};
 use zuno_tools::invalid::InvalidTool;
-use zuno_tools::plan_exit::{PlanExitTool, RecordingHost};
-use zuno_tools::question::{QuestionAsker, QuestionTool, ScriptedAnswers};
-
-fn flags(pairs: &[(&str, &str)]) -> ExposureFlags {
-    let owned = pairs
-        .iter()
-        .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
-        .collect::<Vec<_>>();
-    ExposureFlags::from_lookup(|key| {
-        owned
-            .iter()
-            .find(|(name, _)| name == key)
-            .map(|(_, value)| value.clone())
-    })
-}
-
-type MeasuredCase = (
-    &'static [(&'static str, &'static str)],
-    &'static [&'static str],
-);
+use zuno_tools::plan_exit::PlanExitTool;
+use zuno_tools::question::QuestionTool;
+use zuno_types::question::{QuestionAction, QuestionCommand, QuestionPurpose, QuestionState};
 
 #[test]
-fn conditional_invalid_is_offered_in_every_configuration() {
-    for configuration in [
-        flags(&[]),
-        flags(&[(ENV_CLIENT, "tui")]),
-        flags(&[(ENV_CLIENT, "")]),
-        flags(&[(ENV_EXPERIMENTAL, "true")]),
-        flags(&[(ENV_EXPERIMENTAL_PLAN_MODE, "true")]),
-    ] {
-        assert!(
-            exposed_conditional_tools(&configuration).contains(&"invalid"),
-            "invalid must be offered for {configuration:?}"
-        );
+fn a_question_port_enables_all_question_publishers_without_an_experimental_plan_flag() {
+    let unavailable = ExposureFlags::default().with_client("headless");
+    let available = unavailable.clone().with_question_tool();
+    for (flags, expected) in [(&unavailable, false), (&available, true)] {
+        let offered = exposed_conditional_tools(flags);
+        assert!(offered.contains(&"invalid"));
+        for id in ["question", "question_async", "plan_exit"] {
+            assert_eq!(offered.contains(&id), expected, "{id}: {flags:?}");
+        }
+        assert_eq!(QuestionTool::exposed_under(flags), expected);
+        assert_eq!(PlanExitTool::exposed_under(flags), expected);
     }
 }
 
 #[test]
-fn conditional_question_is_offered_only_to_an_interactive_client_or_under_its_flag() {
-    for client in ["cli", "app", "desktop"] {
-        assert!(
-            exposed_conditional_tools(&flags(&[(ENV_CLIENT, client)])).contains(&"question"),
-            "{client} must be offered question"
-        );
-    }
-    assert!(
-        exposed_conditional_tools(&flags(&[
-            (ENV_CLIENT, "tui"),
-            (ENV_ENABLE_QUESTION_TOOL, "true"),
-        ]))
-        .contains(&"question")
-    );
-
-    for client in ["tui", "CLI", "", "headless"] {
-        assert!(
-            !exposed_conditional_tools(&flags(&[(ENV_CLIENT, client)])).contains(&"question"),
-            "{client:?} must not be offered question"
-        );
-    }
-}
-
-#[test]
-fn conditional_plan_exit_is_offered_only_under_plan_mode_with_a_cli_client() {
-    assert!(
-        exposed_conditional_tools(&flags(&[
-            (ENV_CLIENT, "cli"),
-            (ENV_EXPERIMENTAL_PLAN_MODE, "true"),
-        ]))
-        .contains(&"plan_exit")
-    );
-    assert!(!exposed_conditional_tools(&flags(&[(ENV_CLIENT, "cli")])).contains(&"plan_exit"));
-    for client in ["tui", "app", "desktop", "CLI", ""] {
-        assert!(
-            !exposed_conditional_tools(&flags(&[
-                (ENV_CLIENT, client),
-                (ENV_EXPERIMENTAL_PLAN_MODE, "true"),
-            ]))
-            .contains(&"plan_exit"),
-            "{client:?} must not be offered plan_exit"
-        );
-    }
-}
-
-#[test]
-fn conditional_the_exposed_set_matches_the_measured_matrix() {
-    let cases: &[MeasuredCase] = &[
-        (&[], &["invalid", "question"]),
-        (&[(ENV_CLIENT, "tui")], &["invalid"]),
-        (
-            &[(ENV_CLIENT, "tui"), (ENV_ENABLE_QUESTION_TOOL, "true")],
-            &["invalid", "question"],
-        ),
-        (&[(ENV_CLIENT, "app")], &["invalid", "question"]),
-        (&[(ENV_CLIENT, "desktop")], &["invalid", "question"]),
-        (
-            &[(ENV_EXPERIMENTAL_PLAN_MODE, "true")],
-            &["invalid", "question", "plan_exit"],
-        ),
-        (
-            &[(ENV_CLIENT, "tui"), (ENV_EXPERIMENTAL_PLAN_MODE, "true")],
-            &["invalid"],
-        ),
-        (
-            &[(ENV_CLIENT, "app"), (ENV_EXPERIMENTAL_PLAN_MODE, "true")],
-            &["invalid", "question"],
-        ),
-        (
-            &[(ENV_EXPERIMENTAL, "true")],
-            &["invalid", "question", "plan_exit"],
-        ),
-        (
-            &[
-                (ENV_EXPERIMENTAL, "true"),
-                (ENV_EXPERIMENTAL_PLAN_MODE, "false"),
-            ],
-            &["invalid", "question"],
-        ),
-        (
-            &[
-                (ENV_EXPERIMENTAL, "false"),
-                (ENV_EXPERIMENTAL_PLAN_MODE, "true"),
-            ],
-            &["invalid", "question", "plan_exit"],
-        ),
-        (
-            &[(ENV_EXPERIMENTAL_PLAN_MODE, "1")],
-            &["invalid", "question", "plan_exit"],
-        ),
-        (
-            &[(ENV_EXPERIMENTAL_PLAN_MODE, "0")],
-            &["invalid", "question"],
-        ),
-        (
-            &[(ENV_CLIENT, "CLI"), (ENV_EXPERIMENTAL_PLAN_MODE, "true")],
-            &["invalid"],
-        ),
-        (
-            &[(ENV_CLIENT, ""), (ENV_EXPERIMENTAL_PLAN_MODE, "true")],
-            &["invalid"],
-        ),
-    ];
-
-    assert!(cases.len() >= 15);
-    for (environment, expected) in cases {
-        let mut offered = exposed_conditional_tools(&flags(environment));
-        offered.sort_unstable();
-        let mut want = expected.to_vec();
-        want.sort_unstable();
-        assert_eq!(offered, want, "exposure differs for {environment:?}");
-    }
-}
-
-#[test]
-fn conditional_tools_report_the_same_exposure_as_the_registry_predicates() {
-    let plan_mode_cli = flags(&[(ENV_EXPERIMENTAL_PLAN_MODE, "true")]);
-    let headless = flags(&[(ENV_CLIENT, "tui")]);
-
-    assert!(QuestionTool::exposed_under(&plan_mode_cli));
-    assert!(!QuestionTool::exposed_under(&headless));
-    assert!(PlanExitTool::exposed_under(&plan_mode_cli));
-    assert!(!PlanExitTool::exposed_under(&headless));
-}
-
-#[test]
-fn conditional_tools_erase_into_one_list_with_distinct_wire_ids() {
-    let asker: Arc<dyn QuestionAsker> = Arc::new(ScriptedAnswers::selecting("Yes"));
+fn shared_port_tools_register_distinct_ids_and_user_mediated_non_replayable_calls() {
+    let fixture = QuestionFixture::new();
+    let port = fixture.shared_port();
     let registry: Vec<Arc<dyn Tool>> = vec![
         erase(InvalidTool::new()),
-        erase(QuestionTool::new(Arc::clone(&asker))),
-        erase(PlanExitTool::new(asker, Arc::new(RecordingHost::default()))),
+        erase(QuestionTool::new(Arc::clone(&port))),
+        erase(QuestionTool::asynchronous(Arc::clone(&port))),
+        erase(PlanExitTool::new(port)),
     ];
 
     let ids = registry.iter().map(|tool| tool.id()).collect::<Vec<_>>();
-    assert_eq!(ids, vec!["invalid", "question", "plan_exit"]);
+    assert_eq!(ids, ["invalid", "question", "question_async", "plan_exit"]);
     for tool in &registry {
         let definition = tool.definition();
         assert_eq!(definition.parameters["type"], "object");
         assert!(!definition.description.is_empty());
     }
+    for tool in &registry[1..] {
+        assert_eq!(tool.effect(&json!({})), ToolEffect::UserMediated);
+        assert_eq!(tool.replay_policy(), ToolReplayPolicy::Never);
+    }
+    assert!(fixture.port.opened().is_empty());
+}
+
+#[tokio::test]
+async fn a_shared_port_keeps_clarification_replies_separate_from_plan_authorization() {
+    let fixture = QuestionFixture::new();
+    fixture.port.bind_plan(plan_binding());
+    let clarification = erase(QuestionTool::asynchronous(fixture.shared_port()));
+    let approval = erase(PlanExitTool::new(fixture.shared_port()));
+    let clarified = clarification
+        .invoke(
+            json!({"questions":[{"question":"Which database?","header":"Database"}]}),
+            context("call_clarification"),
+        )
+        .await
+        .expect("publish optional clarification");
+    let confirmation = approval
+        .invoke(json!({}), context("call_plan"))
+        .await
+        .expect("publish Plan authorization");
+    let pending = fixture.port.pending(SESSION_ID).await.expect("pending");
+    assert_eq!(pending.len(), 2);
+    let clarification = pending
+        .iter()
+        .find(|view| view.purpose == QuestionPurpose::Clarification)
+        .expect("clarification");
+    let plan = pending
+        .iter()
+        .find(|view| view.purpose == QuestionPurpose::PlanAuthorization)
+        .expect("Plan authorization");
+    assert_eq!(
+        clarified.metadata[zuno_tool::METADATA_HUMAN_REQUEST_ID_KEY],
+        clarification.id
+    );
+    assert_eq!(
+        confirmation.metadata[zuno_tool::METADATA_HUMAN_REQUEST_ID_KEY],
+        plan.id
+    );
+    assert_ne!(clarification.id, plan.id);
+    assert_eq!(fixture.port.wait_count(), 0);
+    assert!(
+        fixture
+            .inbox()
+            .pending(SESSION_ID)
+            .expect("inbox")
+            .is_empty()
+    );
+
+    fixture
+        .port
+        .apply(
+            SESSION_ID,
+            &clarification.id,
+            QuestionCommand {
+                command_id: "answer_database".to_owned(),
+                expected_revision: clarification.revision,
+                action: QuestionAction::Answer {
+                    answers: [(
+                        clarification.questions[0].id.clone(),
+                        vec!["SQLite".to_owned()],
+                    )]
+                    .into(),
+                },
+            },
+        )
+        .await
+        .expect("answer only the clarification");
+    let unchanged = fixture
+        .port
+        .get(SESSION_ID, &plan.id)
+        .await
+        .expect("Plan still awaits its own explicit decision");
+    assert_eq!(unchanged, *plan);
+    assert_eq!(unchanged.state, QuestionState::Pending);
+    assert_eq!(unchanged.decision, None);
+    assert_eq!(unchanged.authorization, None);
+    let inputs = fixture.inbox().pending(SESSION_ID).expect("answer inbox");
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0].prompt["requestID"], clarification.id);
 }

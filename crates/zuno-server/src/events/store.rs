@@ -136,6 +136,26 @@ impl Store {
         Ok(self.snapshot(session_id, after)?.events)
     }
 
+    /// Reconstruct question notification coverage after a live receiver lagged.
+    pub(super) fn question_sessions(&self) -> Result<Vec<String>, EventStreamError> {
+        self.ensure_initialized()?;
+        let connection = self.pool.get()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT DISTINCT aggregate_id FROM event \
+                 WHERE type LIKE 'question.opened.%' \
+                    OR type LIKE 'question.updated.%' \
+                    OR type LIKE 'question.authorization.%' \
+                 ORDER BY aggregate_id",
+            )
+            .map_err(open::map_error)?;
+        Ok(statement
+            .query_map([], |row| row.get(0))
+            .map_err(open::map_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(open::map_error)?)
+    }
+
     pub(super) fn page(
         &self,
         session_id: &str,

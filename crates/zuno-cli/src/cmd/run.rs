@@ -90,6 +90,7 @@ pub(super) fn execute(
         variant: args.variant.clone(),
         thinking: args.thinking,
         tool_authority: None,
+        parent_authority: None,
         extension_composition: super::turn::ExtensionComposition::Active,
     };
     report_progress(progress);

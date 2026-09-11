@@ -35,70 +35,6 @@ use super::blocking::Budget;
 use super::error::ApiError;
 use super::state::ApiState;
 
-/// The HTTP system prompts.
-///
-/// # Why these bytes live here rather than in `zuno-catalog`
-///
-/// These assets are owned by the HTTP projection because that surface may evolve
-/// independently from the CLI catalogue.
-mod v2 {
-    /// Explore-agent prompt.
-    pub const PROMPT_EXPLORE: &str = include_str!("v2/agent-explore.txt");
-    /// Compaction-agent prompt.
-    pub const PROMPT_COMPACTION: &str = include_str!("v2/agent-compaction.txt");
-    /// Title-agent prompt.
-    pub const PROMPT_TITLE: &str = include_str!("v2/agent-title.txt");
-    /// Summary-agent prompt.
-    pub const PROMPT_SUMMARY: &str = include_str!("v2/agent-summary.txt");
-}
-
-/// The V2 system prompt for a native agent, when V2 declares one.
-///
-/// `build` gets [`V2_BUILD_SYSTEM`] through `item.system ??=`, so a user prompt wins
-/// there; the other four are assigned unconditionally (`plugin/agent.ts:166-201`),
-/// so V2's copy wins over anything the v1 files carry.
-fn v2_system(name: &str) -> Option<&'static str> {
-    match name {
-        "explore" => Some(v2::PROMPT_EXPLORE),
-        "compaction" => Some(
-            v2::PROMPT_COMPACTION
-                .strip_suffix('\n')
-                .unwrap_or(v2::PROMPT_COMPACTION),
-        ),
-        "title" => Some(v2::PROMPT_TITLE),
-        "summary" => Some(v2::PROMPT_SUMMARY),
-        _ => None,
-    }
-}
-
-/// The `build` agent's system prompt on the V2 surface.
-///
-/// `packages/core/src/plugin/agent.ts:11-13`, applied at `:127` as
-/// `item.system ??= BUILD_SYSTEM`. This is the **second** v1/v2 seam in this port:
-/// `zuno-catalog`'s `build` correctly has no prompt, because the v1 agent module it
-/// mirrors has none, and `opencode debug agent` prints the v1 shape. The V2 HTTP
-/// surface adds this one. Reporting the v1 absence here would answer `system:
-/// undefined` for the default agent, which is what a client renders as "this agent
-/// has no instructions".
-const V2_BUILD_SYSTEM: &str = "You are an AI coding agent. Help the user accomplish software engineering tasks by inspecting the workspace, making targeted changes, and using tools according to the configured permissions.";
-
-/// The V2 native roster in its declaration order.
-///
-/// `packages/core/src/plugin/agent.ts:124-204` calls `draft.update` in exactly this
-/// order, and the map it writes into preserves insertion order, so this is the
-/// order `/api/agent` answers in. `zuno-catalog` returns its own (sorted) order
-/// because `agent list` sorts for display, so the two disagree and the roster has
-/// to be re-ordered here rather than trusted as-is.
-const V2_NATIVE_ORDER: &[&str] = &[
-    "build",
-    "plan",
-    "general",
-    "explore",
-    "compaction",
-    "title",
-    "summary",
-];
-
 /// Upstream's `{location, data}` success envelope.
 ///
 /// `workspaceID` is omitted rather than null when absent, which is what the
@@ -162,8 +98,7 @@ impl<T: Serialize> IntoResponse for OptionalEnvelope<T> {
     }
 }
 
-/// Upstream's `Agent.Info` (`packages/schema/src/agent.ts:19-31`), in its field
-/// order.
+/// The resolved Zuno agent definition in the HTTP catalog shape.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AgentInfo {
     /// The agent's name.
@@ -173,7 +108,7 @@ pub struct AgentInfo {
     pub model: Option<ModelRef>,
     /// Per-agent request overrides.
     pub request: RequestBody,
-    /// The system prompt.
+    /// The catalog's base prompt after custom overrides, before runtime sections.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
     /// When to use the agent.
@@ -189,7 +124,8 @@ pub struct AgentInfo {
     /// Iteration cap.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub steps: Option<u32>,
-    /// The resolved permission ruleset.
+    /// Ordered default, native-role, and configured permission rules. Runtime
+    /// tool availability and inherited attempt authority may narrow this further.
     pub permissions: Vec<PermissionRule>,
 }
 
@@ -384,101 +320,78 @@ pub async fn agents(
     )
     .map_err(|error| ApiError::CatalogUnavailable(error.to_string()))?;
     let layout = zuno_paths::Layout::resolve(state.env());
-    let worktree = resolved
-        .worktree
-        .clone()
-        .unwrap_or_else(|| resolved.directory.clone());
-    let mut data = agents
+    let data = agents
         .into_iter()
-        .map(|entry| agent_info(entry, &resolved.config, &layout, &worktree))
+        .map(|entry| agent_info(entry, &resolved.config, &layout))
         .collect::<Vec<_>>();
-    data.sort_by_key(|entry| {
-        V2_NATIVE_ORDER
-            .iter()
-            .position(|name| *name == entry.id)
-            .unwrap_or(V2_NATIVE_ORDER.len())
-    });
     Ok(state.envelope(data))
 }
 
-/// The V2 permission ruleset for one agent.
+/// Project native role policy between common defaults and custom overrides.
 ///
-/// `PermissionV2.merge` is `rulesets.flat()`
-/// (`packages/core/src/permission.ts:88-90`), so a ruleset is a concatenation and
-/// **its order is the semantics**: resolution is find-last, which is how `explore`
-/// can start from `{*: allow}` and still end up read-only.
-///
-/// This is the V2 set, deliberately not `zuno-cli`'s v1 set: V2 whitelists only the
-/// tool-output and temp directories, where v1 also whitelists every discovered
-/// skill and reference root. Answering with the v1 rules would advertise
-/// permissions the V2 runtime does not grant.
-fn v2_permissions(name: &str, layout: &zuno_paths::Layout, worktree: &Path) -> Vec<PermissionRule> {
-    let plans = layout.data().join("plans");
-    let readonly_external = vec![
-        v2_rule("external_directory", "*", "ask"),
-        v2_rule(
+/// The catalog owns every role-specific grant and deny. HTTP must not substitute
+/// its own roster or role policy. Rule order matters: user configuration follows
+/// the native overlay, and the resolved per-Agent rules come last.
+fn agent_permissions(
+    entry: &agent::Agent,
+    config: &Config,
+    layout: &zuno_paths::Layout,
+) -> Vec<PermissionRule> {
+    let external = [
+        catalog_rule("external_directory", "*", PermissionAction::Ask),
+        catalog_rule(
             "external_directory",
             &glob_of(&layout.tool_output()),
-            "allow",
+            PermissionAction::Allow,
         ),
-        v2_rule("external_directory", &glob_of(layout.temp()), "allow"),
+        catalog_rule(
+            "external_directory",
+            &glob_of(layout.temp()),
+            PermissionAction::Allow,
+        ),
     ];
-    let mut rules = vec![v2_rule("*", "*", "allow")];
-    rules.extend(readonly_external.iter().cloned());
+    let mut rules = vec![
+        catalog_rule("*", "*", PermissionAction::Allow),
+        catalog_rule("doom_loop", "*", PermissionAction::Ask),
+    ];
+    rules.extend(external.iter().cloned());
     rules.extend([
-        v2_rule("question", "*", "deny"),
-        v2_rule("plan_enter", "*", "deny"),
-        v2_rule("plan_exit", "*", "deny"),
-        v2_rule("read", "*", "allow"),
-        v2_rule("read", "*.env", "ask"),
-        v2_rule("read", "*.env.*", "ask"),
-        v2_rule("read", "*.env.example", "allow"),
+        catalog_rule("question", "*", PermissionAction::Allow),
+        catalog_rule("plan_enter", "*", PermissionAction::Deny),
+        catalog_rule("plan_exit", "*", PermissionAction::Deny),
+        catalog_rule("read", "*", PermissionAction::Allow),
+        catalog_rule("read", "*.env", PermissionAction::Ask),
+        catalog_rule("read", "*.env.*", PermissionAction::Ask),
+        catalog_rule("read", "*.env.example", PermissionAction::Allow),
     ]);
-    match name {
-        "build" => rules.extend([
-            v2_rule("question", "*", "allow"),
-            v2_rule("plan_enter", "*", "allow"),
-        ]),
-        "plan" => rules.extend([
-            v2_rule("question", "*", "allow"),
-            v2_rule("plan_exit", "*", "allow"),
-            v2_rule("external_directory", &glob_of(&plans), "allow"),
-            v2_rule("edit", "*", "deny"),
-            v2_rule("edit", ".zuno/plans/*.md", "allow"),
-            v2_rule(
-                "edit",
-                &relative_path(worktree, &plans.join("*.md")),
-                "allow",
-            ),
-        ]),
-        "general" => rules.extend([
-            v2_rule("plan_update", "*", "deny"),
-            v2_rule("todo_update", "*", "deny"),
-        ]),
-        "explore" => {
-            rules.extend([
-                v2_rule("*", "*", "deny"),
-                v2_rule("grep", "*", "allow"),
-                v2_rule("glob", "*", "allow"),
-                v2_rule("webfetch", "*", "allow"),
-                v2_rule("web_search", "*", "allow"),
-                v2_rule("read", "*", "allow"),
-            ]);
-            rules.extend(readonly_external);
+    if entry.source.is_native()
+        && let Some(builtin) = agent::builtin::get(&entry.name)
+        && let Some(overlay) = builtin.permission_overlay()
+    {
+        rules.extend(rules_from_config(&overlay));
+        if builtin.uses_external_directories() {
+            rules.extend(external.iter().skip(1).cloned());
         }
-        "compaction" | "title" | "summary" | "council-synth" => {
-            rules.push(v2_rule("*", "*", "deny"));
-        }
-        _ => {}
     }
-    rules
+    if let Some(user) = &config.permission {
+        rules.extend(rules_from_config(user));
+    }
+    if let Some(agent_rules) = &entry.permission {
+        rules.extend(rules_from_config(agent_rules));
+    }
+    rules.into_iter().map(permission_rule).collect()
 }
 
-fn v2_rule(action: &str, resource: &str, effect: &'static str) -> PermissionRule {
-    PermissionRule {
-        action: action.to_owned(),
-        resource: resource.to_owned(),
-        effect,
+fn catalog_rule(
+    permission: &str,
+    pattern: &str,
+    action: PermissionAction,
+) -> zuno_permission::Rule {
+    zuno_permission::Rule {
+        source: None,
+        permission: permission.to_owned(),
+        pattern: pattern.to_owned(),
+        action,
     }
 }
 
@@ -486,54 +399,9 @@ fn glob_of(path: &Path) -> String {
     path.join("*").to_string_lossy().into_owned()
 }
 
-/// `path.relative(from, to)`, which upstream uses for the plan-edit rule so a
-/// worktree outside the data directory still gets a usable pattern.
-fn relative_path(from: &Path, to: &Path) -> String {
-    let from = from.components().collect::<Vec<_>>();
-    let to = to.components().collect::<Vec<_>>();
-    let shared = from
-        .iter()
-        .zip(&to)
-        .take_while(|(left, right)| left == right)
-        .count();
-    let mut relative = PathBuf::new();
-    for _ in shared..from.len() {
-        relative.push("..");
-    }
-    for component in &to[shared..] {
-        relative.push(component.as_os_str());
-    }
-    relative.to_string_lossy().into_owned()
-}
-
-/// Projects one resolved agent onto upstream's `Agent.Info`.
-fn agent_info(
-    entry: agent::Agent,
-    config: &Config,
-    layout: &zuno_paths::Layout,
-    worktree: &Path,
-) -> AgentInfo {
-    let mut permissions = if entry.source.is_native() {
-        v2_permissions(&entry.name, layout, worktree)
-    } else {
-        Vec::new()
-    };
-    if let Some(user) = &config.permission {
-        permissions.extend(rules_from_config(user).into_iter().map(permission_rule));
-    }
-    if let Some(agent_rules) = &entry.permission {
-        permissions.extend(
-            rules_from_config(agent_rules)
-                .into_iter()
-                .map(permission_rule),
-        );
-    }
-    let is_v2_build = entry.source.is_native() && entry.name == "build";
-    let v2_native_system = entry
-        .source
-        .is_native()
-        .then(|| v2_system(&entry.name))
-        .flatten();
+/// Preserve the resolved catalog definition when projecting its HTTP fields.
+fn agent_info(entry: agent::Agent, config: &Config, layout: &zuno_paths::Layout) -> AgentInfo {
+    let permissions = agent_permissions(&entry, config, layout);
     AgentInfo {
         id: entry.name,
         model: entry
@@ -545,10 +413,7 @@ fn agent_info(
             body: entry.options.clone(),
             variant: None,
         },
-        system: v2_native_system
-            .map(ToOwned::to_owned)
-            .or(entry.prompt)
-            .or_else(|| is_v2_build.then(|| V2_BUILD_SYSTEM.to_owned())),
+        system: entry.prompt,
         description: entry.description,
         mode: match entry.mode {
             AgentMode::Subagent => "subagent",

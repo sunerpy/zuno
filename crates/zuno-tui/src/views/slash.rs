@@ -173,6 +173,10 @@ pub enum HostCommand {
     Learn(String),
     /// Run isolated learning extraction.
     Reflect(String),
+    /// List or reopen this session's durable pending questions.
+    Questions(String),
+    /// Explicitly resume work paused by the session scheduler.
+    Resume(String),
     /// Select a configured model-team preset, or open the picker when omitted.
     Preset(Option<String>),
     /// Launch a native Council preset, or open the picker when omitted.
@@ -333,6 +337,12 @@ impl SlashRouter {
             SlashCommandKind::Host(HostCommand::Reflect(_)) => {
                 SlashSubmission::Host(HostCommand::Reflect(arguments))
             }
+            SlashCommandKind::Host(HostCommand::Questions(_)) => {
+                SlashSubmission::Host(HostCommand::Questions(arguments))
+            }
+            SlashCommandKind::Host(HostCommand::Resume(_)) => {
+                SlashSubmission::Host(HostCommand::Resume(arguments))
+            }
             SlashCommandKind::Host(HostCommand::Preset(_)) => SlashSubmission::Host(
                 HostCommand::Preset((!arguments.is_empty()).then_some(arguments)),
             ),
@@ -383,7 +393,7 @@ const UI_SPECS: &[UiSpec] = &[
     },
     UiSpec {
         action: "session_list",
-        aliases: &["resume", "continue"],
+        aliases: &["continue"],
     },
     UiSpec {
         action: "session_new",
@@ -431,6 +441,26 @@ const UI_SPECS: &[UiSpec] = &[
     },
 ];
 
+fn native_session_command(command: SessionCommand) -> SlashCommand {
+    let host = match command {
+        SessionCommand::Compact => HostCommand::Compact,
+        SessionCommand::Goal => HostCommand::Goal(String::new()),
+        SessionCommand::Learn => HostCommand::Learn(String::new()),
+        SessionCommand::Reflect => HostCommand::Reflect(String::new()),
+        SessionCommand::Plan => HostCommand::Plan,
+        SessionCommand::Questions => HostCommand::Questions(String::new()),
+        SessionCommand::ResumeWork => HostCommand::Resume(String::new()),
+        SessionCommand::StartPlan => HostCommand::StartPlan,
+        SessionCommand::StartWork => HostCommand::StartWork,
+    };
+    SlashCommand {
+        name: command.name().to_owned(),
+        aliases: Vec::new(),
+        description: command.description().to_owned(),
+        kind: SlashCommandKind::Host(host),
+    }
+}
+
 fn ui_commands() -> Vec<SlashCommand> {
     // This route metadata contains only actions `SessionScreen` consumes. Definitions for
     // planned surfaces remain in the source binding table, but advertising one before its
@@ -475,13 +505,8 @@ fn ui_commands() -> Vec<SlashCommand> {
                 kind: SlashCommandKind::UiAction(definition.name),
             })
         })
+        .chain(SessionCommand::ALL.into_iter().map(native_session_command))
         .chain([
-            SlashCommand {
-                name: SessionCommand::Compact.name().to_owned(),
-                aliases: Vec::new(),
-                description: SessionCommand::Compact.description().to_owned(),
-                kind: SlashCommandKind::Host(HostCommand::Compact),
-            },
             SlashCommand {
                 name: "undo".to_owned(),
                 aliases: Vec::new(),
@@ -495,24 +520,6 @@ fn ui_commands() -> Vec<SlashCommand> {
                 kind: SlashCommandKind::Host(HostCommand::Redo),
             },
             SlashCommand {
-                name: "goal".to_owned(),
-                aliases: Vec::new(),
-                description: SessionCommand::Goal.description().to_owned(),
-                kind: SlashCommandKind::Host(HostCommand::Goal(String::new())),
-            },
-            SlashCommand {
-                name: SessionCommand::Learn.name().to_owned(),
-                aliases: Vec::new(),
-                description: SessionCommand::Learn.description().to_owned(),
-                kind: SlashCommandKind::Host(HostCommand::Learn(String::new())),
-            },
-            SlashCommand {
-                name: SessionCommand::Reflect.name().to_owned(),
-                aliases: Vec::new(),
-                description: SessionCommand::Reflect.description().to_owned(),
-                kind: SlashCommandKind::Host(HostCommand::Reflect(String::new())),
-            },
-            SlashCommand {
                 name: "preset".to_owned(),
                 aliases: Vec::new(),
                 description: "Switch the configured model team, or choose one".to_owned(),
@@ -523,25 +530,6 @@ fn ui_commands() -> Vec<SlashCommand> {
                 aliases: Vec::new(),
                 description: "Run a native multi-agent Council preset".to_owned(),
                 kind: SlashCommandKind::Host(HostCommand::Council(String::new())),
-            },
-            SlashCommand {
-                name: "plan".to_owned(),
-                aliases: Vec::new(),
-                description: "Enter Plan mode, or confirm starting work when already planning"
-                    .to_owned(),
-                kind: SlashCommandKind::Host(HostCommand::Plan),
-            },
-            SlashCommand {
-                name: "start-plan".to_owned(),
-                aliases: Vec::new(),
-                description: "Enter read-only Plan mode immediately".to_owned(),
-                kind: SlashCommandKind::Host(HostCommand::StartPlan),
-            },
-            SlashCommand {
-                name: "start-work".to_owned(),
-                aliases: Vec::new(),
-                description: "Review the durable plan and confirm implementation".to_owned(),
-                kind: SlashCommandKind::Host(HostCommand::StartWork),
             },
             SlashCommand {
                 name: "stop".to_owned(),

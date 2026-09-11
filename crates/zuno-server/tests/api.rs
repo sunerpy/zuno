@@ -28,10 +28,10 @@ use zuno_permission::ReplyKind;
 use zuno_pty::{CreateInput, PtyId, TicketScope};
 use zuno_server::api::{self, ApiState};
 use zuno_server::{
-    Delivery, EventService, NewEvent, PermissionRequest, QuestionDecision, QuestionRequest,
-    RequestBroker, ServerBuilder, ServerConfig, ServerServices, SessionCompactExecution,
-    SessionMemoryPolicyExecution, SessionMemoryPolicyFuture, SessionMemoryPolicyMutationError,
-    SessionMutationExecutor, SessionMutationFuture, SessionPromptExecution, SessionReportExecution,
+    Delivery, EventService, NewEvent, PermissionRequest, RequestBroker, ServerBuilder,
+    ServerConfig, ServerServices, SessionCompactExecution, SessionMemoryPolicyExecution,
+    SessionMemoryPolicyFuture, SessionMemoryPolicyMutationError, SessionMutationExecutor,
+    SessionMutationFuture, SessionPromptExecution, SessionReportExecution,
 };
 
 fn api_app(state: ApiState) -> Router {
@@ -591,6 +591,23 @@ struct MutationApiFixture {
 }
 
 impl MutationApiFixture {
+    fn bind_report_cycle(&self, session_id: &str) {
+        self.pool
+            .transaction(|tx| {
+                let mut state = zuno_db::session_execution::seed_in(
+                    tx,
+                    session_id,
+                    zuno_types::execution::CollaborationMode::Work,
+                    None,
+                    0,
+                )?;
+                let revision = state.revision;
+                state.cycle_id = Some("cycle_http_reports".to_owned());
+                zuno_db::session_execution::update_in(tx, revision, state).map(|_| ())
+            })
+            .expect("bind reports to the current execution cycle");
+    }
+
     fn new(session_id: &str) -> Self {
         let temp = tempfile::tempdir().expect("temporary mutation fixture directory");
         let location = DbLocation::File(temp.path().join("zuno.db"));
@@ -742,7 +759,12 @@ fn fixture_operations(document: &Value) -> BTreeSet<(String, String)> {
 fn api_openapi_contains_only_registered_zuno_operations() {
     let generated = api::openapi();
     let actual = fixture_operations(&generated);
-    assert_eq!(actual.len(), 51, "the registered Zuno API surface changed");
+    assert_eq!(
+        actual.len(),
+        47,
+        "the provider-free Zuno API surface changed"
+    );
+    assert_eq!(fixture_operations(&api::openapi_with_questions()).len(), 52);
     for operation in [
         ("/api/permission/saved", "get"),
         ("/api/permission/saved/{id}", "delete"),
@@ -771,7 +793,7 @@ fn api_openapi_presents_zunos_identity() {
 
 #[test]
 fn api_openapi_binds_every_body_with_an_existing_rust_schema() {
-    let document = api::openapi();
+    let document = api::openapi_with_questions();
     let request_ref = |path: &str, method: &str| {
         document["paths"][path][method]["requestBody"]["content"]["application/json"]["schema"]
             ["$ref"]
@@ -839,7 +861,7 @@ fn api_openapi_binds_every_body_with_an_existing_rust_schema() {
             "/api/session/{sessionID}/question/{requestID}/reply",
             "post"
         ),
-        Some("#/components/schemas/QuestionReply")
+        Some("#/components/schemas/QuestionCommand")
     );
 }
 
@@ -1392,7 +1414,6 @@ async fn api_session_read_routes_return_not_found_for_an_unknown_session() {
         "/api/session/ses_missing/context",
         "/api/session/ses_missing/history",
         "/api/session/ses_missing/message",
-        "/api/session/ses_missing/question",
     ] {
         let response = app
             .clone()
@@ -1405,7 +1426,7 @@ async fn api_session_read_routes_return_not_found_for_an_unknown_session() {
 }
 
 #[tokio::test]
-async fn api_permission_and_question_read_routes_match_the_empty_process_state() {
+async fn api_permission_read_routes_match_the_empty_process_state() {
     let state = ApiState::memory("/repo").expect("in-memory API state initializes");
     state
         .sessions()
@@ -1423,8 +1444,7 @@ async fn api_permission_and_question_read_routes_match_the_empty_process_state()
 
     for path in [
         "/api/permission/request",
-        "/api/question/request",
-        "/api/session/ses_empty/question",
+        "/api/session/ses_empty/permission",
     ] {
         let response = app
             .clone()
@@ -1764,7 +1784,7 @@ async fn archiving_a_session_withdraws_its_saved_permissions() {
 }
 
 #[tokio::test]
-async fn api_reply_routes_validate_bodies_before_rejecting_cross_session_requests() {
+async fn api_permission_replies_validate_bodies_before_rejecting_cross_session_requests() {
     let state = ApiState::memory("/repo").expect("in-memory API state initializes");
     let requests = RequestBroker::default();
     let services = ServerServices::new(64).with_requests(requests.clone());
@@ -1837,82 +1857,10 @@ async fn api_reply_routes_validate_bodies_before_rejecting_cross_session_request
         ReplyKind::Once
     );
 
-    let mut question_answer = tokio::spawn({
-        let requests = requests.clone();
-        async move {
-            requests
-                .ask_question(QuestionRequest {
-                    id: "que_owner".to_owned(),
-                    session_id: "ses_owner".to_owned(),
-                    questions: vec![json!({"question": "Continue?"})],
-                    tool: None,
-                })
-                .await
-        }
-    });
-    bounded_until(
-        "an unowned question ask to park in the broker",
-        || !requests.questions(None).is_empty(),
-        || format!("parked questions={}", requests.questions(None).len()),
-    )
-    .await;
-
-    let malformed_question = app
-        .clone()
-        .oneshot(request(
-            Method::POST,
-            "/api/session/ses_other/question/que_owner/reply",
-            Some(json!("malformed for QuestionReplyBody")),
-        ))
-        .await
-        .expect("malformed cross-session question reply responds");
-    assert_eq!(malformed_question.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(requests.questions(None).len(), 1);
-
-    let cross_session_question = app
-        .clone()
-        .oneshot(request(
-            Method::POST,
-            "/api/session/ses_other/question/que_owner/reply",
-            Some(json!({"answers": [["yes"]]})),
-        ))
-        .await
-        .expect("valid cross-session question reply responds");
-    assert_eq!(cross_session_question.status(), StatusCode::NOT_FOUND);
-    assert_eq!(requests.questions(None).len(), 1);
-
-    let owner_question = app
-        .clone()
-        .oneshot(request(
-            Method::POST,
-            "/api/session/ses_owner/question/que_owner/reply",
-            Some(json!({"answers": [["yes"]]})),
-        ))
-        .await
-        .expect("owner question reply responds");
-    assert_eq!(owner_question.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), &mut question_answer)
-            .await
-            .expect("question asker resumes")
-            .expect("question asker task does not panic"),
-        QuestionDecision::Answered(vec![vec!["yes".to_owned()]])
-    );
-
-    for (path, body) in [
-        (
-            "/api/session/ses_owner/permission/request_matrix/reply",
-            Some(json!({"reply": "once"})),
-        ),
-        (
-            "/api/session/ses_owner/question/request_matrix/reply",
-            Some(json!({"answers": [["yes"]]})),
-        ),
-        (
-            "/api/session/ses_owner/question/request_matrix/reject",
-            None,
-        ),
-    ] {
+    for (path, body) in [(
+        "/api/session/ses_owner/permission/request_matrix/reply",
+        Some(json!({"reply": "once"})),
+    )] {
         let response = app
             .clone()
             .oneshot(request(Method::POST, path, body))
@@ -1921,17 +1869,10 @@ async fn api_reply_routes_validate_bodies_before_rejecting_cross_session_request
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
     }
 
-    for (path, body) in [
-        (
-            "/api/session/ses_owner/permission/per_missing/reply",
-            Some(json!({"reply": "once"})),
-        ),
-        (
-            "/api/session/ses_owner/question/que_missing/reply",
-            Some(json!({"answers": [["yes"]]})),
-        ),
-        ("/api/session/ses_owner/question/que_missing/reject", None),
-    ] {
+    for (path, body) in [(
+        "/api/session/ses_owner/permission/per_missing/reply",
+        Some(json!({"reply": "once"})),
+    )] {
         let response = app
             .clone()
             .oneshot(request(Method::POST, path, body))
@@ -1939,58 +1880,6 @@ async fn api_reply_routes_validate_bodies_before_rejecting_cross_session_request
             .expect("missing request responds");
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
     }
-}
-
-#[tokio::test]
-async fn malformed_owned_question_reply_rejects_and_removes_the_request() {
-    let state = ApiState::memory("/repo").expect("in-memory API state initializes");
-    let requests = RequestBroker::default();
-    let services = ServerServices::new(64).with_requests(requests.clone());
-    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
-        .with_services(services)
-        .with_routes(api::router(state))
-        .router();
-    let mut answer = tokio::spawn({
-        let requests = requests.clone();
-        async move {
-            requests
-                .ask_question(QuestionRequest {
-                    id: "que_malformed_owned".to_owned(),
-                    session_id: "ses_owner".to_owned(),
-                    questions: vec![json!({"question": "Continue?"})],
-                    tool: None,
-                })
-                .await
-        }
-    });
-    bounded_until(
-        "an unowned question ask to park in the broker",
-        || !requests.questions(None).is_empty(),
-        || format!("parked questions={}", requests.questions(None).len()),
-    )
-    .await;
-
-    let malformed = app
-        .oneshot(request(
-            Method::POST,
-            "/api/session/ses_owner/question/que_malformed_owned/reply",
-            Some(json!("malformed for QuestionReplyBody")),
-        ))
-        .await
-        .expect("malformed owned question reply responds");
-
-    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), &mut answer)
-            .await
-            .expect("owned malformed cleanup must release the question asker")
-            .expect("question asker task does not panic"),
-        QuestionDecision::Failed
-    );
-    assert!(
-        requests.questions(None).is_empty(),
-        "owned malformed cleanup must remove the rejected question"
-    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -2033,46 +1922,6 @@ async fn permission_without_an_observer_is_rejected_by_the_deadline() {
     assert!(
         requests.permissions(None).is_empty(),
         "the deadline must remove the stale permission request"
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn question_without_an_observer_is_rejected_by_the_deadline() {
-    let requests = RequestBroker::default();
-    let mut answer = tokio::spawn({
-        let requests = requests.clone();
-        async move {
-            requests
-                .ask_question(QuestionRequest {
-                    id: "que_unobserved".to_owned(),
-                    session_id: "ses_unobserved".to_owned(),
-                    questions: vec![json!({"question": "Continue?"})],
-                    tool: None,
-                })
-                .await
-        }
-    });
-    // A ceiling cannot help this spin: a `yield_now` loop keeps the runtime runnable,
-    // so this test's paused clock never auto-advances and a `timeout` here would never
-    // fire. `.config/nextest.toml`'s `terminate-after` is what names this test in CI.
-    while requests.questions(None).is_empty() {
-        tokio::task::yield_now().await;
-    }
-
-    tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
-    tokio::task::yield_now().await;
-
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), &mut answer)
-            .await
-            .expect("an unobserved question request must have a finite deadline")
-            .expect("question asker task does not panic"),
-        QuestionDecision::Expired,
-        "the deadline must fail closed rather than invent an answer"
-    );
-    assert!(
-        requests.questions(None).is_empty(),
-        "the deadline must remove the stale question request"
     );
 }
 
@@ -2455,20 +2304,25 @@ async fn api_busy_steer_is_durable_and_runs_after_the_active_prompt() {
 #[tokio::test]
 async fn api_prompt_driver_runs_a_durable_subagent_report_before_later_user_input() {
     let fixture = MutationApiFixture::new("ses_report");
+    fixture.bind_report_cycle("ses_report");
     SessionInbox::new(Arc::clone(&fixture.pool))
-        .admit(NewSessionInput::new(
-            "input_report",
-            "ses_report",
-            json!({
-                "kind": "subagentReport",
-                "jobID": "job_1",
-                "childSessionID": "ses_child",
-                "status": "completed",
-                "text": "background result"
-            }),
-            InputDelivery::Queue,
-            1,
-        ))
+        .admit(
+            NewSessionInput::new(
+                "input_report",
+                "ses_report",
+                json!({
+                    "kind": "subagentReport",
+                    "jobID": "job_1",
+                    "childSessionID": "ses_child",
+                    "status": "completed",
+                    "text": "background result"
+                }),
+                InputDelivery::Queue,
+                1,
+            )
+            .with_trigger_kind(zuno_types::execution::InputTriggerKind::Automatic)
+            .with_cycle_id(Some("cycle_http_reports")),
+        )
         .expect("admit background report");
     let executor = Arc::new(BlockingMutationExecutor::default());
     let services = ServerServices::new(64).with_mutations(executor.clone());
@@ -2534,6 +2388,7 @@ async fn api_prompt_driver_runs_a_durable_subagent_report_before_later_user_inpu
 #[tokio::test]
 async fn api_prompt_driver_runs_every_settled_report_as_one_request() {
     let fixture = MutationApiFixture::new("ses_batch");
+    fixture.bind_report_cycle("ses_batch");
     let inbox = SessionInbox::new(Arc::clone(&fixture.pool));
     for (input_id, job, text, created) in [
         ("input_early", "job_1", "job one is halfway", 1),
@@ -2541,19 +2396,23 @@ async fn api_prompt_driver_runs_every_settled_report_as_one_request() {
         ("input_late", "job_1", "job one finished", 3),
     ] {
         inbox
-            .admit(NewSessionInput::new(
-                input_id,
-                "ses_batch",
-                json!({
-                    "kind": "subagentReport",
-                    "jobID": job,
-                    "childSessionID": "ses_child",
-                    "status": "completed",
-                    "text": text
-                }),
-                InputDelivery::Queue,
-                created,
-            ))
+            .admit(
+                NewSessionInput::new(
+                    input_id,
+                    "ses_batch",
+                    json!({
+                        "kind": "subagentReport",
+                        "jobID": job,
+                        "childSessionID": "ses_child",
+                        "status": "completed",
+                        "text": text
+                    }),
+                    InputDelivery::Queue,
+                    created,
+                )
+                .with_trigger_kind(zuno_types::execution::InputTriggerKind::Automatic)
+                .with_cycle_id(Some("cycle_http_reports")),
+            )
             .expect("admit settled report");
     }
     let executor = Arc::new(BlockingMutationExecutor::default());
@@ -2762,35 +2621,44 @@ async fn api_prompt_driver_leaves_another_surfaces_pending_input_untouched() {
 #[tokio::test]
 async fn api_prompt_driver_fails_an_unreadable_report_and_runs_the_rest_of_the_batch() {
     let fixture = MutationApiFixture::new("ses_unreadable");
+    fixture.bind_report_cycle("ses_unreadable");
     let inbox = SessionInbox::new(Arc::clone(&fixture.pool));
     inbox
-        .admit(NewSessionInput::new(
-            "input_broken",
-            "ses_unreadable",
-            json!({
-                "kind": "subagentReport",
-                "jobID": "job_1",
-                "childSessionID": "ses_child",
-                "status": "completed"
-            }),
-            InputDelivery::Queue,
-            1,
-        ))
+        .admit(
+            NewSessionInput::new(
+                "input_broken",
+                "ses_unreadable",
+                json!({
+                    "kind": "subagentReport",
+                    "jobID": "job_1",
+                    "childSessionID": "ses_child",
+                    "status": "completed"
+                }),
+                InputDelivery::Queue,
+                1,
+            )
+            .with_trigger_kind(zuno_types::execution::InputTriggerKind::Automatic)
+            .with_cycle_id(Some("cycle_http_reports")),
+        )
         .expect("admit unreadable report");
     inbox
-        .admit(NewSessionInput::new(
-            "input_ok",
-            "ses_unreadable",
-            json!({
-                "kind": "subagentReport",
-                "jobID": "job_2",
-                "childSessionID": "ses_child",
-                "status": "completed",
-                "text": "job two finished"
-            }),
-            InputDelivery::Queue,
-            2,
-        ))
+        .admit(
+            NewSessionInput::new(
+                "input_ok",
+                "ses_unreadable",
+                json!({
+                    "kind": "subagentReport",
+                    "jobID": "job_2",
+                    "childSessionID": "ses_child",
+                    "status": "completed",
+                    "text": "job two finished"
+                }),
+                InputDelivery::Queue,
+                2,
+            )
+            .with_trigger_kind(zuno_types::execution::InputTriggerKind::Automatic)
+            .with_cycle_id(Some("cycle_http_reports")),
+        )
         .expect("admit report");
     let executor = Arc::new(BlockingMutationExecutor::default());
     let services = ServerServices::new(64).with_mutations(executor.clone());
@@ -2862,6 +2730,7 @@ async fn api_prompt_driver_fails_an_unreadable_report_and_runs_the_rest_of_the_b
 #[tokio::test]
 async fn api_prompt_driver_delivers_every_asynchronous_report_shape() {
     let fixture = MutationApiFixture::new("ses_reports");
+    fixture.bind_report_cycle("ses_reports");
     let inbox = SessionInbox::new(Arc::clone(&fixture.pool));
     let reports = [
         (
@@ -2889,13 +2758,17 @@ async fn api_prompt_driver_delivers_every_asynchronous_report_shape() {
     ];
     for (index, (id, prompt)) in reports.iter().enumerate() {
         inbox
-            .admit(NewSessionInput::new(
-                *id,
-                "ses_reports",
-                prompt.clone(),
-                InputDelivery::Queue,
-                i64::try_from(index).expect("small index") + 1,
-            ))
+            .admit(
+                NewSessionInput::new(
+                    *id,
+                    "ses_reports",
+                    prompt.clone(),
+                    InputDelivery::Queue,
+                    i64::try_from(index).expect("small index") + 1,
+                )
+                .with_trigger_kind(zuno_types::execution::InputTriggerKind::Automatic)
+                .with_cycle_id(Some("cycle_http_reports")),
+            )
             .expect("admit report");
     }
     let executor = Arc::new(BlockingMutationExecutor::default());
@@ -4429,14 +4302,19 @@ async fn api_agent_roster_is_the_resolved_native_set() {
         .iter()
         .find(|entry| entry["id"] == "plan")
         .expect("plan is present");
-    let resources = plan["permissions"]
+    let edit = plan["permissions"]
         .as_array()
         .expect("permissions are an array")
         .iter()
-        .filter_map(|rule| rule["resource"].as_str())
-        .collect::<Vec<_>>();
-    assert!(resources.contains(&".zuno/plans/*.md"));
-    assert!(!resources.contains(&".opencode/plans/*.md"));
+        .rev()
+        .find(|rule| {
+            matches!(rule["action"].as_str(), Some("*" | "edit")) && rule["resource"] == "*"
+        })
+        .expect("Plan has an edit policy");
+    assert_eq!(
+        edit["effect"], "deny",
+        "Plan must use the canonical read-only role policy"
+    );
 }
 
 #[tokio::test]
@@ -5054,81 +4932,78 @@ async fn api_two_replies_to_one_recovered_permission_publish_one_decision() {
     );
 }
 
-/// The same input against `question_reply`, which the review called identical.
-///
-/// A recovered question is answered through `answer_with_input`, so its write and its
-/// model-visible inbox input commit together and the event follows the write. Two
-/// claims still publish only one `question.v2.replied`.
+/// Concurrent commands use the service's durable compare-and-set boundary.
 #[tokio::test]
 async fn api_two_answers_to_one_recovered_question_publish_one_decision() {
+    use zuno_session_control::QuestionService;
+    use zuno_tool::question::QuestionPort;
+    use zuno_types::question::{
+        QuestionMode, QuestionOrigin, QuestionPrompt, QuestionPurpose, QuestionSpec,
+    };
+
     let fixture = ReadApiFixture::new();
     fixture.seed_session_messages(0, -1);
-    let (app, _requests) = durable_request_app(&fixture);
-    recovered_request(
-        &fixture.pool,
-        "que_recovered",
-        zuno_db::human_request::HumanRequestKind::Input,
-        json!({
-            "source": "question",
-            "questions": [{
-                "question": "Which channel?",
-                "header": "Channel",
-                "options": [],
-                "multiple": false,
-                "custom": true
-            }],
-            "tool": null,
-        }),
+    let original = QuestionService::new(Arc::clone(&fixture.pool));
+    let opened = original
+        .open(QuestionSpec {
+            origin: QuestionOrigin {
+                session_id: "ses_reads".to_owned(),
+                message_id: None,
+                call_id: None,
+                turn_id: None,
+                goal_id: None,
+            },
+            mode: QuestionMode::Deferred,
+            purpose: QuestionPurpose::Clarification,
+            questions: vec![
+                QuestionPrompt::new("Which channel?", "Channel", Vec::new()).into_request(),
+            ],
+            expected_goal_revision: None,
+            plan: None,
+        })
+        .await
+        .expect("open durable question");
+    drop(original);
+    let recovered: Arc<dyn QuestionPort> =
+        Arc::new(QuestionService::new(Arc::clone(&fixture.pool)));
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_routes(api::router_with_questions(fixture.state.clone(), recovered))
+        .router();
+    let path = format!(
+        "/api/session/ses_reads/question/{}/reply",
+        opened.question.id
     );
-
-    // See the permission case: the lock parks the first answer inside its transaction,
-    // so the second one arrives while the row is still `pending`.
-    let blocker = fixture.pool.get().expect("blocking connection");
-    blocker
-        .execute_batch("BEGIN IMMEDIATE")
-        .expect("the test holds the write lock");
-    let mut first = std::pin::pin!(app.clone().oneshot(request(
+    let item_id = &opened.question.questions[0].id;
+    let first = app.clone().oneshot(request(
         Method::POST,
-        "/api/session/ses_reads/question/que_recovered/reply",
-        Some(json!({"answers": [["first"]]})),
-    )));
-    let mut second = std::pin::pin!(app.clone().oneshot(request(
+        &path,
+        Some(json!({
+            "commandId": "first",
+            "expectedRevision": opened.question.revision,
+            "action": {"type": "answer", "answers": {(item_id): ["first"]}}
+        })),
+    ));
+    let second = app.oneshot(request(
         Method::POST,
-        "/api/session/ses_reads/question/que_recovered/reply",
-        Some(json!({"answers": [["second"]]})),
-    )));
-    assert!(futures::poll!(first.as_mut()).is_pending());
-    let ceiling = std::time::Instant::now() + Duration::from_secs(60);
-    let losing = loop {
-        if let std::task::Poll::Ready(response) = futures::poll!(second.as_mut()) {
-            break response.expect("the second answer responds");
-        }
-        assert!(
-            futures::poll!(first.as_mut()).is_pending(),
-            "the first answer must still hold the question while the second is refused"
-        );
-        assert!(
-            std::time::Instant::now() < ceiling,
-            "the second answer never responded"
-        );
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    };
+        &path,
+        Some(json!({
+            "commandId": "second",
+            "expectedRevision": opened.question.revision,
+            "action": {"type": "answer", "answers": {(item_id): ["second"]}}
+        })),
+    ));
+    let (first, second) = tokio::join!(first, second);
+    let statuses = BTreeSet::from([
+        first.expect("first response").status().as_u16(),
+        second.expect("second response").status().as_u16(),
+    ]);
     assert_eq!(
-        losing.status(),
-        StatusCode::NOT_FOUND,
-        "a question another answer already owns has to be refused, not answered twice"
-    );
-    blocker
-        .execute_batch("ROLLBACK")
-        .expect("the test releases the write lock");
-    drop(blocker);
-    assert_eq!(
-        first.await.expect("the first answer responds").status(),
-        StatusCode::NO_CONTENT,
-        "the answer that owns the question must still be accepted"
+        statuses,
+        BTreeSet::from([200, 409]),
+        "one command commits and the stale concurrent command conflicts"
     );
     assert_eq!(
-        durable_event_count(&fixture, "question.v2.replied").await,
+        durable_event_count(&fixture, "question.updated").await,
         1,
         "a published answer must describe a write that landed"
     );

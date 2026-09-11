@@ -466,10 +466,13 @@ async fn deliver_pending_inputs(session_id: &str, target: &NotificationTarget) {
             return;
         }
     };
-    let Some(report) = pending
-        .into_iter()
-        .find(|input| is_async_notification(&input.prompt))
-    else {
+    let Some(report) = pending.into_iter().find(|input| {
+        is_async_notification(&input.prompt)
+            && target
+                .inbox
+                .wake_admission(input)
+                .is_ok_and(|admission| admission != zuno_types::execution::WakeAdmission::Reject)
+    }) else {
         return;
     };
     wake_with_retry(target.wake.as_ref(), report).await;
@@ -575,6 +578,29 @@ mod tests {
             )
             .expect("insert session");
         drop(connection);
+        let execution = zuno_db::session_execution::SessionExecutionStore::new(Arc::clone(&pool));
+        let identity = zuno_types::execution::TurnExecutionIdentity::new("build", "fake", "model");
+        let mut state = execution
+            .seed(
+                "ses_parent",
+                zuno_types::execution::CollaborationMode::Work,
+                Some(identity.clone()),
+                1,
+            )
+            .expect("seed execution");
+        state.cycle_id = Some("notification-cycle".to_owned());
+        state.continuation = Some(zuno_types::execution::ContinuationToken {
+            cycle_id: "notification-cycle".to_owned(),
+            identity,
+            mode: zuno_types::execution::CollaborationMode::Work,
+            plan_id: None,
+            plan_revision: None,
+            context_epoch: 0,
+            anchor_message_id: None,
+        });
+        execution
+            .update(state.revision, state)
+            .expect("bind origin cycle");
         let inbox = SessionInbox::new(Arc::clone(&pool));
         let completion = CompletionDeliveryStore::new(Arc::clone(&pool));
         let jobs = AgentJobStore::new(pool);
@@ -600,6 +626,7 @@ mod tests {
             id: BackgroundExecutionId::parse("bg_0123456789abcdef0123456789abcdef")
                 .expect("valid execution id"),
             session_id: "ses_parent".to_owned(),
+            cycle_id: Some("notification-cycle".to_owned()),
             title: "tests".to_owned(),
             command: "cargo test".to_owned(),
             purpose: BackgroundExecutionPurpose::Command,
@@ -833,19 +860,22 @@ mod tests {
             .admit(NewSessionInput::new(
                 "msg_report",
                 "ses_parent",
-                json!({"kind":"workflowReport","text":"workflow finished"}),
+                json!({"kind":"workflowReport","jobID":"job_workflow","text":"workflow finished"}),
                 InputDelivery::Steer,
                 2,
-            ))
+            ).with_cycle_id(Some("notification-cycle")))
             .expect("admit report");
         inbox
-            .admit(NewSessionInput::new(
-                "msg_council",
-                "ses_parent",
-                json!({"kind":"councilReport","text":"council finished"}),
-                InputDelivery::Queue,
-                3,
-            ))
+            .admit(
+                NewSessionInput::new(
+                    "msg_council",
+                    "ses_parent",
+                    json!({"kind":"councilReport","jobID":"job_council","text":"council finished"}),
+                    InputDelivery::Queue,
+                    3,
+                )
+                .with_cycle_id(Some("notification-cycle")),
+            )
             .expect("admit council report");
         inbox
             .admit(NewSessionInput::new(
@@ -993,10 +1023,10 @@ mod tests {
                     Some(NewSessionInput::new(
                         "msg_child",
                         "ses_parent",
-                        json!({"kind":"subagentReport","text":"child finished"}),
+                        json!({"kind":"subagentReport","jobID":"job_child","text":"child finished"}),
                         InputDelivery::Queue,
                         3,
-                    )),
+                    ).with_cycle_id(Some("notification-cycle"))),
                 ),
             )
             .expect("settle child job");
@@ -1058,10 +1088,10 @@ mod tests {
             .admit(NewSessionInput::new(
                 "msg_sync_surface",
                 "ses_parent",
-                json!({"kind":"workflowReport","text":"workflow finished"}),
+                json!({"kind":"workflowReport","jobID":"job_workflow","text":"workflow finished"}),
                 InputDelivery::Queue,
                 2,
-            ))
+            ).with_cycle_id(Some("notification-cycle")))
             .expect("admit report");
         let service = Arc::new(
             BackgroundExecutionService::open(directory.path().join("background"))
@@ -1303,6 +1333,7 @@ mod tests {
         BackgroundExecutionInput {
             prepared,
             session_id: "ses_parent".to_owned(),
+            cycle_id: Some("notification-cycle".to_owned()),
             title: "notification test".to_owned(),
             command: command.to_owned(),
             purpose: BackgroundExecutionPurpose::Command,

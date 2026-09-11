@@ -8062,6 +8062,9 @@ dependencies = [
  "zuno-paths",
  "zuno-permission",
  "zuno-pty",
+ "zuno-session-control",
+ "zuno-tool",
+ "zuno-tools",
  "zuno-types",
 ]
 
@@ -8069,16 +8072,21 @@ dependencies = [
 name = "zuno-session-control"
 version = "0.10.29"
 dependencies = [
+ "async-trait",
  "rusqlite",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",
+ "tokio",
+ "tracing",
  "uuid",
  "zuno-db",
+ "zuno-engine",
  "zuno-error",
  "zuno-goal",
  "zuno-paths",
  "zuno-review",
+ "zuno-tool",
  "zuno-tools",
  "zuno-types",
 ]
@@ -8142,6 +8150,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.19",
  "tokio",
  "tracing",
  "uuid",
@@ -8150,6 +8159,7 @@ dependencies = [
  "zuno-orchestration",
  "zuno-paths",
  "zuno-permission",
+ "zuno-types",
 ]
 
 [[package]]

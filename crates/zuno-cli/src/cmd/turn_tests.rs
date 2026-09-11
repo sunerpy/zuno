@@ -1,5 +1,8 @@
 //! What both surfaces must be able to trust about the shared composition root.
 
+#[path = "turn/tests/scheduling_tests.rs"]
+mod scheduling_tests;
+
 use super::*;
 use zuno_engine::interrupt::InterruptSignal;
 use zuno_engine::r#loop::run_turn;
@@ -13,6 +16,13 @@ use zuno_catalog::agent::{Agent, AgentMode, AgentSource};
 use zuno_llm::sse::StreamIdleTimeout;
 use zuno_orchestration::sha256_text;
 use zuno_paths::Env;
+
+impl TurnPlan {
+    /// Inspect the real resolved authority from sibling composition-root tests.
+    pub(crate) fn capability_snapshot_for_test(&self) -> &CapabilitySnapshot {
+        self.capability.as_ref()
+    }
+}
 
 #[derive(Debug)]
 struct DirectTestSandbox {
@@ -454,9 +464,7 @@ async fn hiding_plan_update_does_not_create_a_private_host_plan() {
             interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
             sandbox: test_sandbox(),
-            todo_store: Arc::new(
-                zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
-            ),
+            todo_store: test_tool_pool(),
             work_observer: test_work_observer(),
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
@@ -1330,30 +1338,34 @@ fn a_promoted_report_batch_keeps_one_task_report_metadata_per_message() {
             )
             .expect("seed batch session");
     }
+    bind_test_cycle(&pool, "ses-batch");
     let inbox = zuno_db::inbox::SessionInbox::new(Arc::clone(&pool));
     for (input_id, job_id, agent, text) in [
         ("input-first", "job-first", "explorer", "first result"),
         ("input-second", "job-second", "reviewer", "second result"),
     ] {
         inbox
-            .admit(zuno_db::inbox::NewSessionInput::new(
-                input_id,
-                "ses-batch",
-                json!({
-                    "kind": "subagentReport",
-                    "jobID": job_id,
-                    "childSessionID": "ses-child",
-                    "status": "completed",
-                    "text": text,
-                    "metadata": {
-                        "schemaVersion": 1,
-                        "agent": agent,
-                        "finalText": text
-                    }
-                }),
-                zuno_db::inbox::InputDelivery::Queue,
-                2,
-            ))
+            .admit(
+                zuno_db::inbox::NewSessionInput::new(
+                    input_id,
+                    "ses-batch",
+                    json!({
+                        "kind": "subagentReport",
+                        "jobID": job_id,
+                        "childSessionID": "ses-child",
+                        "status": "completed",
+                        "text": text,
+                        "metadata": {
+                            "schemaVersion": 1,
+                            "agent": agent,
+                            "finalText": text
+                        }
+                    }),
+                    zuno_db::inbox::InputDelivery::Queue,
+                    2,
+                )
+                .with_cycle_id(Some("test-cycle")),
+            )
             .expect("admit report");
     }
     let promoted = inbox
@@ -1441,26 +1453,30 @@ fn promoted_subagent_report_persists_host_metadata_on_the_user_message() {
             )
             .expect("seed report session");
     }
+    bind_test_cycle(&pool, "ses-report");
     let inbox = zuno_db::inbox::SessionInbox::new(Arc::clone(&pool));
     inbox
-        .admit(zuno_db::inbox::NewSessionInput::new(
-            "input-report",
-            "ses-report",
-            json!({
-                "kind": "subagentReport",
-                "jobID": "job-report",
-                "childSessionID": "ses-child",
-                "status": "completed",
-                "text": "background result",
-                "metadata": {
-                    "schemaVersion": 1,
-                    "agent": "explorer",
-                    "finalText": "background result"
-                }
-            }),
-            zuno_db::inbox::InputDelivery::Queue,
-            2,
-        ))
+        .admit(
+            zuno_db::inbox::NewSessionInput::new(
+                "input-report",
+                "ses-report",
+                json!({
+                    "kind": "subagentReport",
+                    "jobID": "job-report",
+                    "childSessionID": "ses-child",
+                    "status": "completed",
+                    "text": "background result",
+                    "metadata": {
+                        "schemaVersion": 1,
+                        "agent": "explorer",
+                        "finalText": "background result"
+                    }
+                }),
+                zuno_db::inbox::InputDelivery::Queue,
+                2,
+            )
+            .with_cycle_id(Some("test-cycle")),
+        )
         .expect("admit report");
     inbox
         .promote_id("ses-report", "input-report")
@@ -1546,6 +1562,24 @@ fn test_background_executions(directory: &Path) -> Arc<zuno_pty::BackgroundExecu
         zuno_pty::BackgroundExecutionService::open(directory.join(".background"))
             .expect("test background execution service"),
     )
+}
+
+fn test_tool_pool() -> Arc<zuno_db::Pool> {
+    let pool =
+        Arc::new(zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("tool database"));
+    let mut connection = pool.get().expect("connection");
+    zuno_db::migration::apply(&mut connection).expect("tool database schema");
+    drop(connection);
+    pool
+}
+
+fn bind_test_cycle(pool: &Arc<zuno_db::Pool>, session_id: &str) {
+    let store = zuno_db::session_execution::SessionExecutionStore::new(Arc::clone(pool));
+    let mut state = store
+        .seed(session_id, CollaborationMode::Work, None, 1)
+        .expect("execution");
+    state.cycle_id = Some("test-cycle".to_owned());
+    store.update(state.revision, state).expect("bound cycle");
 }
 
 #[test]
@@ -1734,7 +1768,7 @@ fn test_job_controller() -> Arc<dyn zuno_tools::job_cancel::JobController> {
 #[derive(Debug, Clone, Copy)]
 enum ScriptedTurnBehavior {
     PreserveWork,
-    SettlePlanOnSecondTurn,
+    SettleWorkOnSecondTurn,
     CompactThenComplete,
     UpdatePlanThenCompact,
 }
@@ -1806,7 +1840,7 @@ impl AgentDriver for ScriptedTurnDriver {
                     reason: "provider-reported context crossed the proactive threshold".to_owned(),
                 });
             }
-            if matches!(behavior, ScriptedTurnBehavior::SettlePlanOnSecondTurn) && call == 2 {
+            if matches!(behavior, ScriptedTurnBehavior::SettleWorkOnSecondTurn) && call == 2 {
                 let current = work
                     .plan(&request.session_id)
                     .expect("read scripted Plan")
@@ -1828,6 +1862,28 @@ impl AgentDriver for ScriptedTurnDriver {
                     },
                 )
                 .expect("settle scripted Plan");
+                let changes = work
+                    .snapshot(&request.session_id)
+                    .expect("scripted work")
+                    .items
+                    .into_iter()
+                    .map(|item| zuno_tools::WorkItemChange::Update {
+                        id: item.id,
+                        expected_revision: item.revision,
+                        goal_id: item.goal_id,
+                        plan_step_id: item.plan_step_id,
+                        parent_id: item.parent_id,
+                        subject: item.subject,
+                        description: item.description,
+                        active_form: item.active_form,
+                        status: zuno_tools::WorkItemStatus::Completed,
+                        priority: item.priority,
+                        dependencies: item.dependencies,
+                        owner: item.owner,
+                    })
+                    .collect();
+                work.update_items(&request.session_id, changes)
+                    .expect("settle scripted runnable Todos");
             }
             Ok(TurnOutcome::Completed {
                 assistant_message_id: format!("msg_scripted_{call}"),
@@ -1905,7 +1961,8 @@ async fn scripted_reconciliation_host(
     let directory = tempfile::tempdir().expect("scripted host workspace");
     let session_id = format!("ses_scripted_{agent_name}");
     let config = zuno_config::schema::Config::default();
-    let agent = agent(agent_name);
+    let mut agent = agent(agent_name);
+    agent.tools = Some(Vec::new());
     let profile = agent_profile(agent.clone(), directory.path(), &config);
     let mut plan = plan_for(
         directory.path().to_str().expect("UTF-8 workspace"),
@@ -2075,6 +2132,11 @@ fn start_scripted_remote_observer(
         .start(zuno_pty::BackgroundExecutionInput {
             prepared,
             session_id: host.session_id.clone(),
+            cycle_id: host
+                .session_control
+                .state(&host.session_id)
+                .expect("observer origin state")
+                .and_then(|state| state.cycle_id),
             title: "watch release run".to_owned(),
             command: command.to_owned(),
             purpose: zuno_pty::BackgroundExecutionPurpose::RemoteObserver,
@@ -2216,8 +2278,8 @@ async fn plan_handoff_finishes_one_host_turn_and_preserves_future_work() {
 #[tokio::test]
 async fn ordinary_build_still_runs_reconciliation_until_durable_work_settles() {
     let (_directory, mut host, driver, work) =
-        scripted_reconciliation_host("build", ScriptedTurnBehavior::SettlePlanOnSecondTurn).await;
-    seed_scripted_plan(&work, &host.session_id, false);
+        scripted_reconciliation_host("build", ScriptedTurnBehavior::SettleWorkOnSecondTurn).await;
+    seed_scripted_plan(&work, &host.session_id, true);
     let guard = host
         .runs
         .begin_turn(host.session_id.clone())
@@ -2243,10 +2305,14 @@ async fn ordinary_build_still_runs_reconciliation_until_durable_work_settles() {
     assert_eq!(
         driver.calls(),
         2,
-        "ordinary work must receive one reconciliation turn before settlement"
+        "runnable Todo work receives one reconciliation turn before settlement"
     );
     let snapshot = work.snapshot(&host.session_id).expect("settled work state");
-    assert!(snapshot.items.is_empty());
+    assert_eq!(snapshot.items.len(), 1);
+    assert_eq!(
+        snapshot.items[0].status,
+        zuno_tools::WorkItemStatus::Completed
+    );
     assert!(
         snapshot
             .plan
@@ -2278,6 +2344,23 @@ async fn a_remote_observer_defers_goal_reconciliation_until_its_durable_wake() {
             None,
         )
         .expect("create active Goal");
+    let plan = work
+        .plan(&host.session_id)
+        .expect("Plan")
+        .expect("Plan exists");
+    let continuation = host
+        .session_control
+        .record_continuation(
+            &host.session_id,
+            "scripted-observer-cycle",
+            host.current_turn_identity(),
+            CollaborationMode::Work,
+            Some(plan.id),
+            Some(plan.revision),
+            None,
+            zuno_db::message::now_millis(),
+        )
+        .expect("bind observer origin before launch");
     let execution_id = start_scripted_remote_observer(&host, directory.path());
     assert!(host.remote_observer_running());
 
@@ -2290,7 +2373,7 @@ async fn a_remote_observer_defers_goal_reconciliation_until_its_durable_wake() {
         host.execute_turn_unaccounted(
             DynamicContext::default(),
             DynamicContextRefreshInstruction::Fixed("scripted".to_owned()),
-            TurnStart::UserMessage,
+            TurnStart::Recovery { continuation },
             None,
             &guard,
             sender,
@@ -2316,7 +2399,7 @@ async fn a_remote_observer_defers_goal_reconciliation_until_its_durable_wake() {
         phase.phase,
         zuno_engine::plan_driver::DriverPhase::WaitingBackground
     );
-    assert_eq!(phase.reason.as_deref(), Some("remote_observer_running"));
+    assert_eq!(phase.reason.as_deref(), Some("waiting_external"));
     assert_eq!(phase.reconciliation_attempt, 0);
     assert!(
         events
@@ -2959,6 +3042,8 @@ fn orchestration_seed(capability: &CapabilitySnapshot) -> Arc<AttemptSeed> {
         preset: None,
         subagent_model_policy_sha256: sha256_text("subagent-model-policy"),
         parent_attempt: None,
+        parent_authority: None,
+        cycle_id: None,
         workflow: None,
         workflow_node: None,
     })
@@ -2968,6 +3053,8 @@ fn parent_attempt(capability: CapabilitySnapshot) -> AttemptSnapshot {
     AttemptSnapshot {
         schema_version: zuno_orchestration::SNAPSHOT_SCHEMA_VERSION,
         turn_id: "turn-parent".to_owned(),
+        parent_authority: None,
+        cycle_id: None,
         step: 1,
         capability,
         owner: zuno_orchestration::OwnerLineage {
@@ -6455,9 +6542,7 @@ fn production_registry_exposes_all_three_goal_tools() {
             interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
             sandbox: test_sandbox(),
-            todo_store: Arc::new(
-                zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
-            ),
+            todo_store: test_tool_pool(),
             work_observer: test_work_observer(),
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
@@ -6507,7 +6592,7 @@ fn interaction_tool_ids(
     let selected_agent = agent_profile(agent(selected_agent_name), directory.path(), &config);
     let question = attached_human_surface.then(|| {
         Arc::new(zuno_tools::question::ScriptedAnswers::default())
-            as Arc<dyn zuno_tools::question::QuestionAsker>
+            as Arc<dyn zuno_tool::question::QuestionPort>
     });
     tool_runtime::assemble(
         directory.path(),
@@ -6526,9 +6611,7 @@ fn interaction_tool_ids(
             interaction_policy: policy,
             background_executions: test_background_executions(directory.path()),
             sandbox: test_sandbox(),
-            todo_store: Arc::new(
-                zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
-            ),
+            todo_store: test_tool_pool(),
             work_observer: test_work_observer(),
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
@@ -6560,8 +6643,16 @@ fn interaction_tools_follow_plan_goal_and_subagent_boundaries() {
     let work = interaction_tool_ids(zuno_goal::InteractionPolicy::WorkAutonomous, true);
     assert!(
         work.iter()
-            .all(|tool| tool != zuno_tools::question::WIRE_ID),
-        "ordinary Work must finish with a direct question instead of parking a synchronous tool"
+            .any(|tool| tool == zuno_tools::question::WIRE_ID),
+        "ordinary Work may durably wait for required input without a Goal"
+    );
+    assert!(
+        work.iter()
+            .any(|tool| tool == zuno_tools::question::ASYNC_WIRE_ID)
+    );
+    assert!(
+        work.iter()
+            .all(|tool| tool != zuno_tools::plan_exit::WIRE_ID)
     );
 
     let plan = interaction_tool_ids(zuno_goal::InteractionPolicy::PlanClarification, true);
@@ -6594,7 +6685,9 @@ fn interaction_tools_follow_plan_goal_and_subagent_boundaries() {
 
     let subagent = interaction_tool_ids(zuno_goal::InteractionPolicy::SubagentReportOnly, true);
     assert!(subagent.iter().all(|tool| {
-        tool != zuno_tools::question::WIRE_ID && tool != zuno_goal::REQUEST_GOAL_INPUT_TOOL_ID
+        tool != zuno_tools::question::WIRE_ID
+            && tool != zuno_tools::question::ASYNC_WIRE_ID
+            && tool != zuno_goal::REQUEST_GOAL_INPUT_TOOL_ID
     }));
 }
 
@@ -6664,10 +6757,7 @@ async fn the_supplied_generated_root_reaches_the_assembled_shell_tool() {
                 interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
                 background_executions: test_background_executions(directory),
                 sandbox: test_sandbox(),
-                todo_store: Arc::new(
-                    zuno_db::Pool::open(&zuno_paths::DbLocation::Memory)
-                        .expect("in-memory todo store"),
-                ),
+                todo_store: test_tool_pool(),
                 work_observer: test_work_observer(),
                 goal_store: Arc::new(
                     GoalStore::open_memory(goal_spill.path().to_owned())
@@ -6767,9 +6857,7 @@ async fn production_registry_wires_configured_shell_into_the_shell_tool() {
             interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
             sandbox: test_sandbox(),
-            todo_store: Arc::new(
-                zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
-            ),
+            todo_store: test_tool_pool(),
             work_observer: test_work_observer(),
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
@@ -6853,9 +6941,7 @@ async fn production_registry_wires_configured_output_limits_into_the_shell_tool(
             interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
             sandbox: test_sandbox(),
-            todo_store: Arc::new(
-                zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
-            ),
+            todo_store: test_tool_pool(),
             work_observer: test_work_observer(),
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
@@ -6955,9 +7041,7 @@ async fn explicit_full_access_uses_the_native_backend_and_retains_managed_lifecy
             interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
             sandbox: None,
-            todo_store: Arc::new(
-                zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
-            ),
+            todo_store: test_tool_pool(),
             work_observer: test_work_observer(),
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
@@ -7060,9 +7144,7 @@ async fn unavailable_fallback_is_visible_and_keeps_managed_shell_guards_and_auth
             interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: Arc::clone(&background_executions),
             sandbox: Some(Arc::new(UnavailableTestSandbox)),
-            todo_store: Arc::new(
-                zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
-            ),
+            todo_store: test_tool_pool(),
             work_observer: test_work_observer(),
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
@@ -7245,9 +7327,7 @@ fn read_only_agent_refuses_unavailable_fallback_even_when_trusted_config_allows_
             interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
             sandbox: Some(Arc::new(UnavailableTestSandbox)),
-            todo_store: Arc::new(
-                zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
-            ),
+            todo_store: test_tool_pool(),
             work_observer: test_work_observer(),
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
@@ -7373,9 +7453,7 @@ async fn a_read_only_agent_contract_narrows_a_full_access_invocation() {
             interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
             sandbox: test_sandbox(),
-            todo_store: Arc::new(
-                zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
-            ),
+            todo_store: test_tool_pool(),
             work_observer: test_work_observer(),
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
@@ -7444,10 +7522,7 @@ fn production_registry_exposes_council_only_to_a_delegating_profile() {
                 interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
                 background_executions: test_background_executions(directory.path()),
                 sandbox: test_sandbox(),
-                todo_store: Arc::new(
-                    zuno_db::Pool::open(&zuno_paths::DbLocation::Memory)
-                        .expect("in-memory todo store"),
-                ),
+                todo_store: test_tool_pool(),
                 work_observer: test_work_observer(),
                 goal_store: Arc::new(
                     GoalStore::open_memory(goal_spill.path().to_owned())
@@ -7555,9 +7630,7 @@ fn production_registry_uses_the_frozen_profile_rules() {
             interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
             sandbox: test_sandbox(),
-            todo_store: Arc::new(
-                zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
-            ),
+            todo_store: test_tool_pool(),
             work_observer: test_work_observer(),
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
@@ -7810,7 +7883,7 @@ fn durable_work_context_projects_plan_todos_jobs_reports_and_prior_receipt_from_
     )
     .expect("decode durable work context");
 
-    assert_eq!(snapshot["schemaVersion"], 2);
+    assert_eq!(snapshot["schemaVersion"], 3);
     assert_eq!(snapshot["plan"]["id"], "plan_durable");
     assert_eq!(snapshot["plan"]["revision"], 2);
     assert_eq!(snapshot["todos"][0]["id"], "todo_durable");
@@ -7845,6 +7918,9 @@ fn durable_work_context_projects_plan_todos_jobs_reports_and_prior_receipt_from_
 fn durable_work_context_has_a_deterministic_total_prompt_budget() {
     let snapshot = DurableWorkContextSnapshot {
         schema_version: DURABLE_WORK_CONTEXT_SCHEMA_VERSION,
+        execution: None,
+        questions: Vec::new(),
+        omitted_questions: 0,
         plan: None,
         todos: (0..DURABLE_WORK_CONTEXT_MAX_ENTRIES)
             .map(|index| DurableTodoContext {
@@ -9254,10 +9330,7 @@ mod production_registry {
                 interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
                 background_executions: test_background_executions(directory.path()),
                 sandbox: test_sandbox(),
-                todo_store: Arc::new(
-                    zuno_db::Pool::open(&zuno_paths::DbLocation::Memory)
-                        .expect("in-memory todo store"),
-                ),
+                todo_store: test_tool_pool(),
                 work_observer: test_work_observer(),
                 goal_store: Arc::new(
                     GoalStore::open_memory(goal_spill.path().to_owned())
@@ -9872,10 +9945,7 @@ mod production_registry {
                 interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
                 background_executions: test_background_executions(directory.path()),
                 sandbox: test_sandbox(),
-                todo_store: Arc::new(
-                    zuno_db::Pool::open(&zuno_paths::DbLocation::Memory)
-                        .expect("in-memory todo store"),
-                ),
+                todo_store: test_tool_pool(),
                 work_observer: test_work_observer(),
                 goal_store: Arc::new(
                     GoalStore::open_memory(goal_spill.path().to_owned())
@@ -12891,9 +12961,7 @@ fn assemble_on_unsupported_platform(
             interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory),
             sandbox: Some(Arc::new(UnsupportedPlatformTestSandbox)),
-            todo_store: Arc::new(
-                zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
-            ),
+            todo_store: test_tool_pool(),
             work_observer: test_work_observer(),
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.to_owned()).expect("in-memory goal store"),
