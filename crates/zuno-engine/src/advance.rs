@@ -1,9 +1,8 @@
 //! Bounded advancement of the ordinary agent loop.
 //!
-//! A checkpoint is only issued after every tool result in its step is durable.
-//! Interrupted in-flight advances require inspection; a checkpoint is never a
-//! license to replay a side effect. This local adapter does not grant a lease
-//! over an external environment.
+//! A checkpoint records a completed step or an exact durable tool wait.
+//! Interrupted advances without such a boundary require inspection; a checkpoint
+//! never authorizes replay of an external effect or grants an environment lease.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
@@ -23,8 +22,10 @@ use crate::r#loop::{
 };
 use crate::prompt::PromptTraceSet;
 
+pub use crate::r#loop::tool_step::ToolStepCheckpoint;
+
 const EVENT_TYPE: &str = "runtime.driver.advance";
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 pub const DRIVER_CHECKPOINT_VERSION: u32 = SCHEMA_VERSION;
 const MAX_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
 
@@ -105,6 +106,10 @@ pub enum AdvanceOutcome {
     Progressed {
         checkpoint: CheckpointRef,
     },
+    Waiting {
+        checkpoint: CheckpointRef,
+        waits: Vec<zuno_types::wait::WaitRef>,
+    },
     Completed {
         assistant_message_id: String,
         steps: u32,
@@ -174,6 +179,7 @@ pub enum AdvanceError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LoopCheckpoint {
+    pub tool_step: Option<ToolStepCheckpoint>,
     pub steps: u32,
     pub tool_calls_dispatched: u32,
     pub last_assistant_id: Option<String>,
@@ -193,9 +199,24 @@ pub struct LoopCheckpoint {
     pub started_at_ms: i64,
 }
 
+impl LoopCheckpoint {
+    pub fn waits(&self) -> Vec<zuno_types::wait::WaitRef> {
+        self.tool_step
+            .as_ref()
+            .map(|step| {
+                step.pending
+                    .iter()
+                    .map(|pending| pending.reference.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
 pub(crate) enum LoopOutcome {
     Completed(TurnOutcome),
     Progressed(Box<LoopCheckpoint>),
+    Waiting(Box<LoopCheckpoint>),
 }
 
 impl From<TurnOutcome> for LoopOutcome {
@@ -232,6 +253,9 @@ pub enum BeginAdvance {
 pub enum AdvanceState {
     Started,
     Checkpointed {
+        checkpoint: Box<LoopCheckpoint>,
+    },
+    Waiting {
         checkpoint: Box<LoopCheckpoint>,
     },
     Completed {
@@ -273,6 +297,88 @@ fn decode(event: &SessionEvent) -> Result<AdvanceRecord, AdvanceError> {
     Ok(record)
 }
 
+/// A valid tool-phase checkpoint protects only its exact unfinished rows.
+pub fn protects_unfinished(
+    event: &SessionEvent,
+    parts: &[zuno_db::message::PartRecord],
+) -> Result<bool, AdvanceError> {
+    let record = decode(event)?;
+    let checkpoint = match record.state {
+        AdvanceState::Checkpointed { checkpoint } | AdvanceState::Waiting { checkpoint } => {
+            checkpoint
+        }
+        _ => return Ok(false),
+    };
+    let Some(phase) = &checkpoint.tool_step else {
+        return Ok(false);
+    };
+    Ok(phase.covers_unfinished(&event.session_id, &record.turn_id, parts, true)?)
+}
+
+pub fn pending_waits(event: &SessionEvent) -> Result<Vec<zuno_types::wait::WaitRef>, AdvanceError> {
+    let record = decode(event)?;
+    Ok(match record.state {
+        AdvanceState::Waiting { checkpoint } => checkpoint.waits(),
+        _ => Vec::new(),
+    })
+}
+
+/// Reclaim only an unchanged, explicit boundary. A newer started advance or an
+/// unexplained unfinished invocation keeps the expired execution uncertain.
+pub fn reclaimable_checkpoint(
+    event: &SessionEvent,
+    owner: &PrincipalKey,
+    reference: &Value,
+    unfinished: &[zuno_db::message::PartRecord],
+) -> Result<bool, AdvanceError> {
+    let record = decode(event)?;
+    if &record.owner != owner
+        || event.event_type != EVENT_TYPE
+        || json!(checkpoint_ref(event, &record.turn_id)) != *reference
+    {
+        return Ok(false);
+    }
+    match record.state {
+        AdvanceState::Checkpointed { checkpoint } | AdvanceState::Waiting { checkpoint } => {
+            match checkpoint.tool_step {
+                Some(phase) => Ok(phase.covers_unfinished(
+                    &event.session_id,
+                    &record.turn_id,
+                    unfinished,
+                    true,
+                )?),
+                None => Ok(unfinished.is_empty()),
+            }
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Recover the authoritative checkpoint referenced by a request. Caller-supplied
+/// admission/checkpoint bodies never substitute for this durable event.
+pub fn restore_checkpoint(
+    event: &SessionEvent,
+    request: &AdvanceRequest,
+    owner: &PrincipalKey,
+) -> Result<LoopCheckpoint, AdvanceError> {
+    let record = decode(event)?;
+    if event.session_id != request.run.session_id
+        || event.event_type != EVENT_TYPE
+        || record.turn_id != request.run.turn_id
+        || &record.owner != owner
+        || record.request_digest != digest(request)
+        || request.checkpoint.as_ref() != Some(&checkpoint_ref(event, &record.turn_id))
+    {
+        return Err(AdvanceError::Conflict);
+    }
+    match record.state {
+        AdvanceState::Checkpointed { checkpoint } | AdvanceState::Waiting { checkpoint } => {
+            Ok(*checkpoint)
+        }
+        _ => Err(AdvanceError::Conflict),
+    }
+}
+
 fn encode(record: &AdvanceRecord) -> Result<NewSessionEvent, AdvanceError> {
     let encoded = serde_json::to_vec(&record)
         .map_err(|error| AdvanceError::InvalidCheckpoint(error.to_string()))?;
@@ -296,7 +402,36 @@ fn encode(record: &AdvanceRecord) -> Result<NewSessionEvent, AdvanceError> {
 /// The storage provider makes this decision while holding its session write lock.
 pub enum PreparedBegin {
     Admit(Box<PreparedAdmission>),
+    Consume(Box<PreparedConsumption>),
     AlreadyCommitted(AdvanceOutcome),
+}
+
+/// A dependency-only transition has no provider/tool effects and needs no
+/// separately committed "started" marker. Its entire consumption is one CAS.
+pub struct PreparedConsumption {
+    pub checkpoint: LoopCheckpoint,
+    turn_id: String,
+    owner: PrincipalKey,
+    request_digest: String,
+    previous: Option<CheckpointRef>,
+}
+
+impl PreparedConsumption {
+    pub fn event(self) -> Result<NewSessionEvent, AdvanceError> {
+        if !self.checkpoint.waits().is_empty() {
+            return Err(AdvanceError::Conflict);
+        }
+        encode(&AdvanceRecord {
+            schema_version: SCHEMA_VERSION,
+            turn_id: self.turn_id,
+            owner: self.owner,
+            request_digest: self.request_digest,
+            previous: self.previous,
+            state: AdvanceState::Checkpointed {
+                checkpoint: Box::new(self.checkpoint),
+            },
+        })
+    }
 }
 
 pub struct PreparedAdmission {
@@ -339,6 +474,7 @@ pub fn prepare_begin(
     latest: Option<SessionEvent>,
     unfinished: bool,
     uncertain: bool,
+    waits_ready: bool,
 ) -> Result<PreparedBegin, AdvanceError> {
     if unfinished || uncertain {
         return Err(AdvanceError::NeedsInspection);
@@ -363,6 +499,12 @@ pub fn prepare_begin(
                             },
                         ));
                     }
+                    AdvanceState::Waiting { checkpoint } => {
+                        return Ok(PreparedBegin::AlreadyCommitted(AdvanceOutcome::Waiting {
+                            checkpoint: checkpoint_ref(&event, &record.turn_id),
+                            waits: checkpoint.waits(),
+                        }));
+                    }
                     AdvanceState::Completed { outcome } => {
                         return Ok(PreparedBegin::AlreadyCommitted(outcome.clone().into()));
                     }
@@ -373,14 +515,17 @@ pub fn prepare_begin(
                 (AdvanceState::Completed { .. }, None) if record.turn_id != request.run.turn_id => {
                     None
                 }
-                (AdvanceState::Checkpointed { checkpoint }, Some(previous))
-                    if previous.session_id == request.run.session_id
-                        && previous.turn_id == request.run.turn_id
-                        && previous.sequence == event.sequence
-                        && previous.event_id == event.id
-                        && record.turn_id == request.run.turn_id
-                        && record.owner == owner
-                        && record.request_digest == request_digest =>
+                (
+                    AdvanceState::Checkpointed { checkpoint }
+                    | AdvanceState::Waiting { checkpoint },
+                    Some(previous),
+                ) if previous.session_id == request.run.session_id
+                    && previous.turn_id == request.run.turn_id
+                    && previous.sequence == event.sequence
+                    && previous.event_id == event.id
+                    && record.turn_id == request.run.turn_id
+                    && record.owner == owner
+                    && record.request_digest == request_digest =>
                 {
                     if checkpoint.steps == 0
                         || checkpoint.steps == u32::MAX
@@ -390,6 +535,12 @@ pub fn prepare_begin(
                         return Err(AdvanceError::InvalidCheckpoint(
                             "a ready checkpoint requires a completed assistant step".to_owned(),
                         ));
+                    }
+                    if !checkpoint.waits().is_empty() && !waits_ready {
+                        return Ok(PreparedBegin::AlreadyCommitted(AdvanceOutcome::Waiting {
+                            checkpoint: previous.clone(),
+                            waits: checkpoint.waits(),
+                        }));
                     }
                     Some(*checkpoint)
                 }
@@ -401,6 +552,17 @@ pub fn prepare_begin(
         }
         (None, Some(_)) => return Err(AdvanceError::Conflict),
     };
+    if let Some(checkpoint) = &checkpoint
+        && !checkpoint.waits().is_empty()
+    {
+        return Ok(PreparedBegin::Consume(Box::new(PreparedConsumption {
+            checkpoint: checkpoint.clone(),
+            turn_id: request.run.turn_id.clone(),
+            owner,
+            request_digest,
+            previous: request.checkpoint.clone(),
+        })));
+    }
     Ok(PreparedBegin::Admit(Box::new(PreparedAdmission {
         session_id: request.run.session_id.clone(),
         checkpoint,
@@ -425,27 +587,69 @@ pub(crate) fn begin(
         .map_err(zuno_db::open::map_error)?;
     session::get_owned(&transaction, &request.run.session_id, &owner)?;
     let messages = zuno_db::message::MessageStore::new(&transaction);
-    let unfinished = !messages
-        .unfinished_tool_parts_for_session(&request.run.session_id)?
-        .is_empty();
+    let unfinished_parts = messages.unfinished_tool_parts_for_session(&request.run.session_id)?;
     let uncertain = !messages
         .pending_uncertain_tool_calls(&request.run.session_id, i64::MIN)?
         .is_empty();
     let latest = latest_of_type_in(&transaction, &request.run.session_id, EVENT_TYPE)?;
-    match prepare_begin(request, owner, latest, unfinished, uncertain)? {
-        PreparedBegin::AlreadyCommitted(outcome) => Ok(BeginAdvance::AlreadyCommitted(outcome)),
+    let unfinished = !unfinished_parts.is_empty()
+        && !latest
+            .as_ref()
+            .map(|event| protects_unfinished(event, &unfinished_parts))
+            .transpose()?
+            .unwrap_or(false);
+    let waits = latest
+        .as_ref()
+        .map(pending_waits)
+        .transpose()?
+        .unwrap_or_default();
+    let scope = crate::state::TurnStateScope {
+        owner: owner.clone(),
+        session_id: request.run.session_id.clone(),
+    };
+    let completions = crate::wait::sqlite_completions(&transaction, &scope, &waits)?;
+    let waits_ready = completions.is_some();
+    let outcome = match prepare_begin(request, owner, latest, unfinished, uncertain, waits_ready)? {
+        PreparedBegin::AlreadyCommitted(outcome) => BeginAdvance::AlreadyCommitted(outcome),
+        PreparedBegin::Consume(mut prepared) => {
+            let completions = completions.ok_or(AdvanceError::Conflict)?;
+            let parts = crate::r#loop::tool_step::consume(
+                &request.run,
+                &mut prepared.checkpoint,
+                &completions,
+            )?;
+            for part in parts {
+                messages.put_part(&part)?;
+            }
+            for completion in &completions {
+                zuno_db::event_log::append_identified_in(
+                    &transaction,
+                    &scope.session_id,
+                    &crate::wait::consumed_event_id(&scope, &completion.reference),
+                    crate::wait::consumed_event(completion)?,
+                )?;
+            }
+            let event = append_in(&transaction, &scope.session_id, prepared.event()?)?;
+            BeginAdvance::AlreadyCommitted(AdvanceOutcome::Progressed {
+                checkpoint: checkpoint_ref(&event, &request.run.turn_id),
+            })
+        }
         PreparedBegin::Admit(prepared) => {
             let event = append_in(&transaction, &request.run.session_id, prepared.event()?)?;
             let admission = prepared.committed(&event)?;
-            transaction.commit().map_err(zuno_db::open::map_error)?;
-            Ok(BeginAdvance::Admitted(Box::new(admission)))
+            BeginAdvance::Admitted(Box::new(admission))
         }
-    }
+    };
+    transaction.commit().map_err(zuno_db::open::map_error)?;
+    Ok(outcome)
 }
 
 pub(crate) fn completion_state(outcome: &Result<LoopOutcome, TurnError>) -> AdvanceState {
     match outcome {
         Ok(LoopOutcome::Progressed(checkpoint)) => AdvanceState::Checkpointed {
+            checkpoint: checkpoint.clone(),
+        },
+        Ok(LoopOutcome::Waiting(checkpoint)) => AdvanceState::Waiting {
             checkpoint: checkpoint.clone(),
         },
         Ok(LoopOutcome::Completed(outcome)) => AdvanceState::Completed {
@@ -507,6 +711,27 @@ pub(crate) fn commit(
     session::get_owned(&transaction, &request.run.session_id, &admission.owner)?;
     let latest = latest_of_type_in(&transaction, &request.run.session_id, EVENT_TYPE)?
         .ok_or(AdvanceError::Conflict)?;
+    if let AdvanceState::Waiting { checkpoint } = &state {
+        let phase = checkpoint
+            .tool_step
+            .as_ref()
+            .ok_or(AdvanceError::Conflict)?;
+        let messages = zuno_db::message::MessageStore::new(&transaction);
+        let parts = messages.unfinished_tool_parts_for_session(&request.run.session_id)?;
+        if phase.pending.is_empty()
+            || !phase.covers_unfinished(
+                &request.run.session_id,
+                &request.run.turn_id,
+                &parts,
+                false,
+            )?
+        {
+            return Err(AdvanceError::NeedsInspection);
+        }
+        for part in phase.waiting_parts(&parts)? {
+            messages.put_part(&part)?;
+        }
+    }
     let event = append_in(
         &transaction,
         &request.run.session_id,

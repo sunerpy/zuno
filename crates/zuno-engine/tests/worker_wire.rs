@@ -7,7 +7,7 @@ use std::sync::{
 use zuno_db::message::MessageWithParts;
 use zuno_engine::state::remote::{RemoteTurnPersistence, StateTransport};
 use zuno_engine::state::wire::{
-    StateCommand, StateReply, StateRequest, StateResponse, StoredMessage,
+    StateCommand, StateReply, StateRequest, StateResponse, StoredMessage, WORKER_PROTOCOL_VERSION,
 };
 use zuno_engine::state::{TurnPersistence, TurnStateError, TurnStateScope};
 use zuno_types::identity::{PrincipalScope, SessionId};
@@ -21,10 +21,22 @@ fn scope() -> TurnStateScope {
 
 #[test]
 fn request_version_and_scope_injection_fail_closed() {
-    assert!(StateRequest::decode(br#"{"version":2,"command":{"kind":"touch"}}"#).is_err());
+    for version in [1, WORKER_PROTOCOL_VERSION + 1] {
+        assert!(
+            StateRequest::decode(
+                &serde_json::to_vec(&json!({
+                    "version":version,"command":{"kind":"touch"},
+                }))
+                .unwrap()
+            )
+            .is_err()
+        );
+    }
     assert!(
         StateRequest::decode(
-            br#"{"version":1,"owner":"administrator","command":{"kind":"touch"}}"#
+            &serde_json::to_vec(&json!({
+                "version":WORKER_PROTOCOL_VERSION,"owner":"administrator","command":{"kind":"touch"},
+            })).unwrap()
         )
         .is_err()
     );

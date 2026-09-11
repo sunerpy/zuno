@@ -17,6 +17,22 @@ use zuno_tool::{
     ToolEffect, ToolOutput, ToolReplayPolicy,
 };
 
+#[async_trait]
+trait LocalDispatch: ToolDispatcher {
+    async fn dispatch_local(
+        &self,
+        request: DispatchRequest,
+    ) -> zuno_engine::r#loop::ToolDispatchResult {
+        match self.dispatch(request).await {
+            zuno_engine::r#loop::ToolDispatchOutcome::Completed(result) => *result,
+            zuno_engine::r#loop::ToolDispatchOutcome::Pending(reference) => {
+                panic!("the native tool registry unexpectedly deferred {reference:?}")
+            }
+        }
+    }
+}
+impl<T: ToolDispatcher + ?Sized> LocalDispatch for T {}
+
 #[derive(Default)]
 struct RecordingApprover {
     asks: Mutex<Vec<PermissionAsk>>,
@@ -624,7 +640,7 @@ async fn strict_authorization_forces_fresh_manual_approval_despite_allows() {
 
     for index in 0..2 {
         let result = dispatcher
-            .dispatch(request(
+            .dispatch_local(request(
                 &dispatcher,
                 &format!("call-strict-{index}"),
                 "shell",
@@ -661,7 +677,7 @@ async fn strict_authorization_does_not_add_prompts_to_read_only_tools() {
     );
 
     let result = dispatcher
-        .dispatch(request(
+        .dispatch_local(request(
             &dispatcher,
             "call-strict-read",
             "grep",
@@ -693,7 +709,7 @@ async fn managed_memory_skips_generic_strict_approval_but_preserves_explicit_den
             McpToolStatus::Ready,
         );
         let result = dispatcher
-            .dispatch(request(
+            .dispatch_local(request(
                 &dispatcher,
                 "memory-call",
                 "memory_update",
@@ -719,7 +735,7 @@ async fn allow_all_skips_hitl_for_side_effecting_tools() {
     );
 
     let result = dispatcher
-        .dispatch(request(
+        .dispatch_local(request(
             &dispatcher,
             "call-allow-all",
             "shell",
@@ -748,7 +764,7 @@ async fn allow_all_skips_tool_owned_non_manual_gate() {
     );
 
     let result = dispatcher
-        .dispatch(request(
+        .dispatch_local(request(
             &dispatcher,
             "call-allow-all-internal",
             "shell",
@@ -780,7 +796,7 @@ async fn allow_all_skips_tool_owned_manual_gate() {
     );
 
     let result = dispatcher
-        .dispatch(request(
+        .dispatch_local(request(
             &dispatcher,
             "call-allow-all-manual",
             "shell",
@@ -809,7 +825,7 @@ async fn allow_all_keeps_explicit_denies_terminal() {
     );
 
     let result = dispatcher
-        .dispatch(request(
+        .dispatch_local(request(
             &dispatcher,
             "call-allow-all-deny",
             "shell",
@@ -840,7 +856,7 @@ async fn auxiliary_directory_denial_keeps_the_tool_permission_path_and_rule_sour
         McpToolStatus::Ready,
     );
     let result = dispatcher
-        .dispatch(request(&dispatcher, "external-read", "read", json!({})))
+        .dispatch_local(request(&dispatcher, "external-read", "read", json!({})))
         .await;
     assert_eq!(
         result.blocked,
@@ -878,7 +894,7 @@ async fn strict_authorization_keeps_explicit_denies_terminal() {
     .with_hooks(Arc::new(AllowingHooks));
 
     let result = dispatcher
-        .dispatch(request(
+        .dispatch_local(request(
             &dispatcher,
             "call-strict-deny",
             "shell",
@@ -912,7 +928,7 @@ async fn strict_dispatch_approval_covers_the_same_tools_internal_gate_once() {
     );
 
     let result = dispatcher
-        .dispatch(request(
+        .dispatch_local(request(
             &dispatcher,
             "call-strict-internal",
             "shell",
@@ -941,7 +957,7 @@ async fn strict_dispatch_approval_does_not_hide_a_later_explicit_resource_deny()
     );
 
     let result = dispatcher
-        .dispatch(request(
+        .dispatch_local(request(
             &dispatcher,
             "call-strict-internal-deny",
             "shell",
@@ -979,7 +995,7 @@ async fn manual_tool_gate_requires_fresh_approval_despite_standard_allow() {
 
     for index in 0..2 {
         let result = dispatcher
-            .dispatch(request(
+            .dispatch_local(request(
                 &dispatcher,
                 &format!("call-manual-{index}"),
                 "shell",
@@ -1014,7 +1030,7 @@ async fn a_plugin_allow_cannot_cross_an_explicit_deny_rule() {
     .with_hooks(Arc::new(AllowingHooks));
 
     let result = dispatcher
-        .dispatch(request(
+        .dispatch_local(request(
             &dispatcher,
             "call-plugin-allow-versus-deny-rule",
             "shell",
@@ -1071,7 +1087,7 @@ async fn production_dispatch_rewrites_arguments_before_permission_and_execution(
     .with_hooks(Arc::new(MutatingHooks));
 
     let result = dispatcher
-        .dispatch(request(
+        .dispatch_local(request(
             &dispatcher,
             "call-hooked",
             "shell",
@@ -1107,7 +1123,7 @@ async fn a_hook_cannot_escalate_an_argument_dependent_policy_after_scheduling() 
         ToolConcurrencyPolicy::ParallelSafe
     );
 
-    let result = dispatcher.dispatch(request).await;
+    let result = dispatcher.dispatch_local(request).await;
 
     assert!(result.is_error);
     assert!(
@@ -1133,7 +1149,7 @@ async fn a_plugin_allow_resolves_an_ask_without_prompting() {
     .with_hooks(Arc::new(AllowingHooks));
 
     let result = dispatcher
-        .dispatch(request(
+        .dispatch_local(request(
             &dispatcher,
             "call-plugin-allow-resolves-ask",
             "shell",
@@ -1166,7 +1182,7 @@ async fn the_intent_reaches_the_permission_layer_but_not_the_tool() {
     );
 
     let result = dispatcher
-        .dispatch(request(
+        .dispatch_local(request(
             &dispatcher,
             "call-intent-hand-off",
             "shell",
@@ -1206,7 +1222,7 @@ async fn dispatch_rejects_unregistered_tool_aliases_without_running_the_native_t
 
     for (index, alias) in ["Bash", "functions.bash"].into_iter().enumerate() {
         let result = dispatcher
-            .dispatch(request(
+            .dispatch_local(request(
                 &dispatcher,
                 &format!("call_{index}"),
                 alias,
@@ -1246,7 +1262,7 @@ async fn dispatch_unknown_tool_returns_ranked_suggestion_and_available_list() {
     );
 
     let result = dispatcher
-        .dispatch(request(
+        .dispatch_local(request(
             &dispatcher,
             "call_unknown",
             "ToolSerch",
@@ -1292,7 +1308,7 @@ async fn dispatch_malformed_json_synthesizes_error_without_running_tool() {
     malformed.call.raw_input = "{\"command\":".to_owned();
     malformed.call.input_error = Some("EOF while parsing a value".to_owned());
 
-    let result = dispatcher.dispatch(malformed).await;
+    let result = dispatcher.dispatch_local(malformed).await;
 
     assert!(result.is_error);
     assert_eq!(
@@ -1324,7 +1340,7 @@ async fn dispatch_schema_error_is_a_result_and_does_not_run_tool() {
     );
 
     let result = dispatcher
-        .dispatch(request(
+        .dispatch_local(request(
             &dispatcher,
             "call_bad_args",
             "shell",
@@ -1358,7 +1374,7 @@ async fn dispatch_denial_is_an_error_result_and_a_later_call_still_runs() {
     );
 
     let denied = dispatcher
-        .dispatch(request(
+        .dispatch_local(request(
             &dispatcher,
             "call_denied",
             "shell",
@@ -1366,7 +1382,7 @@ async fn dispatch_denial_is_an_error_result_and_a_later_call_still_runs() {
         ))
         .await;
     let continued = dispatcher
-        .dispatch(request(
+        .dispatch_local(request(
             &dispatcher,
             "call_continued",
             "shell",
@@ -1402,7 +1418,7 @@ async fn dispatch_waits_for_argument_derived_permission_before_execution() {
         let dispatcher = Arc::clone(&dispatcher);
         tokio::spawn(async move {
             dispatcher
-                .dispatch(request(
+                .dispatch_local(request(
                     &dispatcher,
                     "call_permission",
                     "shell",
@@ -1443,7 +1459,7 @@ async fn dispatch_interrupt_cancels_a_pending_permission_before_execution() {
     let interrupt = call.interrupt.clone();
     let task = {
         let dispatcher = Arc::clone(&dispatcher);
-        tokio::spawn(async move { dispatcher.dispatch(call).await })
+        tokio::spawn(async move { dispatcher.dispatch_local(call).await })
     };
 
     approver.entered.notified().await;
@@ -1474,7 +1490,7 @@ async fn dispatch_interrupt_waits_for_cooperative_tool_cleanup() {
     let interrupt = call.interrupt.clone();
     let task = {
         let dispatcher = Arc::clone(&dispatcher);
-        tokio::spawn(async move { dispatcher.dispatch(call).await })
+        tokio::spawn(async move { dispatcher.dispatch_local(call).await })
     };
 
     started.notified().await;
@@ -1524,7 +1540,7 @@ async fn dispatch_records_an_undecided_cooperative_cancellation_as_uncertain() {
     let interrupt = call.interrupt.clone();
     let task = {
         let dispatcher = Arc::clone(&dispatcher);
-        tokio::spawn(async move { dispatcher.dispatch(call).await })
+        tokio::spawn(async move { dispatcher.dispatch_local(call).await })
     };
 
     started.notified().await;
@@ -1581,7 +1597,7 @@ async fn dispatch_interrupt_keeps_typed_cancellation_when_after_hook_fails() {
     let interrupt = call.interrupt.clone();
     let task = {
         let dispatcher = Arc::clone(&dispatcher);
-        tokio::spawn(async move { dispatcher.dispatch(call).await })
+        tokio::spawn(async move { dispatcher.dispatch_local(call).await })
     };
 
     started.notified().await;
@@ -1617,7 +1633,7 @@ async fn dispatch_interrupt_forces_and_marks_a_tool_that_ignores_cancellation() 
     let interrupt = call.interrupt.clone();
     let task = {
         let dispatcher = Arc::clone(&dispatcher);
-        tokio::spawn(async move { dispatcher.dispatch(call).await })
+        tokio::spawn(async move { dispatcher.dispatch_local(call).await })
     };
 
     started.notified().await;
@@ -1654,7 +1670,7 @@ async fn dispatch_passes_argument_pattern_to_permission_approver() {
     );
 
     let result = dispatcher
-        .dispatch(request(
+        .dispatch_local(request(
             &dispatcher,
             "call_pattern",
             "shell",
@@ -1701,7 +1717,7 @@ async fn dispatch_forced_interrupt_marks_uncertainty_while_the_abort_is_reaped()
     let interrupt = call.interrupt.clone();
     let task = {
         let dispatcher = Arc::clone(&dispatcher);
-        tokio::spawn(async move { dispatcher.dispatch(call).await })
+        tokio::spawn(async move { dispatcher.dispatch_local(call).await })
     };
 
     started.notified().await;
@@ -1799,7 +1815,7 @@ async fn deferred_tools_are_discovered_monotonically_before_they_become_callable
     );
 
     let hidden = dispatcher
-        .dispatch(request(
+        .dispatch_local(request(
             &dispatcher,
             "call_hidden",
             "mcp_docs_search",
@@ -1810,7 +1826,7 @@ async fn deferred_tools_are_discovered_monotonically_before_they_become_callable
     assert_eq!(docs_calls.load(Ordering::SeqCst), 0);
 
     let first_search = dispatcher
-        .dispatch(request(
+        .dispatch_local(request(
             &dispatcher,
             "call_search_docs",
             "tool_search",
@@ -1834,7 +1850,7 @@ async fn deferred_tools_are_discovered_monotonically_before_they_become_callable
         ["read", "mcp_docs_search", "tool_search"]
     );
     let docs = dispatcher
-        .dispatch(request(
+        .dispatch_local(request(
             &dispatcher,
             "call_docs",
             "mcp_docs_search",
@@ -1845,7 +1861,7 @@ async fn deferred_tools_are_discovered_monotonically_before_they_become_callable
     assert_eq!(docs_calls.load(Ordering::SeqCst), 1);
 
     let second_search = dispatcher
-        .dispatch(request(
+        .dispatch_local(request(
             &dispatcher,
             "call_search_issues",
             "tool_search",
@@ -1981,7 +1997,7 @@ async fn dispatch_hands_the_model_every_cause_beneath_a_failure() {
     );
 
     let result = dispatcher
-        .dispatch(request(
+        .dispatch_local(request(
             &dispatcher,
             "call_nested",
             "chrome_devtools_list_pages",
@@ -2019,7 +2035,7 @@ async fn a_failed_after_hook_keeps_a_settled_tool_result_and_its_status() {
     .with_hooks(Arc::new(FailingAfterHooks));
 
     let result = dispatcher
-        .dispatch(request(
+        .dispatch_local(request(
             &dispatcher,
             "call_after_hook_settled",
             "task",

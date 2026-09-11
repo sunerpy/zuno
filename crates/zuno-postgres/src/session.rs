@@ -326,6 +326,62 @@ pub(crate) async fn emit(
     kind: &str,
     data: Value,
 ) -> Result<i64, ApplicationError> {
+    emit_new(tx, principal, session, None, kind, data).await
+}
+
+/// The caller holds this session's write lock. Repeated notifications reuse an
+/// immutable fact and do not allocate another client event sequence.
+pub(crate) async fn emit_identified(
+    tx: &mut Transaction<'_, Postgres>,
+    principal: &PrincipalScope,
+    session: &str,
+    event_id: &str,
+    kind: &str,
+    data: Value,
+) -> Result<i64, ApplicationError> {
+    let previous = sqlx_core::query::query(
+        "SELECT session_id,sequence,type,version,data FROM zuno_enterprise_preview.event
+         WHERE tenant_id=$1 AND principal_id=$2 AND id=$3",
+    )
+    .bind(principal.tenant_id().as_str())
+    .bind(principal.principal_id().as_str())
+    .bind(event_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(database_error)?;
+    if let Some(previous) = previous {
+        if previous
+            .try_get::<String, _>("session_id")
+            .map_err(database_error)?
+            != session
+            || previous
+                .try_get::<String, _>("type")
+                .map_err(database_error)?
+                != kind
+            || previous
+                .try_get::<i32, _>("version")
+                .map_err(database_error)?
+                != 1
+            || previous
+                .try_get::<Value, _>("data")
+                .map_err(database_error)?
+                != data
+        {
+            return Err(ApplicationError::Conflict);
+        }
+        return previous.try_get("sequence").map_err(database_error);
+    }
+    emit_new(tx, principal, session, Some(event_id), kind, data).await
+}
+
+async fn emit_new(
+    tx: &mut Transaction<'_, Postgres>,
+    principal: &PrincipalScope,
+    session: &str,
+    event_id: Option<&str>,
+    kind: &str,
+    data: Value,
+) -> Result<i64, ApplicationError> {
     let sequence: i64 = sqlx_core::query_scalar::query_scalar(
         "UPDATE zuno_enterprise_preview.session SET event_sequence=event_sequence+1
          WHERE tenant_id=$1 AND principal_id=$2 AND id=$3 RETURNING event_sequence",
@@ -336,10 +392,12 @@ pub(crate) async fn emit(
     .fetch_one(&mut **tx)
     .await
     .map_err(database_error)?;
-    let id = format!(
-        "evt_{}",
-        zuno_orchestration::sha256_json(&json!([principal.owner(), session, sequence]))
-    );
+    let id = event_id.map(str::to_owned).unwrap_or_else(|| {
+        format!(
+            "evt_{}",
+            zuno_orchestration::sha256_json(&json!([principal.owner(), session, sequence]))
+        )
+    });
     sqlx_core::query::query(
         "INSERT INTO zuno_enterprise_preview.event(tenant_id,principal_id,session_id,id,sequence,type,data)
          VALUES($1,$2,$3,$4,$5,$6,$7)",

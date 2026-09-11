@@ -175,7 +175,7 @@ impl PostgresTurnPersistence {
     }
 }
 
-fn state_error(error: ApplicationError) -> TurnError {
+pub(crate) fn state_error(error: ApplicationError) -> TurnError {
     match error {
         ApplicationError::Unavailable => TurnStateError::Unavailable,
         ApplicationError::NotFound => TurnStateError::NotFound,
@@ -222,7 +222,7 @@ async fn event(
     })
 }
 
-fn decode_event(row: PgRow) -> Result<SessionEvent, TurnError> {
+pub(crate) fn decode_event(row: PgRow) -> Result<SessionEvent, TurnError> {
     let data: Value = row.try_get("data").map_err(sql_error)?;
     Ok(SessionEvent {
         id: row.try_get("id").map_err(sql_error)?,
@@ -236,4 +236,38 @@ fn decode_event(row: PgRow) -> Result<SessionEvent, TurnError> {
             .cloned()
             .ok_or(TurnStateError::InvalidData)?,
     })
+}
+
+pub(crate) async fn reclaimable_checkpoint(
+    tx: &mut Transaction<'_, Postgres>,
+    job: &RuntimeJob,
+) -> Result<bool, ApplicationError> {
+    let Some(checkpoint) = &job.checkpoint else {
+        return Ok(false);
+    };
+    if checkpoint.driver != "default"
+        || checkpoint.schema_version != zuno_engine::advance::DRIVER_CHECKPOINT_VERSION
+    {
+        return Ok(false);
+    }
+    let scope = TurnStateScope {
+        owner: job.principal.owner(),
+        session_id: job.session_id.to_string(),
+    };
+    let Some(event) = journal::latest(tx, &scope)
+        .await
+        .map_err(ApplicationError::storage)?
+    else {
+        return Ok(false);
+    };
+    let unfinished = history::unfinished(tx, &scope)
+        .await
+        .map_err(ApplicationError::storage)?;
+    zuno_engine::advance::reclaimable_checkpoint(
+        &event,
+        &scope.owner,
+        &checkpoint.reference,
+        &unfinished,
+    )
+    .map_err(ApplicationError::storage)
 }

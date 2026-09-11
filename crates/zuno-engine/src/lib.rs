@@ -21,4 +21,5 @@ pub mod state;
 pub mod status;
 pub mod stream;
 pub mod terminal_lease;
+pub mod wait;
 pub mod wake;

@@ -2,7 +2,8 @@
 
 mod store;
 mod transactions;
-pub(crate) use transactions::{checkpoint_in, finish_in};
+pub(crate) mod waiting;
+pub(crate) use transactions::{checkpoint_in, finish_in, suspend_in};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -87,6 +88,7 @@ async fn read_job(
     let phase = match phase.as_str() {
         "ready" => JobPhase::Ready,
         "running" => JobPhase::Running,
+        "waiting" => JobPhase::Waiting,
         "paused" => JobPhase::Paused,
         "completed" => JobPhase::Completed,
         "failed" => JobPhase::Failed,
@@ -233,22 +235,31 @@ async fn expire_inflight(
             .try_get("lease_attempt_id")
             .map_err(database_error)?;
         let job = read_job(tx, owner, &id).await?;
+        let reclaimable = crate::turn::reclaimable_checkpoint(tx, &job).await?;
         let seq = emit(
             tx,
             &job.principal,
             &session,
             "runtime.lease.expired",
-            json!({"jobID":id,"attemptID":attempt}),
+            json!({"jobID":id,"attemptID":attempt,"reclaimableCheckpoint":reclaimable}),
         )
         .await?;
-        query(
+        if reclaimable {
+            query(
+                "UPDATE zuno_enterprise_preview.runtime_job SET phase='ready',active_attempt_id=NULL,ready_at=$4,time_updated=$4
+                 WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3",
+            ).bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(&id).bind(time)
+                .execute(&mut **tx).await.map_err(database_error)?;
+        } else {
+            query(
             "UPDATE zuno_enterprise_preview.agent_job SET status='uncertain',error='execution lease expired; inspect checkpoint and external operations',
              settled_seq=$4,time_completed=$5,time_updated=$5 WHERE tenant_id=$1 AND principal_id=$2 AND id=$3",
         ).bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(&id).bind(seq).bind(time)
             .execute(&mut **tx).await.map_err(database_error)?;
-        query("UPDATE zuno_enterprise_preview.runtime_job SET phase='uncertain',active_attempt_id=NULL,time_updated=$4 WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3")
+            query("UPDATE zuno_enterprise_preview.runtime_job SET phase='uncertain',active_attempt_id=NULL,time_updated=$4 WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3")
             .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(&id).bind(time)
             .execute(&mut **tx).await.map_err(database_error)?;
+        }
         query("UPDATE zuno_enterprise_preview.runtime_attempt SET state='lost',finished_at=$4 WHERE tenant_id=$1 AND principal_id=$2 AND id=$3")
             .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(attempt).bind(time)
             .execute(&mut **tx).await.map_err(database_error)?;

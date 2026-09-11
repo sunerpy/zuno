@@ -291,6 +291,7 @@ async fn real_postgres_enforces_scopes_transactions_role_boundaries_and_schema_i
     crate::turn_tests::exercise(&backend, &admin, &migrator).await;
     format_two_upgrade(&fixture, &admin).await;
     format_three_upgrade(&fixture, &admin).await;
+    format_four_upgrade(&fixture, &admin).await;
     let expected_count: i64 = query_scalar("SELECT count(*) FROM zuno_enterprise_preview.session")
         .fetch_one(&admin)
         .await
@@ -501,6 +502,82 @@ async fn format_three_upgrade(fixture: &Fixture, admin: &sqlx_postgres::PgPool) 
         defaults,
         json!({"epoch":0,"cost":0,"known":false,"parent":null})
     );
+    PostgresBackend::connect(database(fixture.options(false, 2)))
+        .await
+        .unwrap();
+}
+
+async fn format_four_upgrade(fixture: &Fixture, admin: &PgPool) {
+    raw_sql("CREATE DATABASE zuno_format_four_fixture OWNER zuno_preview_migrator")
+        .execute(admin)
+        .await
+        .unwrap();
+    fn database(mut options: PostgresOptions) -> PostgresOptions {
+        let prefix = options
+            .url
+            .strip_suffix("/postgres")
+            .expect("isolated fixture database");
+        options.url = format!("{prefix}/zuno_format_four_fixture");
+        options
+    }
+    let migrator = database(fixture.migration_options())
+        .connect()
+        .await
+        .unwrap();
+    let admin = database(fixture.options(true, 2)).connect().await.unwrap();
+    migration::install_format_four_fixture(&migrator, &fixture.runtime_role)
+        .await
+        .unwrap();
+    async fn snapshot(pool: &PgPool) -> Value {
+        query_scalar(
+            "SELECT jsonb_build_object(
+              'session',(SELECT to_jsonb(s) FROM zuno_enterprise_preview.session s WHERE id='legacy-session'),
+              'message',(SELECT to_jsonb(m) FROM zuno_enterprise_preview.message m WHERE id='legacy-assistant'),
+              'part',(SELECT to_jsonb(p) FROM zuno_enterprise_preview.part p WHERE id='legacy-tool'),
+              'job',(SELECT to_jsonb(j) FROM zuno_enterprise_preview.runtime_job j WHERE job_id='legacy-job'),
+              'slot',(SELECT to_jsonb(s) FROM zuno_enterprise_preview.runtime_session s WHERE session_id='legacy-session'),
+              'member',(SELECT to_jsonb(m) FROM zuno_enterprise_preview.organization_member m WHERE tenant_id='migration-fixture')
+            )",
+        ).fetch_one(pool).await.unwrap()
+    }
+    let before = snapshot(&admin).await;
+    raw_sql(
+        "CREATE FUNCTION public.zuno_refuse_wait_migration() RETURNS event_trigger LANGUAGE plpgsql AS $$
+         BEGIN IF TG_TAG='CREATE INDEX' AND to_regclass('zuno_enterprise_preview.runtime_wait') IS NOT NULL
+           THEN RAISE EXCEPTION 'injected wait migration failure'; END IF; END $$;
+         CREATE EVENT TRIGGER zuno_refuse_wait_migration ON ddl_command_start EXECUTE FUNCTION public.zuno_refuse_wait_migration();",
+    ).execute(&admin).await.unwrap();
+    assert!(migrate(&migrator, &fixture.runtime_role).await.is_err());
+    raw_sql("DROP EVENT TRIGGER zuno_refuse_wait_migration; DROP FUNCTION public.zuno_refuse_wait_migration()")
+        .execute(&admin).await.unwrap();
+    assert_eq!(
+        query_scalar::<_, i32>("SELECT version FROM zuno_enterprise_preview.schema_format")
+            .fetch_one(&admin)
+            .await
+            .unwrap(),
+        4
+    );
+    assert!(
+        query_scalar::<_, bool>(
+            "SELECT to_regclass('zuno_enterprise_preview.runtime_wait') IS NULL"
+        )
+        .fetch_one(&admin)
+        .await
+        .unwrap()
+    );
+    assert_eq!(snapshot(&admin).await, before);
+    migrate(&migrator, &fixture.runtime_role).await.unwrap();
+    assert_eq!(snapshot(&admin).await, before);
+    assert_eq!(
+        query_scalar::<_, i32>("SELECT version FROM zuno_enterprise_preview.schema_format")
+            .fetch_one(&admin)
+            .await
+            .unwrap(),
+        migration::FORMAT
+    );
+    assert!(query_scalar::<_,bool>(
+        "SELECT relrowsecurity AND relforcerowsecurity FROM pg_class WHERE oid='zuno_enterprise_preview.runtime_wait'::regclass",
+    ).fetch_one(&admin).await.unwrap());
     PostgresBackend::connect(database(fixture.options(false, 2)))
         .await
         .unwrap();

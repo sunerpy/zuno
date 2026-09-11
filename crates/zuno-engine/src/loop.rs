@@ -12,6 +12,9 @@
 //! Retry, compaction, and the one-live-loop-per-session registry wrap the same
 //! [`run_turn`] entry point rather than copying its state machine.
 
+#[path = "tool_step.rs"]
+pub(crate) mod tool_step;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU8, NonZeroU32};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -523,7 +526,8 @@ pub enum TurnEvent {
 }
 
 /// Why a tool call was stopped before its requested effect ran.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolBlockKind {
     /// A permission rule, plugin, or human refused the call.
     Denied,
@@ -549,7 +553,8 @@ impl ToolBlockKind {
 }
 
 /// How a running tool settled after a hard turn interruption.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolInterruption {
     /// The tool observed cancellation and returned during the grace period.
     Cooperative,
@@ -641,7 +646,8 @@ pub struct ToolFailureRecovery {
 /// putting the two in one field would make every consumer re-derive which kind it
 /// was holding. The dispatcher decides this once, from the typed error or the
 /// tool's own cancellation verdict, and everything downstream reads the decision.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UncertainOutcome {
     /// Tool whose call lost its authoritative final state.
     pub tool: String,
@@ -652,6 +658,7 @@ pub struct UncertainOutcome {
     /// without ever learning which paths the command had reached.
     pub applied_paths: Vec<String>,
     /// How the call arrived at an undecided outcome.
+    #[serde(with = "crate::wait::uncertain_cause")]
     pub cause: UncertainCause,
 }
 
@@ -1134,7 +1141,8 @@ impl AvailableTools {
 }
 
 /// One completed provider tool call ready for the dispatch seam.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -1160,7 +1168,8 @@ pub struct DispatchRequest {
 
 /// A model-visible dispatch result. Dispatch failures are represented as error
 /// outputs so the loop can append them and let the model recover.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ToolDispatchResult {
     pub output: ToolOutput,
     pub is_error: bool,
@@ -1246,16 +1255,25 @@ impl ToolDispatchResult {
     }
 }
 
-/// Todo 33's single dispatch choke point.
-pub struct PreparedToolDispatch {
-    execution: BoxFuture<'static, ToolDispatchResult>,
+/// A pending invocation has no model-visible result until its completion is
+/// consumed with the driver's checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolDispatchOutcome {
+    Completed(Box<ToolDispatchResult>),
+    Pending(zuno_types::wait::WaitRef),
+}
+
+/// One dispatch boundary shared by local and durable executors.
+pub enum PreparedToolDispatch {
+    Execution(BoxFuture<'static, ToolDispatchResult>),
+    Pending(zuno_types::wait::WaitRef),
 }
 
 impl PreparedToolDispatch {
     /// Stage an owned execution future after validation and permission checks.
     #[must_use]
     pub fn new(execution: BoxFuture<'static, ToolDispatchResult>) -> Self {
-        Self { execution }
+        Self::Execution(execution)
     }
 
     /// Stage a result that was fully decided during preparation.
@@ -1265,8 +1283,11 @@ impl PreparedToolDispatch {
     }
 
     /// Execute the already-authorized call.
-    pub async fn execute(self) -> ToolDispatchResult {
-        self.execution.await
+    pub async fn execute(self) -> ToolDispatchOutcome {
+        match self {
+            Self::Execution(execution) => ToolDispatchOutcome::Completed(Box::new(execution.await)),
+            Self::Pending(wait) => ToolDispatchOutcome::Pending(wait),
+        }
     }
 }
 
@@ -1307,7 +1328,7 @@ pub trait ToolDispatcher: Send + Sync {
 
     async fn prepare(&self, request: DispatchRequest) -> PreparedToolDispatch;
 
-    async fn dispatch(&self, request: DispatchRequest) -> ToolDispatchResult {
+    async fn dispatch(&self, request: DispatchRequest) -> ToolDispatchOutcome {
         self.prepare(request).await.execute().await
     }
 }
@@ -2152,9 +2173,11 @@ pub async fn run_turn(
         .await?
     {
         crate::advance::LoopOutcome::Completed(outcome) => Ok(outcome),
-        crate::advance::LoopOutcome::Progressed(_) => Err(TurnError::Hook(
-            "an unbounded driver unexpectedly yielded a checkpoint".to_owned(),
-        )),
+        crate::advance::LoopOutcome::Progressed(_) | crate::advance::LoopOutcome::Waiting(_) => {
+            Err(TurnError::Hook(
+                "an unbounded driver unexpectedly yielded a checkpoint".to_owned(),
+            ))
+        }
     }
 }
 
@@ -2203,6 +2226,12 @@ pub async fn advance_turn(
         crate::advance::LoopOutcome::Completed(outcome) => Ok(outcome.into()),
         crate::advance::LoopOutcome::Progressed(_) => {
             Ok(crate::advance::AdvanceOutcome::Progressed { checkpoint })
+        }
+        crate::advance::LoopOutcome::Waiting(state) => {
+            Ok(crate::advance::AdvanceOutcome::Waiting {
+                checkpoint,
+                waits: state.waits(),
+            })
         }
     }
 }
@@ -2262,6 +2291,7 @@ async fn run_turn_in_span(
             .await?;
     }
     let state = checkpoint.unwrap_or_else(|| crate::advance::LoopCheckpoint {
+        tool_step: None,
         steps: 0,
         tool_calls_dispatched: 0,
         last_assistant_id: None,
@@ -2280,6 +2310,7 @@ async fn run_turn_in_span(
         elapsed_millis: 0,
         started_at_ms: wall_now_ms,
     });
+    let mut pending_tool_step = state.tool_step;
     let mut steps = state.steps;
     let yield_after = max_steps.map(|limit| steps.saturating_add(limit.get()));
     let started_at_ms = state.started_at_ms;
@@ -2325,468 +2356,436 @@ async fn run_turn_in_span(
             return Ok(outcome.into());
         }
 
-        let repaired = store.persistence.repair_history(&store.scope).await?;
-        if repaired > 0 {
-            events
-                .send(TurnEvent::HistoryRepaired {
-                    repaired_tool_results: repaired,
-                })
-                .await?;
-        }
-
-        if max_steps.is_some() && store.persistence.has_uncertain_calls(&store.scope).await? {
-            honour_budget_decision(
-                &events,
-                BudgetDecision::stop_uncertain_side_effect(
-                    "inspect the unresolved external effect before advancing this turn",
-                ),
-            )
-            .await?;
-        }
-
-        if yield_after.is_some_and(|limit| steps >= limit) {
-            return Ok(crate::advance::LoopOutcome::Progressed(Box::new(
-                crate::advance::LoopCheckpoint {
-                    steps,
-                    tool_calls_dispatched,
-                    last_assistant_id,
-                    requested_turn: pinned_requested_turn,
-                    prompt_traces,
-                    unresolved_tool_failures,
-                    consecutive_invalid_tool_calls,
-                    stagnant_work_state_read,
-                    dynamic_context: current_dynamic_context,
-                    dynamic_context_refresh: cumulative_dynamic_context_refresh,
-                    step_limit_finalization_attempted,
+        let mut tool_step_checkpoint = if let Some(pending) = pending_tool_step.take() {
+            pending.validate(&request.session_id, &request.turn_id)?;
+            // Waiting time remains part of the original turn allowance. Check
+            // it before dispatching another tool, even without a model request.
+            let decision = budget
+                .after_response(&TurnUsageSnapshot {
+                    session_id: &request.session_id,
+                    turn_id: &request.turn_id,
+                    step: steps,
                     turn_usage,
                     last_request,
-                    last_context_tokens,
-                    reported_historical_tool_repair,
-                    elapsed_millis: elapsed_before_millis.saturating_add(
+                    estimated_prompt_tokens: last_context_tokens.unwrap_or(0),
+                    context_limit: request.context_limit,
+                    elapsed_seconds: elapsed_before_millis.saturating_add(
                         u64::try_from(turn_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    ) / 1_000,
+                    tool_calls_dispatched,
+                })
+                .await
+                .map_err(|error| budget_policy_failure("after_response", error))?;
+            honour_budget_decision(&events, decision).await?;
+            pending
+        } else {
+            let repaired = store.persistence.repair_history(&store.scope).await?;
+            if repaired > 0 {
+                events
+                    .send(TurnEvent::HistoryRepaired {
+                        repaired_tool_results: repaired,
+                    })
+                    .await?;
+            }
+
+            if max_steps.is_some() && store.persistence.has_uncertain_calls(&store.scope).await? {
+                honour_budget_decision(
+                    &events,
+                    BudgetDecision::stop_uncertain_side_effect(
+                        "inspect the unresolved external effect before advancing this turn",
                     ),
-                    started_at_ms,
-                },
-            )));
-        }
-
-        let mut history = store.persistence.history(&store.scope).await?;
-        let has_compaction_checkpoint =
-            crate::compaction::checkpoint::latest_checkpoint(&history).is_some();
-        apply_legacy_tool_schema_identities(&mut history, &legacy_tool_schema_snapshots);
-        let requested = match &pinned_requested_turn {
-            Some(requested) => requested.clone(),
-            None => requested_turn(&request.session_id, &history, &request.start)?,
-        };
-        if inject_live_inputs(context, &request, &requested, &events)
-            .await?
-            .count
-            > 0
-        {
-            continue;
-        }
-        if max_steps.is_some() && pinned_requested_turn.is_none() {
-            pinned_requested_turn = Some(requested.clone());
-        }
-        resolve_history_attachments(
-            &mut history,
-            context.attachments.as_ref(),
-            &mut resolved_attachments,
-        )
-        .await?;
-        let Some(agent) = context.resolver.resolve_agent(&requested.agent) else {
-            append_turn_rejected(&store, &request, &requested, "agent_unavailable").await?;
-            return Err(TurnError::AgentNotFound {
-                agent: requested.agent.clone(),
-            });
-        };
-        let Some(model) = context
-            .resolver
-            .resolve_model(&requested.provider_id, &requested.model_id)
-        else {
-            append_turn_rejected(&store, &request, &requested, "model_unavailable").await?;
-            return Err(TurnError::ModelNotFound {
-                provider_id: requested.provider_id.clone(),
-                model_id: requested.model_id.clone(),
-            });
-        };
-        span::record_turn_identity(
-            &turn_span,
-            &agent.name,
-            &model.catalog_provider_id,
-            &model.catalog_model_id,
-        );
-        if !durable_turn_start_recorded {
-            append_turn_started(&store, &request, &requested, &agent, &model).await?;
-            durable_turn_start_recorded = true;
-        }
-        // Scoped before anything reads `history`, so the hook path and the direct
-        // projection see the same request. The option is read from the resolved
-        // model's spec: a declared endpoint capability, never a provider-id rule.
-        let reasoning_replay = ReasoningReplayPolicy::from_options(&model.provider.options)
-            .map_err(|error| TurnError::Provider(ProviderError::fatal(error)))?;
-        // `off` withholds everything, not merely the envelopes a scope rejects. A
-        // session that once ran with replay on has envelopes in durable history, and
-        // an endpoint that is no longer asked for `reasoning.encrypted_content` is an
-        // endpoint that must not receive a sealed item either: it would be an
-        // unrequested item on the wire, and the request event would report
-        // `reasoningReplay: "off"` beside a non-zero replay count.
-        let scope = if reasoning_replay.requests_encrypted() {
-            ReasoningReplayScope::Model {
-                provider_id: &model.catalog_provider_id,
-                model_id: &model.catalog_model_id,
-                now: now_millis(),
-                max_age: reasoning_replay.max_age,
-            }
-        } else {
-            ReasoningReplayScope::None
-        };
-        let restored_reasoning_replay_boundaries = if reasoning_replay.requests_encrypted() {
-            let historical_developer_contexts =
-                historical_developer_contexts.get_or_insert_with(BTreeMap::new);
-            let recovered = store
-                .persistence
-                .developer_contexts(&store.scope, &history, historical_developer_contexts)
+                )
                 .await?;
-            historical_developer_contexts.extend(recovered);
-            restore_historical_developer_contexts(&mut history, historical_developer_contexts)
-        } else {
-            0
-        };
-        let withheld_reasoning_capsules = withhold_unreplayable_capsules(&mut history, scope);
-
-        let step_limit_finalization = agent.max_steps.filter(|max_steps| steps >= max_steps.get());
-        if let Some(max_steps) = step_limit_finalization {
-            if step_limit_finalization_attempted {
-                return Err(TurnError::StepLimit {
-                    agent: agent.name,
-                    max_steps: max_steps.get(),
-                });
             }
-            step_limit_finalization_attempted = true;
-        }
-        let step = steps.saturating_add(1);
-        steps = step;
-        events
-            .send(TurnEvent::AgentResolved {
-                step,
-                agent: agent.name.clone(),
-            })
-            .await?;
-        events
-            .send(TurnEvent::ModelResolved {
-                step,
-                provider_id: model.catalog_provider_id.clone(),
-                model_id: model.catalog_model_id.clone(),
-            })
-            .await?;
 
-        let provider = context
-            .providers
-            .resolve(model.provider.clone())
-            .map_err(ProviderError::from)?;
-        let capabilities = provider.capabilities();
-        let mut assistant = assistant_message(
-            &request, &session, &requested, &agent, &model, step, &history,
-        )?;
-        let assembled_system = agent.prompt_assembly.system_messages();
-        let mut system = assembled_system.clone();
-        context
-            .hooks
-            .transform_system(&request.session_id, &model, &mut system)
-            .await
-            .map_err(TurnError::Hook)?;
-        let system_prompt = system.join("\n\n");
-        let available = context.dispatcher.available_tools();
-        let mut definitions = if capabilities.tool_calls {
-            available.definitions
-        } else {
-            Vec::new()
-        };
-        for definition in &mut definitions {
-            context
-                .hooks
-                .tool_definition(definition)
-                .await
-                .map_err(TurnError::Hook)?;
-        }
-        let history_definitions = if step_limit_finalization.is_some() {
-            &[][..]
-        } else {
-            definitions.as_slice()
-        };
-        let history_tool_projection =
-            historical_tool_projection(&history, history_definitions, &request.turn_id);
-        let history_tool_fallbacks = history_tool_projection.fallback_reasons();
-        let stable_history = if context.hooks.enabled() {
-            let mut transformed = hook_messages(&history);
-            context
-                .hooks
-                .transform_messages(&request.session_id, &mut transformed)
-                .await
-                .map_err(TurnError::Hook)?;
-            let mut messages = system
-                .iter()
-                .filter(|message| !message.is_empty())
-                .map(|message| RequestMessage::new(Message::new(Role::System, message.clone())))
-                .collect::<Vec<_>>();
-            for message in transformed {
-                append_transformed_message_owned(&mut messages, message);
+            if yield_after.is_some_and(|limit| steps >= limit) {
+                return Ok(crate::advance::LoopOutcome::Progressed(Box::new(
+                    crate::advance::LoopCheckpoint {
+                        tool_step: None,
+                        steps,
+                        tool_calls_dispatched,
+                        last_assistant_id,
+                        requested_turn: pinned_requested_turn,
+                        prompt_traces,
+                        unresolved_tool_failures,
+                        consecutive_invalid_tool_calls,
+                        stagnant_work_state_read,
+                        dynamic_context: current_dynamic_context,
+                        dynamic_context_refresh: cumulative_dynamic_context_refresh,
+                        step_limit_finalization_attempted,
+                        turn_usage,
+                        last_request,
+                        last_context_tokens,
+                        reported_historical_tool_repair,
+                        elapsed_millis: elapsed_before_millis.saturating_add(
+                            u64::try_from(turn_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        ),
+                        started_at_ms,
+                    },
+                )));
             }
-            messages
-        } else {
-            project_history_owned_with_system_messages(&system, history)
-        };
-        ensure_historical_tool_protocol_unchanged(
-            &history_tool_projection.blocks,
-            &stable_history,
-            "transform_messages",
-        )
-        .map_err(TurnError::Hook)?;
-        let cache = prompt_cache.get_or_insert_with(|| PromptCache::new(system_prompt.clone()));
-        let step_dynamic_context = if step_limit_finalization.is_some() {
-            current_dynamic_context
-                .clone()
-                .with_runtime_instruction(STEP_LIMIT_FINALIZATION_INSTRUCTION)
-        } else {
-            current_dynamic_context.clone()
-        };
-        let prepared = cache.prepare_turn_owned_with_tool_revision(
-            stable_history,
-            step_dynamic_context,
-            &definitions,
-            available.mcp_status,
-            available.revision,
-        )?;
-        let prepared = if step_limit_finalization.is_some() {
-            prepared.without_tools()
-        } else {
-            prepared
-        };
-        let assembled_dynamic_context = prepared.developer_context().to_vec();
-        let locked_tools: Arc<[ToolDefinition]> = Arc::from(prepared.tools().to_vec());
-        let rebuilt_for_late_mcp = prepared.rebuilt_tools();
 
-        let mut completion = completion_request(&model, prepared, provider_request_context.clone());
-        let hook_message = completion
-            .messages
-            .last()
-            .map(|message| message.message().clone())
-            .unwrap_or_else(|| Message::new(Role::System, ""));
-        let hook_tool_authority = completion.tools.clone();
-        ensure_historical_tool_protocol_unchanged(
-            &history_tool_projection.blocks,
-            &completion.messages,
-            "prompt assembly",
-        )
-        .map_err(TurnError::Hook)?;
-        context
-            .hooks
-            .prepare_request(
-                RequestHookInput {
-                    session_id: &request.session_id,
-                    agent: &agent,
-                    model: &model,
-                    message: &hook_message,
-                },
-                &mut completion,
+            let mut history = store.persistence.history(&store.scope).await?;
+            let has_compaction_checkpoint =
+                crate::compaction::checkpoint::latest_checkpoint(&history).is_some();
+            apply_legacy_tool_schema_identities(&mut history, &legacy_tool_schema_snapshots);
+            let requested = match &pinned_requested_turn {
+                Some(requested) => requested.clone(),
+                None => requested_turn(&request.session_id, &history, &request.start)?,
+            };
+            if inject_live_inputs(context, &request, &requested, &events)
+                .await?
+                .count
+                > 0
+            {
+                continue;
+            }
+            if max_steps.is_some() && pinned_requested_turn.is_none() {
+                pinned_requested_turn = Some(requested.clone());
+            }
+            resolve_history_attachments(
+                &mut history,
+                context.attachments.as_ref(),
+                &mut resolved_attachments,
             )
-            .await
-            .map_err(TurnError::Hook)?;
-        ensure_prepare_request_tool_subset(&hook_tool_authority, &completion.tools)
-            .map_err(TurnError::Hook)?;
-        ensure_historical_tool_protocol_unchanged(
-            &history_tool_projection.blocks,
-            &completion.messages,
-            "prepare_request",
-        )
-        .map_err(TurnError::Hook)?;
-        let mut combined_history_tool_fallbacks = history_tool_fallbacks;
-        combined_history_tool_fallbacks.extend(unavailable_historical_tool_fallbacks(
-            &history_tool_projection.occurrences,
-            &completion.tools,
-        ));
-        let combined_history_tool_repair = downgrade_projected_tool_history(
-            &mut completion.messages,
-            &history_tool_projection.blocks,
-            &history_tool_projection.occurrences,
-            &combined_history_tool_fallbacks,
-        );
-        let context_epoch = store.persistence.context_epoch(&store.scope).await?;
-        let combined_history_tool_repair = combined_history_tool_repair.retain_new_diagnostics(
-            context.run_registry.as_ref(),
-            &request.session_id,
-            context_epoch,
-        );
-        let should_report = !combined_history_tool_repair.is_empty()
-            && (context.run_registry.is_some() || !reported_historical_tool_repair);
-        if should_report {
-            tracing::warn!(
-                session_id = %request.session_id,
-                code = "historical_tool_declaration_repaired",
-                detail = %combined_history_tool_repair.detail(),
-                "historical tool declarations required bounded inert projection"
+            .await?;
+            let Some(agent) = context.resolver.resolve_agent(&requested.agent) else {
+                append_turn_rejected(&store, &request, &requested, "agent_unavailable").await?;
+                return Err(TurnError::AgentNotFound {
+                    agent: requested.agent.clone(),
+                });
+            };
+            let Some(model) = context
+                .resolver
+                .resolve_model(&requested.provider_id, &requested.model_id)
+            else {
+                append_turn_rejected(&store, &request, &requested, "model_unavailable").await?;
+                return Err(TurnError::ModelNotFound {
+                    provider_id: requested.provider_id.clone(),
+                    model_id: requested.model_id.clone(),
+                });
+            };
+            span::record_turn_identity(
+                &turn_span,
+                &agent.name,
+                &model.catalog_provider_id,
+                &model.catalog_model_id,
             );
+            if !durable_turn_start_recorded {
+                append_turn_started(&store, &request, &requested, &agent, &model).await?;
+                durable_turn_start_recorded = true;
+            }
+            // Scoped before anything reads `history`, so the hook path and the direct
+            // projection see the same request. The option is read from the resolved
+            // model's spec: a declared endpoint capability, never a provider-id rule.
+            let reasoning_replay = ReasoningReplayPolicy::from_options(&model.provider.options)
+                .map_err(|error| TurnError::Provider(ProviderError::fatal(error)))?;
+            // `off` withholds everything, not merely the envelopes a scope rejects. A
+            // session that once ran with replay on has envelopes in durable history, and
+            // an endpoint that is no longer asked for `reasoning.encrypted_content` is an
+            // endpoint that must not receive a sealed item either: it would be an
+            // unrequested item on the wire, and the request event would report
+            // `reasoningReplay: "off"` beside a non-zero replay count.
+            let scope = if reasoning_replay.requests_encrypted() {
+                ReasoningReplayScope::Model {
+                    provider_id: &model.catalog_provider_id,
+                    model_id: &model.catalog_model_id,
+                    now: now_millis(),
+                    max_age: reasoning_replay.max_age,
+                }
+            } else {
+                ReasoningReplayScope::None
+            };
+            let restored_reasoning_replay_boundaries = if reasoning_replay.requests_encrypted() {
+                let historical_developer_contexts =
+                    historical_developer_contexts.get_or_insert_with(BTreeMap::new);
+                let recovered = store
+                    .persistence
+                    .developer_contexts(&store.scope, &history, historical_developer_contexts)
+                    .await?;
+                historical_developer_contexts.extend(recovered);
+                restore_historical_developer_contexts(&mut history, historical_developer_contexts)
+            } else {
+                0
+            };
+            let withheld_reasoning_capsules = withhold_unreplayable_capsules(&mut history, scope);
+
+            let step_limit_finalization =
+                agent.max_steps.filter(|max_steps| steps >= max_steps.get());
+            if let Some(max_steps) = step_limit_finalization {
+                if step_limit_finalization_attempted {
+                    return Err(TurnError::StepLimit {
+                        agent: agent.name,
+                        max_steps: max_steps.get(),
+                    });
+                }
+                step_limit_finalization_attempted = true;
+            }
+            let step = steps.saturating_add(1);
+            steps = step;
             events
-                .send(TurnEvent::Notice {
-                    audience: NoticeAudience::Diagnostic,
-                    severity: NoticeSeverity::Warning,
-                    code: "historical_tool_declaration_repaired".to_owned(),
-                    detail: combined_history_tool_repair.detail(),
+                .send(TurnEvent::AgentResolved {
+                    step,
+                    agent: agent.name.clone(),
                 })
                 .await?;
-            reported_historical_tool_repair = true;
-        }
-        let ambiguous_replay = if reasoning_replay.requests_encrypted() {
-            withhold_ambiguous_responses_replay(&mut completion.messages)
-        } else {
-            Default::default()
-        };
-        let mut runtime_sections = agent.runtime_prompt_policy.sections(
-            completion.tools.iter().map(|tool| tool.name.as_str()),
-            !request.dynamic_context.is_empty(),
-        );
-        if has_compaction_checkpoint {
-            runtime_sections.push(crate::prompt::RuntimePromptSection::compaction_continuation());
-        }
-        let runtime_context = runtime_sections
-            .iter()
-            .map(|section| section.content().to_owned())
-            .collect::<Vec<_>>();
-        let mut assembled_developer_context =
-            Vec::with_capacity(runtime_context.len() + assembled_dynamic_context.len());
-        assembled_developer_context.extend(runtime_context.iter().cloned());
-        assembled_developer_context.extend(assembled_dynamic_context);
-        let hook_developer_context = std::mem::take(&mut completion.developer_context);
-        completion
-            .developer_context
-            .reserve(runtime_context.len() + hook_developer_context.len());
-        completion
-            .developer_context
-            .extend(runtime_context.iter().cloned());
-        completion.developer_context.extend(hook_developer_context);
-        let persist_preceding_developer_receipt = step == 1
-            && reasoning_replay.requests_encrypted()
-            && completion.developer_context[runtime_context.len()..]
-                .iter()
-                .any(|context| !context.trim().is_empty())
-            && responses_history_ends_in_assistant_output(&completion.messages);
-        completion
-            .validate_tool_arguments()
-            .map_err(ProviderError::fatal)?;
-        let mut receipt_assembly = agent.prompt_assembly.clone();
-        for section in &runtime_sections {
-            receipt_assembly
-                .push(section.id(), section.source(), section.content())
-                .expect("runtime policy section ids are unique and valid");
-        }
-        let assembled_projection = PromptProviderProjection {
-            system_messages: &assembled_system,
-            developer_context: &assembled_developer_context,
-        };
-        let actual_projection = PromptProviderProjection {
-            system_messages: &system,
-            developer_context: &completion.developer_context,
-        };
-        let estimated_prompt_tokens = estimate_completion_prompt_tokens(&completion);
-        require_context_compaction_before_request(
-            &events,
-            step,
-            request.context_compaction_threshold,
-            last_context_tokens,
-            estimated_prompt_tokens,
-        )
-        .await?;
-        ensure_prompt_context_budget(estimated_prompt_tokens, request.context_limit)?;
-        // Consulted here and nowhere earlier: `estimated_prompt_tokens` is only the
-        // size of the request about to be sent once the prompt is assembled, the
-        // `prepare_request` hooks have run, and the context check has passed — before
-        // that the policy would be answering about a prompt that no longer exists.
-        // Consulted here and nowhere later: everything below writes provider-request
-        // bookkeeping, so a request the policy refuses leaves behind no started-request
-        // row, no prompt receipt, and no `ProviderRequestStarted` event.
-        let decision = budget
-            .before_request(&TurnUsageSnapshot {
-                session_id: &request.session_id,
-                turn_id: &request.turn_id,
-                step,
-                turn_usage,
-                last_request,
-                estimated_prompt_tokens,
-                context_limit: request.context_limit,
-                elapsed_seconds: elapsed_before_millis.saturating_add(
-                    u64::try_from(turn_started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                ) / 1_000,
-                tool_calls_dispatched,
-            })
-            .await
-            .map_err(|error| budget_policy_failure("before_request", error))?;
-        honour_budget_decision(&events, decision).await?;
-        let assistant_id = assistant.id.clone();
-        // Every part of this step is stamped with the message's creation time, so the
-        // part id decides the order inside the message. Persist only after every
-        // pre-request intervention has accepted the request: a proactive compaction
-        // or budget stop must not leave a blank assistant checkpoint behind.
-        let assistant_time_created = assistant.time_created;
-        store
-            .commit_assistant(&zuno_db::assistant_commit::AssistantCommit {
-                message: assistant.clone(),
-                parts: Vec::new(),
-                persisted_at_ms: now_millis(),
-                context_limit: None,
-            })
-            .await?;
-        last_assistant_id = Some(assistant_id.clone());
-        events
-            .send(TurnEvent::AssistantMessageCreated {
-                step,
-                message_id: assistant_id.clone(),
-            })
-            .await?;
-        events
-            .send(TurnEvent::ToolSnapshotLocked {
-                step,
-                tool_ids: locked_tools.iter().map(|tool| tool.id.clone()).collect(),
-                rebuilt_for_late_mcp,
-            })
-            .await?;
-        let prompt_receipt_id =
-            if let Some(receipt_id) = prompt_traces.receipt_id(actual_projection) {
-                receipt_id.to_owned()
-            } else {
-                let mut properties = receipt_assembly.event_properties(
-                    &agent.name,
+            events
+                .send(TurnEvent::ModelResolved {
                     step,
-                    assembled_projection,
-                    actual_projection,
-                );
-                properties.insert("turnId".to_owned(), Value::String(request.turn_id.clone()));
-                if let Some(seed) = &agent.orchestration_seed {
-                    let identity = seed
-                        .capability
-                        .identity()
-                        .expect("capability snapshot contains only serializable identity data");
-                    properties.insert(
-                        "capabilitySnapshotID".to_owned(),
-                        serde_json::to_value(identity)
-                            .expect("capability snapshot identity is serializable"),
-                    );
-                    properties.insert(
-                        "capabilitySnapshot".to_owned(),
-                        serde_json::to_value(&seed.capability)
-                            .expect("capability snapshot is serializable"),
-                    );
-                }
-                let event = NewSessionEvent::new("session.prompt.assembled", properties)?;
-                let receipt = store.append(event, ProviderEventUpdate::None).await?;
-                prompt_traces.remember(actual_projection, receipt.id.clone());
-                receipt.id
+                    provider_id: model.catalog_provider_id.clone(),
+                    model_id: model.catalog_model_id.clone(),
+                })
+                .await?;
+
+            let provider = context
+                .providers
+                .resolve(model.provider.clone())
+                .map_err(ProviderError::from)?;
+            let capabilities = provider.capabilities();
+            let mut assistant = assistant_message(
+                &request, &session, &requested, &agent, &model, step, &history,
+            )?;
+            let assembled_system = agent.prompt_assembly.system_messages();
+            let mut system = assembled_system.clone();
+            context
+                .hooks
+                .transform_system(&request.session_id, &model, &mut system)
+                .await
+                .map_err(TurnError::Hook)?;
+            let system_prompt = system.join("\n\n");
+            let available = context.dispatcher.available_tools();
+            let mut definitions = if capabilities.tool_calls {
+                available.definitions
+            } else {
+                Vec::new()
             };
-        if persist_preceding_developer_receipt {
-            assistant.data.insert(
-                PRECEDING_DEVELOPER_RECEIPT_KEY.to_owned(),
-                Value::String(prompt_receipt_id.clone()),
+            for definition in &mut definitions {
+                context
+                    .hooks
+                    .tool_definition(definition)
+                    .await
+                    .map_err(TurnError::Hook)?;
+            }
+            let history_definitions = if step_limit_finalization.is_some() {
+                &[][..]
+            } else {
+                definitions.as_slice()
+            };
+            let history_tool_projection =
+                historical_tool_projection(&history, history_definitions, &request.turn_id);
+            let history_tool_fallbacks = history_tool_projection.fallback_reasons();
+            let stable_history = if context.hooks.enabled() {
+                let mut transformed = hook_messages(&history);
+                context
+                    .hooks
+                    .transform_messages(&request.session_id, &mut transformed)
+                    .await
+                    .map_err(TurnError::Hook)?;
+                let mut messages = system
+                    .iter()
+                    .filter(|message| !message.is_empty())
+                    .map(|message| RequestMessage::new(Message::new(Role::System, message.clone())))
+                    .collect::<Vec<_>>();
+                for message in transformed {
+                    append_transformed_message_owned(&mut messages, message);
+                }
+                messages
+            } else {
+                project_history_owned_with_system_messages(&system, history)
+            };
+            ensure_historical_tool_protocol_unchanged(
+                &history_tool_projection.blocks,
+                &stable_history,
+                "transform_messages",
+            )
+            .map_err(TurnError::Hook)?;
+            let cache = prompt_cache.get_or_insert_with(|| PromptCache::new(system_prompt.clone()));
+            let step_dynamic_context = if step_limit_finalization.is_some() {
+                current_dynamic_context
+                    .clone()
+                    .with_runtime_instruction(STEP_LIMIT_FINALIZATION_INSTRUCTION)
+            } else {
+                current_dynamic_context.clone()
+            };
+            let prepared = cache.prepare_turn_owned_with_tool_revision(
+                stable_history,
+                step_dynamic_context,
+                &definitions,
+                available.mcp_status,
+                available.revision,
+            )?;
+            let prepared = if step_limit_finalization.is_some() {
+                prepared.without_tools()
+            } else {
+                prepared
+            };
+            let assembled_dynamic_context = prepared.developer_context().to_vec();
+            let locked_tools: Arc<[ToolDefinition]> = Arc::from(prepared.tools().to_vec());
+            let rebuilt_for_late_mcp = prepared.rebuilt_tools();
+
+            let mut completion =
+                completion_request(&model, prepared, provider_request_context.clone());
+            let hook_message = completion
+                .messages
+                .last()
+                .map(|message| message.message().clone())
+                .unwrap_or_else(|| Message::new(Role::System, ""));
+            let hook_tool_authority = completion.tools.clone();
+            ensure_historical_tool_protocol_unchanged(
+                &history_tool_projection.blocks,
+                &completion.messages,
+                "prompt assembly",
+            )
+            .map_err(TurnError::Hook)?;
+            context
+                .hooks
+                .prepare_request(
+                    RequestHookInput {
+                        session_id: &request.session_id,
+                        agent: &agent,
+                        model: &model,
+                        message: &hook_message,
+                    },
+                    &mut completion,
+                )
+                .await
+                .map_err(TurnError::Hook)?;
+            ensure_prepare_request_tool_subset(&hook_tool_authority, &completion.tools)
+                .map_err(TurnError::Hook)?;
+            ensure_historical_tool_protocol_unchanged(
+                &history_tool_projection.blocks,
+                &completion.messages,
+                "prepare_request",
+            )
+            .map_err(TurnError::Hook)?;
+            let mut combined_history_tool_fallbacks = history_tool_fallbacks;
+            combined_history_tool_fallbacks.extend(unavailable_historical_tool_fallbacks(
+                &history_tool_projection.occurrences,
+                &completion.tools,
+            ));
+            let combined_history_tool_repair = downgrade_projected_tool_history(
+                &mut completion.messages,
+                &history_tool_projection.blocks,
+                &history_tool_projection.occurrences,
+                &combined_history_tool_fallbacks,
             );
+            let context_epoch = store.persistence.context_epoch(&store.scope).await?;
+            let combined_history_tool_repair = combined_history_tool_repair.retain_new_diagnostics(
+                context.run_registry.as_ref(),
+                &request.session_id,
+                context_epoch,
+            );
+            let should_report = !combined_history_tool_repair.is_empty()
+                && (context.run_registry.is_some() || !reported_historical_tool_repair);
+            if should_report {
+                tracing::warn!(
+                    session_id = %request.session_id,
+                    code = "historical_tool_declaration_repaired",
+                    detail = %combined_history_tool_repair.detail(),
+                    "historical tool declarations required bounded inert projection"
+                );
+                events
+                    .send(TurnEvent::Notice {
+                        audience: NoticeAudience::Diagnostic,
+                        severity: NoticeSeverity::Warning,
+                        code: "historical_tool_declaration_repaired".to_owned(),
+                        detail: combined_history_tool_repair.detail(),
+                    })
+                    .await?;
+                reported_historical_tool_repair = true;
+            }
+            let ambiguous_replay = if reasoning_replay.requests_encrypted() {
+                withhold_ambiguous_responses_replay(&mut completion.messages)
+            } else {
+                Default::default()
+            };
+            let mut runtime_sections = agent.runtime_prompt_policy.sections(
+                completion.tools.iter().map(|tool| tool.name.as_str()),
+                !request.dynamic_context.is_empty(),
+            );
+            if has_compaction_checkpoint {
+                runtime_sections
+                    .push(crate::prompt::RuntimePromptSection::compaction_continuation());
+            }
+            let runtime_context = runtime_sections
+                .iter()
+                .map(|section| section.content().to_owned())
+                .collect::<Vec<_>>();
+            let mut assembled_developer_context =
+                Vec::with_capacity(runtime_context.len() + assembled_dynamic_context.len());
+            assembled_developer_context.extend(runtime_context.iter().cloned());
+            assembled_developer_context.extend(assembled_dynamic_context);
+            let hook_developer_context = std::mem::take(&mut completion.developer_context);
+            completion
+                .developer_context
+                .reserve(runtime_context.len() + hook_developer_context.len());
+            completion
+                .developer_context
+                .extend(runtime_context.iter().cloned());
+            completion.developer_context.extend(hook_developer_context);
+            let persist_preceding_developer_receipt = step == 1
+                && reasoning_replay.requests_encrypted()
+                && completion.developer_context[runtime_context.len()..]
+                    .iter()
+                    .any(|context| !context.trim().is_empty())
+                && responses_history_ends_in_assistant_output(&completion.messages);
+            completion
+                .validate_tool_arguments()
+                .map_err(ProviderError::fatal)?;
+            let mut receipt_assembly = agent.prompt_assembly.clone();
+            for section in &runtime_sections {
+                receipt_assembly
+                    .push(section.id(), section.source(), section.content())
+                    .expect("runtime policy section ids are unique and valid");
+            }
+            let assembled_projection = PromptProviderProjection {
+                system_messages: &assembled_system,
+                developer_context: &assembled_developer_context,
+            };
+            let actual_projection = PromptProviderProjection {
+                system_messages: &system,
+                developer_context: &completion.developer_context,
+            };
+            let estimated_prompt_tokens = estimate_completion_prompt_tokens(&completion);
+            require_context_compaction_before_request(
+                &events,
+                step,
+                request.context_compaction_threshold,
+                last_context_tokens,
+                estimated_prompt_tokens,
+            )
+            .await?;
+            ensure_prompt_context_budget(estimated_prompt_tokens, request.context_limit)?;
+            // Consulted here and nowhere earlier: `estimated_prompt_tokens` is only the
+            // size of the request about to be sent once the prompt is assembled, the
+            // `prepare_request` hooks have run, and the context check has passed — before
+            // that the policy would be answering about a prompt that no longer exists.
+            // Consulted here and nowhere later: everything below writes provider-request
+            // bookkeeping, so a request the policy refuses leaves behind no started-request
+            // row, no prompt receipt, and no `ProviderRequestStarted` event.
+            let decision = budget
+                .before_request(&TurnUsageSnapshot {
+                    session_id: &request.session_id,
+                    turn_id: &request.turn_id,
+                    step,
+                    turn_usage,
+                    last_request,
+                    estimated_prompt_tokens,
+                    context_limit: request.context_limit,
+                    elapsed_seconds: elapsed_before_millis.saturating_add(
+                        u64::try_from(turn_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    ) / 1_000,
+                    tool_calls_dispatched,
+                })
+                .await
+                .map_err(|error| budget_policy_failure("before_request", error))?;
+            honour_budget_decision(&events, decision).await?;
+            let assistant_id = assistant.id.clone();
+            // Every part of this step is stamped with the message's creation time, so the
+            // part id decides the order inside the message. Persist only after every
+            // pre-request intervention has accepted the request: a proactive compaction
+            // or budget stop must not leave a blank assistant checkpoint behind.
+            let assistant_time_created = assistant.time_created;
             store
                 .commit_assistant(&zuno_db::assistant_commit::AssistantCommit {
                     message: assistant.clone(),
@@ -2795,274 +2794,385 @@ async fn run_turn_in_span(
                     context_limit: None,
                 })
                 .await?;
-        }
-        let message_count = completion
-            .messages
-            .len()
-            .saturating_add(completion.developer_context.len());
-        let capsules = tally_capsules(&completion.messages);
-        let orchestration_snapshot = Arc::new(attempt_snapshot(AttemptSnapshotInput {
-            request: &request,
-            session: &session,
-            agent: &agent,
-            model: &model,
-            step,
-            prompt_receipt_id: Some(&prompt_receipt_id),
-            prompt_assembly_sha256: assembled_projection.sha256(),
-            prompt_actual_sha256: actual_projection.sha256(),
-            tools: &completion.tools,
-            locked_tools: &locked_tools,
-        }));
-        let request_id = format!("req_{}", Uuid::now_v7().simple());
-        append_provider_request_started(
-            &store,
-            &request,
-            ProviderRequestStart {
-                step,
-                request_id: &request_id,
-                prompt_receipt_id: Some(&prompt_receipt_id),
-                message_count,
-                estimated_prompt_tokens,
-                reasoning_replay,
-                replayed_reasoning_capsules: capsules.replayed,
-                withheld_reasoning_capsules: withheld_reasoning_capsules
-                    .saturating_add(capsules.unpaired)
-                    .saturating_add(ambiguous_replay.capsules),
-                withheld_ambiguous_reasoning_capsules: ambiguous_replay.capsules,
-                restored_reasoning_replay_boundaries,
-                assistant_message_id: &assistant_id,
-                orchestration_snapshot: &orchestration_snapshot,
-                request_context: completion
-                    .request_context()
-                    .expect("foreground completion always has provider routing context"),
-                step_limit_finalization,
-            },
-        )
-        .await?;
-        events
-            .send(TurnEvent::ProviderRequestStarted {
-                step,
-                message_count,
-                estimated_prompt_tokens,
-            })
-            .await?;
-        let accumulator = Arc::new(Mutex::new(StepAccumulator::new(
-            model.catalog_provider_id.clone(),
-            model.catalog_model_id.clone(),
-            model.cost,
-            StreamLimits::from_environment().max_tool_input_bytes(),
-        )));
-        let policy = model.retry_policy;
-        let soft_interrupt = context
-            .live_inputs
-            .as_ref()
-            .map(|live| live.guard.soft_interrupt_signal().clone());
-        let provider_interrupt = context.interrupt.clone();
-        let retry_interrupt = context.interrupt.clone();
-        let retry_soft_interrupt = soft_interrupt.clone();
-        let attempt =
-            {
-                retry_provider_with_wake_observed(
-                policy,
-                |attempt| {
-                    let provider = Arc::clone(&provider);
-                    let completion = completion.clone();
-                    let interrupt = provider_interrupt.clone();
-                    let soft_interrupt = soft_interrupt.clone();
-                    let events = events.clone();
-                    let accumulator = Arc::clone(&accumulator);
-                    let locked_tools = Arc::clone(&locked_tools);
-                    let request_span = span::provider_request_for_session(
-                        &request.session_id,
-                        &model.catalog_provider_id,
-                        &model.catalog_model_id,
-                        attempt,
-                        true,
-                        "turn",
+            last_assistant_id = Some(assistant_id.clone());
+            events
+                .send(TurnEvent::AssistantMessageCreated {
+                    step,
+                    message_id: assistant_id.clone(),
+                })
+                .await?;
+            events
+                .send(TurnEvent::ToolSnapshotLocked {
+                    step,
+                    tool_ids: locked_tools.iter().map(|tool| tool.id.clone()).collect(),
+                    rebuilt_for_late_mcp,
+                })
+                .await?;
+            let prompt_receipt_id =
+                if let Some(receipt_id) = prompt_traces.receipt_id(actual_projection) {
+                    receipt_id.to_owned()
+                } else {
+                    let mut properties = receipt_assembly.event_properties(
+                        &agent.name,
+                        step,
+                        assembled_projection,
+                        actual_projection,
                     );
-                    async move {
-                        let operation_span = request_span.clone();
-                        let result = async move {
-                            let mut stream = provider.stream(completion);
-                            // `Some(n)` once the message has finished: how many more frames may be
-                            // read for their bookkeeping before the step ends regardless.
-                            let mut trailing: Option<u8> = None;
-                            loop {
-                                let control = wait_for_provider_control(
-                                    interrupt.clone(),
-                                    soft_interrupt.clone(),
-                                );
-                                tokio::pin!(control);
-                                let next = tokio::select! {
-                                    biased;
-                                    exit = &mut control => return Ok(Ok(exit)),
-                                    event = stream.next() => event,
-                                };
-                                let Some(next) = next else {
-                                    return Ok(Ok(ProviderStreamExit::Completed));
-                                };
-                                // An error *after* the message has finished is not the turn's
-                                // failure: the answer is already complete and persisted, and the
-                                // only thing still outstanding is bookkeeping. Failing the turn
-                                // over a truncated trailing frame would throw away a reply the
-                                // user has already read.
-                                if trailing.is_some() && next.is_err() {
-                                    return Ok(Ok(ProviderStreamExit::Completed));
-                                }
-                                let event = match next {
-                                    Ok(event) => event,
-                                    Err(error)
-                                        if error.is_retryable()
-                                            && !error.permits_partial_output_retry()
-                                            && accumulator
-                                                .lock()
-                                                .expect("step accumulator lock")
-                                                .has_generated_output() =>
-                                    {
-                                        // Opaque transient failures cannot authorize replacement
-                                        // after bytes were exposed. Only a structured stream code
-                                        // carries that replay permission.
-                                        return Ok(Err(TurnError::Provider(error)));
-                                    }
-                                    Err(error) => return Err(error),
-                                };
-                                let ended = matches!(event, StreamEvent::MessageEnd { .. });
-                                let apply = accumulator
-                                    .lock()
-                                    .expect("step accumulator lock")
-                                    .apply(step, &event);
-                                if let Err(error) = apply {
-                                    return Ok(Err(error));
-                                }
-                                if let StreamEvent::ToolUseStart { id, name } = &event
-                                    && let Err(error) = events
-                                        .send(TurnEvent::ToolCallStarted {
-                                            step,
-                                            call_id: id.clone(),
-                                            display_name: tool_display_name(&locked_tools, name),
-                                            name: name.clone(),
-                                            ui_intent: tool_ui_intent(&locked_tools, name),
-                                        })
-                                        .await
-                                {
-                                    return Ok(Err(error));
-                                }
-                                if let Err(error) =
-                                    events.send(TurnEvent::Provider { step, event }).await
-                                {
-                                    return Ok(Err(error));
-                                }
-                                // `MessageEnd` is not the last frame an OpenAI-compatible endpoint
-                                // sends: `usage` arrives in a chunk *after* the one carrying the
-                                // finish reason, and `[DONE]` after that. Returning here read the
-                                // finish reason and discarded everything behind it, so
-                                // `StreamEvent::TokenUsage` — and therefore
-                                // `StepAccumulator`'s token fields, and therefore the `tokens`
-                                // column `update_usage` writes — could never be reached on those
-                                // providers. Measured: every assistant row in a nine-session
-                                // database had `input: 0, output: 0`.
-                                //
-                                // So a finished message starts a bounded trailing drain rather
-                                // than ending the step. Bounded because a provider that keeps
-                                // streaming after saying it finished must not hold the turn open:
-                                // the count is generous next to the one-or-two frames a real
-                                // endpoint sends, and the provider's own idle timeout still
-                                // governs how long any single frame may take to arrive.
-                                if ended {
-                                    trailing = Some(TRAILING_FRAME_BUDGET);
-                                }
-                                if let Some(remaining) = trailing.as_mut() {
-                                    if *remaining == 0 {
-                                        return Ok(Ok(ProviderStreamExit::Completed));
-                                    }
-                                    *remaining -= 1;
-                                }
-                            }
-                        }
-                        .instrument(operation_span)
-                        .await;
-                        record_provider_attempt(&request_span, step, &result);
-                        result
+                    properties.insert("turnId".to_owned(), Value::String(request.turn_id.clone()));
+                    if let Some(seed) = &agent.orchestration_seed {
+                        let identity = seed
+                            .capability
+                            .identity()
+                            .expect("capability snapshot contains only serializable identity data");
+                        properties.insert(
+                            "capabilitySnapshotID".to_owned(),
+                            serde_json::to_value(identity)
+                                .expect("capability snapshot identity is serializable"),
+                        );
+                        properties.insert(
+                            "capabilitySnapshot".to_owned(),
+                            serde_json::to_value(&seed.capability)
+                                .expect("capability snapshot is serializable"),
+                        );
                     }
-                },
-                |event| {
-                    let events = events.clone();
-                    let accumulator = Arc::clone(&accumulator);
-                    async move {
-                        accumulator
-                            .lock()
-                            .expect("step accumulator lock")
-                            .apply(step, &event)?;
-                        events.send(TurnEvent::Provider { step, event }).await
-                    }
-                },
-                move || {
-                    let interrupt = retry_interrupt.clone();
-                    let soft_interrupt = retry_soft_interrupt.clone();
-                    async move { Ok(wait_for_provider_control(interrupt, soft_interrupt).await) }
-                },
-                TurnAttemptObserver {
-                    store: &store,
-                    request: &request,
-                    accumulator: &accumulator,
-                    record: ProviderAttemptRecord {
-                        step, request_id: &request_id, assistant_message_id: &assistant_id,
-                        agent: &agent.name, provider_id: &model.catalog_provider_id,
-                        model_id: &model.catalog_model_id, attempt: 1, max_attempts: 1,
-                    },
+                    let event = NewSessionEvent::new("session.prompt.assembled", properties)?;
+                    let receipt = store.append(event, ProviderEventUpdate::None).await?;
+                    prompt_traces.remember(actual_projection, receipt.id.clone());
+                    receipt.id
+                };
+            if persist_preceding_developer_receipt {
+                assistant.data.insert(
+                    PRECEDING_DEVELOPER_RECEIPT_KEY.to_owned(),
+                    Value::String(prompt_receipt_id.clone()),
+                );
+                store
+                    .commit_assistant(&zuno_db::assistant_commit::AssistantCommit {
+                        message: assistant.clone(),
+                        parts: Vec::new(),
+                        persisted_at_ms: now_millis(),
+                        context_limit: None,
+                    })
+                    .await?;
+            }
+            let message_count = completion
+                .messages
+                .len()
+                .saturating_add(completion.developer_context.len());
+            let capsules = tally_capsules(&completion.messages);
+            let orchestration_snapshot = Arc::new(attempt_snapshot(AttemptSnapshotInput {
+                request: &request,
+                session: &session,
+                agent: &agent,
+                model: &model,
+                step,
+                prompt_receipt_id: Some(&prompt_receipt_id),
+                prompt_assembly_sha256: assembled_projection.sha256(),
+                prompt_actual_sha256: actual_projection.sha256(),
+                tools: &completion.tools,
+                locked_tools: &locked_tools,
+            }));
+            let request_id = format!("req_{}", Uuid::now_v7().simple());
+            append_provider_request_started(
+                &store,
+                &request,
+                ProviderRequestStart {
+                    step,
+                    request_id: &request_id,
+                    prompt_receipt_id: Some(&prompt_receipt_id),
+                    message_count,
+                    estimated_prompt_tokens,
+                    reasoning_replay,
+                    replayed_reasoning_capsules: capsules.replayed,
+                    withheld_reasoning_capsules: withheld_reasoning_capsules
+                        .saturating_add(capsules.unpaired)
+                        .saturating_add(ambiguous_replay.capsules),
+                    withheld_ambiguous_reasoning_capsules: ambiguous_replay.capsules,
+                    restored_reasoning_replay_boundaries,
+                    assistant_message_id: &assistant_id,
+                    orchestration_snapshot: &orchestration_snapshot,
+                    request_context: completion
+                        .request_context()
+                        .expect("foreground completion always has provider routing context"),
+                    step_limit_finalization,
                 },
             )
-            .await
+            .await?;
+            events
+                .send(TurnEvent::ProviderRequestStarted {
+                    step,
+                    message_count,
+                    estimated_prompt_tokens,
+                })
+                .await?;
+            let accumulator = Arc::new(Mutex::new(StepAccumulator::new(
+                model.catalog_provider_id.clone(),
+                model.catalog_model_id.clone(),
+                model.cost,
+                StreamLimits::from_environment().max_tool_input_bytes(),
+            )));
+            let policy = model.retry_policy;
+            let soft_interrupt = context
+                .live_inputs
+                .as_ref()
+                .map(|live| live.guard.soft_interrupt_signal().clone());
+            let provider_interrupt = context.interrupt.clone();
+            let retry_interrupt = context.interrupt.clone();
+            let retry_soft_interrupt = soft_interrupt.clone();
+            let attempt = {
+                retry_provider_with_wake_observed(
+                    policy,
+                    |attempt| {
+                        let provider = Arc::clone(&provider);
+                        let completion = completion.clone();
+                        let interrupt = provider_interrupt.clone();
+                        let soft_interrupt = soft_interrupt.clone();
+                        let events = events.clone();
+                        let accumulator = Arc::clone(&accumulator);
+                        let locked_tools = Arc::clone(&locked_tools);
+                        let request_span = span::provider_request_for_session(
+                            &request.session_id,
+                            &model.catalog_provider_id,
+                            &model.catalog_model_id,
+                            attempt,
+                            true,
+                            "turn",
+                        );
+                        async move {
+                            let operation_span = request_span.clone();
+                            let result = async move {
+                                let mut stream = provider.stream(completion);
+                                // `Some(n)` once the message has finished: how many more frames may be
+                                // read for their bookkeeping before the step ends regardless.
+                                let mut trailing: Option<u8> = None;
+                                loop {
+                                    let control = wait_for_provider_control(
+                                        interrupt.clone(),
+                                        soft_interrupt.clone(),
+                                    );
+                                    tokio::pin!(control);
+                                    let next = tokio::select! {
+                                        biased;
+                                        exit = &mut control => return Ok(Ok(exit)),
+                                        event = stream.next() => event,
+                                    };
+                                    let Some(next) = next else {
+                                        return Ok(Ok(ProviderStreamExit::Completed));
+                                    };
+                                    // An error *after* the message has finished is not the turn's
+                                    // failure: the answer is already complete and persisted, and the
+                                    // only thing still outstanding is bookkeeping. Failing the turn
+                                    // over a truncated trailing frame would throw away a reply the
+                                    // user has already read.
+                                    if trailing.is_some() && next.is_err() {
+                                        return Ok(Ok(ProviderStreamExit::Completed));
+                                    }
+                                    let event = match next {
+                                        Ok(event) => event,
+                                        Err(error)
+                                            if error.is_retryable()
+                                                && !error.permits_partial_output_retry()
+                                                && accumulator
+                                                    .lock()
+                                                    .expect("step accumulator lock")
+                                                    .has_generated_output() =>
+                                        {
+                                            // Opaque transient failures cannot authorize replacement
+                                            // after bytes were exposed. Only a structured stream code
+                                            // carries that replay permission.
+                                            return Ok(Err(TurnError::Provider(error)));
+                                        }
+                                        Err(error) => return Err(error),
+                                    };
+                                    let ended = matches!(event, StreamEvent::MessageEnd { .. });
+                                    let apply = accumulator
+                                        .lock()
+                                        .expect("step accumulator lock")
+                                        .apply(step, &event);
+                                    if let Err(error) = apply {
+                                        return Ok(Err(error));
+                                    }
+                                    if let StreamEvent::ToolUseStart { id, name } = &event
+                                        && let Err(error) = events
+                                            .send(TurnEvent::ToolCallStarted {
+                                                step,
+                                                call_id: id.clone(),
+                                                display_name: tool_display_name(&locked_tools, name),
+                                                name: name.clone(),
+                                                ui_intent: tool_ui_intent(&locked_tools, name),
+                                            })
+                                            .await
+                                    {
+                                        return Ok(Err(error));
+                                    }
+                                    if let Err(error) =
+                                        events.send(TurnEvent::Provider { step, event }).await
+                                    {
+                                        return Ok(Err(error));
+                                    }
+                                    // `MessageEnd` is not the last frame an OpenAI-compatible endpoint
+                                    // sends: `usage` arrives in a chunk *after* the one carrying the
+                                    // finish reason, and `[DONE]` after that. Returning here read the
+                                    // finish reason and discarded everything behind it, so
+                                    // `StreamEvent::TokenUsage` — and therefore
+                                    // `StepAccumulator`'s token fields, and therefore the `tokens`
+                                    // column `update_usage` writes — could never be reached on those
+                                    // providers. Measured: every assistant row in a nine-session
+                                    // database had `input: 0, output: 0`.
+                                    //
+                                    // So a finished message starts a bounded trailing drain rather
+                                    // than ending the step. Bounded because a provider that keeps
+                                    // streaming after saying it finished must not hold the turn open:
+                                    // the count is generous next to the one-or-two frames a real
+                                    // endpoint sends, and the provider's own idle timeout still
+                                    // governs how long any single frame may take to arrive.
+                                    if ended {
+                                        trailing = Some(TRAILING_FRAME_BUDGET);
+                                    }
+                                    if let Some(remaining) = trailing.as_mut() {
+                                        if *remaining == 0 {
+                                            return Ok(Ok(ProviderStreamExit::Completed));
+                                        }
+                                        *remaining -= 1;
+                                    }
+                                }
+                            }
+                            .instrument(operation_span)
+                            .await;
+                            record_provider_attempt(&request_span, step, &result);
+                            result
+                        }
+                    },
+                    |event| {
+                        let events = events.clone();
+                        let accumulator = Arc::clone(&accumulator);
+                        async move {
+                            accumulator
+                                .lock()
+                                .expect("step accumulator lock")
+                                .apply(step, &event)?;
+                            events.send(TurnEvent::Provider { step, event }).await
+                        }
+                    },
+                    move || {
+                        let interrupt = retry_interrupt.clone();
+                        let soft_interrupt = retry_soft_interrupt.clone();
+                        async move { Ok(wait_for_provider_control(interrupt, soft_interrupt).await) }
+                    },
+                    TurnAttemptObserver {
+                        store: &store,
+                        request: &request,
+                        accumulator: &accumulator,
+                        record: ProviderAttemptRecord {
+                            step, request_id: &request_id, assistant_message_id: &assistant_id,
+                            agent: &agent.name, provider_id: &model.catalog_provider_id,
+                            model_id: &model.catalog_model_id, attempt: 1, max_attempts: 1,
+                        },
+                    },
+                )
+                .await
             };
-        let provider_result = match attempt {
-            Ok(result) => result,
-            Err(ProviderRetryObservedError::Retry(error)) => match error {
-                ProviderRetryError::Provider(error)
-                | ProviderRetryError::AttemptsExhausted { source: error, .. } => {
-                    Err(TurnError::Provider(error))
+            let provider_result = match attempt {
+                Ok(result) => result,
+                Err(ProviderRetryObservedError::Retry(error)) => match error {
+                    ProviderRetryError::Provider(error)
+                    | ProviderRetryError::AttemptsExhausted { source: error, .. } => {
+                        Err(TurnError::Provider(error))
+                    }
+                    ProviderRetryError::DeadlineExceeded {
+                        attempt,
+                        recovery_elapsed,
+                        total_elapsed,
+                        last_provider_error_code,
+                    } => Err(TurnError::ProviderRetryDeadlineExceeded {
+                        attempt,
+                        recovery_elapsed,
+                        total_elapsed,
+                        last_provider_error_code,
+                    }),
+                    // The peer named a delay the same-request deadline cannot hold. The
+                    // turn ends on the peer's own typed error so the goal controller
+                    // schedules its retry from that `retry_after`, clamped to the
+                    // configured ceiling, instead of from a local backoff the peer has
+                    // already said is too soon.
+                    ProviderRetryError::RetryAfterBeyondDeadline { source, .. } => {
+                        Err(TurnError::Provider(source))
+                    }
+                    ProviderRetryError::RollbackEmission { source } => Err(*source),
+                },
+                Err(ProviderRetryObservedError::Observation { source }) => Err(source),
+            };
+            let mut accumulator = {
+                let mut accumulator = accumulator.lock().expect("step accumulator lock");
+                let replacement = StepAccumulator::new(
+                    accumulator.provider.clone(),
+                    accumulator.stream.clone(),
+                    accumulator.cost,
+                    accumulator.tool_input_limit,
+                );
+                std::mem::replace(&mut *accumulator, replacement)
+            };
+            // Accounted before the step's disposition is examined, so a request whose
+            // stream failed, was steered, or was interrupted still counts against the
+            // allowance. Those requests were paid for; only their answers were lost.
+            last_context_tokens = request_context_tokens(&accumulator);
+            last_request = request_usage(&accumulator);
+            turn_usage = turn_usage.saturating_add(last_request);
+            let provider_exit = match provider_result {
+                Ok(exit) => exit,
+                Err(error) => {
+                    append_provider_request_terminal(
+                        &store,
+                        &request,
+                        step,
+                        &request_id,
+                        "failed",
+                        &assistant_id,
+                        Some(&error),
+                    )
+                    .await?;
+                    checkpoint_assistant(
+                        &store,
+                        &request,
+                        step,
+                        &mut assistant,
+                        &accumulator,
+                        &locked_tools,
+                        AssistantCheckpointDisposition::Failed(&error),
+                    )
+                    .await?;
+                    events
+                        .send(TurnEvent::AssistantCheckpointed {
+                            step,
+                            message_id: assistant_id,
+                            interrupted: false,
+                        })
+                        .await?;
+                    return Err(error);
                 }
-                ProviderRetryError::DeadlineExceeded {
-                    attempt,
-                    recovery_elapsed,
-                    total_elapsed,
-                    last_provider_error_code,
-                } => Err(TurnError::ProviderRetryDeadlineExceeded {
-                    attempt,
-                    recovery_elapsed,
-                    total_elapsed,
-                    last_provider_error_code,
-                }),
-                // The peer named a delay the same-request deadline cannot hold. The
-                // turn ends on the peer's own typed error so the goal controller
-                // schedules its retry from that `retry_after`, clamped to the
-                // configured ceiling, instead of from a local backoff the peer has
-                // already said is too soon.
-                ProviderRetryError::RetryAfterBeyondDeadline { source, .. } => {
-                    Err(TurnError::Provider(source))
+            };
+
+            // One call per contiguous text segment, each with the part id that segment
+            // will be persisted under. A step whose text is split by a tool call or a
+            // reasoning item is several parts, and a hook rewrites exactly the segment
+            // it was handed.
+            let mut hook_failure = None;
+            for (position, item) in accumulator.items.iter_mut().enumerate() {
+                let StepItem::Text(text) = item else { continue };
+                if text.is_empty() {
+                    continue;
                 }
-                ProviderRetryError::RollbackEmission { source } => Err(*source),
-            },
-            Err(ProviderRetryObservedError::Observation { source }) => Err(source),
-        };
-        let mut accumulator = {
-            let mut accumulator = accumulator.lock().expect("step accumulator lock");
-            let replacement = StepAccumulator::new(
-                accumulator.provider.clone(),
-                accumulator.stream.clone(),
-                accumulator.cost,
-                accumulator.tool_input_limit,
-            );
-            std::mem::replace(&mut *accumulator, replacement)
-        };
-        // Accounted before the step's disposition is examined, so a request whose
-        // stream failed, was steered, or was interrupted still counts against the
-        // allowance. Those requests were paid for; only their answers were lost.
-        last_context_tokens = request_context_tokens(&accumulator);
-        last_request = request_usage(&accumulator);
-        turn_usage = turn_usage.saturating_add(last_request);
-        let provider_exit = match provider_result {
-            Ok(exit) => exit,
-            Err(error) => {
+                let part_id = positional_part_id(&request.turn_id, step, position, PART_KIND_TEXT);
+                if let Err(message) = context
+                    .hooks
+                    .text_complete(&request.session_id, &assistant_id, &part_id, text)
+                    .await
+                {
+                    hook_failure = Some(message);
+                    break;
+                }
+            }
+            if let Some(message) = hook_failure {
+                let error = TurnError::Hook(message);
                 append_provider_request_terminal(
                     &store,
                     &request,
@@ -3092,40 +3202,163 @@ async fn run_turn_in_span(
                     .await?;
                 return Err(error);
             }
-        };
 
-        // One call per contiguous text segment, each with the part id that segment
-        // will be persisted under. A step whose text is split by a tool call or a
-        // reasoning item is several parts, and a hook rewrites exactly the segment
-        // it was handed.
-        let mut hook_failure = None;
-        for (position, item) in accumulator.items.iter_mut().enumerate() {
-            let StepItem::Text(text) = item else { continue };
-            if text.is_empty() {
+            if provider_exit == ProviderStreamExit::Interrupted {
+                let interruption = hard_interrupt_request(context);
+                append_provider_request_terminal(
+                    &store,
+                    &request,
+                    step,
+                    &request_id,
+                    "cancelled",
+                    &assistant_id,
+                    None,
+                )
+                .await?;
+                checkpoint_assistant(
+                    &store,
+                    &request,
+                    step,
+                    &mut assistant,
+                    &accumulator,
+                    &locked_tools,
+                    AssistantCheckpointDisposition::Interrupted(interruption),
+                )
+                .await?;
+                events
+                    .send(TurnEvent::AssistantCheckpointed {
+                        step,
+                        message_id: assistant_id.clone(),
+                        interrupted: true,
+                    })
+                    .await?;
+                events
+                    .send(TurnEvent::TurnInterrupted {
+                        assistant_message_id: Some(assistant_id.clone()),
+                        steps,
+                        request: interruption,
+                    })
+                    .await?;
+                return Ok(TurnOutcome::Interrupted {
+                    assistant_message_id: Some(assistant_id),
+                    steps,
+                }
+                .into());
+            }
+
+            if provider_exit == ProviderStreamExit::Steered && !accumulator.saw_message_end {
+                append_provider_request_terminal(
+                    &store,
+                    &request,
+                    step,
+                    &request_id,
+                    "steered",
+                    &assistant_id,
+                    None,
+                )
+                .await?;
+                checkpoint_assistant(
+                    &store,
+                    &request,
+                    step,
+                    &mut assistant,
+                    &accumulator,
+                    &locked_tools,
+                    AssistantCheckpointDisposition::Steered,
+                )
+                .await?;
+                events
+                    .send(TurnEvent::AssistantCheckpointed {
+                        step,
+                        message_id: assistant_id,
+                        interrupted: false,
+                    })
+                    .await?;
+                let _injected = inject_live_inputs(context, &request, &requested, &events).await?;
+                events
+                    .send(TurnEvent::StepCompleted {
+                        step,
+                        finish_reason: None,
+                    })
+                    .await?;
                 continue;
             }
-            let part_id = positional_part_id(&request.turn_id, step, position, PART_KIND_TEXT);
-            if let Err(message) = context
-                .hooks
-                .text_complete(&request.session_id, &assistant_id, &part_id, text)
-                .await
-            {
-                hook_failure = Some(message);
-                break;
+
+            if !accumulator.saw_message_end {
+                let error = TurnError::StreamEndedWithoutMessageEnd { step };
+                append_provider_request_terminal(
+                    &store,
+                    &request,
+                    step,
+                    &request_id,
+                    "failed",
+                    &assistant_id,
+                    Some(&error),
+                )
+                .await?;
+                checkpoint_assistant(
+                    &store,
+                    &request,
+                    step,
+                    &mut assistant,
+                    &accumulator,
+                    &locked_tools,
+                    AssistantCheckpointDisposition::Failed(&error),
+                )
+                .await?;
+                events
+                    .send(TurnEvent::AssistantCheckpointed {
+                        step,
+                        message_id: assistant_id,
+                        interrupted: false,
+                    })
+                    .await?;
+                return Err(error);
             }
-        }
-        if let Some(message) = hook_failure {
-            let error = TurnError::Hook(message);
-            append_provider_request_terminal(
-                &store,
-                &request,
-                step,
-                &request_id,
-                "failed",
-                &assistant_id,
-                Some(&error),
-            )
-            .await?;
+
+            if !accumulator.has_assistant_parts() {
+                let error = if accumulator.finish_reason == Some(FinishReason::ContentFilter) {
+                    TurnError::Provider(ProviderError::Refused {
+                        provider: model.catalog_provider_id,
+                        provider_text: Some(
+                            "the model returned a content-filtered response".to_owned(),
+                        ),
+                    })
+                } else {
+                    TurnError::EmptyAssistantMessage {
+                        provider_id: model.catalog_provider_id,
+                        step,
+                    }
+                };
+                append_provider_request_terminal(
+                    &store,
+                    &request,
+                    step,
+                    &request_id,
+                    "failed",
+                    &assistant_id,
+                    Some(&error),
+                )
+                .await?;
+                checkpoint_assistant(
+                    &store,
+                    &request,
+                    step,
+                    &mut assistant,
+                    &accumulator,
+                    &locked_tools,
+                    AssistantCheckpointDisposition::Failed(&error),
+                )
+                .await?;
+                events
+                    .send(TurnEvent::AssistantCheckpointed {
+                        step,
+                        message_id: assistant_id,
+                        interrupted: false,
+                    })
+                    .await?;
+                return Err(error);
+            }
             checkpoint_assistant(
                 &store,
                 &request,
@@ -3133,566 +3366,152 @@ async fn run_turn_in_span(
                 &mut assistant,
                 &accumulator,
                 &locked_tools,
-                AssistantCheckpointDisposition::Failed(&error),
+                AssistantCheckpointDisposition::Completed,
             )
             .await?;
-            events
-                .send(TurnEvent::AssistantCheckpointed {
-                    step,
-                    message_id: assistant_id,
-                    interrupted: false,
-                })
-                .await?;
-            return Err(error);
-        }
-
-        if provider_exit == ProviderStreamExit::Interrupted {
-            let interruption = hard_interrupt_request(context);
             append_provider_request_terminal(
                 &store,
                 &request,
                 step,
                 &request_id,
-                "cancelled",
+                "completed",
                 &assistant_id,
                 None,
-            )
-            .await?;
-            checkpoint_assistant(
-                &store,
-                &request,
-                step,
-                &mut assistant,
-                &accumulator,
-                &locked_tools,
-                AssistantCheckpointDisposition::Interrupted(interruption),
             )
             .await?;
             events
                 .send(TurnEvent::AssistantCheckpointed {
                     step,
                     message_id: assistant_id.clone(),
-                    interrupted: true,
-                })
-                .await?;
-            events
-                .send(TurnEvent::TurnInterrupted {
-                    assistant_message_id: Some(assistant_id.clone()),
-                    steps,
-                    request: interruption,
-                })
-                .await?;
-            return Ok(TurnOutcome::Interrupted {
-                assistant_message_id: Some(assistant_id),
-                steps,
-            }
-            .into());
-        }
-
-        if provider_exit == ProviderStreamExit::Steered && !accumulator.saw_message_end {
-            append_provider_request_terminal(
-                &store,
-                &request,
-                step,
-                &request_id,
-                "steered",
-                &assistant_id,
-                None,
-            )
-            .await?;
-            checkpoint_assistant(
-                &store,
-                &request,
-                step,
-                &mut assistant,
-                &accumulator,
-                &locked_tools,
-                AssistantCheckpointDisposition::Steered,
-            )
-            .await?;
-            events
-                .send(TurnEvent::AssistantCheckpointed {
-                    step,
-                    message_id: assistant_id,
                     interrupted: false,
                 })
                 .await?;
-            let _injected = inject_live_inputs(context, &request, &requested, &events).await?;
-            events
-                .send(TurnEvent::StepCompleted {
+            // Consulted after this step's tokens are in the turn total and after the
+            // assistant checkpoint is durable, so a stop here can never discard model
+            // output the user has already been shown, and before a single tool of this
+            // step is dispatched, so a spent allowance authorizes no further work of any
+            // kind. Unanswered tool calls left by that stop are closed by
+            // `repair_missing_tool_outputs` at the head of the next turn, exactly as a
+            // hard interrupt's are.
+            let decision = budget
+                .after_response(&TurnUsageSnapshot {
+                    session_id: &request.session_id,
+                    turn_id: &request.turn_id,
                     step,
-                    finish_reason: None,
+                    turn_usage,
+                    last_request,
+                    estimated_prompt_tokens,
+                    context_limit: request.context_limit,
+                    elapsed_seconds: elapsed_before_millis.saturating_add(
+                        u64::try_from(turn_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    ) / 1_000,
+                    tool_calls_dispatched,
                 })
-                .await?;
-            continue;
-        }
+                .await
+                .map_err(|error| budget_policy_failure("after_response", error))?;
+            honour_budget_decision(&events, decision).await?;
 
-        if !accumulator.saw_message_end {
-            let error = TurnError::StreamEndedWithoutMessageEnd { step };
-            append_provider_request_terminal(
-                &store,
-                &request,
-                step,
-                &request_id,
-                "failed",
-                &assistant_id,
-                Some(&error),
-            )
-            .await?;
-            checkpoint_assistant(
-                &store,
-                &request,
-                step,
-                &mut assistant,
-                &accumulator,
-                &locked_tools,
-                AssistantCheckpointDisposition::Failed(&error),
-            )
-            .await?;
-            events
-                .send(TurnEvent::AssistantCheckpointed {
-                    step,
-                    message_id: assistant_id,
-                    interrupted: false,
-                })
-                .await?;
-            return Err(error);
-        }
-
-        if !accumulator.has_assistant_parts() {
-            let error = if accumulator.finish_reason == Some(FinishReason::ContentFilter) {
-                TurnError::Provider(ProviderError::Refused {
-                    provider: model.catalog_provider_id,
-                    provider_text: Some(
-                        "the model returned a content-filtered response".to_owned(),
-                    ),
-                })
-            } else {
-                TurnError::EmptyAssistantMessage {
-                    provider_id: model.catalog_provider_id,
-                    step,
-                }
-            };
-            append_provider_request_terminal(
-                &store,
-                &request,
-                step,
-                &request_id,
-                "failed",
-                &assistant_id,
-                Some(&error),
-            )
-            .await?;
-            checkpoint_assistant(
-                &store,
-                &request,
-                step,
-                &mut assistant,
-                &accumulator,
-                &locked_tools,
-                AssistantCheckpointDisposition::Failed(&error),
-            )
-            .await?;
-            events
-                .send(TurnEvent::AssistantCheckpointed {
-                    step,
-                    message_id: assistant_id,
-                    interrupted: false,
-                })
-                .await?;
-            return Err(error);
-        }
-        checkpoint_assistant(
-            &store,
-            &request,
-            step,
-            &mut assistant,
-            &accumulator,
-            &locked_tools,
-            AssistantCheckpointDisposition::Completed,
-        )
-        .await?;
-        append_provider_request_terminal(
-            &store,
-            &request,
-            step,
-            &request_id,
-            "completed",
-            &assistant_id,
-            None,
-        )
-        .await?;
-        events
-            .send(TurnEvent::AssistantCheckpointed {
-                step,
-                message_id: assistant_id.clone(),
-                interrupted: false,
-            })
-            .await?;
-        // Consulted after this step's tokens are in the turn total and after the
-        // assistant checkpoint is durable, so a stop here can never discard model
-        // output the user has already been shown, and before a single tool of this
-        // step is dispatched, so a spent allowance authorizes no further work of any
-        // kind. Unanswered tool calls left by that stop are closed by
-        // `repair_missing_tool_outputs` at the head of the next turn, exactly as a
-        // hard interrupt's are.
-        let decision = budget
-            .after_response(&TurnUsageSnapshot {
-                session_id: &request.session_id,
-                turn_id: &request.turn_id,
-                step,
-                turn_usage,
-                last_request,
-                estimated_prompt_tokens,
-                context_limit: request.context_limit,
-                elapsed_seconds: elapsed_before_millis.saturating_add(
-                    u64::try_from(turn_started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                ) / 1_000,
-                tool_calls_dispatched,
-            })
-            .await
-            .map_err(|error| budget_policy_failure("after_response", error))?;
-        honour_budget_decision(&events, decision).await?;
-
-        let calls = accumulator.calls.values().cloned().collect::<Vec<_>>();
-        // Where each call sat in the stream. The part id carries that position, not
-        // the dispatch index, so a call keeps its place among the text and reasoning
-        // parts of the same step.
-        let call_positions = accumulator.call_positions();
-        if !calls.is_empty()
-            && let Some(max_steps) = step_limit_finalization
-        {
-            return Err(TurnError::StepLimit {
-                agent: agent.name,
-                max_steps: max_steps.get(),
-            });
-        }
-        let invalid_calls = calls
-            .iter()
-            .filter(|call| call.input_error.is_some())
-            .count();
-        if invalid_calls == 0 {
-            consecutive_invalid_tool_calls = 0;
-        } else {
-            consecutive_invalid_tool_calls = consecutive_invalid_tool_calls
-                .saturating_add(u8::try_from(invalid_calls).unwrap_or(u8::MAX));
-            if consecutive_invalid_tool_calls >= 3 {
-                let tool = calls
-                    .iter()
-                    .rev()
-                    .find(|call| call.input_error.is_some())
-                    .map_or_else(|| "unknown".to_owned(), |call| call.name.clone());
-                return Err(TurnError::InvalidToolCalls {
-                    count: consecutive_invalid_tool_calls,
-                    tool,
+            let calls = accumulator.calls.values().cloned().collect::<Vec<_>>();
+            // Where each call sat in the stream. The part id carries that position, not
+            // the dispatch index, so a call keeps its place among the text and reasoning
+            // parts of the same step.
+            let call_positions = accumulator.call_positions();
+            if !calls.is_empty()
+                && let Some(max_steps) = step_limit_finalization
+            {
+                return Err(TurnError::StepLimit {
+                    agent: agent.name,
+                    max_steps: max_steps.get(),
                 });
             }
-        }
-        let mut injected = inject_live_inputs(context, &request, &requested, &events).await?;
-        let mut yield_until_input = false;
-        let mut waiting_for_human = None;
-        let mut work_state_read = None;
-        let mut step_dynamic_context_refresh = None;
-        if !injected.skip_remaining_tools {
-            let mut next_call = 0;
-            while next_call < calls.len() && !injected.skip_remaining_tools {
-                let first_request = dispatch_request(
-                    calls[next_call].clone(),
-                    &request,
-                    &assistant_id,
-                    &agent.name,
-                    &locked_tools,
-                    context,
-                    &orchestration_snapshot,
-                );
-                let first_policy = context.dispatcher.concurrency_policy(&first_request);
-                let mut group_end = next_call.saturating_add(1);
-                if first_policy != ToolConcurrencyPolicy::Exclusive {
-                    while group_end < calls.len() {
-                        let candidate = dispatch_request(
-                            calls[group_end].clone(),
-                            &request,
-                            &assistant_id,
-                            &agent.name,
-                            &locked_tools,
-                            context,
-                            &orchestration_snapshot,
-                        );
-                        if context.dispatcher.concurrency_policy(&candidate)
-                            == ToolConcurrencyPolicy::Exclusive
-                        {
-                            break;
-                        }
-                        group_end = group_end.saturating_add(1);
-                    }
+            let invalid_calls = calls
+                .iter()
+                .filter(|call| call.input_error.is_some())
+                .count();
+            if invalid_calls == 0 {
+                consecutive_invalid_tool_calls = 0;
+            } else {
+                consecutive_invalid_tool_calls = consecutive_invalid_tool_calls
+                    .saturating_add(u8::try_from(invalid_calls).unwrap_or(u8::MAX));
+                if consecutive_invalid_tool_calls >= 3 {
+                    let tool = calls
+                        .iter()
+                        .rev()
+                        .find(|call| call.input_error.is_some())
+                        .map_or_else(|| "unknown".to_owned(), |call| call.name.clone());
+                    return Err(TurnError::InvalidToolCalls {
+                        count: consecutive_invalid_tool_calls,
+                        tool,
+                    });
                 }
-
-                let mut prepared = Vec::with_capacity(group_end.saturating_sub(next_call));
-                for (call_index, call) in calls
-                    .iter()
-                    .cloned()
-                    .enumerate()
-                    .take(group_end)
-                    .skip(next_call)
-                {
-                    let ui_intent = tool_ui_intent(&locked_tools, &call.name);
-                    let display_name = tool_display_name(&locked_tools, &call.name);
-                    events
-                        .send(TurnEvent::ToolDispatchStarted {
-                            step,
-                            call_id: call.id.clone(),
-                            display_name: display_name.clone(),
-                            name: call.name.clone(),
-                            ui_intent,
-                        })
-                        .await?;
-                    let dispatch = context
-                        .dispatcher
-                        .prepare(dispatch_request(
-                            call.clone(),
-                            &request,
-                            &assistant_id,
-                            &agent.name,
-                            &locked_tools,
-                            context,
-                            &orchestration_snapshot,
-                        ))
-                        .await;
-                    prepared.push((call_index, call, display_name, ui_intent, dispatch));
-                }
-
-                // The hand-off becomes durable before any of this group can take
-                // effect. A process that dies inside `execute` leaves a row the next
-                // turn has to classify, and the only evidence that survives the death
-                // is what was committed before it: `repair_missing_tool_outputs` reads
-                // this stamp to separate a call that may have changed authoritative
-                // state from one that was never handed over. Written for the whole
-                // group in one transaction because the group runs concurrently, so any
-                // member of it may be the call that is in flight.
-                mark_group_dispatched(
-                    &store,
-                    &request,
-                    step,
-                    &locked_tools,
-                    DispatchedGroup {
-                        assistant_id: &assistant_id,
-                        assistant_time_created,
-                        call_positions: &call_positions,
-                        calls: prepared
-                            .iter()
-                            .map(|(call_index, call, display_name, ui_intent, _)| {
-                                (*call_index, call, display_name.as_str(), *ui_intent)
-                            })
-                            .collect(),
-                    },
-                )
-                .await?;
-
-                let completed = if first_policy == ToolConcurrencyPolicy::Exclusive {
-                    let (call_index, call, display_name, ui_intent, dispatch) =
-                        prepared.pop().expect("exclusive group contains one call");
-                    vec![(
-                        call_index,
-                        call,
-                        display_name,
-                        ui_intent,
-                        dispatch.execute().await,
-                    )]
-                } else {
-                    stream::iter(prepared.into_iter().map(
-                        |(call_index, call, display_name, ui_intent, dispatch)| async move {
-                            (
-                                call_index,
-                                call,
-                                display_name,
-                                ui_intent,
-                                dispatch.execute().await,
-                            )
-                        },
-                    ))
-                    .buffered(context.tool_concurrency.get())
-                    .collect::<Vec<_>>()
-                    .await
-                };
-                if calls.len() == 1
-                    && completed.len() == 1
-                    && let Some((_, call, _, _, dispatch)) = completed.first()
-                    && !dispatch.is_error
-                    && dispatch.recovery.is_none()
-                    && dispatch.blocked.is_none()
-                    && dispatch.interruption.is_none()
-                    && dispatch.uncertain.is_none()
-                    && dispatch.output.continuation == ToolContinuation::Continue
-                    && dispatch.output.written_paths().is_empty()
-                    && let Some(observation) = dispatch.output.progress_observation()
-                {
-                    work_state_read = Some((
-                        call.name.clone(),
-                        observation.scope().to_owned(),
-                        observation.fingerprint().to_owned(),
-                    ));
-                }
-                for (_, _, _, _, dispatch) in &completed {
-                    if !dispatch.is_error
-                        && dispatch.recovery.is_none()
-                        && dispatch.blocked.is_none()
-                        && dispatch.interruption.is_none()
-                        && dispatch.uncertain.is_none()
-                        && let Some(refresh) = dispatch.output.dynamic_context_refresh()
-                    {
-                        step_dynamic_context_refresh = Some(merge_dynamic_context_refresh(
-                            step_dynamic_context_refresh,
-                            refresh,
-                        ));
-                    }
-                }
-                // Every entry ran to a result, whether it succeeded, was blocked, or was
-                // interrupted, so this is the truthful count of tool work the turn did;
-                // the next `before_request` reads it.
-                tool_calls_dispatched = tool_calls_dispatched
-                    .saturating_add(u32::try_from(completed.len()).unwrap_or(u32::MAX));
-
-                // A completed parallel group is an indivisible durable unit: every
-                // execution result is appended in model order before an urgent inbox
-                // item may prevent the next group from starting.
-                let result_parts = completed
-                    .iter()
-                    .map(|(call_index, call, display_name, ui_intent, dispatch)| {
-                        tool_result_part(
-                            &request,
-                            ToolPartIdentity {
-                                step,
-                                position: call_positions[*call_index],
-                                message_time_created: assistant_time_created,
-                                message_id: &assistant_id,
-                                call,
-                                display_name,
-                                ui_intent: *ui_intent,
-                                schema_identity: tool_schema_identity(&locked_tools, &call.name),
-                            },
-                            dispatch,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                store
-                    .persistence
-                    .commit_tool_parts(
-                        &store.scope,
-                        &result_parts,
-                        crate::state::ToolPartCommitKind::Result,
-                        now_millis(),
-                    )
-                    .await?;
-                for (_, call, display_name, _, dispatch) in completed {
-                    if !dispatch.is_error {
-                        match dispatch.output.continuation {
-                            ToolContinuation::Continue => {}
-                            ToolContinuation::YieldUntilInput => yield_until_input = true,
-                            ToolContinuation::WaitingForHuman => {
-                                let request_id = dispatch
-                                    .output
-                                    .metadata
-                                    .get(METADATA_HUMAN_REQUEST_ID_KEY)
-                                    .and_then(Value::as_str)
-                                    .filter(|request_id| !request_id.is_empty())
-                                    .ok_or_else(|| TurnError::MissingHumanRequestId {
-                                        tool: call.name.clone(),
-                                    })?
-                                    .to_owned();
-                                waiting_for_human = Some(request_id);
-                            }
-                        }
-                    }
-                    if let Some(recovery) = dispatch.recovery.clone() {
-                        unresolved_tool_failures.insert(recovery.tool.clone(), recovery);
-                    } else {
-                        unresolved_tool_failures.remove(&call.name);
-                    }
-                    if let Some(kind) = dispatch.blocked {
-                        events
-                            .send(TurnEvent::ToolDispatchBlocked {
-                                step,
-                                call_id: call.id.clone(),
-                                kind,
-                            })
-                            .await?;
-                    }
-                    if let Some(interruption) = dispatch.interruption {
-                        // The dispatcher already resolved this call's certainty against
-                        // the tool's own claim and recorded it; recomputing it from the
-                        // mode here is what made the live surfaces contradict the
-                        // durable record. The mode is only the fallback for a result
-                        // that carries no readable verdict.
-                        let uncertain =
-                            crate::dispatch::recorded_interruption_uncertainty(&dispatch)
-                                .unwrap_or_else(|| interruption.uncertain());
-                        events
-                            .send(TurnEvent::ToolDispatchInterrupted {
-                                step,
-                                call_id: call.id.clone(),
-                                display_name,
-                                name: call.name,
-                                title: dispatch.output.title.clone(),
-                                output: dispatch.output.output.clone(),
-                                interruption,
-                                uncertain,
-                            })
-                            .await?;
-                    } else {
-                        if let Some(presentation) = dispatch.output.presentation.clone() {
-                            events
-                                .send(TurnEvent::ToolResultPresented {
-                                    step,
-                                    call_id: call.id.clone(),
-                                    presentation,
-                                })
-                                .await?;
-                        }
-                        events
-                            .send(TurnEvent::ToolDispatchCompleted {
-                                step,
-                                call_id: call.id.clone(),
-                                display_name,
-                                name: call.name,
-                                title: dispatch.output.title.clone(),
-                                output: dispatch.output.output.clone(),
-                                diff: ToolDiff::from_output(&dispatch.output),
-                                written_paths: dispatch
-                                    .output
-                                    .written_paths()
-                                    .into_iter()
-                                    .map(str::to_owned)
-                                    .collect(),
-                                is_error: dispatch.is_error,
-                            })
-                            .await?;
-                    }
-                    events
-                        .send(TurnEvent::ToolResultAppended {
-                            step,
-                            call_id: call.id,
-                            is_error: dispatch.is_error,
-                        })
-                        .await?;
-                    if waiting_for_human.is_some() {
-                        injected.skip_remaining_tools = true;
-                    } else {
-                        injected.merge(
-                            inject_live_inputs(context, &request, &requested, &events).await?,
-                        );
-                    }
-                }
-                next_call = group_end;
             }
-        }
-        if waiting_for_human.is_none() {
-            injected.merge(inject_live_inputs(context, &request, &requested, &events).await?);
-        }
+            crate::advance::ToolStepCheckpoint {
+                step,
+                assistant_id,
+                assistant_time_created,
+                requested,
+                locked_tools: locked_tools.to_vec(),
+                orchestration_snapshot: (*orchestration_snapshot).clone(),
+                calls,
+                call_positions,
+                finish_reason: accumulator.finish_reason,
+                next_call: 0,
+                pending: Vec::new(),
+                effects: tool_step::ToolStepEffects::default(),
+            }
+        };
+        let step = tool_step_checkpoint.step;
+        let assistant_id = tool_step_checkpoint.assistant_id.clone();
+        let calls_empty = tool_step_checkpoint.calls.is_empty();
+        let finish_reason = tool_step_checkpoint.finish_reason;
+        let tool_result = tool_step::execute(
+            &mut tool_step_checkpoint,
+            &request,
+            context,
+            &events,
+            &store,
+            (&mut tool_calls_dispatched, &mut unresolved_tool_failures),
+            max_steps.is_some(),
+        )
+        .await?;
+        let tool_step::ToolStepOutcome::Completed(tool_result) = tool_result else {
+            return Ok(crate::advance::LoopOutcome::Waiting(Box::new(
+                crate::advance::LoopCheckpoint {
+                    tool_step: Some(tool_step_checkpoint),
+                    steps,
+                    tool_calls_dispatched,
+                    last_assistant_id,
+                    requested_turn: pinned_requested_turn,
+                    prompt_traces,
+                    unresolved_tool_failures,
+                    consecutive_invalid_tool_calls,
+                    stagnant_work_state_read,
+                    dynamic_context: current_dynamic_context,
+                    dynamic_context_refresh: cumulative_dynamic_context_refresh,
+                    step_limit_finalization_attempted,
+                    turn_usage,
+                    last_request,
+                    last_context_tokens,
+                    reported_historical_tool_repair,
+                    elapsed_millis: elapsed_before_millis.saturating_add(
+                        u64::try_from(turn_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    ),
+                    started_at_ms,
+                },
+            )));
+        };
+        let tool_step::ToolStepResult {
+            injected,
+            yield_until_input,
+            waiting_for_human,
+            work_state_read,
+            dynamic_context_refresh: step_dynamic_context_refresh,
+        } = tool_result;
 
         events
             .send(TurnEvent::StepCompleted {
                 step,
-                finish_reason: accumulator.finish_reason,
+                finish_reason,
             })
             .await?;
 
@@ -3732,8 +3551,7 @@ async fn run_turn_in_span(
             .into());
         }
 
-        let another_provider_request =
-            injected.count > 0 || (!yield_until_input && !calls.is_empty());
+        let another_provider_request = injected.count > 0 || (!yield_until_input && !calls_empty);
         if another_provider_request && let Some(refresh) = step_dynamic_context_refresh {
             let refresh =
                 merge_dynamic_context_refresh(cumulative_dynamic_context_refresh, refresh);
@@ -3755,7 +3573,7 @@ async fn run_turn_in_span(
             continue;
         }
 
-        if (yield_until_input || calls.is_empty())
+        if (yield_until_input || calls_empty)
             && context
                 .live_inputs
                 .as_ref()
@@ -3783,7 +3601,7 @@ async fn run_turn_in_span(
             .into());
         }
 
-        if !calls.is_empty() {
+        if !calls_empty {
             continue;
         }
 
@@ -3913,7 +3731,8 @@ fn dispatch_request(
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct InjectedLiveInputs {
     count: usize,
     skip_remaining_tools: bool,
@@ -4288,8 +4107,19 @@ pub(crate) fn repair_missing_tool_outputs(
     session_id: &str,
 ) -> Result<usize, TurnError> {
     let store = MessageStore::new(connection);
+    let unfinished = store.unfinished_tool_parts_for_session(session_id)?;
+    if !unfinished.is_empty()
+        && let Some(event) =
+            zuno_db::event_log::latest_of_type_in(connection, session_id, "runtime.driver.advance")?
+        && crate::advance::protects_unfinished(&event, &unfinished)
+            .map_err(|_| crate::state::TurnStateError::InvalidData)?
+    {
+        // Only the bounded driver may continue a protected tool phase. An
+        // ordinary new turn must not fabricate interrupted results or overtake it.
+        return Err(crate::state::TurnStateError::Conflict.into());
+    }
     let mut repaired = 0;
-    for part in store.unfinished_tool_parts_for_session(session_id)? {
+    for part in unfinished {
         if let Some(part) = repair_unanswered_tool_part(part, now_millis()) {
             store.put_part(&part)?;
             repaired += 1;

@@ -108,7 +108,8 @@ use zuno_orchestration::{ToolSchemaIdentity, replay_schema_sha256, sha256_json, 
 ///
 /// Produced only by [`Tool::definition`], so the augmentation cannot be skipped by
 /// assembling one of these from parts.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ToolDefinition {
     /// The name the model calls.
     pub id: String,
@@ -154,7 +155,8 @@ pub struct ToolSource {
 /// This is independent from [`ToolReplayPolicy`]: history projection never executes a
 /// call again. It only decides whether a completed call/result pair remains native,
 /// becomes inert data, or is omitted in favor of a current authoritative projection.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HistoryPolicy {
     /// Preserve native protocol only under a compatible declaration; otherwise emit
     /// bounded inert records.

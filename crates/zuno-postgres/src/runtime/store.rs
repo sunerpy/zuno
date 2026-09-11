@@ -138,6 +138,8 @@ impl RuntimeStore for PostgresRuntimeStore {
             let mut tx = owner_transaction(&self.pool, &owner).await?;
             let time = database_time(&mut tx).await?;
             expire_inflight(&mut tx, &owner, time).await?;
+            waiting::wake_timers(&mut tx, &owner, time).await?;
+            let time = database_time(&mut tx).await?;
             let candidate = query(
                 "SELECT r.job_id FROM zuno_enterprise_preview.runtime_job r
                  JOIN zuno_enterprise_preview.runtime_session s

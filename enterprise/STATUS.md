@@ -7,8 +7,8 @@ Baseline: `v0.10.29`, `d1212860dba6a6b420ce81d444ace58feaf0adb5`.
 | P0 | Complete | PR #176 merged into preview; native CI run 34553054820 succeeded |
 | P1 | In progress | Principal propagation implemented; ownership migration validated; local bounded driver and scoped session application validated; local runtime Job/lease port validated; Memory persistence/authority ports validated; backend assembly remains |
 | P2 | In progress | PostgreSQL sessions/runtime Jobs, OAuth2/Entra verification and organization/approval storage validated; Memory, login and execution integration remain |
-| P3 | In progress | Shared kernel, PostgreSQL checkpoint handoff and authenticated HTTPS state transport validated; independent Worker processes, Docker gateway and full launch assembly remain |
-| P4 | Pending | Durable child/Workflow/Council waits, merges and cancellation |
+| P3 | In progress | Shared kernel, PostgreSQL checkpoint handoff, authenticated HTTPS transport and rootless backend validated; independent Worker processes, gateway service and launch assembly remain |
+| P4 | In progress | Durable invocation waits/consumption implemented; child/Workflow/Council producers, merges and cancellation controls remain |
 | P5 | Pending | Web, SDK, remote ACP, common projections |
 | P6 | Pending | Fault injection, native artifacts, preview publication |
 
@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p3-environment-gateway`.
+- Current phase branch: `codex/enterprise-p4-durable-waits`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -156,6 +156,15 @@ verification is pending the next preview CI run. No release is enabled.
 - `zuno-environment` provides persistent workspace volumes, per-operation Docker containers, a separate single-owner ledger, immutable start admission, late receipt inspection, cancellation, streamed output cursors, verified snapshots, fork isolation and tombstone release.
 - `OrganizationOperationAuthority` reuses existing Job and approval stores. The real PostgreSQL contract verifies no execution before HITL approval and rejects changed commands/resources/leases. There is no production allow-all default.
 - Local rootless Docker 29.7.1 passes actual read-only-root, network-none, memory/CPU/PID limits, command-once recovery, output paging, cancellation, snapshot/fork and release tests. Ledger/archive tests: 5 passed. PostgreSQL/HTTPS contracts, 99 docs/release contracts, 11 preview publisher tests, workspace check, Clippy, fmt, diff and actionlint passed.
-- Preview CI/release now requires a separate rootless Docker gate on Linux amd64 and arm64. Remote platform results are pending this change's CI.
+- Preview CI/release requires a separate rootless Docker gate on Linux amd64 and arm64. Both native architectures passed in CI 34622569086.
 - Both local validation modes passed: reusing the dedicated task daemon and starting/stopping a fresh isolated rootless daemon. The host needed only `uidmap`/`libsubid4`; the existing rootful Docker service was not restarted. The task daemon uses a separate socket/data/exec directory and the user systemd D-Bus.
 - Gateway service authentication, Worker/Agent tool registration, durable HITL waits, watchdog/cumulative quotas, remote artifact storage and interrupted-fork/retention management remain unfinished. These backend tests do not enable an enterprise runtime command or release.
+
+## Durable invocation waiting
+
+- Environment PR #191 merged into preview at `510290b5ff688cb5c1197773c130b32b3281f3bd`; CI 34622569086 passed all gates, including rootless Docker and PostgreSQL on Linux amd64/arm64.
+- Typed pending results retain the original call and tool-phase cursor. Completion publication and consumption are separate facts; consumption, original result and next checkpoint commit together without an intermediate started marker.
+- SQLite wait replacement/rollback tests passed. The real PostgreSQL suite passed competing claims, independent sessions, early completion, timer wakeup, paused-parent retention, owner isolation, consumption failure/takeover and format-4 migration rollback/preservation.
+- Engine/database regression, final dispatch/alias tests, 52 CLI production/permission tests, PostgreSQL/HTTPS wait contracts, 99 documentation/release contracts and 11 preview publishing tests passed. Workspace check, Clippy, fmt and diff checks passed.
+- This phase's remote CI remains pending. The complete enterprise runtime, child/Workflow producers, public approval/control APIs and Web remain unregistered; publication stays disabled.
+- Main was refreshed at `1518f0ef` (package version `0.10.30`). Its session, permission and automatic Memory fixes will enter preview through a separate synchronization PR; this phase still targets the existing preview baseline.

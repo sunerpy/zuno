@@ -56,3 +56,5 @@ Model-visible output remains reconstructable from durable state.
 Organization policy and durable approval contracts: [English](AUTHORIZATION.md), [中文](AUTHORIZATION.zh.md).
 
 Rootless environments and operation recovery: [English](ENVIRONMENTS.md), [中文](ENVIRONMENTS.zh.md).
+
+Durable invocation waiting and consumption: [English](WAITING.md), [中文](WAITING.zh.md).

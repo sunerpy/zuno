@@ -7,6 +7,32 @@ pub(crate) async fn checkpoint_in(
     lease: &ExecutionLease,
     checkpoint: RuntimeCheckpoint,
 ) -> Result<RuntimeJob, ApplicationError> {
+    checkpoint_phase_in(tx, lease, checkpoint, "ready").await
+}
+
+pub(crate) async fn suspend_in(
+    tx: &mut Transaction<'_, Postgres>,
+    lease: &ExecutionLease,
+    checkpoint: RuntimeCheckpoint,
+    references: &[zuno_types::wait::WaitRef],
+) -> Result<RuntimeJob, ApplicationError> {
+    let job = verify_lease(tx, lease).await?;
+    let all_ready = waiting::register(tx, &job, references).await?;
+    checkpoint_phase_in(
+        tx,
+        lease,
+        checkpoint,
+        if all_ready { "ready" } else { "waiting" },
+    )
+    .await
+}
+
+async fn checkpoint_phase_in(
+    tx: &mut Transaction<'_, Postgres>,
+    lease: &ExecutionLease,
+    checkpoint: RuntimeCheckpoint,
+    phase: &str,
+) -> Result<RuntimeJob, ApplicationError> {
     checkpoint.validate()?;
     let job = verify_lease(tx, lease).await?;
     if checkpoint.job_id != job.id
@@ -18,7 +44,7 @@ pub(crate) async fn checkpoint_in(
     require_consumed_input(tx, &job).await?;
     let time = database_time(tx).await?;
     query(
-        "UPDATE zuno_enterprise_preview.runtime_job SET phase='ready',active_attempt_id=NULL,
+        "UPDATE zuno_enterprise_preview.runtime_job SET phase=$6,active_attempt_id=NULL,
            checkpoint=$4,checkpoint_version=checkpoint_version+1,ready_at=$5,time_updated=$5
          WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3",
     )
@@ -27,6 +53,7 @@ pub(crate) async fn checkpoint_in(
     .bind(job.id.as_str())
     .bind(json!(checkpoint))
     .bind(time)
+    .bind(phase)
     .execute(&mut **tx)
     .await
     .map_err(database_error)?;
@@ -39,6 +66,7 @@ pub(crate) async fn checkpoint_in(
         json!({
             "jobID":job.id,"attemptID":lease.attempt_id,"epoch":lease.epoch,
             "checkpointVersion":job.checkpoint_version+1,"checkpoint":checkpoint,
+            "phase":phase,
         }),
     )
     .await?;

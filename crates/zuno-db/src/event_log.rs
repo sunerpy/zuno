@@ -293,6 +293,74 @@ pub fn append_in(
     session_id: &str,
     event: NewSessionEvent,
 ) -> Result<SessionEvent, DbError> {
+    append_new_in(
+        transaction,
+        session_id,
+        &format!("evt_{}", Uuid::now_v7().simple()),
+        event,
+    )
+}
+
+/// Read one stable event identity without scanning a session's history.
+pub fn by_id_in(
+    connection: &Connection,
+    session_id: &str,
+    event_id: &str,
+) -> Result<Option<SessionEvent>, DbError> {
+    connection
+        .query_row(
+            "SELECT id, aggregate_id, seq, type, data FROM event WHERE aggregate_id=?1 AND id=?2",
+            params![session_id, event_id],
+            decode_stored_row,
+        )
+        .optional()
+        .map_err(open::map_error)?
+        .map(decode_event)
+        .transpose()
+}
+
+/// Append an immutable fact with a host-derived identity. A repeated identical
+/// fact returns its original sequence; reuse for another fact is a conflict.
+/// The caller owns an immediate transaction and performs scope authorization.
+pub fn append_identified_in(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    event_id: &str,
+    event: NewSessionEvent,
+) -> Result<SessionEvent, DbError> {
+    if event_id.is_empty()
+        || event_id.len() > 128
+        || !event_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+    {
+        return Err(query_error(std::io::Error::other(
+            "invalid stable event identity",
+        )));
+    }
+    validate_event_type(&event.event_type)?;
+    if let Some(previous) = by_id_in(transaction, session_id, event_id)? {
+        if previous.version == EVENT_VERSION
+            && previous.event_type == event.event_type
+            && previous.properties == event.properties
+        {
+            return Ok(previous);
+        }
+        return Err(DbError::Conflict {
+            table: "event".to_owned(),
+            id: event_id.to_owned(),
+            detail: "a stable event identity already names another fact".to_owned(),
+        });
+    }
+    append_new_in(transaction, session_id, event_id, event)
+}
+
+fn append_new_in(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    event_id: &str,
+    event: NewSessionEvent,
+) -> Result<SessionEvent, DbError> {
     let latest = transaction
         .query_row(
             "SELECT seq FROM event_sequence WHERE aggregate_id = ?1",
@@ -305,7 +373,7 @@ pub fn append_in(
     let sequence = latest
         .checked_add(1)
         .ok_or_else(|| query_error(std::io::Error::other("event sequence exhausted")))?;
-    let id = format!("evt_{}", Uuid::now_v7().simple());
+    let id = event_id.to_owned();
     let data = serde_json::to_string(&event.properties).map_err(query_error)?;
     let stored_type = format!("{}.{}", event.event_type, EVENT_VERSION);
 
