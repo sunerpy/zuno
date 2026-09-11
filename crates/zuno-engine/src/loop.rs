@@ -2232,6 +2232,13 @@ async fn run_turn_in_span(
     let budget = Arc::clone(&context.budget);
     let events = events.with_hooks(Arc::clone(&context.hooks));
     let session = store.persistence.session(&store.scope).await?;
+    if session
+        .directory
+        .as_deref()
+        .is_none_or(|directory| directory.is_empty())
+    {
+        return Err(crate::state::TurnStateError::InvalidData.into());
+    }
     let provider_session_identity =
         ProviderSessionIdentity::parse(session.id.clone()).map_err(ProviderError::fatal)?;
     let provider_request_context = if session.is_root() {

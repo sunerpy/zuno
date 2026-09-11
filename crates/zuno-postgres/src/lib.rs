@@ -114,6 +114,14 @@ impl PostgresBackend {
         PostgresTurnPersistence::new(self.pool.clone(), lease, executor_directory)
     }
 
+    /// State-only access for a remote Worker. No control-plane path is exposed.
+    pub fn worker_state(
+        &self,
+        lease: zuno_application::runtime::ExecutionLease,
+    ) -> PostgresTurnPersistence {
+        PostgresTurnPersistence::for_worker(self.pool.clone(), lease)
+    }
+
     /// Register a logical workspace through an already authorized host action.
     pub async fn register_workspace(
         &self,

@@ -30,7 +30,7 @@ use crate::{database_error, database_time, owner_transaction};
 pub struct PostgresTurnPersistence {
     pool: PgPool,
     lease: ExecutionLease,
-    executor_directory: String,
+    executor_directory: Option<String>,
 }
 
 impl PostgresTurnPersistence {
@@ -50,7 +50,94 @@ impl PostgresTurnPersistence {
         Ok(Self {
             pool,
             lease,
-            executor_directory,
+            executor_directory: Some(executor_directory),
+        })
+    }
+
+    pub(crate) fn for_worker(pool: PgPool, lease: ExecutionLease) -> Self {
+        Self {
+            pool,
+            lease,
+            executor_directory: None,
+        }
+    }
+
+    /// Renewal for an authenticated Worker also checks current organization
+    /// policy in the same transaction as extending the lease.
+    pub async fn renew_authorized(
+        &self,
+        duration: zuno_application::runtime::LeaseDuration,
+    ) -> Result<ExecutionLease, TurnError> {
+        let scope = TurnStateScope {
+            owner: self.lease.owner.clone(),
+            session_id: self.lease.session_id.to_string(),
+        };
+        let (mut tx, _) = self.transaction(&scope).await?;
+        let expires = database_time(&mut tx)
+            .await
+            .map_err(state_error)?
+            .checked_add(i64::from(duration.milliseconds()))
+            .ok_or(TurnStateError::InvalidData)?;
+        let expires_at_ms=query_scalar(
+            "UPDATE zuno_enterprise_preview.runtime_session SET lease_expires=GREATEST(lease_expires,$4)
+             WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3 RETURNING lease_expires",
+        ).bind(scope.owner.tenant_id.as_str()).bind(scope.owner.principal_id.as_str()).bind(&scope.session_id).bind(expires)
+            .fetch_one(&mut *tx).await.map_err(sql_error)?;
+        self.commit_transaction(tx).await?;
+        Ok(ExecutionLease {
+            expires_at_ms,
+            ..self.lease.clone()
+        })
+    }
+
+    pub async fn primary_input(&self) -> Result<zuno_application::runtime::JobInput, TurnError> {
+        let scope = TurnStateScope {
+            owner: self.lease.owner.clone(),
+            session_id: self.lease.session_id.to_string(),
+        };
+        let (mut tx, job) = self.transaction(&scope).await?;
+        let prompt:Value=query_scalar(
+            "SELECT prompt FROM zuno_enterprise_preview.input WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3 AND id=$4",
+        ).bind(scope.owner.tenant_id.as_str()).bind(scope.owner.principal_id.as_str()).bind(&scope.session_id).bind(job.input_id.as_str())
+            .fetch_one(&mut *tx).await.map_err(sql_error)?;
+        if prompt.get("kind").and_then(Value::as_str) != Some("user") {
+            return Err(TurnStateError::InvalidData.into());
+        }
+        let text = prompt
+            .pointer("/prompt/text")
+            .and_then(Value::as_str)
+            .ok_or(TurnStateError::InvalidData)?
+            .to_owned();
+        let agent = prompt
+            .get("agent")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let model = prompt
+            .get("model")
+            .filter(|value| !value.is_null())
+            .map(|model| {
+                Ok::<_, TurnStateError>(zuno_application::runtime::JobInputModel {
+                    provider_id: model
+                        .get("providerID")
+                        .or_else(|| model.get("providerId"))
+                        .and_then(Value::as_str)
+                        .ok_or(TurnStateError::InvalidData)?
+                        .to_owned(),
+                    model_id: model
+                        .get("modelID")
+                        .or_else(|| model.get("modelId"))
+                        .and_then(Value::as_str)
+                        .ok_or(TurnStateError::InvalidData)?
+                        .to_owned(),
+                })
+            })
+            .transpose()?;
+        self.commit_transaction(tx).await?;
+        Ok(zuno_application::runtime::JobInput {
+            id: job.input_id,
+            text,
+            agent,
+            model,
         })
     }
 

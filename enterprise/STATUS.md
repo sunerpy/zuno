@@ -7,7 +7,7 @@ Baseline: `v0.10.29`, `d1212860dba6a6b420ce81d444ace58feaf0adb5`.
 | P0 | Complete | PR #176 merged into preview; native CI run 34553054820 succeeded |
 | P1 | In progress | Principal propagation implemented; ownership migration validated; local bounded driver and scoped session application validated; local runtime Job/lease port validated; Memory persistence/authority ports validated; backend assembly remains |
 | P2 | In progress | PostgreSQL sessions/runtime Jobs, OAuth2/Entra verification and organization/approval storage validated; Memory, login and execution integration remain |
-| P3 | In progress | Shared kernel and PostgreSQL checkpoint handoff validated; authenticated transport, independent Worker processes, Docker gateway and root-task takeover remain |
+| P3 | In progress | Shared kernel, PostgreSQL checkpoint handoff and authenticated HTTPS state transport validated; independent Worker processes, Docker gateway and full launch assembly remain |
 | P4 | Pending | Durable child/Workflow/Council waits, merges and cancellation |
 | P5 | Pending | Web, SDK, remote ACP, common projections |
 | P6 | Pending | Fault injection, native artifacts, preview publication |
@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p3-postgres-turn`.
+- Current phase branch: `codex/enterprise-p3-worker-transport`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -139,3 +139,13 @@ verification is pending the next preview CI run. No release is enabled.
 - Fault injection verifies expiration during state writes, checkpoint/slot rollback and current membership revocation. Formats 1–3 upgrade without rebuilding; a captured format-3 authorization fixture preserves policy, membership, audit, budget and lease data across failed/successful migration.
 - Validation: the PostgreSQL 18 TLS/kernel/fault suite passed; database/engine regression 850 passed, CLI rendering/recovery checks 12 passed, and documentation/release contracts 99 passed. Workspace check, Clippy, formatting and diff checks passed. Completed assistant content is immutable in both providers.
 - This is database/kernel evidence in one test process. HTTP state transport, independent Workers, configuration/environment resolution, remote steering/attachments/compaction writes and durable distributed waits remain unfinished. No enterprise endpoint or release is enabled.
+
+## Authenticated Worker transport
+
+- PostgreSQL kernel PR #189 merged at `97fd2af22c48375be39412b635de2c42e9868ad0`; CI 34605507014 passed, including all CI-process platforms, Linux/Windows gates and PostgreSQL on both Linux architectures.
+- `zuno-worker` implements HTTPS-only claim, renewal and remote turn persistence without a PostgreSQL dependency. Service tokens may rotate through a bounded private-file source; POST retries and redirects are disabled.
+- `WorkerAuthority` rejects delegated users and unlisted service identities/apps. Short-lived HMAC grants bind workload, application and the complete execution lease; retained-key rotation is explicit. Database authorization and lease checks remain authoritative.
+- The internal router supplies real claim/renew/state handlers. Protocol version/size/record validation is separate from the future public activity protocol. Remote session coordinates do not expose the control-plane directory.
+- The isolated script passes real HTTPS/PostgreSQL kernel continuation through two lease identities, certificate/user/redirect refusal, no POST retry and stale-lease rejection. This is one-process network evidence, not independent Worker or Docker execution.
+- Validation: 424 engine/identity/Worker tests, 154 Server tests and 99 documentation/release contracts passed. Workspace check, Clippy, formatting and diff checks passed. The normal `zuno-worker` dependency graph contains neither `zuno-postgres` nor `zuno-server`.
+- Independent Worker startup, model/configuration/environment assembly, Docker operations, distributed waits, public HTTP/ACP/Web integration and enterprise release acceptance remain incomplete. Publication stays disabled.

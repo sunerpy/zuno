@@ -49,7 +49,7 @@ impl TurnPersistence for SqliteTurnPersistence<'_> {
             Ok(TurnSession {
                 id: session.id,
                 parent_id: session.parent_id,
-                directory: session.directory,
+                directory: Some(session.directory),
             })
         })
     }

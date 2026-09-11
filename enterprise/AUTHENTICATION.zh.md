@@ -125,3 +125,29 @@ audience／issuer／应用错误、身份类型混用、过期、跨 issuer 主�
 身份服务的 HTTP client 通过 `zuno-network` 创建，遵守控制面进程的代理策略及 `NO_PROXY`；适配器继续强制 HTTPS、禁止重定向并限制请求。
 
 组织策略和持久审批存储已独立实现，见[授权指南](AUTHORIZATION.zh.md)；BFF／Driver 集成仍待完成。
+
+## Worker 服务身份与 Job 凭证
+
+内部状态路由要求有效工作负载 access token，并显式白名单限定租户、主体和调用应用。
+委派用户 token 不能转为 Worker 身份。底层仍使用通用 OAuth2／Entra verifier，
+不把 token 内容直接当作组织策略。
+
+领取任务返回短期 HMAC 凭证，绑定服务主体／应用、Job、会话、Worker 实例、attempt、
+epoch 和检查点版本；有效期不超过租约或服务 token。轮换只接受明确保留的旧 key。
+Debug 输出隐藏凭证；命令容器和公共 Web DTO 不得接收它。
+
+`WorkerStateService` 已提供真实的 `/internal/worker/v1/claim`、`/renew` 和 `/state`
+处理器。状态请求和续租同时要求服务 token 与 `x-zuno-job-grant`，PostgreSQL 仍检查
+当前成员、策略和执行权。签名有效不代表过期或已被替代的租约重新生效。
+
+`zuno-worker` 提供仅 HTTPS 的客户端和可由工作负载身份 sidecar 轮换的私有 token 文件
+读取器。客户端禁止重定向，限制请求／响应大小，并关闭 POST 自动重试。写入或领取确认丢失
+时要求核查权威状态，不静默重放；并发续租的旧响应不能覆盖客户端已知的更新期限。
+
+内部协议独立版本化，并使用类型化命令。会话坐标不返回控制面的工作目录，Worker 显式绑定
+自己的执行目录；服务端 remote view 未绑定执行目录时不能直接运行内核。协议包含私有续接
+数据，不属于公共活动展示 API。
+
+独立验证脚本使用临时 CA 和真实 HTTPS，覆盖服务／用户身份分离、证书与重定向拒绝、
+POST 不重放、续租及两次租约之间的真实内核接续。它仍在一个测试进程内运行；独立 Worker
+进程、Docker 网关及企业启动／Profile 装配仍有单独验收。BFF 登录与真实身份提供商验证也尚未完成。

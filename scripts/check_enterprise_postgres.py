@@ -117,6 +117,10 @@ def main():
                 ["cargo", "test", "-p", "zuno-postgres", "--lib", "--", "--include-ignored"],
                 cwd=repository, env=environment, check=True,
             )
+            subprocess.run(
+                ["cargo", "test", "-p", "zuno-server", "--test", "enterprise_state", "--", "--include-ignored"],
+                cwd=repository, env=environment, check=True,
+            )
         except subprocess.CalledProcessError as error:
             setup.flush()
             if not error.cmd or error.cmd[0] != "cargo":

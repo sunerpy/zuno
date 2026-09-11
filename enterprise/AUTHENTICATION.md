@@ -161,3 +161,40 @@ See [中文](AUTHENTICATION.zh.md) and [status](STATUS.md).
 Identity HTTP clients use `zuno-network` and honor the control-plane process proxy policy, including `NO_PROXY`. HTTPS, redirect refusal and request limits remain enforced by the identity adapter.
 
 Organization policy and durable approval storage are implemented separately; see [authorization](AUTHORIZATION.md). BFF/driver integration remains pending.
+
+## Worker service and Job grants
+
+The internal state router requires a verified workload access token and an explicit
+allowlist of tenant, principal and calling application. A delegated user token
+cannot become a Worker identity. The underlying verifier remains the generic
+OAuth2/Entra adapter; token contents are not accepted as an organization policy.
+
+Claiming returns a short-lived HMAC grant bound to that workload/application,
+Job, session, Worker incarnation, attempt, epoch and checkpoint version. Its
+deadline cannot exceed the lease or workload token. Key rotation accepts only
+explicitly retained keys. Grants are redacted in Debug output; command containers
+and public Web DTOs must never receive them.
+
+`WorkerStateService` exposes the real `/internal/worker/v1/claim`, `/renew` and
+`/state` handlers. Every state/renew call requires both the workload token and
+`x-zuno-job-grant`. PostgreSQL still checks current membership, policy and execution
+authority. A valid signature cannot revive an expired or superseded lease.
+
+`zuno-worker` provides an HTTPS-only client and a private token-file source that
+can be rotated by a workload-identity sidecar. It refuses redirects, bounds
+request/response sizes and disables automatic POST retries. Ambiguous writes and
+claim acknowledgements require authoritative reconciliation; they are not silently
+replayed. Renewed credentials cannot replace a newer local deadline with an older
+concurrent response.
+
+The internal protocol has its own version and typed commands. Session coordinates
+exclude the control plane's directory; the Worker explicitly binds its execution
+directory. The data owner's remote view cannot run the kernel without that binding.
+The protocol includes private replay material and is not the public activity API.
+
+The isolated verification script now tests real HTTPS against a temporary CA,
+workload/user separation, certificate refusal, redirect refusal, no POST replay,
+renewal and actual kernel continuation through two lease identities. It still runs
+within one test process; independent Worker processes, the Docker gateway and
+enterprise launch/profile assembly remain separate acceptance gates. BFF login and
+live identity-provider validation are also still pending.

@@ -19,6 +19,7 @@ mod auth;
 mod browser_auth;
 mod directory;
 mod discovery;
+pub mod enterprise_state;
 mod event;
 mod events;
 mod request_broker;
