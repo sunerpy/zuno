@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p2-browser-login`.
+- Current phase branch: `codex/enterprise-p0-stable31-sync`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -192,3 +192,9 @@ verification is pending the next preview CI run. No release is enabled.
 - Validation passed: 215 identity/HTTP tests; isolated PostgreSQL and two HTTPS contracts; 100 documentation/release tests; 11 preview publisher tests; workspace check, Clippy, formatting and diff checks. Remote CI for this phase remains pending.
 - Documentation impact: both browser guides, identity/PostgreSQL/wait guides, preview navigation and both workspace inventories are updated. Preview docs remain tag artifacts; the stable site is not published by this branch.
 - Complete enterprise launch, current resource authorization integration, distributed tool execution, Memory backend, Workflow/Council and Web remain outstanding. No enterprise CLI entry point or release is enabled.
+
+## Stable 0.10.31 synchronization
+
+- Main `5619205d60aef572e484646dd9ab0563e1ef8066` adds only the 0.10.31 release-version update to the previously imported source. The merge keeps all preview crates and authentication changes; every first-party package advances together and third-party lock entries remain unchanged.
+- `preview.json` records that exact source baseline, with publication disabled. The next eligible first preview becomes `0.10.32-preview.1`, subject to later synchronization and runtime acceptance.
+- Workspace check, Clippy, 100 documentation/release tests and preview channel validation passed. This synchronization is prepared separately from browser PR #196, which remains in CI.
