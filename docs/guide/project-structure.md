@@ -69,7 +69,7 @@ Every crate opts into the workspace lint policy. First-party code forbids
 | `zuno-provider-bedrock` | Amazon Bedrock Responses and Converse transports |
 | `zuno-provider-compatible` | Configurable OpenAI-compatible endpoints |
 | `zuno-auth` | API-key and OAuth credential storage and refresh |
-| `zuno-identity` | Enterprise API identities: OAuth2 JWT/introspection, OIDC key discovery, and Entra claim policy |
+| `zuno-identity` | Enterprise identities: OAuth2 JWT/introspection, OIDC code/PKCE login, encrypted browser state ports, and Entra claim policy |
 | `zuno-aws-auth` | AWS credential-chain resolution and SigV4 signing |
 | `zuno-network` | Shared outbound HTTP clients, proxy routing, and transport policy |
 | `zuno-mcp` | MCP stdio and remote clients, including tools, resources, and prompts |

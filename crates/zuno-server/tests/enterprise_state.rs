@@ -46,6 +46,9 @@ use zuno_tool::{AllowAll, Tool, ToolContext, ToolOutput};
 use zuno_types::identity::*;
 use zuno_worker::{AccessTokenSource, WorkerClient};
 
+#[path = "enterprise_state/browser.rs"]
+mod browser;
+
 #[derive(Deserialize)]
 struct Fixture {
     admin_url: String,
@@ -186,6 +189,15 @@ impl zuno_engine::r#loop::ToolDispatcher for DeferredDispatcher {
 }
 
 async fn tls_server(router: Router, fixture: &Fixture) -> (url::Url, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    tls_server_at(router, fixture, listener).await
+}
+
+async fn tls_server_at(
+    router: Router,
+    fixture: &Fixture,
+    listener: tokio::net::TcpListener,
+) -> (url::Url, tokio::task::JoinHandle<()>) {
     let root = fixture.root_certificate.parent().unwrap();
     let certs = CertificateDer::pem_file_iter(root.join("server.crt"))
         .unwrap()
@@ -201,7 +213,6 @@ async fn tls_server(router: Router, fixture: &Fixture) -> (url::Url, tokio::task
     .with_single_cert(certs, key)
     .unwrap();
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let handle = tokio::spawn(async move {
         loop {

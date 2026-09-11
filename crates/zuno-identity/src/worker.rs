@@ -295,9 +295,11 @@ mod tests {
     fn identity(kind: VerifiedIdentityKind, client: &str) -> VerifiedIdentity {
         let subject = subject(client);
         VerifiedIdentity::from_verified(
+            "https://worker.example.test".to_owned(),
             subject.tenant_id,
             subject.principal_id,
             subject.client_id,
+            client.to_owned(),
             kind,
             10,
         )

@@ -58,3 +58,5 @@ Organization policy and durable approval contracts: [English](AUTHORIZATION.md),
 Rootless environments and operation recovery: [English](ENVIRONMENTS.md), [中文](ENVIRONMENTS.zh.md).
 
 Durable invocation waiting and consumption: [English](WAITING.md), [中文](WAITING.zh.md).
+
+Browser login and BFF session contracts: [English](BROWSER.md), [中文](BROWSER.zh.md).

@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p0-main-sync`.
+- Current phase branch: `codex/enterprise-p2-browser-login`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -181,3 +181,14 @@ verification is pending the next preview CI run. No release is enabled.
 - The preview remains disabled. With this incorporated stable baseline, the first version request will use 0.10.31-preview.1, subject to later main synchronization and runnable acceptance.
 
 - Synchronization PR #195 first CI (34643334370) passed Linux, PostgreSQL and Docker gates but exposed a Windows clipboard fixture timing race. A 300ms caller-start delay reproduces its 250ms harness watchdog failure. The fixture now synchronizes caller startup, waits for the intended hostile branch, and releases its fake blocked threads afterward; 51 focused tests pass. Production clipboard deadlines are unchanged. Repaired native CI is pending.
+
+## Browser login implementation
+
+- Main synchronization PR #195 merged at `410faf43f089228a03ea50138d79cb2ac06c594e`; repaired CI `34646255325` passed all gates. The merge retains main ancestry.
+- The generic OIDC BFF now composes code/PKCE, nonce/ID-token validation, the existing API verifier, encrypted one-time transactions and opaque browser sessions. Exact issuer-native OAuth client binding remains distinct from the namespaced application identity used by organization policy.
+- PostgreSQL format 7 adds tenant-bound browser state and audit. The isolated PostgreSQL 18 suite passed capacity, competing consumption, wrong binding/tenant, expiry, user separation, logout/audit rollback and captured format-6 migration rollback/preservation.
+- Real HTTPS code exchange and two independent BFF instances passed with a signed generic OIDC issuer fixture. The browser does not receive OAuth tokens, and token POSTs do not redirect or replay. This is fixture/network evidence, not a live Entra tenant or rendered Web application.
+- Focused failing tests exposed cross-client acceptance, comparison of raw versus namespaced client IDs, and an unbound callback overwriting the active login cookie. All three have passing regressions; red/green evidence is retained in the task's ignored validation directory.
+- Validation passed: 215 identity/HTTP tests; isolated PostgreSQL and two HTTPS contracts; 100 documentation/release tests; 11 preview publisher tests; workspace check, Clippy, formatting and diff checks. Remote CI for this phase remains pending.
+- Documentation impact: both browser guides, identity/PostgreSQL/wait guides, preview navigation and both workspace inventories are updated. Preview docs remain tag artifacts; the stable site is not published by this branch.
+- Complete enterprise launch, current resource authorization integration, distributed tool execution, Memory backend, Workflow/Council and Web remain outstanding. No enterprise CLI entry point or release is enabled.

@@ -12,6 +12,7 @@ pub(crate) const MAX_ACCESS_TOKEN_BYTES: usize = 32 * 1024;
 pub(crate) enum JwtHeaderType {
     ProviderJwt,
     Rfc9068,
+    OidcIdToken,
 }
 
 /// Cryptographic JWT access-token validation independent of identity mapping.
@@ -57,6 +58,7 @@ impl JwtValidator {
             JwtHeaderType::Rfc9068 => {
                 matches!(header.typ.as_deref(), Some("at+jwt" | "application/at+jwt"))
             }
+            JwtHeaderType::OidcIdToken => matches!(header.typ.as_deref(), None | Some("JWT")),
         };
         if header.alg != Algorithm::RS256
             || !valid_type
