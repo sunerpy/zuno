@@ -8090,6 +8090,7 @@ name = "zuno-postgres"
 version = "0.10.29"
 dependencies = [
  "async-trait",
+ "futures",
  "serde",
  "serde_json",
  "sqlx-core",
@@ -8098,8 +8099,13 @@ dependencies = [
  "tokio",
  "uuid",
  "zuno-application",
+ "zuno-db",
+ "zuno-engine",
+ "zuno-error",
+ "zuno-llm",
  "zuno-orchestration",
  "zuno-permission",
+ "zuno-tool",
  "zuno-types",
 ]
 

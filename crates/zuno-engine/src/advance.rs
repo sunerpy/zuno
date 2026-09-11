@@ -25,6 +25,7 @@ use crate::prompt::PromptTraceSet;
 
 const EVENT_TYPE: &str = "runtime.driver.advance";
 const SCHEMA_VERSION: u32 = 2;
+pub const DRIVER_CHECKPOINT_VERSION: u32 = SCHEMA_VERSION;
 const MAX_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
 
 /// A durable reference, not a caller-supplied replacement checkpoint body.
@@ -65,6 +66,10 @@ pub struct AdvanceRequest {
 }
 
 impl AdvanceRequest {
+    pub fn configuration_digest(&self) -> &str {
+        &self.configuration_digest
+    }
+
     pub fn new(
         run: RunTurnRequest,
         configuration_digest: String,
@@ -259,7 +264,7 @@ fn decode(event: &SessionEvent) -> Result<AdvanceRecord, AdvanceError> {
     Ok(record)
 }
 
-fn encode(record: AdvanceRecord) -> Result<NewSessionEvent, AdvanceError> {
+fn encode(record: &AdvanceRecord) -> Result<NewSessionEvent, AdvanceError> {
     let encoded = serde_json::to_vec(&record)
         .map_err(|error| AdvanceError::InvalidCheckpoint(error.to_string()))?;
     if encoded.len() > MAX_CHECKPOINT_BYTES {
@@ -279,29 +284,57 @@ fn encode(record: AdvanceRecord) -> Result<NewSessionEvent, AdvanceError> {
 
 /// Compare and admit before any provider/tool effect. A lost in-flight marker is
 /// never silently replaced by another executor.
-pub(crate) fn begin(
-    connection: &mut Connection,
+/// The storage provider makes this decision while holding its session write lock.
+pub enum PreparedBegin {
+    Admit(Box<PreparedAdmission>),
+    AlreadyCommitted(AdvanceOutcome),
+}
+
+pub struct PreparedAdmission {
+    session_id: String,
+    checkpoint: Option<LoopCheckpoint>,
+    record: AdvanceRecord,
+}
+
+impl PreparedAdmission {
+    pub fn event(&self) -> Result<NewSessionEvent, AdvanceError> {
+        encode(&self.record)
+    }
+
+    pub fn committed(self, event: &SessionEvent) -> Result<AdvanceAdmission, AdvanceError> {
+        let record = decode(event)?;
+        if event.session_id != self.session_id
+            || event.event_type != EVENT_TYPE
+            || event.id.is_empty()
+            || record.turn_id != self.record.turn_id
+            || record.owner != self.record.owner
+            || record.request_digest != self.record.request_digest
+            || record.previous != self.record.previous
+            || !matches!(record.state, AdvanceState::Started)
+        {
+            return Err(AdvanceError::Conflict);
+        }
+        Ok(AdvanceAdmission {
+            checkpoint: self.checkpoint,
+            event_id: event.id.clone(),
+            owner: record.owner,
+            request_digest: record.request_digest,
+            previous: record.previous,
+        })
+    }
+}
+
+pub fn prepare_begin(
     request: &AdvanceRequest,
     owner: PrincipalKey,
-) -> Result<BeginAdvance, AdvanceError> {
+    latest: Option<SessionEvent>,
+    unfinished: bool,
+    uncertain: bool,
+) -> Result<PreparedBegin, AdvanceError> {
+    if unfinished || uncertain {
+        return Err(AdvanceError::NeedsInspection);
+    }
     let request_digest = digest(request);
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(zuno_db::open::map_error)?;
-    session::get_owned(&transaction, &request.run.session_id, &owner)?;
-    if !zuno_db::message::MessageStore::new(&transaction)
-        .unfinished_tool_parts_for_session(&request.run.session_id)?
-        .is_empty()
-    {
-        return Err(AdvanceError::NeedsInspection);
-    }
-    if !zuno_db::message::MessageStore::new(&transaction)
-        .pending_uncertain_tool_calls(&request.run.session_id, i64::MIN)?
-        .is_empty()
-    {
-        return Err(AdvanceError::NeedsInspection);
-    }
-    let latest = latest_of_type_in(&transaction, &request.run.session_id, EVENT_TYPE)?;
     let checkpoint = match (latest, &request.checkpoint) {
         (None, None) => None,
         (Some(event), previous) => {
@@ -315,12 +348,14 @@ pub(crate) fn begin(
             {
                 match &record.state {
                     AdvanceState::Checkpointed { .. } => {
-                        return Ok(BeginAdvance::AlreadyCommitted(AdvanceOutcome::Progressed {
-                            checkpoint: checkpoint_ref(&event, &record.turn_id),
-                        }));
+                        return Ok(PreparedBegin::AlreadyCommitted(
+                            AdvanceOutcome::Progressed {
+                                checkpoint: checkpoint_ref(&event, &record.turn_id),
+                            },
+                        ));
                     }
                     AdvanceState::Completed { outcome } => {
-                        return Ok(BeginAdvance::AlreadyCommitted(outcome.clone().into()));
+                        return Ok(PreparedBegin::AlreadyCommitted(outcome.clone().into()));
                     }
                     AdvanceState::Started | AdvanceState::Failed { .. } => {}
                 }
@@ -357,26 +392,46 @@ pub(crate) fn begin(
         }
         (None, Some(_)) => return Err(AdvanceError::Conflict),
     };
-    let event = append_in(
-        &transaction,
-        &request.run.session_id,
-        encode(AdvanceRecord {
+    Ok(PreparedBegin::Admit(Box::new(PreparedAdmission {
+        session_id: request.run.session_id.clone(),
+        checkpoint,
+        record: AdvanceRecord {
             schema_version: SCHEMA_VERSION,
             turn_id: request.run.turn_id.clone(),
-            owner: owner.clone(),
-            request_digest: request_digest.clone(),
+            owner,
+            request_digest,
             previous: request.checkpoint.clone(),
             state: AdvanceState::Started,
-        })?,
-    )?;
-    transaction.commit().map_err(zuno_db::open::map_error)?;
-    Ok(BeginAdvance::Admitted(Box::new(AdvanceAdmission {
-        checkpoint,
-        event_id: event.id,
-        owner,
-        request_digest,
-        previous: request.checkpoint.clone(),
+        },
     })))
+}
+
+pub(crate) fn begin(
+    connection: &mut Connection,
+    request: &AdvanceRequest,
+    owner: PrincipalKey,
+) -> Result<BeginAdvance, AdvanceError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(zuno_db::open::map_error)?;
+    session::get_owned(&transaction, &request.run.session_id, &owner)?;
+    let messages = zuno_db::message::MessageStore::new(&transaction);
+    let unfinished = !messages
+        .unfinished_tool_parts_for_session(&request.run.session_id)?
+        .is_empty();
+    let uncertain = !messages
+        .pending_uncertain_tool_calls(&request.run.session_id, i64::MIN)?
+        .is_empty();
+    let latest = latest_of_type_in(&transaction, &request.run.session_id, EVENT_TYPE)?;
+    match prepare_begin(request, owner, latest, unfinished, uncertain)? {
+        PreparedBegin::AlreadyCommitted(outcome) => Ok(BeginAdvance::AlreadyCommitted(outcome)),
+        PreparedBegin::Admit(prepared) => {
+            let event = append_in(&transaction, &request.run.session_id, prepared.event()?)?;
+            let admission = prepared.committed(&event)?;
+            transaction.commit().map_err(zuno_db::open::map_error)?;
+            Ok(BeginAdvance::Admitted(Box::new(admission)))
+        }
+    }
 }
 
 pub(crate) fn completion_state(outcome: &Result<LoopOutcome, TurnError>) -> AdvanceState {
@@ -401,35 +456,66 @@ pub(crate) fn completion_state(outcome: &Result<LoopOutcome, TurnError>) -> Adva
     }
 }
 
+pub fn prepare_commit(
+    request: &AdvanceRequest,
+    admission: &AdvanceAdmission,
+    latest: &SessionEvent,
+    state: AdvanceState,
+) -> Result<NewSessionEvent, AdvanceError> {
+    let record = decode(latest)?;
+    if latest.id != admission.event_id
+        || latest.session_id != request.run.session_id
+        || latest.event_type != EVENT_TYPE
+        || record.turn_id != request.run.turn_id
+        || record.owner != admission.owner
+        || record.request_digest != admission.request_digest
+        || record.request_digest != digest(request)
+        || record.previous != admission.previous
+        || !matches!(record.state, AdvanceState::Started)
+        || matches!(state, AdvanceState::Started)
+    {
+        return Err(AdvanceError::Conflict);
+    }
+    encode(&AdvanceRecord {
+        schema_version: SCHEMA_VERSION,
+        turn_id: request.run.turn_id.clone(),
+        owner: admission.owner.clone(),
+        request_digest: admission.request_digest.clone(),
+        previous: admission.previous.clone(),
+        state,
+    })
+}
+
 pub(crate) fn commit(
     connection: &mut Connection,
-    request: &RunTurnRequest,
+    request: &AdvanceRequest,
     admission: &AdvanceAdmission,
     state: AdvanceState,
 ) -> Result<CheckpointRef, AdvanceError> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(zuno_db::open::map_error)?;
-    session::get_owned(&transaction, &request.session_id, &admission.owner)?;
-    let latest = latest_of_type_in(&transaction, &request.session_id, EVENT_TYPE)?
+    session::get_owned(&transaction, &request.run.session_id, &admission.owner)?;
+    let latest = latest_of_type_in(&transaction, &request.run.session_id, EVENT_TYPE)?
         .ok_or(AdvanceError::Conflict)?;
-    if latest.id != admission.event_id {
-        return Err(AdvanceError::Conflict);
-    }
     let event = append_in(
         &transaction,
-        &request.session_id,
-        encode(AdvanceRecord {
-            schema_version: SCHEMA_VERSION,
-            turn_id: request.turn_id.clone(),
-            owner: admission.owner.clone(),
-            request_digest: admission.request_digest.clone(),
-            previous: admission.previous.clone(),
-            state,
-        })?,
+        &request.run.session_id,
+        prepare_commit(request, admission, &latest, state)?,
     )?;
     transaction.commit().map_err(zuno_db::open::map_error)?;
-    Ok(checkpoint_ref(&event, &request.turn_id))
+    Ok(checkpoint_ref(&event, &request.run.turn_id))
+}
+
+pub fn checkpoint_reference(
+    event: &SessionEvent,
+    turn_id: &str,
+) -> Result<CheckpointRef, AdvanceError> {
+    let record = decode(event)?;
+    if record.turn_id != turn_id || event.event_type != EVENT_TYPE || event.id.is_empty() {
+        return Err(AdvanceError::Conflict);
+    }
+    Ok(checkpoint_ref(event, turn_id))
 }
 
 fn checkpoint_ref(event: &SessionEvent, turn_id: &str) -> CheckpointRef {

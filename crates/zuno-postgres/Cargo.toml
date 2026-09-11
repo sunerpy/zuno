@@ -20,10 +20,16 @@ uuid = { workspace = true }
 zuno-application = { workspace = true }
 zuno-orchestration = { workspace = true }
 zuno-types = { workspace = true }
+zuno-db = { workspace = true }
+zuno-engine = { workspace = true }
+zuno-error = { workspace = true }
 zuno-permission = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+zuno-llm = { workspace = true }
+zuno-tool = { workspace = true }
+futures = { workspace = true }
 
 [lints]
 workspace = true

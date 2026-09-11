@@ -113,10 +113,13 @@ assigns the input's durable order and consumes the inbox with its message and pa
 Dynamic-context refresh is an asynchronous host service, awaited after a committed
 tool result, with its own scoped storage access.
 
-The SQLite provider is implemented and consumed by the ordinary driver. Its
-in-process record types are not a public Web or Worker wire protocol. PostgreSQL
-turn-state encoding, authenticated state transport, lease fencing and the coherent
-enterprise backend bundle must be connected before a remote Worker is available.
+The ordinary driver consumes SQLite and fenced PostgreSQL providers. The latter
+rechecks current organization authorization and execution ownership, and commits
+driver checkpoints with native Job handoff/settlement in one transaction.
+In-process records are not a public Web or Worker wire protocol. Authenticated
+state transport, environment receipts and the coherent enterprise backend bundle
+must be connected before a remote Worker is available. A lost state-service
+acknowledgement pauses recovery; it never authorizes mechanical effect replay.
 
 ### Bounded driver checkpoints
 
@@ -144,9 +147,10 @@ Wrong owners, changed configuration, stale references, unsupported schemas and
 in-flight advances without a completed checkpoint fail closed. Checkpoint bodies
 are internal state, limited to 8 MiB; clients carry stable references.
 
-This is a local driver boundary. PostgreSQL leases, remote state APIs, environment
-receipts and suspended distributed child calls are subsequent enterprise stages.
-It does not move a running process or prove that an external side effect stopped.
+The checkpoint contract now has SQLite and PostgreSQL providers, sharing admission
+and immutable request validation. Remote state APIs, environment receipts and
+suspended distributed child calls remain subsequent enterprise stages. A checkpoint
+does not move a running process or prove that an external side effect stopped.
 The host must resolve the recorded configuration and recheck current authorization
 before entering each advance.
 

@@ -1,6 +1,8 @@
 //! Tenant-bound scheduling in the data owner, never in an Agent Worker.
 
 mod store;
+mod transactions;
+pub(crate) use transactions::{checkpoint_in, finish_in};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};

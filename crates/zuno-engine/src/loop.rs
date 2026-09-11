@@ -731,6 +731,8 @@ pub enum TurnError {
     Hook(String),
     #[error(transparent)]
     Database(#[from] DbError),
+    #[error(transparent)]
+    State(#[from] crate::state::TurnStateError),
     #[error("durable image attachment state is invalid")]
     Attachment(#[source] zuno_attachment::AttachmentError),
     #[error(transparent)]
@@ -815,6 +817,7 @@ impl TurnError {
             Self::EventConsumerClosed => "event_consumer_closed",
             Self::Hook(_) => "hook",
             Self::Database(_) => "database",
+            Self::State(_) => "state",
             Self::Attachment(_) => "attachment",
             Self::Provider(_) => "provider",
             Self::PromptAssembly(_) => "prompt_assembly",
@@ -860,6 +863,16 @@ impl TurnError {
     #[must_use]
     pub fn recovery(&self) -> TurnRecovery {
         match self {
+            Self::State(
+                crate::state::TurnStateError::Unavailable
+                | crate::state::TurnStateError::LeaseLost
+                | crate::state::TurnStateError::Forbidden,
+            ) => TurnRecovery::Pause,
+            Self::State(
+                crate::state::TurnStateError::NotFound
+                | crate::state::TurnStateError::Conflict
+                | crate::state::TurnStateError::InvalidData,
+            ) => TurnRecovery::Fail,
             Self::StepLimit { .. } => TurnRecovery::Retry {
                 reason: TurnRetryReason::StepLimit,
                 after: None,
@@ -2181,7 +2194,7 @@ pub async fn advance_turn(
         .persistence
         .commit_advance(
             &store.scope,
-            &request.run,
+            &request,
             &admission,
             crate::advance::completion_state(&result),
         )
@@ -4176,101 +4189,104 @@ fn required_string(record: &MessageRecord, field: &'static str) -> Result<String
 /// that is worse than either honest answer — so a row whose own `callID` or `tool` is
 /// unusable still carries its obligation, under [`UNNAMED_TOOL_CALL_IDENTITY`], and is
 /// reported through `tracing::error!` as well.
+pub fn repair_unanswered_tool_part(mut part: PartRecord, observed_at: i64) -> Option<PartRecord> {
+    let part_id = part.id.clone();
+    let call_id = non_empty_field(&part, "callID");
+    let tool = non_empty_field(&part, "tool");
+    let state = part.data.get_mut("state").and_then(Value::as_object_mut)?;
+    // Presence alone, not the stamped instant: the value is evidence for a human
+    // reading the row, and a clock that went backwards must not turn an observed
+    // hand-off into an unobserved one.
+    let stamped = state.contains_key(DISPATCH_STARTED_FIELD);
+    // Only a row this build checkpointed can prove a *negative*. Without the tracking
+    // marker the row was written before hand-off was recorded at all, and the
+    // released build wrote that same shape for calls it went on to dispatch, so the
+    // missing stamp is unknown rather than "never started". Unknown fails closed.
+    // The value, not the key: a writer that spells "I do not track hand-off" as
+    // `dispatchTracked: false` (or `null`) must read as unprovable, never as proof.
+    let hand_off_provable =
+        state.get(DISPATCH_TRACKED_FIELD).and_then(Value::as_bool) == Some(true);
+    let may_have_run = stamped || !hand_off_provable;
+    state.insert("status".to_owned(), Value::String("error".to_owned()));
+    if may_have_run {
+        state.insert(
+            "error".to_owned(),
+            Value::String(UNOBSERVED_TOOL_RESULT.to_owned()),
+        );
+        // `Forced` is the mode a repair can honestly claim: nothing was observed,
+        // and no tool acknowledged anything. `graceMs` is zero because a repair
+        // allowed no settling window at all, which is the fact the dispatcher's
+        // own record of that field reports. The certainty is recorded beside the
+        // mode rather than left to be re-derived from it.
+        let interruption = json!({
+            "mode": ToolInterruption::Forced.as_str(),
+            "forced": ToolInterruption::Forced.is_forced(),
+            "uncertain": true,
+            "graceMs": 0,
+        });
+        let mut metadata = state
+            .get_mut("metadata")
+            .and_then(Value::as_object_mut)
+            .map(std::mem::take)
+            .unwrap_or_default();
+        metadata.insert(
+            crate::dispatch::INTERRUPTION_METADATA_KEY.to_owned(),
+            interruption,
+        );
+        state.insert("metadata".to_owned(), Value::Object(metadata));
+        if tool.is_none() || call_id.is_none() {
+            // The obligation is still recorded below. This says the evidence in it is
+            // degraded, which is a defect in whatever wrote the row — not a reason to
+            // let a possibly-landed side effect go uninspected.
+            tracing::error!(
+                part = %part_id,
+                named_tool = tool.is_some(),
+                named_call = call_id.is_some(),
+                "an unanswered dispatched tool call cannot name itself, so its \
+                 inspection obligation is recorded under a placeholder identity"
+            );
+        }
+        state.insert("outcome".to_owned(), Value::String("uncertain".to_owned()));
+        state.insert(
+            "uncertain".to_owned(),
+            json!({
+                "tool": tool.unwrap_or_else(|| UNNAMED_TOOL_CALL_IDENTITY.to_owned()),
+                "callID": call_id
+                    .unwrap_or_else(|| UNNAMED_TOOL_CALL_IDENTITY.to_owned()),
+                // Nothing observed which paths moved: the process that could
+                // have said so is gone. An empty list is the real answer.
+                "appliedPaths": [],
+                "cause": UncertainCause::Interrupted.as_str(),
+                "observedAtMs": observed_at,
+            }),
+        );
+    } else {
+        state.insert(
+            "error".to_owned(),
+            Value::String(INTERRUPTED_TOOL_RESULT.to_owned()),
+        );
+        let mut metadata = state
+            .get_mut("metadata")
+            .and_then(Value::as_object_mut)
+            .map(std::mem::take)
+            .unwrap_or_default();
+        metadata.insert("synthetic".to_owned(), Value::Bool(true));
+        state.insert("metadata".to_owned(), Value::Object(metadata));
+    }
+    Some(part)
+}
+
 pub(crate) fn repair_missing_tool_outputs(
     connection: &Connection,
     session_id: &str,
 ) -> Result<usize, TurnError> {
     let store = MessageStore::new(connection);
     let mut repaired = 0;
-    for mut part in store.unfinished_tool_parts_for_session(session_id)? {
-        let part_id = part.id.clone();
-        let call_id = non_empty_field(&part, "callID");
-        let tool = non_empty_field(&part, "tool");
-        let Some(state) = part.data.get_mut("state").and_then(Value::as_object_mut) else {
-            continue;
-        };
-        // Presence alone, not the stamped instant: the value is evidence for a human
-        // reading the row, and a clock that went backwards must not turn an observed
-        // hand-off into an unobserved one.
-        let stamped = state.contains_key(DISPATCH_STARTED_FIELD);
-        // Only a row this build checkpointed can prove a *negative*. Without the tracking
-        // marker the row was written before hand-off was recorded at all, and the
-        // released build wrote that same shape for calls it went on to dispatch, so the
-        // missing stamp is unknown rather than "never started". Unknown fails closed.
-        // The value, not the key: a writer that spells "I do not track hand-off" as
-        // `dispatchTracked: false` (or `null`) must read as unprovable, never as proof.
-        let hand_off_provable =
-            state.get(DISPATCH_TRACKED_FIELD).and_then(Value::as_bool) == Some(true);
-        let may_have_run = stamped || !hand_off_provable;
-        state.insert("status".to_owned(), Value::String("error".to_owned()));
-        let observed_at = now_millis();
-        if may_have_run {
-            state.insert(
-                "error".to_owned(),
-                Value::String(UNOBSERVED_TOOL_RESULT.to_owned()),
-            );
-            // `Forced` is the mode a repair can honestly claim: nothing was observed,
-            // and no tool acknowledged anything. `graceMs` is zero because a repair
-            // allowed no settling window at all, which is the fact the dispatcher's
-            // own record of that field reports. The certainty is recorded beside the
-            // mode rather than left to be re-derived from it.
-            let interruption = json!({
-                "mode": ToolInterruption::Forced.as_str(),
-                "forced": ToolInterruption::Forced.is_forced(),
-                "uncertain": true,
-                "graceMs": 0,
-            });
-            let mut metadata = state
-                .get_mut("metadata")
-                .and_then(Value::as_object_mut)
-                .map(std::mem::take)
-                .unwrap_or_default();
-            metadata.insert(
-                crate::dispatch::INTERRUPTION_METADATA_KEY.to_owned(),
-                interruption,
-            );
-            state.insert("metadata".to_owned(), Value::Object(metadata));
-            if tool.is_none() || call_id.is_none() {
-                // The obligation is still recorded below. This says the evidence in it is
-                // degraded, which is a defect in whatever wrote the row — not a reason to
-                // let a possibly-landed side effect go uninspected.
-                tracing::error!(
-                    part = %part_id,
-                    named_tool = tool.is_some(),
-                    named_call = call_id.is_some(),
-                    "an unanswered dispatched tool call cannot name itself, so its \
-                     inspection obligation is recorded under a placeholder identity"
-                );
-            }
-            state.insert("outcome".to_owned(), Value::String("uncertain".to_owned()));
-            state.insert(
-                "uncertain".to_owned(),
-                json!({
-                    "tool": tool.unwrap_or_else(|| UNNAMED_TOOL_CALL_IDENTITY.to_owned()),
-                    "callID": call_id
-                        .unwrap_or_else(|| UNNAMED_TOOL_CALL_IDENTITY.to_owned()),
-                    // Nothing observed which paths moved: the process that could
-                    // have said so is gone. An empty list is the real answer.
-                    "appliedPaths": [],
-                    "cause": UncertainCause::Interrupted.as_str(),
-                    "observedAtMs": observed_at,
-                }),
-            );
-        } else {
-            state.insert(
-                "error".to_owned(),
-                Value::String(INTERRUPTED_TOOL_RESULT.to_owned()),
-            );
-            let mut metadata = state
-                .get_mut("metadata")
-                .and_then(Value::as_object_mut)
-                .map(std::mem::take)
-                .unwrap_or_default();
-            metadata.insert("synthetic".to_owned(), Value::Bool(true));
-            state.insert("metadata".to_owned(), Value::Object(metadata));
+    for part in store.unfinished_tool_parts_for_session(session_id)? {
+        if let Some(part) = repair_unanswered_tool_part(part, now_millis()) {
+            store.put_part(&part)?;
+            repaired += 1;
         }
-        store.put_part(&part)?;
-        repaired += 1;
     }
     Ok(repaired)
 }
@@ -4396,7 +4412,7 @@ fn prompt_event_data(
         .transpose()
 }
 
-fn historical_developer_context_from_prompt(prompt: &Value) -> Option<Vec<String>> {
+pub fn historical_developer_context_from_prompt(prompt: &Value) -> Option<Vec<String>> {
     let developer = prompt
         .pointer("/actualProviderProjection/developer")
         .or_else(|| prompt.pointer("/providerProjection/developer"))?
@@ -4435,7 +4451,7 @@ fn historical_developer_context_from_prompt(prompt: &Value) -> Option<Vec<String
     (!context.is_empty()).then_some(context)
 }
 
-fn historical_developer_boundary_targets(history: &[MessageWithParts]) -> BTreeSet<String> {
+pub fn historical_developer_boundary_targets(history: &[MessageWithParts]) -> BTreeSet<String> {
     let mut targets = BTreeSet::new();
     let mut ends_in_assistant_output = false;
     for stored in history {

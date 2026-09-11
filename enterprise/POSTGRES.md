@@ -1,10 +1,10 @@
 # PostgreSQL preview persistence
 
-This adapter currently implements `SessionPersistence`: logical workspaces,
-private sessions, cursor paging, idempotent text admission and durable events.
-`AgentApplication` consumes the same port for SQLite and PostgreSQL. PostgreSQL
-Memory state, remote engine access and OAuth2/OIDC HTTP entry points are subsequent
-work; this library alone does not register an enterprise server or worker.
+This adapter implements scoped sessions, runtime Jobs, organization approvals and
+the shared kernel's `TurnPersistence` port. `AgentApplication` and the ordinary
+bounded driver consume the same contracts for SQLite and PostgreSQL. PostgreSQL
+Memory, authenticated Worker transport and OAuth2/OIDC HTTP entry points remain
+subsequent work; this library alone does not register an enterprise server or worker.
 
 ## Database boundary
 
@@ -69,6 +69,44 @@ replace the local SQLite backend. SQLx-specific types remain in the backend,
 outside the application persistence port.
 
 See [the Chinese guide](POSTGRES.zh.md) and [implementation status](STATUS.md).
+
+## Fenced kernel state
+
+`PostgresBackend::turn_state` is a data-owner factory. The host authenticates the
+Worker, selects its exact execution lease, and resolves an executor-visible
+directory before calling it. The directory is not accepted from a public client
+and must not expose a control-plane private path. Workers receive a state API
+client in the distributed deployment; they do not receive this pool.
+
+Every operation checks the owner/session, current lease and current organization
+membership/application policy in the database transaction. Ordinary state
+operations recheck the lease before commit, so a slow write cannot outlive its
+authority. Policy/member read locks serialize mutations with revocation.
+
+Message/part identities, tool parameters and settled receipts are immutable at
+their respective commit boundaries. Assistant usage reuses the local accounting
+normalizer and reconciles by message delta. Parallel tool results commit as one
+batch. Prompt receipts, attempt facts and retry bookkeeping remain durable.
+History selects the committed compaction suffix before decoding discarded tool
+or reasoning payloads; exact developer receipts remain available for replay.
+
+Driver admission and checkpoint validation use the shared journal state machine.
+A checkpoint event, runtime checkpoint/version and Worker-slot release commit
+together. A terminal driver result and native Job settlement also share a
+transaction. A lost response after commit can therefore be reconstructed from
+the next claimant's Job checkpoint, without restarting steps or tool calls.
+Unfinished/in-flight advances retain the conservative inspection boundary.
+
+The current materializer supports the root text inputs accepted by the runtime
+application port. Remote steering, attachments, distributed human/child waits,
+gateway receipts and their consumers are not enabled by this adapter. A local
+human-request result cannot masquerade as a distributed wait checkpoint.
+
+Preview format 4 adds message/part and retry state, parent/context metadata and
+usage projections. Formats 1–3 migrate atomically without rebuilding databases.
+The format-3 fixture retains its captured authorization DDL and original source
+digest; injected migration failure preserves its organization policy, membership,
+audit, Job budget and lease state.
 
 ## Runtime Jobs and checkpoints
 

@@ -205,6 +205,8 @@ impl TurnPersistence for SqliteTurnPersistence<'_> {
                 let previous = store.part(&part.id)?;
                 if previous.session_id != part.session_id
                     || previous.message_id != part.message_id
+                    || previous.kind != part.kind
+                    || previous.time_created != part.time_created
                     || previous.data.get("callID") != part.data.get("callID")
                     || previous.data.get("tool") != part.data.get("tool")
                     || previous
@@ -342,11 +344,11 @@ impl TurnPersistence for SqliteTurnPersistence<'_> {
     async fn commit_advance(
         &self,
         scope: &TurnStateScope,
-        request: &RunTurnRequest,
+        request: &AdvanceRequest,
         admission: &AdvanceAdmission,
         state: AdvanceState,
     ) -> Result<CheckpointRef, AdvanceError> {
-        if scope.session_id != request.session_id || scope.owner != admission.owner {
+        if scope.session_id != request.run.session_id || scope.owner != admission.owner {
             return Err(AdvanceError::Conflict);
         }
         let mut connection = self.connection.lock().map_err(|_| AdvanceError::Conflict)?;

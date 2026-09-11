@@ -1,7 +1,7 @@
 use serde_json::Value;
 use zuno_db::message::{MessageRole, MessageWithParts, PartKind};
 
-pub(crate) struct HistoryCheckpoint<'a> {
+pub struct HistoryCheckpoint<'a> {
     pub tail_index: usize,
     pub summary: &'a MessageWithParts,
 }
@@ -25,13 +25,13 @@ fn completed_summary(message: &MessageWithParts) -> bool {
         })
 }
 
-pub(crate) fn visible_in_history(message: &MessageWithParts, active_summary: Option<&str>) -> bool {
+pub fn visible_in_history(message: &MessageWithParts, active_summary: Option<&str>) -> bool {
     !is_compaction_summary(message)
         || (completed_summary(message) && active_summary.is_none_or(|id| id == message.info.id))
 }
 
 /// A newer failed or partial attempt cannot replace the last accepted checkpoint.
-pub(crate) fn latest_checkpoint(history: &[MessageWithParts]) -> Option<HistoryCheckpoint<'_>> {
+pub fn latest_checkpoint(history: &[MessageWithParts]) -> Option<HistoryCheckpoint<'_>> {
     for (marker_index, marker) in history.iter().enumerate().rev() {
         if marker.info.role != MessageRole::User {
             continue;

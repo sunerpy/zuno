@@ -10,11 +10,15 @@ mod runtime_tests;
 mod session;
 #[cfg(test)]
 mod tests;
+mod turn;
+#[cfg(test)]
+mod turn_tests;
 
 pub use authorization::{PostgresOrganizationStore, bootstrap_organization};
 pub use migration::{PREVIEW_SCHEMA, migrate};
 pub use runtime::PostgresRuntimeStore;
 pub use session::PostgresSessionPersistence;
+pub use turn::PostgresTurnPersistence;
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -97,6 +101,17 @@ impl PostgresBackend {
 
     pub fn organizations(&self, tenant: TenantId) -> PostgresOrganizationStore {
         PostgresOrganizationStore::new(self.pool.clone(), tenant)
+    }
+
+    /// Construct only in the data owner after authenticating the Worker and
+    /// resolving its environment. The directory is executor-visible, not a path
+    /// supplied by a public client or a control-plane private directory.
+    pub fn turn_state(
+        &self,
+        lease: zuno_application::runtime::ExecutionLease,
+        executor_directory: String,
+    ) -> Result<PostgresTurnPersistence, ApplicationError> {
+        PostgresTurnPersistence::new(self.pool.clone(), lease, executor_directory)
     }
 
     /// Register a logical workspace through an already authorized host action.

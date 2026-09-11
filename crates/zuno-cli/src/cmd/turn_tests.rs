@@ -8507,6 +8507,7 @@ fn every_turn_error() -> Vec<TurnError> {
             tool: "goal_request_input".to_owned(),
         },
         TurnError::EventConsumerClosed,
+        TurnError::State(zuno_engine::state::TurnStateError::Unavailable),
         TurnError::Hook(
             "plugin `fixture-plugin` failed hook `chat.params`: fixture failure".to_owned(),
         ),
@@ -8628,6 +8629,7 @@ fn the_variant_table_covers_the_whole_enum() {
             TurnError::EventConsumerClosed => "EventConsumerClosed",
             TurnError::Hook(_) => "Hook",
             TurnError::Database(_) => "Database",
+            TurnError::State(_) => "State",
             TurnError::Provider(_) => "Provider",
             TurnError::PromptAssembly(_) => "PromptAssembly",
             TurnError::ProviderRetryDeadlineExceeded { .. } => "ProviderRetryDeadlineExceeded",
@@ -8639,7 +8641,7 @@ fn the_variant_table_covers_the_whole_enum() {
 
     assert_eq!(
         named.len(),
-        25,
+        26,
         "the table covers only {named:?}; every variant needs a value or the rendering \
          claims above are vacuous for the ones missing"
     );

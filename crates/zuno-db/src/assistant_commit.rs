@@ -16,10 +16,12 @@ pub struct AssistantCommit {
     pub context_limit: Option<i64>,
 }
 
-pub fn commit_assistant(
-    connection: &Connection,
-    owner: &PrincipalKey,
+/// Validate immutable message/invocation identities independently of a database.
+/// The caller reads the previous records under the same lock as its writes.
+pub fn validate_commit(
     commit: &AssistantCommit,
+    previous: Option<&MessageRecord>,
+    existing_parts: &[PartRecord],
 ) -> Result<(), DbError> {
     if commit.message.role != MessageRole::Assistant
         || commit.parts.iter().any(|part| {
@@ -32,11 +34,7 @@ pub fn commit_assistant(
             detail: "assistant commit contains a different message or session".to_owned(),
         });
     }
-    let tx = open::immediate_transaction(connection)?;
-    session::get_owned(&tx, &commit.message.session_id, owner)?;
-    let store = MessageStore::new(&tx);
-    let previous = store.find_message(&commit.message.id)?;
-    if previous.as_ref().is_some_and(|record| {
+    if previous.is_some_and(|record| {
         record.session_id != commit.message.session_id
             || record.role != MessageRole::Assistant
             || (record
@@ -53,7 +51,6 @@ pub fn commit_assistant(
                 .to_owned(),
         });
     }
-    let previous = previous.map(|record| session::MessageUsage::from_data(&record.data));
     let mut ids = std::collections::BTreeSet::new();
     for part in &commit.parts {
         if !ids.insert(&part.id) {
@@ -63,8 +60,31 @@ pub fn commit_assistant(
                 detail: "assistant commit repeats a part identity".to_owned(),
             });
         }
-        match store.part(&part.id) {
-            Ok(previous)
+        if previous.is_some_and(|message| {
+            message
+                .data
+                .get("time")
+                .and_then(|time| time.get("completed"))
+                .is_some_and(|completed| !completed.is_null())
+        }) && !existing_parts.iter().any(|stored| {
+            stored.id == part.id
+                && stored.message_id == part.message_id
+                && stored.session_id == part.session_id
+                && stored.time_created == part.time_created
+                && stored.kind == part.kind
+                && stored.data == part.data
+        }) {
+            return Err(DbError::Conflict {
+                table: "part".to_owned(),
+                id: part.id.clone(),
+                detail: "a completed assistant step cannot acquire different content".to_owned(),
+            });
+        }
+        match existing_parts
+            .iter()
+            .find(|previous| previous.id == part.id)
+        {
+            Some(previous)
                 if previous.session_id != part.session_id
                     || previous.message_id != part.message_id
                     || previous.kind != part.kind
@@ -94,10 +114,31 @@ pub fn commit_assistant(
                     detail: "assistant commit cannot replace another part identity or settled invocation".to_owned(),
                 });
             }
-            Ok(_) | Err(DbError::NotFound { .. }) => {}
+            Some(_) | None => {}
+        }
+    }
+    Ok(())
+}
+
+pub fn commit_assistant(
+    connection: &Connection,
+    owner: &PrincipalKey,
+    commit: &AssistantCommit,
+) -> Result<(), DbError> {
+    let tx = open::immediate_transaction(connection)?;
+    session::get_owned(&tx, &commit.message.session_id, owner)?;
+    let store = MessageStore::new(&tx);
+    let previous = store.find_message(&commit.message.id)?;
+    let mut existing = Vec::with_capacity(commit.parts.len());
+    for part in &commit.parts {
+        match store.part(&part.id) {
+            Ok(part) => existing.push(part),
+            Err(DbError::NotFound { .. }) => {}
             Err(error) => return Err(error),
         }
     }
+    validate_commit(commit, previous.as_ref(), &existing)?;
+    let previous = previous.map(|record| session::MessageUsage::from_data(&record.data));
     store.put_message_at(&commit.message, commit.persisted_at_ms)?;
     for part in &commit.parts {
         store.put_part_at(part, commit.persisted_at_ms)?;

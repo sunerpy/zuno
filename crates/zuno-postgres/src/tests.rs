@@ -2,7 +2,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx_core::query::query;
 use sqlx_core::query_scalar::query_scalar;
 use sqlx_core::raw_sql::raw_sql;
@@ -288,7 +288,9 @@ async fn real_postgres_enforces_scopes_transactions_role_boundaries_and_schema_i
 
     crate::runtime_tests::exercise(&backend, &admin).await;
     crate::authorization_tests::exercise(&backend, &admin, &migrator).await;
+    crate::turn_tests::exercise(&backend, &admin, &migrator).await;
     format_two_upgrade(&fixture, &admin).await;
+    format_three_upgrade(&fixture, &admin).await;
     let expected_count: i64 = query_scalar("SELECT count(*) FROM zuno_enterprise_preview.session")
         .fetch_one(&admin)
         .await
@@ -358,7 +360,7 @@ async fn legacy_snapshot(pool: &sqlx_postgres::PgPool) -> serde_json::Value {
     query(
         "SELECT jsonb_build_object(
           'workspace',(SELECT to_jsonb(w) FROM zuno_enterprise_preview.workspace w WHERE w.id='legacy-workspace'),
-          'session',(SELECT to_jsonb(s) FROM zuno_enterprise_preview.session s WHERE s.id='legacy-session'),
+          'session',(SELECT to_jsonb(s) FROM (SELECT tenant_id,principal_id,id,workspace_id,title,agent,model,event_sequence,time_created,time_updated FROM zuno_enterprise_preview.session WHERE id='legacy-session') s),
           'input',(SELECT to_jsonb(i) FROM zuno_enterprise_preview.input i WHERE i.id='legacy-input'),
           'event',(SELECT to_jsonb(e) FROM zuno_enterprise_preview.event e WHERE e.id='legacy-event'),
           'receipt',(SELECT to_jsonb(r) FROM zuno_enterprise_preview.request_receipt r WHERE r.request_id='legacy-request')
@@ -428,4 +430,78 @@ async fn format_two_upgrade(fixture: &Fixture, admin: &sqlx_postgres::PgPool) {
             .unwrap(),
         migration::FORMAT
     );
+}
+
+async fn format_three_upgrade(fixture: &Fixture, admin: &sqlx_postgres::PgPool) {
+    raw_sql("CREATE DATABASE zuno_format_three_fixture OWNER zuno_preview_migrator")
+        .execute(admin)
+        .await
+        .unwrap();
+    fn database(mut options: PostgresOptions) -> PostgresOptions {
+        let prefix = options
+            .url
+            .strip_suffix("/postgres")
+            .expect("isolated fixture database");
+        options.url = format!("{prefix}/zuno_format_three_fixture");
+        options
+    }
+    let migrator = database(fixture.migration_options())
+        .connect()
+        .await
+        .unwrap();
+    let admin = database(fixture.options(true, 2)).connect().await.unwrap();
+    migration::install_format_three_fixture(&migrator, &fixture.runtime_role)
+        .await
+        .unwrap();
+    async fn snapshot(pool: &PgPool) -> Value {
+        query_scalar(
+            "SELECT jsonb_build_object(
+              'policy',(SELECT to_jsonb(p) FROM zuno_enterprise_preview.organization_policy p WHERE tenant_id='migration-fixture'),
+              'member',(SELECT to_jsonb(m) FROM zuno_enterprise_preview.organization_member m WHERE tenant_id='migration-fixture'),
+              'audit',(SELECT to_jsonb(a) FROM zuno_enterprise_preview.organization_audit a WHERE id='legacy-audit'),
+              'job',(SELECT to_jsonb(j) FROM zuno_enterprise_preview.runtime_job j WHERE job_id='legacy-job'),
+              'attempt',(SELECT to_jsonb(a) FROM zuno_enterprise_preview.runtime_attempt a WHERE id='legacy-attempt')
+            )",
+        ).fetch_one(pool).await.unwrap()
+    }
+    let before = snapshot(&admin).await;
+    let sessions = legacy_snapshot(&admin).await;
+    raw_sql(
+        "CREATE FUNCTION public.zuno_refuse_turn_migration() RETURNS event_trigger LANGUAGE plpgsql AS $$
+         BEGIN IF TG_TAG='CREATE TABLE' AND to_regclass('zuno_enterprise_preview.message') IS NOT NULL
+           THEN RAISE EXCEPTION 'injected turn migration failure'; END IF; END $$;
+         CREATE EVENT TRIGGER zuno_refuse_turn_migration ON ddl_command_start EXECUTE FUNCTION public.zuno_refuse_turn_migration();",
+    ).execute(&admin).await.unwrap();
+    assert!(migrate(&migrator, &fixture.runtime_role).await.is_err());
+    raw_sql("DROP EVENT TRIGGER zuno_refuse_turn_migration; DROP FUNCTION public.zuno_refuse_turn_migration()")
+        .execute(&admin).await.unwrap();
+    assert_eq!(
+        query_scalar::<_, i32>("SELECT version FROM zuno_enterprise_preview.schema_format")
+            .fetch_one(&admin)
+            .await
+            .unwrap(),
+        3
+    );
+    assert!(
+        query_scalar::<_, bool>("SELECT to_regclass('zuno_enterprise_preview.message') IS NULL")
+            .fetch_one(&admin)
+            .await
+            .unwrap()
+    );
+    assert_eq!(snapshot(&admin).await, before);
+    assert_eq!(legacy_snapshot(&admin).await, sessions);
+    migrate(&migrator, &fixture.runtime_role).await.unwrap();
+    assert_eq!(snapshot(&admin).await, before);
+    assert_eq!(legacy_snapshot(&admin).await, sessions);
+    let defaults: Value=query_scalar(
+        "SELECT jsonb_build_object('epoch',context_epoch,'cost',cost,'known',tokens_known,'parent',parent_id)
+         FROM zuno_enterprise_preview.session WHERE id='legacy-session'",
+    ).fetch_one(&admin).await.unwrap();
+    assert_eq!(
+        defaults,
+        json!({"epoch":0,"cost":0,"known":false,"parent":null})
+    );
+    PostgresBackend::connect(database(fixture.options(false, 2)))
+        .await
+        .unwrap();
 }

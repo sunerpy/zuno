@@ -49,6 +49,12 @@ fn repeating_a_step_preserves_parts_and_does_not_charge_usage_twice() {
         "Result"
     );
     let mut replacement = step;
+    replacement.parts[0].data["text"] = json!("changed completed content");
+    assert!(commit_assistant(&connection, &owner, &replacement).is_err());
+    assert_eq!(
+        MessageStore::new(&connection).part("part").unwrap().data["text"],
+        "Result"
+    );
     replacement.message.data["cost"] = json!(99);
     assert!(commit_assistant(&connection, &owner, &replacement).is_err());
     assert_eq!(usage(&connection), first);
