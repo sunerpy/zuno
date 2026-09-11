@@ -12,6 +12,9 @@ The preview starts from Zuno v0.10.29 at
 until their provider, consumer, entry point, and acceptance tests are present.
 See [STATUS.md](STATUS.md) for completed work and remaining gates.
 
+The PostgreSQL persistence adapter and its isolated verification procedure are
+documented in [English](POSTGRES.md) and [中文](POSTGRES.zh.md).
+
 ## Channel contract
 
 - Integration branch: `codex/enterprise-preview`.

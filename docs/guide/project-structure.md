@@ -1,7 +1,7 @@
 # Project structure and execution flow
 
 Use this page to find the crate that owns a behavior before changing it. Zuno is a
-single Rust workspace with 50 crates. `crates/zuno-cli` builds the `zuno` binary;
+single Rust workspace with 51 crates. `crates/zuno-cli` builds the `zuno` binary;
 the other crates keep protocol, runtime, storage, tool, and client concerns out of
 that entry point.
 
@@ -91,6 +91,7 @@ Every crate opts into the workspace lint policy. First-party code forbids
 
 | Crate | Responsibility |
 | --- | --- |
+| `zuno-postgres` | Enterprise preview session persistence, verified TLS, role boundaries and PostgreSQL RLS |
 | `zuno-db` | SQLite schemas, migrations, sessions, events, inboxes, jobs, and durable projections |
 | `zuno-memory` | Capped resident Memory files, candidate validation, reviewed apply, and recovery |
 | `zuno-learning` | Experience extraction and retrieval, pattern mining, feedback, and Skill candidates |

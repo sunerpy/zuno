@@ -3,8 +3,6 @@ name: Enterprise preview CI
 on:
   pull_request:
     branches: [codex/enterprise-preview]
-  push:
-    branches: [codex/enterprise-p0-foundation]
   workflow_dispatch:
 
 permissions:
@@ -32,14 +30,18 @@ jobs:
   shared:
     name: Shared native gates
     uses: ./.github/workflows/ci.yml
+  postgres:
+    name: PostgreSQL contracts
+    uses: ./.github/workflows/enterprise-postgres.yml
   gate:
     name: Enterprise preview gate
     if: always()
-    needs: [channel, shared]
+    needs: [channel, shared, postgres]
     runs-on: ubuntu-24.04
     steps:
       - name: Require all gates
         env:
           CHANNEL: ${{ needs.channel.result }}
           SHARED: ${{ needs.shared.result }}
-        run: test "$CHANNEL" = success && test "$SHARED" = success
+          POSTGRES: ${{ needs.postgres.result }}
+        run: test "$CHANNEL" = success && test "$SHARED" = success && test "$POSTGRES" = success

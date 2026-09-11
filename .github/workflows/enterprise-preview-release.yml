@@ -37,6 +37,10 @@ jobs:
     needs: identify
     if: needs.identify.outputs.publish == 'true'
     uses: ./.github/workflows/ci.yml
+  postgres:
+    needs: identify
+    if: needs.identify.outputs.publish == 'true'
+    uses: ./.github/workflows/enterprise-postgres.yml
   build:
     needs: identify
     if: needs.identify.outputs.publish == 'true'
@@ -84,11 +88,12 @@ jobs:
           if-no-files-found: error
           retention-days: 30
   seal:
-    needs: [identify, checks, build]
+    needs: [identify, checks, postgres, build]
     if: >-
       !cancelled() &&
       needs.identify.outputs.publish == 'true' &&
       needs.checks.result == 'success' &&
+      needs.postgres.result == 'success' &&
       needs.build.result == 'success'
     runs-on: ubuntu-24.04
     permissions:

@@ -69,6 +69,7 @@ zuno-network = { version = "0.10.29", path = "crates/zuno-network" } # x-release
 zuno-observability = { version = "0.10.29", path = "crates/zuno-observability" } # x-release-please-version
 zuno-orchestration = { version = "0.10.29", path = "crates/zuno-orchestration" } # x-release-please-version
 zuno-paths = { version = "0.10.29", path = "crates/zuno-paths" } # x-release-please-version
+zuno-postgres = { version = "0.10.29", path = "crates/zuno-postgres" } # x-release-please-version
 zuno-permission = { version = "0.10.29", path = "crates/zuno-permission" } # x-release-please-version
 zuno-process = { version = "0.10.29", path = "crates/zuno-process" } # x-release-please-version
 zuno-product-agent = { version = "0.10.29", path = "crates/zuno-product-agent" } # x-release-please-version
@@ -288,6 +289,13 @@ similar = "2.7.0"
 # and WAL behavior consistent across supported hosts. `cc` is therefore an
 # accepted build requirement; cross builds use `cargo-zigbuild`.
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+# Pin the pair exactly: the SQLx facade also resolves an optional SQLite driver
+# whose sqlite3 link range conflicts with the released rusqlite backend. Only the
+# PostgreSQL driver is used here; the local SQLite version must not be downgraded.
+sqlx-core = { version = "=0.9.0", default-features = false, features = [
+  "_rt-tokio", "json", "_tls-rustls-aws-lc-rs",
+] }
+sqlx-postgres = { version = "=0.9.0", default-features = false, features = ["json"] }
 
 # -- primitives -------------------------------------------------------------
 # Already in the tree: reqwest's `rustls` feature selects aws-lc-rs as rustls'

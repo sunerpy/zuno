@@ -1,6 +1,6 @@
 # 项目结构与执行流
 
-修改行为之前，先用本页找到负责它的 crate。Zuno 是一个包含 50 个 crate 的 Rust
+修改行为之前，先用本页找到负责它的 crate。Zuno 是一个包含 51 个 crate 的 Rust
 workspace。`crates/zuno-cli` 构建最终的 `zuno` 二进制，其余 crate 把协议、运行时、
 存储、工具和客户端职责从入口程序中分离出来。
 
@@ -89,6 +89,7 @@ workspace。`crates/zuno-cli` 构建最终的 `zuno` 二进制，其余 crate �
 
 | Crate | 职责 |
 | --- | --- |
+| `zuno-postgres` | 企业预览会话存储、TLS 校验、角色边界与 PostgreSQL RLS |
 | `zuno-db` | SQLite schema、migration、Session、event、inbox、job 与持久 projection |
 | `zuno-memory` | 有容量上限的常驻 Memory、候选校验、复核后应用与恢复 |
 | `zuno-learning` | Experience 提取与检索、模式挖掘、反馈与 Skill candidate |

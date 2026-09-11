@@ -25,6 +25,7 @@ zuno-network
 zuno-observability
 zuno-orchestration
 zuno-paths
+zuno-postgres
 zuno-permission
 zuno-process
 zuno-product-agent
