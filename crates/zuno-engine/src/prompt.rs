@@ -825,7 +825,7 @@ fn canonical_section_rank(role: &str) -> u8 {
 }
 
 /// Track durable receipt ids for exact provider projections within one turn.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PromptTraceSet {
     receipts: BTreeMap<String, String>,
 }

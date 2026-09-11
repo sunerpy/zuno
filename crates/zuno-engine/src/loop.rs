@@ -598,7 +598,8 @@ impl ToolInterruption {
 pub const TRAILING_FRAME_BUDGET: u8 = 8;
 
 /// A normal terminal state of [`run_turn`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TurnOutcome {
     Completed {
         assistant_message_id: String,
@@ -618,7 +619,8 @@ pub enum TurnOutcome {
 }
 
 /// Recovery information retained after a model-visible tool failure.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ToolFailureRecovery {
     /// Tool whose most recent retryable failure remains unresolved.
     pub tool: String,
@@ -747,7 +749,8 @@ pub enum TurnError {
 }
 
 /// Why a retryable terminal turn ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TurnRetryReason {
     /// The provider explicitly rate limited the request.
     RateLimited,
@@ -766,7 +769,8 @@ pub enum TurnRetryReason {
 }
 
 /// Action a goal controller may take after a terminal turn failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TurnRecovery {
     /// Start a fresh goal turn after backoff.
     Retry {
@@ -1307,7 +1311,8 @@ pub trait DynamicContextRefresher: Send + Sync {
 }
 
 /// Why a turn started and where its execution identity comes from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TurnStart {
     /// A genuine user message owns both the causal anchor and execution identity.
     UserMessage,
@@ -1347,7 +1352,8 @@ impl TurnStart {
 }
 
 /// Stable caller-owned identity and volatile suffix for one run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunTurnRequest {
     pub session_id: String,
     pub turn_id: String,
@@ -1697,8 +1703,9 @@ async fn require_context_compaction_before_request(
     Err(TurnError::CompactionRequired { reason })
 }
 
-#[derive(Debug)]
-struct RequestedTurn {
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RequestedTurn {
     anchor_message_id: Option<String>,
     agent: String,
     provider_id: String,
@@ -2102,21 +2109,55 @@ fn parse_tool_input(raw: &str) -> (Value, Option<String>) {
 /// this same loop and emits through the same bounded channel.
 pub async fn run_turn(
     request: RunTurnRequest,
-    context: TurnContext<'_>,
+    mut context: TurnContext<'_>,
     events: TurnEventSender,
 ) -> Result<TurnOutcome, TurnError> {
     let turn_span = span::turn(&request.session_id, &request.turn_id);
-    run_turn_in_span(request, context, events, turn_span.clone())
+    match run_turn_in_span(request, &mut context, events, turn_span.clone(), None, None)
         .instrument(turn_span)
-        .await
+        .await?
+    {
+        crate::advance::LoopOutcome::Completed(outcome) => Ok(outcome),
+        crate::advance::LoopOutcome::Progressed(_) => Err(TurnError::Hook(
+            "an unbounded driver unexpectedly yielded a checkpoint".to_owned(),
+        )),
+    }
+}
+
+/// Advance the same provider/tool loop to a durable step boundary.
+pub async fn advance_turn(
+    request: crate::advance::AdvanceRequest,
+    mut context: TurnContext<'_>,
+    events: TurnEventSender,
+) -> Result<crate::advance::AdvanceOutcome, crate::advance::AdvanceError> {
+    let owner = context.principal_scope.owner();
+    let mut admission = match crate::advance::begin(context.connection, &request, owner)? {
+        crate::advance::BeginAdvance::Admitted(admission) => admission,
+        crate::advance::BeginAdvance::AlreadyCommitted(outcome) => return Ok(outcome),
+    };
+    let checkpoint = admission.checkpoint.take();
+    let turn_span = span::turn(&request.run.session_id, &request.run.turn_id);
+    let result = run_turn_in_span(
+        request.run.clone(),
+        &mut context,
+        events,
+        turn_span.clone(),
+        checkpoint,
+        Some(request.max_steps),
+    )
+    .instrument(turn_span)
+    .await;
+    crate::advance::finish(context.connection, &request.run, &admission, result)
 }
 
 async fn run_turn_in_span(
     request: RunTurnRequest,
-    mut context: TurnContext<'_>,
+    context: &mut TurnContext<'_>,
     events: TurnEventSender,
     turn_span: tracing::Span,
-) -> Result<TurnOutcome, TurnError> {
+    checkpoint: Option<crate::advance::LoopCheckpoint>,
+    max_steps: Option<NonZeroU32>,
+) -> Result<crate::advance::LoopOutcome, TurnError> {
     // One clock for the whole turn, read every time the policy is consulted: a time
     // allowance measured per step would restart on each provider request and could
     // never expire.
@@ -2138,35 +2179,58 @@ async fn run_turn_in_span(
         .live_inputs
         .as_ref()
         .and_then(|live| live.guard.mark_turn_started(&request.turn_id));
-    events
-        .send(TurnEvent::TurnStarted {
-            session_id: request.session_id.clone(),
-            turn_id: request.turn_id.clone(),
-        })
-        .await?;
-
-    let mut steps = 0_u32;
+    let resuming = checkpoint.is_some();
+    if !resuming {
+        events
+            .send(TurnEvent::TurnStarted {
+                session_id: request.session_id.clone(),
+                turn_id: request.turn_id.clone(),
+            })
+            .await?;
+    }
+    let state = checkpoint.unwrap_or_else(|| crate::advance::LoopCheckpoint {
+        steps: 0,
+        tool_calls_dispatched: 0,
+        last_assistant_id: None,
+        requested_turn: None,
+        prompt_traces: PromptTraceSet::default(),
+        unresolved_tool_failures: BTreeMap::new(),
+        consecutive_invalid_tool_calls: 0,
+        stagnant_work_state_read: None,
+        dynamic_context: request.dynamic_context.clone(),
+        dynamic_context_refresh: None,
+        step_limit_finalization_attempted: false,
+        turn_usage: empty_turn_usage(),
+        last_request: ProviderRequestUsage::default(),
+        last_context_tokens: None,
+        reported_historical_tool_repair: false,
+        elapsed_millis: 0,
+    });
+    let mut steps = state.steps;
+    let yield_after = max_steps.map(|limit| steps.saturating_add(limit.get()));
+    let elapsed_before_millis = state.elapsed_millis;
     // Incremented where a dispatch group's results come back, so it counts calls the
     // loop ran and never calls the model merely issued: a call a stop or an urgent
     // input kept from running did no work, and a ceiling on this number is meant to
     // bound work done.
-    let mut tool_calls_dispatched = 0_u32;
-    let mut last_assistant_id = None;
+    let mut tool_calls_dispatched = state.tool_calls_dispatched;
+    let mut last_assistant_id = state.last_assistant_id;
+    let mut pinned_requested_turn = state.requested_turn;
     let mut prompt_cache: Option<PromptCache<ToolDefinition>> = None;
     let mut historical_developer_contexts: Option<HistoricalDeveloperContexts> = None;
-    let mut prompt_traces = PromptTraceSet::default();
-    let mut unresolved_tool_failures = BTreeMap::<String, ToolFailureRecovery>::new();
+    let mut prompt_traces = state.prompt_traces;
+    let mut unresolved_tool_failures = state.unresolved_tool_failures;
     let mut resolved_attachments = ResolvedAttachments::new();
-    let mut consecutive_invalid_tool_calls = 0_u8;
-    let mut stagnant_work_state_read: Option<(String, String, u8)> = None;
-    let mut current_dynamic_context = request.dynamic_context.clone();
-    let mut cumulative_dynamic_context_refresh = None;
-    let mut step_limit_finalization_attempted = false;
-    let mut turn_usage = empty_turn_usage();
-    let mut last_request = ProviderRequestUsage::default();
-    let mut last_context_tokens = None;
-    let mut reported_historical_tool_repair = false;
-    let mut durable_turn_start_recorded = false;
+    let mut consecutive_invalid_tool_calls = state.consecutive_invalid_tool_calls;
+    let mut stagnant_work_state_read = state.stagnant_work_state_read;
+    let mut current_dynamic_context = state.dynamic_context;
+    let mut cumulative_dynamic_context_refresh = state.dynamic_context_refresh;
+    let mut step_limit_finalization_attempted = state.step_limit_finalization_attempted;
+    let mut turn_usage = state.turn_usage;
+    let mut last_request = state.last_request;
+    let mut last_context_tokens = state.last_context_tokens;
+    let mut reported_historical_tool_repair = state.reported_historical_tool_repair;
+    let mut durable_turn_start_recorded = resuming;
 
     loop {
         if context.interrupt.is_set() {
@@ -2178,10 +2242,10 @@ async fn run_turn_in_span(
                 .send(TurnEvent::TurnInterrupted {
                     assistant_message_id: last_assistant_id,
                     steps,
-                    request: hard_interrupt_request(&context),
+                    request: hard_interrupt_request(context),
                 })
                 .await?;
-            return Ok(outcome);
+            return Ok(outcome.into());
         }
 
         let repaired = repair_missing_tool_outputs(context.connection, &request.session_id)?;
@@ -2193,17 +2257,62 @@ async fn run_turn_in_span(
                 .await?;
         }
 
+        if max_steps.is_some()
+            && !MessageStore::new(context.connection)
+                .pending_uncertain_tool_calls(&request.session_id, i64::MIN)?
+                .is_empty()
+        {
+            honour_budget_decision(
+                &events,
+                BudgetDecision::stop_uncertain_side_effect(
+                    "inspect the unresolved external effect before advancing this turn",
+                ),
+            )
+            .await?;
+        }
+
+        if yield_after.is_some_and(|limit| steps >= limit) {
+            return Ok(crate::advance::LoopOutcome::Progressed(Box::new(
+                crate::advance::LoopCheckpoint {
+                    steps,
+                    tool_calls_dispatched,
+                    last_assistant_id,
+                    requested_turn: pinned_requested_turn,
+                    prompt_traces,
+                    unresolved_tool_failures,
+                    consecutive_invalid_tool_calls,
+                    stagnant_work_state_read,
+                    dynamic_context: current_dynamic_context,
+                    dynamic_context_refresh: cumulative_dynamic_context_refresh,
+                    step_limit_finalization_attempted,
+                    turn_usage,
+                    last_request,
+                    last_context_tokens,
+                    reported_historical_tool_repair,
+                    elapsed_millis: elapsed_before_millis.saturating_add(
+                        u64::try_from(turn_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    ),
+                },
+            )));
+        }
+
         let mut history = hydrate_retained_history(context.connection, &request.session_id)?;
         let has_compaction_checkpoint =
             crate::compaction::checkpoint::latest_checkpoint(&history).is_some();
         apply_legacy_tool_schema_identities(&mut history, &legacy_tool_schema_snapshots);
-        let requested = requested_turn(&request.session_id, &history, &request.start)?;
-        if inject_live_inputs(&mut context, &request, &requested, &events)
+        let requested = match &pinned_requested_turn {
+            Some(requested) => requested.clone(),
+            None => requested_turn(&request.session_id, &history, &request.start)?,
+        };
+        if inject_live_inputs(context, &request, &requested, &events)
             .await?
             .count
             > 0
         {
             continue;
+        }
+        if max_steps.is_some() && pinned_requested_turn.is_none() {
+            pinned_requested_turn = Some(requested.clone());
         }
         resolve_history_attachments(
             &mut history,
@@ -2543,7 +2652,9 @@ async fn run_turn_in_span(
                 last_request,
                 estimated_prompt_tokens,
                 context_limit: request.context_limit,
-                elapsed_seconds: turn_started.elapsed().as_secs(),
+                elapsed_seconds: elapsed_before_millis.saturating_add(
+                    u64::try_from(turn_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                ) / 1_000,
                 tool_calls_dispatched,
             })
             .await
@@ -3057,7 +3168,7 @@ async fn run_turn_in_span(
         }
 
         if provider_exit == ProviderStreamExit::Interrupted {
-            let interruption = hard_interrupt_request(&context);
+            let interruption = hard_interrupt_request(context);
             append_provider_request_terminal(
                 context.connection,
                 &request,
@@ -3093,7 +3204,8 @@ async fn run_turn_in_span(
             return Ok(TurnOutcome::Interrupted {
                 assistant_message_id: Some(assistant_id),
                 steps,
-            });
+            }
+            .into());
         }
 
         if provider_exit == ProviderStreamExit::Steered && !accumulator.saw_message_end {
@@ -3122,7 +3234,7 @@ async fn run_turn_in_span(
                     interrupted: false,
                 })
                 .await?;
-            let _injected = inject_live_inputs(&mut context, &request, &requested, &events).await?;
+            let _injected = inject_live_inputs(context, &request, &requested, &events).await?;
             events
                 .send(TurnEvent::StepCompleted {
                     step,
@@ -3244,7 +3356,9 @@ async fn run_turn_in_span(
                 last_request,
                 estimated_prompt_tokens,
                 context_limit: request.context_limit,
-                elapsed_seconds: turn_started.elapsed().as_secs(),
+                elapsed_seconds: elapsed_before_millis.saturating_add(
+                    u64::try_from(turn_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                ) / 1_000,
                 tool_calls_dispatched,
             })
             .await
@@ -3285,7 +3399,7 @@ async fn run_turn_in_span(
                 });
             }
         }
-        let mut injected = inject_live_inputs(&mut context, &request, &requested, &events).await?;
+        let mut injected = inject_live_inputs(context, &request, &requested, &events).await?;
         let mut yield_until_input = false;
         let mut waiting_for_human = None;
         let mut work_state_read = None;
@@ -3299,7 +3413,7 @@ async fn run_turn_in_span(
                     &assistant_id,
                     &agent.name,
                     &locked_tools,
-                    &context,
+                    context,
                     &orchestration_snapshot,
                 );
                 let first_policy = context.dispatcher.concurrency_policy(&first_request);
@@ -3312,7 +3426,7 @@ async fn run_turn_in_span(
                             &assistant_id,
                             &agent.name,
                             &locked_tools,
-                            &context,
+                            context,
                             &orchestration_snapshot,
                         );
                         if context.dispatcher.concurrency_policy(&candidate)
@@ -3351,7 +3465,7 @@ async fn run_turn_in_span(
                             &assistant_id,
                             &agent.name,
                             &locked_tools,
-                            &context,
+                            context,
                             &orchestration_snapshot,
                         ))
                         .await;
@@ -3561,7 +3675,7 @@ async fn run_turn_in_span(
                         injected.skip_remaining_tools = true;
                     } else {
                         injected.merge(
-                            inject_live_inputs(&mut context, &request, &requested, &events).await?,
+                            inject_live_inputs(context, &request, &requested, &events).await?,
                         );
                     }
                 }
@@ -3569,7 +3683,7 @@ async fn run_turn_in_span(
             }
         }
         if waiting_for_human.is_none() {
-            injected.merge(inject_live_inputs(&mut context, &request, &requested, &events).await?);
+            injected.merge(inject_live_inputs(context, &request, &requested, &events).await?);
         }
 
         events
@@ -3611,7 +3725,8 @@ async fn run_turn_in_span(
                 assistant_message_id: assistant_id,
                 steps,
                 request_id,
-            });
+            }
+            .into());
         }
 
         let another_provider_request =
@@ -3660,7 +3775,8 @@ async fn run_turn_in_span(
                 assistant_message_id: assistant_id,
                 steps,
                 unresolved_tool_failures: unresolved_tool_failures.into_values().collect(),
-            });
+            }
+            .into());
         }
 
         if !calls.is_empty() {
@@ -3679,7 +3795,8 @@ async fn run_turn_in_span(
             assistant_message_id: assistant_id,
             steps,
             unresolved_tool_failures: unresolved_tool_failures.into_values().collect(),
-        });
+        }
+        .into());
     }
 }
 
