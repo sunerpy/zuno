@@ -567,6 +567,7 @@ pub fn consume(
     request: &RunTurnRequest,
     checkpoint: &mut crate::advance::LoopCheckpoint,
     completions: &[crate::wait::WaitCompletion],
+    unfinished_parts: &[PartRecord],
 ) -> Result<Vec<PartRecord>, TurnError> {
     let phase = checkpoint
         .tool_step
@@ -578,6 +579,8 @@ pub fn consume(
     }
     let mut parts = Vec::with_capacity(completions.len());
     let mut completion_ids = BTreeSet::new();
+    let mut settled = 0u32;
+    let mut recheck = None;
     for pending in &phase.pending {
         let completion = completions
             .iter()
@@ -588,6 +591,36 @@ pub fn consume(
             return Err(crate::state::TurnStateError::Conflict.into());
         }
         let call = &phase.calls[pending.index];
+        let crate::wait::WaitOutcome::ToolResult { result } = &completion.outcome else {
+            // Preparation stops at the first wait. Rechecking only that final,
+            // undispatched call cannot replay earlier effects in this group.
+            if phase.pending.len() != 1
+                || pending.index + 1 != phase.next_call
+                || !phase.covers_unfinished(
+                    &request.session_id,
+                    &request.turn_id,
+                    unfinished_parts,
+                    true,
+                )?
+            {
+                return Err(crate::state::TurnStateError::Conflict.into());
+            }
+            let mut part = unfinished_parts
+                .iter()
+                .find(|part| {
+                    part.data.get("callID").and_then(Value::as_str) == Some(call.id.as_str())
+                })
+                .cloned()
+                .ok_or(crate::state::TurnStateError::Conflict)?;
+            part.data
+                .get_mut("state")
+                .and_then(Value::as_object_mut)
+                .ok_or(crate::state::TurnStateError::InvalidData)?
+                .remove("waitRef");
+            recheck = Some(pending.index);
+            parts.push(part);
+            continue;
+        };
         let display_name = tool_display_name(&phase.locked_tools, &call.name);
         let mut part = tool_result_part(
             request,
@@ -601,7 +634,7 @@ pub fn consume(
                 ui_intent: tool_ui_intent(&phase.locked_tools, &call.name),
                 schema_identity: tool_schema_identity(&phase.locked_tools, &call.name),
             },
-            &completion.result,
+            result,
         )?;
         part.data
             .insert("completionID".to_owned(), json!(completion.id));
@@ -609,14 +642,16 @@ pub fn consume(
             &mut phase.effects,
             &mut checkpoint.unresolved_tool_failures,
             call,
-            &completion.result,
+            result,
             phase.calls.len() == 1,
         )?;
         parts.push(part);
+        settled = settled.saturating_add(1);
     }
-    checkpoint.tool_calls_dispatched = checkpoint
-        .tool_calls_dispatched
-        .saturating_add(u32::try_from(completions.len()).unwrap_or(u32::MAX));
+    checkpoint.tool_calls_dispatched = checkpoint.tool_calls_dispatched.saturating_add(settled);
     phase.pending.clear();
+    if let Some(index) = recheck {
+        phase.next_call = index;
+    }
     Ok(parts)
 }

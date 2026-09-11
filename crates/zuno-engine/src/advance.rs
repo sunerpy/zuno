@@ -617,6 +617,7 @@ pub(crate) fn begin(
                 &request.run,
                 &mut prepared.checkpoint,
                 &completions,
+                &unfinished_parts,
             )?;
             for part in parts {
                 messages.put_part(&part)?;

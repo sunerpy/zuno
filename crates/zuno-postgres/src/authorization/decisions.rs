@@ -119,6 +119,7 @@ pub(super) async fn answer(
             "approval no longer matches current task authority",
         )
         .await?;
+        crate::runtime::waiting::approval_changed(&mut tx, &record).await?;
         tx.commit().await.map_err(database_error)?;
         return Err(ApplicationError::Forbidden);
     }
@@ -159,6 +160,7 @@ pub(super) async fn answer(
     .map_err(database_error)?;
     set_owner(&mut tx, &owner).await?;
     let result = record_in(&mut tx, &owner, record.id.as_str(), false).await?;
+    crate::runtime::waiting::approval_changed(&mut tx, &result).await?;
     tx.commit().await.map_err(database_error)?;
     Ok(result)
 }

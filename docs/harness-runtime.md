@@ -156,8 +156,12 @@ The checkpoint contract has SQLite and PostgreSQL providers and authenticated
 Worker transport, sharing admission and immutable request validation.
 `PreparedToolDispatch::Pending` carries a typed `WaitRef`; it never supplies an
 interim successful tool result. `WaitCompletionStore` publishes the authoritative
-completion. Driver admission atomically consumes that fact, writes the original
-result and advances the checkpoint before remaining tools or models run.
+completion. A typed `WaitOutcome` distinguishes a tool result from an invocation
+that requires another authorization check. Tool results commit with consumption
+and the next checkpoint. An approval signal instead keeps the original part
+pending, removes its wait marker and restores its preparation cursor; it does
+not write a tool result or spend another tool call. Preparation rechecks current
+authority before executing. Only an exact undispatched approval wait may do this.
 The PostgreSQL wait releases the Worker lease while retaining the logical Job.
 History repair rejects attempts to overtake an exact protected tool checkpoint.
 

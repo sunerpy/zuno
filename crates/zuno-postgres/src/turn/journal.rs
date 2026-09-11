@@ -84,6 +84,7 @@ pub(super) async fn begin(
                 &request.run,
                 &mut prepared.checkpoint,
                 &completions,
+                &unfinished_parts,
             )?;
             let time = database_time(&mut tx).await.map_err(state_error)?;
             for part in parts {

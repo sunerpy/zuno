@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p0-stable31-sync`.
+- Current phase branch: `codex/enterprise-p3-approval-resume`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -198,3 +198,12 @@ verification is pending the next preview CI run. No release is enabled.
 - Main `5619205d60aef572e484646dd9ab0563e1ef8066` adds only the 0.10.31 release-version update to the previously imported source. The merge keeps all preview crates and authentication changes; every first-party package advances together and third-party lock entries remain unchanged.
 - `preview.json` records that exact source baseline, with publication disabled. The next eligible first preview becomes `0.10.32-preview.1`, subject to later synchronization and runtime acceptance.
 - Workspace check, Clippy, 100 documentation/release tests and preview channel validation passed. This synchronization is prepared separately from browser PR #196, which remains in CI.
+
+## Approval continuation
+
+- Browser PR #196 merged at `93c46ef3fd0742cfc9cd61edfd0a2946694d8d7a`; CI `34652125193` passed every gate. Stable-version synchronization PR #197 uses `c490e257df7442ab26946e8f90e35133643b6ec0` and remains in CI.
+- Typed wait outcomes distinguish actual tool results from approval readiness. The latter preserves the original pending part and provider metadata, restores only the undispatched preparation cursor, and does not spend a tool execution or issue another model request.
+- PostgreSQL commits approval answers, decision receipts, readiness facts and wakeups in one transaction. Registration observes an earlier answer; duplicate answers/facts do not duplicate consumption. Legacy result facts remain immutable and readable; ambiguous legacy approval-as-result facts fail closed.
+- Two focused failing tests demonstrated premature tool completion and a missing approval wakeup before their fixes. The engine dispatch suite and real PostgreSQL/HTTPS contracts now pass, including a full kernel continuation through three lease identities, failed wakeup rollback, original-result consumption, unchanged earlier effects and preserved budgets.
+- Validation passed: 456 engine tests, native PostgreSQL and both HTTPS contracts, 100 documentation/release tests, workspace check, Clippy, formatting and diff checks.
+- Public approval endpoints and production gateway/Worker dispatch remain pending. The enterprise runtime and preview release remain disabled.

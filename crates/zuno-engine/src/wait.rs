@@ -58,10 +58,37 @@ pub const MAX_COMPLETION_BYTES: usize = 2 * 1024 * 1024;
 pub struct WaitCompletion {
     pub id: CompletionId,
     pub reference: WaitRef,
-    pub result: ToolDispatchResult,
+    pub outcome: WaitOutcome,
+}
+
+/// A permission decision can make preparation eligible again; it can never
+/// assert that an external tool has executed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WaitOutcome {
+    ToolResult { result: Box<ToolDispatchResult> },
+    RecheckInvocation,
 }
 
 impl WaitCompletion {
+    pub fn tool_result(id: CompletionId, reference: WaitRef, result: ToolDispatchResult) -> Self {
+        Self {
+            id,
+            reference,
+            outcome: WaitOutcome::ToolResult {
+                result: Box::new(result),
+            },
+        }
+    }
+
+    pub fn recheck_invocation(id: CompletionId, reference: WaitRef) -> Self {
+        Self {
+            id,
+            reference,
+            outcome: WaitOutcome::RecheckInvocation,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), TurnStateError> {
         self.reference
             .validate()
@@ -70,16 +97,27 @@ impl WaitCompletion {
             .map_err(|_| TurnStateError::InvalidData)?
             .len()
             > MAX_COMPLETION_BYTES
-            || self.result.uncertain.is_some()
-            || self.result.output.continuation == zuno_tool::ToolContinuation::WaitingForHuman
-            || (self.result.blocked.is_some()
-                && (!self.result.is_error
-                    || self.result.uncertain.is_some()
-                    || self.result.interruption.is_some()))
-            || (self.result.recovery.is_some()
-                && (self.result.blocked.is_some() || self.result.uncertain.is_some()))
         {
             return Err(TurnStateError::InvalidData);
+        }
+        let approval = matches!(
+            self.reference.target,
+            zuno_types::wait::WaitTarget::Approval { .. }
+        );
+        match &self.outcome {
+            WaitOutcome::RecheckInvocation if !approval => return Err(TurnStateError::InvalidData),
+            WaitOutcome::ToolResult { result }
+                if approval
+                    || result.uncertain.is_some()
+                    || result.output.continuation
+                        == zuno_tool::ToolContinuation::WaitingForHuman
+                    || (result.blocked.is_some()
+                        && (!result.is_error || result.interruption.is_some()))
+                    || (result.recovery.is_some() && result.blocked.is_some()) =>
+            {
+                return Err(TurnStateError::InvalidData);
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -107,11 +145,12 @@ pub fn completion_event(
     completion: &WaitCompletion,
 ) -> Result<NewSessionEvent, crate::r#loop::TurnError> {
     completion.validate()?;
-    let serde_json::Value::Object(properties) =
+    let serde_json::Value::Object(mut properties) =
         serde_json::to_value(completion).map_err(|_| TurnStateError::InvalidData)?
     else {
         return Err(TurnStateError::InvalidData.into());
     };
+    properties.insert("schemaVersion".to_owned(), serde_json::json!(2));
     Ok(NewSessionEvent::new(COMPLETION_EVENT, properties)?)
 }
 
@@ -131,15 +170,35 @@ pub fn consumed_event(
 }
 
 pub fn decode_completion(
-    event: SessionEvent,
+    mut event: SessionEvent,
     reference: &WaitRef,
 ) -> Result<WaitCompletion, crate::r#loop::TurnError> {
     if event.version != 1 || event.event_type != COMPLETION_EVENT {
         return Err(TurnStateError::InvalidData.into());
     }
-    let completion: WaitCompletion =
-        serde_json::from_value(serde_json::Value::Object(event.properties))
-            .map_err(|_| TurnStateError::InvalidData)?;
+    let version = event.properties.remove("schemaVersion");
+    let completion: WaitCompletion = match version {
+        None => {
+            // Earlier preview facts are preserved. An old approval/result
+            // conflation fails validation; it is never promoted to permission.
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase", deny_unknown_fields)]
+            struct LegacyCompletion {
+                id: CompletionId,
+                reference: WaitRef,
+                result: ToolDispatchResult,
+            }
+            let old: LegacyCompletion =
+                serde_json::from_value(serde_json::Value::Object(event.properties))
+                    .map_err(|_| TurnStateError::InvalidData)?;
+            WaitCompletion::tool_result(old.id, old.reference, old.result)
+        }
+        Some(serde_json::Value::Number(value)) if value.as_u64() == Some(2) => {
+            serde_json::from_value(serde_json::Value::Object(event.properties))
+                .map_err(|_| TurnStateError::InvalidData)?
+        }
+        _ => return Err(TurnStateError::InvalidData.into()),
+    };
     completion.validate()?;
     if &completion.reference != reference {
         return Err(TurnStateError::Conflict.into());
@@ -157,14 +216,14 @@ pub fn timer_completion(reference: &WaitRef, now_ms: i64) -> Option<WaitCompleti
         "cmp_{}",
         zuno_orchestration::sha256_json(&serde_json::json!(reference))
     );
-    Some(WaitCompletion {
-        id: CompletionId::new(id).expect("bounded derived completion identity"),
-        reference: reference.clone(),
-        result: ToolDispatchResult::success(zuno_tool::ToolOutput::text(
+    Some(WaitCompletion::tool_result(
+        CompletionId::new(id).expect("bounded derived completion identity"),
+        reference.clone(),
+        ToolDispatchResult::success(zuno_tool::ToolOutput::text(
             "Timer completed",
             "The requested deadline has been reached.",
         )),
-    })
+    ))
 }
 
 /// Called by a trusted local completion source after it has validated the
@@ -176,10 +235,18 @@ pub fn publish_sqlite_completion(
 ) -> Result<SessionEvent, crate::r#loop::TurnError> {
     let transaction = open::immediate_transaction(connection)?;
     session::get_owned(&transaction, &scope.session_id, &scope.owner)?;
+    let id = completion_event_id(scope, &completion.reference);
+    if let Some(existing) = event_log::by_id_in(&transaction, &scope.session_id, &id)? {
+        if decode_completion(existing.clone(), &completion.reference)? != *completion {
+            return Err(TurnStateError::Conflict.into());
+        }
+        transaction.commit().map_err(open::map_error)?;
+        return Ok(existing);
+    }
     let event = event_log::append_identified_in(
         &transaction,
         &scope.session_id,
-        &completion_event_id(scope, &completion.reference),
+        &id,
         completion_event(completion)?,
     )?;
     transaction.commit().map_err(open::map_error)?;
@@ -251,8 +318,9 @@ pub fn consume_results(
     request: &RunTurnRequest,
     checkpoint: &mut crate::advance::LoopCheckpoint,
     completions: &[WaitCompletion],
+    unfinished_parts: &[zuno_db::message::PartRecord],
 ) -> Result<Vec<zuno_db::message::PartRecord>, crate::r#loop::TurnError> {
-    crate::r#loop::tool_step::consume(request, checkpoint, completions)
+    crate::r#loop::tool_step::consume(request, checkpoint, completions, unfinished_parts)
 }
 
 pub(crate) mod uncertain_cause {

@@ -7,6 +7,87 @@ use zuno_engine::state::{TurnStateError, TurnStateScope};
 use zuno_engine::wait::{self, WaitCompletion};
 use zuno_types::wait::{WaitRef, WaitTarget};
 
+async fn approval_ready(
+    tx: &mut Transaction<'_, Postgres>,
+    job: &RuntimeJob,
+    reference: &WaitRef,
+) -> Result<Option<WaitCompletion>, ApplicationError> {
+    let WaitTarget::Approval { approval_id } = &reference.target else {
+        return Ok(None);
+    };
+    let owner = job.principal.owner();
+    let row = query(
+        "SELECT binding,state FROM zuno_enterprise_preview.operation_approval
+         WHERE tenant_id=$1 AND principal_id=$2 AND id=$3 AND job_id=$4 AND session_id=$5",
+    )
+    .bind(owner.tenant_id.as_str())
+    .bind(owner.principal_id.as_str())
+    .bind(approval_id.as_str())
+    .bind(job.id.as_str())
+    .bind(job.session_id.as_str())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(database_error)?
+    .ok_or(ApplicationError::Conflict)?;
+    let binding: zuno_application::authorization::ApprovalBinding =
+        serde_json::from_value(row.try_get("binding").map_err(database_error)?)
+            .map_err(ApplicationError::storage)?;
+    binding.validate()?;
+    if binding.turn_id != reference.turn_id || binding.invocation_id != reference.invocation_id {
+        return Err(ApplicationError::Conflict);
+    }
+    let state: zuno_application::authorization::ApprovalState =
+        serde_json::from_value(Value::String(row.try_get("state").map_err(database_error)?))
+            .map_err(ApplicationError::storage)?;
+    if state == zuno_application::authorization::ApprovalState::Pending {
+        return Ok(None);
+    }
+    Ok(Some(WaitCompletion::recheck_invocation(
+        zuno_types::identity::CompletionId::new(format!(
+            "cmp_{}",
+            zuno_orchestration::sha256_json(&json!([
+                "approval-readiness",
+                approval_id,
+                reference.id
+            ]),)
+        ))
+        .expect("bounded derived identity"),
+        reference.clone(),
+    )))
+}
+
+/// The approval writer already holds the owning session lock. Its answer,
+/// receipt, readiness fact and scheduler notification share that transaction.
+pub(crate) async fn approval_changed(
+    tx: &mut Transaction<'_, Postgres>,
+    record: &zuno_application::authorization::ApprovalRecord,
+) -> Result<(), ApplicationError> {
+    let owner = record.requester.owner();
+    let job = read_job(tx, &owner, record.binding.job_id.as_str()).await?;
+    let rows = query(
+        "SELECT reference FROM zuno_enterprise_preview.runtime_wait
+         WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND state='pending'
+           AND reference->'target'->>'kind'='approval'
+           AND reference->'target'->>'approval_id'=$4",
+    )
+    .bind(owner.tenant_id.as_str())
+    .bind(owner.principal_id.as_str())
+    .bind(job.id.as_str())
+    .bind(record.id.as_str())
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(database_error)?;
+    for row in rows {
+        let reference: WaitRef =
+            serde_json::from_value(row.try_get("reference").map_err(database_error)?)
+                .map_err(ApplicationError::storage)?;
+        if let Some(completion) = approval_ready(tx, &job, &reference).await? {
+            publish(tx, &job, &completion).await?;
+        }
+    }
+    Ok(())
+}
+
 fn scope(job: &RuntimeJob) -> TurnStateScope {
     TurnStateScope {
         owner: job.principal.owner(),
@@ -107,6 +188,11 @@ pub(crate) async fn register(
         if reference.turn_id != job.turn_id || !ids.insert(&reference.id) {
             return Err(ApplicationError::Conflict);
         }
+        if let Some(completion) = approval_ready(tx, job, reference).await? {
+            // The human may have answered before the Worker persisted its wait.
+            // Both paths hold the same session lock, closing the lost wakeup.
+            publish(tx, job, &completion).await?;
+        }
         let ready = completion(tx, &scope, reference).await?;
         let deadline = match reference.target {
             WaitTarget::Timer { deadline_ms } => Some(deadline_ms),
@@ -204,16 +290,33 @@ async fn publish(
     }
     let scope = scope(job);
     let event_id = wait::completion_event_id(&scope, &completion.reference);
-    let event = wait::completion_event(completion).map_err(payload_error)?;
-    let sequence = crate::session::emit_identified(
-        tx,
-        &job.principal,
-        job.session_id.as_str(),
-        &event_id,
-        &event.event_type,
-        Value::Object(event.properties.clone()),
-    )
-    .await?;
+    let mut event = wait::completion_event(completion).map_err(payload_error)?;
+    let existing = query(
+        "SELECT * FROM zuno_enterprise_preview.event WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3 AND id=$4",
+    ).bind(scope.owner.tenant_id.as_str()).bind(scope.owner.principal_id.as_str())
+        .bind(&scope.session_id).bind(&event_id).fetch_optional(&mut **tx).await.map_err(database_error)?;
+    let sequence = if let Some(row) = existing {
+        let existing = crate::turn::decode_event(row).map_err(payload_error)?;
+        if wait::decode_completion(existing.clone(), &completion.reference)
+            .map_err(payload_error)?
+            != *completion
+        {
+            return Err(ApplicationError::Conflict);
+        }
+        // Preserve the original serialized fact, including older preview data.
+        event.properties = existing.properties;
+        existing.sequence
+    } else {
+        crate::session::emit_identified(
+            tx,
+            &job.principal,
+            job.session_id.as_str(),
+            &event_id,
+            &event.event_type,
+            Value::Object(event.properties.clone()),
+        )
+        .await?
+    };
     let time = database_time(tx).await?;
     let registered = query(
         "SELECT job_id,reference FROM zuno_enterprise_preview.runtime_wait WHERE tenant_id=$1 AND principal_id=$2 AND id=$3",
