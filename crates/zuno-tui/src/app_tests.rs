@@ -1300,7 +1300,9 @@ async fn app_a_resize_alone_repaints_without_waiting_for_another_event() {
     );
 }
 
-#[tokio::test]
+// This verifies frame scheduling, not the host's ability to wake a timer within
+// 40 ms while hundreds of other native tests are competing for CPU.
+#[tokio::test(start_paused = true)]
 async fn app_coalesces_queued_engine_redraws_into_one_frame() {
     const EVENTS: usize = 32;
 
