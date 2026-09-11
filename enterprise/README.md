@@ -14,6 +14,10 @@ See [STATUS.md](STATUS.md) for completed work and remaining gates.
 
 The PostgreSQL persistence adapter and its isolated verification procedure are
 documented in [English](POSTGRES.md) and [中文](POSTGRES.zh.md).
+The generic OAuth2 adapter and Entra specialization are described in
+[English](AUTHENTICATION.md) and [中文](AUTHENTICATION.zh.md). This implements the
+2026-09-11 scope amendment: Entra is a provider adapter, not the application API's
+authentication abstraction.
 
 ## Channel contract
 

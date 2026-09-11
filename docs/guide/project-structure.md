@@ -1,7 +1,7 @@
 # Project structure and execution flow
 
 Use this page to find the crate that owns a behavior before changing it. Zuno is a
-single Rust workspace with 51 crates. `crates/zuno-cli` builds the `zuno` binary;
+single Rust workspace with 52 crates. `crates/zuno-cli` builds the `zuno` binary;
 the other crates keep protocol, runtime, storage, tool, and client concerns out of
 that entry point.
 
@@ -67,6 +67,7 @@ Every crate opts into the workspace lint policy. First-party code forbids
 | `zuno-provider-bedrock` | Amazon Bedrock Responses and Converse transports |
 | `zuno-provider-compatible` | Configurable OpenAI-compatible endpoints |
 | `zuno-auth` | API-key and OAuth credential storage and refresh |
+| `zuno-identity` | Enterprise API identities: OAuth2 JWT/introspection, OIDC key discovery, and Entra claim policy |
 | `zuno-aws-auth` | AWS credential-chain resolution and SigV4 signing |
 | `zuno-network` | Shared outbound HTTP clients, proxy routing, and transport policy |
 | `zuno-mcp` | MCP stdio and remote clients, including tools, resources, and prompts |

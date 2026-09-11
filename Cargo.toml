@@ -60,6 +60,7 @@ zuno-eval = { version = "0.10.29", path = "crates/zuno-eval" } # x-release-pleas
 zuno-extension = { version = "0.10.29", path = "crates/zuno-extension" } # x-release-please-version
 zuno-goal = { version = "0.10.29", path = "crates/zuno-goal" } # x-release-please-version
 zuno-harness = { version = "0.10.29", path = "crates/zuno-harness" } # x-release-please-version
+zuno-identity = { version = "0.10.29", path = "crates/zuno-identity" } # x-release-please-version
 zuno-llm = { version = "0.10.29", path = "crates/zuno-llm" } # x-release-please-version
 zuno-lsp = { version = "0.10.29", path = "crates/zuno-lsp" } # x-release-please-version
 zuno-learning = { version = "0.10.29", path = "crates/zuno-learning" } # x-release-please-version
@@ -129,6 +130,7 @@ reqwest = { version = "0.13.4", default-features = false, features = [
 ] }
 http = "1.5.0"
 url = "2.5.8"
+jsonwebtoken = { version = "=11.0.0", default-features = false, features = ["aws_lc_rs"] }
 
 # -- serialization ----------------------------------------------------------
 schemars = "1.2.2"

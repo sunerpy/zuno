@@ -6,7 +6,7 @@ Baseline: `v0.10.29`, `d1212860dba6a6b420ce81d444ace58feaf0adb5`.
 | --- | --- | --- |
 | P0 | Complete | PR #176 merged into preview; native CI run 34553054820 succeeded |
 | P1 | In progress | Principal propagation implemented; ownership migration validated; local bounded driver and scoped session application validated; local runtime Job/lease port validated; Memory persistence/authority ports validated; backend assembly remains |
-| P2 | In progress | PostgreSQL session TLS/RLS verified locally; runtime Job/Memory, identity/approval and remote state remain |
+| P2 | In progress | PostgreSQL session TLS/RLS and OAuth2/Entra verifier contracts validated; runtime Job/Memory, login integration, organization policy/approval and remote state remain |
 | P3 | Pending | Two workers, Docker gateway, root-task takeover |
 | P4 | Pending | Durable child/Workflow/Council waits, merges and cancellation |
 | P5 | Pending | Web, SDK, remote ACP, common projections |
@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p2-postgres`.
+- Current phase branch: `codex/enterprise-p2-identity`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -88,3 +88,13 @@ verification is pending the next preview CI run. No release is enabled.
 - Preview publishing contracts: 11 passed. Documentation/release contracts: 99 passed. Shared workspace check, Clippy, fmt and diff checks passed. Actionlint passed.
 - PostgreSQL 16 CI passed on Linux amd64/arm64 in run 34576215561. Its shared supply-chain gate identified the SQLx CA data package; `webpki-roots` now has an explicit per-package data-license exception, like `webpki-root-certs`.
 - PostgreSQL Job/Memory storage and engine integration, Entra, HITL, gateway, distributed waits and the Web are still required. Publication remains disabled.
+
+## General OAuth2/OIDC identity boundary
+
+- User-approved amendment on 2026-09-11: Entra is one provider adapter behind a general OAuth2/OIDC boundary. The original full plan is retained; the amendment is documented in `AUTHENTICATION.md` and `AUTHENTICATION.zh.md`.
+- `AccessTokenVerifier` produces a non-deserializable `VerifiedIdentity`. Generic RFC 9068 JWT, explicit provider JWT, RFC 7662 introspection, and Entra v2 implement the same interface.
+- Entra shares JWT cryptography, bounded OIDC discovery/JWKS transport and the concurrent key cache. Its tenant, GUID, key-issuer, delegated/app-only rules stay in its adapter.
+- Generic identities scope opaque subjects by issuer and user/workload kind; they do not inherit Entra's `tid`/`oid` assumptions. Introspection rechecks revocation each time and never falls back to a previously successful result.
+- Identity tests: 15 passed, using ephemeral real RSA signatures. Documentation/release contracts: 99 passed. Shared workspace check, Clippy, fmt, dependency and diff checks passed.
+- The HTTP login/BFF, organization authority, runtime authorization integration and live IdP validation are still required. No enterprise authentication endpoint or runtime entry point has been advertised.
+- Documentation impact: both language guides and the workspace inventory are updated. These preview docs are packaged with future preview tags; the stable documentation site is not published by this branch.

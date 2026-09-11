@@ -16,6 +16,7 @@ zuno-eval
 zuno-extension
 zuno-goal
 zuno-harness
+zuno-identity
 zuno-learning
 zuno-llm
 zuno-lsp
