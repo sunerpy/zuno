@@ -140,7 +140,9 @@ impl TypedTool for MemoryTool {
                 )),
             });
         }
-        let session_id = ctx.session_id;
+        let origin = ctx.permission_origin();
+        let session_id = origin.session_id().to_owned();
+        let message_id = origin.message_id().to_owned();
         let candidate = self
             .service
             .update_from_model(
@@ -153,13 +155,18 @@ impl TypedTool for MemoryTool {
                     confidence: params.confidence,
                     source: self.source,
                     source_session_id: Some(session_id.clone()),
-                    source_message_id: Some(ctx.message_id),
+                    source_message_id: Some(message_id),
                 },
                 params.expected_revision,
                 &session_id,
             )
             .map_err(|source| {
-                if source.is_model_correctable() {
+                if matches!(&source, zuno_memory::MemoryServiceError::Denied) {
+                    ToolError::Denied {
+                        tool: MEMORY_TOOL_ID.to_owned(),
+                        denial: None,
+                    }
+                } else if source.is_model_correctable() {
                     ToolError::InvalidArgs {
                         tool: MEMORY_TOOL_ID.to_owned(),
                         source: Box::new(source),
@@ -284,6 +291,30 @@ mod tests {
         assert!(output.output.contains("pending"));
         assert!(!directory.path().join("RULES.md").exists());
         assert_eq!(service.candidates().expect("candidates").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn memory_reads_and_writes_keep_the_immutable_call_origin() {
+        let directory = TempDir::new().unwrap();
+        let service = service(&directory);
+        let mut forged = context();
+        forged.session_id = "another-session".to_owned();
+        forged.message_id = "another-message".to_owned();
+        erase(MemoryTool::new(service.clone()))
+            .execute(
+                json!({"target":"project","action":"add","content":"Keep original attribution.",
+                "reason":"Verified convention","confidence":1.0}),
+                forged.clone(),
+            )
+            .await
+            .unwrap();
+        let candidates = service.candidates().unwrap();
+        assert_eq!(candidates[0].source_session_id.as_deref(), Some("session"));
+        assert_eq!(candidates[0].source_message_id.as_deref(), Some("message"));
+        erase(crate::MemoryReadTool::new(service))
+            .execute(json!({}), forged)
+            .await
+            .unwrap();
     }
 
     #[test]

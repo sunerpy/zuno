@@ -33,13 +33,17 @@ impl MemoryService {
         source_session: Option<&str>,
         now: i64,
     ) -> Result<zuno_db::memory_maintenance::MemorySourceRetraction, MemoryServiceError> {
+        for scope in Scope::ALL {
+            self.authority
+                .authorize(scope.into(), super::MemoryAccess::Forget)?;
+        }
         let paths = self
             .read_views()?
             .into_iter()
             .map(|view| view.document.path)
             .collect::<Vec<_>>();
         let result = self
-            .maintenance
+            .persistence
             .forget_sources(ids, &paths, source_session, now)?;
         for document in &result.documents {
             self.project_document(document)?;
@@ -53,8 +57,8 @@ impl MemoryService {
         project_id: &str,
     ) -> Result<Option<MemoryMaintenanceState>, MemoryServiceError> {
         let project = self.document(Scope::Project)?;
-        self.maintenance
-            .state(project_id, &project.path)
+        self.persistence
+            .maintenance_state(project_id, &project.path)
             .map_err(Into::into)
     }
 
@@ -84,6 +88,10 @@ impl MemoryService {
         context: MemoryMaintenanceContext<'_>,
         mut updates: Vec<MemoryMaintenanceUpdate>,
     ) -> Result<Vec<MemoryCandidateRecord>, MemoryServiceError> {
+        for scope in Scope::ALL {
+            self.authority
+                .authorize(scope.into(), super::MemoryAccess::Maintain)?;
+        }
         if updates.len() > 32 {
             return Err(MemoryServiceError::Invalid(
                 "memory maintenance exceeds 32 changes".to_owned(),
@@ -148,7 +156,7 @@ impl MemoryService {
             }
             if let Some(content) = update.content.as_deref()
                 && self
-                    .maintenance
+                    .persistence
                     .content_retired(&views[update.scope.as_str()].document.path, content)?
             {
                 return Err(MemoryServiceError::Invalid(
@@ -264,7 +272,7 @@ impl MemoryService {
                 apply,
             });
         }
-        let committed = self.maintenance.commit(MemoryBatchCommit {
+        let committed = self.persistence.commit_maintenance(MemoryBatchCommit {
             project_id,
             global_path: &global.document.path,
             project_path: &project.document.path,

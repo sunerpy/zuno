@@ -86,10 +86,19 @@ impl TypedTool for MemoryReadTool {
         let limit = params.limit.unwrap_or(32) as usize;
         let views = self
             .service
-            .read_for_model(&ctx.session_id)
-            .map_err(|source| ToolError::Failed {
-                tool: MEMORY_READ_TOOL_ID.to_owned(),
-                source: Box::new(source),
+            .read_for_model(ctx.permission_origin().session_id())
+            .map_err(|source| {
+                if matches!(&source, zuno_memory::MemoryServiceError::Denied) {
+                    ToolError::Denied {
+                        tool: MEMORY_READ_TOOL_ID.to_owned(),
+                        denial: None,
+                    }
+                } else {
+                    ToolError::Failed {
+                        tool: MEMORY_READ_TOOL_ID.to_owned(),
+                        source: Box::new(source),
+                    }
+                }
             })?;
         let mut remaining_bytes = 32_768usize;
         let mut scopes = Vec::new();

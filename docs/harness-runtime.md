@@ -1195,6 +1195,33 @@ completes normally.
 
 ## Resident memory and user learning
 
+The preview separates `MemoryPersistence` from `MemoryAuthority`.
+`MemoryService` receives one coherent persistence provider covering candidates,
+document revisions, evidence, retraction and maintenance settlement. The default
+`SqliteMemoryPersistence` constructs all three underlying stores from one pool;
+batch changes, source evidence, Job settlement and the maintenance watermark
+retain their original atomic boundary.
+
+An injected provider requires an explicit authority. `MemoryAccess` distinguishes
+read, proposal, apply, edit, rejection, undo, import, maintenance and forgetting.
+The trusted personal profile uses `LocalMemoryAuthority`. This is neither Entra
+authentication nor an enterprise approval service. Organization policy must also
+be rechecked by the committing backend; a preflight policy decision cannot replace
+transactional session-generation, source-validity or learning-lease checks.
+
+Candidate lookup and edit enforce the same document-path ownership as apply and
+undo. An out-of-scope candidate returns a denied result without disclosing its
+path. Model Memory tools use the immutable call origin for session and message
+provenance; changing a tool context's public fields cannot change that origin.
+Authority denial is a permission failure, not a model-correctable proposal.
+
+These synchronous persistence transactions belong to the Memory data owner.
+Remote HTTP/state-service consumers need bounded execution around that owner;
+they must not block an Agent Worker's async reactor on a remote backend call.
+Local file projection remains explicit in this implementation. Managed document
+namespaces, enterprise authorization and the PostgreSQL provider are subsequent
+integration work, not capabilities implied by an injectable trait.
+
 Resident Memory has one model-visible mutation boundary: `memory_update`. It
 validates add/replace/remove operations and inserts a durable `MemoryCandidate`;
 it never edits the resident file directly. Candidates retain scope, action,
