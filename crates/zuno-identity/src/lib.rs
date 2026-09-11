@@ -12,6 +12,7 @@ mod jwt;
 mod keys;
 mod oauth2;
 mod verifier;
+pub mod worker;
 
 pub use authority::OAuth2Authority;
 pub use config::{ActorPolicy, EntraConfig, IdentityConfigError};

@@ -134,6 +134,23 @@ pub struct ClaimedJob {
     pub lease: ExecutionLease,
 }
 
+/// Immutable input selected by the claimed Job for its authenticated Worker.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobInput {
+    pub id: InputId,
+    pub text: String,
+    pub agent: Option<String>,
+    pub model: Option<JobInputModel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobInputModel {
+    pub provider_id: String,
+    pub model_id: String,
+}
+
 /// Configured positive lease lifetime. The database chooses the actual deadline.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(try_from = "u32", into = "u32")]

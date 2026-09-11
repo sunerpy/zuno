@@ -100,7 +100,7 @@ impl AdvanceRequest {
 }
 
 /// A scheduling boundary is distinct from an agent turn's terminal result.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdvanceOutcome {
     Progressed {
         checkpoint: CheckpointRef,
@@ -205,6 +205,8 @@ impl From<TurnOutcome> for LoopOutcome {
 }
 
 /// The durable admission token of one local advance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AdvanceAdmission {
     pub checkpoint: Option<LoopCheckpoint>,
     event_id: String,
@@ -213,12 +215,19 @@ pub struct AdvanceAdmission {
     previous: Option<CheckpointRef>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum BeginAdvance {
     Admitted(Box<AdvanceAdmission>),
     AlreadyCommitted(AdvanceOutcome),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 pub enum AdvanceState {
     Started,

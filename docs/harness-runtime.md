@@ -116,10 +116,13 @@ tool result, with its own scoped storage access.
 The ordinary driver consumes SQLite and fenced PostgreSQL providers. The latter
 rechecks current organization authorization and execution ownership, and commits
 driver checkpoints with native Job handoff/settlement in one transaction.
-In-process records are not a public Web or Worker wire protocol. Authenticated
-state transport, environment receipts and the coherent enterprise backend bundle
-must be connected before a remote Worker is available. A lost state-service
-acknowledgement pauses recovery; it never authorizes mechanical effect replay.
+In-process records are not a public Web wire protocol. The separately versioned
+Worker codec and HTTPS client now connect this port to authenticated state routes;
+service identity and signed Job scope are checked independently from current
+database authority. The Worker client has no PostgreSQL dependency. Environment
+receipts and enterprise launch/profile assembly are still required for a runnable
+distributed deployment. A lost state-service acknowledgement pauses recovery;
+it never authorizes mechanical effect replay.
 
 ### Bounded driver checkpoints
 

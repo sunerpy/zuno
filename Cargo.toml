@@ -93,6 +93,7 @@ zuno-tools = { version = "0.10.29", path = "crates/zuno-tools" } # x-release-ple
 zuno-tui = { version = "0.10.29", path = "crates/zuno-tui" } # x-release-please-version
 zuno-types = { version = "0.10.29", path = "crates/zuno-types" } # x-release-please-version
 zuno-watch = { version = "0.10.29", path = "crates/zuno-watch" } # x-release-please-version
+zuno-worker = { version = "0.10.29", path = "crates/zuno-worker" } # x-release-please-version
 
 # -- async runtime ----------------------------------------------------------
 async-trait = "0.1.91"

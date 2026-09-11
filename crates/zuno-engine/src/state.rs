@@ -4,7 +4,9 @@
 //! and, for distributed execution, fence writes against the current execution
 //! lease. A caller never supplies a database connection or a SQL statement.
 
+pub mod remote;
 mod sqlite;
+pub mod wire;
 pub use sqlite::SqliteTurnPersistence;
 
 use std::collections::BTreeMap;
@@ -54,7 +56,7 @@ pub enum TurnStateError {
 pub struct TurnSession {
     pub id: String,
     pub parent_id: Option<String>,
-    pub directory: String,
+    pub directory: Option<String>,
 }
 
 impl TurnSession {
@@ -71,7 +73,8 @@ pub struct TurnStateScope {
 }
 
 /// Bookkeeping committed in the same transaction as a provider event.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProviderEventUpdate {
     #[default]
     None,
@@ -85,7 +88,8 @@ pub enum ProviderEventUpdate {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolPartCommitKind {
     Dispatched,
     Result,

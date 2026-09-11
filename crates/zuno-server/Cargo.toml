@@ -19,6 +19,7 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 zuno-attachment = { workspace = true }
 zuno-auth = { workspace = true }
+zuno-application = { workspace = true }
 zuno-catalog = { workspace = true }
 zuno-config = { workspace = true }
 zuno-db = { workspace = true }
@@ -27,11 +28,14 @@ zuno-error = { workspace = true }
 zuno-goal = { workspace = true }
 zuno-llm = { workspace = true }
 zuno-learning = { workspace = true }
+zuno-identity = { workspace = true }
 zuno-observability = { workspace = true }
 zuno-paths = { workspace = true }
 zuno-permission = { workspace = true }
+zuno-postgres = { workspace = true }
 zuno-pty = { workspace = true }
 zuno-types = { workspace = true }
+zuno-worker = { workspace = true }
 rusqlite = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
@@ -42,6 +46,13 @@ url = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
+hyper-util = { workspace = true, features = ["server-auto", "service"] }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+sqlx-core = { workspace = true }
+sqlx-postgres = { workspace = true }
+zuno-tool = { workspace = true }
 jsonschema = { version = "=0.37.1", default-features = false }
 reqwest = { workspace = true }
 tempfile = { workspace = true }
