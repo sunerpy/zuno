@@ -72,6 +72,7 @@ fn register_non_file_builtins(builder: &mut ToolRegistryBuilder) {
     for (slot, id) in [
         (BuiltinSlot::Invalid, "invalid"),
         (BuiltinSlot::Question, "question"),
+        (BuiltinSlot::QuestionAsync, "question_async"),
         (BuiltinSlot::Shell, "shell"),
         (BuiltinSlot::Background, "bg"),
         (BuiltinSlot::Glob, "glob"),
@@ -121,6 +122,7 @@ fn registry_builtin_order_is_stable_before_turn_filters() {
         vec![
             "invalid",
             "question",
+            "question_async",
             "shell",
             "bg",
             "read",
@@ -135,6 +137,7 @@ fn registry_builtin_order_is_stable_before_turn_filters() {
             "web_search",
             "skill",
             "apply_patch",
+            "plan_exit",
         ]
     );
 }
@@ -490,7 +493,14 @@ fn registry_flags(case: DifferentialCase) -> RegistryFlags {
 }
 
 fn expected_set(case: DifferentialCase) -> BTreeSet<String> {
-    case.expected.iter().map(|id| (*id).to_owned()).collect()
+    // These consumers were explicitly registered by this fixture; their exposure
+    // no longer depends on an experimental Plan flag or provider family.
+    case.expected
+        .iter()
+        .copied()
+        .chain(["question_async", "plan_exit"])
+        .map(str::to_owned)
+        .collect()
 }
 
 #[test]

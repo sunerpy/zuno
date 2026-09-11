@@ -72,6 +72,7 @@
 pub mod context;
 pub mod guard;
 pub mod output;
+pub mod question;
 pub mod schema;
 pub mod store;
 pub mod verification;

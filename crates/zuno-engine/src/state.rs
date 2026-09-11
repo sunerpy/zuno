@@ -100,12 +100,57 @@ pub enum ToolPartCommitKind {
 #[derive(Debug, Clone)]
 pub struct InputMaterialization {
     pub input_id: Option<String>,
+    pub turn_id: Option<String>,
     pub message: MessageRecord,
     pub parts: Vec<PartRecord>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ProviderRequestCommit {
+    pub assistant: MessageRecord,
+    pub event: NewSessionEvent,
+    pub estimated_prompt_tokens: u64,
+    pub context_limit: Option<u64>,
+    pub context: crate::context_usage::ContextRequestPreparation,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderRequestReceipt {
+    pub event: SessionEvent,
+    pub context: zuno_types::context_usage::ContextUsageTracker,
+}
+
 #[async_trait]
 pub trait TurnPersistence: Send + Sync {
+    async fn context_usage(
+        &self,
+        scope: &TurnStateScope,
+    ) -> Result<crate::context_usage::ContextUsageSeed, TurnError>;
+    async fn commit_context_usage(
+        &self,
+        scope: &TurnStateScope,
+        update: &zuno_types::context_usage::ContextUsageWrite,
+    ) -> Result<(), TurnError>;
+    /// Request admission, the initial assistant, bookkeeping and canonical
+    /// context state share the event's database-assigned logical sequence.
+    async fn start_provider_request(
+        &self,
+        scope: &TurnStateScope,
+        commit: ProviderRequestCommit,
+    ) -> Result<ProviderRequestReceipt, TurnError>;
+    /// Only consumed inputs with nonterminal execution receipts are eligible.
+    async fn applicable_inputs(
+        &self,
+        scope: &TurnStateScope,
+        candidates: &[String],
+    ) -> Result<Vec<String>, TurnError>;
+    async fn mark_inputs_applied(
+        &self,
+        scope: &TurnStateScope,
+        turn_id: &str,
+        input_ids: &[String],
+        at_ms: i64,
+    ) -> Result<(), TurnError>;
     async fn session(&self, scope: &TurnStateScope) -> Result<TurnSession, TurnError>;
     async fn clock(&self, scope: &TurnStateScope) -> Result<i64, TurnError>;
     async fn touch(&self, scope: &TurnStateScope) -> Result<(), TurnError>;

@@ -76,6 +76,7 @@ fn running() -> (
         .start(BackgroundExecutionInput {
             prepared: prepared(directory.path(), command),
             session_id: "session-a".to_owned(),
+            cycle_id: None,
             title: "preview server".to_owned(),
             command: command.to_owned(),
             purpose: BackgroundExecutionPurpose::Command,

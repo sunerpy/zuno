@@ -15,7 +15,7 @@ use zuno_db::message::{MessageRecord, MessageWithParts, PartRecord};
 use zuno_db::provider_backoff::ProviderBackoffCheckpoint;
 use zuno_types::identity::{InputId, SessionId, TurnId};
 
-pub const WORKER_PROTOCOL_VERSION: u32 = 2;
+pub const WORKER_PROTOCOL_VERSION: u32 = 3;
 pub const MAX_WORKER_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -81,6 +81,7 @@ pub struct AssistantWrite {
     pub message: StoredMessage,
     pub persisted_at_ms: i64,
     pub context_limit: Option<i64>,
+    pub context_usage: Option<zuno_types::context_usage::ContextUsageWrite>,
 }
 impl From<&AssistantCommit> for AssistantWrite {
     fn from(commit: &AssistantCommit) -> Self {
@@ -92,6 +93,7 @@ impl From<&AssistantCommit> for AssistantWrite {
             .into(),
             persisted_at_ms: commit.persisted_at_ms,
             context_limit: commit.context_limit,
+            context_usage: commit.context_usage.clone(),
         }
     }
 }
@@ -104,6 +106,7 @@ impl TryFrom<AssistantWrite> for AssistantCommit {
             parts: message.parts,
             persisted_at_ms: value.persisted_at_ms,
             context_limit: value.context_limit,
+            context_usage: value.context_usage,
         };
         zuno_db::assistant_commit::validate_commit(&commit, None, &[])
             .map_err(|_| TurnStateError::InvalidData)?;
@@ -113,8 +116,54 @@ impl TryFrom<AssistantWrite> for AssistantCommit {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderRequestWrite {
+    pub assistant: StoredMessage,
+    pub event: EventDraft,
+    pub estimated_prompt_tokens: u64,
+    pub context_limit: Option<u64>,
+    pub context: crate::context_usage::ContextRequestPreparation,
+}
+
+impl From<super::ProviderRequestCommit> for ProviderRequestWrite {
+    fn from(commit: super::ProviderRequestCommit) -> Self {
+        Self {
+            assistant: MessageWithParts {
+                info: commit.assistant,
+                parts: Vec::new(),
+            }
+            .into(),
+            event: commit.event.into(),
+            estimated_prompt_tokens: commit.estimated_prompt_tokens,
+            context_limit: commit.context_limit,
+            context: commit.context,
+        }
+    }
+}
+
+impl TryFrom<ProviderRequestWrite> for super::ProviderRequestCommit {
+    type Error = TurnStateError;
+    fn try_from(commit: ProviderRequestWrite) -> Result<Self, Self::Error> {
+        let assistant = MessageWithParts::try_from(commit.assistant)?;
+        if !assistant.parts.is_empty()
+            || assistant.info.role != zuno_db::message::MessageRole::Assistant
+        {
+            return Err(TurnStateError::InvalidData);
+        }
+        Ok(Self {
+            assistant: assistant.info,
+            event: commit.event.try_into()?,
+            estimated_prompt_tokens: commit.estimated_prompt_tokens,
+            context_limit: commit.context_limit,
+            context: commit.context,
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InputWrite {
     pub input_id: InputId,
+    pub turn_id: Option<TurnId>,
     pub message: StoredMessage,
 }
 impl TryFrom<InputMaterialization> for InputWrite {
@@ -124,6 +173,11 @@ impl TryFrom<InputMaterialization> for InputWrite {
             .map_err(|_| TurnStateError::InvalidData)?;
         Ok(Self {
             input_id,
+            turn_id: value
+                .turn_id
+                .map(TurnId::new)
+                .transpose()
+                .map_err(|_| TurnStateError::InvalidData)?,
             message: MessageWithParts {
                 info: value.message,
                 parts: value.parts,
@@ -141,6 +195,7 @@ impl TryFrom<InputWrite> for InputMaterialization {
         }
         Ok(Self {
             input_id: Some(value.input_id.to_string()),
+            turn_id: value.turn_id.map(String::from),
             message: message.info,
             parts: message.parts,
         })
@@ -247,6 +302,17 @@ impl From<EventReceipt> for SessionEvent {
 )]
 pub enum StateCommand {
     Session,
+    ContextUsage,
+    CommitContextUsage(Box<zuno_types::context_usage::ContextUsageWrite>),
+    StartProviderRequest(Box<ProviderRequestWrite>),
+    ApplicableInputs {
+        candidates: Vec<String>,
+    },
+    MarkInputsApplied {
+        turn_id: TurnId,
+        input_ids: Vec<InputId>,
+        at_ms: i64,
+    },
     Clock,
     Touch,
     RepairHistory,
@@ -258,7 +324,7 @@ pub enum StateCommand {
         known: DeveloperContexts,
     },
     ContextEpoch,
-    CommitAssistant(AssistantWrite),
+    CommitAssistant(Box<AssistantWrite>),
     AppendEvent {
         event: EventDraft,
         update: ProviderEventUpdate,
@@ -270,11 +336,11 @@ pub enum StateCommand {
     },
     ConsumeInput(InputWrite),
     ScheduleBackoff(ProviderBackoffCheckpoint),
-    BeginAdvance(AdvanceCall),
+    BeginAdvance(Box<AdvanceCall>),
     CommitAdvance {
-        request: AdvanceCall,
+        request: Box<AdvanceCall>,
         admission: Box<AdvanceAdmission>,
-        state: AdvanceState,
+        state: Box<AdvanceState>,
     },
 }
 
@@ -286,6 +352,12 @@ pub enum StateCommand {
     deny_unknown_fields
 )]
 pub enum StateReply {
+    ContextUsage(Box<crate::context_usage::ContextUsageSeed>),
+    ProviderRequest {
+        event: EventReceipt,
+        context: Box<zuno_types::context_usage::ContextUsageTracker>,
+    },
+    InputIds(Vec<String>),
     Done,
     Session {
         id: SessionId,
@@ -355,6 +427,47 @@ pub async fn execute(
     command: StateCommand,
 ) -> Result<StateReply, StateFailure> {
     Ok(match command {
+        StateCommand::ContextUsage => {
+            StateReply::ContextUsage(Box::new(provider.context_usage(scope).await?))
+        }
+        StateCommand::CommitContextUsage(update) => {
+            provider.commit_context_usage(scope, &update).await?;
+            StateReply::Done
+        }
+        StateCommand::StartProviderRequest(commit) => {
+            let receipt = provider
+                .start_provider_request(scope, super::ProviderRequestCommit::try_from(*commit)?)
+                .await?;
+            StateReply::ProviderRequest {
+                event: receipt.event.try_into()?,
+                context: Box::new(receipt.context),
+            }
+        }
+        StateCommand::ApplicableInputs { candidates } => {
+            if candidates.len() > 4096
+                || candidates
+                    .iter()
+                    .any(|id| id.is_empty() || id.len() > 1024 || id.contains('\0'))
+            {
+                return Err(TurnStateError::InvalidData.into());
+            }
+            StateReply::InputIds(provider.applicable_inputs(scope, &candidates).await?)
+        }
+        StateCommand::MarkInputsApplied {
+            turn_id,
+            input_ids,
+            at_ms,
+        } => {
+            provider
+                .mark_inputs_applied(
+                    scope,
+                    turn_id.as_str(),
+                    &input_ids.into_iter().map(String::from).collect::<Vec<_>>(),
+                    at_ms,
+                )
+                .await?;
+            StateReply::Done
+        }
         StateCommand::Session => {
             let session = provider.session(scope).await?;
             StateReply::Session {
@@ -398,7 +511,7 @@ pub async fn execute(
         StateCommand::ContextEpoch => StateReply::Integer(provider.context_epoch(scope).await?),
         StateCommand::CommitAssistant(commit) => {
             provider
-                .commit_assistant(scope, &AssistantCommit::try_from(commit)?)
+                .commit_assistant(scope, &AssistantCommit::try_from(*commit)?)
                 .await?;
             StateReply::Done
         }
@@ -434,7 +547,7 @@ pub async fn execute(
         }
         StateCommand::BeginAdvance(request) => StateReply::BeginAdvance(
             provider
-                .begin_advance(scope, &AdvanceRequest::try_from(request)?)
+                .begin_advance(scope, &AdvanceRequest::try_from(*request)?)
                 .await?,
         ),
         StateCommand::CommitAdvance {
@@ -445,9 +558,9 @@ pub async fn execute(
             provider
                 .commit_advance(
                     scope,
-                    &AdvanceRequest::try_from(request)?,
+                    &AdvanceRequest::try_from(*request)?,
                     &admission,
-                    state,
+                    *state,
                 )
                 .await?,
         ),

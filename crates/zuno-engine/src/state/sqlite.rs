@@ -43,6 +43,147 @@ fn conflict(id: &str, detail: &str) -> TurnError {
 
 #[async_trait]
 impl TurnPersistence for SqliteTurnPersistence<'_> {
+    async fn mark_inputs_applied(
+        &self,
+        scope: &TurnStateScope,
+        turn_id: &str,
+        input_ids: &[String],
+        at_ms: i64,
+    ) -> Result<(), TurnError> {
+        self.with(scope, |connection| {
+            let transaction = open::immediate_transaction(connection)?;
+            zuno_db::input_receipt::bind_turn_in(
+                &transaction,
+                &scope.session_id,
+                input_ids,
+                turn_id,
+                at_ms,
+            )?;
+            zuno_db::input_receipt::mark_applied_in(
+                &transaction,
+                &scope.session_id,
+                input_ids,
+                turn_id,
+                at_ms,
+            )?;
+            transaction.commit().map_err(open::map_error)?;
+            Ok(())
+        })
+    }
+
+    async fn context_usage(
+        &self,
+        scope: &TurnStateScope,
+    ) -> Result<crate::context_usage::ContextUsageSeed, TurnError> {
+        self.with(scope, |connection| {
+            let session = session::get_owned(connection, &scope.session_id, &scope.owner)?;
+            Ok(crate::context_usage::ContextUsageRecorder::load(connection, &session)?.seed())
+        })
+    }
+
+    async fn commit_context_usage(
+        &self,
+        scope: &TurnStateScope,
+        update: &zuno_types::context_usage::ContextUsageWrite,
+    ) -> Result<(), TurnError> {
+        self.with(scope, |connection| {
+            if update.tracker.snapshot().session_id != scope.session_id {
+                return Err(super::TurnStateError::Conflict.into());
+            }
+            let transaction = open::immediate_transaction(connection)?;
+            zuno_db::context_usage::commit_in(&transaction, update)?;
+            transaction.commit().map_err(open::map_error)?;
+            Ok(())
+        })
+    }
+
+    async fn start_provider_request(
+        &self,
+        scope: &TurnStateScope,
+        commit: ProviderRequestCommit,
+    ) -> Result<ProviderRequestReceipt, TurnError> {
+        self.with(scope, |connection| {
+            if commit.assistant.session_id != scope.session_id
+                || commit.context.before.tracker.snapshot().session_id != scope.session_id
+                || commit.event.event_type != "session.provider.request"
+                || commit
+                    .event
+                    .properties
+                    .get("requestID")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(commit.context.identity.request_id.as_str())
+                || commit
+                    .assistant
+                    .data
+                    .get("requestID")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(commit.context.identity.request_id.as_str())
+            {
+                return Err(super::TurnStateError::Conflict.into());
+            }
+            let transaction = open::immediate_transaction(connection)?;
+            let messages = MessageStore::new(&transaction);
+            if let Some(previous) = messages.find_message(&commit.assistant.id)?
+                && (previous.session_id != scope.session_id
+                    || previous.role != zuno_db::message::MessageRole::Assistant
+                    || previous.time_created != commit.assistant.time_created
+                    || previous.data.contains_key("requestID")
+                    || previous
+                        .data
+                        .get("time")
+                        .and_then(|time| time.get("completed"))
+                        .is_some())
+            {
+                return Err(super::TurnStateError::Conflict.into());
+            }
+            messages.put_message(&commit.assistant)?;
+            session::record_provider_request_started(
+                &transaction,
+                &scope.session_id,
+                commit.estimated_prompt_tokens,
+                commit.context_limit,
+            )?;
+            let event =
+                zuno_db::event_log::append_in(&transaction, &scope.session_id, commit.event)?;
+            let update = commit.context.with_sequence(
+                u64::try_from(event.sequence).map_err(|_| super::TurnStateError::InvalidData)?,
+            )?;
+            zuno_db::context_usage::commit_in(&transaction, &update)?;
+            transaction.commit().map_err(open::map_error)?;
+            Ok(ProviderRequestReceipt {
+                event,
+                context: update.tracker,
+            })
+        })
+    }
+
+    async fn applicable_inputs(
+        &self,
+        scope: &TurnStateScope,
+        candidates: &[String],
+    ) -> Result<Vec<String>, TurnError> {
+        self.with(scope, |connection| {
+            let mut eligible = Vec::new();
+            for id in candidates {
+                if let Some(receipt) =
+                    zuno_db::input_receipt::get_in(connection, &scope.session_id, id)?
+                    && (receipt.state.is_terminal()
+                        || receipt.state == zuno_types::admission::InputReceiptState::Applied)
+                {
+                    continue;
+                }
+                if let Some(input) = zuno_db::inbox::read_in(connection, &scope.session_id, id)?
+                    && input.state == zuno_db::inbox::SubmissionState::Consumed
+                {
+                    eligible.push(id.clone());
+                }
+            }
+            eligible.sort();
+            eligible.dedup();
+            Ok(eligible)
+        })
+    }
+
     async fn session(&self, scope: &TurnStateScope) -> Result<TurnSession, TurnError> {
         self.with(scope, |connection| {
             let session = session::get_owned(connection, &scope.session_id, &scope.owner)?;
@@ -298,6 +439,15 @@ impl TurnPersistence for SqliteTurnPersistence<'_> {
                         input_id,
                         "input is not available for consumed settlement",
                     ));
+                }
+                if let Some(turn_id) = &input.turn_id {
+                    zuno_db::input_receipt::bind_turn_in(
+                        &transaction,
+                        &scope.session_id,
+                        std::slice::from_ref(input_id),
+                        turn_id,
+                        created,
+                    )?;
                 }
             }
             store.put_message_at(&input.message, created)?;

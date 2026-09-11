@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use zuno_engine::r#loop::TurnEvent;
 use zuno_types::UsageSnapshot;
+use zuno_types::context_usage::{ContextUsageSnapshot, ContextUsageSource};
 
 const CHILD_PROMPT_PLACEHOLDER: &str = "message this child";
 
@@ -73,7 +74,7 @@ impl LiveSessions {
     }
 
     fn publish(&self, opened: LiveSessionOpen, running: bool) {
-        let mut transcript = Transcript::new();
+        let mut transcript = Transcript::for_session(&opened.session_id, ContextUsageSource::Child);
         if let Some(usage) = opened.usage {
             transcript.restore_usage(usage);
         }
@@ -145,6 +146,24 @@ impl LiveSessions {
             }
         }
         changed
+    }
+
+    /// Apply a durable child-context snapshot without remounting a parent or host.
+    pub fn set_context_usage(&self, snapshot: ContextUsageSnapshot) -> bool {
+        let mut state = self.lock();
+        let session_id = snapshot.session_id.clone();
+        let Some(session) = state.sessions.get_mut(&session_id) else {
+            return false;
+        };
+        if !session.transcript.set_context_usage(snapshot) {
+            return false;
+        }
+        state.generation = state.generation.wrapping_add(1);
+        let generation = state.generation;
+        if let Some(session) = state.sessions.get_mut(&session_id) {
+            session.generation = generation;
+        }
+        true
     }
 
     /// The newest immutable state for `session_id`.

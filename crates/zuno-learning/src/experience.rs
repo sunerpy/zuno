@@ -169,17 +169,18 @@ impl ExperienceService {
         // Extraction has no resident-memory side effects. Only a completed job's
         // source-validated experiences and raw hints can enter consolidation.
         // Stable ordinals keep interrupted extraction retries idempotent.
-        let experiences = self
-            .store
-            .record_extraction(job_id, lease, &new_experiences, now)?;
         if let Some(object) = result.as_object_mut() {
             object.insert(
                 "unverifiedExperienceIds".to_owned(),
                 json!(
-                    experiences
+                    new_experiences
                         .iter()
-                        .filter(|experience| !experience.verified_sources())
-                        .map(|experience| &experience.projection.id)
+                        .filter(|experience| experience.evidence.is_empty()
+                            || experience
+                                .evidence
+                                .iter()
+                                .any(|evidence| !evidence.verified))
+                        .map(|experience| &experience.id)
                         .collect::<Vec<_>>()
                 ),
             );
@@ -200,7 +201,7 @@ impl ExperienceService {
         for memory in extraction.memories {
             let Some(linked) = stored_by_ordinal
                 .get(&memory.experience_ordinal)
-                .map(|position| &experiences[*position])
+                .map(|position| &new_experiences[*position])
             else {
                 // Its experience was refused, so there is nothing to attach the
                 // candidate to. Reported rather than dropped: a Memory that never
@@ -230,15 +231,15 @@ impl ExperienceService {
                     detail: detail.clone(),
                 });
                 memory_hints.push(MemoryHintResult {
-                    experience_id: Some(linked.projection.id.clone()),
+                    experience_id: Some(linked.id.clone()),
                     hint: None,
                     rejected_reason: Some(format!("{field}: {detail}")),
                 });
                 continue;
             }
-            if !linked.projection.kind.promotable() {
+            if !linked.kind.promotable() {
                 memory_hints.push(MemoryHintResult {
-                    experience_id: Some(linked.projection.id.clone()),
+                    experience_id: Some(linked.id.clone()),
                     hint: None,
                     rejected_reason: Some(
                         "unresolved issues cannot become Memory or Skill".to_owned(),
@@ -247,7 +248,7 @@ impl ExperienceService {
                 continue;
             }
             memory_hints.push(MemoryHintResult {
-                experience_id: Some(linked.projection.id.clone()),
+                experience_id: Some(linked.id.clone()),
                 hint: Some(memory),
                 rejected_reason: None,
             });
@@ -262,7 +263,9 @@ impl ExperienceService {
         {
             object.insert("refusedItems".to_owned(), refusals_value(&refusals));
         }
-        self.store.finish_extraction(job_id, lease, &result, now)?;
+        let experiences =
+            self.store
+                .complete_extraction(job_id, lease, &new_experiences, &result, now)?;
         Ok(ExtractionPersistence {
             experiences,
             memory_hints,
@@ -298,6 +301,12 @@ impl ExperienceService {
         now: i64,
     ) -> Result<ValidatedExtraction> {
         extraction.validate_bounds()?;
+        if !self.jobs.sources_current(job_id)? {
+            return Err(invalid(
+                "job.sources",
+                "closed source changed or was forgotten before extraction committed",
+            ));
+        }
         let job = self.jobs.get(job_id)?;
         let project_id = job.project_id.ok_or_else(|| {
             invalid(
@@ -825,7 +834,7 @@ mod tests {
                        (id, project_id, slug, directory, title, version, time_created, time_updated)
                      VALUES ('session-1', 'project-1', 'slug', '/workspace', 'title', '1', 1, 1);
                      INSERT INTO message (id, session_id, time_created, time_updated, data)
-                     VALUES ('assistant-1', 'session-1', 1, 1, '{\"role\":\"assistant\"}');",
+                     VALUES ('assistant-1', 'session-1', 1, 1, '{\"role\":\"assistant\",\"finish\":\"stop\",\"time\":{\"completed\":1}}');",
                 )
                 .expect("fixture");
         }

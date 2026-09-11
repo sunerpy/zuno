@@ -207,6 +207,164 @@ pub enum ProviderError {
 }
 
 impl ProviderError {
+    /// Bounded diagnostic text, never a recovery classifier.
+    /// Causes retain the provider's actual reason instead of only the taxonomy label.
+    #[must_use]
+    pub fn diagnostic(&self) -> String {
+        use std::error::Error as _;
+        let mut text = bounded_display(self);
+        let mut source = self.source();
+        for _ in 0..8 {
+            let Some(cause) = source else { break };
+            text.push_str(": ");
+            text.push_str(&bounded_display(cause));
+            source = cause.source();
+        }
+        Self::sanitize_diagnostic(&text, &[])
+    }
+
+    /// Structured wire metadata when the adapter captured it. Missing metadata
+    /// stays missing; rendered prose is never parsed to infer a code or request id.
+    #[must_use]
+    pub fn diagnostic_fields(&self) -> serde_json::Value {
+        use std::error::Error as _;
+        let mut source = self.source();
+        for _ in 0..8 {
+            let Some(cause) = source else { break };
+            if let Some(wire) = cause.downcast_ref::<HttpDiagnostic>() {
+                return serde_json::json!({
+                    "status":wire.status,"code":wire.code,
+                    "requestID":wire.request_id,"reason":wire.reason,
+                });
+            }
+            source = cause.source();
+        }
+        let status = match self {
+            Self::Transient { status, .. } | Self::Fatal { status, .. } => *status,
+            _ => None,
+        };
+        let code = match self {
+            Self::Stream { code, .. } => Some(code.as_str()),
+            Self::Protocol { code, .. } => Some(code.as_str()),
+            _ => None,
+        };
+        serde_json::json!({
+            "status":status,"code":code,"requestID":null,"reason":self.diagnostic()
+        })
+    }
+
+    /// Attach facts read from a bounded HTTP response without changing recovery.
+    #[must_use]
+    pub fn with_http_diagnostic(
+        mut self,
+        status: u16,
+        code: Option<&str>,
+        request_id: Option<&str>,
+        reason: Option<&str>,
+        credentials: &[&str],
+    ) -> Self {
+        let clean = |text: &str, max: usize| {
+            let text = Self::sanitize_diagnostic(text, credentials);
+            text[..text.floor_char_boundary(text.len().min(max))].to_owned()
+        };
+        let detail = HttpDiagnostic {
+            status,
+            code: code.map(|text| clean(text, 192)),
+            request_id: request_id.map(|text| clean(text, 256)),
+            reason: reason.map(|text| clean(text, 3_072)),
+        };
+        match &mut self {
+            Self::Transient { source, .. }
+            | Self::Fatal { source, .. }
+            | Self::Auth { source, .. } => {
+                *source = Some(Box::new(detail));
+            }
+            Self::Refused { provider_text, .. } => {
+                *provider_text = detail.reason;
+            }
+            _ => {}
+        }
+        self
+    }
+
+    /// Remove adapter-owned secrets before a transport failure crosses its boundary.
+    #[must_use]
+    pub fn redacted(mut self, credentials: &[&str]) -> Self {
+        match &mut self {
+            Self::Transient { source, .. }
+            | Self::Fatal { source, .. }
+            | Self::Auth { source, .. }
+            | Self::Stream { source, .. }
+            | Self::Protocol { source, .. } => {
+                if let Some(cause) = source.take() {
+                    if let Some(wire) = cause.downcast_ref::<HttpDiagnostic>() {
+                        *source = Some(Box::new(HttpDiagnostic {
+                            status: wire.status,
+                            code: wire
+                                .code
+                                .as_deref()
+                                .map(|s| Self::sanitize_diagnostic(s, credentials)),
+                            request_id: wire
+                                .request_id
+                                .as_deref()
+                                .map(|s| Self::sanitize_diagnostic(s, credentials)),
+                            reason: wire
+                                .reason
+                                .as_deref()
+                                .map(|s| Self::sanitize_diagnostic(s, credentials)),
+                        }));
+                    } else {
+                        *source = Some(Box::new(DiagnosticText(Self::sanitize_diagnostic(
+                            &bounded_display(cause.as_ref()),
+                            credentials,
+                        ))));
+                    }
+                }
+            }
+            Self::Refused { provider_text, .. } => {
+                *provider_text = provider_text
+                    .as_deref()
+                    .map(|text| Self::sanitize_diagnostic(text, credentials));
+            }
+            _ => {}
+        }
+        self
+    }
+
+    /// Scrub complete text before clipping, including exact reflected credentials,
+    /// JSON credential fields, and common inline authorization assignments.
+    #[must_use]
+    pub fn sanitize_diagnostic(text: &str, credentials: &[&str]) -> String {
+        let mut text = text.to_owned();
+        for secret in credentials
+            .iter()
+            .copied()
+            .filter(|secret| !secret.is_empty())
+        {
+            text = text.replace(secret, "<redacted>");
+            let escaped = serde_json::to_string(secret).expect("strings serialize");
+            text = text.replace(&escaped[1..escaped.len() - 1], "<redacted>");
+            if let Some((scheme, token)) = secret.split_once(' ')
+                && matches!(scheme.to_ascii_lowercase().as_str(), "bearer" | "basic")
+                && !token.is_empty()
+            {
+                text = text.replace(token, "<redacted>");
+            }
+        }
+        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&text) {
+            scrub_json(&mut value);
+            text = value.to_string();
+        }
+        text = scrub_inline(text);
+        // Control characters must not inject terminal escapes or forged log lines.
+        text = text
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        text.truncate(text.floor_char_boundary(text.len().min(4_096)));
+        text
+    }
+
     /// Classify a wire status code into the taxonomy.
     ///
     /// This is the single place a status code becomes a recovery class, so the
@@ -309,6 +467,173 @@ impl ProviderError {
     pub const fn permits_partial_output_retry(&self) -> bool {
         matches!(self, Self::Stream { .. })
     }
+}
+
+#[derive(Debug)]
+struct HttpDiagnostic {
+    status: u16,
+    code: Option<String>,
+    request_id: Option<String>,
+    reason: Option<String>,
+}
+
+impl fmt::Display for HttpDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "HTTP {}", self.status)?;
+        if let Some(code) = &self.code {
+            write!(f, " code={code}")?;
+        }
+        if let Some(id) = &self.request_id {
+            write!(f, " requestID={id}")?;
+        }
+        if let Some(reason) = &self.reason {
+            write!(f, " reason={reason}")?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for HttpDiagnostic {}
+
+#[derive(Debug)]
+struct DiagnosticText(String);
+impl fmt::Display for DiagnosticText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for DiagnosticText {}
+
+fn bounded_display(value: &(impl fmt::Display + ?Sized)) -> String {
+    struct Bounded(String);
+    impl fmt::Write for Bounded {
+        fn write_str(&mut self, value: &str) -> fmt::Result {
+            if self.0.len().saturating_add(value.len()) > 16_384 {
+                return Err(fmt::Error);
+            }
+            self.0.push_str(value);
+            Ok(())
+        }
+    }
+    let mut output = Bounded(String::new());
+    if fmt::write(&mut output, format_args!("{value}")).is_err() {
+        return "[provider diagnostic exceeded its source limit]".to_owned();
+    }
+    output.0
+}
+
+fn sensitive_diagnostic_key(key: &str) -> bool {
+    let key = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "authorization"
+            | "proxyauthorization"
+            | "apikey"
+            | "xapikey"
+            | "token"
+            | "accesstoken"
+            | "refreshtoken"
+            | "password"
+            | "secret"
+            | "clientsecret"
+            | "credential"
+            | "cookie"
+            | "setcookie"
+    )
+}
+
+fn scrub_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, value) in object {
+                if sensitive_diagnostic_key(key) {
+                    *value = serde_json::json!("<redacted>");
+                } else {
+                    scrub_json(value);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                scrub_json(value);
+            }
+        }
+        serde_json::Value::String(text) => *text = scrub_inline(std::mem::take(text)),
+        _ => {}
+    }
+}
+
+fn scrub_inline(mut text: String) -> String {
+    for marker in [
+        "bearer ",
+        "basic ",
+        "authorization",
+        "api_key",
+        "api-key",
+        "apikey",
+        "access_token",
+        "refresh_token",
+        "password",
+        "client_secret",
+        "credential",
+        "token",
+    ] {
+        let mut cursor = 0;
+        loop {
+            let lower = text.to_ascii_lowercase();
+            let Some(relative) = lower[cursor..].find(marker) else {
+                break;
+            };
+            let offset = cursor + relative;
+            let after = offset + marker.len();
+            cursor = after;
+            if offset > 0 && text.as_bytes()[offset - 1].is_ascii_alphanumeric() {
+                continue;
+            }
+            let mut start = after;
+            if !marker.ends_with(' ') {
+                while matches!(
+                    text.as_bytes().get(start),
+                    Some(b' ' | b'\t' | b'"' | b'\'')
+                ) {
+                    start += 1;
+                }
+                if !matches!(text.as_bytes().get(start), Some(b'=' | b':')) {
+                    continue;
+                }
+                start += 1;
+                while matches!(text.as_bytes().get(start), Some(b' ' | b'\t')) {
+                    start += 1;
+                }
+            }
+            let quote = match text.as_bytes().get(start) {
+                Some(b'"' | b'\'') => {
+                    let quote = text.as_bytes()[start];
+                    start += 1;
+                    Some(quote)
+                }
+                _ => None,
+            };
+            let end = text[start..]
+                .char_indices()
+                .find_map(|(i, c)| {
+                    let end = quote.map_or_else(
+                        || c.is_whitespace() || matches!(c, ',' | ';' | '}' | ']' | '"' | '\''),
+                        |quote| c == char::from(quote),
+                    );
+                    end.then_some(start + i)
+                })
+                .unwrap_or(text.len());
+            if end > start {
+                text.replace_range(start..end, "<redacted>");
+                cursor = start + "<redacted>".len();
+            }
+        }
+    }
+    text
 }
 
 impl Recoverable for ProviderError {

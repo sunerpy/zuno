@@ -339,6 +339,15 @@ impl SessionInbox {
         Self { pool }
     }
 
+    /// Revalidate the current row and the shared scheduling gate before waking.
+    pub fn wake_admission(
+        &self,
+        input: &SessionInput,
+    ) -> Result<zuno_types::execution::WakeAdmission, DbError> {
+        let connection = self.pool.get()?;
+        crate::session_wake::pending_admission_in(&connection, input)
+    }
+
     /// Admit an input and its event in one transaction.
     ///
     /// # Errors
@@ -526,15 +535,9 @@ impl SessionInbox {
                 {
                     continue;
                 }
-                let input_id = input.id.clone();
-                let claimed =
-                    promote_selected(transaction, session_id, Some(input))?.ok_or_else(|| {
-                        conflict(
-                            &input_id,
-                            "the pending report vanished while the batch was being promoted",
-                        )
-                    })?;
-                promoted.push(claimed);
+                if let Some(claimed) = promote_selected(transaction, session_id, Some(input))? {
+                    promoted.push(claimed);
+                }
             }
             Ok(promoted)
         })
@@ -667,6 +670,7 @@ impl SessionInbox {
 }
 
 pub(crate) fn validate_input(input: &NewSessionInput) -> Result<(), DbError> {
+    crate::input_receipt::validate_client_key(input)?;
     if input.id.trim().is_empty() || input.session_id.trim().is_empty() {
         return Err(query_error(std::io::Error::other(
             "input id and session id must not be empty",
@@ -706,6 +710,8 @@ pub fn admit_in(
     if let Some(source_key) = input.source_key.as_deref()
         && let Some(existing) = select_by_source_key(transaction, &input.session_id, source_key)?
     {
+        crate::input_receipt::validate_client_replay(&existing, &input)?;
+        crate::input_receipt::ensure_in(transaction, &existing)?;
         return Ok(existing);
     }
     let event = append_in(
@@ -735,7 +741,7 @@ pub fn admit_in(
             ],
         )
         .map_err(open::map_error)?;
-    Ok(SessionInput {
+    let admitted = SessionInput {
         id: input.id,
         session_id: input.session_id,
         prompt: input.prompt,
@@ -750,7 +756,9 @@ pub fn admit_in(
         error: None,
         time_created: input.time_created,
         time_updated: input.time_created,
-    })
+    };
+    crate::input_receipt::ensure_in(transaction, &admitted)?;
+    Ok(admitted)
 }
 
 /// Admit and immediately promote one driver-owned input in the caller's transaction.
@@ -783,35 +791,17 @@ fn select_next(
     session_id: &str,
     delivery: Option<InputDelivery>,
 ) -> Result<Option<SessionInput>, DbError> {
-    let stored = match delivery {
-        Some(delivery) => transaction
-            .query_row(
-                "SELECT id, session_id, prompt, delivery, state, revision, admitted_seq, \
-                        promoted_seq, error, source_key, trigger_kind, cycle_id, \
-                        time_created, time_updated \
-                 FROM session_input \
-                 WHERE session_id = ?1 AND state IN ('queued', 'steering') AND delivery = ?2 \
-                 ORDER BY admitted_seq LIMIT 1",
-                params![session_id, delivery.as_str()],
-                decode_stored_input,
-            )
-            .optional()
-            .map_err(open::map_error)?,
-        None => transaction
-            .query_row(
-                "SELECT id, session_id, prompt, delivery, state, revision, admitted_seq, \
-                        promoted_seq, error, source_key, trigger_kind, cycle_id, \
-                        time_created, time_updated \
-                 FROM session_input \
-                 WHERE session_id = ?1 AND state IN ('queued', 'steering') \
-                 ORDER BY admitted_seq LIMIT 1",
-                [session_id],
-                decode_stored_input,
-            )
-            .optional()
-            .map_err(open::map_error)?,
-    };
-    stored.map(decode_input).transpose()
+    for input in pending_in(transaction, session_id)? {
+        if delivery.is_some_and(|delivery| input.delivery != delivery) {
+            continue;
+        }
+        if crate::session_wake::admission_in(transaction, &input)?
+            != zuno_types::execution::WakeAdmission::Reject
+        {
+            return Ok(Some(input));
+        }
+    }
+    Ok(None)
 }
 
 fn promote_selected(
@@ -822,6 +812,20 @@ fn promote_selected(
     let Some(mut input) = input else {
         return Ok(None);
     };
+    match crate::session_wake::admission_in(transaction, &input)? {
+        zuno_types::execution::WakeAdmission::Reject => return Ok(None),
+        zuno_types::execution::WakeAdmission::Resume => {
+            if let Some(signal) = crate::session_wake::signal_in(transaction, &input)? {
+                crate::session_execution::admit_wake_in(
+                    transaction,
+                    session_id,
+                    &signal,
+                    crate::message::now_millis(),
+                )?;
+            }
+        }
+        zuno_types::execution::WakeAdmission::Admit => {}
+    }
     let previous_revision = input.revision;
     input.state = SubmissionState::Promoted;
     input.revision = input.revision.saturating_add(1);
@@ -1036,6 +1040,15 @@ fn select_by_source_key(
         .transpose()
 }
 
+/// Resolve one idempotent producer identity inside a caller-owned transaction.
+pub fn read_by_source_key_in(
+    connection: &rusqlite::Connection,
+    session_id: &str,
+    source_key: &str,
+) -> Result<Option<SessionInput>, DbError> {
+    select_by_source_key(connection, session_id, source_key)
+}
+
 /// Read one input through a caller-owned SQLite connection or transaction.
 ///
 /// This is the transactional counterpart to [`SessionInbox::get`]. It lets a
@@ -1166,6 +1179,7 @@ fn cancel_pending_in(
         )
         .map_err(open::map_error)?;
     require_changed(input_id, changed)?;
+    crate::input_receipt::sync_input_in(transaction, &input)?;
     Ok(input)
 }
 
@@ -1246,6 +1260,7 @@ pub(crate) fn transition_in(
         )
         .map_err(open::map_error)?;
     require_changed(input_id, changed)?;
+    crate::input_receipt::sync_input_in(transaction, &input)?;
     Ok(Some(input))
 }
 

@@ -82,6 +82,29 @@ its state under the private Zuno data directory. `--background-list` never start
 missing supervisor. Normal TUI exit still requires two matching `Ctrl+C` or `Ctrl+D`
 presses within 1.5 seconds; that exits the retained child, whereas `Ctrl+]` only detaches.
 
+## Question and resume commands
+
+Enter these commands inside the TUI:
+
+| Command | Behavior |
+| --- | --- |
+| `/questions` or `/questions list` | Show pending requests, saved drafts, and confirmed-answer counts |
+| `/questions open <request-id>` or `/questions <request-id>` | Reopen one request with its stored answers and draft values |
+| `/resume` | Explicitly resume paused or completed Work in the current session |
+
+`Ctrl+S` in a question form saves a durable draft. Even a fully populated draft remains
+pending; draft text is not sent to the model. Reopening the same session restores saved
+drafts after a restart. Only explicit submission commits answers, which enter the durable
+FIFO once. Deferral and empty replies enqueue no model input.
+
+Plan approval requires an explicit `approve` decision and, for a Draft review, a nonempty
+risk reason. Neither a highlighted choice nor a saved approval draft starts Work.
+`/resume` cannot bypass Plan approval or a required human/external wait. Use `/goal resume`
+first when the Goal itself is inactive.
+
+Use `/session`, `/sessions`, or `/continue` to choose a saved session. The full question
+workflow is described in [The terminal application](/guide/tui).
+
 ## See also
 
 - [Global options](/cli/global-options)

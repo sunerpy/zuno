@@ -48,7 +48,7 @@ async fn an_admitted_invocation_cannot_change_parameters_reexecute_or_replace_it
                 "id":"assistant","sessionID":"session","role":"assistant","time":{"created":10}
             })).expect("assistant"),
             parts: vec![part(json!({"status":"pending","input":{"command":"inspect"},"dispatchTracked":true}))],
-            persisted_at_ms:10,context_limit:None,
+            persisted_at_ms:10,context_limit:None,context_usage:None,
         }).await.expect("assistant step");
         let changed =
             part(json!({"status":"pending","input":{"command":"different"},"dispatchedAtMs":20}));
@@ -175,7 +175,7 @@ async fn a_failed_parallel_result_batch_preserves_every_previous_part() {
                 "id":"assistant","sessionID":"session","role":"assistant","time":{"created":10}
             })).unwrap(),
             parts: vec![first.clone(), second.clone()],
-            persisted_at_ms:10, context_limit:None,
+            persisted_at_ms:10, context_limit:None,context_usage:None,
         }).await.unwrap();
     }
     connection

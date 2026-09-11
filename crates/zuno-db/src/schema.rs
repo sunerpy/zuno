@@ -5,13 +5,20 @@ use rusqlite::Transaction;
 use zuno_error::DbError;
 
 /// Number of application tables created by the current schema's single `up`.
-pub const TABLE_COUNT: usize = 51;
+pub const TABLE_COUNT: usize = 56;
 
 const MEMORY_RUNTIME_SCHEMA_SQL: &str = include_str!("schema/memory_runtime.sql");
 const AUTOMATIC_MEMORY_SCHEMA_SQL: &str = include_str!("schema/automatic_memory.sql");
 const SESSION_OWNERSHIP_SCHEMA_SQL: &str = include_str!("schema/session_ownership.sql");
 const RUNTIME_JOBS_SCHEMA_SQL: &str = include_str!("schema/runtime_jobs.sql");
+pub(crate) const PREVIEW_SCHEMA_SQL: &str = include_str!("schema/preview.sql");
 const ROOT_JOB_SCHEMA_SQL: &str = include_str!("schema/agent_job_root.sql");
+
+const QUESTIONS_SCHEMA_SQL: &str = include_str!("schema/questions.sql");
+const SCHEDULING_SCHEMA_SQL: &str = include_str!("schema/scheduling.sql");
+const GOAL_RESUME_SCHEMA_SQL: &str = include_str!("schema/goal_resume.sql");
+const INPUT_RECEIPT_SCHEMA_SQL: &str = include_str!("schema/input_receipt.sql");
+const CONTEXT_USAGE_SCHEMA_SQL: &str = include_str!("schema/context_usage.sql");
 
 const CORE_SCHEMA_SQL: &str = r#"
 CREATE TABLE `workspace` (
@@ -793,6 +800,10 @@ pub(crate) fn declared_tables() -> Vec<&'static str> {
         AUTOMATIC_MEMORY_SCHEMA_SQL,
         SESSION_OWNERSHIP_SCHEMA_SQL,
         RUNTIME_JOBS_SCHEMA_SQL,
+        QUESTIONS_SCHEMA_SQL,
+        PREVIEW_SCHEMA_SQL,
+        INPUT_RECEIPT_SCHEMA_SQL,
+        CONTEXT_USAGE_SCHEMA_SQL,
     ]
     .into_iter()
     .flat_map(declared_tables_in)
@@ -826,8 +837,14 @@ pub fn up(transaction: &Transaction<'_>) -> Result<(), DbError> {
     up_execution(transaction)?;
     up_memory_runtime(transaction)?;
     up_automatic_memory(transaction)?;
+    up_questions(transaction)?;
+    up_scheduling(transaction)?;
+    up_runtime_consistency(transaction)?;
     up_session_ownership(transaction)?;
-    up_runtime_jobs(transaction)
+    up_runtime_jobs(transaction)?;
+    transaction
+        .execute_batch(PREVIEW_SCHEMA_SQL)
+        .map_err(migration::map_error)
 }
 
 /// Add the learning-flywheel tables to a format-5 database.
@@ -1009,6 +1026,58 @@ fn job_upgrade_error(detail: &str) -> DbError {
         format: migration::CURRENT_FORMAT,
         source: Box::new(std::io::Error::other(detail.to_owned())),
     }
+}
+
+/// Add question companion metadata and the per-request command receipt ledger.
+///
+/// Existing human-request payloads and responses remain in `human_request`.
+/// The migration caller backfills companion metadata in this same transaction
+/// before advancing the format marker.
+///
+/// # Errors
+///
+/// [`DbError::Schema`] if SQLite rejects any DDL statement.
+pub fn up_questions(transaction: &Transaction<'_>) -> Result<(), DbError> {
+    transaction
+        .execute_batch(QUESTIONS_SCHEMA_SQL)
+        .map_err(migration::map_error)
+}
+
+/// Append nullable session scheduling without rewriting historical execution
+/// rows. The migration caller repairs structured no-progress pauses in the same
+/// transaction before advancing the format marker.
+pub(crate) fn up_scheduling(transaction: &Transaction<'_>) -> Result<(), DbError> {
+    transaction
+        .execute_batch(SCHEDULING_SCHEMA_SQL)
+        .map_err(migration::map_error)
+}
+
+/// Format 14 keeps received/history-recorded input distinct from model execution.
+/// Legacy rows gain only facts their inbox state proves; no Goal is resumed.
+pub(crate) fn up_runtime_consistency(transaction: &Transaction<'_>) -> Result<(), DbError> {
+    transaction
+        .execute_batch(GOAL_RESUME_SCHEMA_SQL)
+        .map_err(migration::map_error)?;
+    transaction
+        .execute_batch(INPUT_RECEIPT_SCHEMA_SQL)
+        .map_err(migration::map_error)?;
+    transaction
+        .execute_batch(CONTEXT_USAGE_SCHEMA_SQL)
+        .map_err(migration::map_error)?;
+    transaction
+        .execute_batch(
+            "INSERT INTO session_input_receipt
+               (input_id,state,delivery,completed_at,error,time_updated)
+             SELECT id,
+               CASE state WHEN 'consumed' THEN 'recorded'
+                          WHEN 'cancelled' THEN 'cancelled'
+                          WHEN 'failed' THEN 'failed' ELSE 'admitted' END,
+               delivery,
+               CASE WHEN state IN ('cancelled','failed') THEN time_updated ELSE NULL END,
+               error,time_updated
+             FROM session_input;",
+        )
+        .map_err(migration::map_error)
 }
 
 /// Add durable suspended/completed Plan frames to a format-6 database.

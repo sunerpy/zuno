@@ -156,6 +156,16 @@ impl Transport for ReqwestTransport {
 
             let status = response.status();
             if !status.is_success() {
+                let request_id = [
+                    "x-request-id",
+                    "request-id",
+                    "x-amzn-requestid",
+                    "x-ms-request-id",
+                ]
+                .iter()
+                .find_map(|name| response.headers().get(*name))
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
                 let header = response
                     .headers()
                     .get(reqwest::header::RETRY_AFTER)
@@ -169,12 +179,41 @@ impl Transport for ReqwestTransport {
                     .await??
                     .into_bytes();
                 let text = std::str::from_utf8(&bytes).ok().map(str::to_owned);
-                return Err(classify_response(
-                    &provider,
-                    status.as_u16(),
-                    header,
-                    text.as_deref(),
-                ));
+                let body = text
+                    .as_deref()
+                    .and_then(|text| serde_json::from_str::<Value>(text).ok());
+                let wire = body.as_ref().map(|body| body.get("error").unwrap_or(body));
+                let code = wire
+                    .and_then(|wire| wire.get("code").or_else(|| wire.get("type")))
+                    .and_then(|code| match code {
+                        Value::String(code) => Some(code.clone()),
+                        Value::Number(code) => Some(code.to_string()),
+                        _ => None,
+                    });
+                let body_request_id = body.as_ref().and_then(|body| {
+                    ["request_id", "requestID", "requestId"]
+                        .iter()
+                        .find_map(|name| body.get(*name).and_then(Value::as_str))
+                });
+                let reason = wire
+                    .and_then(|wire| wire.get("message"))
+                    .and_then(Value::as_str)
+                    .or(text.as_deref());
+                let credentials = request
+                    .headers
+                    .values()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                return Err(
+                    classify_response(&provider, status.as_u16(), header, text.as_deref())
+                        .with_http_diagnostic(
+                            status.as_u16(),
+                            code.as_deref(),
+                            request_id.as_deref().or(body_request_id),
+                            reason,
+                            &credentials,
+                        ),
+                );
             }
 
             let body = Box::pin(response.bytes_stream());
@@ -247,7 +286,7 @@ pub fn classify_response(
     let detail = ResponseBody {
         provider: provider.to_owned(),
         status,
-        body: body.map(truncate),
+        body: body.map(|body| truncate(&ProviderError::sanitize_diagnostic(body, &[]))),
     };
     match ProviderError::from_status(provider, status) {
         ProviderError::Auth { provider, .. } => ProviderError::Auth {
@@ -437,6 +476,55 @@ mod tests {
         assert!(cut.len() <= BODY_LIMIT + 4, "{}", cut.len());
         assert!(cut.ends_with('…'));
         assert!(std::str::from_utf8(cut.as_bytes()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn http_failure_retains_wire_code_request_id_and_redacted_reason() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let received = socket.read(&mut request).await.unwrap();
+            assert!(request[..received].starts_with(b"POST "));
+            let body = r#"{"error":{"code":"unsupported_parameter","message":"service_tier is unsupported; reflected fixture-credential-value"}}"#;
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\
+                X-Request-ID: req_diagnostic_fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let transport = ReqwestTransport::new("fixture");
+        let result = transport
+            .send(HttpRequest {
+                url: format!("http://{address}/responses"),
+                headers: BTreeMap::from([(
+                    "authorization".to_owned(),
+                    "Bearer fixture-credential-value".to_owned(),
+                )]),
+                body: serde_json::json!({"model":"fixture-model"}),
+                timeouts: HttpTimeouts::default(),
+            })
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("fixture returns HTTP 400"),
+        };
+        server.await.unwrap();
+        assert_eq!(error.recovery(), Recovery::Fail);
+        let diagnostic = error.diagnostic_fields();
+        assert_eq!(diagnostic["status"], 400);
+        assert_eq!(diagnostic["code"], "unsupported_parameter");
+        assert_eq!(diagnostic["requestID"], "req_diagnostic_fixture");
+        assert!(
+            diagnostic["reason"]
+                .as_str()
+                .unwrap()
+                .contains("service_tier")
+        );
+        assert!(!diagnostic.to_string().contains("fixture-credential-value"));
+        assert!(!error.diagnostic().contains("fixture-credential-value"));
     }
 
     #[tokio::test]

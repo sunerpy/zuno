@@ -1,5 +1,10 @@
 //! Durable, idempotent work queue for extraction, aggregation, evaluation, and Skill changes.
 
+mod history;
+mod snapshot;
+
+pub use history::{LearningHistoryBatch, MAX_LEARNING_HISTORY_BATCH};
+
 use crate::event_log::query_error;
 use crate::{Pool, open};
 use rusqlite::{Connection, OptionalExtension as _, Row, params};
@@ -7,6 +12,9 @@ use serde_json::Value;
 use std::sync::Arc;
 use zuno_error::DbError;
 use zuno_types::SessionMemoryGeneration;
+
+pub const MAX_LEARNING_JOB_ATTEMPTS: u32 = 3;
+const MAX_CLAIM_CANDIDATES: i64 = 32;
 
 const COLUMNS: &str = "id, project_id, session_id, source_message_id, kind, extractor_version, \
     idempotency_key, status, attempt, owner_id, lease_expires, scheduled_at, payload, result, \
@@ -297,6 +305,20 @@ impl LearningJobStore {
             if generation != SessionMemoryGeneration::Enabled {
                 return Ok(ExtractionJobInsert::Blocked(generation));
             }
+            let forgotten: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM experience_record
+                 WHERE session_id=?1 AND source_message_id=?2 AND status='forgotten')",
+                    params![session_id, job.source_message_id],
+                    |row| row.get(0),
+                )
+                .map_err(open::map_error)?;
+            if forgotten {
+                return Ok(ExtractionJobInsert::Blocked(
+                    SessionMemoryGeneration::Excluded,
+                ));
+            }
+            snapshot::validate_new_on(transaction, &job)?;
             enqueue_in(transaction, &job, payload.as_deref())
                 .map(Box::new)
                 .map(ExtractionJobInsert::Admitted)
@@ -316,6 +338,7 @@ impl LearningJobStore {
             )));
         }
         self.pool.transaction(|transaction| {
+            settle_exhausted_on(transaction, None, now)?;
             let id = transaction
                 .query_row(
                     "SELECT id FROM learning_job
@@ -337,6 +360,7 @@ impl LearningJobStore {
             let Some(id) = id else {
                 return Ok(None);
             };
+            if !snapshot::validate_queued_on(transaction,&id,now)? {return Ok(None);}
             let changed = transaction
                 .execute(
                     "UPDATE learning_job
@@ -371,6 +395,7 @@ impl LearningJobStore {
             )));
         }
         self.pool.transaction(|transaction| {
+            settle_exhausted_on(transaction, Some(project_id), now)?;
             let id = transaction
                 .query_row(
                     "SELECT id FROM learning_job
@@ -394,6 +419,7 @@ impl LearningJobStore {
             let Some(id) = id else {
                 return Ok(None);
             };
+            if !snapshot::validate_queued_on(transaction,&id,now)? {return Ok(None);}
             let changed = transaction
                 .execute(
                     "UPDATE learning_job
@@ -471,8 +497,9 @@ impl LearningJobStore {
         }
         let busy_session_ids = serde_json::to_string(busy_session_ids).map_err(query_error)?;
         self.pool.transaction(|transaction| {
-            let id = transaction
-                .query_row(
+            settle_exhausted_on(transaction, Some(project_id), now)?;
+            let mut candidates = transaction
+                .prepare(
                     "SELECT learning_job.id FROM learning_job
                      WHERE learning_job.status = 'queued'
                        AND learning_job.scheduled_at <= ?1
@@ -505,9 +532,14 @@ impl LearningJobStore {
                              WHERE session_memory_policy.session_id = learning_job.session_id
                                AND session_memory_policy.generation <> 'enabled'
                            )
-                           AND NOT EXISTS (
-                             SELECT 1 FROM json_each(?4)
-                             WHERE json_each.value = learning_job.session_id
+                           AND (
+                             NOT EXISTS (
+                               SELECT 1 FROM json_each(?4)
+                               WHERE json_each.value = learning_job.session_id
+                             )
+                             OR (?3 = ?1
+                               AND json_extract(learning_job.payload,'$.sourceSnapshot.version')=1
+                               AND json_extract(learning_job.payload,'$.sourceSnapshot.allowBusy')=1)
                            )
                            AND (
                              json_extract(learning_job.payload, '$.trigger') = 'manual'
@@ -515,45 +547,64 @@ impl LearningJobStore {
                                COALESCE(
                                  json_extract(learning_job.payload, '$.trigger'),
                                  'automatic_post_turn'
-                               ) = 'automatic_post_turn'
-                               AND EXISTS (
-                                 SELECT 1 FROM session
-                                 WHERE session.id = learning_job.session_id
-                                   AND session.time_updated <= ?3
-                               )
-                               AND NOT EXISTS (
-                                 SELECT 1 FROM session_input
-                                 WHERE session_input.session_id = learning_job.session_id
-                                   AND session_input.state IN ('queued','steering','promoted')
+                               ) IN ('automatic_post_turn','legacy_reprocess')
+                               AND (
+                                 (?3 = ?1
+                                   AND json_extract(learning_job.payload,'$.sourceSnapshot.version')=1
+                                   AND json_extract(learning_job.payload,'$.sourceSnapshot.allowBusy')=1)
+                                 OR (
+                                   EXISTS (
+                                     SELECT 1 FROM session
+                                     WHERE session.id = learning_job.session_id
+                                       AND session.time_updated <= ?3
+                                   )
+                                   AND NOT EXISTS (
+                                     SELECT 1 FROM session_input
+                                     WHERE session_input.session_id = learning_job.session_id
+                                       AND session_input.state IN ('queued','steering','promoted')
+                                   )
+                                 )
                                )
                              )
                            )
                          )
                        )
-                     ORDER BY learning_job.scheduled_at, learning_job.time_created,
+                     ORDER BY CASE
+                       WHEN learning_job.kind='extraction'
+                         AND json_extract(learning_job.payload,'$.sourceSnapshot.version')=1
+                         AND json_extract(learning_job.payload,'$.trigger')<>'legacy_reprocess' THEN 0
+                       WHEN json_extract(learning_job.payload,'$.purpose')='memory' THEN 1
+                       ELSE 2 END,
+                              learning_job.scheduled_at, learning_job.time_created,
                               learning_job.id
-                     LIMIT 1",
-                    params![now, project_id, idle_before, busy_session_ids, memory_project_path],
+                     LIMIT ?6",
+                )
+                .map_err(open::map_error)?;
+            let ids = candidates
+                .query_map(
+                    params![now, project_id, idle_before, busy_session_ids, memory_project_path,
+                        MAX_CLAIM_CANDIDATES],
                     |row| row.get::<_, String>(0),
                 )
-                .optional()
+                .map_err(open::map_error)?
+                .collect::<Result<Vec<_>, _>>()
                 .map_err(open::map_error)?;
-            let Some(id) = id else {
-                return Ok(None);
-            };
-            let changed = transaction
-                .execute(
-                    "UPDATE learning_job
-                     SET status = 'running', attempt = attempt + 1, owner_id = ?2, lease_token = lower(hex(randomblob(16))),
-                         lease_expires = ?3, error = NULL, time_updated = ?4
-                     WHERE id = ?1 AND status = 'queued'",
-                    params![id, owner_id, lease_expires, now],
-                )
-                .map_err(open::map_error)?;
-            if changed != 1 {
-                return Ok(None);
+            drop(candidates);
+            for id in ids {
+                if !snapshot::validate_queued_on(transaction, &id, now)? {
+                    continue;
+                }
+                let changed = transaction.execute(
+                    "UPDATE learning_job SET status='running',attempt=attempt+1,owner_id=?2,
+                       lease_token=lower(hex(randomblob(16))),lease_expires=?3,error=NULL,time_updated=?4
+                     WHERE id=?1 AND status='queued' AND attempt<?5",
+                    params![id,owner_id,lease_expires,now,MAX_LEARNING_JOB_ATTEMPTS],
+                ).map_err(open::map_error)?;
+                if changed == 1 {
+                    return read_required(transaction, &id).map(Some);
+                }
             }
-            read_required(transaction, &id).map(Some)
+            Ok(None)
         })
     }
 
@@ -573,6 +624,9 @@ impl LearningJobStore {
             )));
         }
         self.pool.transaction(|transaction| {
+            if !snapshot::validate_queued_on(transaction, id, now)? {
+                return Ok(None);
+            }
             let changed = transaction
                 .execute(
                     "UPDATE learning_job
@@ -612,6 +666,9 @@ impl LearningJobStore {
             )));
         }
         self.pool.transaction(|transaction| {
+            if !snapshot::validate_queued_on(transaction, id, now)? {
+                return Ok(None);
+            }
             let changed = transaction
                 .execute(
                     "UPDATE learning_job
@@ -619,20 +676,26 @@ impl LearningJobStore {
                          lease_expires = ?3, error = NULL, time_updated = ?4
                      WHERE id = ?1 AND kind = 'extraction' AND status = 'queued'
                        AND scheduled_at <= ?4
-                       AND EXISTS (
-                         SELECT 1 FROM session
-                         WHERE session.id = learning_job.session_id
-                           AND session.time_updated <= ?5
-                       )
                        AND NOT EXISTS (
                          SELECT 1 FROM session_memory_policy
                          WHERE session_memory_policy.session_id = learning_job.session_id
                            AND session_memory_policy.generation <> 'enabled'
                        )
-                       AND NOT EXISTS (
-                         SELECT 1 FROM session_input
-                         WHERE session_input.session_id = learning_job.session_id
-                           AND session_input.state IN ('queued','steering','promoted')
+                       AND (
+                         (?4=?5 AND json_extract(payload,'$.sourceSnapshot.version')=1
+                           AND json_extract(payload,'$.sourceSnapshot.allowBusy')=1)
+                         OR (
+                           EXISTS (
+                             SELECT 1 FROM session
+                             WHERE session.id = learning_job.session_id
+                               AND session.time_updated <= ?5
+                           )
+                           AND NOT EXISTS (
+                             SELECT 1 FROM session_input
+                             WHERE session_input.session_id = learning_job.session_id
+                               AND session_input.state IN ('queued','steering','promoted')
+                           )
+                         )
                        )",
                     params![id, owner_id, lease_expires, now, idle_before],
                 )
@@ -756,15 +819,17 @@ impl LearningJobStore {
                      SET status = CASE WHEN kind = 'extraction' AND EXISTS (
                            SELECT 1 FROM session_memory_policy p
                            WHERE p.session_id = learning_job.session_id AND p.generation <> 'enabled'
-                         ) THEN 'skipped' ELSE 'queued' END,
+                         ) THEN 'skipped'
+                           WHEN attempt>=?7 THEN 'failed' ELSE 'queued' END,
                          owner_id = NULL, lease_token = NULL, lease_expires = NULL,
                          scheduled_at = ?4, error = ?3, time_updated = ?5,
                          time_completed = CASE WHEN kind = 'extraction' AND EXISTS (
                            SELECT 1 FROM session_memory_policy p
                            WHERE p.session_id = learning_job.session_id AND p.generation <> 'enabled'
-                         ) THEN ?5 ELSE NULL END
+                         ) THEN ?5 WHEN attempt>=?7 THEN ?5 ELSE NULL END
                      WHERE id = ?1 AND owner_id = ?2 AND status = 'running' AND lease_token = ?6",
-                    params![id, lease.owner_id, error, scheduled_at, now, lease.token],
+                    params![id, lease.owner_id, error, scheduled_at, now, lease.token,
+                        MAX_LEARNING_JOB_ATTEMPTS],
                 )
                 .map_err(open::map_error)?;
             if changed != 1 {
@@ -779,6 +844,14 @@ impl LearningJobStore {
     /// Recover pure jobs, but mark side-effectful Skill jobs uncertain.
     pub fn reconcile_expired(&self, now: i64) -> Result<LeaseReconciliation, DbError> {
         self.pool.transaction(|transaction| {
+            transaction.execute(
+                "UPDATE learning_job SET status='failed',owner_id=NULL,lease_token=NULL,
+                   lease_expires=NULL,error='learning attempt limit reached after lease loss',
+                   time_updated=?1,time_completed=?1
+                 WHERE status='running' AND lease_expires<=?1 AND attempt>=?2
+                   AND kind IN ('extraction','project_aggregation','global_aggregation','evaluation')",
+                params![now,MAX_LEARNING_JOB_ATTEMPTS],
+            ).map_err(open::map_error)?;
             let skipped = transaction
                 .execute(
                     "UPDATE learning_job
@@ -847,14 +920,30 @@ impl LearningJobStore {
         payload: &Value,
         now: i64,
     ) -> Result<LearningJobRecord, DbError> {
-        let payload = serde_json::to_string(payload).map_err(query_error)?;
+        let encoded = serde_json::to_string(payload).map_err(query_error)?;
         self.pool.transaction(|transaction| {
+            let mut job = read_required(transaction, id)?;
+            let had_snapshot = job
+                .payload
+                .as_ref()
+                .is_some_and(|value| value.get("sourceSnapshot").is_some());
+            if had_snapshot && payload.get("sourceSnapshot").is_none() {
+                return Err(query_error(std::io::Error::other(
+                    "closed source snapshot cannot be removed",
+                )));
+            }
+            job.payload = Some(payload.clone());
+            if encoded.len() > 2_097_152 || !snapshot::current_on(transaction, &job)? {
+                return Err(query_error(std::io::Error::other(
+                    "learning source snapshot is no longer current",
+                )));
+            }
             let changed = transaction
                 .execute(
                     "UPDATE learning_job SET payload=?4
                  WHERE id=?1 AND owner_id=?2 AND lease_token=?3 AND status='running'
                    AND kind='extraction' AND lease_expires>?5",
-                    params![id, lease.owner_id, lease.token, payload, now],
+                    params![id, lease.owner_id, lease.token, encoded, now],
                 )
                 .map_err(open::map_error)?;
             if changed != 1 {
@@ -881,6 +970,14 @@ impl LearningJobStore {
             )));
         }
         self.pool.transaction(|transaction| {
+            let job = match read_required(transaction, id) {
+                Ok(job) => job,
+                Err(DbError::NotFound { .. }) => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            if !snapshot::current_on(transaction, &job)? {
+                return Ok(false);
+            }
             transaction
                 .execute(
                     "UPDATE learning_job SET lease_expires = ?4
@@ -891,6 +988,8 @@ impl LearningJobStore {
                      WHERE p.session_id = learning_job.session_id AND p.generation <> 'enabled'
                    )
                    AND (kind <> 'extraction' OR json_extract(payload, '$.trigger') = 'manual'
+                     OR (json_extract(payload,'$.sourceSnapshot.version')=1
+                       AND json_extract(payload,'$.sourceSnapshot.allowBusy')=1)
                      OR (
                        NOT EXISTS (SELECT 1 FROM session_input i
                          WHERE i.session_id = learning_job.session_id
@@ -926,11 +1025,43 @@ impl LearningJobStore {
     }
 }
 
+fn settle_exhausted_on(
+    connection: &Connection,
+    project_id: Option<&str>,
+    now: i64,
+) -> Result<(), DbError> {
+    connection.execute(
+        "UPDATE learning_job SET status='failed',owner_id=NULL,lease_token=NULL,lease_expires=NULL,
+           error=COALESCE(error,'learning attempt limit reached'),time_updated=?2,time_completed=?2
+         WHERE status='queued' AND attempt>=?3
+           AND (?1 IS NULL OR project_id=?1 OR kind='global_aggregation')",
+        params![project_id,now,MAX_LEARNING_JOB_ATTEMPTS],
+    ).map_err(open::map_error)?;
+    Ok(())
+}
+
+/// Reuse the closed-source and forget fence inside an extraction writer's
+/// transaction. Passing the writer connection avoids a check/commit race.
+pub fn extraction_sources_current_on(
+    connection: &Connection,
+    job_id: &str,
+) -> Result<bool, DbError> {
+    snapshot::current_on(connection, &read_required(connection, job_id)?)
+}
+
+impl LearningJobStore {
+    pub fn sources_current(&self, job_id: &str) -> Result<bool, DbError> {
+        let connection = self.pool.get()?;
+        extraction_sources_current_on(&connection, job_id)
+    }
+}
+
 fn enqueue_in(
     connection: &Connection,
     job: &NewLearningJob,
     payload: Option<&str>,
 ) -> Result<LearningJobInsert, DbError> {
+    snapshot::validate_new_on(connection, job)?;
     let changed = connection
         .execute(
             "INSERT INTO learning_job (
@@ -970,6 +1101,22 @@ fn enqueue_in(
              WHERE kind='extraction' AND session_id=?1 AND source_message_id=?2
                AND idempotency_key<>?3 AND status IN ('queued','running')",
             params![job.session_id,job.source_message_id,job.idempotency_key,job.time_created],
+        ).map_err(open::map_error)?;
+    }
+    if changed == 1
+        && job.kind == LearningJobKind::Extraction
+        && job
+            .payload
+            .as_ref()
+            .is_some_and(|value| value.get("sourceSnapshot").is_some())
+    {
+        connection.execute(
+            "UPDATE learning_job SET status='skipped',error='superseded by source-validated extraction',
+             time_updated=?4,time_completed=?4
+             WHERE kind='extraction' AND session_id=?1 AND source_message_id=?2
+               AND id<>?3 AND status='queued' AND extractor_version<>?5
+               AND NOT EXISTS(SELECT 1 FROM experience_record e WHERE e.extraction_job_id=learning_job.id)",
+            params![job.session_id,job.source_message_id,job.id,job.time_created,job.extractor_version],
         ).map_err(open::map_error)?;
     }
     Ok(LearningJobInsert {

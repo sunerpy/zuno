@@ -116,9 +116,10 @@ next-step 报告或 Goal 所属人工请求，完成就会被拒绝。
 
 一次暂停只有在指明该看什么时才是可操作的。`/goal show` 给出 `pendingUncertainCalls`：
 每条不确定调用一项，带工具名、call id、该调用自己报告已改动的路径、类型化原因和观察
-时刻。`/goal resume` 就是“这些状态已经检查过了”这句话本身：它只结清自己列出的那些调用，
-以 `reconciledUncertainCalls` 回显，然后才让 Goal 重新运行。`/goal pause` 与
-`/goal cancel` 不结清任何一条，因为它们都没有声称检查已经发生。
+时刻。`/goal resume` 与可跳过的 Resume goal 选择都不代表检查已完成：
+它们保留检查义务，在义务未解决时拒绝通用恢复。先检查权威状态并完成相关领域的
+reconciliation，再恢复 Goal。`/goal pause` 与 `/goal cancel`
+不结清任何一条，因为它们都没有声称检查已经发生。
 
 ### 成功标准与证据
 
@@ -457,7 +458,7 @@ Work 模式是否需要 Plan 的判断，并通过操作式 `plan_update` 创建
 
 一次连自己都无法命名的已交接调用，同样欠一次检查。当 provider 或网关给出空的 call id 或空工具名时，
 `state.uncertain.tool` 与 `state.uncertain.callID` 记为 `<unnamed>`，而不是丢弃这份义务；
-`/goal resume` 仍像对其他调用那样按 part id 结清它。`<unnamed>` 不可能与真实工具名相撞，它本身就是
+通用 Goal 恢复不能仅凭 part id 就结清它。`<unnamed>` 不可能与真实工具名相撞，它本身就是
 一份报告：该 provider 的 tool-call 身份不可用。
 
 来自 OpenAI 兼容 chat 或 Responses 网关的工具调用如果没有 id、或 id 为空，会在到达 engine 之前被赋予一个

@@ -4,13 +4,13 @@ Zuno's TUI, headless CLI, HTTP server, ACP adapter, and future GUI clients are v
 
 ## Shared model
 
-Every client uses four runtime surfaces:
+Every client uses shared runtime surfaces:
 
 1. Commands admit user intent through the same command registry and real handlers.
 2. Session events are the durable record of prompts, model output, tools, retries, questions, approvals, subagent reports, and lifecycle changes.
 3. Projections derive current conversation and status state from those events.
 4. The durable inbox accepts prompts, live steering, and `reportDelivery: nextStep` reports before work is scheduled.
-5. Durable human requests own Goal questions and permissions across process restarts;
+5. Durable human requests own ordinary and Goal questions and permissions across process restarts;
    process-local channels only notify already-running surfaces after commit.
 
 The shared projection vocabulary includes:
@@ -113,12 +113,30 @@ into history; cancellation removes it without inventing a user message.
 
 Human input has priority over an automatic goal retry. The client may show the persisted retry deadline and reason, but cancellation, pause, and resume are explicit commands rather than local timer changes.
 
-Goal-owned questions and permissions are rows, not open sockets or parked client
-futures. A client lists the shared pending set, answers by request id, and treats the
-answer as successful only after the request settlement and FIFO inbox admission commit
-together. On reconnect it re-presents pending rows in deterministic creation order.
-Only the runtime may conditionally resume the matching Goal; the client must not infer
-resumption from a local dialog closing.
+Questions and permissions are durable rows, not the lifetime of an RPC or tool
+future. `QuestionPort` separates publication, lookup/list, command application and
+waiting. `QuestionService` owns the transaction joining request CAS, command
+receipt, FIFO input, session wait and any matching Goal transition. The model sees
+receipt-only tool output; the actual response enters history through the inbox.
+Clients preserve stable item IDs and partial answers. Defer is pending, not an
+answer; `draftAnswers` are stored separately and never copied into model input.
+Reconnect re-presents pending rows in creation order without repeating a
+tool call. Ordinary sessions use the same wait contract as Goals.
+
+`plan_exit` is a deferred approval publisher, not a mode-switch implementation.
+Its host-created binding freezes the Plan ID/revision, Work identity and review
+gate. The user submits an explicit typed decision. Early approval remains
+`waiting_for_handoff`; source-turn completion and Start Work admission commit
+together. Changed Plan/review/identity or interruption cannot authorize Work.
+
+Scheduling metadata lives on `session_execution_state`: ready, waiting for an
+exact human request, waiting for an external source/cycle, paused, or completed.
+Admission is separate from eligibility to call the model. A user status query can
+be answered without clearing a pause. Callbacks and recovery preserve the gate
+and session-level no-progress fingerprint. FIFO promotion rechecks eligibility
+under its database transaction; gated automatic items do not block later human
+input. Explicit `/resume` creates a durable Work control, not synthetic user text
+or Plan consent.
 
 ## Backpressure and disconnects
 
@@ -156,12 +174,45 @@ session with `_meta.zuno.childSessionId`, so it never has to accept an unknown
 route. Reusable permission grants are still owned by the root ACP session and
 are cleared when it closes.
 
-An autonomous Goal may yield `WaitingForHuman` through `goal_request_input`, but
-it does not receive the synchronous `question` tool. Plan may ask structured
-clarifying questions. Ordinary Work also does not receive that tool: it proceeds
-with safe evidence-backed defaults and, only when genuinely blocked, finishes the
-turn with one direct question. A delegated child contacts neither client surface
-directly and reports blockers to its parent.
+An autonomous Goal may yield `WaitingForHuman` through `goal_request_input`.
+Plan may ask synchronous clarifications, and ordinary Work may use `question`
+for required input. Root sessions can use `question_async` for optional input
+without delaying their current summary. A delegated child reports blockers to
+its parent rather than contacting the user directly.
+
+### Design sources and deliberate differences
+
+The implementation was based on Zuno v0.10.29, with Codex
+`9ba1d9eb5bbbd87ba2fc528d91ad239eea975ee9` and oh-my-openagent
+`44c95e976dfd13b911de7988872fc2302f2b1092` as design references.
+Request/user-input lifetimes, optional follow-up and explicit collaboration
+boundaries inform the question interface. Responsibility-oriented prompts,
+bounded specialist delegation and evidence-driven execution inform the native
+Agent catalog. These are design references, not wire/configuration compatibility
+targets; no upstream prompt body is copied.
+
+Zuno keeps all fifteen native roles. The parent passes its current effective
+rules, resource contract and complete authorized tool registry separately from
+the provider-visible schema subset. Explicit child-role restrictions narrow this
+authority; a new child invocation does not reuse an obsolete child permission
+snapshot or gain authority from newly discovered global configuration.
+
+The follow-up runtime-consistency work starts from Zuno v0.10.30 and pins Codex
+`eaa8b6d91701d6cabe464141facc677e5915fbfc`. Its per-issue source mapping and
+intentional differences are in [the six-part audit](harness-comparison.md#six-part-runtime-consistency-audit).
+
+Database format 14 retains the published question/scheduling contracts and adds
+`InputAdmissionReceipt`, `GoalResumeRequest` binding and `ContextUsageSnapshot`
+persistence. Supported formats 5–13 migrate through one guarded transaction,
+retain original session/message/memory values, and advance the marker last.
+Legacy unbound completions remain evidence; a migration never invents a work
+cycle, model application, verified Memory source or Goal resume.
+
+Input admission, history recording, model application and terminal processing
+are distinct native facts. Standard ACP prompt waits for its associated outcome;
+steer returns immediate admission. All clients consume the same Context snapshot,
+not independent guesses. A paused Goal is offered a skippable host-owned resume
+choice; its exact Goal revision and original input are validated atomically.
 
 ## TUI
 

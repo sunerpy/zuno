@@ -7,7 +7,7 @@ use zuno_application::ApplicationError;
 use crate::database_error;
 
 pub const PREVIEW_SCHEMA: &str = "zuno_enterprise_preview";
-pub(crate) const FORMAT: i32 = 5;
+pub(crate) const FORMAT: i32 = 6;
 const TABLES: &[&str] = &["workspace", "session", "request_receipt", "input", "event"];
 const RUNTIME_TABLES: &[&str] = &[
     "agent_job",
@@ -22,6 +22,8 @@ const AUTHORIZATION_DDL: &str = include_str!("schema_authorization.sql");
 const TURN_DDL: &str = include_str!("schema_turn.sql");
 const WAIT_DDL: &str = include_str!("schema_wait.sql");
 const WAIT_TABLES: &[&str] = &["runtime_wait"];
+const CONTEXT_DDL: &str = include_str!("schema_context.sql");
+const CONTEXT_TABLES: &[&str] = &["context_usage", "input_execution_receipt"];
 const TURN_TABLES: &[&str] = &["message", "part", "provider_retry_backoff"];
 const AUTHORIZATION_TABLES: &[&str] = &[
     "organization_member",
@@ -48,9 +50,13 @@ fn source_digest(version: i32) -> String {
         zuno_orchestration::sha256_text(&format!(
             "4\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{POLICY}\n{TENANT_POLICY}"
         ))
+    } else if version == 5 {
+        zuno_orchestration::sha256_text(&format!(
+            "5\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{WAIT_DDL}\n{POLICY}\n{TENANT_POLICY}"
+        ))
     } else {
         zuno_orchestration::sha256_text(&format!(
-            "{FORMAT}\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{WAIT_DDL}\n{POLICY}\n{TENANT_POLICY}"
+            "{FORMAT}\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{WAIT_DDL}\n{CONTEXT_DDL}\n{POLICY}\n{TENANT_POLICY}"
         ))
     }
 }
@@ -132,7 +138,10 @@ pub async fn migrate(admin: &PgPool, runtime_role: &str) -> Result<(), Applicati
                 if version < 4 {
                     install_turn(&mut tx).await?;
                 }
-                install_waits(&mut tx).await?;
+                if version < 5 {
+                    install_waits(&mut tx).await?;
+                }
+                install_context(&mut tx).await?;
                 grant_runtime(&mut tx, runtime_role).await?;
                 let manifest = schema_manifest(&mut tx).await?;
                 let changed = sqlx_core::query::query(
@@ -176,6 +185,7 @@ pub async fn migrate(admin: &PgPool, runtime_role: &str) -> Result<(), Applicati
     install_authorization(&mut tx).await?;
     install_turn(&mut tx).await?;
     install_waits(&mut tx).await?;
+    install_context(&mut tx).await?;
     sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
         "REVOKE ALL ON SCHEMA {PREVIEW_SCHEMA} FROM PUBLIC;
          CREATE TABLE {PREVIEW_SCHEMA}.schema_format(
@@ -383,6 +393,7 @@ async fn grant_runtime(connection: &mut PgConnection, role: &str) -> Result<(), 
         .chain(AUTHORIZATION_TABLES)
         .chain(TURN_TABLES)
         .chain(WAIT_TABLES)
+        .chain(CONTEXT_TABLES)
         .chain(["organization_policy", "organization_audit"].iter())
     {
         sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
@@ -396,6 +407,7 @@ async fn grant_runtime(connection: &mut PgConnection, role: &str) -> Result<(), 
         "GRANT EXECUTE ON FUNCTION {PREVIEW_SCHEMA}.dispatch_owners(text) TO \"{role}\";
          GRANT EXECUTE ON FUNCTION {PREVIEW_SCHEMA}.create_runtime_session() TO \"{role}\";
          GRANT EXECUTE ON FUNCTION {PREVIEW_SCHEMA}.advance_input_version() TO \"{role}\";
+         GRANT EXECUTE ON FUNCTION {PREVIEW_SCHEMA}.create_input_execution_receipt() TO \"{role}\";
          GRANT EXECUTE ON FUNCTION {PREVIEW_SCHEMA}.approval_coordinates(text,text) TO \"{role}\";"
     )))
     .execute(&mut *connection)
@@ -430,6 +442,22 @@ async fn install_waits(connection: &mut PgConnection) -> Result<(), ApplicationE
         .await
         .map_err(database_error)?;
     for table in WAIT_TABLES {
+        sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
+            "ALTER TABLE {PREVIEW_SCHEMA}.{table} ENABLE ROW LEVEL SECURITY;
+             ALTER TABLE {PREVIEW_SCHEMA}.{table} FORCE ROW LEVEL SECURITY;
+             CREATE POLICY owner_scope ON {PREVIEW_SCHEMA}.{table} USING ({POLICY}) WITH CHECK ({POLICY});
+             REVOKE ALL ON {PREVIEW_SCHEMA}.{table} FROM PUBLIC;"
+        ))).execute(&mut *connection).await.map_err(database_error)?;
+    }
+    Ok(())
+}
+
+async fn install_context(connection: &mut PgConnection) -> Result<(), ApplicationError> {
+    sqlx_core::raw_sql::raw_sql(CONTEXT_DDL)
+        .execute(&mut *connection)
+        .await
+        .map_err(database_error)?;
+    for table in CONTEXT_TABLES {
         sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
             "ALTER TABLE {PREVIEW_SCHEMA}.{table} ENABLE ROW LEVEL SECURITY;
              ALTER TABLE {PREVIEW_SCHEMA}.{table} FORCE ROW LEVEL SECURITY;
@@ -661,6 +689,41 @@ pub(crate) async fn install_format_four_fixture(
     sqlx_core::query::query(
         "UPDATE zuno_enterprise_preview.schema_format SET version=4,source_digest=$1,manifest=$2 WHERE singleton=1",
     ).bind("563173ce50200fcd2a4dbbfb4a99270d51687a80b9b6e46609de2e04f8cfdeb2")
+        .bind(manifest).execute(&mut *tx).await.map_err(database_error)?;
+    tx.commit().await.map_err(database_error)
+}
+
+#[cfg(test)]
+pub(crate) async fn install_format_five_fixture(
+    pool: &PgPool,
+    role: &str,
+) -> Result<(), ApplicationError> {
+    install_format_four_fixture(pool, role).await?;
+    let mut tx = pool.begin().await.map_err(database_error)?;
+    sqlx_core::raw_sql::raw_sql(include_str!("fixtures/format5-wait.sql"))
+        .execute(&mut *tx)
+        .await
+        .map_err(database_error)?;
+    sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
+        "ALTER TABLE {PREVIEW_SCHEMA}.runtime_wait ENABLE ROW LEVEL SECURITY;
+         ALTER TABLE {PREVIEW_SCHEMA}.runtime_wait FORCE ROW LEVEL SECURITY;
+         CREATE POLICY owner_scope ON {PREVIEW_SCHEMA}.runtime_wait USING ({POLICY}) WITH CHECK ({POLICY});
+         REVOKE ALL ON {PREVIEW_SCHEMA}.runtime_wait FROM PUBLIC;
+         GRANT SELECT,INSERT,UPDATE,DELETE ON {PREVIEW_SCHEMA}.runtime_wait TO \"{role}\";"
+    ))).execute(&mut *tx).await.map_err(database_error)?;
+    sqlx_core::raw_sql::raw_sql(
+        "SELECT set_config('zuno.tenant_id','migration-fixture',true),set_config('zuno.principal_id','owner',true);
+         UPDATE zuno_enterprise_preview.runtime_job SET phase='waiting' WHERE job_id='legacy-job';
+         INSERT INTO zuno_enterprise_preview.runtime_wait(
+           tenant_id,principal_id,id,job_id,session_id,turn_id,invocation_id,reference,state,time_created,time_updated)
+         VALUES('migration-fixture','owner','legacy-wait','legacy-job','legacy-session','legacy-turn','legacy-pending',
+           '{\"id\":\"legacy-wait\",\"turnId\":\"legacy-turn\",\"invocationId\":\"legacy-pending\",\"argumentsSha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"target\":{\"kind\":\"operation\",\"operation_id\":\"legacy-operation\"},\"continuation\":\"current_turn\"}',
+           'pending',1005,1005);",
+    ).execute(&mut *tx).await.map_err(database_error)?;
+    let manifest = schema_manifest(&mut tx).await?;
+    sqlx_core::query::query(
+        "UPDATE zuno_enterprise_preview.schema_format SET version=5,source_digest=$1,manifest=$2 WHERE singleton=1",
+    ).bind("ee9af544a130315c5963acc55727f4e299cd352887c63f0cd113ad3e66a2c18a")
         .bind(manifest).execute(&mut *tx).await.map_err(database_error)?;
     tx.commit().await.map_err(database_error)
 }

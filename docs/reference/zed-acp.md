@@ -388,30 +388,31 @@ Structured `question` calls use ACP form controls rather than a generic prompt:
 - submitting `Other` takes precedence over selected options, matching the Zuno
   TUI, while an empty optional form is reported as unanswered.
 
-A form the user dismisses, one that expires, and one whose reply Zuno cannot
-read are decided outcomes, not lost work: the question tool reports the
-withdrawal to the model and the session's Goal keeps running. The durable record
-separates the two facts — the request is settled, and no answer was given — by
-storing an empty answer list together with an `outcome` of `cancelled`,
-`expired`, or `failed`. Permission dialogs follow the same rule: a dismissed
-reply, or one naming an option this dialog never offered, is recorded as
-`reject` together with the `outcome` that produced it, so a client bug cannot
-later be replayed as a deliberate rejection by the user.
+Questions are owned by the durable session, not the originating prompt RPC.
+`question_async` permits optional follow-up while the Agent continues independent
+work or finishes its summary. Native form cancellation defers without consent;
+an explicit decline cancels. Null/empty acceptance is not an answer. Saved
+`draftAnswers` remain separate from confirmed answers and are not sent to the
+model. The client can list and respond through `questions/list` and
+`questions/respond`, using stable item IDs, a command ID and expected revision.
+Only a matching required answer can clear its human-wait gate.
 
 When Zuno re-presents a question or permission left pending by an earlier
 process and the client cannot be reached at all, nothing is recorded. The
 request stays pending and answerable from the TUI or the HTTP API, this
 `session/prompt` ends with `stopReason: end_turn`, and sending another prompt
-presents it again.
+can inspect the pending set again. Malformed responses also leave the request
+untouched; they are not recorded as a user choice.
 
-After a form answer is accepted, Zuno immediately updates the same question
-tool call as `in_progress`. Its typed metadata records the authoritative
-`answered` outcome and sets `continuationPending: true`, so Zed keeps a visible
-activity row while the next provider request has no checkpointed output. At the
-next assistant checkpoint, Zuno sends the question's `completed` update first
-and then the committed continuation output. A terminal failure, interruption,
-or closed event stream also settles the question card while discarding any
-provisional provider text.
+New tool results are receipts; accepted answers enter the durable inbox once.
+The same service handles ordinary and Goal questions. `plan_exit` needs an
+explicit typed approve decision for the displayed Plan/review/Work identity.
+Early approval waits for successful source-cycle handoff; a normal compaction
+recovery may change the engine turn ID without changing that logical cycle.
+`/resume` resumes already-authorized paused Work, never a pending Plan approval.
+
+Older stored tool results containing authoritative answer metadata still replay
+as static answered cards, including their historical continuation markers.
 
 After settlement and on historical replay, the question remains a static tool
 card showing its prompt, choices, status, and—when durable answer metadata is
@@ -440,14 +441,13 @@ replay the same durable summary and tag. A successful internal compaction
 therefore does not surface as a terminal turn failure or require a second prompt
 to continue.
 
-When the selected model has a known context window, ACP sends an absolute
-`usage_update` as soon as each `ProviderRequestStarted` event arrives. Its
-`used` value is the assembled prompt estimate, so a request after compaction can
-immediately move the UI away from the previous request's 100% reading. When the
-provider later reports token usage, ACP sends another `usage_update` with the
-measured provider usage for that request. Provider output remains attempt-buffered;
-the request-start usage reset does not. If the model context size is unknown,
-ACP invents neither the estimate nor a window size.
+ACP projects the native `ContextUsageSnapshot` as an absolute `usage_update`,
+with the full source-aware snapshot in `_meta.zuno.contextUsage`. Occupancy is
+the latest provider-confirmed baseline plus estimated material not yet counted
+by it, not the session's cumulative bill. Partial usage frames merge; cache and
+reasoning subcounts are not added twice. A lower request estimate cannot replace
+the confirmed baseline. Compaction advances the epoch, and load/resume uses the
+same durable snapshot. Unknown counters or window sizes stay unknown.
 
 Historical replay keeps provider reasoning capsules durable for future provider
 requests, but does not render an exact capsule copy when the same message
@@ -471,37 +471,33 @@ first and decides who runs it second:
 - if the running turn ends before the steer lands, the prompt stays durably
   queued and the next turn in the session promotes it in admission order.
 
-ACP v1 has no success shape for "accepted, but this request ran no turn":
-`stopReason` is a closed enum, so every value would misreport a turn this
-request never had. Zuno therefore answers the second `session/prompt` with a
-JSON-RPC error in the implementation-defined range and carries the admission
-facts in `error.data`:
+Standard `session/prompt` waits for the accepted input's associated processing
+outcome. Busy acceptance is not an error and does not manufacture an immediate
+`stopReason`. The native driver owns execution; RPC requests observe durable
+receipts. A completed request returns a legal `stopReason` and
+`_meta.zuno.receipt`. Acceptance, recording in history, inclusion in a provider
+request, and execution completion are distinct states.
+
+For retry-safe admission, supply a session-scoped client message ID:
 
 ```json
 {
   "jsonrpc": "2.0",
   "id": 4,
-  "error": {
-    "code": -32001,
-    "message": "session ses_x is running a turn; this prompt was admitted durably and steered into it",
-    "data": {
-      "sessionId": "ses_x",
-      "admission": "steered",
-      "inputId": "msg_1f2e",
-      "admittedSequence": 42,
-      "delivery": "steer"
-    }
+  "method": "session/prompt",
+  "params": {
+    "sessionId": "ses_x",
+    "prompt": [{ "type": "text", "text": "Adjust the active work." }],
+    "_meta": { "zuno": { "messageId": "client-message-42" } }
   }
 }
 ```
 
-`data.admission` is `steered` when the running turn accepted the prompt and
-`queued` when it is waiting for the next turn; `delivery` and `admittedSequence`
-are the durable inbox row's own fields, and `inputId` names that row. The
-streamed `user_message_chunk`, assistant output, and `stopReason` for the
-admitted prompt all arrive on the request that owns the turn, so a v1 client
-that ignores `data` still shows the work — it sees the error message text
-instead of a second `stopReason`.
+The client ID must contain 1–256 bytes. Reusing it with the same content attaches
+another observer to the existing input; conflicting reuse is rejected.
+Identical text with different IDs is not deduplicated. Failure after admission
+includes the receipt in error data, distinguishing it from genuine rejection.
+An RPC disconnection does not withdraw already accepted input.
 
 Zuno also exposes an extension success shape for clients that opt into it.
 Initialize advertises `_meta.zuno.steering`, and every turn-scoped
@@ -524,12 +520,12 @@ Success returns immediately with `turnId`, `inputId`, `admittedSequence`,
 queue insertion share the live-turn registry lock, so a handoff cannot steer a
 successor turn. Rejections use `-32002`; `data.reason` is one of
 `noActiveTurn`, `expectedTurnMismatch`, `activeTurnNotSteerable`, or
-`emptyInput`. Commands remain idle-only. The ordinary `session/prompt`
-`-32001` result and standards-compliant `session/cancel` behavior are unchanged.
+`emptyInput`. Commands remain idle-only. Standard `session/prompt` waits for
+processing; `session/steer` is the immediate-admission interface.
 
 A slash command is different. It is resolved against the host command catalog
 and runs as its own turn, so it cannot be steered into work already in flight.
-Zuno refuses it with the same code, `admission: "rejected"`, and
+Zuno refuses it with a busy error, `admission: "rejected"`, and
 `reason: "commandRequiresIdleSession"`, and writes nothing durable; send it
 again once the session is idle. Only a prompt that actually names a command, an
 unambiguous Skill, or a native session control is a command invocation. A prompt
@@ -537,20 +533,13 @@ that merely begins with `/` — an absolute POSIX path, a regular expression —
 ordinary content, so it is admitted durably and steered like any other prompt
 rather than refused as an unresolvable command.
 
-Cancellation is keyed on the JSON-RPC request id, never on what a request asked
-for: two prompts can carry byte-identical params. `$/cancel_request` for the
-request that owns the turn interrupts that turn, and no other request's
-cancellation can stop it.
-
-Withdrawing a `session/prompt` that has not been answered yet retires exactly
-what that request contributed. Its durable inbox row is cancelled, so the
-withdrawn text is never promoted into any turn, and the request is answered with
-the JSON-RPC cancellation code `-32800` carrying `data.admission: "withdrawn"`
-and the `inputId` of the row it retired. A request that was already answered with
-`admission: "steered"` or `"queued"` is finished: `$/cancel_request` for it does
-nothing at all, because its prompt is already durable and the turn it feeds
-belongs to a different request. Use `session/cancel` to stop the session's live
-turn regardless of which request owns it.
+Cancellation is keyed by RPC request identity, never by equal text.
+`$/cancel_request` withdraws that request's own still-pending contribution;
+`-32800` reports the withdrawal and its durable receipt. It cannot erase input
+already applied to a model request, and a duplicate-ID observer cannot withdraw
+the original contributor's input. Use `session/cancel` for an explicit
+session-wide interruption. Closing an observer, explicit withdrawal, and
+terminating the Zuno process are separate lifecycle events.
 
 ### Delegated child sessions
 

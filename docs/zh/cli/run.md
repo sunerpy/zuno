@@ -63,6 +63,10 @@ zuno run --continue "now add tests for the new branch"
 
 输出 JSON，让脚本解析结果，而不是去抓取格式化文本。
 
+`context_usage` 事件携带原生 `snapshot`，包含确认值、尾部估算、累计非重叠计量、
+来源和请求标识。未知值保持未知；脚本不要用 `provider_request_started` 的粗估值
+覆盖供应商已经确认的基线。
+
 ```sh
 zuno run --format json "list the failing tests" > result.json
 ```

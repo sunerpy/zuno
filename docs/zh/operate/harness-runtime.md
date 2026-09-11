@@ -125,7 +125,33 @@ Worker 或 Docker 执行证据。
 
 Agent 具有显式的正向职责、负向委派边界、权限以及结构化输出预期。
 
-内置 Agent 的分工：`build` 负责端到端交付，`plan` 是只读规划，`deep` 承担困难的跨领域实现且不再递归委派。
+内置 Agent 的分工：`build` 负责端到端交付，`plan` 是只读规划，`deep` 承担困难的跨领域实现，
+并可在父级授权、深度与并发限制内委派边界明确的任务，不能递归转交整个原目标。
+
+子级继承父级当前已生效的权限规则、资源边界与完整授权工具目录，显式只读角色进一步收窄。
+已授权但尚未展示的 MCP schema 不等于不存在的权限；反过来，新发现的全局配置也不能给 child
+增加父级没有的权限。旧 child 的权限快照不能覆盖本次委派的新上限。
+
+### 提问、批准与会话调度
+
+`QuestionPort` 将发布、查询、回答、等待分离；`QuestionService` 在同一事务中维护请求
+revision、稳定问题项 ID、部分回答、幂等命令回执、inbox 和匹配的 Goal/会话状态。
+`question_async` 只发布可选问题，不妨碍继续工作或总结；`question` 可以等待首次响应，
+“稍后”保留 pending。无 Goal 的普通 Work 也可以登记真正的人工等待。
+TUI 用 Ctrl+S 选择稍后，`/questions` 重开待答项。高亮、空输入、取消都不是批准。
+
+`plan_exit` 只发布精确绑定 Plan、review、Agent/模型身份的批准请求。用户提前批准时，
+必须等来源 Plan 回合正常交接后才排入 Work；过期或中断的批准不生效。
+
+普通会话和 Goal 共用 `session_execution_state.scheduling`：可执行、等待指定人工请求、
+等待指定外部来源/周期、暂停、完成。未完成不等于可执行；blocked Todo 或 Plan 末步未完成
+不会自动产生下一轮模型请求。暂停期间 callback 仍能入库，但不能重置无进展计数或解除暂停。
+状态查询不恢复 Work；`/resume` 是显式恢复控制，不能绕过待答条件或 Plan 授权。
+
+终态 `bg output`、`bg wait`、callback 使用同一消费回执，并保留来源工作周期。
+格式 14 在一个原子前向迁移中升级受支持的 5–13 格式，保留用户原数据，最后更新格式标记。
+新增输入处理回执、按来源隔离的 Context 快照，以及绑定 Goal revision 的原生恢复选择；
+迁移不调用模型、不批量晋升历史证据，也不恢复暂停 Goal。
 
 `runtime.execution` 还会按最终工具快照为内置与自定义 Agent 生成简短降级规则：首选工具
 限速、不可用或暂时失败时，不原样重复调用。`tool_search` 可见时可以发现另一个已经授权的
@@ -250,11 +276,25 @@ CLI 启动。无法抓取的远程规则来源使用同一类非致命 notice，
 置信度至少为 `0.9` 的候选会自动写入；全局与低置信候选继续等待评审，并且所有已应用
 变更都可以撤销。
 
-自动学习没有额度百分比、每日 token 或金额预算。后台仍受六小时空闲、每次最多两个
-任务、资格检查、去重与最多三次尝试约束；真实 provider 限流会保留 typed
+自动学习的 `post_turn.idle_delay_ms` 默认 `0`。合格回合完成后保存有界来源快照并立即
+入队、唤醒 worker，下一轮对话正在执行不会阻止上一轮快照提炼；显式正值保留空闲延迟。
+新任务优先于历史补处理。后台仍受每次最多两个任务、项目并发、资格检查、输入/输出/时间
+上限、去重与最多三次尝试约束；真实 provider 限流会保留 typed
 `Retry-After`。新会话固化新的自动默认值，已有 `/memories` 会话策略不会被追溯改写。
 
+提炼与 Memory 合并仍分两阶段，并复用所选模型的参数与能力解析。400 会保存脱敏响应、
+状态码和请求标识，不能靠盲重试或换模型处理。`/learn reprocess <assistant-message-id>`
+可按新提炼版本重处理；`/learn repair-history [--dry-run]` 先核对原始来源，缺证内容
+继续未验证。更正和遗忘复用 `memory_update`，后续 provider 请求刷新 Memory 提示词。
+
 ## Provider 用量
+
+`ContextUsageSnapshot` 是窗口占用的统一来源：最近供应商确认基线，加尚未计入内容的估算。
+`73,948` 的粗估值不能覆盖 `149,501` 的确认输入。累计用量、确认值、尾部估算分开，
+分批 usage 合并而非清零缺失字段或重复累加；缓存、推理子项不重复计数。
+快照携带来源、请求/attempt、epoch、revision、freshness 与更新时间；未知不等于 0。
+ACP、TUI、HTTP、JSON run 与恢复路径消费同一快照，子 Agent 和学习请求不覆盖主会话窗口。
+估算按实际规范化发送内容计算，不按未读取文件大小计算。
 
 assistant checkpoint 在同一事务内对账消息快照与会话投影；同一消息的重复 checkpoint
 先扣除旧快照再加入新快照。会话分别保存累计非重叠 token 桶、最新完整提示词和统计口径。
@@ -272,6 +312,12 @@ TUI 保存请求前基线及当前请求的可替换用量快照。分批事件�
 ## 持久输入
 
 用户提示词、steering 以及子 Agent 报告在执行前进入持久 FIFO 收件箱。`reportDelivery: nextStep` 必须完成子结果结算、准许父级输入并唤醒父级，且不存在轮询竞态。
+
+`InputAdmissionReceipt` 分开记录 admitted、recorded、applied 与 completed/failed/cancelled。
+写入历史不代表模型已处理；实际 post-hook 请求建立应用事实，逻辑执行结束才结算完成。
+同周期恢复显式交接 owner，其他 turn 不能完成这条输入。标准 ACP prompt 等待真实结果，
+`session/steer` 即时返回接收；可选客户端消息 ID 按会话幂等，不按文本去重。
+观察者断线不等于撤回，也不能证明旧执行已结束。
 
 队列立即发送在同一准入事务中比较选中行的 revision 与界面显示的 turn id；失败则回滚行和事件，
 不改投新回合。空闲时先持有 run guard 再提升选中行，其他条目保持原准入顺序。消费时校验信号
@@ -492,6 +538,12 @@ session 级联删除，并进入 session export/import、sanitize 与 prune。TU
 
 活跃的 Goal 会持续推进，直到它完成、被显式暂停或阻塞、达到预算上限，或遇到类型化的永久失败。
 
+中断保持 Goal 暂停。宿主参考 Codex 的 Goal 菜单，提供 Resume goal / Keep paused：
+跳过不授权。Zuno 用 `QuestionPort` 保存选择，通过 `GoalResumeRequest` 绑定 Goal ID/revision 和已有输入 ID；
+确认才在一个事务中衔接 Goal、执行门禁与输入，不重投已处理文本。
+Plan、审批、预算、认证及未知副作用仍由各自控制处理；记录 callback 也不代表已进入模型。
+提示词显示真实 Goal 状态、暂停原因和恢复条件。
+
 Goal continuation 是一等的回合来源。准备阶段会捕获确切 Goal id 与 revision；provider
 工作开始前若 revision 已变化，这份 continuation 会失效。回合执行身份独立地从当前 host
 捕获 Agent、目录 provider 与目录模型。保留的 user 历史只提供因果 transcript anchor，
@@ -678,6 +730,14 @@ PowerShell 仍然只是那个守护器的后端依赖，而不是运行 CLI 的�
 ## 后台命令执行
 
 后台命令有独立的生命周期与输出游标，父会话通过持久状态观察它们，而不是靠轮询。
+
+前台观察超时只返回同一进程句柄，不自动切换为后台任务。现有 `bg wait/output` 可以
+继续等待该句柄；宿主保持逻辑任务、原周期与同一预算，在下一次模型请求之前等待真实
+进程/控制通知，支持 steer 和中断，不让模型反复查询无变化状态。只有显式
+`background: true` 才进入后台交付。串行 CI 默认前台，独立并行工作或明确要求才使用后台。
+
+前台终态输出、原工具验证凭据与消费权原子落库后才回收句柄，不再额外产生 callback。
+观察超时不等于远端失败，进程丢失不等于成功；原有硬时限与预算继续有效。
 
 `bg` 工具为当前会话拥有的执行提供 `list`、`output`、`wait`、`cancel`，另有 `artifact`
 用于读回被输出上限从该会话任一工具那里扣留的输出。`output`、`wait`、`artifact` 都接受可选的

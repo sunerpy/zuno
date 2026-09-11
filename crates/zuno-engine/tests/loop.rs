@@ -47,6 +47,9 @@ use zuno_types::execution::{CollaborationMode, ContinuationToken};
 
 const SESSION_ID: &str = "ses_loop_test";
 
+#[path = "loop/context_usage.rs"]
+mod context_usage_tests;
+
 #[derive(Debug)]
 struct ScriptedResponse {
     events: Vec<Result<StreamEvent, ProviderError>>,
@@ -316,6 +319,8 @@ fn trace_seed() -> Arc<AttemptSeed> {
         parent_attempt: None,
         workflow: None,
         workflow_node: None,
+        parent_authority: None,
+        cycle_id: None,
     })
 }
 
@@ -634,6 +639,7 @@ fn seeded_shared_pool_with_goal_schema() -> Arc<Pool> {
 }
 
 fn seed_durable_compaction_state(pool: Arc<Pool>) {
+    bind_loop_cycle(&pool);
     let connection = pool
         .open_connection()
         .expect("open durable state connection");
@@ -692,25 +698,42 @@ fn seed_durable_compaction_state(pool: Arc<Pool>) {
                 "workItemID": "todo_compaction"
             }),
             107,
-            Some(NewSessionInput::new(
-                "input_compaction_report",
-                SESSION_ID,
-                json!({
-                    "kind": "subagentReport",
-                    "jobID": "job_compaction",
-                    "text": "durable report",
-                    "references": {
-                        "goalID": "goal_compaction",
-                        "planID": "plan_compaction",
-                        "workItemID": "todo_compaction"
-                    }
-                }),
-                InputDelivery::Queue,
-                107,
-            )),
+            Some(
+                NewSessionInput::new(
+                    "input_compaction_report",
+                    SESSION_ID,
+                    json!({
+                        "kind": "subagentReport",
+                        "jobID": "job_compaction",
+                        "text": "durable report",
+                        "references": {
+                            "goalID": "goal_compaction",
+                            "planID": "plan_compaction",
+                            "workItemID": "todo_compaction"
+                        }
+                    }),
+                    InputDelivery::Queue,
+                    107,
+                )
+                .with_cycle_id(Some("loop-cycle")),
+            ),
         ),
     )
     .expect("settle Job with one next-step report");
+}
+
+fn bind_loop_cycle(pool: &Arc<Pool>) {
+    let store = zuno_db::session_execution::SessionExecutionStore::new(Arc::clone(pool));
+    let mut state = store
+        .seed(
+            SESSION_ID,
+            zuno_types::execution::CollaborationMode::Work,
+            None,
+            1,
+        )
+        .expect("execution");
+    state.cycle_id = Some("loop-cycle".to_owned());
+    store.update(state.revision, state).expect("bound cycle");
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2643,26 +2666,30 @@ async fn loop_injects_a_durable_background_report_at_the_tool_safe_point() {
     }
     let mut connection = pool.get().expect("turn connection");
     put_user(&connection, "msg_user", 10, "echo hello");
+    bind_loop_cycle(&pool);
     let inbox = SessionInbox::new(Arc::clone(&pool));
     inbox
-        .admit(NewSessionInput::new(
-            "msg_steer",
-            SESSION_ID,
-            json!({
-                "kind": "subagentReport",
-                "jobID": "job_report",
-                "childSessionID": "ses_child",
-                "status": "completed",
-                "text": "include benchmark",
-                "metadata": {
-                    "schemaVersion": 1,
-                    "agent": "explorer",
-                    "finalText": "include benchmark"
-                }
-            }),
-            InputDelivery::Steer,
-            11,
-        ))
+        .admit(
+            NewSessionInput::new(
+                "msg_steer",
+                SESSION_ID,
+                json!({
+                    "kind": "subagentReport",
+                    "jobID": "job_report",
+                    "childSessionID": "ses_child",
+                    "status": "completed",
+                    "text": "include benchmark",
+                    "metadata": {
+                        "schemaVersion": 1,
+                        "agent": "explorer",
+                        "finalText": "include benchmark"
+                    }
+                }),
+                InputDelivery::Steer,
+                11,
+            )
+            .with_cycle_id(Some("loop-cycle")),
+        )
         .expect("admit steer");
     let run_registry = SessionRunRegistry::new();
     let guard = run_registry.begin_turn(SESSION_ID).expect("live turn");
@@ -3309,7 +3336,17 @@ async fn loop_live_steer_wakes_provider_retry_backoff_without_replaying_stale_in
     }));
 }
 
-fn without_prompt_estimates(events: &[TurnEvent]) -> Vec<TurnEvent> {
+fn context_usage_event_marker() -> TurnEvent {
+    TurnEvent::ContextUsageUpdated {
+        snapshot: Box::new(zuno_types::context_usage::ContextUsageSnapshot::unknown(
+            SESSION_ID,
+        )),
+    }
+}
+
+/// Keep the context event's exact position; its full state is compared separately
+/// by `stable_context_usage`, without volatile request IDs and wall-clock times.
+fn event_order_without_request_metadata(events: &[TurnEvent]) -> Vec<TurnEvent> {
     events
         .iter()
         .cloned()
@@ -3323,7 +3360,37 @@ fn without_prompt_estimates(events: &[TurnEvent]) -> Vec<TurnEvent> {
                 message_count,
                 estimated_prompt_tokens: 0,
             },
+            TurnEvent::ContextUsageUpdated { .. } => context_usage_event_marker(),
             event => event,
+        })
+        .collect()
+}
+
+fn stable_context_usage(
+    events: &[TurnEvent],
+) -> Vec<zuno_types::context_usage::ContextUsageSnapshot> {
+    fn normalize_request(request: &mut zuno_types::context_usage::ContextRequestIdentity) {
+        request.request_id = format!("request-{}", request.request_sequence);
+        request.time_started = 0;
+    }
+
+    events
+        .iter()
+        .filter_map(|event| {
+            let TurnEvent::ContextUsageUpdated { snapshot } = event else {
+                return None;
+            };
+            snapshot.validate().expect("canonical event must be valid");
+            let mut snapshot = snapshot.as_ref().clone();
+            snapshot.time_updated = 0;
+            if let Some(request) = snapshot.request.as_mut() {
+                normalize_request(request);
+            }
+            if let Some(confirmed) = snapshot.last_confirmed.as_mut() {
+                normalize_request(&mut confirmed.request);
+                confirmed.time_confirmed = 0;
+            }
+            Some(snapshot)
         })
         .collect()
 }
@@ -3352,6 +3419,7 @@ fn expected_full_turn_events() -> Vec<TurnEvent> {
             tool_ids: vec!["echo".to_owned()],
             rebuilt_for_late_mcp: false,
         },
+        context_usage_event_marker(),
         TurnEvent::ProviderRequestStarted {
             step: 1,
             message_count: 5,
@@ -3394,6 +3462,7 @@ fn expected_full_turn_events() -> Vec<TurnEvent> {
                 stop_reason: Some(FinishReason::ToolCalls),
             },
         },
+        context_usage_event_marker(),
         TurnEvent::AssistantCheckpointed {
             step: 1,
             message_id: "msg_turn-full_0001".to_owned(),
@@ -3444,6 +3513,7 @@ fn expected_full_turn_events() -> Vec<TurnEvent> {
             tool_ids: vec!["echo".to_owned()],
             rebuilt_for_late_mcp: false,
         },
+        context_usage_event_marker(),
         TurnEvent::ProviderRequestStarted {
             step: 2,
             message_count: 7,
@@ -3459,6 +3529,7 @@ fn expected_full_turn_events() -> Vec<TurnEvent> {
                 stop_reason: Some(FinishReason::Stop),
             },
         },
+        context_usage_event_marker(),
         TurnEvent::AssistantCheckpointed {
             step: 2,
             message_id: "msg_turn-full_0002".to_owned(),
@@ -3483,7 +3554,7 @@ async fn loop_full_turn_emits_the_exact_sequence_deterministically() {
     for run_index in 0..3 {
         let (events, requests, calls) = run_full_turn_once().await;
         assert_eq!(
-            without_prompt_estimates(&events),
+            event_order_without_request_metadata(&events),
             expected,
             "event sequence changed"
         );
@@ -3526,7 +3597,14 @@ async fn loop_full_turn_emits_the_exact_sequence_deterministically() {
                 events.len()
             );
         }
-        rendered_runs.push(format!("{events:#?}").into_bytes());
+        rendered_runs.push(
+            format!(
+                "{:#?}\n{:#?}",
+                event_order_without_request_metadata(&events),
+                stable_context_usage(&events),
+            )
+            .into_bytes(),
+        );
     }
 
     assert!(
@@ -7004,12 +7082,30 @@ async fn a_multi_step_turn_yields_for_compaction_after_crossing_the_context_thre
     let error = run
         .outcome
         .expect_err("the next provider request must wait for compaction");
+    let history = MessageStore::new(&run.connection)
+        .hydrate_session(SESSION_ID)
+        .expect("the checkpoint and actual tool result are durable");
+    let messages = project_history_owned("", history)
+        .into_iter()
+        .map(zuno_llm::registry::RequestMessage::new)
+        .collect::<Vec<_>>();
+    let boundary = messages
+        .iter()
+        .rposition(|message| message.role == Role::Assistant)
+        .expect("the first provider response")
+        + 1;
+    let tail = zuno_engine::context_usage::estimate_message_tokens(&messages[boundary..]);
+    assert!(
+        tail > 0,
+        "the returned tool result is unaccounted local context"
+    );
+    let expected_context = format!("{} tokens", 120 + tail);
     assert!(
         matches!(
             &error,
             TurnError::CompactionRequired { reason }
-                if reason.contains("provider-reported context")
-                    && reason.contains("120 tokens")
+                if reason.contains("provider-confirmed context plus estimated tail")
+                    && reason.contains(&expected_context)
                     && reason.contains("threshold of 110")
                     && reason.contains("step 2")
         ),
@@ -7046,7 +7142,7 @@ async fn a_multi_step_turn_yields_for_compaction_after_crossing_the_context_thre
                     detail,
                     ..
                 } if code == "context.compact"
-                    && detail.contains("120 tokens")
+                    && detail.contains(&expected_context)
                     && detail.contains("threshold of 110")
             )
         }),
@@ -7371,14 +7467,19 @@ async fn the_default_budget_policy_leaves_a_multi_step_turn_byte_identical() {
         }
     );
     assert_eq!(
-        without_prompt_estimates(&run.events),
-        without_prompt_estimates(&unpolicied),
+        event_order_without_request_metadata(&run.events),
+        event_order_without_request_metadata(&unpolicied),
         "installing the default policy changed the turn's observable events"
     );
     assert_eq!(
-        without_prompt_estimates(&run.events),
+        event_order_without_request_metadata(&run.events),
         expected_full_turn_events(),
         "the frozen event sequence moved"
+    );
+    assert_eq!(
+        stable_context_usage(&run.events),
+        stable_context_usage(&unpolicied),
+        "the default policy changed canonical usage state"
     );
     assert!(
         run.events

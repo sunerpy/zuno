@@ -1005,7 +1005,7 @@ impl SidebarView {
             let kind = if context.estimated {
                 "estimate"
             } else {
-                "current prompt"
+                "used"
             };
             lines.push(padded(
                 &format!(
@@ -1034,11 +1034,7 @@ impl SidebarView {
                 self.context.muted(),
             ));
         } else {
-            lines.push(padded(
-                "  — current prompt unavailable",
-                width,
-                self.context.muted(),
-            ));
+            lines.push(padded("  — context unknown", width, self.context.muted()));
         }
         if self.ambient.failed_turns > 0 {
             let plural = if self.ambient.failed_turns == 1 {

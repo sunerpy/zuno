@@ -23,8 +23,8 @@
 //!
 //! [`zuno_tools::registry::BUILTIN_ORDER`] is the canonical native slot order. This module
 //! registers the ones whose implementation needs nothing but the workspace, the
-//! database, and the collaborators [`ToolSelection`] carries. `plan_exit` needs a
-//! live user to answer, `lsp` has no implementation in `zuno-tools` at all, and
+//! database, and the collaborators [`ToolSelection`] carries. Questions and
+//! `plan_exit` need a durable QuestionPort, `lsp` has no implementation here, and
 //! `execute` is registered by the builder itself behind an experimental flag. An
 //! unregistered slot is simply absent from the assembled vector, so the model is
 //! never told about a tool that cannot run.
@@ -62,13 +62,14 @@ use zuno_sandbox::{
     SandboxPolicy, SandboxResolution, SandboxResolutionKind, SandboxResolver,
     SandboxUnavailableAction, SandboxUnavailableCause, SystemSandboxResolver,
 };
+use zuno_tool::question::QuestionPort;
 use zuno_tool::{
     OutputLimits, PermissionAsk, PermissionAsker, PermissionOrigin, Tool, ToolContext,
     ToolUiIntent, erase,
 };
 use zuno_tools::FileTools;
 use zuno_tools::exposure::ExposureFlags;
-use zuno_tools::question::{QuestionAsker, QuestionTool};
+use zuno_tools::question::QuestionTool;
 use zuno_tools::registry::{
     BuiltinSlot, CustomTool, McpToolLoader, McpToolSnapshot, RegistryFlags, ResolveInput,
     ToolRegistryBuilder,
@@ -94,6 +95,7 @@ pub(crate) struct ToolRuntime {
     /// natively under a confined request: the trusted `run-unconfined` fallback or an
     /// explicit `sandbox.backend: native` selection.
     pub(crate) sandbox_notice: Option<String>,
+    pub(crate) parent_authority: zuno_orchestration::ParentAuthoritySnapshot,
 }
 
 pub(crate) struct ToolSelection<'a> {
@@ -102,7 +104,7 @@ pub(crate) struct ToolSelection<'a> {
     pub(crate) manifest: Arc<zuno_harness::ToolManifest>,
     pub(crate) contributions: Arc<zuno_harness::ToolContributions>,
     pub(crate) public_http: Arc<zuno_network::PublicHttpClient>,
-    pub(crate) question: Option<Arc<dyn QuestionAsker>>,
+    pub(crate) question: Option<Arc<dyn QuestionPort>>,
     pub(crate) background_executions: Arc<zuno_pty::BackgroundExecutionService>,
     /// Test seam for a resolver supplied by the composition root.
     ///
@@ -284,8 +286,13 @@ pub(crate) fn assemble(
         require_provider(&search).map_err(to_string)?;
     }
 
+    let exposure = ExposureFlags::from_lookup(|key| env.value(key).map(str::to_owned));
     let flags = RegistryFlags {
-        exposure: ExposureFlags::from_lookup(|key| env.value(key).map(str::to_owned)),
+        exposure: if selection.question.is_some() {
+            exposure.with_question_tool()
+        } else {
+            exposure
+        },
         search: search.clone(),
         experimental_lsp_tool: false,
         experimental_code_mode: false,
@@ -323,7 +330,22 @@ pub(crate) fn assemble(
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    let rules = selected_profile.rules_with_extension_tools(&dynamic_tool_ids);
+    let mut rules = selected_profile.rules_with_extension_tools(&dynamic_tool_ids);
+    if config
+        .tools
+        .as_ref()
+        .and_then(|tools| tools.get(zuno_engine::dispatch::TOOL_SEARCH_ID))
+        == Some(&false)
+    {
+        // Discovery is synthesized by the dispatcher, not a raw registry entry.
+        // Preserve an explicit disable in the authority inherited by children.
+        rules.push(Rule {
+            permission: zuno_engine::dispatch::TOOL_SEARCH_ID.to_owned(),
+            pattern: "*".to_owned(),
+            action: zuno_permission::PermissionAction::Deny,
+            source: Some("config.tools".to_owned()),
+        });
+    }
     let native_review =
         selected_agent.name == "review" && matches!(&selected_agent.source, AgentSource::Native);
 
@@ -342,6 +364,8 @@ pub(crate) fn assemble(
     };
     let tooling = SearchTooling::deferred(scope);
     let mut sandbox_notice = None;
+    let mut inherited_policy = sandbox_policy(directory, config, selected_profile, &rules)?;
+    let mut inherited_backend = config.sandbox_backend().as_str().to_owned();
     let shell = shell_visible(selected_profile, selected_agent, &selection.manifest).then(|| {
         let policy = sandbox_policy(directory, config, selected_profile, &rules)?;
         let requested_mode = policy.mode();
@@ -353,6 +377,16 @@ pub(crate) fn assemble(
             .resolve(policy, sandbox_backend_request(config))
             .map_err(|error| render_sandbox_error(error, requested_mode))?;
         sandbox_notice = native_notice(&resolution);
+        inherited_policy = resolution.requested_policy().clone();
+        if matches!(
+            resolution.kind(),
+            SandboxResolutionKind::ExplicitNative
+                | SandboxResolutionKind::TrustedNative
+                | SandboxResolutionKind::PlatformNative
+                | SandboxResolutionKind::UnavailableFallback
+        ) {
+            inherited_backend = "native".to_owned();
+        }
         let (backend, execution_policy) = resolution.into_execution();
         zuno_tools::shell::ShellTool::with_sandbox_backend_and_generated_root(
             directory,
@@ -364,17 +398,45 @@ pub(crate) fn assemble(
         .map_err(to_string)
         .map(|tool| {
             tool.with_background_executions(Arc::clone(&selection.background_executions))
+                .with_execution_store(Arc::clone(&selection.todo_store))
                 .with_output_limits(OutputLimits::from_config(config.tool_output.as_ref()))
         })
     });
     let shell = shell.transpose()?;
     if selection.interaction_policy.allows_question()
         && selection.manifest.contains(BuiltinSlot::Question)
-        && let Some(asker) = selection.question.clone()
+        && let Some(port) = selection.question.clone()
+    {
+        let tool = if selection.interaction_policy == zuno_goal::InteractionPolicy::WorkAutonomous {
+            QuestionTool::required(port)
+        } else {
+            QuestionTool::new(port)
+        };
+        builder
+            .register_builtin(BuiltinSlot::Question, erase(tool))
+            .map_err(|error| error.to_string())?;
+    }
+    if selection.interaction_policy.allows_async_question()
+        && selection.manifest.contains(BuiltinSlot::QuestionAsync)
+        && let Some(port) = selection.question.clone()
     {
         builder
-            .register_builtin(BuiltinSlot::Question, erase(QuestionTool::new(asker)))
-            .map_err(|error| error.to_string())?;
+            .register_builtin(
+                BuiltinSlot::QuestionAsync,
+                erase(QuestionTool::asynchronous(port)),
+            )
+            .map_err(to_string)?;
+    }
+    if selection.interaction_policy == zuno_goal::InteractionPolicy::PlanClarification
+        && selection.manifest.contains(BuiltinSlot::Plan)
+        && let Some(port) = selection.question.clone()
+    {
+        builder
+            .register_builtin(
+                BuiltinSlot::Plan,
+                erase(zuno_tools::PlanExitTool::new(port)),
+            )
+            .map_err(to_string)?;
     }
     let Delegation {
         host,
@@ -607,10 +669,10 @@ pub(crate) fn assemble(
     builder.register_configured_builtin(erase(zuno_tools::TaskReportTool::new(Arc::clone(
         &selection.todo_store,
     ))));
-    if selection.interaction_policy.allows_goal_request_input() && selection.question.is_some() {
-        builder.register_configured_builtin(erase(zuno_goal::GoalRequestInputTool::new(
-            Arc::clone(&selection.goal_store),
-        )));
+    if selection.interaction_policy.allows_goal_request_input()
+        && let Some(port) = selection.question.clone()
+    {
+        builder.register_configured_builtin(erase(zuno_goal::GoalRequestInputTool::new(port)));
     }
     for tool in zuno_tools::work_state_tools_with_observer(
         Arc::clone(&selection.todo_store),
@@ -645,6 +707,10 @@ pub(crate) fn assemble(
     }
     tools.retain(|tool| match tool.id() {
         zuno_tools::question::WIRE_ID => selection.interaction_policy.allows_question(),
+        zuno_tools::question::ASYNC_WIRE_ID => selection.interaction_policy.allows_async_question(),
+        "plan_exit" => {
+            selection.interaction_policy == zuno_goal::InteractionPolicy::PlanClarification
+        }
         zuno_goal::REQUEST_GOAL_INPUT_TOOL_ID => {
             selection.interaction_policy.allows_goal_request_input()
         }
@@ -672,10 +738,9 @@ pub(crate) fn assemble(
         mcp_schemas
             .iter()
             .filter(|tool| {
-                selection.tool_authority.is_some()
-                    || explicit_tool_allowlist
-                        .as_ref()
-                        .is_some_and(|allowlist| allowlist.contains(tool.id.as_str()))
+                explicit_tool_allowlist
+                    .as_ref()
+                    .is_some_and(|allowlist| allowlist.contains(tool.id.as_str()))
             })
             .map(|tool| tool.id.clone()),
     );
@@ -710,12 +775,65 @@ pub(crate) fn assemble(
         );
     }
     let deferred_tool_ids = exposure.deferred;
+    let parent_authority = zuno_orchestration::ParentAuthoritySnapshot {
+        permission_mode: match config.effective_permission_mode() {
+            PermissionMode::Standard => zuno_orchestration::PermissionModeSnapshot::Standard,
+            PermissionMode::Strict => zuno_orchestration::PermissionModeSnapshot::Strict,
+            PermissionMode::AllowAll => zuno_orchestration::PermissionModeSnapshot::AllowAll,
+        },
+        workspace: inherited_policy.workspace().to_string_lossy().into_owned(),
+        rules: rules
+            .iter()
+            .map(|rule| zuno_orchestration::PermissionRuleSnapshot {
+                permission: rule.permission.clone(),
+                pattern: rule.pattern.clone(),
+                source: rule.source.clone(),
+                action: match rule.action {
+                    zuno_permission::PermissionAction::Allow => {
+                        zuno_orchestration::PermissionActionSnapshot::Allow
+                    }
+                    zuno_permission::PermissionAction::Ask => {
+                        zuno_orchestration::PermissionActionSnapshot::Ask
+                    }
+                    zuno_permission::PermissionAction::Deny => {
+                        zuno_orchestration::PermissionActionSnapshot::Deny
+                    }
+                },
+            })
+            .collect(),
+        sandbox: zuno_orchestration::SandboxCapabilityDescriptor {
+            mode: inherited_policy.mode().as_str().to_owned(),
+            network: if inherited_policy.network() == NetworkAccess::Allowed {
+                "allow"
+            } else {
+                "deny"
+            }
+            .to_owned(),
+            backend: inherited_backend,
+            writable_roots: inherited_policy
+                .writable_roots()
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+            protected_paths: inherited_policy
+                .protected_paths()
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+        },
+        sandbox_on_unavailable: config.sandbox_on_unavailable().as_str().to_owned(),
+        tools: tools
+            .iter()
+            .map(|tool| tool.definition().schema_identity())
+            .collect(),
+    };
     Ok(ToolRuntime {
         tools,
         deferred_tool_ids,
         rules,
         suppressions,
         sandbox_notice,
+        parent_authority,
     })
 }
 

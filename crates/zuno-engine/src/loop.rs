@@ -60,6 +60,9 @@ use zuno_tool::{
     ToolContinuation, ToolDefinition, ToolDynamicContextRefresh, ToolOutput, ToolReplayPolicy,
     ToolResultPresentation, ToolUiIntent,
 };
+use zuno_types::context_usage::{
+    ContextRequestIdentity, ContextTokenAccounting, ContextUsageCounters, ContextUsageSnapshot,
+};
 pub use zuno_types::execution::TurnExecutionIdentity;
 use zuno_types::execution::{CompletionSource, ContinuationToken, TurnStartKind, UserControlKind};
 
@@ -67,6 +70,7 @@ use crate::budget::{
     BudgetDecision, BudgetPolicyError, BudgetStop, NoopBudgetPolicy, ProviderRequestUsage,
     TurnBudgetPolicy, TurnUsageSnapshot,
 };
+use crate::context_usage::{ContextUsageRecorder, counters_from_stream_event};
 use crate::hooks::{HookMessageWithParts, NoopHooks, RequestHookInput, TurnHooks};
 use crate::interrupt::{HardInterruptRequest, InterruptSignal, SoftInterruptMessage};
 use crate::prompt::{
@@ -390,6 +394,11 @@ pub enum TurnEvent {
         message_count: usize,
         /// Deterministic local estimate retained when a provider rejects the request.
         estimated_prompt_tokens: u64,
+    },
+    /// Canonical state committed before publication. Boxing keeps the shared
+    /// event channel's enum size independent from the snapshot's metadata.
+    ContextUsageUpdated {
+        snapshot: Box<ContextUsageSnapshot>,
     },
     Provider {
         step: u32,
@@ -1340,6 +1349,12 @@ pub trait ToolDispatcher: Send + Sync {
 /// awaited after the tool result commits; the host supplies its own state provider.
 #[async_trait]
 pub trait DynamicContextRefresher: Send + Sync {
+    /// Refresh host-owned Memory/work state without exposing a storage connection
+    /// to the shared kernel or serializing a live host into a checkpoint.
+    async fn before_request(&self, _session_id: &str) -> Result<Option<DynamicContext>, String> {
+        Ok(None)
+    }
+
     async fn refresh(
         &self,
         session_id: &str,
@@ -1608,29 +1623,26 @@ fn hard_interrupt_request(context: &TurnContext<'_>) -> Option<HardInterruptRequ
 /// on a turn that still had allowance. `request_context_tokens` right below already
 /// went through the mode for the same reason.
 fn request_usage(accumulator: &StepAccumulator) -> ProviderRequestUsage {
+    accumulator
+        .prior_attempt_usage
+        .saturating_add(current_attempt_usage(accumulator))
+}
+
+fn current_attempt_usage(accumulator: &StepAccumulator) -> ProviderRequestUsage {
     let input = accumulator.input_tokens.unwrap_or(0);
-    let output = accumulator.output_tokens.unwrap_or(0);
+    let output = accumulator
+        .output_tokens
+        .unwrap_or(accumulator.reasoning_tokens.unwrap_or(0));
     let cache_read = accumulator.cache_read_input_tokens.unwrap_or(0);
     let cache_write = accumulator.cache_write_input_tokens.unwrap_or(0);
-    match accumulator.prompt_accounting {
+    let mut usage = match accumulator.prompt_accounting {
         Some(accounting) => {
             ProviderRequestUsage::reported(accounting, input, output, cache_read, cache_write)
         }
         None => ProviderRequestUsage::unreported(input, output, cache_read, cache_write),
-    }
-}
-
-fn request_context_tokens(accumulator: &StepAccumulator) -> Option<u64> {
-    let accounting = accumulator.prompt_accounting?;
-    Some(
-        accounting
-            .prompt_total(
-                accumulator.input_tokens.unwrap_or(0),
-                accumulator.cache_read_input_tokens.unwrap_or(0),
-                accumulator.cache_write_input_tokens.unwrap_or(0),
-            )
-            .saturating_add(accumulator.output_tokens.unwrap_or(0)),
-    )
+    };
+    usage.accounted &= accumulator.usage_counters().is_complete();
+    usage
 }
 
 /// The turn total before any request has been accounted for.
@@ -1726,7 +1738,7 @@ async fn require_context_compaction_before_request(
     events: &TurnEventSender,
     step: u32,
     threshold: Option<u64>,
-    last_context_tokens: Option<u64>,
+    confirmed_context_with_tail: Option<u64>,
     estimated_prompt_tokens: u64,
 ) -> Result<(), TurnError> {
     if step <= 1 {
@@ -1735,10 +1747,10 @@ async fn require_context_compaction_before_request(
     let Some(threshold) = threshold else {
         return Ok(());
     };
-    let (used_tokens, source) = last_context_tokens
+    let (used_tokens, source) = confirmed_context_with_tail
         .filter(|tokens| *tokens > 0)
         .map_or((estimated_prompt_tokens, "estimated prompt"), |tokens| {
-            (tokens, "provider-reported context")
+            (tokens, "provider-confirmed context plus estimated tail")
         });
     if used_tokens < threshold {
         return Ok(());
@@ -1823,6 +1835,8 @@ struct StepAccumulator {
     next_tool_ordinal: usize,
     finish_reason: Option<FinishReason>,
     saw_message_end: bool,
+    /// The persisted assistant differs from the output the provider measured.
+    context_rewritten: bool,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     /// Output tokens the provider itemised as reasoning, exactly as reported.
@@ -1834,6 +1848,9 @@ struct StepAccumulator {
     cache_read_input_tokens: Option<u64>,
     cache_write_input_tokens: Option<u64>,
     prompt_accounting: Option<PromptAccounting>,
+    /// Observed usage survives output rollback. Failed streams cannot certify a
+    /// final bill, so these lower-bound totals keep `accounted` false.
+    prior_attempt_usage: ProviderRequestUsage,
 }
 
 impl StepAccumulator {
@@ -1849,12 +1866,14 @@ impl StepAccumulator {
             next_tool_ordinal: 0,
             finish_reason: None,
             saw_message_end: false,
+            context_rewritten: false,
             input_tokens: None,
             output_tokens: None,
             reasoning_tokens: None,
             cache_read_input_tokens: None,
             cache_write_input_tokens: None,
             prompt_accounting: None,
+            prior_attempt_usage: empty_turn_usage(),
         }
     }
 
@@ -1961,21 +1980,29 @@ impl StepAccumulator {
                 self.finish_reason = *stop_reason;
                 self.saw_message_end = true;
             }
-            StreamEvent::RetryRollback { .. } => self.reset_generated(),
-            StreamEvent::TokenUsage {
-                input_tokens,
-                output_tokens,
-                reasoning_tokens,
-                cache_read_input_tokens,
-                cache_write_input_tokens,
-                accounting,
-            } => {
-                self.input_tokens = *input_tokens;
-                self.output_tokens = *output_tokens;
-                self.reasoning_tokens = *reasoning_tokens;
-                self.cache_read_input_tokens = *cache_read_input_tokens;
-                self.cache_write_input_tokens = *cache_write_input_tokens;
-                self.prompt_accounting = Some(*accounting);
+            StreamEvent::RetryRollback { .. } => {
+                let mut observed = current_attempt_usage(self);
+                observed.accounted = false;
+                self.prior_attempt_usage = self.prior_attempt_usage.saturating_add(observed);
+                self.reset_generated();
+            }
+            StreamEvent::TokenUsage { .. } => {
+                let mut counters = self.usage_counters();
+                counters.merge_snapshot(counters_from_stream_event(event).expect("usage frame"));
+                self.input_tokens = counters.input_tokens;
+                self.output_tokens = counters.output_tokens;
+                self.reasoning_tokens = counters.reasoning_tokens;
+                self.cache_read_input_tokens = counters.cache_read_input_tokens;
+                self.cache_write_input_tokens = counters.cache_write_input_tokens;
+                self.prompt_accounting = match counters.accounting {
+                    ContextTokenAccounting::CacheInsideInput => {
+                        Some(PromptAccounting::CacheInsideInput)
+                    }
+                    ContextTokenAccounting::CacheBesideInput => {
+                        Some(PromptAccounting::CacheBesideInput)
+                    }
+                    ContextTokenAccounting::Unknown => None,
+                };
             }
             StreamEvent::NativeToolCall {
                 request_id,
@@ -2113,12 +2140,32 @@ impl StepAccumulator {
         self.next_tool_ordinal = 0;
         self.finish_reason = None;
         self.saw_message_end = false;
+        self.context_rewritten = false;
         self.input_tokens = None;
         self.output_tokens = None;
         self.reasoning_tokens = None;
         self.cache_read_input_tokens = None;
         self.cache_write_input_tokens = None;
         self.prompt_accounting = None;
+    }
+
+    fn usage_counters(&self) -> ContextUsageCounters {
+        ContextUsageCounters {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            reasoning_tokens: self.reasoning_tokens,
+            cache_read_input_tokens: self.cache_read_input_tokens,
+            cache_write_input_tokens: self.cache_write_input_tokens,
+            accounting: match self.prompt_accounting {
+                Some(PromptAccounting::CacheInsideInput) => {
+                    ContextTokenAccounting::CacheInsideInput
+                }
+                Some(PromptAccounting::CacheBesideInput) => {
+                    ContextTokenAccounting::CacheBesideInput
+                }
+                None => ContextTokenAccounting::Unknown,
+            },
+        }
     }
 
     /// Whether any byte of this step reached the user or the transcript, including a
@@ -2237,7 +2284,7 @@ pub async fn advance_turn(
 }
 
 async fn run_turn_in_span(
-    request: RunTurnRequest,
+    mut request: RunTurnRequest,
     context: &mut TurnContext<'_>,
     events: TurnEventSender,
     turn_span: tracing::Span,
@@ -2275,6 +2322,9 @@ async fn run_turn_in_span(
     } else {
         ProviderRequestContext::ChildTurn(provider_session_identity)
     };
+    let context_usage = Arc::new(Mutex::new(ContextUsageRecorder::from_seed(
+        store.persistence.context_usage(&store.scope).await?,
+    )?));
     let legacy_tool_schema_snapshots = store.persistence.legacy_tool_schemas(&store.scope).await?;
     store.persistence.touch(&store.scope).await?;
     let _turn_identity = context
@@ -2336,7 +2386,7 @@ async fn run_turn_in_span(
     let mut step_limit_finalization_attempted = state.step_limit_finalization_attempted;
     let mut turn_usage = state.turn_usage;
     let mut last_request = state.last_request;
-    let mut last_context_tokens = state.last_context_tokens;
+    let last_context_tokens = state.last_context_tokens;
     let mut reported_historical_tool_repair = state.reported_historical_tool_repair;
     let mut durable_turn_start_recorded = resuming;
 
@@ -2361,7 +2411,7 @@ async fn run_turn_in_span(
             // Waiting time remains part of the original turn allowance. Check
             // it before dispatching another tool, even without a model request.
             let decision = budget
-                .after_response(&TurnUsageSnapshot {
+                .before_tool_continuation(&TurnUsageSnapshot {
                     session_id: &request.session_id,
                     turn_id: &request.turn_id,
                     step: steps,
@@ -2375,7 +2425,7 @@ async fn run_turn_in_span(
                     tool_calls_dispatched,
                 })
                 .await
-                .map_err(|error| budget_policy_failure("after_response", error))?;
+                .map_err(|error| budget_policy_failure("before_tool_continuation", error))?;
             honour_budget_decision(&events, decision).await?;
             pending
         } else {
@@ -2425,6 +2475,26 @@ async fn run_turn_in_span(
                 )));
             }
 
+            let soft_before_hook = context.live_inputs.as_ref().map(|live| {
+                let signal = live.guard.soft_interrupt_signal();
+                (signal.epoch(), signal.is_set())
+            });
+            tokio::select! {
+                biased;
+                () = context.interrupt.notified() => continue,
+                result = context.hooks.before_provider_request(
+                    &request.session_id, &request.turn_id, steps.saturating_add(1),
+                ) => result.map_err(TurnError::Hook)?,
+            }
+            if let Some(refresher) = context.dynamic_context_refresher
+                && let Some(refreshed) = refresher
+                    .before_request(&request.session_id)
+                    .await
+                    .map_err(|detail| TurnError::DynamicContextRefresh { detail })?
+            {
+                current_dynamic_context = refreshed.clone();
+                request.dynamic_context = refreshed;
+            }
             let mut history = store.persistence.history(&store.scope).await?;
             let has_compaction_checkpoint =
                 crate::compaction::checkpoint::latest_checkpoint(&history).is_some();
@@ -2433,11 +2503,15 @@ async fn run_turn_in_span(
                 Some(requested) => requested.clone(),
                 None => requested_turn(&request.session_id, &history, &request.start)?,
             };
-            if inject_live_inputs(context, &request, &requested, &events)
-                .await?
-                .count
-                > 0
-            {
+            let injected = inject_live_inputs(context, &request, &requested, &events).await?;
+            let handled_soft_wake = context
+                .live_inputs
+                .as_ref()
+                .zip(soft_before_hook)
+                .is_some_and(|(live, (epoch, was_set))| {
+                    was_set || live.guard.soft_interrupt_signal().epoch() != epoch
+                });
+            if injected.count > 0 || handled_soft_wake {
                 continue;
             }
             if max_steps.is_some() && pinned_requested_turn.is_none() {
@@ -2574,6 +2648,7 @@ async fn run_turn_in_span(
             let history_tool_projection =
                 historical_tool_projection(&history, history_definitions, &request.turn_id);
             let history_tool_fallbacks = history_tool_projection.fallback_reasons();
+            let input_provenance = request_input_provenance(&history);
             let stable_history = if context.hooks.enabled() {
                 let mut transformed = hook_messages(&history);
                 context
@@ -2599,6 +2674,16 @@ async fn run_turn_in_span(
                 "transform_messages",
             )
             .map_err(TurnError::Hook)?;
+            if context_usage
+                .lock()
+                .expect("context usage lock")
+                .confirmed_history_changed(&stable_history)
+            {
+                // Terminal foreground publication may replace an earlier running
+                // handle in place. Rebuild the request cache for that real history;
+                // canonical occupancy stays unknown until the provider measures it.
+                prompt_cache = None;
+            }
             let cache = prompt_cache.get_or_insert_with(|| PromptCache::new(system_prompt.clone()));
             let step_dynamic_context = if step_limit_finalization.is_some() {
                 current_dynamic_context
@@ -2670,6 +2755,20 @@ async fn run_turn_in_span(
                 &combined_history_tool_fallbacks,
             );
             let context_epoch = store.persistence.context_epoch(&store.scope).await?;
+            let reset = {
+                let mut usage = context_usage.lock().expect("context usage lock");
+                let previous = usage.snapshot().context_epoch;
+                usage.observe_history_epoch(context_epoch)?;
+                usage.snapshot().context_epoch != previous
+            };
+            if reset {
+                publish_context_usage(
+                    &events,
+                    persist_context_state(&store, &context_usage).await?,
+                )
+                .await?;
+            }
+
             let combined_history_tool_repair = combined_history_tool_repair.retain_new_diagnostics(
                 context.run_registry.as_ref(),
                 &request.session_id,
@@ -2747,11 +2846,19 @@ async fn run_turn_in_span(
                 developer_context: &completion.developer_context,
             };
             let estimated_prompt_tokens = estimate_completion_prompt_tokens(&completion);
+            let projected_context = context_usage
+                .lock()
+                .expect("context usage lock")
+                .projected_occupancy(
+                    &model.catalog_provider_id,
+                    &model.catalog_model_id,
+                    &completion,
+                );
             require_context_compaction_before_request(
                 &events,
                 step,
                 request.context_compaction_threshold,
-                last_context_tokens,
+                projected_context,
                 estimated_prompt_tokens,
             )
             .await?;
@@ -2792,6 +2899,7 @@ async fn run_turn_in_span(
                     parts: Vec::new(),
                     persisted_at_ms: now_millis(),
                     context_limit: None,
+                    context_usage: None,
                 })
                 .await?;
             last_assistant_id = Some(assistant_id.clone());
@@ -2851,6 +2959,7 @@ async fn run_turn_in_span(
                         parts: Vec::new(),
                         persisted_at_ms: now_millis(),
                         context_limit: None,
+                        context_usage: None,
                     })
                     .await?;
             }
@@ -2872,9 +2981,26 @@ async fn run_turn_in_span(
                 locked_tools: &locked_tools,
             }));
             let request_id = format!("req_{}", Uuid::now_v7().simple());
-            append_provider_request_started(
+            let applied_input_ids =
+                request_input_ids(&store, &input_provenance, &completion).await?;
+            assistant
+                .data
+                .insert("requestID".to_owned(), json!(request_id));
+            assistant.data.insert(
+                "requestPurpose".to_owned(),
+                json!(provider_request_context.purpose().as_str()),
+            );
+            assistant.data.insert(
+                "requestContextTokens".to_owned(),
+                json!(
+                    crate::context_usage::estimate_request_context(&completion)
+                        .request_context_tokens
+                ),
+            );
+            let context_update = append_provider_request_started(
                 &store,
                 &request,
+                &context_usage,
                 ProviderRequestStart {
                     step,
                     request_id: &request_id,
@@ -2894,9 +3020,26 @@ async fn run_turn_in_span(
                         .request_context()
                         .expect("foreground completion always has provider routing context"),
                     step_limit_finalization,
+                    assistant: &assistant,
+                    completion: &completion,
+                    context_identity: ContextRequestIdentity {
+                        request_id: request_id.clone(),
+                        request_sequence: 0,
+                        attempt: 1,
+                        context_epoch: 0,
+                        provider_id: model.catalog_provider_id.clone(),
+                        model_id: model.catalog_model_id.clone(),
+                        source: crate::context_usage::source_for_request(&provider_request_context),
+                        turn_id: Some(request.turn_id.clone()),
+                        time_started: now_millis(),
+                        request_context_tokens: None,
+                        history_prefix: None,
+                    },
+                    applied_input_ids: &applied_input_ids,
                 },
             )
             .await?;
+            publish_context_usage(&events, context_update).await?;
             events
                 .send(TurnEvent::ProviderRequestStarted {
                     step,
@@ -2928,6 +3071,10 @@ async fn run_turn_in_span(
                         let soft_interrupt = soft_interrupt.clone();
                         let events = events.clone();
                         let accumulator = Arc::clone(&accumulator);
+                    let usage_store = store.clone();
+                    let context_usage = Arc::clone(&context_usage);
+                    let applied_input_ids = applied_input_ids.clone();
+                    let context_turn_id = request.turn_id.clone();
                         let locked_tools = Arc::clone(&locked_tools);
                         let request_span = span::provider_request_for_session(
                             &request.session_id,
@@ -2940,6 +3087,12 @@ async fn run_turn_in_span(
                         async move {
                             let operation_span = request_span.clone();
                             let result = async move {
+                            if attempt == 1
+                                && let Err(error) = usage_store.persistence.mark_inputs_applied(
+                                    &usage_store.scope, &context_turn_id, &applied_input_ids, now_millis(),
+                                ).await {
+                                    return Ok(Err(error));
+                                }
                                 let mut stream = provider.stream(completion);
                                 // `Some(n)` once the message has finished: how many more frames may be
                                 // read for their bookkeeping before the step ends regardless.
@@ -2991,6 +3144,19 @@ async fn run_turn_in_span(
                                     if let Err(error) = apply {
                                         return Ok(Err(error));
                                     }
+                                let context_update = match persist_context_frame(
+                                    &usage_store,
+                                    &context_usage,
+                                    &event,
+                                ).await {
+                                    Ok(snapshot) => snapshot,
+                                    Err(error) => return Ok(Err(error)),
+                                };
+                                if let Err(error) =
+                                    publish_context_usage(&events, context_update).await
+                                {
+                                    return Ok(Err(error));
+                                }
                                     if let StreamEvent::ToolUseStart { id, name } = &event
                                         && let Err(error) = events
                                             .send(TurnEvent::ToolCallStarted {
@@ -3045,11 +3211,16 @@ async fn run_turn_in_span(
                     |event| {
                         let events = events.clone();
                         let accumulator = Arc::clone(&accumulator);
+                    let usage_store = store.clone();
+                    let context_usage = Arc::clone(&context_usage);
                         async move {
                             accumulator
                                 .lock()
                                 .expect("step accumulator lock")
                                 .apply(step, &event)?;
+                        let snapshot =
+                            persist_context_frame(&usage_store, &context_usage, &event).await?;
+                        publish_context_usage(&events, snapshot).await?;
                             events.send(TurnEvent::Provider { step, event }).await
                         }
                     },
@@ -3114,7 +3285,6 @@ async fn run_turn_in_span(
             // Accounted before the step's disposition is examined, so a request whose
             // stream failed, was steered, or was interrupted still counts against the
             // allowance. Those requests were paid for; only their answers were lost.
-            last_context_tokens = request_context_tokens(&accumulator);
             last_request = request_usage(&accumulator);
             turn_usage = turn_usage.saturating_add(last_request);
             let provider_exit = match provider_result {
@@ -3130,16 +3300,18 @@ async fn run_turn_in_span(
                         Some(&error),
                     )
                     .await?;
-                    checkpoint_assistant(
+                    let context_update = checkpoint_assistant(
                         &store,
                         &request,
                         step,
                         &mut assistant,
                         &accumulator,
                         &locked_tools,
+                        &context_usage,
                         AssistantCheckpointDisposition::Failed(&error),
                     )
                     .await?;
+                    publish_context_usage(&events, context_update).await?;
                     events
                         .send(TurnEvent::AssistantCheckpointed {
                             step,
@@ -3162,11 +3334,15 @@ async fn run_turn_in_span(
                     continue;
                 }
                 let part_id = positional_part_id(&request.turn_id, step, position, PART_KIND_TEXT);
-                if let Err(message) = context
+                let before = sha256_text(text);
+                let result = context
                     .hooks
                     .text_complete(&request.session_id, &assistant_id, &part_id, text)
-                    .await
-                {
+                    .await;
+                // Tail-after-assistant accounting cannot cover a hook rewriting that
+                // assistant itself, including a mutation followed by a hook failure.
+                accumulator.context_rewritten |= before != sha256_text(text);
+                if let Err(message) = result {
                     hook_failure = Some(message);
                     break;
                 }
@@ -3183,16 +3359,18 @@ async fn run_turn_in_span(
                     Some(&error),
                 )
                 .await?;
-                checkpoint_assistant(
+                let context_update = checkpoint_assistant(
                     &store,
                     &request,
                     step,
                     &mut assistant,
                     &accumulator,
                     &locked_tools,
+                    &context_usage,
                     AssistantCheckpointDisposition::Failed(&error),
                 )
                 .await?;
+                publish_context_usage(&events, context_update).await?;
                 events
                     .send(TurnEvent::AssistantCheckpointed {
                         step,
@@ -3215,16 +3393,18 @@ async fn run_turn_in_span(
                     None,
                 )
                 .await?;
-                checkpoint_assistant(
+                let context_update = checkpoint_assistant(
                     &store,
                     &request,
                     step,
                     &mut assistant,
                     &accumulator,
                     &locked_tools,
+                    &context_usage,
                     AssistantCheckpointDisposition::Interrupted(interruption),
                 )
                 .await?;
+                publish_context_usage(&events, context_update).await?;
                 events
                     .send(TurnEvent::AssistantCheckpointed {
                         step,
@@ -3257,16 +3437,18 @@ async fn run_turn_in_span(
                     None,
                 )
                 .await?;
-                checkpoint_assistant(
+                let context_update = checkpoint_assistant(
                     &store,
                     &request,
                     step,
                     &mut assistant,
                     &accumulator,
                     &locked_tools,
+                    &context_usage,
                     AssistantCheckpointDisposition::Steered,
                 )
                 .await?;
+                publish_context_usage(&events, context_update).await?;
                 events
                     .send(TurnEvent::AssistantCheckpointed {
                         step,
@@ -3296,16 +3478,18 @@ async fn run_turn_in_span(
                     Some(&error),
                 )
                 .await?;
-                checkpoint_assistant(
+                let context_update = checkpoint_assistant(
                     &store,
                     &request,
                     step,
                     &mut assistant,
                     &accumulator,
                     &locked_tools,
+                    &context_usage,
                     AssistantCheckpointDisposition::Failed(&error),
                 )
                 .await?;
+                publish_context_usage(&events, context_update).await?;
                 events
                     .send(TurnEvent::AssistantCheckpointed {
                         step,
@@ -3340,16 +3524,18 @@ async fn run_turn_in_span(
                     Some(&error),
                 )
                 .await?;
-                checkpoint_assistant(
+                let context_update = checkpoint_assistant(
                     &store,
                     &request,
                     step,
                     &mut assistant,
                     &accumulator,
                     &locked_tools,
+                    &context_usage,
                     AssistantCheckpointDisposition::Failed(&error),
                 )
                 .await?;
+                publish_context_usage(&events, context_update).await?;
                 events
                     .send(TurnEvent::AssistantCheckpointed {
                         step,
@@ -3359,16 +3545,18 @@ async fn run_turn_in_span(
                     .await?;
                 return Err(error);
             }
-            checkpoint_assistant(
+            let context_update = checkpoint_assistant(
                 &store,
                 &request,
                 step,
                 &mut assistant,
                 &accumulator,
                 &locked_tools,
+                &context_usage,
                 AssistantCheckpointDisposition::Completed,
             )
             .await?;
+            publish_context_usage(&events, context_update).await?;
             append_provider_request_terminal(
                 &store,
                 &request,
@@ -3883,6 +4071,7 @@ async fn persist_live_input(
         .consume_input(
             &store.scope,
             crate::state::InputMaterialization {
+                turn_id: Some(request.turn_id.clone()),
                 input_id: input.input_id.clone(),
                 message,
                 parts,
@@ -6608,7 +6797,7 @@ async fn append_turn_rejected(
 /// field, and the two that already accept native reasoning read it from
 /// *provider-scoped* options — a per-session choice cannot live there without
 /// rewriting the model spec on every keypress.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ProviderRequestStart<'a> {
     step: u32,
     request_id: &'a str,
@@ -6634,6 +6823,10 @@ struct ProviderRequestStart<'a> {
     orchestration_snapshot: &'a AttemptSnapshot,
     request_context: &'a ProviderRequestContext,
     step_limit_finalization: Option<NonZeroU32>,
+    assistant: &'a MessageRecord,
+    completion: &'a zuno_llm::registry::CompletionRequest,
+    context_identity: ContextRequestIdentity,
+    applied_input_ids: &'a [String],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6758,8 +6951,9 @@ impl crate::retry::ProviderAttemptObserver<Result<ProviderStreamExit, TurnError>
 async fn append_provider_request_started(
     store: &TurnState<'_>,
     request: &RunTurnRequest,
+    context_usage: &Mutex<ContextUsageRecorder>,
     start: ProviderRequestStart<'_>,
-) -> Result<(), TurnError> {
+) -> Result<Option<ContextUsageSnapshot>, TurnError> {
     let mut properties = Map::from_iter([
         (
             "requestID".to_owned(),
@@ -6843,16 +7037,34 @@ async fn append_provider_request_started(
             .canonical_value()
             .expect("attempt snapshot is serializable"),
     );
-    store
-        .append(
-            NewSessionEvent::new("session.provider.request", properties)?,
-            ProviderEventUpdate::RequestStarted {
+    properties.insert("inputIDs".to_owned(), json!(start.applied_input_ids));
+    let context = context_usage
+        .lock()
+        .expect("context usage lock")
+        .prepare_request(
+            start.context_identity,
+            start.completion,
+            request.context_limit,
+        );
+    let receipt = store
+        .persistence
+        .start_provider_request(
+            &store.scope,
+            crate::state::ProviderRequestCommit {
+                assistant: start.assistant.clone(),
+                event: NewSessionEvent::new("session.provider.request", properties)?,
                 estimated_prompt_tokens: start.estimated_prompt_tokens,
                 context_limit: request.context_limit,
+                context,
             },
         )
         .await?;
-    Ok(())
+    let snapshot = receipt.context.snapshot().clone();
+    context_usage
+        .lock()
+        .expect("context usage lock")
+        .accept(receipt.context)?;
+    Ok(Some(snapshot))
 }
 
 async fn append_provider_attempt_started(
@@ -7251,6 +7463,14 @@ fn attempt_snapshot(input: AttemptSnapshotInput<'_>) -> AttemptSnapshot {
             actual_sha256: prompt_actual_sha256,
         },
         tools,
+        parent_authority: agent
+            .orchestration_seed
+            .as_ref()
+            .and_then(|seed| seed.parent_authority.clone()),
+        cycle_id: agent
+            .orchestration_seed
+            .as_ref()
+            .and_then(|seed| seed.cycle_id.clone()),
     }
 }
 
@@ -7314,26 +7534,7 @@ async fn append_provider_request_terminal(
 }
 
 fn estimate_completion_prompt_tokens(completion: &zuno_llm::registry::CompletionRequest) -> u64 {
-    // `billable_json_len` counts each tool call's arguments once. The blocks carry
-    // both the decoded `input` and the provider's own `raw_arguments` bytes; only one
-    // of the two is ever written to a request body.
-    let message_bytes = crate::prelude::billable_json_len(&completion.messages);
-    let developer_bytes = completion
-        .developer_context
-        .iter()
-        .fold(0_usize, |bytes, context| {
-            bytes.saturating_add(context.len())
-        });
-    let tool_bytes = completion.tools.iter().fold(0_usize, |bytes, tool| {
-        bytes
-            .saturating_add(tool.name.len())
-            .saturating_add(tool.description.len())
-            .saturating_add(tool.parameters.to_string().len())
-    });
-    let bytes = message_bytes
-        .saturating_add(developer_bytes)
-        .saturating_add(tool_bytes);
-    u64::try_from(bytes).unwrap_or(u64::MAX).div_ceil(4)
+    crate::context_usage::estimate_request_context(completion).prompt_tokens
 }
 
 fn completion_request(
@@ -7415,6 +7616,10 @@ enum AssistantCheckpointDisposition<'error> {
     Failed(&'error TurnError),
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one checkpoint binds the assistant, tools and canonical usage"
+)]
 async fn checkpoint_assistant(
     store: &TurnState<'_>,
     request: &RunTurnRequest,
@@ -7422,8 +7627,9 @@ async fn checkpoint_assistant(
     assistant: &mut MessageRecord,
     accumulator: &StepAccumulator,
     locked_tools: &[ToolDefinition],
+    context_usage: &Mutex<ContextUsageRecorder>,
     disposition: AssistantCheckpointDisposition<'_>,
-) -> Result<(), TurnError> {
+) -> Result<Option<ContextUsageSnapshot>, TurnError> {
     let completed = now_millis();
     let time = assistant
         .data
@@ -7571,6 +7777,15 @@ async fn checkpoint_assistant(
             }
         }
     }
+    let context_update = {
+        let mut usage = context_usage.lock().expect("context usage lock");
+        usage.commit_request(
+            accumulator.saw_message_end,
+            accumulator.context_rewritten,
+            completed,
+        );
+        usage.update()
+    };
     store
         .commit_assistant(&zuno_db::assistant_commit::AssistantCommit {
             message: assistant.clone(),
@@ -7579,9 +7794,14 @@ async fn checkpoint_assistant(
             context_limit: request
                 .context_limit
                 .and_then(|limit| i64::try_from(limit).ok()),
+            context_usage: context_update.clone(),
         })
         .await?;
-    Ok(())
+    context_usage
+        .lock()
+        .expect("context usage lock")
+        .did_commit();
+    Ok(context_update.map(|update| update.tracker.snapshot().clone()))
 }
 
 /// Write the assistant row's durable token buckets.
@@ -9337,4 +9557,126 @@ mod historical_tool_declaration_tests {
         assert!(results[0].contains("call_removed"), "{}", results[0]);
         assert!(results[1].contains("call_native"), "{}", results[1]);
     }
+}
+
+fn request_input_provenance(history: &[MessageWithParts]) -> Vec<(String, String)> {
+    let mut provenance = Vec::new();
+    for message in history
+        .iter()
+        .filter(|message| message.info.role == MessageRole::User)
+    {
+        let mut projected = Vec::new();
+        append_user_message(&mut projected, message);
+        for input in projected {
+            provenance.push((
+                message.info.id.clone(),
+                sha256_json(
+                    &serde_json::to_value(input.message())
+                        .expect("normalized request message is serializable"),
+                ),
+            ));
+        }
+    }
+    provenance
+}
+
+async fn request_input_ids(
+    store: &TurnState<'_>,
+    provenance: &[(String, String)],
+    completion: &zuno_llm::registry::CompletionRequest,
+) -> Result<Vec<String>, TurnError> {
+    let actual = completion
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::User)
+        .map(|message| {
+            sha256_json(
+                &serde_json::to_value(message.message())
+                    .expect("normalized request message is serializable"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let same_order = provenance.len() == actual.len()
+        && provenance
+            .iter()
+            .zip(&actual)
+            .all(|((_, before), after)| before == after);
+    let mut before_counts = BTreeMap::<&str, usize>::new();
+    let mut after_counts = BTreeMap::<&str, usize>::new();
+    for (_, fingerprint) in provenance {
+        *before_counts.entry(fingerprint).or_default() += 1;
+    }
+    for fingerprint in &actual {
+        *after_counts.entry(fingerprint).or_default() += 1;
+    }
+    let mut ids = Vec::new();
+    for (id, fingerprint) in provenance {
+        let represented = same_order
+            || (before_counts.get(fingerprint.as_str()) == Some(&1)
+                && after_counts.get(fingerprint.as_str()) == Some(&1));
+        if !represented {
+            continue;
+        }
+        ids.push(id.clone());
+    }
+    ids.sort();
+    ids.dedup();
+    store
+        .persistence
+        .applicable_inputs(&store.scope, &ids)
+        .await
+}
+
+async fn publish_context_usage(
+    events: &TurnEventSender,
+    snapshot: Option<ContextUsageSnapshot>,
+) -> Result<(), TurnError> {
+    if let Some(snapshot) = snapshot {
+        events
+            .send(TurnEvent::ContextUsageUpdated {
+                snapshot: Box::new(snapshot),
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+async fn persist_context_state(
+    store: &TurnState<'_>,
+    context_usage: &Mutex<ContextUsageRecorder>,
+) -> Result<Option<ContextUsageSnapshot>, TurnError> {
+    let update = context_usage.lock().expect("context usage lock").update();
+    let Some(update) = update else {
+        return Ok(None);
+    };
+    store
+        .persistence
+        .commit_context_usage(&store.scope, &update)
+        .await?;
+    context_usage
+        .lock()
+        .expect("context usage lock")
+        .did_commit();
+    Ok(Some(update.tracker.snapshot().clone()))
+}
+
+async fn persist_context_frame(
+    store: &TurnState<'_>,
+    context_usage: &Mutex<ContextUsageRecorder>,
+    event: &StreamEvent,
+) -> Result<Option<ContextUsageSnapshot>, TurnError> {
+    if !matches!(
+        event,
+        StreamEvent::TokenUsage { .. } | StreamEvent::RetryRollback { .. }
+    ) {
+        return Ok(None);
+    }
+    if !context_usage
+        .lock()
+        .expect("context usage lock")
+        .observe_frame(event)?
+    {
+        return Ok(None);
+    }
+    persist_context_state(store, context_usage).await
 }

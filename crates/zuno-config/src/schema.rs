@@ -1038,7 +1038,7 @@ pub const DEFAULT_LEARNING_RETRIEVAL_MAX_ITEMS: u32 = 5;
 /// Default prompt budget for retrieved experiences.
 pub const DEFAULT_LEARNING_RETRIEVAL_MAX_CONTEXT_TOKENS: u32 = 1_200;
 /// Default idle delay before an automatic post-turn extraction becomes runnable.
-pub const DEFAULT_LEARNING_POST_TURN_IDLE_DELAY_MS: u64 = 21_600_000;
+pub const DEFAULT_LEARNING_POST_TURN_IDLE_DELAY_MS: u64 = 0;
 /// Default interval between automatic extraction queue polls.
 pub const DEFAULT_LEARNING_POST_TURN_POLL_INTERVAL_MS: u64 = 60_000;
 /// Default number of automatic extraction jobs admitted by one worker wake.
@@ -1241,10 +1241,8 @@ pub struct LearningPostTurnConfig {
     /// when effective generation is enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
-    /// Delay before an automatic extraction job becomes runnable. Defaults to
-    /// 21600000 milliseconds (six hours).
-    ///
-    /// Zero keeps automatic extraction immediate.
+    /// Delay before an automatic extraction job becomes runnable. Defaults to 0 milliseconds.
+    /// An explicit nonzero value requires the source session to remain idle.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idle_delay_ms: Option<u64>,
     /// Interval between background queue polls. Defaults to 60000 milliseconds.

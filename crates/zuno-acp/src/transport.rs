@@ -138,7 +138,7 @@ pub trait Agent: Send + Sync + 'static {
         client: ClientConnection,
     ) -> Result<(), RpcError>;
 
-    /// Notify the Agent before an in-flight client request future is dropped.
+    /// Notify the Agent when a client explicitly sends `$/cancel_request`.
     ///
     /// The transport owns JSON-RPC request ids, while the Agent owns session and
     /// process-tree cancellation. `request` is the withdrawn request's identity, so
@@ -146,6 +146,13 @@ pub trait Agent: Send + Sync + 'static {
     /// params say what it was, without teaching the transport about
     /// product-specific session fields.
     async fn request_cancelled(&self, _method: &str, _request: &RequestId, _params: &Value) {}
+
+    /// Notify the Agent before disconnect drops an in-flight request observer.
+    ///
+    /// Loss of a connection does not withdraw accepted durable input. Session
+    /// owners decide how native execution shuts down or recovers separately from
+    /// the lifetime of this transport's request future.
+    async fn request_disconnected(&self, _method: &str, _request: &RequestId, _params: &Value) {}
 }
 
 enum Outbound {
@@ -183,10 +190,29 @@ const INITIALIZED: u8 = 2;
 type Pending = HashMap<String, oneshot::Sender<Result<Value, RpcError>>>;
 
 struct InFlightRequest {
-    cancel: oneshot::Sender<()>,
+    cancel: oneshot::Sender<RequestTermination>,
     method: String,
     params: Value,
     response_ready: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy)]
+enum RequestTermination {
+    Withdrawn,
+    Disconnected,
+}
+
+impl RequestTermination {
+    fn error(self) -> RpcError {
+        let (reason, message) = match self {
+            Self::Withdrawn => ("requestWithdrawn", "request withdrawn by the client"),
+            Self::Disconnected => (
+                "connectionClosed",
+                "connection closed before the request observer completed",
+            ),
+        };
+        RpcError::cancelled(message).with_data(json!({"reason": reason}))
+    }
 }
 
 type InFlight = HashMap<RequestId, InFlightRequest>;
@@ -237,6 +263,23 @@ impl Drop for PendingRequestGuard {
 }
 
 impl ClientConnection {
+    /// Clone for outbound RPCs supervised by the session rather than one prompt.
+    ///
+    /// Only prompt-owned pending-request tracking is cleared. The connection's
+    /// writer, ID sequence, disconnect state, and after-response notification
+    /// ordering remain shared. Completing or cancelling the originating prompt
+    /// cannot cancel requests made through this clone; disconnect still does.
+    ///
+    /// The host owns session shutdown and must drop/abort its supervised request
+    /// futures when the session closes.
+    #[must_use]
+    pub fn session_scoped(&self) -> Self {
+        Self {
+            scoped_requests: None,
+            ..self.clone()
+        }
+    }
+
     pub async fn session_update(&self, session_id: &str, update: Value) -> Result<(), RpcError> {
         self.notify(
             "session/update",
@@ -491,7 +534,12 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let (output_tx, output_rx) = mpsc::channel(OUTBOUND_FRAME_CHANNEL_CAPACITY);
-    let writer = tokio::spawn(write_frames(output, output_rx));
+    let (writer_stopped_tx, mut writer_stopped) = oneshot::channel();
+    let writer = tokio::spawn(async move {
+        let result = write_frames(output, output_rx).await;
+        let _notified = writer_stopped_tx.send(());
+        result
+    });
     let client = ClientConnection {
         output: output_tx,
         pending: Arc::new(Mutex::new(PendingState::default())),
@@ -513,7 +561,11 @@ where
             // handled, and the EOF drain would spend its grace on tasks that already
             // responded instead of on the ones still running.
             while requests.try_join_next().is_some() {}
-            let frame = match read_frame(&mut reader, MAX_INBOUND_FRAME_BYTES).await? {
+            let incoming = tokio::select! {
+                frame = read_frame(&mut reader, MAX_INBOUND_FRAME_BYTES) => frame?,
+                _ = &mut writer_stopped => return Err(ServeError::WriterClosed),
+            };
+            let frame = match incoming {
                 FrameRead::Eof => {
                     clean_eof = true;
                     break;
@@ -573,7 +625,7 @@ where
                         agent
                             .request_cancelled(&request.method, &withdrawn, &request.params)
                             .await;
-                        let _ignored = request.cancel.send(());
+                        let _ignored = request.cancel.send(RequestTermination::Withdrawn);
                     }
                     client.cancel_pending(request_id);
                 }
@@ -669,11 +721,11 @@ where
                     let request_client = client.request_scoped();
                     let result = tokio::select! {
                         result = agent.request(&method, &request_key, params, request_client.clone()) => result,
-                        _ = cancel_rx => {
+                        termination = cancel_rx => {
                             if let Err(error) = request_client.cancel_scoped_requests().await {
                                 eprintln!("ACP child request cancellation failed: {error}");
                             }
-                            Err(RpcError::cancelled("request cancelled"))
+                            Err(termination.unwrap_or(RequestTermination::Disconnected).error())
                         },
                     };
                     response_ready.store(true, Ordering::Release);
@@ -738,9 +790,9 @@ where
     };
     for (withdrawn, request) in cancellations {
         agent
-            .request_cancelled(&request.method, &withdrawn, &request.params)
+            .request_disconnected(&request.method, &withdrawn, &request.params)
             .await;
-        let _ignored = request.cancel.send(());
+        let _ignored = request.cancel.send(RequestTermination::Disconnected);
     }
     client.close_pending(RpcError::internal("ACP connection closed"));
     while requests.join_next().await.is_some() {}
@@ -948,6 +1000,10 @@ pub(crate) mod test_client {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "durable_question_tests.rs"]
+mod durable_question_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1316,7 +1372,7 @@ mod tests {
         assert!(frames[1].get("result").is_some());
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Default)]
     struct BlockingAgent {
         started: Arc<Notify>,
         dropped: Arc<AtomicBool>,
@@ -1324,6 +1380,8 @@ mod tests {
         served: Arc<Mutex<Option<RequestId>>>,
         /// Identity the transport reported as withdrawn.
         cancelled: Arc<Mutex<Option<RequestId>>>,
+        disconnected: Arc<Mutex<Option<RequestId>>>,
+        client: Arc<Mutex<Option<ClientConnection>>>,
     }
 
     struct DropSignal(Arc<AtomicBool>);
@@ -1341,12 +1399,13 @@ mod tests {
             method: &str,
             request: &RequestId,
             _params: Value,
-            _client: ClientConnection,
+            client: ClientConnection,
         ) -> Result<Value, RpcError> {
             if method == "initialize" {
                 return Ok(json!({}));
             }
             *lock(&self.served) = Some(request.clone());
+            *lock(&self.client) = Some(client.session_scoped());
             let _drop = DropSignal(Arc::clone(&self.dropped));
             self.started.notify_one();
             std::future::pending::<()>().await;
@@ -1367,6 +1426,12 @@ mod tests {
                 *lock(&self.cancelled) = Some(request.clone());
             }
         }
+
+        async fn request_disconnected(&self, method: &str, request: &RequestId, params: &Value) {
+            if method == "session/prompt" && params["sessionId"] == "ses_cancel" {
+                *lock(&self.disconnected) = Some(request.clone());
+            }
+        }
     }
 
     #[tokio::test]
@@ -1375,11 +1440,14 @@ mod tests {
         let dropped = Arc::new(AtomicBool::new(false));
         let served = Arc::new(Mutex::new(None));
         let cancelled = Arc::new(Mutex::new(None));
+        let disconnected = Arc::new(Mutex::new(None));
         let agent = BlockingAgent {
             started: Arc::clone(&started),
             dropped: Arc::clone(&dropped),
             served: Arc::clone(&served),
             cancelled: Arc::clone(&cancelled),
+            disconnected: Arc::clone(&disconnected),
+            ..BlockingAgent::default()
         };
         let (mut input_writer, input_reader) = tokio::io::duplex(4096);
         let (output_writer, output_reader) = tokio::io::duplex(4096);
@@ -1422,6 +1490,7 @@ mod tests {
         let response: Value = serde_json::from_str(&line).expect("cancellation response");
         assert_eq!(response["id"], 2);
         assert_eq!(response["error"]["code"], -32800);
+        assert_eq!(response["error"]["data"]["reason"], "requestWithdrawn");
         // The withdrawn request is reported by the identity the transport served
         // it under, not by its params: an Agent that keys per-request state on
         // params cannot tell two identical requests apart.
@@ -1429,6 +1498,7 @@ mod tests {
         assert_eq!(withdrawn, RequestId::from_json(&json!(2)));
         assert_eq!(withdrawn, lock(&served).clone());
         assert_ne!(withdrawn, RequestId::from_json(&json!("2")));
+        assert!(lock(&disconnected).is_none());
         assert!(dropped.load(AtomicOrdering::SeqCst));
 
         input_writer.shutdown().await.expect("close ACP input");
@@ -1445,11 +1515,14 @@ mod tests {
         let dropped = Arc::new(AtomicBool::new(false));
         let served = Arc::new(Mutex::new(None));
         let cancelled = Arc::new(Mutex::new(None));
+        let disconnected = Arc::new(Mutex::new(None));
         let agent = BlockingAgent {
             started: Arc::clone(&started),
             dropped: Arc::clone(&dropped),
             served: Arc::clone(&served),
             cancelled: Arc::clone(&cancelled),
+            disconnected: Arc::clone(&disconnected),
+            ..BlockingAgent::default()
         };
         let (mut input_writer, input_reader) = tokio::io::duplex(4096);
         let (output_writer, output_reader) = tokio::io::duplex(4096);
@@ -1480,8 +1553,81 @@ mod tests {
             .expect("clean EOF cancels active requests")
             .expect("server task joins")
             .expect("server exits cleanly");
-        assert_eq!(lock(&cancelled).clone(), RequestId::from_json(&json!(2)));
+        assert!(
+            lock(&cancelled).is_none(),
+            "disconnect was reported as an explicit withdrawal of accepted input"
+        );
+        assert_eq!(lock(&disconnected).clone(), RequestId::from_json(&json!(2)));
         assert!(dropped.load(AtomicOrdering::SeqCst));
+        line.clear();
+        output
+            .read_line(&mut line)
+            .await
+            .expect("disconnect response");
+        let response: Value = serde_json::from_str(&line).expect("disconnect response JSON");
+        assert_eq!(response["error"]["data"]["reason"], "connectionClosed");
+    }
+
+    #[tokio::test]
+    async fn writer_disconnect_detaches_observers_even_when_input_remains_open() {
+        let started = Arc::new(Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(Mutex::new(None));
+        let disconnected = Arc::new(Mutex::new(None));
+        let retained_client = Arc::new(Mutex::new(None));
+        let agent = BlockingAgent {
+            started: Arc::clone(&started),
+            dropped: Arc::clone(&dropped),
+            cancelled: Arc::clone(&cancelled),
+            disconnected: Arc::clone(&disconnected),
+            client: Arc::clone(&retained_client),
+            ..BlockingAgent::default()
+        };
+        let (mut input_writer, input_reader) = tokio::io::duplex(4096);
+        let (output_writer, output_reader) = tokio::io::duplex(4096);
+        let mut output = BufReader::new(output_reader);
+        let mut server = tokio::spawn(serve(agent, input_reader, output_writer));
+        input_writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .expect("write initialize");
+        let mut line = String::new();
+        output
+            .read_line(&mut line)
+            .await
+            .expect("initialize response");
+        input_writer
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"ses_cancel\"}}\n",
+            )
+            .await
+            .expect("write prompt");
+        started.notified().await;
+        let client = lock(&retained_client).clone().expect("retained client");
+        drop(output);
+        assert!(
+            client
+                .session_update("ses_cancel", json!({"sessionUpdate":"plan","entries":[]}))
+                .await
+                .is_err()
+        );
+        let finished = timeout(Duration::from_secs(1), &mut server).await;
+        if finished.is_err() {
+            // Keep the regression bounded even when the old reader loop hangs.
+            server.abort();
+            let _joined = server.await;
+            panic!("writer disconnect did not detach the in-flight observer");
+        }
+        assert!(
+            finished
+                .expect("bounded writer shutdown")
+                .expect("server task")
+                .is_err()
+        );
+        assert!(lock(&cancelled).is_none());
+        assert_eq!(lock(&disconnected).clone(), RequestId::from_json(&json!(2)));
+        assert!(dropped.load(AtomicOrdering::SeqCst));
+        drop(input_writer);
     }
 
     #[derive(Debug)]

@@ -153,6 +153,8 @@ impl ToolContinuation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuestionResultStatus {
+    Pending,
+    Deferred,
     Answered,
     Cancelled,
     Expired,
@@ -164,6 +166,8 @@ impl QuestionResultStatus {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Pending => "pending",
+            Self::Deferred => "deferred",
             Self::Answered => "answered",
             Self::Cancelled => "cancelled",
             Self::Expired => "expired",
@@ -175,6 +179,8 @@ impl QuestionResultStatus {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
+            Self::Pending => "Awaiting answer",
+            Self::Deferred => "Deferred",
             Self::Answered => "Answered",
             Self::Cancelled => "Cancelled",
             Self::Expired => "Expired",
@@ -909,17 +915,30 @@ mod tests {
 
     #[test]
     fn typed_presentation_is_live_only_and_not_part_of_durable_tool_output() {
-        let output = ToolOutput::text("question", "accepted").with_presentation(
-            ToolResultPresentation::Question(QuestionResultPresentation::new(
-                QuestionResultStatus::Answered,
-                Some(vec![vec!["SQLite".to_owned()]]),
-                1,
-                12,
-            )),
-        );
+        for status in [
+            QuestionResultStatus::Pending,
+            QuestionResultStatus::Deferred,
+            QuestionResultStatus::Answered,
+            QuestionResultStatus::Cancelled,
+            QuestionResultStatus::Expired,
+            QuestionResultStatus::Failed,
+        ] {
+            let output = ToolOutput::text(status.label(), "Question receipt")
+                .with_metadata(METADATA_HUMAN_REQUEST_ID_KEY, "que_output_receipt")
+                .with_metadata("questionStatus", status.as_str())
+                .with_presentation(ToolResultPresentation::Question(
+                    QuestionResultPresentation::new(status, None, 1, 12),
+                ));
 
-        let durable = serde_json::to_value(output).expect("serialize durable tool output");
-        assert!(durable.get("presentation").is_none());
+            let durable = serde_json::to_value(output).expect("serialize durable tool output");
+            assert!(durable.get("presentation").is_none());
+            assert!(durable["metadata"].get("answers").is_none());
+            assert_eq!(durable["metadata"]["questionStatus"], status.as_str());
+            assert_eq!(
+                durable["metadata"][METADATA_HUMAN_REQUEST_ID_KEY],
+                "que_output_receipt"
+            );
+        }
     }
 
     #[test]

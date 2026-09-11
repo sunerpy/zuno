@@ -1,5 +1,6 @@
 //! Fenced turn-state provider. Only the authenticated data owner holds this pool.
 
+mod context;
 mod history;
 mod journal;
 mod records;

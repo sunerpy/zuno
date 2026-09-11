@@ -12,27 +12,39 @@ use zuno_config::schema::permission::{
     PermissionAction, PermissionConfig, PermissionMode, PermissionObject, PermissionRule,
 };
 
+// Working roles share one verification rubric. Hidden tool-free roles retain
+// their output-specific prompts, and configured prompt overrides remain intact.
+// Design references at Codex eaa8b6d917: codex-rs/models-manager/prompt.md
+// ("Validating your work"), and codex-rs/prompts/src/review_request.rs::REVIEW_PROMPT
+// with codex-rs/prompts/templates/review/rubric.md. The stricter reproducible-bug
+// red/green sequence is user-chosen Zuno prompt guidance, not a Codex runtime gate.
+macro_rules! working_prompt {
+    ($body:expr) => {
+        concat!($body, "\n\n", include_str!("prompt/verification.txt"))
+    };
+}
+
 macro_rules! specialist_prompt {
     ($path:literal) => {
-        concat!(
+        working_prompt!(concat!(
             include_str!($path),
             "\n\nReturn concise natural Markdown. Use these headings when they add value: \
              Outcome, Evidence, Inspected/Changed, Risks/Blocker. Omit empty headings. Do not \
              emit JSON or XML unless the caller explicitly requires machine-readable output."
-        )
+        ))
     };
 }
 
 /// Default multi-agent coordinator.
-pub const PROMPT_ORCHESTRATOR: &str = include_str!("prompt/orchestrator.txt");
+pub const PROMPT_ORCHESTRATOR: &str = working_prompt!(include_str!("prompt/orchestrator.txt"));
 /// Direct end-to-end implementation agent.
-pub const PROMPT_BUILD: &str = include_str!("prompt/build.txt");
+pub const PROMPT_BUILD: &str = working_prompt!(include_str!("prompt/build.txt"));
 /// Read-only planning agent.
-pub const PROMPT_PLAN: &str = include_str!("prompt/plan.txt");
+pub const PROMPT_PLAN: &str = working_prompt!(include_str!("prompt/plan.txt"));
 /// Read-only high-assurance review agent.
-pub const PROMPT_REVIEW: &str = include_str!("prompt/review.txt");
+pub const PROMPT_REVIEW: &str = working_prompt!(include_str!("prompt/review.txt"));
 /// Thorough cross-cutting implementation agent.
-pub const PROMPT_DEEP: &str = include_str!("prompt/deep.txt");
+pub const PROMPT_DEEP: &str = working_prompt!(include_str!("prompt/deep.txt"));
 /// Focused local implementation specialist.
 pub const PROMPT_FIXER: &str = specialist_prompt!("prompt/fixer.txt");
 /// Bounded miscellaneous implementation specialist.
@@ -92,7 +104,9 @@ pub struct Builtin {
     pub delegates: Option<&'static [&'static str]>,
 }
 
-const ORCHESTRATOR_DELEGATES: &[&str] = &[
+/// Bounded work targets for delivery and deep investigation. The runtime applies
+/// the caller's tool authority, configured depth, and per-Agent restrictions.
+const WORK_DELEGATES: &[&str] = &[
     "deep",
     "fixer",
     "general",
@@ -114,14 +128,13 @@ const REVIEW_DELEGATES: &[&str] = &["explorer", "librarian", "oracle"];
 
 /// The natives that may start a child turn at all.
 ///
-/// `orchestrator` coordinates delivery and owns integration; `review` seats the
-/// first-party `balanced-review` Council. Nothing else declares children, and `build`
-/// denies `task` outright, because an agent that can fan out without owning the
-/// verification of what comes back is how one review turn came to run three
-/// same-shaped explorers and inherit a wrong conclusion from all of them.
+/// `orchestrator` coordinates delivery; `deep` may delegate bounded evidence or
+/// implementation work while retaining the causal investigation and verification.
+/// `review` seats only the first-party `balanced-review` Council. `build` remains
+/// a direct execution lane without child tools.
 ///
 /// One list so the catalog and its tests cannot disagree about where the boundary is.
-pub const DELEGATING_NATIVES: [&str; 2] = ["orchestrator", "review"];
+pub const DELEGATING_NATIVES: [&str; 3] = ["orchestrator", "review", "deep"];
 
 /// The built-in Skills `review` loads before it starts reasoning.
 ///
@@ -135,6 +148,9 @@ pub const DELEGATING_NATIVES: [&str; 2] = ["orchestrator", "review"];
 /// Skill's required tools, which is why the `review` overlay allows `read`, `glob`,
 /// `grep` and `skill`.
 const REVIEW_REQUIRED_SKILLS: &[&str] = &["codemap", "verification-planning"];
+
+/// First-party decomposition and acceptance disciplines for deep work.
+const DEEP_REQUIRED_SKILLS: &[&str] = &["deepwork", "verification-planning"];
 
 /// Every native agent in declaration order.
 #[must_use]
@@ -181,7 +197,7 @@ fn orchestrator() -> Builtin {
         hidden: false,
         temperature: Some(0.1),
         prompt: Some(PROMPT_ORCHESTRATOR),
-        delegates: Some(ORCHESTRATOR_DELEGATES),
+        delegates: Some(WORK_DELEGATES),
     }
 }
 
@@ -220,7 +236,7 @@ fn review() -> Builtin {
         name: "review",
         description: Some(
             "Reviews a plan, design, or root-cause analysis against recorded evidence and \
-             decides whether it is ready to implement, without changing any file.",
+             decides whether it is ready to implement, without changing product files.",
         ),
         mode: AgentMode::Primary,
         hidden: false,
@@ -234,14 +250,15 @@ fn deep() -> Builtin {
     Builtin {
         name: "deep",
         description: Some(
-            "Runs difficult debugging and cross-cutting implementation either as the selected \
-             session Agent or as one bounded delegated objective, without spawning children.",
+            "Owns difficult debugging and cross-cutting work through evidence, competing \
+             hypotheses, discriminating experiments, authorized root fixes, and recovery verification; \
+             may delegate bounded tasks when runtime authority permits.",
         ),
         mode: AgentMode::All,
         hidden: false,
         temperature: Some(0.1),
         prompt: Some(PROMPT_DEEP),
-        delegates: None,
+        delegates: Some(WORK_DELEGATES),
     }
 }
 
@@ -388,10 +405,10 @@ impl Builtin {
     ///
     /// Every delegable Agent is deny-by-default. The primary `orchestrator`
     /// inherits the common tool set and may delegate; direct `build` explicitly
-    /// denies delegation. `deep` is directly selectable and delegable, has no child
-    /// tools, and may own the same durable Goal lifecycle as a primary writer. `plan`
-    /// may inspect and write only its plan document; the path-specific edit grants are
-    /// added by the CLI composition root.
+    /// denies delegation. `deep` is directly selectable and delegable, may delegate
+    /// bounded work within runtime limits, and may own the same durable Goal lifecycle
+    /// as a primary writer. `plan` may inspect and update durable planning state without
+    /// granting workspace edit tools.
     ///
     /// Two grants are here because a deny-by-default overlay hides anything it does not
     /// name, and both were unnamed. `bg` accompanies every `shell` grant: a background
@@ -476,6 +493,8 @@ impl Builtin {
                 ("edit", allow()),
                 ("shell", allow()),
                 ("bg", allow()),
+                ("task", allow()),
+                ("job", allow()),
                 ("webfetch", allow()),
                 ("web_search", allow()),
                 ("question", allow()),
@@ -597,15 +616,15 @@ impl Builtin {
     /// Skills this native loads at the start of every turn.
     ///
     /// `None` leaves Skill selection to the model, which is right for an agent whose work
-    /// is not defined by one discipline. `review` is the exception: its whole job is to
-    /// produce checkable evidence, and a review that forgot to load the evidence
-    /// discipline is the failure the agent exists to prevent.
+    /// is not defined by one discipline. `review` requires checkable evidence; `deep`
+    /// requires durable decomposition and a verification plan for its causal work.
     ///
     /// Only first-party names may appear here; see [`REVIEW_REQUIRED_SKILLS`].
     #[must_use]
     pub fn required_skills(&self) -> Option<&'static [&'static str]> {
         match self.name {
             "review" => Some(REVIEW_REQUIRED_SKILLS),
+            "deep" => Some(DEEP_REQUIRED_SKILLS),
             _ => None,
         }
     }
@@ -649,6 +668,28 @@ mod tests {
             hidden,
             vec!["compaction", "title", "summary", "council-synth"]
         );
+        for name in hidden {
+            let builtin = get(name).expect("internal exists");
+            let rules = effective_rules(&builtin);
+            assert!(builtin.delegates.is_none());
+            assert!(builtin.required_skills().is_none());
+            for tool in [
+                "read",
+                "shell",
+                "edit",
+                "task",
+                "skill",
+                "tool_search",
+                "report_write",
+                "memory_update",
+                "unknown_tool",
+            ] {
+                assert!(
+                    !is_tool_visible(tool, &rules),
+                    "{name} must not expose {tool}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -670,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn delegable_agents_are_deny_by_default_and_cannot_delegate() {
+    fn delegable_agents_are_deny_by_default_and_only_deep_may_delegate() {
         for builtin in all()
             .into_iter()
             .filter(|builtin| matches!(builtin.mode, AgentMode::Subagent | AgentMode::All))
@@ -684,11 +725,10 @@ mod tests {
                 "{} needs deny-by-default",
                 builtin.name
             );
-            assert!(
-                !overlay.iter().any(|(key, rule)| {
-                    key == "task" && rule == &PermissionRule::Action(PermissionAction::Allow)
-                }),
-                "{} must not create grandchildren",
+            assert_eq!(
+                is_tool_visible("task", &effective_rules(&builtin)),
+                builtin.name == "deep",
+                "{} disagrees with its native delegation policy",
                 builtin.name
             );
         }
@@ -734,35 +774,82 @@ mod tests {
     ///
     /// `required_skills` resolution fails closed on a name that matches nothing, so a
     /// user-installed name here would make the agent unavailable wherever that Skill is
-    /// absent. The `codegraph` assertion is the specific mistake this guards.
+    /// absent. Resolve the first-party descriptor and run the actual visibility gate.
     #[test]
-    fn only_review_forces_skills_and_only_first_party_ones() {
+    fn required_native_skills_are_first_party_and_usable_by_their_roles() {
         for builtin in all() {
-            if builtin.name == "review" {
-                assert_eq!(
-                    builtin.required_skills(),
-                    Some(REVIEW_REQUIRED_SKILLS),
-                    "review must load the evidence discipline it exists to apply"
-                );
-            } else {
+            let expected = match builtin.name {
+                "review" => Some(REVIEW_REQUIRED_SKILLS),
+                "deep" => Some(DEEP_REQUIRED_SKILLS),
+                _ => None,
+            };
+            assert_eq!(
+                builtin.required_skills(),
+                expected,
+                "{} must declare its required discipline",
+                builtin.name
+            );
+            let Some(required) = builtin.required_skills() else {
+                continue;
+            };
+            let rules = effective_rules(&builtin);
+            assert!(is_tool_visible("skill", &rules));
+            for name in required {
+                let skill = crate::skill::builtin::skill(name).unwrap_or_else(|| {
+                    panic!("{} requires missing first-party Skill {name}", builtin.name)
+                });
                 assert!(
-                    builtin.required_skills().is_none(),
-                    "{} unexpectedly forces a Skill load",
+                    crate::skill::builtin::visible_to(&skill.location, builtin.name, None, &rules),
+                    "{} cannot load its required Skill {name}",
                     builtin.name
                 );
             }
         }
-        assert!(
-            !REVIEW_REQUIRED_SKILLS.contains(&"codegraph"),
-            "`codegraph` is user-installed; requiring it would fail closed where it is absent"
+    }
+
+    #[test]
+    fn deep_required_skills_survive_prompt_overrides_and_can_be_configured() {
+        use zuno_config::schema::agent::AgentConfig;
+
+        let mut overrides = OrderedMap::new();
+        overrides.insert(
+            "deep",
+            AgentConfig {
+                prompt: Some("Investigate the assigned failure.".to_owned()),
+                ..AgentConfig::default()
+            },
         );
-        let rules = effective_rules(&get("review").expect("review"));
-        for tool in ["read", "glob", "grep", "skill"] {
-            assert!(
-                is_tool_visible(tool, &rules),
-                "review forces Skills that need `{tool}`, so its overlay must grant it"
-            );
-        }
+        let resolve_deep = |overrides: &OrderedMap<AgentConfig>| {
+            crate::agent::resolve(overrides, &[])
+                .into_iter()
+                .find(|agent| agent.name == "deep")
+                .expect("deep resolves")
+        };
+        let deep = resolve_deep(&overrides);
+        assert_eq!(
+            deep.required_skills,
+            Some(
+                DEEP_REQUIRED_SKILLS
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect()
+            )
+        );
+        assert_eq!(
+            deep.prompt.as_deref(),
+            Some("Investigate the assigned failure.")
+        );
+        overrides.insert(
+            "deep",
+            AgentConfig {
+                required_skills: Some(Vec::new()),
+                delegates: Some(vec!["explorer".to_owned()]),
+                ..AgentConfig::default()
+            },
+        );
+        let configured = resolve_deep(&overrides);
+        assert_eq!(configured.required_skills, Some(Vec::new()));
+        assert_eq!(configured.delegates, Some(vec!["explorer".to_owned()]));
     }
 
     /// The overlay has to actually serve the evidence surface it was written for.
@@ -830,7 +917,10 @@ mod tests {
     #[test]
     fn only_the_delegating_natives_declare_and_expose_delegation() {
         let orchestrator = get("orchestrator").expect("orchestrator");
-        assert_eq!(orchestrator.delegates, Some(ORCHESTRATOR_DELEGATES));
+        assert_eq!(orchestrator.delegates, Some(WORK_DELEGATES));
+        let deep = get("deep").expect("deep");
+        assert_eq!(deep.delegates, Some(WORK_DELEGATES));
+        assert!(is_tool_visible("task", &effective_rules(&deep)));
         assert_eq!(
             get("review").expect("review").delegates,
             Some(REVIEW_DELEGATES)
@@ -877,6 +967,15 @@ mod tests {
                 .get("task"),
             Some(&PermissionRule::Action(PermissionAction::Deny))
         );
+
+        for builtin in all() {
+            for target in builtin.delegates.unwrap_or_default() {
+                let child = get(target).expect("every native delegate must resolve");
+                assert!(matches!(child.mode, AgentMode::Subagent | AgentMode::All));
+                assert!(!child.hidden);
+                assert_ne!(child.name, "review", "review must never recurse");
+            }
+        }
     }
 
     #[test]
@@ -941,6 +1040,8 @@ mod tests {
             "goal_propose",
             "goal_update",
             "goal_request_input",
+            "task",
+            "job",
         ] {
             assert_eq!(
                 deep.get(capability),
@@ -948,11 +1049,159 @@ mod tests {
                 "direct deep work must be able to own `{capability}`"
             );
         }
-        assert_ne!(
-            deep.get("task"),
-            Some(&PermissionRule::Action(PermissionAction::Allow)),
-            "Goal ownership must not grant recursive delegation"
+    }
+
+    const VERIFICATION_SECTION: &str = "\n\n## Verification\n";
+
+    fn verification_rubric(prompt: &str) -> &str {
+        prompt
+            .split_once(VERIFICATION_SECTION)
+            .expect("the assembled working prompt must include shared verification guidance")
+            .1
+    }
+
+    fn role_prompt_words(prompt: &str) -> usize {
+        prompt
+            .split_once(VERIFICATION_SECTION)
+            .map_or(prompt, |(role, _)| role)
+            .split_whitespace()
+            .count()
+    }
+
+    // These assertions exercise the catalog's rendered prompt contract. They do
+    // not prove that a model followed the instructions or that runtime behavior
+    // is correct merely because its source contains particular strings.
+    #[test]
+    fn verification_rubric_is_shared_once_by_working_agents_only() {
+        let shared = verification_rubric(PROMPT_BUILD);
+        assert!(
+            shared.split_whitespace().count() <= 320,
+            "keep the common rubric compact independently of each role's word budget"
         );
+
+        for agent in crate::agent::resolve(&OrderedMap::new(), &[]) {
+            let prompt = agent.prompt.as_deref().expect("a native prompt");
+            if agent.hidden == Some(true) {
+                assert!(
+                    !prompt.contains(VERIFICATION_SECTION),
+                    "{} must keep its tool-free output contract",
+                    agent.name
+                );
+                continue;
+            }
+            assert_eq!(
+                prompt.matches(VERIFICATION_SECTION).count(),
+                1,
+                "{} must receive exactly one verification rubric",
+                agent.name
+            );
+            assert_eq!(
+                verification_rubric(prompt),
+                shared,
+                "{} must receive the same rubric as the writing and testing roles",
+                agent.name
+            );
+        }
+    }
+
+    #[test]
+    fn verification_rubric_orders_behavior_red_before_implementation_and_green() {
+        let rubric = verification_rubric(PROMPT_BUILD);
+        let phases = [
+            "fixing a reproducible bug or changing a state machine",
+            "first add or extend a focused behavior test",
+            "against the old implementation",
+            "Confirm it fails for the target behavior",
+            "Then implement the change",
+            "rerun that test to green",
+            "relevant regression checks",
+        ];
+        let mut previous = 0;
+        for phase in phases {
+            let position = rubric
+                .find(phase)
+                .unwrap_or_else(|| panic!("missing verification phase: {phase}"));
+            assert!(position >= previous, "{phase} is out of order");
+            previous = position + phase.len();
+        }
+        for clause in [
+            "build, dependency, permission, or environment error is not a red regression",
+            "observable inputs, outputs, transitions",
+            "interruption, restart, or recovery",
+        ] {
+            assert!(rubric.contains(clause), "missing behavior scope: {clause}");
+        }
+    }
+
+    #[test]
+    fn verification_rubric_scopes_read_only_evidence_and_requires_checkable_receipts() {
+        let rubric = verification_rubric(PROMPT_REVIEW);
+        for clause in [
+            "when writing, fixing, testing, or reviewing",
+            "Read-only roles collect existing reproduction steps, tests, and receipts",
+            "without editing files or running commands that write",
+            "hand missing tests to an authorized writer",
+            "Reviewers check the red/green evidence",
+            "a plan identifies the test and expected failure without claiming it ran",
+            "exact commands",
+            "working directory",
+            "tested source/input identity",
+            "expected versus observed results",
+            "exit status",
+            "authoritative test output or artifact/run receipts",
+            "completed checks from proposed, blocked, and unrun checks",
+        ] {
+            assert!(
+                rubric.contains(clause),
+                "missing evidence boundary: {clause}"
+            );
+        }
+    }
+
+    #[test]
+    fn verification_rubric_keeps_checks_proportional_and_serial_waits_in_foreground() {
+        let rubric = verification_rubric(PROMPT_ORCHESTRATOR);
+        for clause in [
+            "If reproduction is unavailable, explain the limitation",
+            "proportional checks for documentation, trivial changes, and command/script deliverables",
+            "do not manufacture tests for every command",
+            "Source-string assertions alone do not establish runtime behavior",
+            "prompt-output contract tests establish only the rendered prompt contract",
+            "serial CI waits in the same foreground workflow",
+            "Background work is for independent parallel work or an explicit user request",
+            "A polling timeout is not remote failure",
+            "inspect the authoritative run status",
+            "no tool authority, runtime gate, or approval requirement",
+        ] {
+            assert!(rubric.contains(clause), "missing proportionality: {clause}");
+        }
+    }
+
+    #[test]
+    fn verification_rubric_does_not_override_configured_prompts() {
+        use zuno_config::schema::agent::AgentConfig;
+
+        let mut overrides = OrderedMap::new();
+        for name in ["build", "review", "fixer", "custom-test"] {
+            overrides.insert(
+                name,
+                AgentConfig {
+                    prompt: Some("Use the supplied acceptance criteria.".to_owned()),
+                    ..AgentConfig::default()
+                },
+            );
+        }
+        for agent in crate::agent::resolve(&overrides, &[])
+            .into_iter()
+            .filter(|agent| overrides.contains_key(&agent.name))
+        {
+            assert_eq!(
+                agent.prompt.as_deref(),
+                Some("Use the supplied acceptance criteria."),
+                "{} must preserve an explicit prompt override",
+                agent.name
+            );
+        }
     }
 
     #[test]
@@ -961,7 +1210,7 @@ mod tests {
             (
                 "orchestrator",
                 PROMPT_ORCHESTRATOR,
-                190,
+                225,
                 &[
                     "dependency graph",
                     "non-overlapping objectives",
@@ -972,13 +1221,13 @@ mod tests {
                     "Run shared verification once",
                     "After a second failure at one integration boundary",
                     "producer-artifact-consumer contract",
-                    "one authoritative observer",
+                    "Keep one polling owner",
                 ],
             ),
             (
                 "build",
                 PROMPT_BUILD,
-                130,
+                170,
                 &[
                     "direct implementation owner",
                     "owning abstraction",
@@ -998,17 +1247,24 @@ mod tests {
                     "decision-complete",
                     "Do not invent APIs",
                     "defer non-blocking choices",
+                    "durable Plan and Todo state",
                 ],
             ),
             (
                 "deep",
                 PROMPT_DEEP,
-                170,
+                240,
                 &[
                     "difficult debugging",
                     "Reproduce the failure",
                     "Rank competing hypotheses",
+                    "discriminating experiment",
+                    "revise the hypotheses",
                     "causal chain",
+                    "root fix",
+                    "recovery path",
+                    "runtime tools, permissions, and depth",
+                    "independent verification",
                 ],
             ),
         ];
@@ -1020,12 +1276,28 @@ mod tests {
                     "{name} prompt is missing `{clause}`:\n{prompt}"
                 );
             }
-            let words = prompt.split_whitespace().count();
+            let words = role_prompt_words(prompt);
             assert!(
                 words <= word_limit,
                 "{name} prompt grew to {words} words; concise role policy belongs here, not a \
                  second harness manual"
             );
+        }
+    }
+
+    #[test]
+    fn writing_roles_preserve_analysis_intent_and_authorized_command_work() {
+        for prompt in [
+            PROMPT_ORCHESTRATOR,
+            PROMPT_BUILD,
+            PROMPT_DEEP,
+            PROMPT_FIXER,
+            PROMPT_GENERAL,
+        ] {
+            assert!(prompt.contains("explain-only or diagnosis-only"));
+            assert!(prompt.contains("authorized") || prompt.contains("Authorized"));
+            assert!(prompt.contains("command") || prompt.contains("Commands"));
+            assert!(prompt.contains("script"));
         }
     }
 
@@ -1117,7 +1389,7 @@ mod tests {
                     "{name} prompt is missing `{clause}`:\n{prompt}"
                 );
             }
-            let words = prompt.split_whitespace().count();
+            let words = role_prompt_words(prompt);
             assert!(
                 words <= word_limit,
                 "{name} prompt grew to {words} words; keep role guidance compact"

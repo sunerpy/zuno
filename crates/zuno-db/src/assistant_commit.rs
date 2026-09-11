@@ -14,6 +14,7 @@ pub struct AssistantCommit {
     pub parts: Vec<PartRecord>,
     pub persisted_at_ms: i64,
     pub context_limit: Option<i64>,
+    pub context_usage: Option<zuno_types::context_usage::ContextUsageWrite>,
 }
 
 /// Validate immutable message/invocation identities independently of a database.
@@ -24,6 +25,10 @@ pub fn validate_commit(
     existing_parts: &[PartRecord],
 ) -> Result<(), DbError> {
     if commit.message.role != MessageRole::Assistant
+        || commit
+            .context_usage
+            .as_ref()
+            .is_some_and(|update| update.tracker.snapshot().session_id != commit.message.session_id)
         || commit.parts.iter().any(|part| {
             part.session_id != commit.message.session_id || part.message_id != commit.message.id
         })
@@ -150,5 +155,8 @@ pub fn commit_assistant(
         session::MessageUsage::from_data(&commit.message.data),
         commit.context_limit,
     )?;
+    if let Some(update) = &commit.context_usage {
+        crate::context_usage::commit_in(&tx, update)?;
+    }
     tx.commit().map_err(open::map_error)
 }

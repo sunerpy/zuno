@@ -181,7 +181,7 @@ impl AcpPermissionAsker {
     ///
     /// The rule — every terminal outcome resolves `answered` and resumes whatever
     /// Goal the settled row itself carries — lives in [`crate::settlement::settle`],
-    /// shared with [`crate::AcpQuestionAsker`]. This wrapper only chooses the durable
+    /// used on both permission paths. This wrapper only chooses the durable
     /// response and labels a failure with this tool.
     fn settle(
         &self,
@@ -1047,7 +1047,7 @@ mod tests {
 
     /// A row the TUI already answered is skipped, not reported as a failure.
     ///
-    /// `recover_pending_human_requests` reads `pending()` and then calls this; any
+    /// `recover_pending_permissions` reads `pending()` and then calls this; any
     /// other surface may settle the row in between. Failing here turned that benign
     /// race into a `-32603` on the user's `session/prompt`, and would have overwritten
     /// the answer the user actually gave.

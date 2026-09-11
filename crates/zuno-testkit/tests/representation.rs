@@ -205,6 +205,10 @@ fn turn_event_payloads() -> Vec<VariantPayload> {
         payload("AssistantMessageCreated", size_of::<(u32, String)>()),
         payload("ToolSnapshotLocked", size_of::<(u32, Vec<String>, bool)>()),
         payload("ProviderRequestStarted", size_of::<(u32, usize, u64)>()),
+        payload(
+            "ContextUsageUpdated",
+            size_of::<(Box<zuno_types::context_usage::ContextUsageSnapshot>,)>(),
+        ),
         payload("Provider", size_of::<(u32, StreamEvent)>()),
         payload(
             "ToolCallStarted",
@@ -281,6 +285,7 @@ fn turn_event_variant_name(event: &TurnEvent) -> &'static str {
         TurnEvent::AssistantMessageCreated { .. } => "AssistantMessageCreated",
         TurnEvent::ToolSnapshotLocked { .. } => "ToolSnapshotLocked",
         TurnEvent::ProviderRequestStarted { .. } => "ProviderRequestStarted",
+        TurnEvent::ContextUsageUpdated { .. } => "ContextUsageUpdated",
         TurnEvent::Provider { .. } => "Provider",
         TurnEvent::ToolCallStarted { .. } => "ToolCallStarted",
         TurnEvent::AssistantCheckpointed { .. } => "AssistantCheckpointed",

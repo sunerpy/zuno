@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::io::Write as _;
 use std::sync::Arc;
 
@@ -10,14 +11,16 @@ use zuno_permission::ReplyKind;
 use zuno_server::api::{self, ApiState};
 use zuno_server::{
     AuthConfig, DEFAULT_EVENT_SUBSCRIBER_CAPACITY, EventFanout, EventService, NewEvent,
-    PermissionRequest, QuestionDecision, QuestionRequest, QuestionToolCall, RequestBroker,
-    ServerBuilder, ServerConfig, ServerServices, SessionCompactExecution,
+    PermissionRequest, RequestBroker, ServerBuilder, ServerConfig, ServerServices,
+    SessionCompactExecution, SessionControlExecution, SessionControlExecutor,
     SessionMemoryPolicyExecution, SessionMemoryPolicyFuture, SessionMemoryPolicyMutationError,
     SessionMutationExecutor, SessionMutationFuture, SessionPromptExecution, SessionReportExecution,
+    SessionResumeError, SessionResumeFuture, SessionResumeOutcome, SessionResumeRequest,
     events_router,
 };
+use zuno_session_control::{QuestionService, SessionControlError, SessionControlService};
+use zuno_tool::question::QuestionPort;
 use zuno_tool::{PermissionAsk, PermissionAsker, PermissionOrigin};
-use zuno_tools::question::{QuestionAsker, QuestionOutcome};
 
 use super::child_turn::DetachedTurnObserver;
 use super::turn::{SessionChoice, TurnHost, TurnHostRuntimeDependencies, TurnOptions, TurnPlan};
@@ -28,6 +31,9 @@ use crate::environment::StartupEnvironment;
 struct ServerSessionMutationExecutor {
     environment: StartupEnvironment,
     requests: RequestBroker,
+    questions: Arc<dyn QuestionPort>,
+    session_control: SessionControlService,
+    inbox: zuno_db::inbox::SessionInbox,
     runs: SessionRunRegistry,
     /// Serializes host acquisition with extension transition reservation.
     ///
@@ -49,18 +55,24 @@ struct ServerSessionMutationExecutor {
 impl ServerSessionMutationExecutor {
     fn new(
         environment: StartupEnvironment,
-        requests: RequestBroker,
-        runs: SessionRunRegistry,
+        services: &ServerServices,
+        questions: Arc<dyn QuestionPort>,
+        database: Arc<zuno_db::Pool>,
         mcp: Option<zuno_mcp::Catalog>,
         events: EventService,
-        fanout: EventFanout<TurnEvent>,
     ) -> Self {
         Self {
             environment,
-            requests,
-            runs,
+            requests: services.requests.clone(),
+            questions,
+            session_control: SessionControlService::new(Arc::clone(&database)),
+            inbox: zuno_db::inbox::SessionInbox::new(database),
+            runs: services.runs.clone(),
             composition_gate: Arc::new(tokio::sync::Mutex::new(())),
-            detached_observer: Arc::new(ServerDetachedTurnObserver { events, fanout }),
+            detached_observer: Arc::new(ServerDetachedTurnObserver {
+                events,
+                fanout: services.events.clone(),
+            }),
             mcp,
         }
     }
@@ -88,22 +100,7 @@ impl ServerSessionMutationExecutor {
     }
 
     async fn open_plan(&self, plan: TurnPlan, preserve_goal: bool) -> Result<TurnHost, String> {
-        let approval: Arc<dyn PermissionAsker> = Arc::new(ServerPermissionAsker {
-            requests: self.requests.clone(),
-        });
-        let question: Arc<dyn QuestionAsker> = Arc::new(ServerQuestionAsker {
-            requests: self.requests.clone(),
-        });
-        let dependencies = TurnHostRuntimeDependencies {
-            approval,
-            question: Some(question),
-            runs: self.runs.clone(),
-            mcp: self.mcp.clone(),
-            child_observer: None,
-            detached_observer: Some(
-                Arc::clone(&self.detached_observer) as Arc<dyn DetachedTurnObserver>
-            ),
-        };
+        let dependencies = self.runtime_dependencies();
         let mut host = if preserve_goal {
             TurnHost::open_with_runtime_mcp_and_observers_preserving_goal(
                 plan,
@@ -126,6 +123,62 @@ impl ServerSessionMutationExecutor {
         }
         host.activate_background_notifications(&tokio::runtime::Handle::current());
         Ok(host)
+    }
+
+    /// Every request host inherits the same question service used by HTTP clients.
+    fn runtime_dependencies(&self) -> TurnHostRuntimeDependencies {
+        let approval: Arc<dyn PermissionAsker> = Arc::new(ServerPermissionAsker {
+            requests: self.requests.clone(),
+        });
+        TurnHostRuntimeDependencies {
+            approval,
+            question: Some(Arc::clone(&self.questions)),
+            runs: self.runs.clone(),
+            mcp: self.mcp.clone(),
+            child_observer: None,
+            detached_observer: Some(
+                Arc::clone(&self.detached_observer) as Arc<dyn DetachedTurnObserver>
+            ),
+        }
+    }
+
+    fn queued_input(&self, session_id: &str) -> Result<zuno_goal::QueuedUserInput, String> {
+        for input in self
+            .inbox
+            .pending(session_id)
+            .map_err(|error| error.to_string())?
+        {
+            if self
+                .inbox
+                .wake_admission(&input)
+                .map_err(|error| error.to_string())?
+                != zuno_types::execution::WakeAdmission::Reject
+            {
+                return Ok(zuno_goal::QueuedUserInput::Present);
+            }
+        }
+        Ok(zuno_goal::QueuedUserInput::Absent)
+    }
+
+    async fn open_control(
+        &self,
+        request: &SessionControlExecution,
+    ) -> Result<(ServerHostSpec, TurnHost), String> {
+        let spec = ServerHostSpec::for_control(request)?;
+        let _composition = self.composition_gate.lock().await;
+        let plan = TurnPlan::resolve(
+            &spec.options(super::turn::ExtensionComposition::Active),
+            &self.environment,
+        )
+        .await?;
+        if plan.execution_identity() != request.continuation.identity {
+            return Err(
+                "saved Work identity no longer resolves exactly; obtain fresh execution selection"
+                    .to_owned(),
+            );
+        }
+        let host = self.open_plan(plan, true).await?;
+        Ok((spec, host))
     }
 
     fn final_work_state(
@@ -215,9 +268,30 @@ struct ServerHostSpec {
     directory: std::path::PathBuf,
     agent: Option<String>,
     model: Option<zuno_server::SessionModelSelection>,
+    effort: Option<zuno_llm::effort::ReasoningEffort>,
 }
 
 impl ServerHostSpec {
+    fn for_control(request: &SessionControlExecution) -> Result<Self, String> {
+        let identity = &request.continuation.identity;
+        let effort = identity
+            .reasoning
+            .as_deref()
+            .map(str::parse::<zuno_llm::effort::ReasoningEffort>)
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            session_id: request.session_id.clone(),
+            directory: request.directory.clone(),
+            agent: Some(identity.agent.clone()),
+            model: Some(zuno_server::SessionModelSelection {
+                provider_id: identity.provider_id.clone(),
+                model_id: identity.model_id.clone(),
+            }),
+            effort,
+        })
+    }
+
     fn options(&self, extension_composition: super::turn::ExtensionComposition) -> TurnOptions {
         TurnOptions {
             directory: Some(self.directory.clone()),
@@ -229,10 +303,11 @@ impl ServerHostSpec {
             preset: None,
             session: SessionChoice::Existing(self.session_id.clone()),
             title: None,
-            effort: None,
+            effort: self.effort,
             variant: None,
             thinking: false,
             tool_authority: None,
+            parent_authority: None,
             extension_composition,
         }
     }
@@ -303,46 +378,6 @@ impl PermissionAsker for ServerPermissionAsker {
     }
 }
 
-#[derive(Debug)]
-struct ServerQuestionAsker {
-    requests: RequestBroker,
-}
-
-#[async_trait]
-impl QuestionAsker for ServerQuestionAsker {
-    async fn ask(
-        &self,
-        session_id: &str,
-        questions: &[zuno_tools::question::QuestionRequest],
-        call: Option<(&str, &str)>,
-    ) -> Result<QuestionOutcome, ToolError> {
-        let questions = questions
-            .iter()
-            .map(serde_json::to_value)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| ToolError::Failed {
-                tool: "question".to_owned(),
-                source: Box::new(source),
-            })?;
-        let tool = call.map(|(message_id, call_id)| QuestionToolCall {
-            message_id: message_id.to_owned(),
-            call_id: call_id.to_owned(),
-        });
-        let request = QuestionRequest {
-            id: format!("que_{}", Uuid::new_v4().simple()),
-            session_id: session_id.to_owned(),
-            questions,
-            tool,
-        };
-        Ok(match self.requests.ask_question(request).await {
-            QuestionDecision::Answered(answers) => QuestionOutcome::Answered(answers),
-            QuestionDecision::Cancelled => QuestionOutcome::Cancelled,
-            QuestionDecision::Expired => QuestionOutcome::Expired,
-            QuestionDecision::Failed => QuestionOutcome::Failed,
-        })
-    }
-}
-
 /// Hand-written because [`zuno_mcp::Catalog`] is deliberately not [`Debug`].
 ///
 /// Deriving it would need a `Debug` on the catalog, and the useful fact here is
@@ -353,6 +388,7 @@ impl std::fmt::Debug for ServerSessionMutationExecutor {
         f.debug_struct("ServerSessionMutationExecutor")
             .field("environment", &self.environment)
             .field("requests", &self.requests)
+            .field("questions", &"shared durable port")
             .field("runs", &self.runs)
             .field("detached_observer", &"configured")
             .field("mcp", &self.mcp.is_some())
@@ -432,6 +468,7 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                 directory: request.directory,
                 agent: request.agent,
                 model: request.model,
+                effort: None,
             };
             let mut host = executor.open_active(&spec).await?;
             let outcome = async {
@@ -457,7 +494,7 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                 // must be released before it runs or continuation is suppressed.
                 drop(guard);
                 while host
-                    .continue_goal_if_idle(zuno_goal::QueuedUserInput::Absent, events.clone())
+                    .continue_goal_if_idle(executor.queued_input(&spec.session_id)?, events.clone())
                     .await?
                 {}
                 Ok(())
@@ -480,6 +517,7 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                 directory: request.directory,
                 agent: request.agent,
                 model: request.model,
+                effort: None,
             };
             let mut host = executor.open_active_preserving_goal(&spec).await?;
             let outcome = async {
@@ -489,7 +527,7 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                 // must be released before it runs or continuation is suppressed.
                 drop(guard);
                 while host
-                    .continue_goal_if_idle(zuno_goal::QueuedUserInput::Absent, events.clone())
+                    .continue_goal_if_idle(executor.queued_input(&spec.session_id)?, events.clone())
                     .await?
                 {}
                 Ok(())
@@ -512,13 +550,14 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                 directory: request.directory,
                 agent: request.agent,
                 model: request.model,
+                effort: None,
             };
             let mut host = executor.open_active(&spec).await?;
             let outcome = async {
                 host.compact_with_guard(request.automatic, guard, events.clone())
                     .await?;
                 while host
-                    .continue_goal_if_idle(zuno_goal::QueuedUserInput::Absent, events.clone())
+                    .continue_goal_if_idle(executor.queued_input(&spec.session_id)?, events.clone())
                     .await?
                 {}
                 Ok(())
@@ -540,6 +579,7 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                 directory: request.directory,
                 agent: request.agent,
                 model: request.model,
+                effort: None,
             };
             let mut host = executor
                 .open_active(&spec)
@@ -570,6 +610,67 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                 .map_err(SessionMemoryPolicyMutationError::Internal)?;
             drop(guard);
             outcome
+        })
+    }
+}
+
+impl SessionControlExecutor for ServerSessionMutationExecutor {
+    fn resume(&self, request: SessionResumeRequest) -> SessionResumeFuture {
+        let control = self.session_control.clone();
+        Box::pin(async move {
+            let outcome = tokio::task::spawn_blocking(move || {
+                control.resume_session(
+                    &request.session_id,
+                    request.expected_revision,
+                    zuno_db::message::now_millis(),
+                )
+            })
+            .await
+            .map_err(|error| SessionResumeError::Internal(error.to_string()))?
+            .map_err(|error| match error {
+                SessionControlError::ResumeRejected { .. }
+                | SessionControlError::ExecutionRevisionConflict { .. }
+                | SessionControlError::PlanRevisionConflict { .. } => {
+                    SessionResumeError::Conflict(error.to_string())
+                }
+                SessionControlError::Database(zuno_error::DbError::NotFound { id, .. }) => {
+                    SessionResumeError::NotFound(id)
+                }
+                _ => SessionResumeError::Internal(error.to_string()),
+            })?;
+            Ok(SessionResumeOutcome {
+                execution_revision: outcome.state.revision,
+                input: outcome.input,
+            })
+        })
+    }
+
+    fn control(
+        &self,
+        request: SessionControlExecution,
+        guard: SessionRunGuard,
+        events: TurnEventSender,
+    ) -> SessionMutationFuture {
+        let executor = self.clone();
+        Box::pin(async move {
+            let (spec, mut host) = executor.open_control(&request).await?;
+            let outcome = async {
+                host.drive_promoted_start_work_with_guard(
+                    &request.input_id,
+                    request.continuation,
+                    &guard,
+                    events.clone(),
+                )
+                .await?;
+                drop(guard);
+                while host
+                    .continue_goal_if_idle(executor.queued_input(&spec.session_id)?, events.clone())
+                    .await?
+                {}
+                Ok(())
+            }
+            .await;
+            executor.finish_hosted(&spec, host, outcome).await
         })
     }
 }
@@ -689,6 +790,10 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
             .with_goal_store(goals);
         let services =
             ServerServices::new(DEFAULT_EVENT_SUBSCRIBER_CAPACITY).with_requests(requests.clone());
+        let questions =
+            Arc::new(QuestionService::new(Arc::clone(&pool)).with_runs(services.runs.clone()));
+        let question_changes = questions.subscribe();
+        let question_port: Arc<dyn QuestionPort> = questions;
         // Connected once for the server's lifetime, not per request: every host this
         // executor builds reads the same merged catalog. See `super::mcp_runtime`.
         let mcp = super::mcp_runtime::McpRuntime::from_config(&harness_config, mcp_workspace);
@@ -699,16 +804,20 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
         }
         let mutations = Arc::new(ServerSessionMutationExecutor::new(
             environment.clone(),
-            requests,
-            services.runs.clone(),
+            &services,
+            Arc::clone(&question_port),
+            Arc::clone(&pool),
             mcp.as_ref().map(super::mcp_runtime::McpRuntime::catalog),
             events.clone(),
-            services.events.clone(),
         ));
+        let state = state.with_session_controls(mutations.clone());
         let services = services.with_mutations(mutations);
         let mut server = ServerBuilder::new(server_config)
             .with_services(services)
-            .with_routes(api::router(state.clone()).merge(events_router(events)))
+            .with_routes(
+                api::router_with_questions(state.clone(), question_port)
+                    .merge(events_router(events.clone())),
+            )
             .bind()
             .await
             .map_err(|error| error.to_string())?;
@@ -726,7 +835,7 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
         std::io::stdout()
             .flush()
             .map_err(|error| error.to_string())?;
-        let result = server.serve().await.map_err(|error| error.to_string());
+        let result = serve_with_question_events(server.serve(), events, question_changes).await;
         drop(supervisor_state);
         environment.cancel_background_jobs();
         environment.wait_background_jobs().await;
@@ -735,6 +844,29 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
         }
         result
     })
+}
+
+/// Keep the event reader scoped to serving, including early exit and cancellation.
+async fn serve_with_question_events(
+    server: impl Future<Output = Result<(), zuno_server::ServerError>>,
+    events: EventService,
+    changes: tokio::sync::broadcast::Receiver<zuno_types::question::QuestionReceipt>,
+) -> Result<(), String> {
+    let mut forwarding = tokio::task::JoinSet::new();
+    forwarding.spawn(async move { events.forward_question_events(changes).await });
+    let result = tokio::select! {
+        biased;
+        result = server => result.map_err(|error| error.to_string()),
+        result = forwarding.join_next() => Err(match result {
+            Some(Ok(Err(error))) => format!("question event forwarding failed: {error}"),
+            Some(Err(error)) => format!("question event forwarding task failed: {error}"),
+            Some(Ok(Ok(()))) | None => {
+                "question event forwarding stopped while the HTTP server was active".to_owned()
+            }
+        }),
+    };
+    forwarding.shutdown().await;
+    result
 }
 
 /// Resolve the bind address from the flags, then `server`, then the built-in defaults.
@@ -793,6 +925,7 @@ mod tests {
     use std::sync::Arc;
 
     use serde_json::json;
+    use tower::ServiceExt;
     use zuno_tool::{NeverInterrupted, ToolContext};
 
     use super::{
@@ -801,6 +934,227 @@ mod tests {
         server_readiness_message,
     };
     use crate::command::ServeArgs;
+
+    #[test]
+    fn work_control_host_options_use_the_saved_work_identity() {
+        let request = zuno_server::SessionControlExecution {
+            session_id: "ses_control".to_owned(),
+            directory: "/workspace".into(),
+            input_id: "control".to_owned(),
+            continuation: zuno_types::execution::ContinuationToken {
+                cycle_id: "cycle".to_owned(),
+                identity: zuno_types::execution::TurnExecutionIdentity::new(
+                    "deep", "work", "model",
+                )
+                .with_reasoning(Some("high")),
+                mode: zuno_types::execution::CollaborationMode::Work,
+                plan_id: None,
+                plan_revision: None,
+                context_epoch: 0,
+                anchor_message_id: None,
+            },
+        };
+        let spec = super::ServerHostSpec::for_control(&request).expect("saved identity");
+        let options = spec.options(super::super::turn::ExtensionComposition::Active);
+        assert_eq!(options.agent.as_deref(), Some("deep"));
+        assert_eq!(options.model.as_deref(), Some("work/model"));
+        assert_eq!(
+            options.effort,
+            Some(zuno_llm::effort::ReasoningEffort::High)
+        );
+        assert!(options.parent_authority.is_none());
+    }
+
+    #[tokio::test]
+    async fn hosts_and_http_share_one_question_service_and_its_notifications() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::{Request, StatusCode};
+        use zuno_db::artifact_gc::ArtifactGcPaths;
+        use zuno_db::session::SessionCreate;
+        use zuno_paths::{DbLocation, Env};
+        use zuno_server::api::{self, ApiState};
+        use zuno_server::{EventService, ServerBuilder, ServerConfig, ServerServices};
+        use zuno_session_control::QuestionService;
+        use zuno_tool::question::QuestionPort;
+        use zuno_types::question::{
+            QuestionAction, QuestionCommand, QuestionMode, QuestionOrigin, QuestionPrompt,
+            QuestionPurpose, QuestionSpec, QuestionState,
+        };
+
+        let root = tempfile::tempdir().expect("server question fixture");
+        let location = DbLocation::File(root.path().join("zuno.db"));
+        let pool = Arc::new(zuno_db::Pool::open(&location).expect("shared pool"));
+        let state = ApiState::from_pool(
+            zuno_db::Pool::open(&location).expect("API pool"),
+            "/workspace",
+            ArtifactGcPaths::from_data_root(root.path()),
+        )
+        .expect("API state");
+        state
+            .sessions()
+            .create(&SessionCreate::new(
+                "ses_shared",
+                "shared",
+                "global",
+                "/workspace",
+                "/workspace",
+                "Questions",
+                "test",
+            ))
+            .expect("session");
+        let services = ServerServices::new(16);
+        let questions =
+            Arc::new(QuestionService::new(Arc::clone(&pool)).with_runs(services.runs.clone()));
+        let mut notifications = questions.subscribe();
+        let port: Arc<dyn QuestionPort> = questions;
+        let environment = crate::environment::StartupEnvironment::resolve(
+            &Env::empty().with("HOME", root.path().to_string_lossy().into_owned()),
+            &crate::GlobalOptions::default(),
+        );
+        let executor = Arc::new(super::ServerSessionMutationExecutor::new(
+            environment,
+            &services,
+            Arc::clone(&port),
+            Arc::clone(&pool),
+            None,
+            EventService::new(pool, 16),
+        ));
+        let dependencies = executor.runtime_dependencies();
+        let host_port = dependencies.question.expect("host question port");
+        assert!(
+            Arc::ptr_eq(&host_port, &port),
+            "host must not reconstruct its own service"
+        );
+        let opened = host_port
+            .open(QuestionSpec {
+                origin: QuestionOrigin {
+                    session_id: "ses_shared".to_owned(),
+                    message_id: None,
+                    call_id: None,
+                    turn_id: None,
+                    goal_id: None,
+                },
+                mode: QuestionMode::Deferred,
+                purpose: QuestionPurpose::Clarification,
+                questions: vec![
+                    QuestionPrompt::new("Which target?", "Target", Vec::new()).into_request(),
+                ],
+                expected_goal_revision: None,
+                plan: None,
+            })
+            .await
+            .expect("host publishes a question");
+        assert_eq!(
+            notifications.recv().await.expect("same service notifies"),
+            opened
+        );
+        let app = ServerBuilder::new(ServerConfig::default())
+            .with_services(services)
+            .with_routes(api::router_with_questions(
+                state.with_session_controls(executor),
+                port,
+            ))
+            .router();
+        let rejected_resume = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/session/ses_shared/resume")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"expectedRevision":1}"#))
+                    .expect("resume"),
+            )
+            .await
+            .expect("resume responds");
+        assert_eq!(
+            rejected_resume.status(),
+            StatusCode::CONFLICT,
+            "the real control backend must reject a session with no resumable execution state"
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/session/ses_shared/question")
+                    .body(Body::empty())
+                    .expect("GET"),
+            )
+            .await
+            .expect("pending questions");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("body"),
+        )
+        .expect("JSON");
+        assert_eq!(body["data"], json!([opened.question]));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/session/ses_shared/question/{}/reject",
+                        opened.question.id
+                    ))
+                    .body(Body::from(
+                        serde_json::to_vec(&QuestionCommand {
+                            command_id: "cancel".to_owned(),
+                            expected_revision: opened.question.revision,
+                            action: QuestionAction::Cancel,
+                        })
+                        .expect("command"),
+                    ))
+                    .expect("reply"),
+            )
+            .await
+            .expect("HTTP cancellation");
+        assert_eq!(response.status(), StatusCode::OK);
+        let changed = notifications
+            .recv()
+            .await
+            .expect("HTTP uses the same service sender");
+        assert_eq!(changed.question.state, QuestionState::Cancelled);
+        assert_eq!(
+            host_port
+                .get("ses_shared", &opened.question.id)
+                .await
+                .expect("host observes reply"),
+            changed.question,
+        );
+    }
+
+    #[tokio::test]
+    async fn finishing_serve_cancels_and_joins_its_question_event_forwarder() {
+        let pool = Arc::new(zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("pool"));
+        let events = zuno_server::EventService::new(pool, 16);
+        let (changes, receiver) = tokio::sync::broadcast::channel(1);
+        super::serve_with_question_events(async { Ok(()) }, events, receiver)
+            .await
+            .expect("normal server exit");
+        assert_eq!(changes.receiver_count(), 0, "no reader outlives serving");
+    }
+
+    #[tokio::test]
+    async fn an_unexpected_question_event_exit_stops_serving() {
+        let pool = Arc::new(zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("pool"));
+        let events = zuno_server::EventService::new(pool, 16);
+        let (changes, receiver) = tokio::sync::broadcast::channel(1);
+        drop(changes);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            super::serve_with_question_events(
+                std::future::pending::<Result<(), zuno_server::ServerError>>(),
+                events,
+                receiver,
+            ),
+        )
+        .await
+        .expect("forwarder failure is observed")
+        .expect_err("closed provider must stop serving");
+        assert!(error.contains("question event forwarding stopped"));
+    }
 
     fn serve_args(port: Option<u16>, hostname: Option<&str>) -> ServeArgs {
         ServeArgs {

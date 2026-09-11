@@ -192,8 +192,8 @@ async fn a_wait_releases_the_driver_and_consumes_its_original_result_once_before
     assert_eq!(*order.lock().unwrap(), ["before", "after"]);
     assert!(second_dispatcher.deferred.lock().unwrap().is_empty());
     assert_eq!(provider.requests().len(), 1);
-    assert_eq!(budget.0.lock().unwrap()[0].1, 127);
-    assert_eq!(budget.0.lock().unwrap()[0].2, 3);
+    assert_eq!(budget.0.lock().unwrap().last().unwrap().1, 127);
+    assert_eq!(budget.0.lock().unwrap().last().unwrap().2, 3);
     let result = MessageStore::new(&connection).part(&original.id).unwrap();
     assert_eq!(result.data["state"]["status"], "completed");
     assert_eq!(
@@ -285,7 +285,7 @@ struct OneMinuteBudget;
 
 #[async_trait]
 impl TurnBudgetPolicy for OneMinuteBudget {
-    async fn after_response(
+    async fn before_request(
         &self,
         snapshot: &TurnUsageSnapshot<'_>,
     ) -> Result<BudgetDecision, BudgetPolicyError> {
@@ -294,6 +294,13 @@ impl TurnBudgetPolicy for OneMinuteBudget {
         } else {
             BudgetDecision::Continue
         })
+    }
+
+    async fn after_response(
+        &self,
+        snapshot: &TurnUsageSnapshot<'_>,
+    ) -> Result<BudgetDecision, BudgetPolicyError> {
+        self.before_request(snapshot).await
     }
 }
 
@@ -355,4 +362,64 @@ async fn waiting_time_does_not_authorize_remaining_tools_after_the_original_budg
     ));
     assert_eq!(*order.lock().unwrap(), ["before"]);
     assert_eq!(provider.requests().len(), 1);
+}
+
+#[derive(Default)]
+struct ChargingPolicy(std::sync::atomic::AtomicU64);
+
+#[async_trait]
+impl TurnBudgetPolicy for ChargingPolicy {
+    async fn after_response(
+        &self,
+        snapshot: &TurnUsageSnapshot<'_>,
+    ) -> Result<BudgetDecision, BudgetPolicyError> {
+        self.0
+            .fetch_add(snapshot.last_request.total(), Ordering::SeqCst);
+        Ok(BudgetDecision::Continue)
+    }
+}
+
+#[tokio::test]
+async fn tool_continuation_does_not_invoke_the_previous_responses_billing_hook_again() {
+    let mut connection = seeded();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let dispatcher = deferred(&order);
+    let mut responses = provider_events(&[("wait", "remote")]);
+    responses[0].insert(0, usage());
+    let provider = Arc::new(ScriptedProvider::new(responses));
+    let budget = Arc::new(ChargingPolicy::default());
+    let (result, _) = advance(
+        &mut connection,
+        provider.clone(),
+        &dispatcher,
+        request(),
+        budget.clone(),
+    )
+    .await;
+    let AdvanceOutcome::Waiting { checkpoint, waits } = result.unwrap() else {
+        panic!("wait")
+    };
+    assert_eq!(budget.0.load(Ordering::SeqCst), 127);
+    publish_sqlite_completion(&mut connection, &scope(), &completion(waits[0].clone())).unwrap();
+    let (result, _) = advance(
+        &mut connection,
+        provider.clone(),
+        &dispatcher,
+        request().resume(checkpoint),
+        budget.clone(),
+    )
+    .await;
+    let AdvanceOutcome::Progressed { checkpoint } = result.unwrap() else {
+        panic!("consumption")
+    };
+    let (result, _) = advance(
+        &mut connection,
+        provider,
+        &dispatcher,
+        request().resume(checkpoint),
+        budget.clone(),
+    )
+    .await;
+    assert!(matches!(result.unwrap(), AdvanceOutcome::Completed { .. }));
+    assert_eq!(budget.0.load(Ordering::SeqCst), 127);
 }

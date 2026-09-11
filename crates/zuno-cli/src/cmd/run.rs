@@ -90,6 +90,7 @@ pub(super) fn execute(
         variant: args.variant.clone(),
         thinking: args.thinking,
         tool_authority: None,
+        parent_authority: None,
         extension_composition: super::turn::ExtensionComposition::Active,
     };
     report_progress(progress);
@@ -574,6 +575,9 @@ fn event_json(event: TurnEvent) -> Value {
             "messageCount":message_count,
             "estimatedPromptTokens":estimated_prompt_tokens
         }),
+        TurnEvent::ContextUsageUpdated { snapshot } => {
+            json!({"type":"context_usage","snapshot":snapshot})
+        }
         TurnEvent::Provider { step, event } => stream_event_json(step, event),
         TurnEvent::ToolCallStarted {
             step,
@@ -1175,6 +1179,22 @@ mod tests {
         assert_eq!(
             stream_event_json(7, StreamEvent::RetryRollback { attempt: 2, max: 3 }),
             json!({"type":"retry_rollback","step":7,"attempt":2,"max":3})
+        );
+    }
+
+    #[test]
+    fn run_context_usage_json_preserves_the_native_unknown_snapshot() {
+        let snapshot = zuno_types::context_usage::ContextUsageTracker::for_source(
+            "session",
+            zuno_types::context_usage::ContextUsageSource::Main,
+        )
+        .snapshot()
+        .clone();
+        assert_eq!(
+            event_json(TurnEvent::ContextUsageUpdated {
+                snapshot: Box::new(snapshot.clone())
+            }),
+            json!({"type":"context_usage","snapshot":snapshot}),
         );
     }
 

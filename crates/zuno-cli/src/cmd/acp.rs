@@ -9,9 +9,7 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
-use zuno_engine::admission::{
-    InputAdmission, SessionInputAdmission, SteerAdmissionError, SteeringContent, TurnLease,
-};
+use zuno_engine::admission::{SessionInputAdmission, SteerAdmissionError, SteeringContent};
 use zuno_engine::interrupt::{HardInterruptReason, HardInterruptRequest, HardInterruptSource};
 use zuno_engine::r#loop::{TurnEvent, event_channel};
 use zuno_engine::session_command::SessionCommand;
@@ -20,6 +18,19 @@ use zuno_engine::status::{
 };
 use zuno_llm::event::{FinishReason, RequestContentBlock};
 use zuno_tool::PermissionAsker;
+use zuno_tool::question::QuestionPort;
+
+#[cfg(test)]
+#[path = "acp_question_tests.rs"]
+mod durable_question_tests;
+#[path = "acp_question.rs"]
+mod durable_questions;
+#[path = "acp_input_receipt.rs"]
+mod input_receipts;
+#[path = "acp_publication.rs"]
+mod publication;
+#[path = "acp_saved_selection.rs"]
+mod saved_selection;
 
 use super::acp_session_registry::AcpSessionRegistry;
 use super::child_turn::{ChildTurnObserver, DetachedTurnObserver};
@@ -96,6 +107,7 @@ pub(super) struct AcpState {
     elicitation_form: AtomicBool,
     native_subagents: AtomicBool,
     permission_grants: Arc<zuno_acp::AcpPermissionGrants>,
+    question_pool: Arc<zuno_db::Pool>,
 }
 
 #[async_trait]
@@ -119,6 +131,16 @@ impl zuno_acp::Agent for ProductionAcpAgent {
             "session/list" => self.list_sessions(&params),
             "session/close" => self.close_session(&params).await,
             "session/delete" => self.delete_session(&params).await,
+            durable_questions::LIST_METHOD => {
+                let session_id = required_string(&params, "sessionId")?;
+                let session = self.question_session(&session_id).await?;
+                durable_questions::list(session.questions.as_ref(), &params).await
+            }
+            durable_questions::RESPOND_METHOD => {
+                let session_id = required_string(&params, "sessionId")?;
+                let session = self.question_session(&session_id).await?;
+                durable_questions::respond(session.questions.as_ref(), &params).await
+            }
             _ => Err(zuno_acp::RpcError::method_not_found(method)),
         }
     }
@@ -204,6 +226,7 @@ fn initialize(params: &Value) -> Result<Value, zuno_acp::RpcError> {
     if supports_native_subagents(params) {
         response["agentCapabilities"]["sessionCapabilities"]["subagents"] = json!({});
     }
+    response["_meta"]["zuno"]["questions"] = durable_questions::capabilities();
     Ok(response)
 }
 
@@ -230,16 +253,19 @@ impl ProductionAcpAgent {
 
     fn new(environment: StartupEnvironment) -> Result<Self, String> {
         let runtime = discover_acp_runtime_config(&environment)?;
+        let runs = SessionRunRegistry::new();
+        let question_pool = Arc::new(durable_pool().map_err(|error| error.to_string())?);
         Ok(Self {
             state: Arc::new(AcpState {
                 environment,
-                runs: SessionRunRegistry::new(),
+                runs,
                 registry: AcpSessionRegistry::new(runtime),
                 idle_reaper: std::sync::Mutex::new(None),
                 composition_gate: Mutex::new(()),
                 elicitation_form: AtomicBool::new(false),
                 native_subagents: AtomicBool::new(false),
                 permission_grants: Arc::new(zuno_acp::AcpPermissionGrants::default()),
+                question_pool,
             }),
         })
     }
@@ -312,6 +338,7 @@ impl ProductionAcpAgent {
             variant: None,
             thinking: false,
             tool_authority: None,
+            parent_authority: None,
             extension_composition: ExtensionComposition::Active,
         };
         let session_slot = self.reserve_session_slot()?;
@@ -343,6 +370,7 @@ impl ProductionAcpAgent {
             let _shutdown = session.shutdown().await;
             return Err(error);
         }
+        session.start_question_runtime(&self.state, client);
         Ok(with_session_id(response, &session_id))
     }
 
@@ -383,6 +411,7 @@ impl ProductionAcpAgent {
             variant: None,
             thinking: false,
             tool_authority: None,
+            parent_authority: None,
             extension_composition: ExtensionComposition::Active,
         };
         let (session, created) = match self.state.registry.get(&session_id).await {
@@ -449,6 +478,7 @@ impl ProductionAcpAgent {
             }
             session.spawn_goal_recovery();
         }
+        session.start_question_runtime(&self.state, client);
         Ok(response)
     }
 
@@ -496,8 +526,15 @@ impl ProductionAcpAgent {
         // not be lost to a request that has not reached its admission yet.
         let withdrawable = session.track_prompt_request(request);
         let prompt = parse_prompt(params)?;
+        let message_id = input_receipts::message_id(params)?;
         session
-            .prompt(&withdrawable, prompt, Arc::clone(&self.state), client)
+            .prompt(
+                &withdrawable,
+                prompt,
+                message_id,
+                Arc::clone(&self.state),
+                client,
+            )
             .await
     }
 
@@ -542,15 +579,13 @@ impl ProductionAcpAgent {
         let configuration = session
             .reconfigure(change, self.state.as_ref(), client.clone())
             .await?;
-        if configuration.mode == "plan" {
-            zuno_session_control::SessionControlService::new(Arc::new(durable_pool()?))
-                .update_work_identity(
-                    &session_id,
-                    configuration.work_identity()?,
-                    zuno_db::message::now_millis(),
-                )
-                .map_err(session_control_rpc_error)?;
-        }
+        zuno_session_control::SessionControlService::new(Arc::new(durable_pool()?))
+            .record_work_selection(
+                &session_id,
+                configuration.work_identity()?,
+                zuno_db::message::now_millis(),
+            )
+            .map_err(session_control_rpc_error)?;
         defer_configuration_updates(&client, &session_id, &configuration)?;
         Ok(json!({ "configOptions": configuration.config_options() }))
     }
@@ -639,6 +674,11 @@ impl ProductionAcpAgent {
         let background_notification_directory = plan.directory().to_path_buf();
         let background_notifications = self.state.environment.background_notifications();
         let plan_projection = Arc::new(AcpPlanProjection::default());
+        let publications = Arc::new(publication::TurnPublications::default());
+        let questions = Arc::new(
+            zuno_session_control::QuestionService::new(Arc::clone(&self.state.question_pool))
+                .with_runs(self.state.runs.clone()),
+        );
         let resources = open_session_resources(
             plan,
             &self.state.environment,
@@ -647,6 +687,8 @@ impl ProductionAcpAgent {
                 self.state.as_ref(),
                 client,
                 Arc::clone(&plan_projection),
+                Arc::clone(&questions),
+                Arc::clone(&publications),
             ),
             None,
             &mcp_servers,
@@ -681,7 +723,12 @@ impl ProductionAcpAgent {
             control,
             runs: self.state.runs.clone(),
             durable: std::sync::Mutex::new(Some(durable)),
+            receipts: zuno_db::input_receipt::InputReceiptStore::new(Arc::clone(
+                &self.state.question_pool,
+            )),
             turn_owner: std::sync::Mutex::new(None),
+            active_prompt_input: std::sync::Mutex::new(None),
+            prompt_driver: std::sync::Mutex::new(None),
             prompt_requests: std::sync::Mutex::new(HashMap::new()),
             prompts_in_flight: AtomicUsize::new(0),
             replayed: AtomicBool::new(replayed),
@@ -696,10 +743,13 @@ impl ProductionAcpAgent {
             lifecycle: std::sync::Mutex::new(AcpSessionLifecycle::Active),
             last_used_tick: AtomicU64::new(runtime_tick()),
             goal_recovery_running: AtomicBool::new(false),
+            question_runtime: std::sync::Mutex::new(None),
+            questions,
             mcp_servers: Mutex::new(Arc::from(mcp_servers)),
             mcp_manager,
             mcp_cache: Mutex::new(mcp_cache),
             plan_projection,
+            publications,
             attachments,
             dormant: Mutex::new(Some(dormant)),
             resources: Mutex::new(Some(resources)),
@@ -736,12 +786,12 @@ impl ProductionAcpAgent {
                 zuno_types::execution::CollaborationMode::Work => {
                     if let Some(identity) = execution.work_identity.as_ref() {
                         options.agent = Some(identity.agent.clone());
-                        options.model =
-                            Some(format!("{}/{}", identity.provider_id, identity.model_id));
-                        options.effort = identity
-                            .reasoning
-                            .as_deref()
-                            .and_then(|reasoning| reasoning.parse().ok());
+                        saved_selection::restore_model_hint(
+                            &mut options,
+                            identity,
+                            &self.state.environment,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -763,12 +813,29 @@ impl ProductionAcpAgent {
         let replay_pool = durable_pool()?;
         let attachments = super::turn::open_attachment_store(plan.config(), &replay_pool)
             .map_err(zuno_acp::RpcError::internal)?;
+        if execution.is_some() {
+            // Resolution can retire an unavailable saved model. Publish only its
+            // resolved selection through the shared service: no Goal resume,
+            // continuation rewrite or Plan authorization happens during a load.
+            zuno_session_control::SessionControlService::new(Arc::new(replay_pool))
+                .record_work_selection(
+                    &session_id,
+                    configuration.work_identity()?,
+                    zuno_db::message::now_millis(),
+                )
+                .map_err(session_control_rpc_error)?;
+        }
         Ok(Arc::new(AcpSession {
             id: session_id.clone(),
             control: self.state.runs.control(session_id),
             runs: self.state.runs.clone(),
             durable: std::sync::Mutex::new(None),
+            receipts: zuno_db::input_receipt::InputReceiptStore::new(Arc::clone(
+                &self.state.question_pool,
+            )),
             turn_owner: std::sync::Mutex::new(None),
+            active_prompt_input: std::sync::Mutex::new(None),
+            prompt_driver: std::sync::Mutex::new(None),
             prompt_requests: std::sync::Mutex::new(HashMap::new()),
             prompts_in_flight: AtomicUsize::new(0),
             replayed: AtomicBool::new(false),
@@ -783,10 +850,16 @@ impl ProductionAcpAgent {
             lifecycle: std::sync::Mutex::new(AcpSessionLifecycle::Dormant),
             last_used_tick: AtomicU64::new(runtime_tick()),
             goal_recovery_running: AtomicBool::new(false),
+            question_runtime: std::sync::Mutex::new(None),
+            questions: Arc::new(
+                zuno_session_control::QuestionService::new(Arc::clone(&self.state.question_pool))
+                    .with_runs(self.state.runs.clone()),
+            ),
             mcp_servers: Mutex::new(Arc::from(mcp_servers)),
             mcp_manager: zuno_mcp::McpRuntimeManager::new(),
             mcp_cache: Mutex::new(McpToolDirectoryCache::new()),
             plan_projection: Arc::new(AcpPlanProjection::default()),
+            publications: Arc::new(publication::TurnPublications::default()),
             attachments,
             dormant: Mutex::new(Some(DormantSession {
                 options,
@@ -850,13 +923,15 @@ pub(super) struct AcpSession {
     /// without waiting on the lock that turn holds, so admission state is lifted
     /// out of [`SessionResources`] when the session activates.
     durable: std::sync::Mutex<Option<SessionDurableHandles>>,
-    /// Identity of the `session/prompt` request that owns the live turn, if any.
+    receipts: zuno_db::input_receipt::InputReceiptStore,
+    /// One native command request or session-owned durable driver serves the queue.
+    turn_owner: std::sync::Mutex<Option<input_receipts::TurnOwner>>,
+    /// Input selected by the native FIFO driver while its turn lease is held.
     ///
-    /// The JSON-RPC request id is the only thing that distinguishes cancelling the
-    /// running turn from cancelling some other prompt request that never took the
-    /// lease. Request params cannot: two prompts can carry byte-identical params,
-    /// so keying on them let a cancellation aimed at a duplicate abort the owner.
-    turn_owner: std::sync::Mutex<Option<zuno_acp::RequestId>>,
+    /// A request serving the queue may be driving an older input. Withdrawing its
+    /// own pending row must not interrupt that older input's turn.
+    active_prompt_input: std::sync::Mutex<Option<String>>,
+    prompt_driver: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Withdrawal state of every `session/prompt` request still being served.
     ///
     /// Withdrawing a request must retire exactly what that request contributed. A
@@ -882,10 +957,13 @@ pub(super) struct AcpSession {
     lifecycle: std::sync::Mutex<AcpSessionLifecycle>,
     last_used_tick: AtomicU64,
     goal_recovery_running: AtomicBool,
+    question_runtime: std::sync::Mutex<Option<durable_questions::SessionQuestions>>,
+    questions: Arc<zuno_session_control::QuestionService>,
     mcp_servers: Mutex<Arc<[zuno_acp::AcpMcpServer]>>,
     mcp_manager: zuno_mcp::McpRuntimeManager,
     mcp_cache: Mutex<McpToolDirectoryCache>,
     plan_projection: Arc<AcpPlanProjection>,
+    publications: Arc<publication::TurnPublications>,
     attachments: Arc<zuno_attachment::AttachmentStore>,
     dormant: Mutex<Option<DormantSession>>,
     resources: Mutex<Option<SessionResources>>,
@@ -908,7 +986,6 @@ struct SessionResources {
     mcp: Option<McpRuntime>,
     subagents: Option<super::acp_subagent::AcpSubagentBridge>,
     subagent_flush: Option<super::acp_subagent::AcpSubagentFlush>,
-    question_asker: Option<Arc<zuno_acp::AcpQuestionAsker>>,
     permission_asker: Arc<zuno_acp::AcpPermissionAsker>,
     configuration: SessionConfiguration,
     mcp_configuration_digest: String,
@@ -918,6 +995,7 @@ struct SessionResources {
 #[derive(Clone)]
 struct SessionDurableHandles {
     admission: SessionInputAdmission,
+    work_changes: tokio::sync::watch::Receiver<u64>,
     attachments: Arc<zuno_attachment::AttachmentStore>,
     slash: SlashCatalog,
     identity: PreparedSessionIdentity,
@@ -927,6 +1005,7 @@ impl SessionDurableHandles {
     fn from_resources(resources: &SessionResources, runs: &SessionRunRegistry) -> Self {
         Self {
             admission: SessionInputAdmission::new(resources.host.session_inbox(), runs.clone()),
+            work_changes: resources.host.work_state_changes(),
             attachments: resources.host.attachment_store(),
             slash: resources.slash_catalog.clone(),
             identity: resources.host.session_identity(),
@@ -1114,9 +1193,10 @@ impl AcpPlanProjection {
 struct AcpSurfaceContext {
     client: zuno_acp::ClientConnection,
     permission_grants: Arc<zuno_acp::AcpPermissionGrants>,
-    elicitation_form: bool,
+    questions: Arc<zuno_session_control::QuestionService>,
     native_subagents: bool,
     plan_projection: Arc<AcpPlanProjection>,
+    publications: Arc<publication::TurnPublications>,
 }
 
 struct AcpDetachedTurnObserver {
@@ -1125,6 +1205,14 @@ struct AcpDetachedTurnObserver {
     projector: Mutex<zuno_acp::AttemptBufferedTurnEventProjector>,
     plan_projection: Arc<AcpPlanProjection>,
     children: Option<Arc<dyn ChildTurnObserver>>,
+    publications: Arc<publication::TurnPublications>,
+    publication: Mutex<DetachedPublication>,
+}
+
+#[derive(Default)]
+struct DetachedPublication {
+    pass: Option<publication::PublicationPass>,
+    terminal_seen: bool,
 }
 
 #[async_trait]
@@ -1135,6 +1223,16 @@ impl DetachedTurnObserver for AcpDetachedTurnObserver {
             .get()
             .is_some_and(|root| root == session_id)
         {
+            let mut publication = self.publication.lock().await;
+            if matches!(event, TurnEvent::TurnStarted { .. }) {
+                publication.terminal_seen = false;
+                if publication.pass.is_none() {
+                    publication.pass = Some(self.publications.begin(None));
+                }
+            }
+            if let Some(pass) = publication.pass.as_ref() {
+                pass.observe(event);
+            }
             let updates = self.projector.lock().await.project(event);
             for update in updates {
                 if let Err(error) = self.client.session_update(session_id, update).await {
@@ -1145,6 +1243,15 @@ impl DetachedTurnObserver for AcpDetachedTurnObserver {
                     );
                     break;
                 }
+            }
+            if matches!(
+                event,
+                TurnEvent::TurnCompleted { .. }
+                    | TurnEvent::TurnWaitingForHuman { .. }
+                    | TurnEvent::TurnInterrupted { .. }
+                    | TurnEvent::TurnFailed { .. }
+            ) {
+                publication.terminal_seen = true;
             }
         } else if let Some(children) = self.children.as_ref() {
             children.event(session_id, event);
@@ -1159,6 +1266,7 @@ impl DetachedTurnObserver for AcpDetachedTurnObserver {
         {
             return;
         }
+        let mut publication = self.publication.lock().await;
         if let Err(error) = self
             .plan_projection
             .project_durable(session_id, &self.client, false, false)
@@ -1181,6 +1289,10 @@ impl DetachedTurnObserver for AcpDetachedTurnObserver {
                 "detached root turn outlived its final ACP learning projection"
             );
         }
+        if publication.terminal_seen {
+            publication.pass.take();
+            publication.terminal_seen = false;
+        }
     }
 }
 
@@ -1189,13 +1301,16 @@ impl AcpSurfaceContext {
         state: &AcpState,
         client: zuno_acp::ClientConnection,
         plan_projection: Arc<AcpPlanProjection>,
+        questions: Arc<zuno_session_control::QuestionService>,
+        publications: Arc<publication::TurnPublications>,
     ) -> Self {
         Self {
             client,
             permission_grants: Arc::clone(&state.permission_grants),
-            elicitation_form: state.elicitation_form.load(Ordering::Acquire),
+            questions,
             native_subagents: state.native_subagents.load(Ordering::Acquire),
             plan_projection,
+            publications,
         }
     }
 }
@@ -1285,9 +1400,10 @@ async fn open_session_resources_with_mcp(
     let AcpSurfaceContext {
         client,
         permission_grants,
-        elicitation_form,
+        questions,
         native_subagents,
         plan_projection,
+        publications,
     } = surface;
     let configuration = SessionConfiguration::from_plan(&plan, build_agent);
     let mcp_configuration_digest = mcp_configuration_digest(plan.config());
@@ -1322,15 +1438,7 @@ async fn open_session_resources_with_mcp(
         SessionMcpOpening::Reuse(catalog) => (None, Vec::new(), catalog),
     };
     let session_route = Arc::new(zuno_acp::AcpSessionRoute::new(native_subagents));
-    let question_asker = elicitation_form.then(|| {
-        Arc::new(zuno_acp::AcpQuestionAsker::with_route(
-            client.clone(),
-            Arc::clone(&session_route),
-        ))
-    });
-    let question = question_asker
-        .as_ref()
-        .map(|asker| Arc::clone(asker) as Arc<dyn zuno_tools::question::QuestionAsker>);
+    let question = Some(questions as Arc<dyn QuestionPort>);
     let permission_asker = Arc::new(zuno_acp::AcpPermissionAsker::with_grants_and_route(
         client.clone(),
         "Approve Zuno tool call",
@@ -1360,6 +1468,8 @@ async fn open_session_resources_with_mcp(
         ),
         plan_projection: Arc::clone(&plan_projection),
         children: child_observer.as_ref().map(Arc::clone),
+        publications,
+        publication: Mutex::new(DetachedPublication::default()),
     });
     let host = TurnHost::open_with_runtime_mcp_and_observers(
         plan,
@@ -1458,10 +1568,7 @@ async fn open_session_resources_with_mcp(
     host.push_notes(notes);
     let goals = host.goal_store();
     let human_requests = goals.human_requests();
-    permission_asker.attach_durable(human_requests.clone(), Arc::clone(&goals));
-    if let Some(question_asker) = &question_asker {
-        question_asker.attach_durable(human_requests, goals);
-    }
+    permission_asker.attach_durable(human_requests, goals);
     host.activate_background_notifications(&tokio::runtime::Handle::current());
     let slash_catalog = SlashCatalog::new(
         host.commands().cloned().collect::<Vec<_>>(),
@@ -1556,7 +1663,6 @@ async fn open_session_resources_with_mcp(
         mcp,
         subagents,
         subagent_flush,
-        question_asker,
         permission_asker,
         configuration,
         mcp_configuration_digest,
@@ -1640,6 +1746,26 @@ fn persist_dormant_configuration(
 }
 
 impl AcpSession {
+    fn start_question_runtime(
+        self: &Arc<Self>,
+        state: &Arc<AcpState>,
+        client: zuno_acp::ClientConnection,
+    ) {
+        let mut runtime = self
+            .question_runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if runtime
+            .as_ref()
+            .is_some_and(|runtime| !runtime.is_finished())
+        {
+            return;
+        }
+        *runtime = Some(durable_questions::SessionQuestions::start(
+            self, state, client,
+        ));
+    }
+
     pub(super) fn id(&self) -> &str {
         &self.id
     }
@@ -1929,6 +2055,29 @@ impl AcpSession {
                 }
             };
             let (continued, ()) = tokio::join!(drive, project);
+            if !matches!(&continued, Ok(false)) {
+                self.flush_subagents()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let work = {
+                    let resources = self.resources.lock().await;
+                    resources
+                        .as_ref()
+                        .ok_or_else(|| format!("session {} is closed", self.id))?
+                        .host
+                        .work_state()
+                };
+                match work {
+                    Ok(work) => observer.work_state(&self.id, &work).await,
+                    Err(error) => {
+                        tracing::debug!(
+                            session_id = self.id,
+                            %error,
+                            "failed to read recovered Goal work state for ACP projection"
+                        );
+                    }
+                }
+            }
             let continued = continued?;
             if !continued {
                 break;
@@ -1939,24 +2088,6 @@ impl AcpSession {
             // Retry polls and multi-turn Goals release the prompt gate between
             // driver steps so newly admitted user input can take priority.
             tokio::task::yield_now().await;
-        }
-        let work = {
-            let resources = self.resources.lock().await;
-            resources
-                .as_ref()
-                .ok_or_else(|| format!("session {} is closed", self.id))?
-                .host
-                .work_state()
-        };
-        match work {
-            Ok(work) => observer.work_state(&self.id, &work).await,
-            Err(error) => {
-                tracing::debug!(
-                    session_id = self.id,
-                    %error,
-                    "failed to read recovered Goal work state for ACP projection"
-                );
-            }
         }
         Ok(())
     }
@@ -2044,6 +2175,8 @@ impl AcpSession {
                     state,
                     rollback_context.client,
                     Arc::clone(&self.plan_projection),
+                    Arc::clone(&self.questions),
+                    Arc::clone(&self.publications),
                 ),
                 Some(&rollback_context.build_agent),
                 mcp_servers.as_ref(),
@@ -2313,7 +2446,13 @@ impl AcpSession {
             plan,
             &state.environment,
             state.runs.clone(),
-            AcpSurfaceContext::from_state(state, client.clone(), Arc::clone(&self.plan_projection)),
+            AcpSurfaceContext::from_state(
+                state,
+                client.clone(),
+                Arc::clone(&self.plan_projection),
+                Arc::clone(&self.questions),
+                Arc::clone(&self.publications),
+            ),
             Some(&build_agent),
             mcp_servers.as_ref(),
             opening,
@@ -2509,6 +2648,7 @@ impl AcpSession {
         self: &Arc<Self>,
         withdrawable: &WithdrawablePrompt<'_>,
         prompt: AcpPrompt,
+        message_id: Option<String>,
         state: Arc<AcpState>,
         client: zuno_acp::ClientConnection,
     ) -> Result<Value, zuno_acp::RpcError> {
@@ -2539,7 +2679,7 @@ impl AcpSession {
                     .await
             }
             None => {
-                self.admit_and_drive_content(prompt, &handles, withdrawable, &client)
+                self.admit_and_drive_content(prompt, message_id, &handles, withdrawable, &client)
                     .await
             }
         }
@@ -2645,11 +2785,13 @@ impl AcpSession {
                 },
             })?;
         let delivery = input.delivery;
+        let receipt = self.receipt_for_input(&input)?;
         Ok(json!({
             "turnId": expected_turn_id,
             "inputId": input.id,
             "admittedSequence": input.admitted_sequence,
             "admission": "steered",
+            "receipt": receipt,
             "delivery": match delivery {
                 zuno_db::inbox::InputDelivery::Queue => "queue",
                 zuno_db::inbox::InputDelivery::Steer => "steer",
@@ -2684,9 +2826,10 @@ impl AcpSession {
             let guard = self
                 .begin_turn()
                 .map_err(|_| command_requires_idle_session(&self.id))?;
-            self.recover_pending_human_requests(client, &guard).await?;
+            self.recover_pending_permissions(client, &guard).await?;
         }
         let context_size = self.context_size().await?;
+        let publication = self.publications.begin(None);
         let (events, receiver) = event_channel();
         let drive = async {
             let mut resources = self.resources.lock().await;
@@ -2696,14 +2839,16 @@ impl AcpSession {
                     SessionCommand::Compact
                     | SessionCommand::Goal
                     | SessionCommand::Learn
-                    | SessionCommand::Reflect => resources
+                    | SessionCommand::Reflect
+                    | SessionCommand::Questions => resources
                         .host
                         .execute_session_command(*command, arguments, events.clone())
                         .await
                         .map_err(session_command_rpc_error),
                     SessionCommand::Plan
                     | SessionCommand::StartPlan
-                    | SessionCommand::StartWork => Err(zuno_acp::RpcError::internal(format!(
+                    | SessionCommand::StartWork
+                    | SessionCommand::ResumeWork => Err(zuno_acp::RpcError::internal(format!(
                         "/{} mode control was not handled before host execution",
                         command.name()
                     ))),
@@ -2726,105 +2871,19 @@ impl AcpSession {
             drop(events);
             outcome
         };
-        let projection = project_turn(&self.id, context_size, receiver, client.clone());
-        let (driven, projected) = tokio::join!(drive, projection);
-        self.settle_turn(driven, projected?, skill_selection_only, client)
-            .await
-    }
-
-    /// Admit one content prompt durably, then drive it only if it owns the turn.
-    ///
-    /// The durable row is written before the live-turn lease is contended for. A
-    /// prompt that arrives while this session is busy is therefore recorded and
-    /// injected into the running turn instead of being refused with nothing kept.
-    async fn admit_and_drive_content(
-        &self,
-        mut prompt: AcpPrompt,
-        handles: &SessionDurableHandles,
-        withdrawable: &WithdrawablePrompt<'_>,
-        client: &zuno_acp::ClientConnection,
-    ) -> Result<Value, zuno_acp::RpcError> {
-        prompt.admit_images(handles.attachments.as_ref())?;
-        let row = zuno_db::inbox::NewSessionInput::new(
-            format!("msg_{}", uuid::Uuid::new_v4().simple()),
-            self.id.clone(),
-            acp_prompt_payload(&prompt)?,
-            zuno_db::inbox::InputDelivery::Steer,
-            zuno_db::message::now_millis(),
+        let projection = project_turn(
+            &self.id,
+            context_size,
+            receiver,
+            client.clone(),
+            &publication,
         );
-        // A prompt that arrives while another request is still serving this
-        // session never contends for the lease that request releases between its
-        // turns: it is admitted durably and steered into the turn already running.
-        let owner = self.claim_turn(withdrawable.request());
-        let lease = if owner.is_some() {
-            TurnLease::Acquire
-        } else {
-            TurnLease::Deferred
-        };
-        let steering = Some(steering_content(&prompt));
-        let first_input = if handles.identity.is_materialized() {
-            None
-        } else {
-            let mut resources = self.resources.lock().await;
-            let resources = resources.as_mut().ok_or_else(|| self.closed_error())?;
-            if handles.identity.is_materialized() {
-                None
-            } else {
-                resources
-                    .host
-                    .materialize_session_with_input(row.clone())
-                    .map_err(zuno_acp::RpcError::internal)?
-            }
-        };
-        let admitted = match first_input {
-            Some(input) => handles.admission.route_admitted(input, lease, steering),
-            None => handles
-                .admission
-                .admit(row, lease, steering)
-                .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?,
-        };
-        // The row belongs to this request until this request returns, so a
-        // withdrawal retires the row instead of some other request's turn.
-        if withdrawable.publish(&admitted.input().id) {
-            self.retire_pending_input(&admitted.input().id);
-            return Err(prompt_withdrawn(&self.id, admitted.input()));
-        }
-        let (input, guard) = match admitted {
-            InputAdmission::Drive { input, guard } => (input, guard),
-            InputAdmission::Steered { input } | InputAdmission::Pending { input }
-                if withdrawable.withdrawn() =>
-            {
-                return Err(prompt_withdrawn(&self.id, &input));
-            }
-            InputAdmission::Steered { input } => {
-                return Err(admitted_without_turn(&self.id, &input, true));
-            }
-            InputAdmission::Pending { input } => {
-                return Err(admitted_without_turn(&self.id, &input, false));
-            }
-        };
-        // `owner` is held for the rest of this request: releasing it earlier would
-        // let a second prompt claim the session between this request's turns.
-        self.recover_pending_human_requests(client, &guard).await?;
-        // The turn is driven from the durable row rather than from the request
-        // that wrote it, and the oldest queued prompt is promoted first. A prompt
-        // admitted while this session was busy is therefore delivered in
-        // admission order instead of behind whatever arrived after it.
-        let Some((driven, projected)) = self
-            .drive_next_durable_input(client, &guard, DurableInputScope::Prompts)
-            .await?
-        else {
-            if withdrawable.withdrawn() {
-                // The client withdrew this prompt before its own turn promoted it.
-                return Err(prompt_withdrawn(&self.id, &input));
-            }
-            // Another driver claimed the row between admission and promotion. It
-            // is durable there, so this request has no turn of its own to report.
-            return Err(admitted_without_turn(&self.id, &input, false));
-        };
-        // Goal continuation takes its own lease, so this one must be released first.
-        drop(guard);
-        self.settle_turn(driven, projected, false, client).await
+        let (driven, projected) = tokio::join!(drive, projection);
+        let projected = projected?;
+        self.flush_turn_publications(client).await?;
+        drop(publication);
+        self.settle_turn(driven, projected, skill_selection_only, client)
+            .await
     }
 
     /// Project one prompt request's turns until the request has a stop reason.
@@ -2836,8 +2895,9 @@ impl AcpSession {
         client: &zuno_acp::ClientConnection,
     ) -> Result<Value, zuno_acp::RpcError> {
         loop {
-            self.flush_subagents().await?;
-            self.project_work_state(client).await?;
+            if self.closed.load(Ordering::Acquire) {
+                return Err(self.closed_error());
+            }
             match projected {
                 ProjectedTurn::Completed(stop_reason) => {
                     driven?;
@@ -2858,7 +2918,7 @@ impl AcpSession {
                 }
                 ProjectedTurn::WaitingForHuman(request_id) => {
                     driven?;
-                    if !self.answer_pending_human_request(&request_id).await? {
+                    if !self.answer_pending_permission(&request_id).await? {
                         return Ok(json!({ "stopReason": "end_turn" }));
                     }
                     let guard = self.begin_turn()?;
@@ -2894,11 +2954,11 @@ impl AcpSession {
         }
     }
 
-    async fn answer_pending_human_request(
+    async fn answer_pending_permission(
         &self,
         request_id: &str,
     ) -> Result<bool, zuno_acp::RpcError> {
-        let (request, question, permission) = {
+        let (request, permission) = {
             let resources = self.resources.lock().await;
             let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
             let request = resources
@@ -2912,22 +2972,12 @@ impl AcpSession {
                         "human request `{request_id}` disappeared before presentation"
                     ))
                 })?;
-            (
-                request,
-                resources.question_asker.as_ref().map(Arc::clone),
-                Arc::clone(&resources.permission_asker),
-            )
+            (request, Arc::clone(&resources.permission_asker))
         };
         match request.kind {
-            zuno_db::human_request::HumanRequestKind::Input => {
-                let Some(question) = question else {
-                    return Ok(false);
-                };
-                question
-                    .answer_pending(request_id)
-                    .await
-                    .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))
-            }
+            // Questions are presented by the session task. A prompt reaching this
+            // boundary hands off; neither its lease nor RPC owns the human wait.
+            zuno_db::human_request::HumanRequestKind::Input => Ok(false),
             zuno_db::human_request::HumanRequestKind::Permission => permission
                 .answer_pending(request_id)
                 .await
@@ -2939,7 +2989,7 @@ impl AcpSession {
     ///
     /// `guard` is the caller's live-turn lease. Recovery runs inside it so a
     /// recovered input cannot race the prompt that triggered recovery.
-    async fn recover_pending_human_requests(
+    async fn recover_pending_permissions(
         &self,
         client: &zuno_acp::ClientConnection,
         guard: &SessionRunGuard,
@@ -2955,12 +3005,15 @@ impl AcpSession {
                     .pending(Some(resources.host.session_id()))
                     .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?
                     .into_iter()
-                    .next()
+                    .find(|request| {
+                        request.kind == zuno_db::human_request::HumanRequestKind::Permission
+                    })
                     .map(|request| request.id)
             };
-            if let Some(request_id) = pending_request_id
-                && !self.answer_pending_human_request(&request_id).await?
-            {
+            let Some(request_id) = pending_request_id else {
+                return Ok(());
+            };
+            if !self.answer_pending_permission(&request_id).await? {
                 return Ok(());
             }
 
@@ -2974,7 +3027,7 @@ impl AcpSession {
                 ProjectedTurn::Completed(_) => driven?,
                 ProjectedTurn::WaitingForHuman(request_id) => {
                     driven?;
-                    if !self.answer_pending_human_request(&request_id).await? {
+                    if !self.answer_pending_permission(&request_id).await? {
                         return Ok(());
                     }
                 }
@@ -3009,42 +3062,26 @@ impl AcpSession {
             let resources = self.resources.lock().await;
             let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
             let inbox = resources.host.session_inbox();
-            let pending = inbox
-                .pending(resources.host.session_id())
-                .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
-            let Some((input, drivable)) = pending.into_iter().find_map(|input| {
-                match scope.admits(&input) {
-                    Some(drivable) => Some((input, drivable)),
-                    None => {
-                        tracing::debug!(
-                            target: "zuno::acp::inbox",
-                            session_id = %self.id,
-                            input_id = %input.id,
-                            scope = ?scope,
-                            "pending durable input is outside this drive's scope; leaving it queued"
-                        );
-                        None
-                    }
-                }
-            }) else {
+            let Some((input, drivable)) =
+                durable_questions::next_input(&inbox, resources.host.session_id(), scope)?
+            else {
                 return Ok(None);
             };
-            let promoted = inbox
+            let Some(promoted) = inbox
                 .promote_id(resources.host.session_id(), &input.id)
                 .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?
-                .ok_or_else(|| {
-                    zuno_acp::RpcError::internal(format!(
-                        "durable input `{}` changed before ACP promotion",
-                        input.id
-                    ))
-                })?;
+            else {
+                return Ok(None);
+            };
             (promoted.id, drivable, resources.configuration.context_size)
         };
+        let _active_input = input_receipts::ActiveInput::enter(self, &input_id);
+        let publication = self.publications.begin(Some(&input_id));
         let (events, receiver) = event_channel();
         let drive = async {
             let mut resources = self.resources.lock().await;
             let resources = resources.as_mut().ok_or_else(|| self.closed_error())?;
-            let outcome = if let Some(continuation) = drivable.start_work {
+            let outcome = if let Some(continuation) = drivable.work_control {
                 resources
                     .host
                     .drive_promoted_start_work_with_guard(
@@ -3074,9 +3111,18 @@ impl AcpSession {
             drop(events);
             outcome.map_err(zuno_acp::RpcError::internal)
         };
-        let projection = project_turn(&self.id, context_size, receiver, client.clone());
+        let projection = project_turn(
+            &self.id,
+            context_size,
+            receiver,
+            client.clone(),
+            &publication,
+        );
         let (driven, projected) = tokio::join!(drive, projection);
-        Ok(Some((driven, projected?)))
+        let projected = projected?;
+        self.flush_turn_publications(client).await?;
+        drop(publication);
+        Ok(Some((driven, projected)))
     }
 
     /// Drive the oldest prompt this surface admitted that is still queued.
@@ -3106,14 +3152,12 @@ impl AcpSession {
     async fn has_queued_prompt(&self) -> Result<bool, zuno_acp::RpcError> {
         let resources = self.resources.lock().await;
         let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
-        let pending = resources
-            .host
-            .session_inbox()
-            .pending(resources.host.session_id())
-            .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
-        Ok(pending
-            .iter()
-            .any(|input| DurableInputScope::Prompts.admits(input).is_some()))
+        Ok(durable_questions::next_input(
+            &resources.host.session_inbox(),
+            resources.host.session_id(),
+            DurableInputScope::Prompts,
+        )?
+        .is_some())
     }
 
     async fn drive_goal_continuation(
@@ -3121,6 +3165,7 @@ impl AcpSession {
         client: &zuno_acp::ClientConnection,
     ) -> Result<Option<(Result<(), zuno_acp::RpcError>, ProjectedTurn)>, zuno_acp::RpcError> {
         loop {
+            let publication = self.publications.begin(None);
             let context_size = {
                 let resources = self.resources.lock().await;
                 resources
@@ -3141,9 +3186,19 @@ impl AcpSession {
                 drop(events);
                 Ok::<bool, zuno_acp::RpcError>(continued)
             };
-            let projection = project_turn(&self.id, context_size, receiver, client.clone());
+            let projection = project_turn(
+                &self.id,
+                context_size,
+                receiver,
+                client.clone(),
+                &publication,
+            );
             let (continued, projected) = tokio::join!(drive, projection);
             let projected = projected?;
+            if !matches!(&projected, ProjectedTurn::Missing) {
+                self.flush_turn_publications(client).await?;
+            }
+            drop(publication);
             match (continued, projected) {
                 (Ok(false), ProjectedTurn::Missing) => return Ok(None),
                 (Ok(true), ProjectedTurn::Missing) => continue,
@@ -3212,6 +3267,25 @@ impl AcpSession {
         }
         self.materialize_for_control().await?;
         match command {
+            SessionCommand::ResumeWork => {
+                let service =
+                    zuno_session_control::SessionControlService::new(Arc::new(durable_pool()?));
+                let execution = service
+                    .state(&self.id)
+                    .map_err(session_control_rpc_error)?
+                    .ok_or_else(|| {
+                        zuno_acp::RpcError::invalid_params("session has no paused execution")
+                    })?;
+                let outcome = service
+                    .resume_session(&self.id, execution.revision, zuno_db::message::now_millis())
+                    .map_err(session_control_rpc_error)?;
+                let response = json!({
+                    "stopReason":"end_turn", "inputId":outcome.input.id,
+                    "cycleId":outcome.state.cycle_id, "started":"queued",
+                });
+                self.spawn_start_work_recovery(state, client);
+                Ok(response)
+            }
             SessionCommand::StartWork => {
                 let risk_reason = parse_start_work_risk(arguments)?;
                 let owner = self.claim_turn(request);
@@ -3278,6 +3352,7 @@ impl AcpSession {
             | SessionCommand::Goal
             | SessionCommand::Learn
             | SessionCommand::Reflect
+            | SessionCommand::Questions
             | SessionCommand::Plan
             | SessionCommand::StartPlan => Err(zuno_acp::RpcError::internal(format!(
                 "/{} is not a mode control",
@@ -3504,7 +3579,13 @@ impl AcpSession {
             plan,
             &state.environment,
             state.runs.clone(),
-            AcpSurfaceContext::from_state(state, client, Arc::clone(&self.plan_projection)),
+            AcpSurfaceContext::from_state(
+                state,
+                client,
+                Arc::clone(&self.plan_projection),
+                Arc::clone(&self.questions),
+                Arc::clone(&self.publications),
+            ),
             Some(&dormant.configuration.build_agent),
             mcp_servers.as_ref(),
             SessionMcpOpening::Fresh(mcp_cache),
@@ -3562,6 +3643,14 @@ impl AcpSession {
         self.set_lifecycle(AcpSessionLifecycle::Active);
         self.touch();
         Ok(true)
+    }
+
+    async fn flush_turn_publications(
+        &self,
+        client: &zuno_acp::ClientConnection,
+    ) -> Result<(), zuno_acp::RpcError> {
+        self.flush_subagents().await?;
+        self.project_work_state(client).await
     }
 
     async fn project_work_state(
@@ -3627,17 +3716,31 @@ impl AcpSession {
             self.cancel(HardInterruptReason::RequestCancelled);
         }
         if let Some(input_id) = self.withdraw_prompt_request(request) {
+            let driving_this_input = self
+                .active_prompt_input
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_deref()
+                == Some(input_id.as_str());
+            if driving_this_input {
+                let _aborted = self.control.abort_active(HardInterruptRequest::new(
+                    HardInterruptSource::Acp,
+                    HardInterruptReason::RequestCancelled,
+                ));
+            }
             self.retire_pending_input(&input_id);
         }
     }
 
     /// Whether `request` holds this session's prompt-turn claim.
     fn owns_turn(&self, request: &zuno_acp::RequestId) -> bool {
-        self.turn_owner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            == Some(request)
+        matches!(
+            self.turn_owner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref(),
+            Some(input_receipts::TurnOwner::Request(owner)) if owner == request
+        )
     }
 
     /// Record that `request` was withdrawn, returning any row it already admitted.
@@ -3653,7 +3756,10 @@ impl AcpSession {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let tracked = requests.entry(request.clone()).or_default();
         tracked.withdrawn = true;
-        tracked.input_id.clone()
+        tracked
+            .owns_input
+            .then(|| tracked.input_id.clone())
+            .flatten()
     }
 
     /// Cancel one still-pending durable row a withdrawn request admitted.
@@ -3722,8 +3828,17 @@ impl AcpSession {
 
     /// Whether any prompt request or process-local turn is still running.
     fn has_work_in_flight(&self) -> bool {
-        self.prompts_in_flight.load(Ordering::Acquire) > 0
-            || self.control.status() == SessionStatus::Busy
+        self.prompts_in_flight.load(Ordering::Acquire) > 0 || self.has_native_driver_in_flight()
+    }
+
+    /// Receipt observers do not prevent committed controls from being driven.
+    fn has_native_driver_in_flight(&self) -> bool {
+        self.control.status() == SessionStatus::Busy
+            || self
+                .turn_owner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some()
     }
 
     /// Durable admission state, available once the session is active.
@@ -3780,7 +3895,7 @@ impl AcpSession {
         if owner.is_some() {
             return None;
         }
-        *owner = Some(request.clone());
+        *owner = Some(input_receipts::TurnOwner::Request(request.clone()));
         drop(owner);
         Some(PromptTurnOwner { session: self })
     }
@@ -3897,6 +4012,14 @@ impl AcpSession {
                 HardInterruptReason::SessionClose,
             ));
         }
+        let question_runtime = self
+            .question_runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(runtime) = question_runtime {
+            runtime.shutdown().await;
+        }
         let _replay = self.replay_gate.lock().await;
         let _mount = self.mount_gate.lock().await;
         let notification_task = self
@@ -3907,6 +4030,18 @@ impl AcpSession {
             HardInterruptReason::SessionClose,
         ));
         self.control.wait_until_idle().await;
+        let prompt_driver = self
+            .prompt_driver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(task) = prompt_driver {
+            // The host may still be settling a logical receipt after releasing
+            // its run lease. Observer teardown must not cut off that final write.
+            if let Err(error) = task.await {
+                tracing::warn!(session_id = %self.id, %error, "ACP native input driver failed during shutdown");
+            }
+        }
         let notification_error = match notification_task {
             Some(task) => task
                 .await
@@ -4183,6 +4318,7 @@ fn host_options(host: &TurnHost, model: Option<String>) -> TurnOptions {
         variant: None,
         thinking: false,
         tool_authority: None,
+        parent_authority: None,
         extension_composition: ExtensionComposition::Active,
     }
 }
@@ -4592,6 +4728,7 @@ fn session_control_rpc_error(
         | zuno_session_control::SessionControlError::PlanRevisionConflict { .. }
         | zuno_session_control::SessionControlError::ExecutionRevisionConflict { .. }
         | zuno_session_control::SessionControlError::HandoffRequired { .. }
+        | zuno_session_control::SessionControlError::ResumeRejected { .. }
         | zuno_session_control::SessionControlError::DraftReview { .. } => {
             zuno_acp::RpcError::invalid_params(error.to_string())
         }
@@ -4636,6 +4773,8 @@ impl Drop for PromptTurnOwner<'_> {
 struct WithdrawableInput {
     /// Durable inbox row this request admitted, once it has published one.
     input_id: Option<String>,
+    /// An idempotent retry observes the original row without owning its withdrawal.
+    owns_input: bool,
     /// Whether `$/cancel_request` already withdrew this request.
     withdrawn: bool,
 }
@@ -4656,7 +4795,7 @@ impl WithdrawablePrompt<'_> {
     ///
     /// `true` means `$/cancel_request` arrived while the row was being written, so
     /// this request — not the withdrawal — is the side that must retire the row.
-    fn publish(&self, input_id: &str) -> bool {
+    fn publish(&self, input_id: &str, owns_input: bool) -> bool {
         let mut requests = self
             .session
             .prompt_requests
@@ -4666,6 +4805,7 @@ impl WithdrawablePrompt<'_> {
             return false;
         };
         tracked.input_id = Some(input_id.to_owned());
+        tracked.owns_input = owns_input;
         tracked.withdrawn
     }
 
@@ -5147,11 +5287,13 @@ async fn project_turn(
     context_size: u64,
     mut receiver: tokio::sync::mpsc::Receiver<TurnEvent>,
     client: zuno_acp::ClientConnection,
+    publication: &publication::PublicationPass,
 ) -> Result<ProjectedTurn, zuno_acp::RpcError> {
     let mut projector =
         zuno_acp::AttemptBufferedTurnEventProjector::with_context_size(context_size);
     let mut finish_reason = None;
     while let Some(event) = receiver.recv().await {
+        publication.observe(&event);
         for update in projector.project(&event) {
             client.session_update(session_id, update).await?;
         }
@@ -5219,40 +5361,6 @@ fn steering_content(prompt: &AcpPrompt) -> SteeringContent {
     SteeringContent::user(prompt.text.clone()).with_attachments(attachments)
 }
 
-/// Report a prompt that is durable but is not this request's own turn.
-///
-/// ACP v1 has no success shape for "accepted into another request's turn":
-/// `stopReason` is a closed enum, so every member would misdescribe a turn this
-/// request never ran. The admission facts therefore travel in `data`, under a
-/// JSON-RPC implementation-defined server error code.
-fn admitted_without_turn(
-    session_id: &str,
-    input: &zuno_db::inbox::SessionInput,
-    steered: bool,
-) -> zuno_acp::RpcError {
-    let message = if steered {
-        format!(
-            "session {session_id} is running a turn; this prompt was admitted durably and \
-             steered into it"
-        )
-    } else {
-        format!(
-            "session {session_id} is running a turn; this prompt was admitted durably and is \
-             queued for the next turn"
-        )
-    };
-    zuno_acp::RpcError::session_busy(message).with_data(json!({
-        "sessionId": session_id,
-        "admission": if steered { "steered" } else { "queued" },
-        "inputId": input.id,
-        "admittedSequence": input.admitted_sequence,
-        "delivery": match input.delivery {
-            zuno_db::inbox::InputDelivery::Queue => "queue",
-            zuno_db::inbox::InputDelivery::Steer => "steer",
-        },
-    }))
-}
-
 fn steer_rejected(
     session_id: &str,
     reason: &str,
@@ -5265,25 +5373,6 @@ fn steer_rejected(
         "reason": reason,
         "expectedTurnId": expected_turn_id,
         "actualTurnId": actual_turn_id,
-    }))
-}
-
-/// Report a prompt the client withdrew before it reached the model.
-///
-/// `$/cancel_request` can arrive while the prompt is still being admitted. The
-/// durable row exists — admission happens before any lease is contended for — so
-/// the response names the row it just retired instead of pretending nothing was
-/// written. `admission: "withdrawn"` says the row will never be promoted.
-fn prompt_withdrawn(session_id: &str, input: &zuno_db::inbox::SessionInput) -> zuno_acp::RpcError {
-    zuno_acp::RpcError::cancelled(format!(
-        "this prompt was withdrawn before session {session_id} promoted it, so its durable \
-         input was cancelled"
-    ))
-    .with_data(json!({
-        "sessionId": session_id,
-        "admission": "withdrawn",
-        "inputId": input.id,
-        "admittedSequence": input.admitted_sequence,
     }))
 }
 
@@ -5312,7 +5401,7 @@ fn command_requires_idle_session(session_id: &str) -> zuno_acp::RpcError {
 struct AcpDurableInput {
     text: String,
     content: Vec<RequestContentBlock>,
-    start_work: Option<zuno_types::execution::ContinuationToken>,
+    work_control: Option<zuno_types::execution::ContinuationToken>,
 }
 
 /// Which pending durable rows one ACP drive is entitled to claim.
@@ -5328,6 +5417,8 @@ enum DurableInputScope {
     Prompts,
     /// Host-owned collaboration controls admitted by ACP mode commands.
     Controls,
+    /// Settled reports and durable question answers, never ordinary user queries.
+    Automatic,
 }
 
 impl DurableInputScope {
@@ -5339,7 +5430,10 @@ impl DurableInputScope {
         let kind = zuno_db::inbox::DurableInputKind::classify(&input.prompt)?;
         if self == Self::Controls {
             if kind != zuno_db::inbox::DurableInputKind::SessionControl
-                || input.prompt.get("control").and_then(Value::as_str) != Some("start_work")
+                || !matches!(
+                    input.prompt.get("control").and_then(Value::as_str),
+                    Some("start_work" | "resume_work")
+                )
             {
                 return None;
             }
@@ -5348,7 +5442,7 @@ impl DurableInputScope {
             return Some(AcpDurableInput {
                 text: String::new(),
                 content: Vec::new(),
-                start_work: Some(continuation),
+                work_control: Some(continuation),
             });
         }
         let owned = match self {
@@ -5359,6 +5453,10 @@ impl DurableInputScope {
                     | zuno_db::inbox::DurableInputKind::SessionMessage
             ),
             Self::Controls => unreachable!("controls returned above"),
+            Self::Automatic => {
+                kind == zuno_db::inbox::DurableInputKind::HumanRequestAnswer
+                    || kind.is_asynchronous_report()
+            }
         };
         if !owned {
             return None;
@@ -5371,7 +5469,7 @@ impl DurableInputScope {
         Some(AcpDurableInput {
             text,
             content,
-            start_work: None,
+            work_control: None,
         })
     }
 }
@@ -5810,7 +5908,9 @@ mod tests {
                 "goal",
                 "learn",
                 "plan",
+                "questions",
                 "reflect",
+                "resume",
                 "start-plan",
                 "start-work",
                 "review",
@@ -5827,8 +5927,8 @@ mod tests {
             advertised[2]["input"]["hint"],
             "remember|issue|solved|forget|promote|feedback ..."
         );
-        assert_eq!(advertised[4]["input"]["hint"], "turn | session");
-        assert_eq!(advertised[7]["input"]["hint"], "question");
+        assert_eq!(advertised[5]["input"]["hint"], "turn | session");
+        assert_eq!(advertised[9]["input"]["hint"], "question");
     }
 
     #[test]

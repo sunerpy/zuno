@@ -48,6 +48,32 @@ struct HeldWork {
     stopped: Arc<AtomicUsize>,
 }
 
+#[tokio::test(start_paused = true)]
+async fn explicit_project_wake_does_not_wait_for_the_poll_interval_or_create_a_session() {
+    let supervisor = LearningSupervisor::default();
+    let started = Arc::new(Notify::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    supervisor.ensure_project(
+        "p".to_owned(),
+        Arc::new(Work {
+            started: started.clone(),
+            calls: calls.clone(),
+        }),
+        Duration::from_secs(60),
+    );
+    started.notified().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(!supervisor.wake_project("another-project"));
+    assert!(supervisor.wake_project("p"));
+    tokio::time::timeout(Duration::from_millis(1), started.notified())
+        .await
+        .expect("completion must wake the project worker immediately");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(supervisor.project_count(), 1);
+    supervisor.shutdown(Duration::from_millis(10)).await;
+    assert!(!supervisor.wake_project("p"));
+}
+
 #[async_trait]
 impl LearningWork for HeldWork {
     async fn tick(&self, cancel: CancellationToken) {
@@ -75,6 +101,47 @@ async fn shutdown_propagates_cancellation_to_in_flight_work() {
         .expect("wake");
     supervisor.shutdown(Duration::from_secs(1)).await;
     assert_eq!(stopped.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn suspending_one_project_cancels_its_binding_without_stopping_another_project() {
+    let supervisor = LearningSupervisor::default();
+    let started = Arc::new(Notify::new());
+    let stopped = Arc::new(AtomicUsize::new(0));
+    supervisor.ensure_project(
+        "disabled".to_owned(),
+        Arc::new(HeldWork {
+            started: started.clone(),
+            stopped: stopped.clone(),
+        }),
+        Duration::from_secs(60),
+    );
+    started.notified().await;
+    let other_started = Arc::new(Notify::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    supervisor.ensure_project(
+        "enabled".to_owned(),
+        Arc::new(Work {
+            started: other_started.clone(),
+            calls: calls.clone(),
+        }),
+        Duration::from_secs(60),
+    );
+    other_started.notified().await;
+    assert!(supervisor.suspend_project("disabled"));
+    assert!(!supervisor.wake_project("disabled"));
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(stopped.load(Ordering::SeqCst), 1);
+    assert_eq!(supervisor.project_count(), 1);
+    assert!(supervisor.wake_project("enabled"));
+    tokio::time::timeout(Duration::from_millis(1), other_started.notified())
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(!supervisor.suspend_project("disabled"));
+    supervisor.shutdown(Duration::from_millis(10)).await;
 }
 
 struct DropWitness(Arc<AtomicUsize>);

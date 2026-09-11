@@ -226,3 +226,216 @@ fn shell_filesystem_access_is_derived_from_the_effective_edit_capability() {
         ShellFilesystemAccess::WorkspaceWrite
     );
 }
+
+#[test]
+fn a_readonly_child_narrows_an_allow_all_parent_without_regranting_edits() {
+    let profile = AgentProfile::resolve(
+        native("explorer"),
+        vec![rule("*", PermissionAction::Allow)],
+        false,
+    )
+    .with_parent_authority(
+        vec![rule("*", PermissionAction::Allow)],
+        [
+            "read",
+            "shell",
+            "bg",
+            "apply_patch",
+            "write",
+            "memory_update",
+            "mcp_write",
+        ]
+        .map(str::to_owned),
+        ShellFilesystemAccess::WorkspaceWrite,
+    );
+    assert!(profile.capabilities().tool_available("read"));
+    assert!(profile.capabilities().tool_available("shell"));
+    for tool in ["apply_patch", "write", "memory_update", "mcp_write"] {
+        assert!(!profile.capabilities().tool_available(tool), "{tool}");
+    }
+    assert_eq!(
+        profile.capabilities().shell_filesystem_access(),
+        ShellFilesystemAccess::ReadOnly
+    );
+    assert_eq!(
+        zuno_permission::evaluate("edit", "/workspace/file", profile.capabilities().rules()),
+        PermissionAction::Deny
+    );
+}
+
+#[test]
+fn children_retain_parent_ask_deny_resources_and_rule_precedence() {
+    let parent = vec![
+        rule("*", PermissionAction::Deny),
+        rule("read", PermissionAction::Allow),
+        Rule {
+            source: Some("current-parent".to_owned()),
+            permission: "read".to_owned(),
+            pattern: "/workspace/private/*".to_owned(),
+            action: PermissionAction::Deny,
+        },
+        Rule {
+            source: Some("current-parent".to_owned()),
+            permission: "read".to_owned(),
+            pattern: "/workspace/review/*".to_owned(),
+            action: PermissionAction::Ask,
+        },
+        rule("mcp_query", PermissionAction::Ask),
+    ];
+    let profile = AgentProfile::resolve_with_extension_boundary(
+        native("general"),
+        vec![rule("*", PermissionAction::Allow)],
+        1,
+        false,
+    )
+    .with_parent_authority(
+        parent.clone(),
+        ["read", "mcp_query"].map(str::to_owned),
+        ShellFilesystemAccess::WorkspaceWrite,
+    );
+    assert_eq!(&profile.capabilities().rules()[..parent.len()], parent);
+    let expanded = profile.rules_with_extension_tools(&["mcp_query", "new_unapproved_mcp"]);
+    assert_eq!(expanded, profile.capabilities().rules());
+    for (resource, expected) in [
+        ("/workspace/private/key", PermissionAction::Deny),
+        ("/workspace/review/notes", PermissionAction::Ask),
+        ("/workspace/public", PermissionAction::Allow),
+    ] {
+        assert_eq!(
+            zuno_permission::evaluate("read", resource, &expanded),
+            expected
+        );
+    }
+    assert_eq!(
+        zuno_permission::evaluate("mcp_query", "*", &expanded),
+        PermissionAction::Ask
+    );
+    assert!(profile.capabilities().tool_available("mcp_query"));
+    assert!(!profile.capabilities().tool_available("new_unapproved_mcp"));
+}
+
+#[test]
+fn ordinary_children_inherit_writable_shell_and_authorized_deferred_tools() {
+    for name in ["deep", "general", "fixer"] {
+        let profile =
+            AgentProfile::resolve(native(name), vec![rule("*", PermissionAction::Deny)], false)
+                .with_parent_authority(
+                    vec![rule("*", PermissionAction::Allow)],
+                    ["shell", "bg", "mcp_query", "task"].map(str::to_owned),
+                    ShellFilesystemAccess::WorkspaceWrite,
+                );
+        assert!(profile.capabilities().tool_available("shell"), "{name}");
+        assert!(profile.capabilities().tool_available("mcp_query"), "{name}");
+        assert_eq!(
+            profile.capabilities().shell_filesystem_access(),
+            ShellFilesystemAccess::WorkspaceWrite,
+            "{name}: a script does not need a separate edit schema"
+        );
+        assert_eq!(
+            profile.capabilities().can_delegate(),
+            name == "deep",
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_readonly_parent_and_repeated_tool_bounds_can_never_be_widened() {
+    let profile = AgentProfile::resolve(
+        native("deep"),
+        vec![rule("*", PermissionAction::Allow)],
+        false,
+    )
+    .with_tool_authority(["read".to_owned(), "shell".to_owned()])
+    .with_parent_authority(
+        vec![rule("*", PermissionAction::Allow)],
+        ["read", "shell", "write"].map(str::to_owned),
+        ShellFilesystemAccess::ReadOnly,
+    )
+    .with_tool_authority(["read", "shell", "write", "mcp_query"].map(str::to_owned));
+    assert!(!profile.capabilities().tool_available("write"));
+    assert!(!profile.capabilities().tool_available("mcp_query"));
+    assert_eq!(
+        profile.capabilities().shell_filesystem_access(),
+        ShellFilesystemAccess::ReadOnly
+    );
+}
+
+#[test]
+fn explicit_child_denies_narrow_parent_authority_and_allowlists_do_not_deny_sibling_aliases() {
+    let mut definition = native("general");
+    definition.source = agent::AgentSource::NativeOverridden;
+    definition.tools = Some(vec![
+        "read".to_owned(),
+        "shell".to_owned(),
+        "mcp_drop".to_owned(),
+    ]);
+    definition.permission = Some(
+        serde_json::from_value(serde_json::json!({
+            "rules": {"shell":{"rm *":"deny"}, "mcp_drop":"deny"}
+        }))
+        .expect("explicit child restrictions"),
+    );
+    let profile = AgentProfile::resolve(definition, Vec::new(), false).with_parent_authority(
+        vec![rule("*", PermissionAction::Allow)],
+        ["read", "read_mcp_resource", "shell", "mcp_drop"].map(str::to_owned),
+        ShellFilesystemAccess::WorkspaceWrite,
+    );
+    assert!(profile.capabilities().tool_available("read"));
+    assert!(!profile.capabilities().tool_available("read_mcp_resource"));
+    assert!(!profile.capabilities().tool_available("mcp_drop"));
+    assert_eq!(
+        zuno_permission::evaluate("shell", "rm file", profile.capabilities().rules()),
+        PermissionAction::Deny,
+    );
+    assert_eq!(
+        zuno_permission::evaluate("shell", "cat file", profile.capabilities().rules()),
+        PermissionAction::Allow,
+    );
+}
+
+#[test]
+fn native_catalog_deny_baselines_cannot_shadow_inherited_working_permissions() {
+    for name in ["deep", "general", "fixer"] {
+        for materialized in [false, true] {
+            let mut definition = native(name);
+            assert_eq!(definition.source, agent::AgentSource::Native);
+            let baseline = agent::builtin::get(name)
+                .expect("native")
+                .permission_overlay()
+                .expect("native permission baseline");
+            let baseline_rules = zuno_permission::rules_from_config(&baseline);
+            assert_eq!(baseline_rules[0].permission, "*");
+            assert_eq!(baseline_rules[0].action, PermissionAction::Deny);
+            if materialized {
+                definition.permission = Some(baseline);
+            }
+            let parent = vec![
+                rule("*", PermissionAction::Allow),
+                rule("external_directory", PermissionAction::Ask),
+            ];
+            let profile = AgentProfile::resolve(definition, baseline_rules, false)
+                .with_parent_authority(
+                    parent.clone(),
+                    ["shell", "read", "write", "apply_patch", "mcp_query"].map(str::to_owned),
+                    ShellFilesystemAccess::WorkspaceWrite,
+                );
+            assert_eq!(&profile.capabilities().rules()[..parent.len()], parent);
+            for tool in ["shell", "write", "apply_patch", "mcp_query"] {
+                assert!(
+                    profile.capabilities().tool_available(tool),
+                    "{name}/{materialized}: {tool}"
+                );
+            }
+            assert_eq!(
+                zuno_permission::evaluate(
+                    "external_directory",
+                    "/parent-extra/file",
+                    profile.capabilities().rules()
+                ),
+                PermissionAction::Ask,
+                "{name}/{materialized}"
+            );
+        }
+    }
+}

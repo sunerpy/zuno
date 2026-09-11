@@ -5,7 +5,13 @@
 //! descriptors only after independently checking the active Agent profile and its
 //! enforced tool visibility.
 
+mod parent_authority;
 mod snapshot;
+
+pub use parent_authority::{
+    ParentAuthoritySnapshot, PermissionActionSnapshot, PermissionModeSnapshot,
+    PermissionRuleSnapshot,
+};
 
 pub use snapshot::{
     AgentAttemptIdentity, AttemptSeed, AttemptSnapshot, CapabilityContents, CapabilitySnapshot,

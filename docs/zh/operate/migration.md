@@ -2,7 +2,7 @@
 
 Zuno 管理自己的配置根目录和数据根目录。当前数据库格式为 14。空数据库直接创建为当前
 格式；受支持的旧格式通过受保护的前向迁移升级。format 5 是第一个受支持的历史格式，
-format 5 到 format 14 都会原地升级到 format 14，不需要重建数据库。
+format 5 到 format 13 都会原地升级到 format 14，不需要重建数据库。
 迁移链显式覆盖 format 5、format 6、format 7、format 8、format 9、format 10、format 11、format 12 与 format 13。
 
 ## Channel 数据库
@@ -53,13 +53,10 @@ zuno session list
 2. **Format 14。** 应用查询前校验 marker、表、约束、索引和触发器。
 3. **Format 5–13。** 在同一事务中按顺序执行所有剩余迁移：学习（6）、Plan 栈（7）、
    验证账本（8）、会话记忆策略（9）、执行／收件箱状态（10）、记忆版本与检索（11）、
-   自动记忆来源与处理水位（12）、会话归属（13）、运行时执行权（14）。
+   自动记忆来源与处理水位（12）、持久问题与会话调度（13），以及输入处理回执、
+   统一 Context 快照与绑定 revision 的 Goal 恢复选择（14）。
 4. **其他任何状态。** 不受支持的更旧格式、未来格式、缺少 marker，或 marker 与必需
    表不匹配，都会失败关闭且不修改文件。
-
-事件服务在首次发布前完成一次初始化。并发首次发布共享这次初始化，schema 校验与同一连接池
-的写入互斥，避免共享缓存内存数据库在另一发布者开始事务时打开连接或持有 schema 读锁。
-只缓存成功的初始化结果；失败后仍可重试。
 
 两个进程同时打开或升级同一个数据库时，都按拿到 SQLite 写锁之前看到的 format 做决定。
 拿锁失败的一方不会报错：它会重新读取 marker，对赢家实际提交的结果做校验、升级或拒绝，
@@ -85,41 +82,24 @@ zuno session list
 9. 增加候选的可空 `base_revision`／`evidence` 字段、`resident_memory_provenance`、
    `memory_maintenance_state` 及其索引。回填可精确关联的自动记忆来源，不把用户后来的修改
    重新归类为自动记忆。
-10. 创建 `session_ownership`，把已有会话归属回填为显式本地用户，添加子会话继承触发器和主体索引。
-11. 验证并以事务内复制扩展原有 Job 类型约束，保留全部列值；增加输入版本、执行权、尝试、检查点和用户调度状态。
-12. 最后用精确旧值条件把 marker 更新为 14；全部成功后才提交。
+10. 创建 `question_interaction`、`question_action_receipt` 及索引；为有效旧问题添加带稳定
+    问题项 ID 的 companion row，不改写原 `human_request` payload/response。
+11. 为 `session_execution_state` 添加可空 `scheduling`。仅在最新结构化 driver event
+    确切为 `paused/no_progress` 时修复错误保留 `running` 的旧行，保留周期和进度。
+12. 保留已发布问题定义的原始内容，把 purpose 约束扩展为允许原生 `goal_resume`；
+    创建 `session_input_receipt`、`session_context_usage` 及索引。旧 consumed 输入只映射为
+    `recorded`，没有供应商请求证据就不能晋升为 `applied` 或 `completed`。
+13. 最后用精确旧值条件把 marker 更新为 14；全部成功后才提交。
 
 任何失败都会回滚整个事务。迁移不会重写已有的 `session`、`message`、
 `memory_candidate`、`verification_receipt` 或 `work_plan` 值；来源验证和租约仅执行已说明的回填。
-测试使用 format-5 到 format-12 的精确发布 fixture，以及 format-13 的精确预览 fixture，比较 Session、Message、Memory 等保留值，
-再验证新增对象和 marker。Format-12 用例包含已经发布的记忆版本、来源关系和维护水位，并验证最后一个索引创建失败时
+测试使用 format-5 到 format-13 的精确发布 fixture，比较 Session、Message、Memory 等保留值，
+再验证新增对象和 marker。Format-11 用例包含已经发布的记忆版本，并验证最后一个索引创建失败时
 整个升级回滚。不需要重建用户数据库。
 
-### 私有会话归属（企业预览）
-
-`session_ownership` 独立保存租户和用户标识，不能通过会话 metadata 修改。迁移把历史会话
-明确归属到 `local` / `local-user`，不从路径、标题或 OAuth 字段猜测企业所有者。
-可信宿主在创建根会话的同一事务内绑定所有者；子会话继承父会话归属。显式归属不匹配或
-父会话不存在时，作用域化创建整体回滚。重复创建不能转移会话所有权。
-
-`ScopedSessionStore` 固定创建、读取和列表的所有者，SQL 在排序和分页前过滤归属。
-它是存储基础能力，宿主仍须先认证和授权；其他本地 store 需要各自完成作用域适配后才能
-用于企业服务。预览格式 14 只用于独立预览数据库，不能指向正式安装的数据目录。
-
-### 运行时执行权（企业预览）
-
-格式 14 为原有 `agent_job` 增加根回合类型。SQLite 不能直接扩大 CHECK 约束，因此先验证
-受支持的表和索引，拒绝未知入向引用，再在同一事务内复制全部列并恢复索引；整个过程保持外键
-开启。表替换或后续 DDL 失败都会整体回滚。
-
-`runtime_session` 分开保存输入版本、逻辑活跃 Job 和 Worker 租约 epoch。原生输入接纳及编辑
-通过触发器推进输入版本，提升和消费不会推进。`runtime_job` 保存固定定义引用和检查点版本，
-`runtime_attempt` 保存每次领取，`runtime_owner_schedule` 在用户之间轮换执行。
-
-领取、续租、检查点和结算使用数据库时间，并校验 Worker 实例、attempt、epoch 和检查点版本。
-检查点释放 Worker 容量，同时保留原逻辑 turn。租约过期将任务标记为不确定，并阻止该会话继续执行，
-等待权威核查；过期不表示外部副作用已停止。根任务完成不会向自身收件箱投递报告。PostgreSQL、
-远程引擎状态访问、分布式持久等待与外部操作核查仍属于后续企业阶段。
+Format 14 迁移不会调用模型、提炼 Memory、编造 Context 数值或恢复暂停 Goal。
+历史补证与必要重处理由可恢复学习任务完成。先用 `/learn repair-history --dry-run`
+检查，再决定是否执行 `/learn repair-history`；来源缺失的记录继续保持未验证。
 
 ### Session execution 与 completion delivery
 
@@ -129,10 +109,25 @@ zuno session list
 读取 Plan 与 review gate、更新 Goal、写入 Work authorization，并接纳 `UserControl` 输入。
 
 `completion_delivery` 是后台命令、子 Agent、workflow 与 product Agent 的 exactly-once
-消费权账本。同步 `bg wait` 与异步 callback 竞争唯一的 `inline` 或 `callback` owner；
+消费权账本。终态 `bg output`、同步 `bg wait` 与异步 callback 竞争唯一的 `inline` 或 `callback` owner；
 失败的一方不能再接纳第二个 turn。`session_input.source_key` 保证重启后的 producer
 幂等接纳，`trigger_kind` 则区分 user、control、automatic 与 recovery turn，无需伪造
 user message。
+
+没有 Goal 的普通会话也使用可执行、指定人工/外部等待、暂停、完成这套调度状态。
+callback 不能解除无关等待，也不能伪造来源周期。经验证的回答和显式恢复控制通过同一个
+事务性 inbox 消费门控进入模型。
+
+问题把已提交回答与 `draftAnswers` 分开保存；“稍后”和空回答不产生模型输入。
+revision 与 command receipt 保障幂等。Plan 批准绑定精确 Plan/review/Work 身份与
+来源周期，提前批准只有在该逻辑周期正常交接后才可生效。
+
+`session_input_receipt` 分开记录接收、写入历史、进入模型和执行完成。Goal 暂停期间
+记录了 callback，不代表模型已经处理。恢复选择绑定 Goal ID/revision 与已有输入 ID，
+确认才原子衔接 Goal、执行状态和输入；跳过不授权，也不重投旧用户消息。
+
+`session_context_usage` 按来源保存 tracker、revision、epoch 和更新时间。主会话、子 Agent、
+学习及压缩请求不会互相覆盖上下文窗口。计量由持久请求证据恢复，未知值保持未知。
 
 ### Per-session memory policy
 
@@ -188,3 +183,16 @@ Gemini 的线路格式配 Vertex 认证，以及 OpenAI 兼容族无法共用同
 
 如果 Provider id 不被任何协议族声明，Zuno 会返回点名该 id 的错误，而不是静默尝试
 OpenAI 兼容路线。可定位的显式失败正是预期结果。
+
+
+## 企业预览运行时扩展
+
+预览保留 main 的核心格式 14，另用 `zuno_preview_schema` 记录运行时扩展格式 1，
+通道为 `enterprise-preview`。稳定内核的格式号与预览归属／根 Job 存储分别演进。
+
+已发布核心格式 5–13 前向迁移并保留会话、消息、Memory 和提问记录；有效核心格式 14
+在同一事务内安装预览扩展。旧的未发布预览曾使用不同的格式 13（归属）和 14（运行时 Job），
+迁移会验证对应的确切结构，保留归属、预算、检查点和租约 epoch。
+
+缺失或未来扩展标记、必需结构损坏、未标记的两条历史混合均失败关闭。DDL、回填、结构校验
+和版本标记同事务提交。预览安装继续使用独立配置及数据目录，迁移验证只操作隔离 fixture。

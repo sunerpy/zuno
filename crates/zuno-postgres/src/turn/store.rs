@@ -2,6 +2,173 @@ use super::*;
 
 #[async_trait]
 impl TurnPersistence for PostgresTurnPersistence {
+    async fn context_usage(
+        &self,
+        scope: &TurnStateScope,
+    ) -> Result<zuno_engine::context_usage::ContextUsageSeed, TurnError> {
+        let (mut tx, _) = self.transaction(scope).await?;
+        let seed = context::seed(&mut tx, scope).await?;
+        self.commit_transaction(tx).await?;
+        Ok(seed)
+    }
+
+    async fn commit_context_usage(
+        &self,
+        scope: &TurnStateScope,
+        update: &zuno_types::context_usage::ContextUsageWrite,
+    ) -> Result<(), TurnError> {
+        let (mut tx, job) = self.transaction(scope).await?;
+        context::write(&mut tx, scope, &job, update).await?;
+        self.commit_transaction(tx).await
+    }
+
+    async fn start_provider_request(
+        &self,
+        scope: &TurnStateScope,
+        commit: zuno_engine::state::ProviderRequestCommit,
+    ) -> Result<zuno_engine::state::ProviderRequestReceipt, TurnError> {
+        let (mut tx, job) = self.transaction(scope).await?;
+        if commit.assistant.session_id != scope.session_id
+            || commit.assistant.role != MessageRole::Assistant
+            || commit.context.before.tracker.snapshot().session_id != scope.session_id
+            || commit.context.identity.turn_id.as_deref() != Some(job.turn_id.as_str())
+            || commit.event.event_type != "session.provider.request"
+            || commit
+                .event
+                .properties
+                .get("turnID")
+                .and_then(Value::as_str)
+                != Some(job.turn_id.as_str())
+            || commit
+                .event
+                .properties
+                .get("requestID")
+                .and_then(Value::as_str)
+                != Some(commit.context.identity.request_id.as_str())
+            || commit
+                .assistant
+                .data
+                .get("requestID")
+                .and_then(Value::as_str)
+                != Some(commit.context.identity.request_id.as_str())
+        {
+            return Err(TurnStateError::Conflict.into());
+        }
+        let existing = query(
+            "SELECT * FROM zuno_enterprise_preview.message WHERE tenant_id=$1 AND principal_id=$2 AND id=$3",
+        ).bind(scope.owner.tenant_id.as_str()).bind(scope.owner.principal_id.as_str()).bind(&commit.assistant.id)
+            .fetch_optional(&mut *tx).await.map_err(sql_error)?;
+        if let Some(existing) = existing {
+            let previous = records::message(existing)?;
+            if previous.session_id != scope.session_id
+                || previous.role != MessageRole::Assistant
+                || previous.time_created != commit.assistant.time_created
+                || previous.data.contains_key("requestID")
+                || previous
+                    .data
+                    .get("time")
+                    .and_then(|time| time.get("completed"))
+                    .is_some()
+            {
+                return Err(TurnStateError::Conflict.into());
+            }
+        }
+        let at = database_time(&mut tx).await.map_err(state_error)?;
+        records::put_message(&mut tx, scope, &commit.assistant, at).await?;
+        let estimated = i64::try_from(commit.estimated_prompt_tokens)
+            .map_err(|_| TurnStateError::InvalidData)?;
+        let limit = commit
+            .context_limit
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| TurnStateError::InvalidData)?;
+        query("UPDATE zuno_enterprise_preview.session SET tokens_estimated_pending_prompt=$4,tokens_context_limit=$5 WHERE tenant_id=$1 AND principal_id=$2 AND id=$3")
+            .bind(scope.owner.tenant_id.as_str()).bind(scope.owner.principal_id.as_str()).bind(&scope.session_id)
+            .bind(estimated).bind(limit).execute(&mut *tx).await.map_err(sql_error)?;
+        let event = event(&mut tx, &job, commit.event).await?;
+        let update = commit.context.with_sequence(
+            u64::try_from(event.sequence).map_err(|_| TurnStateError::InvalidData)?,
+        )?;
+        context::write(&mut tx, scope, &job, &update).await?;
+        self.commit_transaction(tx).await?;
+        Ok(zuno_engine::state::ProviderRequestReceipt {
+            event,
+            context: update.tracker,
+        })
+    }
+
+    async fn applicable_inputs(
+        &self,
+        scope: &TurnStateScope,
+        candidates: &[String],
+    ) -> Result<Vec<String>, TurnError> {
+        let (mut tx, job) = self.transaction(scope).await?;
+        let eligible: bool = query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM zuno_enterprise_preview.input_execution_receipt r
+             JOIN zuno_enterprise_preview.input i ON i.tenant_id=r.tenant_id AND i.principal_id=r.principal_id AND i.id=r.input_id
+             WHERE r.tenant_id=$1 AND r.principal_id=$2 AND r.session_id=$3 AND r.input_id=$4
+               AND r.state='recorded' AND i.state='consumed' AND (r.turn_id IS NULL OR r.turn_id=$5))",
+        ).bind(scope.owner.tenant_id.as_str()).bind(scope.owner.principal_id.as_str()).bind(&scope.session_id)
+            .bind(job.input_id.as_str()).bind(job.turn_id.as_str()).fetch_one(&mut *tx).await.map_err(sql_error)?;
+        self.commit_transaction(tx).await?;
+        Ok(
+            if eligible && candidates.iter().any(|id| id == job.input_id.as_str()) {
+                vec![job.input_id.to_string()]
+            } else {
+                Vec::new()
+            },
+        )
+    }
+
+    async fn mark_inputs_applied(
+        &self,
+        scope: &TurnStateScope,
+        turn_id: &str,
+        input_ids: &[String],
+        _at_ms: i64,
+    ) -> Result<(), TurnError> {
+        let (mut tx, job) = self.transaction(scope).await?;
+        if turn_id != job.turn_id.as_str() || input_ids.iter().any(|id| id != job.input_id.as_str())
+        {
+            return Err(TurnStateError::Conflict.into());
+        }
+        if !input_ids.is_empty() {
+            let at = database_time(&mut tx).await.map_err(state_error)?;
+            let changed = query(
+                "UPDATE zuno_enterprise_preview.input_execution_receipt SET state='applied',turn_id=$5,applied_at=COALESCE(applied_at,$6),time_updated=$6
+                 WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3 AND input_id=$4
+                   AND state='recorded' AND (turn_id IS NULL OR turn_id=$5)",
+            ).bind(scope.owner.tenant_id.as_str()).bind(scope.owner.principal_id.as_str()).bind(&scope.session_id)
+                .bind(job.input_id.as_str()).bind(turn_id).bind(at).execute(&mut *tx).await.map_err(sql_error)?.rows_affected();
+            if changed == 0 {
+                let applied: bool = query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM zuno_enterprise_preview.input_execution_receipt
+                     WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3 AND input_id=$4 AND turn_id=$5 AND state='applied')",
+                ).bind(scope.owner.tenant_id.as_str()).bind(scope.owner.principal_id.as_str()).bind(&scope.session_id)
+                    .bind(job.input_id.as_str()).bind(turn_id).fetch_one(&mut *tx).await.map_err(sql_error)?;
+                if !applied {
+                    return Err(TurnStateError::Conflict.into());
+                }
+                return self.commit_transaction(tx).await;
+            }
+            event(
+                &mut tx,
+                &job,
+                NewSessionEvent::new(
+                    "session.input.applied",
+                    json!({
+                        "inputID":job.input_id,"turnID":job.turn_id,"appliedAt":at,
+                    })
+                    .as_object()
+                    .expect("fixed envelope")
+                    .clone(),
+                )?,
+            )
+            .await?;
+        }
+        self.commit_transaction(tx).await
+    }
+
     async fn session(&self, scope: &TurnStateScope) -> Result<TurnSession, TurnError> {
         let (mut tx, _) = self.transaction(scope).await?;
         let parent_id: Option<String> = query_scalar(
@@ -114,7 +281,7 @@ impl TurnPersistence for PostgresTurnPersistence {
         if commit.message.session_id != scope.session_id {
             return Err(TurnStateError::Conflict.into());
         }
-        let (mut tx, _) = self.transaction(scope).await?;
+        let (mut tx, job) = self.transaction(scope).await?;
         let previous = records::find_message(&mut tx, scope, &commit.message.id).await?;
         let mut parts = Vec::with_capacity(commit.parts.len());
         for part in &commit.parts {
@@ -137,6 +304,9 @@ impl TurnPersistence for PostgresTurnPersistence {
             commit.context_limit,
         )
         .await?;
+        if let Some(update) = &commit.context_usage {
+            context::write(&mut tx, scope, &job, update).await?;
+        }
         self.commit_transaction(tx).await
     }
 
@@ -264,6 +434,10 @@ impl TurnPersistence for PostgresTurnPersistence {
             .as_deref()
             .ok_or(TurnStateError::InvalidData)?;
         if id != job.input_id.as_str()
+            || input
+                .turn_id
+                .as_deref()
+                .is_some_and(|turn| turn != job.turn_id.as_str())
             || input.message.id != id
             || input.message.role != MessageRole::User
             || input.message.session_id != scope.session_id
@@ -325,6 +499,15 @@ impl TurnPersistence for PostgresTurnPersistence {
         query("UPDATE zuno_enterprise_preview.input SET state='consumed' WHERE tenant_id=$1 AND principal_id=$2 AND id=$3")
             .bind(scope.owner.tenant_id.as_str()).bind(scope.owner.principal_id.as_str()).bind(id)
             .execute(&mut *tx).await.map_err(sql_error)?;
+        let recorded = query(
+            "UPDATE zuno_enterprise_preview.input_execution_receipt SET state='recorded',turn_id=$4,time_updated=$5
+             WHERE tenant_id=$1 AND principal_id=$2 AND input_id=$3 AND state='admitted' AND (turn_id IS NULL OR turn_id=$4)",
+        ).bind(scope.owner.tenant_id.as_str()).bind(scope.owner.principal_id.as_str()).bind(id)
+            .bind(job.turn_id.as_str()).bind(time).execute(&mut *tx).await.map_err(sql_error)?.rows_affected();
+        if recorded != 1 {
+            return Err(TurnStateError::Conflict.into());
+        }
+
         event(
             &mut tx,
             &job,

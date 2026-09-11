@@ -8,7 +8,7 @@
 //! provider family continue to use token budgets, without model-name policy in
 //! the binary.
 
-use crate::registry::ApiSurface;
+use crate::registry::{ApiSurface, generation};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -272,6 +272,14 @@ impl EffortResolution {
 /// - `packages/llm/src/protocols/gemini.ts:292-330` reads `thinkingConfig` from
 ///   provider options and writes it *inside* `generationConfig`.
 ///
+/// The semantic `maxTokens` control follows the same fields the native provider
+/// configuration builders use: `max_output_tokens` for Responses and `max_tokens`
+/// for Chat and Messages. An explicit protocol-native field in the option map
+/// keeps precedence, including Chat's explicit `max_completion_tokens`. Callers
+/// imposing a hard execution ceiling consolidate
+/// competing limit aliases before lowering, as the learning client does.
+/// `Default` leaves this control alone until a provider selects its actual surface.
+///
 /// A name that must become two different things cannot be resolved where the
 /// surface is unknown, and a name that arrives verbatim from a catalog cannot be
 /// fixed at construction time. So the translation belongs here, at the moment an
@@ -297,6 +305,20 @@ pub fn lower_to_wire(options: &Map<String, Value>, surface: ApiSurface) -> Map<S
     let mut wire = Map::new();
     for (name, value) in options {
         match name.as_str() {
+            generation::MAX_TOKENS => {
+                let field = match surface {
+                    ApiSurface::Responses => "max_output_tokens",
+                    ApiSurface::Chat if options.contains_key("max_completion_tokens") => {
+                        "max_completion_tokens"
+                    }
+                    ApiSurface::Chat | ApiSurface::Messages => "max_tokens",
+                    ApiSurface::Default => generation::MAX_TOKENS,
+                };
+                // Native keys may appear before or after the SDK spelling.
+                // Preserve an explicit native value in either iteration order.
+                wire.entry(field.to_owned())
+                    .or_insert_with(|| value.clone());
+            }
             OPEN_AI_EFFORT_OPTION => lower_open_ai_effort(&mut wire, value.clone(), surface),
             OPEN_AI_SUMMARY_OPTION => lower_open_ai_summary(&mut wire, value.clone(), surface),
             ANTHROPIC_THINKING_OPTION => {
@@ -544,6 +566,70 @@ fn merge_objects(target: &mut Map<String, Value>, update: &Map<String, Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::generation;
+
+    #[test]
+    fn generation_output_cap_lowers_only_to_the_resolved_surface_field() {
+        let options = object(json!({
+            "maxTokens": 2048,
+            "metadata": {"trace": "keep"},
+            "text": {"verbosity": "low"}
+        }));
+        for (surface, field) in [
+            (ApiSurface::Chat, "max_tokens"),
+            (ApiSurface::Responses, "max_output_tokens"),
+            (ApiSurface::Messages, "max_tokens"),
+        ] {
+            let mut expected = options.clone();
+            expected.remove(generation::MAX_TOKENS);
+            expected.insert(field.to_owned(), json!(2048));
+            let wire = lower_to_wire(&options, surface);
+            assert_eq!(wire, expected, "{surface:?} must use the native cap field");
+            assert_eq!(
+                lower_to_wire(&wire, surface),
+                wire,
+                "lowering is idempotent"
+            );
+        }
+    }
+
+    #[test]
+    fn generation_output_cap_preserves_explicit_protocol_native_override() {
+        for (surface, field) in [
+            (ApiSurface::Chat, "max_tokens"),
+            (ApiSurface::Chat, "max_completion_tokens"),
+            (ApiSurface::Responses, "max_output_tokens"),
+            (ApiSurface::Messages, "max_tokens"),
+        ] {
+            for native_limit in [128, 4096] {
+                for native_first in [false, true] {
+                    let mut entries = vec![
+                        (generation::MAX_TOKENS.to_owned(), json!(2048)),
+                        (field.to_owned(), json!(native_limit)),
+                    ];
+                    if native_first {
+                        entries.reverse();
+                    }
+                    let options = Map::from_iter(entries);
+                    assert_eq!(
+                        lower_to_wire(&options, surface),
+                        Map::from_iter([(field.to_owned(), json!(native_limit))]),
+                        "an explicit {field} is authoritative regardless of insertion order"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generation_output_cap_does_not_guess_an_unresolved_native_surface() {
+        let options = object(json!({
+            "maxTokens": 2048,
+            "inferenceConfig": {"maxTokens": 512},
+            "generationConfig": {"maxOutputTokens": 1024}
+        }));
+        assert_eq!(lower_to_wire(&options, ApiSurface::Default), options);
+    }
 
     /// Every rename the wire demands, per family and per surface.
     ///

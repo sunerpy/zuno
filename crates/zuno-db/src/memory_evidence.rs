@@ -4,6 +4,10 @@
 //! been deleted since extraction. Both the writer transaction and the read path
 //! use this module. Disabling future generation does not revoke existing memory.
 
+mod legacy;
+
+pub use legacy::LegacyEvidenceRepair;
+
 use crate::experience::{ExperienceEvidenceKind, ExperienceRecord};
 use crate::learning_source::{LearningSource, LearningSourceKind, LearningSourceStore};
 use crate::{Connection, Pool, open};
@@ -163,13 +167,31 @@ pub(crate) fn collect_on(
             return Ok(None);
         };
         let payload: Value = serde_json::from_str(&payload).map_err(query_error)?;
-        let Some(sources) = payload.get("request").unwrap_or(&payload).get("sources") else {
+        let manifest = payload
+            .get("sourceRevalidation")
+            .unwrap_or_else(|| payload.get("request").unwrap_or(&payload));
+        let Some(sources) = manifest.get("sources") else {
             return Ok(None);
         };
         let sources: Vec<LearningSource> =
             serde_json::from_value(sources.clone()).map_err(query_error)?;
         if sources.len() > 256 {
             return Ok(None);
+        }
+        if let Some(snapshot) = manifest
+            .get("sourceSnapshot")
+            .or_else(|| payload.get("sourceSnapshot"))
+        {
+            let snapshot: crate::learning_source::LearningSourceSnapshot =
+                serde_json::from_value(snapshot.clone()).map_err(query_error)?;
+            if snapshot.project_id != record.projection.project_id
+                || record.projection.session_id.as_deref() != Some(snapshot.session_id.as_str())
+                || record.projection.source_message_id.as_deref()
+                    != Some(snapshot.source_message_id.as_str())
+                || !crate::learning_source::snapshot_current_on(connection, &snapshot, &sources)?
+            {
+                return Ok(None);
+            }
         }
         let Some(session_id) = &record.projection.session_id else {
             return Ok(None);
