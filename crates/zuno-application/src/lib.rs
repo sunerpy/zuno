@@ -5,6 +5,7 @@
 //! paths. Drivers and clients do not acquire database connections through this API.
 
 pub mod authorization;
+pub mod environment;
 pub mod runtime;
 
 use std::sync::Arc;

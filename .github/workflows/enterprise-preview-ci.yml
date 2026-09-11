@@ -33,10 +33,13 @@ jobs:
   postgres:
     name: PostgreSQL contracts
     uses: ./.github/workflows/enterprise-postgres.yml
+  docker:
+    name: Rootless Docker contracts
+    uses: ./.github/workflows/enterprise-docker.yml
   gate:
     name: Enterprise preview gate
     if: always()
-    needs: [channel, shared, postgres]
+    needs: [channel, shared, postgres, docker]
     runs-on: ubuntu-24.04
     steps:
       - name: Require all gates
@@ -44,4 +47,5 @@ jobs:
           CHANNEL: ${{ needs.channel.result }}
           SHARED: ${{ needs.shared.result }}
           POSTGRES: ${{ needs.postgres.result }}
-        run: test "$CHANNEL" = success && test "$SHARED" = success && test "$POSTGRES" = success
+          DOCKER: ${{ needs.docker.result }}
+        run: test "$CHANNEL" = success && test "$SHARED" = success && test "$POSTGRES" = success && test "$DOCKER" = success

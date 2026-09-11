@@ -1,6 +1,6 @@
 [package]
-name = "zuno-postgres"
-description = "PostgreSQL persistence for the isolated Zuno enterprise preview."
+name = "zuno-environment"
+description = "Isolated execution environments and durable operation receipts."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,26 +11,25 @@ publish.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+reqwest = { workspace = true }
+rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sqlx-core = { workspace = true }
-sqlx-postgres = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
+tar = { workspace = true }
 uuid = { workspace = true }
 zuno-application = { workspace = true }
+zuno-network = { workspace = true }
 zuno-orchestration = { workspace = true }
-zuno-types = { workspace = true }
-zuno-db = { workspace = true }
-zuno-engine = { workspace = true }
-zuno-error = { workspace = true }
 zuno-permission = { workspace = true }
+zuno-types = { workspace = true }
 
 [dev-dependencies]
-zuno-environment = { workspace = true }
 tempfile = { workspace = true }
-zuno-llm = { workspace = true }
-zuno-tool = { workspace = true }
-futures = { workspace = true }
 
 [lints]
 workspace = true
