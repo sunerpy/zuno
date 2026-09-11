@@ -413,6 +413,7 @@ async fn production_dispatch_arguments_reach_the_rendered_permission_dialog() {
                     available_tools,
                     interrupt: InterruptSignal::new(),
                     orchestration_snapshot: None,
+                    principal_scope: Arc::new(zuno_types::identity::PrincipalScope::local()),
                 })
                 .await
         })
@@ -488,6 +489,7 @@ async fn production_edit_dispatch_renders_path_and_diff_in_collapsed_and_fullscr
                     available_tools,
                     interrupt: InterruptSignal::new(),
                     orchestration_snapshot: None,
+                    principal_scope: Arc::new(zuno_types::identity::PrincipalScope::local()),
                 })
                 .await
         })

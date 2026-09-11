@@ -1,9 +1,9 @@
 # Zuno database lifecycle
 
-Zuno owns its configuration and data roots. The current database format is 12.
+Zuno owns its configuration and data roots. The current database format is 13.
 Empty databases are created at the current format, and supported older formats advance
 through guarded forward migrations. Format 5 is the first supported historical format
-and formats 5 through 11 upgrade in place to format 12 without rebuilding the database.
+and formats 5 through 12 upgrade in place to format 13 without rebuilding the database.
 
 ## The channel database
 
@@ -52,14 +52,14 @@ it opened. See
 
 Database opening recognizes these states:
 
-1. **Empty database.** The complete format-12 schema and the single `zuno_schema`
+1. **Empty database.** The complete format-13 schema and the single `zuno_schema`
    marker are created atomically.
-2. **Format 12.** The marker, tables, constraints, indexes and triggers are validated
+2. **Format 13.** The marker, tables, constraints, indexes and triggers are validated
    before application queries run.
-3. **Formats 5–11.** Every remaining supported additive migration runs in a single
+3. **Formats 5–12.** Every remaining supported additive migration runs in a single
    transaction: learning (6), Plan stack (7), verification receipts (8), session
    memory policy (9), execution/inbox state (10), versioned memory and search (11),
-   then automatic-memory provenance and watermarks (12).
+   automatic-memory provenance and watermarks (12), then session ownership (13).
 4. **Any other state.** An older unsupported format, a future format, a missing marker,
    or a marker whose required tables are absent fails closed without modification.
 
@@ -71,12 +71,12 @@ reported as a schema mismatch; a database whose format keeps changing under the 
 fails closed with a conflict on the `zuno_schema` marker. Neither path writes to the
 database.
 
-### Formats 5–11 to format 12
+### Formats 5–12 to format 13
 
 The supported migration uses one SQLite `BEGIN IMMEDIATE` transaction:
 
 1. Re-read the table inventory and require the marker to be exactly format 5, 6, 7,
-   8, 9, 10, or 11.
+   8, 9, 10, 11, or 12.
 2. Require the historical `session` and `work_plan` tables before changing anything.
 3. From format 5, create all format-6 learning tables and indexes.
 4. From format 5 or 6, add nullable `parent_plan_id`, defaulted `stack_depth`, and
@@ -92,16 +92,34 @@ The supported migration uses one SQLite `BEGIN IMMEDIATE` transaction:
 9. Add nullable candidate `base_revision`/`evidence`, `resident_memory_provenance`,
    `memory_maintenance_state` and their indexes. Backfill exact linked automatic
    provenance without reclassifying newer user-authored memory.
-10. Conditionally update the singleton marker from the exact observed old format to
-    12, last. Commit only after every operation succeeds.
+10. Create `session_ownership`, backfill every historical session with the explicit
+    local owner, and install the child-inheritance trigger and principal index.
+11. Conditionally update the singleton marker from the exact observed old format to
+    13, last. Commit only after every operation succeeds.
 
 Any failure rolls the transaction back. The migration does not rewrite existing
 `session`, `message`, `memory_candidate`, `learning_job`, `verification_receipt`, or
 `work_plan` values except the documented source-validation/lease backfills.
-Tests use exact format-5 through format-11 release fixtures, compare representative
+Tests use exact format-5 through format-12 release fixtures, compare representative
 session/message/memory values and preserved rows, then verify new objects and marker.
-Format-11 tests include previously published resident revisions and rollback of the
+Format-12 tests include previously published resident revisions, provenance and maintenance watermarks and rollback of the
 entire additive change if the final index creation fails.
+
+### Private session ownership (enterprise preview)
+
+`session_ownership` separates tenant and principal identifiers from editable session
+metadata. Existing sessions receive `local` / `local-user`; migration never guesses
+an enterprise owner from a directory, title, or OAuth claim. A trusted host binds a
+new root's owner in its creation transaction. Children inherit the parent owner;
+explicitly mismatched or missing parents abort scoped creation. Duplicate creation
+cannot transfer ownership.
+
+`ScopedSessionStore` fixes the owner for create, get and list. Listings apply the
+ownership predicate in SQL before ordering and pagination. These are storage
+primitives, not an authentication service: the host must authenticate and authorize
+before constructing a scoped store. Other local stores remain local-only until
+scoped adapters are implemented. Preview format 13 must only open a separate
+preview database; do not point a preview binary at a stable installation's data.
 
 ### Session execution and completion delivery
 
@@ -152,7 +170,7 @@ copy before any operator-led recovery.
 For important data, use the exact older binary to export it or implement and validate an
 explicit forward migration. Do not guess the schema, silently drop rows, or require a
 rebuild for a format that the current binary supports. A valid format-5, format-6,
-format-7, format-8, format-9, format-10, or format-11 database should open and migrate automatically.
+format-7, format-8, format-9, format-10, format-11, or format-12 database should open and migrate automatically.
 
 ## Rules for future schema changes
 

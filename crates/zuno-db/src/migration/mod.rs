@@ -14,7 +14,7 @@ use zuno_error::DbError;
 /// Current database format.
 ///
 /// Bump this whenever [`crate::schema`] changes incompatibly.
-pub const CURRENT_FORMAT: u32 = 12;
+pub const CURRENT_FORMAT: u32 = 13;
 const LEARNING_UPGRADE_FROM: u32 = 5;
 const PLAN_STACK_UPGRADE_FROM: u32 = 6;
 const VERIFICATION_UPGRADE_FROM: u32 = 7;
@@ -22,6 +22,7 @@ const MEMORY_POLICY_UPGRADE_FROM: u32 = 8;
 const EXECUTION_UPGRADE_FROM: u32 = 9;
 const MEMORY_RUNTIME_UPGRADE_FROM: u32 = 10;
 const AUTOMATIC_MEMORY_UPGRADE_FROM: u32 = 11;
+const SESSION_OWNERSHIP_UPGRADE_FROM: u32 = 12;
 
 const FORMAT_TABLE: &str = "zuno_schema";
 const FORMAT_SQL: &str = "
@@ -112,6 +113,7 @@ fn dispatch_once(connection: &mut Connection) -> Result<Dispatch, DbError> {
         Some(EXECUTION_UPGRADE_FROM) => migrate_execution(connection),
         Some(MEMORY_RUNTIME_UPGRADE_FROM) => migrate_memory_runtime(connection),
         Some(AUTOMATIC_MEMORY_UPGRADE_FROM) => migrate_automatic_memory(connection),
+        Some(SESSION_OWNERSHIP_UPGRADE_FROM) => migrate_session_ownership(connection),
         observed => Err(DbError::SchemaMismatch {
             expected: CURRENT_FORMAT,
             observed,
@@ -120,8 +122,52 @@ fn dispatch_once(connection: &mut Connection) -> Result<Dispatch, DbError> {
 }
 
 fn validate_current(connection: &Connection, tables: &[String]) -> Result<(), DbError> {
+    validate_format_twelve(connection, tables)?;
+    validate_session_ownership_shape(connection)
+}
+
+fn validate_format_twelve(connection: &Connection, tables: &[String]) -> Result<(), DbError> {
     validate_format_eleven(connection, tables)?;
     validate_automatic_memory_shape(connection)
+}
+
+fn validate_session_ownership_shape(connection: &Connection) -> Result<(), DbError> {
+    validate_sql_objects(
+        connection,
+        &[
+            "session_ownership",
+            "session_ownership_insert",
+            "session_ownership_principal_idx",
+        ],
+    )
+}
+
+/// Extend the published format 12 atomically without guessing enterprise owners.
+fn migrate_session_ownership(connection: &mut Connection) -> Result<Dispatch, DbError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_error)?;
+    let tables = transaction_table_names(&transaction)?;
+    let observed = observed_format(&transaction, &tables)?;
+    if observed != Some(SESSION_OWNERSHIP_UPGRADE_FROM) {
+        return Ok(Dispatch::Moved { observed });
+    }
+    validate_format_twelve(&transaction, &tables)?;
+    schema::up_session_ownership(&transaction)?;
+    validate_session_ownership_shape(&transaction)?;
+    let changed = transaction
+        .execute(
+            "UPDATE zuno_schema SET format=?1 WHERE singleton=1 AND format=?2",
+            params![CURRENT_FORMAT, SESSION_OWNERSHIP_UPGRADE_FROM],
+        )
+        .map_err(map_error)?;
+    if changed != 1 {
+        return Err(failure(std::io::Error::other(
+            "format-12 marker changed during ownership migration",
+        )));
+    }
+    transaction.commit().map_err(map_error)?;
+    Ok(Dispatch::Settled)
 }
 
 fn validate_format_eleven(connection: &Connection, tables: &[String]) -> Result<(), DbError> {
@@ -253,6 +299,7 @@ fn migrate_learning(connection: &mut Connection) -> Result<Dispatch, DbError> {
     schema::up_execution(&transaction)?;
     schema::up_memory_runtime(&transaction)?;
     schema::up_automatic_memory(&transaction)?;
+    schema::up_session_ownership(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -289,6 +336,7 @@ fn migrate_plan_stack(connection: &mut Connection) -> Result<Dispatch, DbError> 
     schema::up_execution(&transaction)?;
     schema::up_memory_runtime(&transaction)?;
     schema::up_automatic_memory(&transaction)?;
+    schema::up_session_ownership(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -324,6 +372,7 @@ fn migrate_verification(connection: &mut Connection) -> Result<Dispatch, DbError
     schema::up_execution(&transaction)?;
     schema::up_memory_runtime(&transaction)?;
     schema::up_automatic_memory(&transaction)?;
+    schema::up_session_ownership(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -360,6 +409,7 @@ fn migrate_memory_policy(connection: &mut Connection) -> Result<Dispatch, DbErro
     schema::up_execution(&transaction)?;
     schema::up_memory_runtime(&transaction)?;
     schema::up_automatic_memory(&transaction)?;
+    schema::up_session_ownership(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -395,6 +445,7 @@ fn migrate_execution(connection: &mut Connection) -> Result<Dispatch, DbError> {
     schema::up_execution(&transaction)?;
     schema::up_memory_runtime(&transaction)?;
     schema::up_automatic_memory(&transaction)?;
+    schema::up_session_ownership(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -430,6 +481,7 @@ fn migrate_memory_runtime(connection: &mut Connection) -> Result<Dispatch, DbErr
     }
     schema::up_memory_runtime(&transaction)?;
     schema::up_automatic_memory(&transaction)?;
+    schema::up_session_ownership(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -457,6 +509,7 @@ fn migrate_automatic_memory(connection: &mut Connection) -> Result<Dispatch, DbE
     }
     validate_format_eleven(&transaction, &tables)?;
     schema::up_automatic_memory(&transaction)?;
+    schema::up_session_ownership(&transaction)?;
     validate_automatic_memory_shape(&transaction)?;
     let changed = transaction
         .execute(
@@ -1942,6 +1995,7 @@ mod tests {
         schema::up_execution(&held).expect("the winner adds session execution state");
         schema::up_memory_runtime(&held).expect("the winner adds memory runtime");
         schema::up_automatic_memory(&held).expect("the winner adds automatic memory");
+        schema::up_session_ownership(&held).expect("the winner adds session ownership");
         held.execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
             params![CURRENT_FORMAT, MEMORY_POLICY_UPGRADE_FROM],

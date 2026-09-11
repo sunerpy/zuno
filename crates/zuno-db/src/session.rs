@@ -529,6 +529,8 @@ pub struct SessionCreate {
     pub permission: Option<String>,
     /// Creation and last-activity time, Unix milliseconds. Both default to now.
     pub time: Option<i64>,
+    /// Explicit private owner supplied by a trusted host. Children inherit when absent.
+    pub owner: Option<zuno_types::identity::PrincipalKey>,
 }
 
 impl SessionCreate {
@@ -558,6 +560,7 @@ impl SessionCreate {
             metadata: None,
             permission: None,
             time: None,
+            owner: None,
         }
     }
 
@@ -565,6 +568,13 @@ impl SessionCreate {
     #[must_use]
     pub fn with_parent(mut self, parent_id: impl Into<String>) -> Self {
         self.parent_id = Some(parent_id.into());
+        self
+    }
+
+    /// Bind ownership during the same transaction as session materialization.
+    #[must_use]
+    pub fn with_owner(mut self, owner: zuno_types::identity::PrincipalKey) -> Self {
+        self.owner = Some(owner);
         self
     }
 
@@ -754,6 +764,8 @@ pub struct ListQuery {
     pub direction: SortDirection,
     /// Maximum rows. See [`UPSTREAM_LIST_LIMIT`].
     pub limit: Option<u32>,
+    /// Private-resource restriction. Applied in SQL before ordering and pagination.
+    pub owner: Option<zuno_types::identity::PrincipalKey>,
 }
 
 impl ListQuery {
@@ -917,6 +929,15 @@ pub fn create(transaction: &Transaction<'_>, input: &SessionCreate) -> Result<Cr
         )
         .map_err(open::map_error)?;
 
+    if let Some(owner) = &input.owner {
+        crate::session_ownership::bind_created(
+            transaction,
+            &input.id,
+            input.parent_id.as_deref(),
+            owner,
+            inserted != 0,
+        )?;
+    }
     let stored = get(transaction, &input.id)?;
     if inserted == 0 {
         return Ok(Creation::AlreadyExists(stored));
@@ -951,6 +972,31 @@ pub fn find(connection: &Connection, id: &str) -> Result<Option<Session>, DbErro
         Some(row) => Ok(Some(from_row(row).map_err(open::map_error)?)),
         None => Ok(None),
     }
+}
+
+/// Read a private session using one ownership-filtered query.
+pub fn get_owned(
+    connection: &Connection,
+    id: &str,
+    owner: &zuno_types::identity::PrincipalKey,
+) -> Result<Session, DbError> {
+    let sql = format!(
+        "SELECT {COLUMNS} FROM session WHERE id=?1 AND EXISTS (\
+         SELECT 1 FROM session_ownership o WHERE o.session_id=session.id \
+         AND o.tenant_id=?2 AND o.principal_id=?3)"
+    );
+    connection
+        .query_row(
+            &sql,
+            params![id, owner.tenant_id.as_str(), owner.principal_id.as_str()],
+            from_row,
+        )
+        .optional()
+        .map_err(open::map_error)?
+        .ok_or_else(|| DbError::NotFound {
+            table: TABLE.to_owned(),
+            id: id.to_owned(),
+        })
 }
 
 /// Set `time_updated` to now, returning the value written.
@@ -2042,6 +2088,16 @@ fn filters(query: &ListQuery) -> (Vec<String>, Vec<Value>) {
     let mut predicates: Vec<String> = Vec::new();
     let mut values: Vec<Value> = Vec::new();
 
+    if let Some(owner) = &query.owner {
+        values.push(Value::Text(owner.tenant_id.as_str().to_owned()));
+        values.push(Value::Text(owner.principal_id.as_str().to_owned()));
+        predicates.push(
+            "EXISTS (SELECT 1 FROM session_ownership o WHERE o.session_id=session.id \
+             AND o.tenant_id=?1 AND o.principal_id=?2)"
+                .to_owned(),
+        );
+    }
+
     match &query.scope {
         ListScope::Directory { directory } => {
             values.push(Value::Text(directory.clone()));
@@ -2328,6 +2384,7 @@ mod tests {
             sort: SessionSort::Updated,
             direction: SortDirection::Descending,
             limit: Some(25),
+            owner: None,
         };
         let (predicates, values) = bindings(&query);
         assert_eq!(

@@ -546,6 +546,7 @@ fn vacuum_stats_counts_every_table_the_live_schema_actually_has() {
             "session_input",
             "session_memory_policy",
             "session_message",
+            "session_ownership",
             "session_share",
             "skill_candidate",
             "verification_receipt",

@@ -1806,7 +1806,7 @@ fn database_docs_describe_the_guarded_chain_to_the_current_format() {
                 zuno_db::migration::CURRENT_FORMAT
             ),
             "Format 5",
-            "Formats 5–11",
+            "Formats 5–12",
             "`BEGIN IMMEDIATE`",
             "exact observed old format",
             "`resident_memory_provenance`",
@@ -1817,7 +1817,7 @@ fn database_docs_describe_the_guarded_chain_to_the_current_format() {
             "fails closed without modification",
             "format marker updated last",
             "A valid format-5, format-6,",
-            "format-10, or format-11 database should open",
+            "format-10, format-11, or format-12 database should open",
             "should open and migrate automatically",
         ],
     );
@@ -1831,7 +1831,7 @@ fn database_docs_describe_the_guarded_chain_to_the_current_format() {
             "format 8",
             "format 9",
             "`BEGIN IMMEDIATE`",
-            "把 marker 更新为 12",
+            &format!("把 marker 更新为 {}", zuno_db::migration::CURRENT_FORMAT),
             "`resident_memory_provenance`",
             "`session`、`message`、",
             "`work_plan` 值",

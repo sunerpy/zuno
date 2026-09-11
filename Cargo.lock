@@ -8150,6 +8150,7 @@ dependencies = [
  "zuno-orchestration",
  "zuno-paths",
  "zuno-permission",
+ "zuno-types",
 ]
 
 [[package]]

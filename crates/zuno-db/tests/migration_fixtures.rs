@@ -18,6 +18,7 @@
 //! | `format-9.sql` | 9      | v0.10.21| execution control and completion routing            |
 //! | `format-10.sql`| 10     | v0.10.23| versioned memory, provenance, leases and search     |
 //! | `format-11.sql`| 11     | v0.10.28| automatic memory provenance and maintenance        |
+//! | `format-12.sql`| 12     | v0.10.29| private session ownership                          |
 //!
 //! Every fixture is upgraded through the real entry point, [`migration::apply`],
 //! and the result is compared *structurally* with a database `apply` creates from
@@ -119,7 +120,7 @@ const FORMAT_TEN: Fixture = Fixture {
 };
 
 /// Every table `sqlite_master` lists once the current schema is in place.
-const CURRENT_TABLE_COUNT: usize = 57;
+const CURRENT_TABLE_COUNT: usize = 58;
 
 const FORMAT_ELEVEN: Fixture = Fixture {
     format: 11,
@@ -132,6 +133,20 @@ const FORMAT_ELEVEN: Fixture = Fixture {
         include_str!("fixtures/format-11.sql")
     ),
     table_count: 55,
+};
+
+const FORMAT_TWELVE: Fixture = Fixture {
+    format: 12,
+    release: "v0.10.29",
+    sql: concat!(
+        include_str!("fixtures/format-7.sql"),
+        include_str!("fixtures/format-8.sql"),
+        include_str!("fixtures/format-9.sql"),
+        include_str!("fixtures/format-10.sql"),
+        include_str!("fixtures/format-11.sql"),
+        include_str!("fixtures/format-12.sql")
+    ),
+    table_count: 57,
 };
 
 /// One additive upgrade step, described by what it must leave behind and by the
@@ -269,8 +284,8 @@ const MEMORY_RUNTIME: Step = Step {
 /// transaction. SQLite rejects the duplicate while *preparing* the statement, so
 /// it never reaches `SQLITE_TRACE_STMT`; the statement immediately before it is
 /// therefore the last one the trace can show before the rollback.
-const TRAP_INDEX: &str = "resident_memory_provenance_candidate_idx";
-const STATEMENT_BEFORE_TRAP: &str = "CREATE INDEX memory_candidate_path_status_updated_idx";
+const TRAP_INDEX: &str = "session_ownership_principal_idx";
+const STATEMENT_BEFORE_TRAP: &str = "CREATE TRIGGER session_ownership_insert";
 
 const AUTOMATIC_MEMORY: Step = Step {
     name: "automatic memory (format 11 -> 12)",
@@ -286,6 +301,14 @@ const AUTOMATIC_MEMORY: Step = Step {
     ],
 };
 
+const SESSION_OWNERSHIP: Step = Step {
+    name: "session ownership (format 12 -> 13)",
+    first_statement: "CREATE TABLE session_ownership",
+    tables: &["session_ownership"],
+    indexes: &["session_ownership_principal_idx"],
+    columns: &[],
+};
+
 fn steps_after(format: u32) -> &'static [&'static Step] {
     match format {
         5 => &[
@@ -296,6 +319,7 @@ fn steps_after(format: u32) -> &'static [&'static Step] {
             &EXECUTION,
             &MEMORY_RUNTIME,
             &AUTOMATIC_MEMORY,
+            &SESSION_OWNERSHIP,
         ],
         6 => &[
             &PLAN_STACK,
@@ -304,6 +328,7 @@ fn steps_after(format: u32) -> &'static [&'static Step] {
             &EXECUTION,
             &MEMORY_RUNTIME,
             &AUTOMATIC_MEMORY,
+            &SESSION_OWNERSHIP,
         ],
         7 => &[
             &VERIFICATION,
@@ -311,18 +336,90 @@ fn steps_after(format: u32) -> &'static [&'static Step] {
             &EXECUTION,
             &MEMORY_RUNTIME,
             &AUTOMATIC_MEMORY,
+            &SESSION_OWNERSHIP,
         ],
         8 => &[
             &MEMORY_POLICY,
             &EXECUTION,
             &MEMORY_RUNTIME,
             &AUTOMATIC_MEMORY,
+            &SESSION_OWNERSHIP,
         ],
-        9 => &[&EXECUTION, &MEMORY_RUNTIME, &AUTOMATIC_MEMORY],
-        10 => &[&MEMORY_RUNTIME, &AUTOMATIC_MEMORY],
-        11 => &[&AUTOMATIC_MEMORY],
+        9 => &[
+            &EXECUTION,
+            &MEMORY_RUNTIME,
+            &AUTOMATIC_MEMORY,
+            &SESSION_OWNERSHIP,
+        ],
+        10 => &[&MEMORY_RUNTIME, &AUTOMATIC_MEMORY, &SESSION_OWNERSHIP],
+        11 => &[&AUTOMATIC_MEMORY, &SESSION_OWNERSHIP],
+        12 => &[&SESSION_OWNERSHIP],
         other => panic!("no fixture describes format {other}"),
     }
+}
+
+#[test]
+fn format_twelve_fixture_matches_the_released_schema() {
+    assert_fixture_is_the_old_format(&FORMAT_TWELVE);
+    assert!(
+        include_str!("fixtures/format-12.sql")
+            .contains(include_str!("../src/schema/automatic_memory.sql").trim())
+    );
+}
+
+#[test]
+fn format_twelve_upgrade_preserves_history_memory_provenance_and_watermarks() {
+    assert_upgrade_preserves_rows_and_reaches_the_current_structure(&FORMAT_TWELVE);
+    let dir = temp_dir();
+    let mut connection = load_fixture(&dir.path().join("zuno.db"), &FORMAT_TWELVE);
+    migration::apply(&mut connection).expect("upgrade");
+    let owner =
+        zuno_db::session_ownership::get(&connection, "ses_fixture_0001").expect("local owner");
+    assert_eq!(owner, zuno_types::identity::PrincipalScope::local().owner());
+    let missing: i64 = connection.query_row(
+        "SELECT count(*) FROM session s LEFT JOIN session_ownership o ON o.session_id=s.id WHERE o.session_id IS NULL",
+        [], |row| row.get(0),
+    ).expect("all legacy sessions are attributed");
+    assert_eq!(missing, 0);
+}
+
+#[test]
+fn format_twelve_failed_upgrade_preserves_history_memory_and_marker() {
+    assert_failed_upgrade_leaves_the_database_untouched(&FORMAT_TWELVE);
+}
+
+#[test]
+fn format_twelve_with_a_future_marker_is_rejected_without_mutation() {
+    let dir = temp_dir();
+    let mut connection = load_fixture(&dir.path().join("zuno.db"), &FORMAT_TWELVE);
+    connection
+        .execute("UPDATE zuno_schema SET format=999", [])
+        .expect("future marker");
+    let before = structure(&connection);
+    let rows = snapshot_rows(&connection, &before);
+    assert!(matches!(
+        migration::apply(&mut connection),
+        Err(DbError::SchemaMismatch { .. })
+    ));
+    assert_eq!(structure(&connection), before);
+    assert_rows_preserved(&connection, &rows, &[]);
+}
+
+#[test]
+fn format_twelve_with_corrupt_memory_schema_is_rejected_before_ownership_backfill() {
+    let dir = temp_dir();
+    let mut connection = load_fixture(&dir.path().join("zuno.db"), &FORMAT_TWELVE);
+    connection
+        .execute_batch("DROP INDEX resident_memory_provenance_candidate_idx")
+        .expect("corrupt schema");
+    let before = structure(&connection);
+    let rows = snapshot_rows(&connection, &before);
+    assert!(matches!(
+        migration::apply(&mut connection),
+        Err(DbError::Schema { .. })
+    ));
+    assert_eq!(structure(&connection), before);
+    assert_rows_preserved(&connection, &rows, &[]);
 }
 
 #[test]
