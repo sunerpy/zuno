@@ -4,6 +4,7 @@
 //! persistence provider. Client DTOs contain neither owner overrides nor host
 //! paths. Drivers and clients do not acquire database connections through this API.
 
+pub mod authorization;
 pub mod runtime;
 
 use std::sync::Arc;
@@ -22,6 +23,8 @@ pub enum ApplicationError {
     Invalid(String),
     #[error("the requested resource is unavailable to this principal")]
     NotFound,
+    #[error("organization policy does not authorize this action")]
+    Forbidden,
     #[error("the request conflicts with already committed state")]
     Conflict,
     #[error("the execution lease is no longer authoritative")]

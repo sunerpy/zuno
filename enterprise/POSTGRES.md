@@ -112,3 +112,5 @@ owner pages, RLS and atomic audit failure. Tests simulate input materialization;
 they do not certify a remote engine, current organization authorization, child
 completion delivery, or external-operation recovery. Those integrations remain
 required before the enterprise runtime can be registered as available.
+
+Format 3 adds [organization authorization and approvals](AUTHORIZATION.md), with forward migrations from both formats 1 and 2.

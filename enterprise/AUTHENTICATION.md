@@ -159,3 +159,5 @@ and [Entra claim validation](https://learn.microsoft.com/en-us/entra/identity-pl
 See [中文](AUTHENTICATION.zh.md) and [status](STATUS.md).
 
 Identity HTTP clients use `zuno-network` and honor the control-plane process proxy policy, including `NO_PROXY`. HTTPS, redirect refusal and request limits remain enforced by the identity adapter.
+
+Organization policy and durable approval storage are implemented separately; see [authorization](AUTHORIZATION.md). BFF/driver integration remains pending.

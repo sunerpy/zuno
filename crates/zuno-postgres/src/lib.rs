@@ -1,5 +1,8 @@
 //! PostgreSQL data-owner adapter. Worker credentials never include this pool.
 
+mod authorization;
+#[cfg(test)]
+mod authorization_tests;
 mod migration;
 mod runtime;
 #[cfg(test)]
@@ -8,6 +11,7 @@ mod session;
 #[cfg(test)]
 mod tests;
 
+pub use authorization::{PostgresOrganizationStore, bootstrap_organization};
 pub use migration::{PREVIEW_SCHEMA, migrate};
 pub use runtime::PostgresRuntimeStore;
 pub use session::PostgresSessionPersistence;
@@ -89,6 +93,10 @@ impl PostgresBackend {
     /// not by a worker-supplied principal or a public request body.
     pub fn runtime(&self, tenant: TenantId) -> PostgresRuntimeStore {
         PostgresRuntimeStore::new(self.pool.clone(), tenant)
+    }
+
+    pub fn organizations(&self, tenant: TenantId) -> PostgresOrganizationStore {
+        PostgresOrganizationStore::new(self.pool.clone(), tenant)
     }
 
     /// Register a logical workspace through an already authorized host action.

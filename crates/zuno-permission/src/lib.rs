@@ -12,6 +12,7 @@
 //! cover more spellings than an `allow`.
 
 mod engine;
+pub mod enterprise;
 pub mod resource;
 mod rule;
 mod types;

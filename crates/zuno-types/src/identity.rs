@@ -147,6 +147,18 @@ identity_id!(
     ConfigurationId,
     "An immutable, host-resolved runtime definition."
 );
+identity_id!(
+    InvocationId,
+    "One logical tool invocation across worker attempts."
+);
+identity_id!(
+    OperationId,
+    "One external operation with stable arguments and receipts."
+);
+identity_id!(
+    ApprovalId,
+    "One durable approval bound to a logical operation."
+);
 
 /// How the host obtained a subject. This is diagnostic data, not a permission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]

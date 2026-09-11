@@ -7568,6 +7568,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
+ "zuno-permission",
  "zuno-runtime",
  "zuno-types",
 ]
@@ -8076,10 +8077,12 @@ version = "0.10.29"
 dependencies = [
  "dirs",
  "proptest",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "zuno-config",
  "zuno-error",
+ "zuno-types",
 ]
 
 [[package]]
@@ -8096,6 +8099,7 @@ dependencies = [
  "uuid",
  "zuno-application",
  "zuno-orchestration",
+ "zuno-permission",
  "zuno-types",
 ]
 

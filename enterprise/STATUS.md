@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p2-runtime`.
+- Current phase branch: `codex/enterprise-p2-authorization`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -110,3 +110,13 @@ verification is pending the next preview CI run. No release is enabled.
 - Materialization is simulated in the storage tests. Remote engine access, current organization authorization, durable child waits/completion consumption and external operation receipts remain outstanding; no enterprise runtime is registered or released.
 
 - Identity PR #183 merged at `5660d000d2f65c9a9d6885d7ba033e2b87900249`; CI 34580934554 passed, including the unified HTTP-construction contract.
+
+## Organization authorization and approval storage
+
+- Runtime PR #184 merged at `abf3e4d2804325800c78fc5a54b0d714d7878ca7`; CI 34584034460 passed, including PostgreSQL 16 on Linux amd64/arm64 and native Windows checks.
+- Organization policy separates API applications, automatic read approval applications, and trusted human approval applications. Commands/changes remain HITL; sensitive requests require another assigned human approver.
+- `OrganizationStore`/`PostgresOrganizationStore` persist stable operation bindings, decision receipts, expiry/revocation checks and administrator changes with atomic audit/revision updates.
+- PostgreSQL format 3 preserves formats 1 and 2. Real old-format fixtures retain native Job checkpoints, budgets, input versions and lease epochs. The isolated TLS suite passes, including concurrent answers/admin requests, application boundaries, changed bindings, Worker handoff, revocation and rollback.
+- Policy/application/types/database regression: 564 passed. Documentation/release contracts: 99 passed. After baseline synchronization, workspace check, Clippy, formatting, dependency checks and all 11 preview-publisher tests passed.
+- HTTP/BFF, authenticated gateway facts, driver waits/wakeups, operation receipts and distributed execution remain pending. This storage layer does not register enterprise entry points or turn a checked decision into a transferable execution credential.
+- Scope review: English/Chinese authorization guides and preview entry links are updated. The stable documentation site and installation remain untouched.

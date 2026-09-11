@@ -141,7 +141,7 @@ async fn read_job(
     Ok(job)
 }
 
-async fn verify_lease(
+pub(crate) async fn verify_lease(
     tx: &mut Transaction<'_, Postgres>,
     lease: &ExecutionLease,
 ) -> Result<RuntimeJob, ApplicationError> {
