@@ -12,6 +12,11 @@ use serde_json::{Value, json};
 
 use crate::*;
 
+#[path = "tests/id_token.rs"]
+mod id_token;
+#[path = "tests/login.rs"]
+mod login;
+
 const TENANT: &str = "11111111-1111-4111-8111-111111111111";
 const AUDIENCE: &str = "22222222-2222-4222-8222-222222222222";
 const CLIENT: &str = "33333333-3333-4333-8333-333333333333";

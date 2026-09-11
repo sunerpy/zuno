@@ -31,14 +31,49 @@ pub struct OidcKeySource {
 
 impl OidcKeySource {
     pub fn new(authority: OAuth2Authority) -> Result<Self, IdentityError> {
-        let client = zuno_network::client_builder()
+        Self::with_root_certificate(authority, None)
+    }
+
+    pub fn with_root_certificate(
+        authority: OAuth2Authority,
+        root_pem: Option<&[u8]>,
+    ) -> Result<Self, IdentityError> {
+        let mut builder = zuno_network::client_builder()
             .https_only(true)
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(3))
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(10));
+        if let Some(pem) = root_pem {
+            if pem.len() > 65536 {
+                return Err(IdentityConfigError("identity trust root is too large").into());
+            }
+            builder = builder.add_root_certificate(
+                reqwest::Certificate::from_pem(pem)
+                    .map_err(|_| IdentityConfigError("invalid identity trust root"))?,
+            );
+        }
+        let client = builder
             .build()
             .map_err(|_| IdentityError::KeysUnavailable)?;
         Ok(Self { client, authority })
+    }
+
+    /// Shared discovery for login and signing keys. Returned metadata still goes
+    /// through the consumer's endpoint/flow validation before it can be used.
+    pub async fn discovery_document(&self) -> Result<Vec<u8>, IdentityError> {
+        let url = Url::parse(&self.authority.discovery_url())
+            .map_err(|_| IdentityError::KeysUnavailable)?;
+        let document = self.document(url).await?;
+        #[derive(Deserialize)]
+        struct Issuer {
+            issuer: String,
+        }
+        let issuer: Issuer =
+            serde_json::from_slice(&document).map_err(|_| IdentityError::KeysUnavailable)?;
+        if issuer.issuer != self.authority.issuer() {
+            return Err(IdentityError::KeysUnavailable);
+        }
+        Ok(document)
     }
 
     async fn document(&self, url: Url) -> Result<Vec<u8>, IdentityError> {
@@ -82,9 +117,7 @@ impl SigningKeySource for OidcKeySource {
         if let Some(url) = &self.authority.jwks_url {
             return self.document(self.authority.check_jwks_url(url)?).await;
         }
-        let discovery_url = Url::parse(&self.authority.discovery_url())
-            .map_err(|_| IdentityError::KeysUnavailable)?;
-        let discovery: Discovery = serde_json::from_slice(&self.document(discovery_url).await?)
+        let discovery: Discovery = serde_json::from_slice(&self.discovery_document().await?)
             .map_err(|_| IdentityError::KeysUnavailable)?;
         if discovery.issuer != self.authority.issuer() {
             return Err(IdentityError::KeysUnavailable);

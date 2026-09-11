@@ -3,6 +3,9 @@
 mod authorization;
 #[cfg(test)]
 mod authorization_tests;
+mod browser;
+#[cfg(test)]
+mod browser_tests;
 mod migration;
 mod runtime;
 #[cfg(test)]
@@ -15,6 +18,7 @@ mod turn;
 mod turn_tests;
 
 pub use authorization::{PostgresOrganizationStore, bootstrap_organization};
+pub use browser::{BrowserStoreLimits, PostgresBrowserStore};
 pub use migration::{PREVIEW_SCHEMA, migrate};
 pub use runtime::PostgresRuntimeStore;
 pub use session::PostgresSessionPersistence;
@@ -78,6 +82,16 @@ pub struct PostgresBackend {
 }
 
 impl PostgresBackend {
+    /// Authentication state is accessible only to the host's BFF, under its fixed
+    /// deployment tenant. Public requests cannot select this scope.
+    pub fn browser_sessions(
+        &self,
+        tenant: TenantId,
+        limits: BrowserStoreLimits,
+    ) -> Result<PostgresBrowserStore, zuno_identity::login::LoginError> {
+        PostgresBrowserStore::new(self.pool.clone(), tenant, limits)
+    }
+
     pub async fn connect(options: PostgresOptions) -> Result<Self, ApplicationError> {
         Self::from_pool(options.connect().await?).await
     }

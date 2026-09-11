@@ -4,8 +4,9 @@ This adapter implements scoped sessions, runtime Jobs, organization approvals an
 the shared kernel's `TurnPersistence` port. `AgentApplication` and the ordinary
 bounded driver consume the same contracts for SQLite and PostgreSQL, including
 durable wait consumption. Authenticated Worker transport uses this adapter.
-PostgreSQL Memory, browser login and complete runtime assembly remain subsequent
-work; this library alone does not register an enterprise server or worker.
+The [browser login/session store](BROWSER.md) uses the same data-owner pool.
+PostgreSQL Memory and complete runtime assembly remain subsequent work; this
+library alone does not register an enterprise server or worker.
 
 ## Database boundary
 
@@ -184,3 +185,23 @@ limit. No incomplete history is treated as an exact old context window.
 The captured format-5 fixture preserves pending waits, Job budgets, lease state,
 messages and usage across failed/successful format-6 migration. The internal Worker
 protocol is version 3; it is separate from public UI DTOs.
+
+## Browser authentication state
+
+Format 7 adds tenant-scoped `browser_login`, `browser_session` and
+`authentication_audit`. Before a browser is identified, only the deployment's
+fixed tenant can select its encrypted transaction or credential digest. The
+host's BFF owns this factory; public requests cannot choose a tenant or database
+principal. These tables also force RLS and keep explicit tenant predicates.
+
+Transaction consumption is a single database-time `DELETE ... RETURNING`,
+committed before a token POST. Invalid bindings cannot consume a different
+browser's state. Configured capacities use transaction-scoped locks; expired
+entries are pruned in bounded batches. Session creation/revocation and audit
+commit or roll back together. Credentials and expiry are checked against both
+indexed columns and decoded storage records.
+
+Formats 1–6 migrate atomically. The captured format-6 fixture retains native
+sessions, message parts, waiting Jobs and input receipts across a failed and a
+successful browser-schema migration. BFF and Worker network fixtures run in
+separate temporary databases in the same isolated verification cluster.

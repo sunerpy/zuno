@@ -67,7 +67,7 @@ workspace。`crates/zuno-cli` 构建最终的 `zuno` 二进制，其余 crate �
 | `zuno-provider-bedrock` | Amazon Bedrock Responses 与 Converse transport |
 | `zuno-provider-compatible` | 可配置的 OpenAI-compatible endpoint |
 | `zuno-auth` | API key 与 OAuth 凭据存储和刷新 |
-| `zuno-identity` | 企业 API 身份：OAuth2 JWT／introspection、OIDC 密钥发现及 Entra 声明策略 |
+| `zuno-identity` | 企业身份：OAuth2 JWT／introspection、OIDC 授权码／PKCE 登录、加密浏览器状态接口及 Entra 声明策略 |
 | `zuno-aws-auth` | AWS 凭据链解析与 SigV4 签名 |
 | `zuno-network` | 统一的出站 HTTP client、代理路由与 transport 策略 |
 | `zuno-mcp` | MCP stdio/remote client、工具、资源与 prompt |

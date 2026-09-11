@@ -11,9 +11,10 @@ adapter. The plan's original text remains available unchanged.
 
 The library is implemented independently of an HTTP entry point. The examples
 below are its configuration documents, **not registered stable `zuno.json` keys**.
-The enterprise BFF, login callback/session store, current organization policy,
-and operation approvals are subsequent integration work. A valid API identity
-does not certify those features.
+The [BFF/login and session stores](BROWSER.md) and [organization authorization](AUTHORIZATION.md)
+are implemented as separate host components. Complete runtime/profile startup and
+resource-handler integration remain separate work. A valid API identity does not
+grant operation permissions.
 
 ## Protocol boundaries
 
@@ -160,7 +161,7 @@ See [中文](AUTHENTICATION.zh.md) and [status](STATUS.md).
 
 Identity HTTP clients use `zuno-network` and honor the control-plane process proxy policy, including `NO_PROXY`. HTTPS, redirect refusal and request limits remain enforced by the identity adapter.
 
-Organization policy and durable approval storage are implemented separately; see [authorization](AUTHORIZATION.md). BFF/driver integration remains pending.
+Organization policy and durable approval storage are implemented separately; see [authorization](AUTHORIZATION.md). Resource/driver integration remains pending.
 
 ## Worker service and Job grants
 
@@ -196,5 +197,6 @@ The isolated verification script now tests real HTTPS against a temporary CA,
 workload/user separation, certificate refusal, redirect refusal, no POST replay,
 renewal and actual kernel continuation through two lease identities. It still runs
 within one test process; independent Worker processes, the Docker gateway and
-enterprise launch/profile assembly remain separate acceptance gates. BFF login and
-live identity-provider validation are also still pending.
+enterprise launch/profile assembly remain separate acceptance gates. BFF network
+and storage verification is described in [browser authentication](BROWSER.md);
+live identity-provider validation remains pending.

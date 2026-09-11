@@ -61,28 +61,39 @@ pub enum VerifiedIdentityKind {
 /// Scopes and roles below establish API admission, not tool/Memory authority.
 #[derive(Debug, Clone)]
 pub struct VerifiedIdentity {
+    issuer: String,
     tenant_id: TenantId,
     principal_id: PrincipalId,
     client_id: ClientId,
+    oauth_client_id: String,
     kind: VerifiedIdentityKind,
     expires_at_seconds: u64,
 }
 
 impl VerifiedIdentity {
     pub(crate) fn from_verified(
+        issuer: String,
         tenant_id: TenantId,
         principal_id: PrincipalId,
         client_id: ClientId,
+        oauth_client_id: String,
         kind: VerifiedIdentityKind,
         expires_at_seconds: u64,
     ) -> Self {
         Self {
+            issuer,
             tenant_id,
             principal_id,
             client_id,
+            oauth_client_id,
             kind,
             expires_at_seconds,
         }
+    }
+
+    #[must_use]
+    pub fn issuer(&self) -> &str {
+        &self.issuer
     }
 
     #[must_use]
@@ -98,6 +109,12 @@ impl VerifiedIdentity {
     #[must_use]
     pub fn client_id(&self) -> &ClientId {
         &self.client_id
+    }
+
+    /// Issuer-native client proof for OIDC binding. `client_id` remains the
+    /// separately namespaced application identity used by organization policy.
+    pub fn oauth_client_id(&self) -> &str {
+        &self.oauth_client_id
     }
 
     #[must_use]
@@ -243,9 +260,11 @@ impl AccessTokenVerifier for EntraVerifier {
             }
         };
         Ok(VerifiedIdentity {
+            issuer: self.config.issuer(),
             tenant_id: TenantId::new(tenant).map_err(|_| TokenRejection::Claims)?,
             principal_id: PrincipalId::new(subject).map_err(|_| TokenRejection::Claims)?,
-            client_id: ClientId::new(client).map_err(|_| TokenRejection::Claims)?,
+            client_id: ClientId::new(client.clone()).map_err(|_| TokenRejection::Claims)?,
+            oauth_client_id: client,
             kind,
             expires_at_seconds: claims.exp,
         })

@@ -2,7 +2,8 @@
 
 当前适配器提供作用域化会话、运行时 Job、组织审批及共享内核的 `TurnPersistence`。
 `AgentApplication` 和普通有界驱动通过相同契约使用 SQLite 或 PostgreSQL，并支持持久等待消费。
-Worker 认证传输已使用此适配器；PostgreSQL Memory、浏览器登录和完整运行时装配仍在后续实施。
+Worker 认证传输和[浏览器登录／会话存储](BROWSER.zh.md)已使用此适配器；
+PostgreSQL Memory 和完整运行时装配仍在后续实施。
 这个库不单独注册企业服务器或 Worker。
 
 ## 数据库边界
@@ -135,3 +136,19 @@ Worker、执行不确定性、闲置所有者分页、RLS 和审核写入失败�
 
 固定格式 5 fixture 验证迁移失败／成功都保留等待、Job 预算、租约、消息和用量。
 内部 Worker 协议版本为 3，与公共 UI DTO 分离。
+
+## 浏览器认证状态
+
+当前格式 7 增加租户作用域的 `browser_login`、`browser_session` 和
+`authentication_audit`。浏览器身份尚未确认时，只有部署固定的租户可查询加密登录事务
+或凭据摘要；工厂属于宿主 BFF，公开请求不能选择租户或数据库主体。三张表均强制 RLS，
+查询另外保留显式租户条件。
+
+登录事务通过数据库时间下的一次 `DELETE ... RETURNING` 原子消费，并在 token POST
+之前提交；错误绑定不消费其他浏览器的事务。事务级锁保护配置的容量上限，过期记录
+按有界批次清理。会话创建／撤销与审计同时提交或回滚，存储记录还需与索引列的凭据、
+主体和到期时间一致。
+
+格式 1–6 均原子前向迁移。捕获的格式 6 fixture 在失败和成功迁移前后保留会话、
+message／part、等待 Job 和输入回执。BFF 与 Worker 的网络验证使用同一临时 TLS 集群
+中的独立数据库。完整接口见[浏览器认证](BROWSER.zh.md)。

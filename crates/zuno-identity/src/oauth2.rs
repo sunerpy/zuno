@@ -334,12 +334,15 @@ impl OAuth2ClaimsPolicy {
         // length framing; delimiters or Unicode cannot create identity collisions.
         let principal = PrincipalId::new(framed_id(domain, issuer, subject))
             .map_err(|_| TokenRejection::Claims)?;
+        let oauth_client_id = client.to_owned();
         let client = ClientId::new(framed_id("oauth2-client-v1", issuer, client))
             .map_err(|_| TokenRejection::Claims)?;
         Ok(VerifiedIdentity::from_verified(
+            issuer.to_owned(),
             self.tenant_id.clone(),
             principal,
             client,
+            oauth_client_id,
             kind,
             exp,
         ))
