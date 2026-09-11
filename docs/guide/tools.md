@@ -25,12 +25,51 @@ The default model-visible surface is deliberately small:
 | `webfetch` | Retrieve one URL | Read-only |
 | `web_search` | Batch web search | Read-only |
 | `skill` | Discover and load reusable instructions | Read-only |
-| `question` | Ask a structured clarification during Plan | User-mediated |
+| `question` | Ask a structured Plan clarification, or register required input during ordinary Work | User-mediated |
+| `question_async` | Publish optional questions and continue independent work | User-mediated |
+| `plan_exit` | Request approval of the exact current Plan and saved Work identity | User-mediated; Plan only |
 
 Durable work state adds `plan_get`, `plan_update`, `todo_get`, `todo_update`, and
 `goal_get`/`goal_update`. Bounded `memory_read` and `memory_update` appear when memory is enabled;
 updates apply automatically unless a review policy is explicitly configured, and
 `council_run` when the active agent can reach it.
+
+## Durable questions and waiting
+
+Questions have stable request/item IDs and a revision. TUI, HTTP, and ACP use the
+same `QuestionPort`: publish, list/get, respond, and wait are separate operations.
+`question_async` returns a receipt immediately. A pending optional question does
+not prevent independent work or a final summary. `question` can wait for the first
+response; choosing **Defer** releases that wait without answering the question.
+Partial answers preserve completed items and leave the others pending.
+
+Actual answers enter the durable inbox exactly once, not both the tool result and
+a later callback. Responses carry `commandId` and `expectedRevision`; repeating
+the same command is idempotent, while stale revisions and changed command bodies
+are rejected. `question_async` is governed by the `question` permission key.
+No answer, highlighted option, timeout, cancellation, or Defer action is consent.
+
+Ordinary Work can register required input even without a Goal. Its session waits
+for that exact request; unrelated callbacks cannot resume it. Goal-owned
+`goal_request_input` uses the same service and atomically records both the Goal
+pause and session wait. Delegated children report blockers to their parent and
+cannot contact the user through these tools.
+
+`plan_exit` publishes a deferred, closed approval request. Only an explicit
+approve action can authorize Work, and only for the displayed Plan revision,
+saved Agent/model identity, and review state. Early approval waits for the source
+Plan turn's successful handoff. Changes or interruption invalidate stale consent.
+Draft review risk acceptance is explicit; the tool cannot provide it for the user.
+
+Automatic continuation requires runnable work. An unfinished Plan or blocked
+Todo alone is insufficient. `/resume` explicitly resumes previously authorized
+Work after a pause; it cannot bypass a pending human/external wait or authorize a
+Plan. A Goal must first be resumed with `/goal resume` when it is paused.
+
+Terminal `bg output`, `bg wait`, and callback delivery share a completion receipt.
+An inline read supersedes an unconsumed queued callback atomically; already
+promoted/consumed callbacks remain protected. Completions retain their original
+work cycle, rather than creating a new cycle that resets no-progress detection.
 
 `session_message` is filtered out of every delegated child tool snapshot, even when the
 parent Attempt contained its schema. At execution it verifies again that the source is a

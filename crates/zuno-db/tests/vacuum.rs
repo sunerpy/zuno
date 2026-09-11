@@ -537,6 +537,8 @@ fn vacuum_stats_counts_every_table_the_live_schema_actually_has() {
             "project",
             "project_directory",
             "provider_retry_backoff",
+            "question_action_receipt",
+            "question_interaction",
             "resident_memory_document",
             "resident_memory_provenance",
             "resident_memory_revision",

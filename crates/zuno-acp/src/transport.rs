@@ -237,6 +237,23 @@ impl Drop for PendingRequestGuard {
 }
 
 impl ClientConnection {
+    /// Clone for outbound RPCs supervised by the session rather than one prompt.
+    ///
+    /// Only prompt-owned pending-request tracking is cleared. The connection's
+    /// writer, ID sequence, disconnect state, and after-response notification
+    /// ordering remain shared. Completing or cancelling the originating prompt
+    /// cannot cancel requests made through this clone; disconnect still does.
+    ///
+    /// The host owns session shutdown and must drop/abort its supervised request
+    /// futures when the session closes.
+    #[must_use]
+    pub fn session_scoped(&self) -> Self {
+        Self {
+            scoped_requests: None,
+            ..self.clone()
+        }
+    }
+
     pub async fn session_update(&self, session_id: &str, update: Value) -> Result<(), RpcError> {
         self.notify(
             "session/update",
@@ -948,6 +965,10 @@ pub(crate) mod test_client {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "durable_question_tests.rs"]
+mod durable_question_tests;
 
 #[cfg(test)]
 mod tests {

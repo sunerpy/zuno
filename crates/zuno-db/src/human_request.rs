@@ -167,8 +167,10 @@ impl HumanRequestStore {
         let connection = self.pool.get()?;
         let count = connection
             .query_row(
-                "SELECT COUNT(*) FROM human_request \
-                 WHERE session_id = ?1 AND goal_id = ?2 AND state = 'pending'",
+                "SELECT COUNT(*) FROM human_request h \
+                 LEFT JOIN question_interaction q ON q.request_id = h.id \
+                 WHERE h.session_id = ?1 AND h.goal_id = ?2 AND h.state = 'pending' \
+                   AND (h.kind = 'permission' OR q.request_id IS NULL OR q.purpose = 'required_input')",
                 params![session_id, goal_id],
                 |row| row.get::<_, i64>(0),
             )

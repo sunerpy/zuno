@@ -1,0 +1,436 @@
+//! Scheduling additions to the unreleased format 13, using frozen released
+//! fixtures. Only the documented stale-running/no-progress repair changes rows.
+
+use rusqlite::{Connection, params, types::Value};
+use serde_json::json;
+use zuno_db::event_log::{NewSessionEvent, append_in};
+use zuno_db::{migration, open, session_execution};
+use zuno_paths::DbLocation;
+use zuno_types::execution::{
+    SessionExecutionPhase, SessionPauseReason, SessionReadiness, SessionWakeSignal, WakeAdmission,
+};
+
+const SESSION: &str = "ses_fixture_0001";
+
+fn legacy(format: u32) -> Connection {
+    let connection = open::open(&DbLocation::Memory).expect("database");
+    connection
+        .execute_batch(match format {
+            5 => include_str!("fixtures/format-5.sql"),
+            6 => include_str!("fixtures/format-6.sql"),
+            _ => include_str!("fixtures/format-7.sql"),
+        })
+        .expect("released base schema");
+    for (next, sql) in [
+        (8, include_str!("fixtures/format-8.sql")),
+        (9, include_str!("fixtures/format-9.sql")),
+        (10, include_str!("fixtures/format-10.sql")),
+        (11, include_str!("fixtures/format-11.sql")),
+        (12, include_str!("fixtures/format-12.sql")),
+    ] {
+        if format >= next {
+            connection
+                .execute_batch(sql)
+                .expect("released schema delta");
+        }
+    }
+    assert_eq!(marker(&connection), format);
+    // Opening a legacy fixture must not mutate it before migration::apply.
+    assert!(!has_scheduling(&connection));
+    connection
+}
+
+fn marker(connection: &Connection) -> u32 {
+    connection
+        .query_row("SELECT format FROM zuno_schema", [], |row| row.get(0))
+        .expect("marker")
+}
+
+fn has_scheduling(connection: &Connection) -> bool {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('session_execution_state') WHERE name='scheduling')",
+        [], |row| row.get(0),
+    ).expect("column inventory")
+}
+
+fn rows(connection: &Connection, sql: &str) -> Vec<Vec<Value>> {
+    let mut statement = connection.prepare(sql).expect("snapshot query");
+    let count = statement.column_count();
+    statement
+        .query_map([], |row| {
+            (0..count)
+                .map(|index| row.get(index))
+                .collect::<rusqlite::Result<Vec<Value>>>()
+        })
+        .expect("snapshot rows")
+        .collect::<Result<_, _>>()
+        .expect("snapshot values")
+}
+
+fn preserved_rows(connection: &Connection) -> Vec<(String, Vec<Vec<Value>>)> {
+    [
+        "session",
+        "message",
+        "memory_candidate",
+        "human_request",
+        "event",
+        "work_plan",
+    ]
+    .into_iter()
+    .filter(|table| {
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+                [table],
+                |row| row.get::<_, bool>(0),
+            )
+            .expect("table inventory")
+    })
+    .map(|table| {
+        let columns = connection
+            .prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
+            .expect("columns")
+            .query_map([table], |row| row.get::<_, String>(0))
+            .expect("column names")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read columns");
+        let columns = columns
+            .into_iter()
+            .map(|column| format!("\"{column}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let query = format!("SELECT {columns} FROM {table} ORDER BY rowid");
+        let snapshot = rows(connection, &query);
+        (query, snapshot)
+    })
+    .collect()
+}
+
+fn assert_preserved(connection: &Connection, before: &[(String, Vec<Vec<Value>>)]) {
+    for (query, snapshot) in before {
+        assert_eq!(&rows(connection, query), snapshot, "{query}");
+    }
+}
+
+fn phase_event(connection: &mut Connection, properties: serde_json::Value) -> String {
+    let transaction = connection.transaction().expect("event transaction");
+    let event = append_in(
+        &transaction,
+        SESSION,
+        NewSessionEvent::new(
+            "session.driver.phase",
+            properties.as_object().expect("properties").clone(),
+        )
+        .expect("event"),
+    )
+    .expect("append");
+    transaction.commit().expect("event commit");
+    event.id
+}
+
+fn paused_event() -> serde_json::Value {
+    json!({
+        "cycleId": "driver-origin-cycle",
+        "phase": "paused",
+        "pauseReason": "no_progress",
+        "reason": "no_progress",
+        "progressFingerprint": "sha256:unchanged",
+        "unchangedProgressCount": 3,
+        "reconciliationAttempt": 3
+    })
+}
+
+fn stale_running(connection: &Connection) {
+    connection.execute(
+        "UPDATE session_execution_state SET revision=15, phase='running', cycle_id='callback-cycle',
+         work_identity=?1, authorized_plan_id='plan-preserved', authorized_plan_revision=4,
+         handoff_plan_id='plan-preserved', handoff_plan_revision=4, continuation=?2,
+         draft_review_risk=?3 WHERE session_id=?4",
+        params![
+            "{ \"agent\" : \"build\", \"providerId\" : \"provider\", \"modelId\" : \"model\", \"reasoning\" : \"high\" }",
+            r#"{ "cycleId":"callback-cycle", "identity":{"agent":"build","providerId":"provider","modelId":"model","reasoning":"high"}, "mode":"work", "planId":"plan-preserved", "planRevision":4, "contextEpoch":7, "anchorMessageId":"message-preserved" }"#,
+            r#"{ "reviewId":"review-preserved", "reviewRevision":2, "reason":"explicit risk acceptance", "timeAccepted":2 }"#,
+            SESSION
+        ],
+    ).expect("stale execution state");
+}
+
+#[test]
+fn every_released_format_five_through_twelve_adds_nullable_scheduling_and_preserves_rows() {
+    for format in 5..=12 {
+        let mut connection = legacy(format);
+        let before = preserved_rows(&connection);
+        let execution = if format >= 10 {
+            Some(rows(
+                &connection,
+                "SELECT * FROM session_execution_state ORDER BY session_id",
+            ))
+        } else {
+            None
+        };
+        migration::apply(&mut connection).unwrap_or_else(|error| {
+            panic!("format {format}: {}", zuno_error::source::describe(&error))
+        });
+        assert_eq!(marker(&connection), 13);
+        assert!(has_scheduling(&connection));
+        assert_preserved(&connection, &before);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM session_execution_state WHERE scheduling IS NOT NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("legacy metadata"),
+            0,
+            "format {format}"
+        );
+        if let Some(execution) = execution {
+            let after = rows(
+                &connection,
+                "SELECT session_id,revision,mode,work_identity,authorized_plan_id,
+                        authorized_plan_revision,handoff_plan_id,handoff_plan_revision,
+                        draft_review_risk,cycle_id,phase,continuation,time_created,time_updated
+                 FROM session_execution_state ORDER BY session_id",
+            );
+            assert_eq!(after, execution, "format {format}");
+        }
+        migration::apply(&mut connection).expect("validate again");
+        assert_preserved(&connection, &before);
+        for invalid in ["[]", "null", "true", "\"text\"", "1", "{"] {
+            // No row exists before format 10, so test the CHECK on a fixture row
+            // only where execution state was already durable.
+            if format >= 10 {
+                assert!(
+                    connection
+                        .execute(
+                            "UPDATE session_execution_state SET scheduling=?1",
+                            [invalid],
+                        )
+                        .is_err(),
+                    "format {format} accepted {invalid}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn legacy_no_progress_repair_preserves_authority_cycle_and_progress_without_a_goal() {
+    for format in 10..=12 {
+        let mut connection = legacy(format);
+        stale_running(&connection);
+        phase_event(&mut connection, paused_event());
+        // The callback reset execution's cycle, while its latest driver phase
+        // still carries the durable no-progress pause from the prior cycle.
+        let before = preserved_rows(&connection);
+        let control_query = "SELECT mode,work_identity,authorized_plan_id,authorized_plan_revision,
+                    handoff_plan_id,handoff_plan_revision,draft_review_risk,cycle_id,
+                    continuation,time_created,time_updated
+             FROM session_execution_state";
+        let control = rows(&connection, control_query);
+        migration::apply(&mut connection).expect("repair and upgrade");
+        assert_preserved(&connection, &before);
+        assert_eq!(
+            rows(&connection, control_query),
+            control,
+            "original JSON bytes"
+        );
+        let repaired = session_execution::read_in(&connection, SESSION)
+            .expect("read")
+            .expect("state");
+        assert_eq!(repaired.revision, 16);
+        assert_eq!(repaired.phase, SessionExecutionPhase::Paused);
+        assert_eq!(repaired.cycle_id.as_deref(), Some("callback-cycle"));
+        let scheduling = repaired.scheduling.as_ref().expect("repaired scheduling");
+        assert_eq!(
+            scheduling.readiness,
+            SessionReadiness::Paused {
+                reason: SessionPauseReason::NoProgress
+            }
+        );
+        assert_eq!(
+            scheduling.progress_fingerprint.as_deref(),
+            Some("sha256:unchanged")
+        );
+        assert_eq!(scheduling.unchanged_progress_count, 3);
+        for signal in [
+            SessionWakeSignal::Automatic,
+            SessionWakeSignal::Recovery,
+            SessionWakeSignal::Callback,
+        ] {
+            assert_eq!(repaired.wake_admission(&signal), WakeAdmission::Reject);
+        }
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM human_request", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("requests"),
+            0
+        );
+        assert!(
+            !connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='goal')",
+                    [],
+                    |row| row.get::<_, bool>(0)
+                )
+                .expect("Goal table")
+        );
+        migration::apply(&mut connection).expect("reopen current format");
+        assert_eq!(
+            session_execution::read_in(&connection, SESSION).expect("read"),
+            Some(repaired)
+        );
+    }
+}
+
+#[test]
+fn legacy_repair_uses_only_the_latest_supported_structured_driver_phase() {
+    for case in [
+        "prose_only",
+        "executing",
+        "reconciling",
+        "user_pause",
+        "future_phase",
+        "already_paused",
+    ] {
+        let mut connection = legacy(12);
+        stale_running(&connection);
+        connection.execute(
+            "UPDATE message SET data=?1 WHERE id='msg_fixture_0001'",
+            [r#"{"role":"assistant","text":"无可执行工作。等待用户批准。No executable work; waiting for your approval."}"#],
+        ).expect("assistant prose is not scheduling evidence");
+        if case != "prose_only" {
+            phase_event(&mut connection, paused_event());
+        }
+        match case {
+            "executing" | "reconciling" => {
+                phase_event(
+                    &mut connection,
+                    json!({
+                        "cycleId":"callback-cycle", "phase":case, "reconciliationAttempt":0
+                    }),
+                );
+            }
+            "user_pause" => {
+                phase_event(
+                    &mut connection,
+                    json!({
+                        "cycleId":"callback-cycle", "phase":"paused", "pauseReason":"user"
+                    }),
+                );
+            }
+            "future_phase" => {
+                let id = phase_event(&mut connection, paused_event());
+                connection
+                    .execute(
+                        "UPDATE event SET type='session.driver.phase.2' WHERE id=?1",
+                        [id],
+                    )
+                    .expect("unknown future event schema");
+            }
+            "already_paused" => {
+                connection
+                    .execute("UPDATE session_execution_state SET phase='paused'", [])
+                    .expect("no stale-running discrepancy");
+            }
+            _ => {}
+        }
+        let old_state = rows(
+            &connection,
+            "SELECT session_id,revision,phase,cycle_id,continuation FROM session_execution_state",
+        );
+        let before = preserved_rows(&connection);
+        migration::apply(&mut connection).expect("conservative upgrade");
+        assert_preserved(&connection, &before);
+        assert_eq!(
+            rows(
+                &connection,
+                "SELECT session_id,revision,phase,cycle_id,continuation FROM session_execution_state"
+            ),
+            old_state,
+            "{case}"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT scheduling FROM session_execution_state",
+                    [],
+                    |row| row.get::<_, Option<String>>(0)
+                )
+                .expect("metadata"),
+            None,
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn final_marker_failure_rolls_back_the_column_repair_and_question_companions() {
+    let mut connection = legacy(12);
+    stale_running(&connection);
+    phase_event(&mut connection, paused_event());
+    connection
+        .execute_batch(
+            "CREATE TRIGGER scheduling_marker_failure BEFORE UPDATE OF format ON zuno_schema
+         WHEN NEW.format=13 BEGIN
+           SELECT CASE WHEN (SELECT phase FROM session_execution_state LIMIT 1) <> 'paused'
+             THEN RAISE(ABORT,'repair must precede marker') END;
+           SELECT CASE WHEN NOT EXISTS(
+             SELECT 1 FROM pragma_table_info('session_execution_state') WHERE name='scheduling')
+             THEN RAISE(ABORT,'column must precede marker') END;
+           SELECT RAISE(ABORT,'final marker refused');
+         END;",
+        )
+        .expect("trap the final marker write");
+    let before = preserved_rows(&connection);
+    let inventory = rows(
+        &connection,
+        "SELECT type,name,sql FROM sqlite_schema ORDER BY name",
+    );
+    let old_execution = rows(&connection, "SELECT * FROM session_execution_state");
+    let error = migration::apply(&mut connection).expect_err("final marker trap");
+    assert!(
+        zuno_error::source::describe(&error).contains("final marker refused"),
+        "{error:?}"
+    );
+    assert_eq!(marker(&connection), 12);
+    assert!(!has_scheduling(&connection));
+    assert_eq!(
+        rows(
+            &connection,
+            "SELECT type,name,sql FROM sqlite_schema ORDER BY name"
+        ),
+        inventory
+    );
+    assert_eq!(
+        rows(&connection, "SELECT * FROM session_execution_state"),
+        old_execution
+    );
+    assert_preserved(&connection, &before);
+}
+
+#[test]
+fn current_marker_with_missing_scheduling_column_fails_without_mutation() {
+    let mut connection = legacy(12);
+    migration::apply(&mut connection).expect("upgrade");
+    connection
+        .execute_batch("ALTER TABLE session_execution_state DROP COLUMN scheduling;")
+        .expect("simulate incomplete current format");
+    let inventory = rows(
+        &connection,
+        "SELECT type,name,sql FROM sqlite_schema ORDER BY name",
+    );
+    let before = preserved_rows(&connection);
+    assert!(migration::apply(&mut connection).is_err());
+    assert_eq!(marker(&connection), 13);
+    assert_eq!(
+        rows(
+            &connection,
+            "SELECT type,name,sql FROM sqlite_schema ORDER BY name"
+        ),
+        inventory
+    );
+    assert_preserved(&connection, &before);
+}

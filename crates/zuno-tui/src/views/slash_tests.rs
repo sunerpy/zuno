@@ -138,6 +138,56 @@ fn plan_controls_are_host_commands_and_never_model_text() {
 }
 
 #[test]
+fn questions_and_resume_are_native_controls_with_unmodified_arguments() {
+    for (text, expected) in [
+        ("/questions", HostCommand::Questions(String::new())),
+        (
+            "/questions open que_saved",
+            HostCommand::Questions("open que_saved".to_owned()),
+        ),
+        ("/resume", HostCommand::Resume(String::new())),
+        (
+            "/resume unexpected",
+            HostCommand::Resume("unexpected".to_owned()),
+        ),
+    ] {
+        assert_eq!(route(text), SlashSubmission::Host(expected));
+    }
+    let router = SlashRouter::new([
+        CatalogCommand::new("questions", None),
+        CatalogCommand::skill("resume", None, "/skills/resume/SKILL.md"),
+    ]);
+    for name in ["questions", "resume"] {
+        let commands = router
+            .commands()
+            .iter()
+            .filter(|command| command.name == name)
+            .collect::<Vec<_>>();
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(commands[0].kind, SlashCommandKind::Host(_)));
+    }
+    assert_eq!(
+        route("//resume"),
+        SlashSubmission::Prompt("/resume".to_owned())
+    );
+}
+
+#[test]
+fn common_session_commands_are_advertised_once_with_the_shared_metadata() {
+    let router = SlashRouter::default();
+    for common in SessionCommand::ALL {
+        let commands = router
+            .commands()
+            .iter()
+            .filter(|command| command.name == common.name())
+            .collect::<Vec<_>>();
+        assert_eq!(commands.len(), 1, "{}", common.name());
+        assert_eq!(commands[0].description, common.description());
+        assert!(matches!(commands[0].kind, SlashCommandKind::Host(_)));
+    }
+}
+
+#[test]
 fn host_commands_win_catalog_name_collisions() {
     let router = SlashRouter::new([
         CatalogCommand::new("compact", None),
@@ -180,7 +230,6 @@ fn supported_ui_commands_and_aliases_dispatch_actions() {
         ("/skill", "prompt_skills"),
         ("/sessions", "session_list"),
         ("/session", "session_list"),
-        ("/resume", "session_list"),
         ("/continue", "session_list"),
         ("/new", "session_new"),
         ("/diff", "diff_open"),

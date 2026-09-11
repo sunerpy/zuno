@@ -178,6 +178,7 @@ pub fn tool_affordance(name: &str) -> (&'static str, &'static str) {
         // Tools that are about to block on the user share the one glyph that reads as a
         // question; their labels still distinguish general and goal-specific elicitation.
         "question" => ("?", "Asking..."),
+        "question_async" => ("?", "Question pending"),
         "goal_request_input" => ("?", "Clarifying the goal..."),
         "skill" => ("✦", "Loading skill..."),
         "lsp" => ("⌁", "Querying language server..."),

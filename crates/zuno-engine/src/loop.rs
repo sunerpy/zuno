@@ -7185,6 +7185,14 @@ fn attempt_snapshot(input: AttemptSnapshotInput<'_>) -> AttemptSnapshot {
             actual_sha256: prompt_actual_sha256,
         },
         tools,
+        parent_authority: agent
+            .orchestration_seed
+            .as_ref()
+            .and_then(|seed| seed.parent_authority.clone()),
+        cycle_id: agent
+            .orchestration_seed
+            .as_ref()
+            .and_then(|seed| seed.cycle_id.clone()),
     }
 }
 

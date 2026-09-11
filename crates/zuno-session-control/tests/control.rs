@@ -16,6 +16,9 @@ use zuno_types::execution::{
 
 const SESSION: &str = "ses_control";
 
+#[path = "control/questions.rs"]
+mod questions;
+
 struct Fixture {
     _spill: TempDir,
     pool: Arc<Pool>,

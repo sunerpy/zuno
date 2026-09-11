@@ -172,7 +172,7 @@ fn default_rules(dynamic: &DynamicRules) -> Vec<Rule> {
     ];
     rules.extend(dynamic.external.iter().skip(1).cloned());
     rules.extend([
-        rule("question", "*", PermissionAction::Deny),
+        rule("question", "*", PermissionAction::Allow),
         rule("plan_enter", "*", PermissionAction::Deny),
         rule("plan_exit", "*", PermissionAction::Deny),
         rule("read", "*", PermissionAction::Allow),

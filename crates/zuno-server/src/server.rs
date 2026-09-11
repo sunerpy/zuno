@@ -32,6 +32,56 @@ use crate::discovery::{self, LocalServerRegistration};
 use crate::{AuthConfig, EventFanout, RequestBroker};
 
 pub type SessionMutationFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>>;
+pub type SessionResumeFuture = Pin<
+    Box<dyn Future<Output = Result<SessionResumeOutcome, SessionResumeError>> + Send + 'static>,
+>;
+
+#[derive(Debug, Clone)]
+pub struct SessionResumeRequest {
+    pub session_id: String,
+    pub expected_revision: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionResumeOutcome {
+    /// The existing, committed control input; HTTP must not admit it again.
+    pub input: zuno_db::inbox::SessionInput,
+    pub execution_revision: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionControlExecution {
+    pub session_id: String,
+    pub directory: PathBuf,
+    pub input_id: String,
+    /// The exact Work identity and authority frozen by session control.
+    pub continuation: zuno_types::execution::ContinuationToken,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SessionResumeError {
+    #[error("{0}")]
+    Invalid(String),
+    #[error("{0}")]
+    NotFound(String),
+    #[error("{0}")]
+    Conflict(String),
+    #[error("{0}")]
+    Internal(String),
+}
+
+/// Optional client control capability, registered only with both real handlers.
+pub trait SessionControlExecutor: SessionMutationExecutor {
+    fn resume(&self, request: SessionResumeRequest) -> SessionResumeFuture;
+
+    fn control(
+        &self,
+        request: SessionControlExecution,
+        guard: SessionRunGuard,
+        events: TurnEventSender,
+    ) -> SessionMutationFuture;
+}
+
 pub type SessionMemoryPolicyFuture = Pin<
     Box<
         dyn Future<

@@ -316,6 +316,8 @@ fn trace_seed() -> Arc<AttemptSeed> {
         parent_attempt: None,
         workflow: None,
         workflow_node: None,
+        parent_authority: None,
+        cycle_id: None,
     })
 }
 
@@ -634,6 +636,7 @@ fn seeded_shared_pool_with_goal_schema() -> Arc<Pool> {
 }
 
 fn seed_durable_compaction_state(pool: Arc<Pool>) {
+    bind_loop_cycle(&pool);
     let connection = pool
         .open_connection()
         .expect("open durable state connection");
@@ -692,25 +695,42 @@ fn seed_durable_compaction_state(pool: Arc<Pool>) {
                 "workItemID": "todo_compaction"
             }),
             107,
-            Some(NewSessionInput::new(
-                "input_compaction_report",
-                SESSION_ID,
-                json!({
-                    "kind": "subagentReport",
-                    "jobID": "job_compaction",
-                    "text": "durable report",
-                    "references": {
-                        "goalID": "goal_compaction",
-                        "planID": "plan_compaction",
-                        "workItemID": "todo_compaction"
-                    }
-                }),
-                InputDelivery::Queue,
-                107,
-            )),
+            Some(
+                NewSessionInput::new(
+                    "input_compaction_report",
+                    SESSION_ID,
+                    json!({
+                        "kind": "subagentReport",
+                        "jobID": "job_compaction",
+                        "text": "durable report",
+                        "references": {
+                            "goalID": "goal_compaction",
+                            "planID": "plan_compaction",
+                            "workItemID": "todo_compaction"
+                        }
+                    }),
+                    InputDelivery::Queue,
+                    107,
+                )
+                .with_cycle_id(Some("loop-cycle")),
+            ),
         ),
     )
     .expect("settle Job with one next-step report");
+}
+
+fn bind_loop_cycle(pool: &Arc<Pool>) {
+    let store = zuno_db::session_execution::SessionExecutionStore::new(Arc::clone(pool));
+    let mut state = store
+        .seed(
+            SESSION_ID,
+            zuno_types::execution::CollaborationMode::Work,
+            None,
+            1,
+        )
+        .expect("execution");
+    state.cycle_id = Some("loop-cycle".to_owned());
+    store.update(state.revision, state).expect("bound cycle");
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2643,26 +2663,30 @@ async fn loop_injects_a_durable_background_report_at_the_tool_safe_point() {
     }
     let mut connection = pool.get().expect("turn connection");
     put_user(&connection, "msg_user", 10, "echo hello");
+    bind_loop_cycle(&pool);
     let inbox = SessionInbox::new(Arc::clone(&pool));
     inbox
-        .admit(NewSessionInput::new(
-            "msg_steer",
-            SESSION_ID,
-            json!({
-                "kind": "subagentReport",
-                "jobID": "job_report",
-                "childSessionID": "ses_child",
-                "status": "completed",
-                "text": "include benchmark",
-                "metadata": {
-                    "schemaVersion": 1,
-                    "agent": "explorer",
-                    "finalText": "include benchmark"
-                }
-            }),
-            InputDelivery::Steer,
-            11,
-        ))
+        .admit(
+            NewSessionInput::new(
+                "msg_steer",
+                SESSION_ID,
+                json!({
+                    "kind": "subagentReport",
+                    "jobID": "job_report",
+                    "childSessionID": "ses_child",
+                    "status": "completed",
+                    "text": "include benchmark",
+                    "metadata": {
+                        "schemaVersion": 1,
+                        "agent": "explorer",
+                        "finalText": "include benchmark"
+                    }
+                }),
+                InputDelivery::Steer,
+                11,
+            )
+            .with_cycle_id(Some("loop-cycle")),
+        )
         .expect("admit steer");
     let run_registry = SessionRunRegistry::new();
     let guard = run_registry.begin_turn(SESSION_ID).expect("live turn");

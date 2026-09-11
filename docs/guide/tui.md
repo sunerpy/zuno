@@ -221,6 +221,8 @@ cannot shadow a runtime control.
 | `/plan` | Enter Plan mode idempotently |
 | `/start-plan` | Enter read-only Plan mode immediately |
 | `/start-work` | Authorize the exact handoff-ready Plan revision and start implementation |
+| `/questions [list \| open <request-id> \| <request-id>]` | List pending questions or reopen a saved form |
+| `/resume` | Explicitly resume paused or completed Work using its saved execution identity |
 | `/preset` | Switch the configured model team, or choose one |
 | `/council` | Run a native multi-agent Council preset |
 | `/undo` | Restore the worktree before the last completed turn |
@@ -249,6 +251,10 @@ notice code in brackets. They are not model output.
 
 Resource pickers follow the same naming: `/model`, `/agent`, `/session`, `/skill`,
 `/theme`, `/mcp`, `/diff`, `/commands`, `/help`.
+
+Use `/session`, `/sessions`, or `/continue` to choose a saved session. `/resume` resumes
+Work in the current session. It does not approve a Plan or bypass a required human or
+external wait; an inactive Goal must be resumed explicitly with `/goal resume`.
 
 `/session` reopens the chosen session under *its* saved Agent, model, and effort — the
 current session's picks do not follow you — and a `/model`, `/agent`, `/preset`, or
@@ -296,15 +302,52 @@ yourself, and then delete the file to re-enable restores.
 ## Permission prompts and questions
 
 Tool-owned human input replaces the composer region rather than adding a transcript card.
-A permission prompt reports awaiting approval; a Plan structured question reports awaiting
-answer. Ordinary Work does not park this interaction and asks directly at a turn boundary
-only when no safe default exists.
+A permission prompt reports awaiting approval. A required question can pause ordinary
+Work or a Goal until a real answer arrives. Optional deferred questions remain available
+while the Agent continues independent work and writes its final summary.
 
 Permission choices accept Left and Right, the Up and Down aliases, Enter, and mouse
 selection; explicit expansion moves the prompt to a larger overlay. Questions show
 `Question i/n`, the remaining unanswered count, numbered choices, and a numbered `Other`
-input, with per-question cursors and custom drafts surviving navigation. Cancelling either
-resolves the tool as a typed denial and never fabricates an answer.
+input, with per-question cursors and custom drafts surviving navigation. Cancelling a
+permission prompt produces a typed denial; cancelling a question records its cancellation
+without fabricating an answer.
+
+Open `/questions` or `/questions list` to see pending request IDs, revisions, confirmed
+answer counts, and saved draft counts. Select a row, or enter `/questions open <request-id>`
+(`/questions <request-id>` also works), to reopen it. This control remains available
+while a turn is running.
+
+### Saving a question draft
+
+`Ctrl+S` saves the current form as a draft and closes it after requesting the save.
+The successful save receipt confirms that it is durable. Reopening the session after
+a process restart restores those saved values through `/questions`, including custom
+text and blank slots.
+
+Drafts and submitted answers are separate. A complete draft remains pending even when
+every question has a value. Navigation moves focus without selecting or submitting
+anything; an explicit submit confirms the completed form. Previously submitted answers
+remain confirmed while unsubmitted edits are shown as drafts. An empty draft slot stays
+blank when reopened instead of selecting a default.
+
+Saving a draft or submitting no answers creates no model input and does not resume
+a Goal or authorize Work. Draft values stay out of model input and tool receipts.
+Real submitted answers enter the durable FIFO once; retrying the same revision-bound
+command cannot deliver the answer twice. A stale form is rejected and can be reloaded
+with `/questions`.
+
+### Plan approval and cancellation
+
+Plan approval shows the stored Plan revision and Work Agent/model. Choose `approve` or
+`decline` explicitly. Approving a Draft review also requires your nonempty risk reason.
+Saving an `approve` choice with `Ctrl+S`, leaving a choice highlighted, or submitting
+nothing grants no authority. An approval can be saved while the Plan summary continues;
+Work starts only after a successful planning handoff and uses the stored Work identity.
+
+`Escape` cancels the question without approving or resuming work and retains the global
+turn-interruption behavior. Closing the TUI or disconnecting does not cancel pending
+requests; saved drafts remain available when the session is reopened.
 
 ## Mouse and scrolling
 

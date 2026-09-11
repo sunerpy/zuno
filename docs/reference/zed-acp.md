@@ -388,30 +388,31 @@ Structured `question` calls use ACP form controls rather than a generic prompt:
 - submitting `Other` takes precedence over selected options, matching the Zuno
   TUI, while an empty optional form is reported as unanswered.
 
-A form the user dismisses, one that expires, and one whose reply Zuno cannot
-read are decided outcomes, not lost work: the question tool reports the
-withdrawal to the model and the session's Goal keeps running. The durable record
-separates the two facts — the request is settled, and no answer was given — by
-storing an empty answer list together with an `outcome` of `cancelled`,
-`expired`, or `failed`. Permission dialogs follow the same rule: a dismissed
-reply, or one naming an option this dialog never offered, is recorded as
-`reject` together with the `outcome` that produced it, so a client bug cannot
-later be replayed as a deliberate rejection by the user.
+Questions are owned by the durable session, not the originating prompt RPC.
+`question_async` permits optional follow-up while the Agent continues independent
+work or finishes its summary. Native form cancellation defers without consent;
+an explicit decline cancels. Null/empty acceptance is not an answer. Saved
+`draftAnswers` remain separate from confirmed answers and are not sent to the
+model. The client can list and respond through `questions/list` and
+`questions/respond`, using stable item IDs, a command ID and expected revision.
+Only a matching required answer can clear its human-wait gate.
 
 When Zuno re-presents a question or permission left pending by an earlier
 process and the client cannot be reached at all, nothing is recorded. The
 request stays pending and answerable from the TUI or the HTTP API, this
 `session/prompt` ends with `stopReason: end_turn`, and sending another prompt
-presents it again.
+can inspect the pending set again. Malformed responses also leave the request
+untouched; they are not recorded as a user choice.
 
-After a form answer is accepted, Zuno immediately updates the same question
-tool call as `in_progress`. Its typed metadata records the authoritative
-`answered` outcome and sets `continuationPending: true`, so Zed keeps a visible
-activity row while the next provider request has no checkpointed output. At the
-next assistant checkpoint, Zuno sends the question's `completed` update first
-and then the committed continuation output. A terminal failure, interruption,
-or closed event stream also settles the question card while discarding any
-provisional provider text.
+New tool results are receipts; accepted answers enter the durable inbox once.
+The same service handles ordinary and Goal questions. `plan_exit` needs an
+explicit typed approve decision for the displayed Plan/review/Work identity.
+Early approval waits for successful source-cycle handoff; a normal compaction
+recovery may change the engine turn ID without changing that logical cycle.
+`/resume` resumes already-authorized paused Work, never a pending Plan approval.
+
+Older stored tool results containing authoritative answer metadata still replay
+as static answered cards, including their historical continuation markers.
 
 After settlement and on historical replay, the question remains a static tool
 card showing its prompt, choices, status, and—when durable answer metadata is

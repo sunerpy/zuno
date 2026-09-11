@@ -15,9 +15,14 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
 use zuno_error::ToolError;
+use zuno_tool::question::QuestionPort;
 use zuno_tool::{
     HistoryPolicy, METADATA_HUMAN_REQUEST_ID_KEY, Tool, ToolContext, ToolEffect, ToolOutput,
     ToolReplayPolicy, TypedTool, erase,
+};
+use zuno_types::question::{
+    QuestionMode, QuestionOption, QuestionOrigin, QuestionPurpose, QuestionRequest, QuestionSpec,
+    QuestionState,
 };
 
 /// Wire name of the goal reader.
@@ -499,16 +504,27 @@ impl TypedTool for UpdateGoalTool {
     }
 }
 
-/// Creates one durable human request and yields the autonomous Goal turn.
-#[derive(Debug, Clone)]
+/// Publishes required input through the host's question service, then yields.
+///
+/// The service resolves the current Goal and atomically binds the request and
+/// pause. This adapter neither reads Goal state nor waits for a human response.
+#[derive(Clone)]
 pub struct GoalRequestInputTool {
-    store: Arc<GoalStore>,
+    port: Arc<dyn QuestionPort>,
+}
+
+impl std::fmt::Debug for GoalRequestInputTool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GoalRequestInputTool")
+            .finish_non_exhaustive()
+    }
 }
 
 impl GoalRequestInputTool {
     #[must_use]
-    pub fn new(store: Arc<GoalStore>) -> Self {
-        Self { store }
+    pub fn new(port: Arc<dyn QuestionPort>) -> Self {
+        Self { port }
     }
 }
 
@@ -534,46 +550,63 @@ impl TypedTool for GoalRequestInputTool {
         ctx: ToolContext,
     ) -> Result<ToolOutput, ToolError> {
         validate_goal_request(&params)?;
-        let request_id = format!("que_{}", uuid::Uuid::new_v4().simple());
-        let payload = serde_json::json!({
-            "source": REQUEST_GOAL_INPUT_TOOL_ID,
-            "questions": [{
-                "question": params.question,
-                "header": params.header,
-                "options": params.options,
-                "multiple": params.multiple,
-                "custom": true,
-            }],
-        });
-        let store = Arc::clone(&self.store);
-        let session_id = ctx.session_id;
-        let message_id = ctx.message_id;
-        let call_id = ctx.call_id;
-        let expected_revision = params.expected_revision;
-        let request = tokio::task::spawn_blocking(move || {
-            store.request_human_input(
-                &session_id,
-                expected_revision,
-                request_id,
-                payload,
-                Some(message_id),
-                Some(call_id),
-            )
-        })
-        .await
-        .map_err(|error| failed(REQUEST_GOAL_INPUT_TOOL_ID, error))?
-        .map_err(|error| map_goal_error(REQUEST_GOAL_INPUT_TOOL_ID, error))?;
-        let request_value = serde_json::to_value(&request)
+        let coordinates = ctx.permission_origin();
+        let receipt = self
+            .port
+            .open(QuestionSpec {
+                origin: QuestionOrigin {
+                    session_id: coordinates.session_id().to_owned(),
+                    message_id: Some(coordinates.message_id().to_owned()),
+                    call_id: Some(coordinates.call_id().to_owned()),
+                    turn_id: ctx
+                        .orchestration_snapshot()
+                        .map(|snapshot| snapshot.turn_id.clone()),
+                    // Only the service may choose the current Goal inside its TX.
+                    goal_id: None,
+                },
+                mode: QuestionMode::Blocking,
+                purpose: QuestionPurpose::RequiredInput,
+                questions: vec![QuestionRequest {
+                    question: params.question,
+                    header: params.header,
+                    options: params
+                        .options
+                        .into_iter()
+                        .map(|option| QuestionOption {
+                            label: option.label,
+                            description: option.description,
+                        })
+                        .collect(),
+                    multiple: params.multiple,
+                    custom: Some(true),
+                }],
+                // The service binds goal_id before validating this provisional spec.
+                expected_goal_revision: Some(params.expected_revision),
+                plan: None,
+            })
+            .await
             .map_err(|error| failed(REQUEST_GOAL_INPUT_TOOL_ID, error))?;
+        let question = receipt.question;
         Ok(ToolOutput::text(
-            "Waiting for human input",
+            if question.state == QuestionState::Pending {
+                "Waiting for human input"
+            } else {
+                "Goal input receipt"
+            },
             format!(
-                "Goal paused. Durable human request `{}` is pending; this turn will stop.",
-                request.id
+                "Goal input request `{}` revision {} is recorded ({}). This turn will stop. \
+                 Human responses are delivered through the durable inbox, not this receipt.",
+                question.id,
+                question.revision,
+                question.state.as_str(),
             ),
         )
-        .with_metadata(METADATA_HUMAN_REQUEST_ID_KEY, request.id)
-        .with_metadata("humanRequest", request_value)
+        .with_metadata(METADATA_HUMAN_REQUEST_ID_KEY, question.id)
+        .with_metadata("questionRevision", question.revision)
+        .with_metadata("questionStatus", question.state.as_str())
+        .with_metadata("questionPurpose", question.purpose.as_str())
+        .with_metadata("questionCount", question.questions.len())
+        .with_metadata("questionDuplicate", receipt.duplicate)
         .with_continuation(zuno_tool::ToolContinuation::WaitingForHuman))
     }
 }
@@ -962,3 +995,7 @@ pub fn goal_from_metadata(output: &ToolOutput) -> Result<Option<Goal>, serde_jso
 #[cfg(test)]
 #[path = "tools_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "request_input_tests.rs"]
+mod request_input_tests;

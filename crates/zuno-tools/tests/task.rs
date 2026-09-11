@@ -280,10 +280,9 @@ fn every_governed_tool_id_is_a_real_production_tool() {
 fn every_default_builtin_the_model_can_see_is_governed_by_the_roster() {
     for slot in DEFAULT_BUILTINS {
         let id = slot.wire_id();
-        // `write` and `apply_patch` are governed under the `edit` key and `invalid` is
-        // the load-failure placeholder; `zuno-agent`'s `GOVERNED_TOOL_IDS` documents
-        // why naming them in a rule would be dead config.
-        if matches!(id, "write" | "apply_patch" | "invalid") {
+        let key = zuno_permission::visibility::permission_key(id);
+        // Aliases (including question_async) share their canonical boundary.
+        if id == "invalid" {
             assert!(
                 !GOVERNED_TOOL_IDS.contains(&id),
                 "`{id}` cannot be named by a rule and must stay out of the governed set"
@@ -291,7 +290,7 @@ fn every_default_builtin_the_model_can_see_is_governed_by_the_roster() {
             continue;
         }
         assert!(
-            GOVERNED_TOOL_IDS.contains(&id),
+            GOVERNED_TOOL_IDS.contains(&key),
             "`{id}` is on the default model surface but no permission set may name it, \
              so every deny-by-default Agent is blind to it: {GOVERNED_TOOL_IDS:?}"
         );

@@ -314,6 +314,19 @@ impl SessionInputAdmission {
         lease: TurnLease,
         steering: Option<SteeringContent>,
     ) -> InputAdmission {
+        match self.inbox.wake_admission(&input) {
+            Ok(
+                zuno_types::execution::WakeAdmission::Admit
+                | zuno_types::execution::WakeAdmission::Resume,
+            ) => {}
+            Ok(zuno_types::execution::WakeAdmission::Reject) => {
+                return InputAdmission::Pending { input };
+            }
+            Err(error) => {
+                tracing::warn!(%error, input_id = %input.id, "durable input wake deferred until scheduling can be verified");
+                return InputAdmission::Pending { input };
+            }
+        }
         let session_id = input.session_id.clone();
         let message = steering.map(|steering| {
             steering

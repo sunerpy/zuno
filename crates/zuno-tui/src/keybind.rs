@@ -2905,6 +2905,14 @@ pub const LOCAL_DEFINITIONS: &[Definition] = &[
         description: "Move to the next question option",
     },
     Definition {
+        name: "dialog.question.defer",
+        scope: "dialog.question",
+        keys: "ctrl+s",
+        command: "dialog.question.defer",
+        prevent_default: None,
+        description: "Keep current answers and answer later",
+    },
+    Definition {
         name: "dialog.permission.prev",
         scope: "dialog.permission",
         keys: "left",

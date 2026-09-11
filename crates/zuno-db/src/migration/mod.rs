@@ -4,8 +4,13 @@
 //! flywheel, the durable Plan stack, the tool-verification receipt ledger, and
 //! per-session memory policy add only tables, indices, and nullable/defaulted columns,
 //! so every upgrade can preserve every existing session, message, Plan, and
-//! resident-memory row. Other older, newer, or unmarked layouts are still rejected
-//! without mutation.
+//! resident-memory row. Format 13 adds question companion metadata and receipts
+//! without rewriting historical human-request payloads or responses. Other older,
+//! newer, or unmarked layouts are still rejected without mutation.
+//!
+//! Format 13 also adds nullable execution scheduling. The sole execution-row
+//! repair is a latest structured driver `paused/no_progress` event paired with
+//! stale `running` execution: preserve authority and cycle, persist the pause.
 
 use crate::{open, schema};
 use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehavior, params};
@@ -14,7 +19,7 @@ use zuno_error::DbError;
 /// Current database format.
 ///
 /// Bump this whenever [`crate::schema`] changes incompatibly.
-pub const CURRENT_FORMAT: u32 = 12;
+pub const CURRENT_FORMAT: u32 = 13;
 const LEARNING_UPGRADE_FROM: u32 = 5;
 const PLAN_STACK_UPGRADE_FROM: u32 = 6;
 const VERIFICATION_UPGRADE_FROM: u32 = 7;
@@ -22,6 +27,7 @@ const MEMORY_POLICY_UPGRADE_FROM: u32 = 8;
 const EXECUTION_UPGRADE_FROM: u32 = 9;
 const MEMORY_RUNTIME_UPGRADE_FROM: u32 = 10;
 const AUTOMATIC_MEMORY_UPGRADE_FROM: u32 = 11;
+const QUESTIONS_UPGRADE_FROM: u32 = 12;
 
 const FORMAT_TABLE: &str = "zuno_schema";
 const FORMAT_SQL: &str = "
@@ -112,6 +118,7 @@ fn dispatch_once(connection: &mut Connection) -> Result<Dispatch, DbError> {
         Some(EXECUTION_UPGRADE_FROM) => migrate_execution(connection),
         Some(MEMORY_RUNTIME_UPGRADE_FROM) => migrate_memory_runtime(connection),
         Some(AUTOMATIC_MEMORY_UPGRADE_FROM) => migrate_automatic_memory(connection),
+        Some(QUESTIONS_UPGRADE_FROM) => migrate_questions(connection),
         observed => Err(DbError::SchemaMismatch {
             expected: CURRENT_FORMAT,
             observed,
@@ -120,8 +127,22 @@ fn dispatch_once(connection: &mut Connection) -> Result<Dispatch, DbError> {
 }
 
 fn validate_current(connection: &Connection, tables: &[String]) -> Result<(), DbError> {
+    validate_format_twelve(connection, tables)?;
+    validate_questions_shape(connection)?;
+    validate_scheduling_shape(connection)
+}
+
+fn validate_format_twelve(connection: &Connection, tables: &[String]) -> Result<(), DbError> {
     validate_format_eleven(connection, tables)?;
-    validate_automatic_memory_shape(connection)
+    validate_automatic_memory_shape(connection)?;
+    validate_sql_objects(
+        connection,
+        &[
+            "human_request",
+            "human_request_session_state_created_idx",
+            "human_request_goal_state_created_idx",
+        ],
+    )
 }
 
 fn validate_format_eleven(connection: &Connection, tables: &[String]) -> Result<(), DbError> {
@@ -253,6 +274,7 @@ fn migrate_learning(connection: &mut Connection) -> Result<Dispatch, DbError> {
     schema::up_execution(&transaction)?;
     schema::up_memory_runtime(&transaction)?;
     schema::up_automatic_memory(&transaction)?;
+    add_questions(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -289,6 +311,7 @@ fn migrate_plan_stack(connection: &mut Connection) -> Result<Dispatch, DbError> 
     schema::up_execution(&transaction)?;
     schema::up_memory_runtime(&transaction)?;
     schema::up_automatic_memory(&transaction)?;
+    add_questions(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -324,6 +347,7 @@ fn migrate_verification(connection: &mut Connection) -> Result<Dispatch, DbError
     schema::up_execution(&transaction)?;
     schema::up_memory_runtime(&transaction)?;
     schema::up_automatic_memory(&transaction)?;
+    add_questions(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -360,6 +384,7 @@ fn migrate_memory_policy(connection: &mut Connection) -> Result<Dispatch, DbErro
     schema::up_execution(&transaction)?;
     schema::up_memory_runtime(&transaction)?;
     schema::up_automatic_memory(&transaction)?;
+    add_questions(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -395,6 +420,7 @@ fn migrate_execution(connection: &mut Connection) -> Result<Dispatch, DbError> {
     schema::up_execution(&transaction)?;
     schema::up_memory_runtime(&transaction)?;
     schema::up_automatic_memory(&transaction)?;
+    add_questions(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -430,6 +456,7 @@ fn migrate_memory_runtime(connection: &mut Connection) -> Result<Dispatch, DbErr
     }
     schema::up_memory_runtime(&transaction)?;
     schema::up_automatic_memory(&transaction)?;
+    add_questions(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -457,7 +484,7 @@ fn migrate_automatic_memory(connection: &mut Connection) -> Result<Dispatch, DbE
     }
     validate_format_eleven(&transaction, &tables)?;
     schema::up_automatic_memory(&transaction)?;
-    validate_automatic_memory_shape(&transaction)?;
+    add_questions(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -471,6 +498,164 @@ fn migrate_automatic_memory(connection: &mut Connection) -> Result<Dispatch, DbE
     }
     transaction.commit().map_err(map_error)?;
     Ok(Dispatch::Settled)
+}
+
+/// Add format-13 companions without rewriting any released format-12 row.
+fn migrate_questions(connection: &mut Connection) -> Result<Dispatch, DbError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_error)?;
+    let tables = transaction_table_names(&transaction)?;
+    let observed = observed_format(&transaction, &tables)?;
+    if observed != Some(QUESTIONS_UPGRADE_FROM) {
+        return Ok(Dispatch::Moved { observed });
+    }
+    add_questions(&transaction)?;
+    let changed = transaction
+        .execute(
+            "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
+            params![CURRENT_FORMAT, QUESTIONS_UPGRADE_FROM],
+        )
+        .map_err(map_error)?;
+    if changed != 1 {
+        return Err(failure(std::io::Error::other(
+            "format-12 marker changed during the question migration",
+        )));
+    }
+    transaction.commit().map_err(map_error)?;
+    Ok(Dispatch::Settled)
+}
+
+/// Every supported upgrade reaches the same validated format-12 boundary.
+/// DDL, companion-only backfill, and validation precede the caller's marker write.
+fn add_questions(transaction: &Transaction<'_>) -> Result<(), DbError> {
+    validate_format_twelve(transaction, &transaction_table_names(transaction)?)?;
+    schema::up_questions(transaction)?;
+    schema::up_scheduling(transaction)?;
+    crate::question::backfill_legacy_in(transaction)?;
+    crate::session_execution::repair_legacy_scheduling_in(transaction)?;
+    validate_questions_shape(transaction)?;
+    validate_scheduling_shape(transaction)
+}
+
+/// A current marker must never accept a missing/weakened scheduling column.
+/// Historical format validation deliberately does not require this new column.
+fn validate_scheduling_shape(connection: &Connection) -> Result<(), DbError> {
+    let column = connection
+        .query_row(
+            "SELECT upper(type),\"notnull\",pk,dflt_value \
+             FROM pragma_table_info('session_execution_state') WHERE name = 'scheduling'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_error)?;
+    if column != Some(("TEXT".to_owned(), false, 0, None)) {
+        return Err(failure(std::io::Error::other(
+            "current session_execution_state is missing or has malformed scheduling",
+        )));
+    }
+    validate_sql_objects(connection, &["session_execution_state"])
+}
+
+fn validate_questions_shape(connection: &Connection) -> Result<(), DbError> {
+    validate_question_columns(
+        connection,
+        "question_interaction",
+        &[
+            ("request_id", "TEXT", false, 1),
+            ("purpose", "TEXT", true, 0),
+            ("mode", "TEXT", true, 0),
+            ("definition", "TEXT", true, 0),
+            ("decision", "TEXT", false, 0),
+            ("authorization", "TEXT", false, 0),
+            ("risk_reason", "TEXT", false, 0),
+            ("authorization_input_id", "TEXT", false, 0),
+        ],
+    )?;
+    validate_question_columns(
+        connection,
+        "question_action_receipt",
+        &[
+            ("request_id", "TEXT", true, 1),
+            ("command_id", "TEXT", true, 2),
+            ("command_json", "TEXT", true, 0),
+            ("receipt", "TEXT", true, 0),
+            ("time_created", "INTEGER", true, 0),
+        ],
+    )?;
+    let mut statement = connection
+        .prepare(
+            "SELECT name FROM pragma_index_info('question_interaction_purpose_authorization_idx')
+             ORDER BY seqno",
+        )
+        .map_err(map_error)?;
+    let indexed = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(map_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_error)?;
+    if indexed != ["purpose", "authorization", "request_id"] {
+        return Err(failure(std::io::Error::other(
+            "current question consent index is missing or malformed",
+        )));
+    }
+    validate_sql_objects(
+        connection,
+        &[
+            "question_interaction",
+            "question_action_receipt",
+            "question_interaction_purpose_authorization_idx",
+        ],
+    )
+}
+
+/// Check parsed column names as well as the stored DDL: whitespace inside a
+/// quoted identifier is significant even when DDL formatting is normalized.
+fn validate_question_columns(
+    connection: &Connection,
+    table: &str,
+    expected: &[(&str, &str, bool, i64)],
+) -> Result<(), DbError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT name,upper(type),\"notnull\",pk,dflt_value
+             FROM pragma_table_info(?1) ORDER BY cid",
+        )
+        .map_err(map_error)?;
+    let columns = statement
+        .query_map([table], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .map_err(map_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_error)?;
+    if columns.len() != expected.len()
+        || columns
+            .iter()
+            .zip(expected)
+            .any(|((name, kind, required, key, default), expected)| {
+                (name.as_str(), kind.as_str(), *required, *key) != *expected || default.is_some()
+            })
+    {
+        return Err(failure(std::io::Error::other(format!(
+            "current question table `{table}` is missing or has malformed columns"
+        ))));
+    }
+    Ok(())
 }
 
 fn validate_automatic_memory_shape(connection: &Connection) -> Result<(), DbError> {
@@ -687,7 +872,7 @@ fn validate_sql_objects(connection: &Connection, names: &[&str]) -> Result<(), D
             .map_err(map_error)?;
         if actual.as_deref().map(normalized_sql).as_ref() != expected.get(*name) {
             return Err(failure(std::io::Error::other(format!(
-                "current memory runtime has a missing or malformed `{name}`"
+                "current schema has a missing or malformed `{name}`"
             ))));
         }
     }
@@ -695,11 +880,38 @@ fn validate_sql_objects(connection: &Connection, names: &[&str]) -> Result<(), D
 }
 
 fn normalized_sql(sql: &str) -> String {
-    sql.chars()
-        .filter(|character| !character.is_whitespace() && !matches!(character, '`' | '"'))
-        .flat_map(char::to_lowercase)
-        .collect::<String>()
-        .replace("ifnotexists", "")
+    let mut normalized = String::with_capacity(sql.len());
+    let mut in_literal = false;
+    for character in sql.chars() {
+        if character == '\'' {
+            // Doubled quotes toggle twice, preserving escaped literal content.
+            in_literal = !in_literal;
+            normalized.push(character);
+        } else if in_literal {
+            normalized.push(character);
+        } else if !character.is_ascii_whitespace() && !matches!(character, '`' | '"') {
+            normalized.extend(character.to_lowercase());
+        }
+    }
+    // Ignore this creation guard only at a DDL prefix. Case, whitespace, and
+    // "ifnotexists" inside a CHECK's string values are part of its closed domain.
+    for prefix in [
+        "createtable",
+        "createvirtualtable",
+        "createindex",
+        "createuniqueindex",
+        "createtrigger",
+        "createview",
+    ] {
+        if normalized
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with("ifnotexists"))
+        {
+            normalized.replace_range(prefix.len()..prefix.len() + "ifnotexists".len(), "");
+            break;
+        }
+    }
+    normalized
 }
 
 fn table_names(connection: &Connection) -> Result<Vec<String>, DbError> {
@@ -1942,6 +2154,7 @@ mod tests {
         schema::up_execution(&held).expect("the winner adds session execution state");
         schema::up_memory_runtime(&held).expect("the winner adds memory runtime");
         schema::up_automatic_memory(&held).expect("the winner adds automatic memory");
+        add_questions(&held).expect("the winner adds question companions");
         held.execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
             params![CURRENT_FORMAT, MEMORY_POLICY_UPGRADE_FROM],

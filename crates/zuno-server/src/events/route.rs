@@ -45,7 +45,7 @@ async fn stream_session_events(
     let cursor = cursor_from_headers(&headers)?;
     let subscription = service.subscribe(&session_id, cursor.as_ref()).await?;
     let observer = services.requests.observe_session(&session_id);
-    let connection = SessionStream::new(subscription, observer);
+    let connection = SessionStream::new(subscription, observer, service.clone());
     let stream = stream::unfold(connection, |mut connection| async move {
         connection.next_sse().await.map(|event| (event, connection))
     });
@@ -113,18 +113,26 @@ struct SessionStream {
     boundary: i64,
     live: LiveSessionSubscription,
     last_cursor: Option<EventCursor>,
+    catch_up_to: Option<i64>,
+    service: EventService,
     finished: bool,
     _observer: SessionRequestObserver,
 }
 
 impl SessionStream {
-    fn new(subscription: SessionSubscription, observer: SessionRequestObserver) -> Self {
+    fn new(
+        subscription: SessionSubscription,
+        observer: SessionRequestObserver,
+        service: EventService,
+    ) -> Self {
         Self {
             session_id: subscription.session_id,
             replay: subscription.events.into(),
             boundary: subscription.boundary,
             live: subscription.live,
             last_cursor: subscription.cursor,
+            catch_up_to: None,
+            service,
             finished: false,
             _observer: observer,
         }
@@ -134,13 +142,57 @@ impl SessionStream {
         if self.finished {
             return None;
         }
-        if let Some(event) = self.replay.pop_front() {
-            self.last_cursor = Some(event.cursor.clone());
-            return Some(encode_event(&event));
-        }
         loop {
+            if let Some(event) = self.replay.pop_front() {
+                self.last_cursor = Some(event.cursor.clone());
+                return Some(encode_event(&event));
+            }
+            let after = self
+                .last_cursor
+                .as_ref()
+                .map_or(self.boundary, |cursor| cursor.sequence.max(self.boundary));
+            if let Some(target) = self.catch_up_to {
+                if after >= target {
+                    self.catch_up_to = None;
+                    continue;
+                }
+                match self
+                    .service
+                    .history_page(&self.session_id, Some(after), 128)
+                    .await
+                {
+                    Ok(page) => {
+                        self.replay = page
+                            .events
+                            .into_iter()
+                            .filter(|event| event.sequence() <= target)
+                            .collect();
+                        if self.replay.is_empty() {
+                            self.finished = true;
+                            return Some(Err(EventStreamError::Database(
+                                zuno_error::DbError::Query {
+                                    source: Box::new(std::io::Error::other(
+                                        "a live event's committed history is missing",
+                                    )),
+                                },
+                            )));
+                        }
+                    }
+                    Err(error) => {
+                        self.finished = true;
+                        return Some(Err(error));
+                    }
+                }
+                continue;
+            }
             match self.live.recv().await? {
-                Delivery::Event(event) if event.sequence() <= self.boundary => continue,
+                Delivery::Event(event) if event.sequence() <= after => continue,
+                Delivery::Event(event) if event.sequence() > after.saturating_add(1) => {
+                    // A domain event may commit before another producer's live
+                    // notification arrives. Fill that gap from the log before
+                    // advancing the client's cursor; delayed duplicates then skip.
+                    self.catch_up_to = Some(event.sequence());
+                }
                 Delivery::Event(event) => {
                     self.last_cursor = Some(event.cursor.clone());
                     return Some(encode_event(&event));

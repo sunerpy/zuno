@@ -53,6 +53,7 @@ fn input(
     BackgroundExecutionInput {
         prepared: prepared(directory, &command),
         session_id: "ses_background".to_owned(),
+        cycle_id: None,
         title: command.clone(),
         command,
         purpose: BackgroundExecutionPurpose::Command,
@@ -445,6 +446,52 @@ async fn remote_observer_purpose_survives_terminal_persistence_and_reopen() {
     assert!(restored.purpose.requires_authoritative_refresh());
 }
 
+#[tokio::test]
+async fn origin_cycle_survives_terminal_persistence_promotion_and_reopen() {
+    for retention in [
+        BackgroundExecutionRetention::Durable,
+        BackgroundExecutionRetention::Ephemeral,
+    ] {
+        let directory = tempfile::tempdir().expect("workspace");
+        let service =
+            BackgroundExecutionService::open(directory.path()).expect("background service");
+        let mut launch = input(directory.path(), "printf origin", Duration::from_secs(2));
+        launch.cycle_id = Some("completion_original_work_cycle".to_owned());
+        launch.retention = retention;
+        let started = service.start(launch).expect("command starts");
+        assert_eq!(
+            started.cycle_id.as_deref(),
+            Some("completion_original_work_cycle")
+        );
+        let settled = service
+            .wait(&started.id, None)
+            .await
+            .expect("command settles")
+            .info;
+        assert_eq!(settled.cycle_id, started.cycle_id);
+        let durable = service.promote(&started.id).expect("retain execution");
+        assert_eq!(durable.cycle_id, started.cycle_id);
+        assert_eq!(
+            read_row(&started.status_file)["info"]["cycleId"],
+            "completion_original_work_cycle"
+        );
+        drop(service);
+
+        let reopened =
+            BackgroundExecutionService::open(directory.path()).expect("background service reopens");
+        let restored = reopened.get(&started.id).expect("command restored");
+        assert_eq!(restored.cycle_id, started.cycle_id);
+        assert_eq!(restored.status, BackgroundExecutionStatus::Completed);
+        assert_eq!(
+            reopened
+                .output(&started.id, ReplayCursor::Full, None)
+                .expect("retained output")
+                .bytes,
+            b"origin"
+        );
+    }
+}
+
 /// A row in the shape Zuno 0.6.6 wrote it - format 3, no `claimed` marker, no `<id>.lock` -
 /// whose command is over. It is reconciled exactly as the released build reconciled it,
 /// because the pid it recorded is one this process spawned and reaped, so its absence is
@@ -489,6 +536,10 @@ fn persisted_running_state_reconciles_to_uncertain_without_replay() {
     let info = service.get(&id).expect("recovered execution");
 
     assert_eq!(info.status, BackgroundExecutionStatus::Uncertain);
+    assert_eq!(
+        info.cycle_id, None,
+        "older metadata must stay readable without guessing an originating cycle"
+    );
     assert_eq!(
         info.purpose,
         BackgroundExecutionPurpose::Command,

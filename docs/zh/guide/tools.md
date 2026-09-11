@@ -22,11 +22,41 @@
 | `webfetch` | 获取一个 URL | 只读 |
 | `web_search` | 批量网络搜索 | 只读 |
 | `skill` | 发现并加载可复用指令 | 只读 |
-| `question` | 在 Plan 中向用户提出结构化澄清问题 | 用户中介型 |
+| `question` | Plan 结构化澄清，或普通 Work 的必要人工输入 | 用户中介型 |
+| `question_async` | 发布非阻塞问题，继续独立工作 | 用户中介型 |
+| `plan_exit` | 请求批准精确的 Plan 与已保存的 Work 执行身份 | 用户中介型；仅 Plan |
 
 持久工作状态会额外加入 `plan_get`、`plan_update`、`todo_get`、`todo_update` 以及 `goal_get`/`goal_update`。
 启用记忆时提供受限 `memory_read` 和 `memory_update`；普通更新默认自动应用，显式配置复核策略时除外。
 当前 Agent 能够触达时会出现 `council_run`。
+
+## 持久问题与等待
+
+问题具有稳定的请求 ID、问题项 ID 和 revision。TUI、HTTP、ACP 共用 `QuestionPort`，
+发布、查询、回答与等待是不同操作。`question_async` 立即返回回执；可选问题未回答时，
+Agent 仍可继续独立工作或给出总结。`question` 可以等待首次响应；选择“稍后”会解除工具等待，
+但不会把问题标记为已回答。部分回答会保存已填内容，其余问题仍为 pending。
+
+真实回答只通过持久 inbox 进入模型一次，不会同时出现在工具结果和后续 callback 中。
+响应携带 `commandId` 与 `expectedRevision`：相同命令幂等重试，旧 revision 或同 ID 不同
+内容被拒绝。`question_async` 由 `question` 权限键管理。未输入、光标高亮、超时、取消、
+“稍后”均不是批准。
+
+没有 Goal 的普通 Work 也能登记必要人工输入。会话只等待该请求的有效回答，无关 callback
+不能恢复它。Goal 的 `goal_request_input` 使用同一服务，在一个事务中记录 Goal 暂停和
+会话等待。被委派的 child 向 parent 报告阻碍，不直接向用户提问。
+
+`plan_exit` 发布非阻塞的封闭批准请求。只有明确的 approve 操作才能授权所展示的 Plan
+revision、Agent/模型身份及 review 状态。提前批准要等来源 Plan 回合正常交接后才生效；
+Plan 或身份变化、回合中断都会使旧批准失效。Draft review 的风险接受必须由用户明确给出。
+
+自动续跑必须有可执行事项；未完成 Plan 或 blocked Todo 本身不是依据。暂停后可用
+`/resume` 明确恢复原有 Work，但它不能跳过仍在等待的人工/外部条件，也不能代替 Plan 批准。
+若 Goal 自身已暂停，应先使用 `/goal resume`。
+
+终态 `bg output`、`bg wait` 和 callback 共用完成消费回执。内联读取会原子撤销尚未被消费的
+排队 callback；已 promoted/consumed 的 callback 不会被取消。完成事实保留原工作周期，
+不能通过新建周期重置无进展计数。
 
 即使父 Attempt 包含它的 schema，`session_message` 也会从每个 delegated child 的工具快照中
 移除。执行时还会再次校验：来源必须是 root，目标必须未归档且属于同一项目，child 目标必须是

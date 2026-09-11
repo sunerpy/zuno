@@ -45,9 +45,9 @@
 //! So a `write_plan`/`read_plan` pair lived here until 2026-08-16 with no caller in
 //! any production path — the reader also carried a legacy-path diagnostic that
 //! nothing could ever reach, which is worse than no diagnostic because it reads as
-//! protection. Both are gone. What a caller needs is [`plan_path`]: the seam that
-//! wants it is `zuno_tools::plan_exit::PlanExitHost::plan_path`, whose own docs
-//! describe exactly this computation (`tool/plan.ts:29`).
+//! protection. Both are gone. [`plan_path`] only locates file-based artifacts.
+//! Durable Plan authorization uses the shared question/session-control service;
+//! a file path is neither a Plan revision nor permission to start Work.
 
 use std::path::{Component, Path, PathBuf};
 

@@ -5,6 +5,9 @@
 //! bound review revision, updates Goal state, freezes the execution identity,
 //! and admits the control input before any of those facts become visible.
 
+mod question;
+pub use question::QuestionService;
+
 use std::sync::Arc;
 
 use serde_json::json;
@@ -18,7 +21,8 @@ use zuno_review::{PlanReviewGate, ReviewError, ReviewStore};
 use zuno_tools::{WorkPlan, WorkStateError, WorkStateStore};
 use zuno_types::execution::{
     CollaborationMode, ContinuationToken, DraftReviewRiskAcceptance, InputTriggerKind,
-    SessionExecutionPhase, SessionExecutionState, TurnExecutionIdentity,
+    SessionExecutionPhase, SessionExecutionState, SessionReadiness, SessionScheduling,
+    TurnExecutionIdentity,
 };
 
 /// One user-visible Start Work disposition.
@@ -61,6 +65,13 @@ pub struct StartWorkOutcome {
     pub review_gate: PlanReviewGate,
     pub input: SessionInput,
     pub disposition: StartWorkDisposition,
+}
+
+/// Explicit resume of already-authorized Work, never a Plan authorization.
+#[derive(Debug, Clone)]
+pub struct ResumeWorkOutcome {
+    pub state: SessionExecutionState,
+    pub input: SessionInput,
 }
 
 #[derive(Debug, Error)]
@@ -106,6 +117,8 @@ pub enum SessionControlError {
     },
     #[error("session execution state for `{session_id}` is corrupt: {detail}")]
     CorruptState { session_id: String, detail: String },
+    #[error("session `{session_id}` cannot resume: {detail}")]
+    ResumeRejected { session_id: String, detail: String },
 }
 
 /// Shared service used by ACP, TUI, and future clients.
@@ -144,6 +157,7 @@ impl SessionControlService {
             state.mode = CollaborationMode::Plan;
             state.work_identity = Some(request.work_identity);
             state.phase = SessionExecutionPhase::Planning;
+            state.scheduling = Some(SessionScheduling::default());
             state.continuation = None;
             state.cycle_id = None;
             if transition {
@@ -201,12 +215,22 @@ impl SessionControlService {
     ) -> Result<SessionExecutionState, SessionControlError> {
         let connection = self.pool.get()?;
         let transaction = open::immediate_transaction(&connection)?;
-        let plan = WorkStateStore::plan_in(&transaction, session_id)?.ok_or_else(|| {
+        let state = Self::mark_plan_handoff_in(&transaction, session_id, at_ms)?;
+        transaction.commit().map_err(open::map_error)?;
+        Ok(state)
+    }
+
+    pub(crate) fn mark_plan_handoff_in(
+        transaction: &rusqlite::Transaction<'_>,
+        session_id: &str,
+        at_ms: i64,
+    ) -> Result<SessionExecutionState, SessionControlError> {
+        let plan = WorkStateStore::plan_in(transaction, session_id)?.ok_or_else(|| {
             SessionControlError::MissingPlan {
                 session_id: session_id.to_owned(),
             }
         })?;
-        let mut state = read_in(&transaction, session_id)?.ok_or_else(|| {
+        let mut state = read_in(transaction, session_id)?.ok_or_else(|| {
             SessionControlError::NotInPlanMode {
                 session_id: session_id.to_owned(),
             }
@@ -218,16 +242,25 @@ impl SessionControlService {
         }
         if state.handoff_plan_id.as_deref() != Some(plan.id.as_str())
             || state.handoff_plan_revision != Some(plan.revision)
-            || state.phase != SessionExecutionPhase::Idle
+            || (state.phase != SessionExecutionPhase::Idle
+                && state
+                    .scheduling
+                    .as_ref()
+                    .is_none_or(|scheduling| scheduling.readiness == SessionReadiness::Ready))
         {
             let expected = state.revision;
             state.handoff_plan_id = Some(plan.id);
             state.handoff_plan_revision = Some(plan.revision);
-            state.phase = SessionExecutionPhase::Idle;
+            if state
+                .scheduling
+                .as_ref()
+                .is_none_or(|scheduling| scheduling.readiness == SessionReadiness::Ready)
+            {
+                state.phase = SessionExecutionPhase::Idle;
+            }
             state.time_updated = at_ms;
-            state = update_in(&transaction, expected, state)?;
+            state = update_in(transaction, expected, state)?;
         }
-        transaction.commit().map_err(open::map_error)?;
         Ok(state)
     }
 
@@ -238,7 +271,16 @@ impl SessionControlService {
     ) -> Result<StartWorkOutcome, SessionControlError> {
         let connection = self.pool.get()?;
         let transaction = open::immediate_transaction(&connection)?;
-        let plan = WorkStateStore::plan_in(&transaction, request.session_id)?.ok_or_else(|| {
+        let outcome = Self::start_work_in(&transaction, request)?;
+        transaction.commit().map_err(open::map_error)?;
+        Ok(outcome)
+    }
+
+    pub(crate) fn start_work_in(
+        transaction: &rusqlite::Transaction<'_>,
+        request: StartWorkRequest<'_>,
+    ) -> Result<StartWorkOutcome, SessionControlError> {
+        let plan = WorkStateStore::plan_in(transaction, request.session_id)?.ok_or_else(|| {
             SessionControlError::MissingPlan {
                 session_id: request.session_id.to_owned(),
             }
@@ -252,7 +294,7 @@ impl SessionControlService {
                 actual: plan.revision,
             });
         }
-        let mut state = read_in(&transaction, request.session_id)?.ok_or_else(|| {
+        let mut state = read_in(transaction, request.session_id)?.ok_or_else(|| {
             SessionControlError::NotInPlanMode {
                 session_id: request.session_id.to_owned(),
             }
@@ -286,7 +328,7 @@ impl SessionControlService {
         }
 
         let review_gate = ReviewStore::plan_review_gate_in(
-            &transaction,
+            transaction,
             request.session_id,
             &plan.id,
             plan.revision,
@@ -356,7 +398,7 @@ impl SessionControlService {
             "continuation": continuation.clone(),
         });
         let input = admit_in(
-            &transaction,
+            transaction,
             NewSessionInput::new(
                 format!("ctl_{}", Uuid::now_v7().simple()),
                 request.session_id,
@@ -370,7 +412,7 @@ impl SessionControlService {
         )?;
 
         let goal = if already_authorized {
-            GoalStore::goal_in(&transaction, request.session_id)?
+            GoalStore::goal_in(transaction, request.session_id)?
         } else {
             let expected = state.revision;
             state.mode = CollaborationMode::Work;
@@ -378,13 +420,14 @@ impl SessionControlService {
             state.authorized_plan_revision = Some(plan.revision);
             state.cycle_id = Some(continuation.cycle_id.clone());
             state.phase = SessionExecutionPhase::Authorized;
+            // Only this explicit, revision-bound user control starts fresh work.
+            state.scheduling = Some(SessionScheduling::default());
             state.continuation = Some(continuation);
             state.draft_review_risk = draft_review_risk;
             state.time_updated = request.at_ms;
-            state = update_in(&transaction, expected, state)?;
-            GoalStore::resume_for_work_in(&transaction, request.session_id, request.at_ms)?
+            state = update_in(transaction, expected, state)?;
+            GoalStore::resume_for_work_in(transaction, request.session_id, request.at_ms)?
         };
-        transaction.commit().map_err(open::map_error)?;
         Ok(StartWorkOutcome {
             state,
             plan,
@@ -399,12 +442,238 @@ impl SessionControlService {
         })
     }
 
+    /// Validate what the human actually saw, not merely the current mode label.
+    pub(crate) fn validate_plan_question_in(
+        transaction: &rusqlite::Transaction<'_>,
+        question: &zuno_types::question::QuestionView,
+    ) -> zuno_tool::question::QuestionResult<SessionExecutionState> {
+        use zuno_tool::question::QuestionError;
+        use zuno_types::question::QuestionPurpose;
+
+        let binding = question
+            .plan
+            .as_ref()
+            .filter(|_| question.purpose == QuestionPurpose::PlanAuthorization)
+            .ok_or_else(|| {
+                QuestionError::Invalid("question has no Plan authorization".to_owned())
+            })?;
+        let session_id = &question.origin.session_id;
+        let state = read_in(transaction, session_id)?.ok_or_else(|| QuestionError::Rejected {
+            code: "missing_execution_state",
+            detail: "the session has no Plan execution state".to_owned(),
+        })?;
+        if state.mode != CollaborationMode::Plan
+            && !(state.mode == CollaborationMode::Work
+                && state.authorized_plan_id.as_deref() == Some(binding.plan_id.as_str())
+                && state.authorized_plan_revision == Some(binding.plan_revision))
+        {
+            return Err(QuestionError::Rejected {
+                code: "not_in_plan_mode",
+                detail: "the session is no longer awaiting this Plan authorization".to_owned(),
+            });
+        }
+        let plan = WorkStateStore::plan_in(transaction, session_id)
+            .map_err(|error| question::control_error(SessionControlError::WorkState(error)))?
+            .ok_or_else(|| QuestionError::Rejected {
+                code: "missing_plan",
+                detail: "the Plan no longer exists".to_owned(),
+            })?;
+        if plan.id != binding.plan_id || plan.revision != binding.plan_revision {
+            return Err(QuestionError::Rejected {
+                code: "stale_plan",
+                detail:
+                    "the Plan changed after this question was published; request fresh approval"
+                        .to_owned(),
+            });
+        }
+        if state.work_identity.as_ref() != Some(&binding.work_identity) {
+            return Err(QuestionError::Rejected {
+                code: "stale_work_identity",
+                detail: "the Work Agent or model changed; request fresh approval".to_owned(),
+            });
+        }
+        let review = ReviewStore::plan_review_gate_in(
+            transaction,
+            session_id,
+            &binding.plan_id,
+            binding.plan_revision,
+        )
+        .map_err(|error| question::control_error(SessionControlError::Review(error)))?;
+        let review = serde_json::to_value(review)
+            .map_err(|error| QuestionError::Invalid(error.to_string()))?;
+        if review != binding.review_gate {
+            return Err(QuestionError::Rejected {
+                code: "stale_review",
+                detail: "the bound review changed; request fresh approval".to_owned(),
+            });
+        }
+        Ok(state)
+    }
+
+    /// Apply one explicitly approved, handoff-ready Plan question exactly once.
+    pub(crate) fn apply_plan_question_in(
+        transaction: &rusqlite::Transaction<'_>,
+        question: &zuno_types::question::QuestionView,
+        at_ms: i64,
+    ) -> zuno_tool::question::QuestionResult<zuno_types::question::QuestionReceipt> {
+        use zuno_tool::question::QuestionError;
+        use zuno_types::question::{PlanAuthorizationState, PlanQuestionDecision, QuestionReceipt};
+
+        if question.decision != Some(PlanQuestionDecision::Approve)
+            || question.authorization != Some(PlanAuthorizationState::WaitingForHandoff)
+            || !zuno_db::question::handoff_completed_in(transaction, &question.id)?
+        {
+            return Err(QuestionError::Rejected {
+                code: "approval_not_ready",
+                detail: "an explicit approval and successful source-turn handoff are required"
+                    .to_owned(),
+            });
+        }
+        let state = Self::validate_plan_question_in(transaction, question)?;
+        let binding = question.plan.as_ref().expect("validated Plan binding");
+        let risk_reason = zuno_db::question::risk_reason_in(transaction, &question.id)?;
+        let outcome = Self::start_work_in(
+            transaction,
+            StartWorkRequest {
+                session_id: &question.origin.session_id,
+                // Handoff bookkeeping may legitimately advance this revision. The
+                // exact Work identity and Plan/review were just checked under this lock.
+                expected_execution_revision: Some(state.revision),
+                expected_plan_revision: Some(binding.plan_revision),
+                anchor_message_id: question.origin.message_id.clone(),
+                draft_review_risk_reason: risk_reason,
+                // This service queues control; only a host holding the run lease
+                // may subsequently claim that execution has actually started.
+                session_busy: true,
+                at_ms,
+            },
+        )
+        .map_err(question::control_error)?;
+        let question = zuno_db::question::set_authorization_in(
+            transaction,
+            &question.origin.session_id,
+            &question.id,
+            PlanAuthorizationState::Applied,
+            Some(&outcome.input.id),
+        )?;
+        Ok(QuestionReceipt {
+            question,
+            input_id: Some(outcome.input.id),
+            duplicate: false,
+        })
+    }
+
     pub fn state(
         &self,
         session_id: &str,
     ) -> Result<Option<SessionExecutionState>, SessionControlError> {
         let connection = self.pool.get()?;
         Ok(read_in(&connection, session_id)?)
+    }
+
+    /// An explicit Goal command resumes the Goal driver, not an ordinary queued
+    /// Work control. Its current host supplies the Agent/model identity.
+    pub fn resume_goal_execution(
+        &self,
+        session_id: &str,
+        at_ms: i64,
+    ) -> Result<(), SessionControlError> {
+        self.pool.try_transaction(|tx| {
+            if !GoalStore::goal_in(tx, session_id)?
+                .is_some_and(|goal| goal.status == zuno_goal::GoalStatus::Active)
+            {
+                return Ok(());
+            }
+            let Some(state) = read_in(tx, session_id)? else {
+                return Ok(());
+            };
+            if state.mode == CollaborationMode::Work
+                && matches!(
+                    state.scheduling.as_ref().map(|s| &s.readiness),
+                    Some(SessionReadiness::Paused { .. } | SessionReadiness::Completed)
+                )
+            {
+                zuno_db::session_execution::set_scheduling_in(
+                    tx,
+                    session_id,
+                    state.revision,
+                    SessionScheduling::default(),
+                    at_ms,
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Resume one exact paused Work revision and durably queue its control.
+    /// Waiting for a specific human/external event is not waived by this action.
+    pub fn resume_session(
+        &self,
+        session_id: &str,
+        expected_revision: i64,
+        at_ms: i64,
+    ) -> Result<ResumeWorkOutcome, SessionControlError> {
+        self.pool.try_transaction(|tx| {
+            let rejected = |detail: &str| SessionControlError::ResumeRejected {
+                session_id: session_id.to_owned(), detail: detail.to_owned(),
+            };
+            let mut state = read_in(tx, session_id)?.ok_or_else(|| rejected("no execution state exists"))?;
+            let source_key = format!("user-control:resume-work:{expected_revision}");
+            if let Some(input) = zuno_db::inbox::read_by_source_key_in(tx, session_id, &source_key)? {
+                return Ok(ResumeWorkOutcome { state, input });
+            }
+            if state.revision != expected_revision {
+                return Err(SessionControlError::ExecutionRevisionConflict {
+                    session_id: session_id.to_owned(), expected: expected_revision, actual: state.revision,
+                });
+            }
+            if state.mode != CollaborationMode::Work {
+                return Err(rejected("use Start Work to authorize a Plan"));
+            }
+            if !matches!(state.scheduling.as_ref().map(|s| &s.readiness),
+                Some(SessionReadiness::Paused { .. } | SessionReadiness::Completed))
+            {
+                return Err(rejected("work is not paused, or an exact human/external wait is still pending"));
+            }
+            if GoalStore::goal_in(tx, session_id)?.is_some_and(|goal| goal.status != zuno_goal::GoalStatus::Active) {
+                return Err(rejected("resume the Goal explicitly first"));
+            }
+            let plan = WorkStateStore::plan_in(tx, session_id)?;
+            if state.authorized_plan_id.is_some()
+                && plan.as_ref().is_none_or(|plan| state.authorized_plan_id.as_deref() != Some(plan.id.as_str())
+                    || state.authorized_plan_revision != Some(plan.revision))
+            {
+                return Err(rejected("the authorized Plan changed; obtain fresh Plan authorization"));
+            }
+            let continuation = ContinuationToken {
+                cycle_id: state.cycle_id.clone().unwrap_or_else(|| format!("cycle_{}", Uuid::now_v7().simple())),
+                identity: state.work_identity.clone().ok_or_else(|| rejected("the Work identity is missing"))?,
+                mode: CollaborationMode::Work,
+                plan_id: plan.as_ref().map(|plan| plan.id.clone()),
+                plan_revision: plan.as_ref().map(|plan| plan.revision),
+                context_epoch: state.continuation.as_ref().map_or(0, |token| token.context_epoch),
+                anchor_message_id: state.continuation.as_ref().and_then(|token| token.anchor_message_id.clone()),
+            };
+            // Like explicit Goal resume, this user control acknowledges the
+            // named uncertainty barrier. It never mechanically replays a tool.
+            let messages = zuno_db::message::MessageStore::new(tx);
+            let pending = messages.pending_uncertain_tool_calls(session_id, 0)?;
+            let part_ids = pending.into_iter().map(|call| call.part_id).collect::<Vec<_>>();
+            messages.reconcile_uncertain_tool_calls(&part_ids, at_ms)?;
+            let input = admit_in(tx, NewSessionInput::new(
+                format!("ctl_{}", Uuid::now_v7().simple()), session_id,
+                json!({"kind":"sessionControl","control":"resume_work","continuation":continuation}),
+                InputDelivery::Queue, at_ms,
+            ).with_source_key(source_key).with_trigger_kind(InputTriggerKind::UserControl)
+                .with_cycle_id(Some(continuation.cycle_id.clone())))?;
+            state.scheduling = Some(SessionScheduling::default());
+            state.phase = SessionExecutionPhase::Authorized;
+            state.cycle_id = Some(continuation.cycle_id.clone());
+            state.continuation = Some(continuation);
+            state.time_updated = at_ms;
+            let state = update_in(tx, expected_revision, state)?;
+            Ok(ResumeWorkOutcome { state, input })
+        })
     }
 
     /// Persist a same-cycle recovery token after compaction or process recovery.
@@ -535,7 +804,13 @@ impl SessionControlService {
         };
         let expected = state.revision;
         state.cycle_id = Some(cycle_id.to_owned());
-        state.phase = SessionExecutionPhase::Running;
+        if state
+            .scheduling
+            .as_ref()
+            .is_none_or(|scheduling| scheduling.readiness == SessionReadiness::Ready)
+        {
+            state.phase = SessionExecutionPhase::Running;
+        }
         state.continuation = Some(token.clone());
         state.time_updated = at_ms;
         update_in(&transaction, expected, state)?;

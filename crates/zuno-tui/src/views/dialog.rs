@@ -135,8 +135,14 @@ pub enum DialogOutcome {
     },
     /// A permission request was replied to.
     Permission(crate::views::permission::PermissionDecision),
-    /// A question was answered, one label list per question.
+    /// Every question was explicitly answered, one nonempty label list per question.
     Question(Vec<Vec<String>>),
+    /// The user chose to answer later, or submitted with questions still unanswered.
+    ///
+    /// One positional list per question, including the current custom draft.
+    /// Empty lists remain unanswered and must be retained when reopening. Even a
+    /// fully populated payload is deferred, never an approval or a final answer.
+    QuestionDeferred(Vec<Vec<String>>),
     /// The session list requested an operation on its highlighted row.
     Session(crate::views::picker::SessionDialogAction),
     /// The durable input queue requested an edit or cancellation.

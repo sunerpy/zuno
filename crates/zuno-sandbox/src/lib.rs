@@ -403,6 +403,18 @@ impl SandboxPolicy {
         &self.workspace
     }
 
+    /// Canonical additional roots retained in this resource contract.
+    #[must_use]
+    pub fn writable_roots(&self) -> &[PathBuf] {
+        &self.writable_roots
+    }
+
+    /// Canonical paths protected even within writable roots.
+    #[must_use]
+    pub fn protected_paths(&self) -> &[PathBuf] {
+        &self.protected_paths
+    }
+
     /// Effective sandbox mode.
     #[must_use]
     pub const fn mode(&self) -> SandboxMode {

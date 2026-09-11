@@ -1872,6 +1872,7 @@ fn shared_completion_fixture() -> (TempDir, Arc<zuno_db::Pool>, GoalStore, Goal)
     let goal = store
         .create_goal(SESSION, "ship safely", None)
         .expect("create goal");
+    bind_completion_cycle(&pool, SESSION);
     (spill, pool, store, goal)
 }
 
@@ -1918,6 +1919,22 @@ fn completion_report_for(
         zuno_db::inbox::InputDelivery::Queue,
         2,
     )
+    .with_cycle_id(Some("completion-cycle"))
+}
+
+fn bind_completion_cycle(pool: &zuno_db::Pool, session_id: &str) {
+    pool.transaction(|tx| {
+        let mut state = zuno_db::session_execution::seed_in(
+            tx,
+            session_id,
+            zuno_types::execution::CollaborationMode::Work,
+            None,
+            1,
+        )?;
+        state.cycle_id = Some("completion-cycle".to_owned());
+        zuno_db::session_execution::update_in(tx, state.revision, state).map(|_| ())
+    })
+    .expect("bound completion cycle");
 }
 
 fn insert_child_session(pool: &zuno_db::Pool, session_id: &str, parent_id: &str) {
@@ -1930,6 +1947,8 @@ fn insert_child_session(pool: &zuno_db::Pool, session_id: &str, parent_id: &str)
             params![session_id, parent_id],
         )
         .expect("insert child session");
+    drop(connection);
+    bind_completion_cycle(pool, session_id);
 }
 
 fn insert_grandchild_sessions(pool: &zuno_db::Pool) {

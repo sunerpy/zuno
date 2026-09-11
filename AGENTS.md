@@ -34,7 +34,7 @@ Zuno is a released, fast-moving Rust agent harness. Prefer the correct foundatio
 
 ## Agents And Tools
 
-- `build` owns end-to-end delivery; `plan` is read-only planning; `deep` owns difficult cross-cutting implementation without recursive delegation.
+- `build` owns end-to-end delivery; `plan` is read-only planning; `deep` owns difficult cross-cutting implementation and may delegate bounded subtasks without recursively handing off the original objective.
 - Specialist agents have explicit positive responsibilities, negative delegation boundaries, permissions, and structured output expectations.
 - `web_search` accepts a batch of queries and owns concurrency, cancellation, stable ordering, limits, and URL deduplication above single-query providers.
 - A CLI command is not registered until a real handler exists. Help text, dispatch, assembled execution, and failure behavior must agree.

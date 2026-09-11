@@ -100,6 +100,9 @@ pub fn permission_key(tool: &str) -> &str {
     if READ_TOOLS.contains(&tool) {
         return "read";
     }
+    if tool == "question_async" {
+        return "question";
+    }
     tool
 }
 

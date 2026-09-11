@@ -1,0 +1,1 @@
+Ask optional clarifying questions without waiting or ending the turn. The question is durable and the user's reply arrives later as new input. Continue independent work and state any assumptions; an unanswered question is not consent. Use question when required input prevents further work, and plan_exit only for explicit Plan-to-Work authorization.

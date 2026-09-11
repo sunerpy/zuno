@@ -11,7 +11,7 @@ use zuno_pty::{PtyService, PtyServiceConfig};
 
 use super::catalog::{LocationBody, LocationEnvelope, OptionalEnvelope, ProjectBody};
 use super::error::ApiError;
-use crate::EventService;
+use crate::{EventService, SessionControlExecutor};
 
 #[derive(Clone, Debug)]
 pub struct ApiState {
@@ -21,6 +21,7 @@ pub struct ApiState {
     directory: Arc<str>,
     artifact_paths: ArtifactGcPaths,
     events: Option<EventService>,
+    session_controls: Option<Arc<dyn SessionControlExecutor>>,
     /// The environment the catalogue operations resolve config and credentials
     /// from. Injected rather than read from the process on every request so a test
     /// can pin a models.dev document without mutating global state.
@@ -130,6 +131,7 @@ impl ApiState {
             attachments,
             artifact_paths,
             events: None,
+            session_controls: None,
             env: Arc::new(Env::from_process()),
             project_id: Arc::from(project.id),
             project_directory,
@@ -142,6 +144,17 @@ impl ApiState {
     pub fn with_events(mut self, events: EventService) -> Self {
         self.events = Some(events);
         self
+    }
+
+    /// Enables native resume and execution of already-authorized Work controls.
+    #[must_use]
+    pub fn with_session_controls(mut self, controls: Arc<dyn SessionControlExecutor>) -> Self {
+        self.session_controls = Some(controls);
+        self
+    }
+
+    pub(super) fn session_controls(&self) -> Option<&Arc<dyn SessionControlExecutor>> {
+        self.session_controls.as_ref()
     }
 
     /// Uses the exact profile-resolved image policy for HTTP prompt admission.
