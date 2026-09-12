@@ -7783,6 +7783,7 @@ dependencies = [
  "futures",
  "hyper-util",
  "reqwest",
+ "rusqlite",
  "rustls",
  "serde",
  "serde_json",

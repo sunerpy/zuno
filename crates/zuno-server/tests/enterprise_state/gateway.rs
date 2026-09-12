@@ -409,6 +409,17 @@ async fn gateway_requests_are_scoped_authenticated_and_still_require_current_hum
         .authorize(&context.lease, &environment, &command)
         .await
         .unwrap();
+    let zuno_worker::LeaseRenewal::Renewed(renewed) = worker.renew(&execution).await.unwrap()
+    else {
+        panic!("running Worker must renew")
+    };
+    assert!(renewed.expires_at_ms > context.lease.expires_at_ms);
+    // A gateway keeps the ticket's admitted execution identity. Renewal extends
+    // its deadline while preserving that identity; it does not invalidate approval.
+    state
+        .authorize(&context.lease, &environment, &command)
+        .await
+        .unwrap();
     if host.is_some() {
         // Lose the submission response and recover through authoritative inspect.
         reply(

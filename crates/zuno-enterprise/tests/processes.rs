@@ -447,7 +447,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
                     .into(),
                     slots: 1,
                     poll_millis: 100,
-                    renew_millis: 1000,
+                    renew_millis: 100,
                     drain_seconds: 5,
                 }),
             )
@@ -541,10 +541,63 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
                 completed += 1;
                 continue;
             }
-            assert!(
-                matches!(job["phase"].as_str(), Some("ready" | "running" | "waiting")),
-                "unexpected Job state {job}"
-            );
+            if !matches!(job["phase"].as_str(), Some("ready" | "running" | "waiting")) {
+                let events:Vec<Value>=query_scalar(
+                    "SELECT data FROM zuno_enterprise_preview.event WHERE tenant_id=$1 AND session_id=$2
+                     AND type IN ('runtime.driver.advance','runtime.operation.completed','runtime.job.finished')
+                     ORDER BY sequence DESC LIMIT 6",
+                ).bind(tenant.as_str()).bind(job["sessionId"].as_str().unwrap()).fetch_all(&admin).await.unwrap();
+                let operations:Vec<Value>=query_scalar(
+                    "SELECT to_jsonb(o) FROM zuno_enterprise_preview.gateway_operation o WHERE tenant_id=$1 AND job_id=$2",
+                ).bind(tenant.as_str()).bind(id).fetch_all(&admin).await.unwrap();
+                let logs = ["control.log", "gateway.log", "worker-a.log", "worker-b.log"]
+                    .into_iter()
+                    .map(|name| {
+                        format!(
+                            "{name}: {}",
+                            std::fs::read_to_string(root.join(name)).unwrap()
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let ledger =
+                    rusqlite::Connection::open(root.join("gateway-state/gateway.sqlite")).unwrap();
+                let states = ledger
+                    .prepare("SELECT data FROM operation")
+                    .unwrap()
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                let mut docker_states = Vec::new();
+                for state in &states {
+                    let state: Value = serde_json::from_str(state).unwrap();
+                    if let Some(container) = state.get("container").and_then(Value::as_str) {
+                        let mut command = tokio::process::Command::new("docker");
+                        command
+                            .args([
+                                "--host",
+                                &format!(
+                                    "unix://{}",
+                                    std::env::var("ZUNO_ROOTLESS_DOCKER_SOCKET").unwrap()
+                                ),
+                                "inspect",
+                                "--format",
+                                "{{json .State}}",
+                                container,
+                            ])
+                            .kill_on_drop(true);
+                        let inspected =
+                            tokio::time::timeout(Duration::from_secs(5), command.output()).await;
+                        docker_states.push(match inspected {
+                            Ok(Ok(output)) => String::from_utf8_lossy(&output.stdout).into_owned(),
+                            _ => "bounded Docker inspection unavailable".to_owned(),
+                        });
+                    }
+                }
+                panic!(
+                    "unexpected Job state {job}; events={events:?}; operations={operations:?}; ledger={states:?}; docker={docker_states:?}; logs={logs:?}"
+                );
+            }
             for wait in job["waits"].as_array().unwrap() {
                 if wait["target"]["kind"] == "approval" {
                     let id = wait["target"]["approval_id"].as_str().unwrap();
