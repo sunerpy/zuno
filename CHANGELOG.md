@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.32](https://github.com/sunerpy/zuno/compare/v0.10.31...v0.10.32) (2026-09-12)
+
+
+### Bug Fixes
+
+* **goal:** 修复目标完成与回合执行边界 ([22b6ede](https://github.com/sunerpy/zuno/commit/22b6ede5b918de28ce31885607d89548a9633ee1))
+
 ## [0.10.31](https://github.com/sunerpy/zuno/compare/v0.10.30...v0.10.31) (2026-09-11)
 
 
