@@ -245,3 +245,9 @@ enterprise PostgreSQL/HTTPS tests, 100 documentation/release tests, Python CI
 contracts, preview publisher tests, actionlint, formatting and diff checks.
 Native Windows validation will run on this shared-manifest change; enterprise-only
 changes can then skip that personal regression according to the path classifier.
+
+PR #200's first Windows scheduler run exposed CRLF translation in the Python-to-Bash
+argument stream (`--workspace` carried a trailing carriage return). A simulated
+Windows stdout regression reproduced the exact bytes before the fix. The selector
+now emits the argument protocol through binary stdout with LF delimiters; Python
+CI tests and personal dependency verification pass. Native CI is being rerun.

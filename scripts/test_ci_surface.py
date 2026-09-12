@@ -1,5 +1,8 @@
 import unittest
+import io
+from unittest.mock import patch
 
+import cargo_surface
 from cargo_surface import personal_arguments
 from ci_platform_scope import requires_personal
 
@@ -12,6 +15,16 @@ def metadata(extra=()):
 
 
 class PersonalSurfaceTests(unittest.TestCase):
+    def test_argument_stream_is_lf_only_even_with_windows_stdout_translation(self):
+        raw = io.BytesIO()
+        translated = io.TextIOWrapper(raw, encoding="utf-8", newline="\r\n")
+        with patch.object(cargo_surface, "metadata_at", return_value=metadata()), \
+                patch("sys.argv", ["cargo_surface.py", "args"]), \
+                patch("sys.stdout", translated):
+            cargo_surface.main()
+            translated.flush()
+        self.assertEqual(raw.getvalue(), b"--workspace\n")
+
     def test_enterprise_only_paths_do_not_require_personal_windows(self):
         self.assertFalse(requires_personal([
             "crates/zuno-postgres/src/operation.rs", "enterprise/STATUS.md",

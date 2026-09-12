@@ -4,6 +4,7 @@
 import argparse
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -46,7 +47,9 @@ def main():
     metadata = metadata_at(repository)
     selection = personal_arguments(metadata)
     if options.mode == "args":
-        print("\n".join(selection))
+        # This is a line protocol consumed by Bash mapfile. Windows text-mode
+        # CRLF translation would become a literal CR inside every Cargo argument.
+        sys.stdout.buffer.write(("\n".join(selection) + "\n").encode("utf-8"))
         return
     if options.mode == "verify":
         result = subprocess.run(
