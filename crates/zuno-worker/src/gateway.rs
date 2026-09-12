@@ -25,6 +25,9 @@ impl WorkerClient {
         execution: &WorkerExecution,
         request: &GatewayRequest,
     ) -> Result<IssuedGatewayRequest, TurnStateError> {
+        if execution.boundary_started() {
+            return Err(TurnStateError::LeaseLost);
+        }
         let grant = execution
             .credential
             .read()

@@ -184,7 +184,8 @@ limit. No incomplete history is treated as an exact old context window.
 
 The captured format-5 fixture preserves pending waits, Job budgets, lease state,
 messages and usage across failed/successful format-6 migration. The internal Worker
-protocol is version 3; it is separate from public UI DTOs.
+protocol is version 4; it is separate from public UI DTOs. Its compatible claims,
+stable input timestamps and bounded grant renewal are described in [Workers](WORKERS.md).
 
 ## Browser authentication state
 

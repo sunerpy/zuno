@@ -260,3 +260,24 @@ argument stream (`--workspace` carried a trailing carriage return). A simulated
 Windows stdout regression reproduced the exact bytes before the fix. The selector
 now emits the argument protocol through binary stdout with LF delimiters; Python
 CI tests and personal dependency verification pass. Native CI is being rerun.
+
+## Bounded Worker execution
+
+- Platform PR #200 passed CI `34663672877` and merged at `27df523e71d4da6c053f37dab849e8ded842bb3c`. Operation-result PR #201 passed CI `34665036201` and merged at `63b1930fcc8a1c8074411dbc2fe5ea242cba77b5`.
+- `WorkerRuntime` composes the shared bounded driver with compatible configuration claims, bounded slots, monotonic grant lifetimes, renewal during initialization and execution, and bounded drain. Worker protocol 4 rejects old claims before acquiring work and carries the input's stable admission timestamp.
+- A focused real HTTPS/PostgreSQL regression reproduced loss of the initial lease during configuration loading. Renewal now covers the complete advance preparation. A second regression showed the missing configuration-routing contract; the claim query now leaves mismatched definitions for a compatible Worker.
+- Two runtime instances exercise the same kernel without duplicate input, provider requests or tool execution. Fault injection rejects renewal before dispatch, and the finish route refuses optimistic success. This remains same-process integration evidence; standalone enterprise services and root-tool assembly are still required.
+- A retained driver event sender reproduced a false lease-loss report after a committed checkpoint. The host now uses nonblocking observations and a bounded final event drain, independent of sender/profile lifetime.
+- Documentation impact: both Worker guides, PostgreSQL/wait guides and preview navigation are updated. Preview documents remain isolated tag artifacts, and no stable site publication or release is enabled.
+
+PR #202's amd64 Docker gate exposed renewal racing the final checkpoint response.
+A controlled 500ms delay after checkpoint commit reproduced the false lease-loss
+report locally. Claim-local serialization now protects the boundary POST and
+retires renewal only after its validated acknowledgement. The controlled
+PostgreSQL/HTTPS regression passes; the native CI rerun remains required.
+
+The rerun also exercised a checkpoint response crossing the old grant deadline.
+A 1.5s post-commit delay under a 1s lease reproduced `LeaseExpired` while the Job
+was already `Completed`. Final submission now closes new state/gateway admission
+and permits only a bounded acknowledgement wait. The target regression passes
+without extending database execution authority or replaying the final POST.

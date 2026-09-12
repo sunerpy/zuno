@@ -204,7 +204,7 @@ async fn gateway_requests_are_scoped_authenticated_and_still_require_current_hum
     let resolver = Arc::new(
         ConfiguredGateways::new(vec![GatewayDeployment {
             tenant: tenant.clone(),
-            configuration,
+            configuration: configuration.clone(),
             gateway_id: GatewayId::new("gateway").unwrap(),
             endpoint: execution_url,
             image: IMAGE.to_owned(),
@@ -255,7 +255,10 @@ async fn gateway_requests_are_scoped_authenticated_and_still_require_current_hum
     )
     .unwrap();
     let execution = worker
-        .claim(WorkerInstanceId::new("first").unwrap())
+        .claim(
+            WorkerInstanceId::new("first").unwrap(),
+            std::slice::from_ref(&configuration),
+        )
         .await
         .unwrap()
         .unwrap();

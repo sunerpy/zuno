@@ -42,7 +42,7 @@ workspace。`crates/zuno-cli` 构建最终的 `zuno` 二进制，其余 crate �
 | Crate | 职责 |
 | --- | --- |
 | `zuno-application` | 作用域化客户端应用服务与可替换持久化接口 |
-| `zuno-worker` | 经认证的 Worker 状态传输，不持有 PostgreSQL 凭证 |
+| `zuno-worker` | 经认证的状态／网关传输与有界 Worker 执行，不持有 PostgreSQL 凭证 |
 | `zuno-environment` | rootless Docker 工作区卷、操作回执、快照和输出游标 |
 | `zuno-runtime` | 有作用域的 Component 运行时、类型化服务、事务式 Profile 替换与 disposer 跟踪 |
 | `zuno-harness` | 发布运行时使用的 `HarnessProfile` 与 `ProfileBundle` 组合 |

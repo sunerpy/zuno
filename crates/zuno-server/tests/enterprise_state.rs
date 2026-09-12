@@ -50,6 +50,8 @@ use zuno_worker::{AccessTokenSource, WorkerClient};
 mod browser;
 #[path = "enterprise_state/gateway.rs"]
 mod gateway;
+#[path = "enterprise_state/worker_runtime.rs"]
+mod worker_runtime;
 
 #[derive(Deserialize)]
 struct Fixture {
@@ -396,7 +398,10 @@ async fn authenticated_workers_resume_the_kernel_over_https_without_database_cre
     let untrusted = WorkerClient::new(url.clone(), Arc::new(Token("worker-token")), None).unwrap();
     assert!(
         untrusted
-            .claim(WorkerInstanceId::new("untrusted").unwrap())
+            .claim(
+                WorkerInstanceId::new("untrusted").unwrap(),
+                std::slice::from_ref(&configuration)
+            )
             .await
             .is_err()
     );
@@ -404,7 +409,10 @@ async fn authenticated_workers_resume_the_kernel_over_https_without_database_cre
         WorkerClient::new(url.clone(), Arc::new(Token("user-token")), Some(ca.clone())).unwrap();
     assert!(
         denied
-            .claim(WorkerInstanceId::new("user").unwrap())
+            .claim(
+                WorkerInstanceId::new("user").unwrap(),
+                std::slice::from_ref(&configuration)
+            )
             .await
             .is_err()
     );
@@ -416,7 +424,10 @@ async fn authenticated_workers_resume_the_kernel_over_https_without_database_cre
     .unwrap();
     assert!(
         failure
-            .claim(WorkerInstanceId::new("failed").unwrap())
+            .claim(
+                WorkerInstanceId::new("failed").unwrap(),
+                std::slice::from_ref(&configuration)
+            )
             .await
             .is_err()
     );
@@ -429,13 +440,19 @@ async fn authenticated_workers_resume_the_kernel_over_https_without_database_cre
     .unwrap();
     assert!(
         redirect
-            .claim(WorkerInstanceId::new("redirected").unwrap())
+            .claim(
+                WorkerInstanceId::new("redirected").unwrap(),
+                std::slice::from_ref(&configuration)
+            )
             .await
             .is_err()
     );
     let client = WorkerClient::new(url, Arc::new(Token("worker-token")), Some(ca)).unwrap();
     let first = client
-        .claim(WorkerInstanceId::new("first").unwrap())
+        .claim(
+            WorkerInstanceId::new("first").unwrap(),
+            std::slice::from_ref(&configuration),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -554,7 +571,10 @@ async fn authenticated_workers_resume_the_kernel_over_https_without_database_cre
     );
     assert!(
         client
-            .claim(WorkerInstanceId::new("waiting").unwrap())
+            .claim(
+                WorkerInstanceId::new("waiting").unwrap(),
+                std::slice::from_ref(&configuration)
+            )
             .await
             .unwrap()
             .is_none()
@@ -571,7 +591,10 @@ async fn authenticated_workers_resume_the_kernel_over_https_without_database_cre
     let fact = runtime.publish(&scope, &completion).await.unwrap();
     assert_eq!(runtime.publish(&scope, &completion).await.unwrap(), fact);
     let second = client
-        .claim(WorkerInstanceId::new("second").unwrap())
+        .claim(
+            WorkerInstanceId::new("second").unwrap(),
+            std::slice::from_ref(&configuration),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -601,7 +624,10 @@ async fn authenticated_workers_resume_the_kernel_over_https_without_database_cre
     assert_eq!(script.calls.load(Ordering::SeqCst), 1);
     // Reconstruct from the Job after losing the consumption response.
     let third = client
-        .claim(WorkerInstanceId::new("third").unwrap())
+        .claim(
+            WorkerInstanceId::new("third").unwrap(),
+            std::slice::from_ref(&configuration),
+        )
         .await
         .unwrap()
         .unwrap();

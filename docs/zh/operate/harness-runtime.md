@@ -108,8 +108,10 @@ provider 及主体／会话作用域，模型与工具编排不再直接持有 S
 普通驱动已接入 SQLite 和带执行权校验的 PostgreSQL 适配器；后者检查当前组织授权，并将驱动
 检查点与原生 Job 交还／结算原子提交。这些进程内记录不是公共 Web 协议。独立版本化的 Worker
 codec 和 HTTPS client 已接入内部认证状态路由，服务身份、签名 Job 范围与当前数据库执行权分别
-校验；Worker client 不依赖 PostgreSQL。可运行的分布式部署仍需执行环境回执及企业启动／Profile
-装配。状态确认丢失时暂停恢复，不因此自动重放副作用。
+校验；Worker client 不依赖 PostgreSQL。`WorkerRuntime` 管理兼容配置领取、有界槽位及覆盖
+初始化与推进的续租；单调时钟保守扣除请求延迟，数据库时间仍是权威。输入时间及检查点预算
+在 Worker 更换后保留，详见 [Worker 宿主](../../../enterprise/WORKERS.zh.md)。
+可运行的分布式部署仍需企业启动／Profile 及工具装配。状态确认丢失时暂停恢复，不因此自动重放副作用。
 
 ## 持久运行时存储
 
