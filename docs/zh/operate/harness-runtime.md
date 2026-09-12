@@ -869,3 +869,6 @@ WebSearch 的带密钥 wire URL 不进入诊断。错误只保留 provider、sch
 
 
 企业 React 工作台消费从 Rust 生成的公共应用与活动 DTO。控制面可选 Web 适配器与同源 OIDC BFF 一起提供不可变资源包，UI 操作仍须通过数据所有者的当前授权。浏览器身份绑定及可取消的会话订阅防止旧账号／会话响应影响当前工作，详见预览文档包 `enterprise/WEB.zh.md`。
+
+
+Workflow／Council 宿主派发区分已完成结果与持久等待，保留类型化工具错误。本地 Workflow 与企业协调器共用 DAG 就绪／逻辑容量决策和有界依赖结果输入。可信外部不确定完成结果消费一次后，后续有界推进要求核查。企业协调及节点审批见预览文档 `enterprise/WORKFLOW.zh.md`。

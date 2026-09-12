@@ -90,3 +90,5 @@ socket 会使该 gate 失败。可以通过 `ZUNO_ROOTLESS_DOCKER_SOCKET` 指定
 ## 数据所有者取消
 
 网关 supervisor 通过独立服务认证轮询 `internal/gateway/v1/cancellations`，领取已停止 Job 的不可变操作接纳记录。该入口在 Worker 撤权后仍有效，只允许停止原操作；完成事实保持原样，不确定状态继续核查。见[控制](CONTROL.zh.md)。
+
+网关协议 3 允许从数据所有者验证过的 Workflow 协调工作区准备子工作区；源工作区必须已经存在，具体子 Job、源与网关绑定保持在签名请求内。普通命令仍要求执行会话一致。

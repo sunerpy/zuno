@@ -17,6 +17,8 @@ use super::*;
 mod format_eight;
 #[path = "tests/format_eleven.rs"]
 mod format_eleven;
+#[path = "tests/format_fourteen.rs"]
+mod format_fourteen;
 #[path = "tests/format_nine.rs"]
 mod format_nine;
 #[path = "tests/format_seven.rs"]
@@ -324,11 +326,16 @@ async fn real_postgres_enforces_scopes_transactions_role_boundaries_and_schema_i
     .unwrap();
     a.queue_text(failed).await.unwrap();
 
-    crate::runtime_tests::exercise(&backend, &admin).await;
-    crate::authorization_tests::exercise(&backend, &admin, &migrator).await;
-    crate::turn_tests::exercise(&backend, &admin, &migrator).await;
-    crate::browser_tests::exercise(&backend, &admin).await;
-    crate::memory::tests::exercise(&backend, &admin).await;
+    // Independent suites keep their async state on the heap instead of
+    // embedding every nested runtime path in the outer test Future.
+    Box::pin(crate::runtime_tests::exercise(&backend, &admin)).await;
+    Box::pin(crate::authorization_tests::exercise(
+        &backend, &admin, &migrator,
+    ))
+    .await;
+    Box::pin(crate::turn_tests::exercise(&backend, &admin, &migrator)).await;
+    Box::pin(crate::browser_tests::exercise(&backend, &admin)).await;
+    Box::pin(crate::memory::tests::exercise(&backend, &admin)).await;
     format_two_upgrade(&fixture, &admin).await;
     format_three_upgrade(&fixture, &admin).await;
     format_four_upgrade(&fixture, &admin).await;
@@ -341,6 +348,7 @@ async fn real_postgres_enforces_scopes_transactions_role_boundaries_and_schema_i
     format_eleven::upgrade(&fixture, &admin).await;
     format_twelve::upgrade(&fixture, &admin).await;
     format_thirteen::upgrade(&fixture, &admin).await;
+    format_fourteen::upgrade(&fixture, &admin).await;
     let expected_count: i64 = query_scalar("SELECT count(*) FROM zuno_enterprise_preview.session")
         .fetch_one(&admin)
         .await

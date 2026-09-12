@@ -131,3 +131,5 @@ The frozen format-13 migration retains messages, Memory and committed frames
 through injected DDL failure. HTTPS tests observe a real pending provider draft
 and verify it disappears after completion; SDK tests cover generation replacement,
 retry clearing and fresh progress after a silent interval.
+
+`UiAction::ViewWorkflow` names the durable orchestration Job. The data owner derives it from the original message execution Job and invocation relation, including completed calls. A model-authored tool name or output cannot create this link.

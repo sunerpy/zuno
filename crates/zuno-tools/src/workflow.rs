@@ -5,6 +5,7 @@
 //! configured template. Model and reasoning resolution reuse [`crate::task::TaskTool`]
 //! so direct delegation and workflow nodes cannot disagree about provider policy.
 
+use crate::orchestration_dispatch::{OrchestrationDispatch, validate_pending};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -95,7 +96,7 @@ pub trait WorkflowHost: Send + Sync + 'static {
         &self,
         request: WorkflowRequest,
         cancellation: CancellationToken,
-    ) -> Result<WorkflowTurn, String>;
+    ) -> Result<OrchestrationDispatch<WorkflowTurn>, ToolError>;
 }
 
 /// A model-facing tool that can only instantiate known workflow templates.
@@ -255,6 +256,16 @@ impl TypedTool for WorkflowTool {
     }
 
     async fn run(&self, params: WorkflowParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        self.dispatch(params, ctx).await?.into_ready(WIRE_ID)
+    }
+}
+
+impl WorkflowTool {
+    pub async fn dispatch(
+        &self,
+        params: WorkflowParams,
+        ctx: ToolContext,
+    ) -> Result<OrchestrationDispatch<ToolOutput>, ToolError> {
         let name = params.workflow.trim();
         if name.is_empty() {
             return Err(invalid("`workflow` must not be empty"));
@@ -331,14 +342,26 @@ impl TypedTool for WorkflowTool {
                     dispatch.await
                 }
             }
+        }?;
+        let turn = match turn {
+            OrchestrationDispatch::Ready(turn) => turn,
+            OrchestrationDispatch::Pending(reference) => {
+                validate_pending(WIRE_ID, &ctx, background, &reference)?;
+                return Ok(OrchestrationDispatch::Pending(reference));
+            }
+        };
+        if !background && turn.job_id.is_some() {
+            return Err(failed(
+                "foreground orchestration is still running; return a durable Pending wait"
+                    .to_owned(),
+            ));
         }
-        .map_err(failed)?;
         if background && turn.job_id.is_none() {
             return Err(failed(
                 "a background workflow dispatch did not return a durable job id".to_owned(),
             ));
         }
-        Ok(render(&params, &turn))
+        Ok(OrchestrationDispatch::Ready(render(&params, &turn)))
     }
 }
 
@@ -417,22 +440,119 @@ mod tests {
         requests: Mutex<Vec<WorkflowRequest>>,
     }
 
+    struct SuspendedHost {
+        call: &'static str,
+        deny: bool,
+    }
+    #[async_trait]
+    impl WorkflowHost for SuspendedHost {
+        async fn dispatch(
+            &self,
+            _: WorkflowRequest,
+            _: CancellationToken,
+        ) -> Result<OrchestrationDispatch<WorkflowTurn>, ToolError> {
+            if self.deny {
+                return Err(ToolError::Denied {
+                    tool: WIRE_ID.to_owned(),
+                    denial: None,
+                });
+            }
+            Ok(OrchestrationDispatch::Pending(zuno_types::wait::WaitRef {
+                id: zuno_types::identity::WaitId::new("wait-workflow").unwrap(),
+                turn_id: zuno_types::identity::TurnId::new("turn-parent").unwrap(),
+                invocation_id: zuno_types::identity::InvocationId::new(self.call).unwrap(),
+                arguments_sha256: "a".repeat(64),
+                target: zuno_types::wait::WaitTarget::Child {
+                    job_id: zuno_types::identity::JobId::new("job-workflow").unwrap(),
+                },
+                continuation: zuno_types::wait::WaitContinuation::CurrentTurn,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn foreground_waits_remain_pending_and_cannot_become_running_tool_text() {
+        let params = |background| WorkflowParams {
+            workflow: "release".into(),
+            prompt: "Inspect".into(),
+            description: None,
+            background,
+            report_delivery: None,
+        };
+        let ctx = || {
+            ToolContext::new(
+                "ses_parent",
+                "msg_parent",
+                "call_workflow",
+                "build",
+                Arc::new(AllowAll),
+                Arc::new(NeverInterrupted),
+            )
+        };
+        let tool = |call, deny| {
+            WorkflowTool::new(
+                [template()],
+                TaskTool::new(
+                    Arc::new(crate::task::RecordingHost::new()),
+                    Arc::new(crate::task::NoProviders),
+                )
+                .with_targets(
+                    crate::task::DelegationTargets::new(["explore".into(), "worker".into()])
+                        .unwrap(),
+                ),
+                Arc::new(SuspendedHost { call, deny }),
+            )
+            .unwrap()
+        };
+        assert!(matches!(
+            tool("call_workflow", false)
+                .dispatch(params(None), ctx())
+                .await
+                .unwrap(),
+            OrchestrationDispatch::Pending(_)
+        ));
+        assert!(
+            tool("call_workflow", false)
+                .run(params(None), ctx())
+                .await
+                .is_err()
+        );
+        assert!(
+            tool("call_workflow", false)
+                .dispatch(params(Some(true)), ctx())
+                .await
+                .is_err()
+        );
+        assert!(
+            tool("another_call", false)
+                .dispatch(params(None), ctx())
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            tool("call_workflow", true)
+                .dispatch(params(None), ctx())
+                .await,
+            Err(ToolError::Denied { .. })
+        ));
+    }
+
     #[async_trait]
     impl WorkflowHost for RecordingWorkflowHost {
         async fn dispatch(
             &self,
             request: WorkflowRequest,
             _cancellation: CancellationToken,
-        ) -> Result<WorkflowTurn, String> {
+        ) -> Result<OrchestrationDispatch<WorkflowTurn>, ToolError> {
             self.requests
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(request);
-            Ok(WorkflowTurn {
+            Ok(OrchestrationDispatch::Ready(WorkflowTurn {
                 run_id: "run_test".to_owned(),
                 job_id: None,
                 output: "done".to_owned(),
-            })
+            }))
         }
     }
 

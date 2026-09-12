@@ -7,6 +7,7 @@ mod control;
 mod store;
 mod transactions;
 pub(crate) mod waiting;
+pub(crate) mod workflow;
 pub(crate) use transactions::{checkpoint_in, finish_in, suspend_in};
 
 use async_trait::async_trait;

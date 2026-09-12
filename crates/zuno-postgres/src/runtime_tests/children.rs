@@ -1,4 +1,5 @@
 use super::*;
+mod workflow;
 mod workspace;
 use zuno_application::child::{
     ChildDefinitionGrant, ChildDelivery, ChildDispatchStore, ChildInvocation,
@@ -65,6 +66,7 @@ pub(super) async fn execution_binding(backend: &PostgresBackend, admin: &PgPool)
     cancellation_fences_the_tree_and_preserves_other_sessions(backend, admin).await;
     completed_parent_cancellation_prevents_a_late_next_step(backend, admin, false).await;
     completed_parent_cancellation_prevents_a_late_next_step(backend, admin, true).await;
+    workflow::exercise(backend, admin).await;
 }
 
 async fn cancellation_fences_the_tree_and_preserves_other_sessions(

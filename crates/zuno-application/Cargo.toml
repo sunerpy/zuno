@@ -18,6 +18,7 @@ thiserror = { workspace = true }
 zuno-runtime = { workspace = true }
 zuno-types = { workspace = true }
 zuno-permission = { workspace = true }
+zuno-orchestration = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

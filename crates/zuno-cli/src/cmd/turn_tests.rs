@@ -1734,8 +1734,16 @@ impl zuno_tools::workflow::WorkflowHost for NoWorkflows {
         &self,
         _request: zuno_tools::workflow::WorkflowRequest,
         _cancellation: tokio_util::sync::CancellationToken,
-    ) -> Result<zuno_tools::workflow::WorkflowTurn, String> {
-        Err("test fixture has no workflows".to_owned())
+    ) -> Result<
+        zuno_tools::orchestration_dispatch::OrchestrationDispatch<
+            zuno_tools::workflow::WorkflowTurn,
+        >,
+        zuno_error::ToolError,
+    > {
+        Err(zuno_error::ToolError::Failed {
+            tool: "workflow".to_owned(),
+            source: Box::new(std::io::Error::other("test fixture has no workflows")),
+        })
     }
 }
 
@@ -1752,8 +1760,14 @@ impl zuno_tools::council::CouncilHost for NoCouncils {
         &self,
         _request: zuno_tools::council::CouncilRequest,
         _cancellation: tokio_util::sync::CancellationToken,
-    ) -> Result<zuno_tools::council::CouncilTurn, String> {
-        Err("test fixture has no Councils".to_owned())
+    ) -> Result<
+        zuno_tools::orchestration_dispatch::OrchestrationDispatch<zuno_tools::council::CouncilTurn>,
+        zuno_error::ToolError,
+    > {
+        Err(zuno_error::ToolError::Failed {
+            tool: "council_run".to_owned(),
+            source: Box::new(std::io::Error::other("test fixture has no Councils")),
+        })
     }
 }
 

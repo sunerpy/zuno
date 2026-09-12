@@ -33,6 +33,7 @@ use zuno_review::{
 use zuno_tools::council::{
     CouncilHost, CouncilRequest, CouncilReviewBinding, CouncilSeatRequest, CouncilTurn,
 };
+use zuno_tools::orchestration_dispatch::OrchestrationDispatch;
 use zuno_tools::task::{ChildTurn, ChildTurnRequest, ReportDelivery};
 use zuno_tools::work_state::{
     WorkItem, WorkItemChange, WorkItemPriority, WorkItemStatus, WorkStateStore,
@@ -46,6 +47,31 @@ const MAX_COUNCIL_LIST_ITEMS: usize = 32;
 const MAX_COUNCIL_FIELD_BYTES: usize = 4_096;
 type NodeJoin = (usize, String, String, i64, Result<ChildTurn, String>);
 type CouncilJoin = (usize, i64, CouncilSeatResult);
+
+enum NativeDispatchFailure {
+    Failed(String),
+    Uncertain(String),
+}
+impl From<String> for NativeDispatchFailure {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+impl NativeDispatchFailure {
+    fn into_tool(self, tool: &str) -> zuno_error::ToolError {
+        match self {
+            Self::Failed(message) => zuno_error::ToolError::Failed {
+                tool: tool.to_owned(),
+                source: Box::new(std::io::Error::other(message)),
+            },
+            Self::Uncertain(message) => zuno_error::ToolError::Uncertain {
+                tool: tool.to_owned(),
+                applied_paths: Vec::new(),
+                source: Box::new(std::io::Error::other(message)),
+            },
+        }
+    }
+}
 
 #[async_trait]
 trait WorkflowNodeRunner: Send + Sync + 'static {
@@ -862,8 +888,23 @@ impl NativeWorkflowHost {
         cancellation: CancellationToken,
         items: &mut WorkflowItems,
     ) -> WorkflowOutcome {
-        let mut pending = (0..request.nodes.len()).collect::<BTreeSet<_>>();
-        let mut completed_ids = BTreeSet::new();
+        use zuno_engine::workflow::{Decision, NodePhase, WorkflowGraph};
+        let graph = match WorkflowGraph::new(
+            request
+                .nodes
+                .iter()
+                .map(|node| (node.id.clone(), node.depends_on.clone())),
+            request.max_parallel,
+        ) {
+            Ok(graph) => graph,
+            Err(error) => {
+                return WorkflowOutcome::Failed {
+                    message: error.to_string(),
+                    completed: Vec::new(),
+                };
+            }
+        };
+        let mut phases = vec![NodePhase::Pending; request.nodes.len()];
         let mut results = vec![None; request.nodes.len()];
         let max_parallel = request.max_parallel.max(1);
         let run_cancellation = cancellation.child_token();
@@ -887,16 +928,22 @@ impl NativeWorkflowHost {
             }
 
             while tasks.len() < max_parallel {
-                let next = pending.iter().copied().find(|index| {
-                    request.nodes[*index]
-                        .depends_on
-                        .iter()
-                        .all(|dependency| completed_ids.contains(dependency))
-                });
+                let next = match graph.decide(&phases) {
+                    Ok(Decision::Dispatch(indices)) => indices.first().copied(),
+                    Ok(_) => None,
+                    Err(error) => {
+                        run_cancellation.cancel();
+                        let _drained = drain_cancelled(&mut tasks).await;
+                        return WorkflowOutcome::Uncertain {
+                            message: error.to_string(),
+                            completed: ordered_results(&results),
+                        };
+                    }
+                };
                 let Some(index) = next else {
                     break;
                 };
-                pending.remove(&index);
+                phases[index] = NodePhase::Running;
                 if let Err(error) = self.transition_item(
                     &request.parent_session_id,
                     &mut items.nodes[index],
@@ -929,7 +976,37 @@ impl NativeWorkflowHost {
                     };
                 }
                 items.nodes[index].started = Some(Instant::now());
-                let node = request.nodes[index].clone();
+                let mut node = request.nodes[index].clone();
+                let dependencies = node
+                    .depends_on
+                    .iter()
+                    .map(|id| {
+                        let result = results
+                            .iter()
+                            .flatten()
+                            .find(|result: &&NodeResult| &result.id == id)
+                            .expect("checked graph permits only completed dependencies");
+                        zuno_engine::workflow::DependencyOutput {
+                            node_id: id.clone(),
+                            job_id: None,
+                            output: result.output.clone(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                node.turn.prompt = match zuno_engine::workflow::dependency_prompt(
+                    &node.turn.prompt,
+                    &dependencies,
+                ) {
+                    Ok(prompt) => prompt,
+                    Err(error) => {
+                        run_cancellation.cancel();
+                        let _drained = drain_cancelled(&mut tasks).await;
+                        return WorkflowOutcome::Uncertain {
+                            message: error.to_string(),
+                            completed: ordered_results(&results),
+                        };
+                    }
+                };
                 let runner = Arc::clone(&self.runner);
                 let node_cancellation = run_cancellation.child_token();
                 tasks.spawn(async move {
@@ -942,7 +1019,7 @@ impl NativeWorkflowHost {
             }
 
             if tasks.is_empty() {
-                if pending.is_empty() {
+                if phases.iter().all(|phase| *phase == NodePhase::Completed) {
                     if cancellation.is_cancelled() {
                         return WorkflowOutcome::Cancelled {
                             message: "cancelled by the parent turn".to_owned(),
@@ -981,7 +1058,7 @@ impl NativeWorkflowHost {
             };
             match joined {
                 Ok((index, id, agent, elapsed_ms, Ok(turn))) => {
-                    completed_ids.insert(id.clone());
+                    phases[index] = NodePhase::Completed;
                     let session_id = turn.session_id;
                     results[index] = Some(NodeResult {
                         index,
@@ -1608,7 +1685,20 @@ impl WorkflowHost for NativeWorkflowHost {
         &self,
         request: WorkflowRequest,
         cancellation: CancellationToken,
-    ) -> Result<WorkflowTurn, String> {
+    ) -> Result<OrchestrationDispatch<WorkflowTurn>, zuno_error::ToolError> {
+        self.dispatch_workflow(request, cancellation)
+            .await
+            .map(OrchestrationDispatch::Ready)
+            .map_err(|error| error.into_tool("workflow"))
+    }
+}
+
+impl NativeWorkflowHost {
+    async fn dispatch_workflow(
+        &self,
+        request: WorkflowRequest,
+        cancellation: CancellationToken,
+    ) -> Result<WorkflowTurn, NativeDispatchFailure> {
         let run_id = super::turn::prefixed_id("run");
         let job_id = super::turn::prefixed_id("job");
         let delivery = if request.background {
@@ -1640,7 +1730,7 @@ impl WorkflowHost for NativeWorkflowHost {
                     JobSettlement::failed(message.clone(), zuno_db::message::now_millis(), None),
                 );
                 self.changes.changed();
-                return Err(message);
+                return Err(message.into());
             }
         };
 
@@ -1681,16 +1771,20 @@ impl WorkflowHost for NativeWorkflowHost {
         let outcome = self
             .execute_managed(&request, cancellation, &mut work_items)
             .await;
-        let summary = self.settle(&request, &run_id, &job_id, &outcome).await?;
+        let summary = self
+            .settle(&request, &run_id, &job_id, &outcome)
+            .await
+            .map_err(NativeDispatchFailure::Uncertain)?;
         match outcome {
             WorkflowOutcome::Completed(_) => Ok(WorkflowTurn {
                 run_id,
                 job_id: None,
                 output: summary,
             }),
-            WorkflowOutcome::Failed { .. }
-            | WorkflowOutcome::Cancelled { .. }
-            | WorkflowOutcome::Uncertain { .. } => Err(summary),
+            WorkflowOutcome::Failed { .. } | WorkflowOutcome::Cancelled { .. } => {
+                Err(summary.into())
+            }
+            WorkflowOutcome::Uncertain { .. } => Err(NativeDispatchFailure::Uncertain(summary)),
         }
     }
 }
@@ -1701,7 +1795,20 @@ impl CouncilHost for NativeWorkflowHost {
         &self,
         request: CouncilRequest,
         cancellation: CancellationToken,
-    ) -> Result<CouncilTurn, String> {
+    ) -> Result<OrchestrationDispatch<CouncilTurn>, zuno_error::ToolError> {
+        self.dispatch_council(request, cancellation)
+            .await
+            .map(OrchestrationDispatch::Ready)
+            .map_err(|error| error.into_tool("council_run"))
+    }
+}
+
+impl NativeWorkflowHost {
+    async fn dispatch_council(
+        &self,
+        request: CouncilRequest,
+        cancellation: CancellationToken,
+    ) -> Result<CouncilTurn, NativeDispatchFailure> {
         if request.seats.is_empty()
             || request.quorum == 0
             || request.quorum > request.seats.len()
@@ -1713,7 +1820,9 @@ impl CouncilHost for NativeWorkflowHost {
             || request.seat_output_bytes == 0
             || request.synthesis_input_bytes == 0
         {
-            return Err("Council request has invalid seats, quorum, or bounds".to_owned());
+            return Err("Council request has invalid seats, quorum, or bounds"
+                .to_owned()
+                .into());
         }
         let run_id = super::turn::prefixed_id("run");
         let job_id = super::turn::prefixed_id("job");
@@ -1755,7 +1864,7 @@ impl CouncilHost for NativeWorkflowHost {
                         .with_result(result),
                 );
                 self.changes.changed();
-                return Err(message);
+                return Err(message.into());
             }
         };
 
@@ -1804,15 +1913,18 @@ impl CouncilHost for NativeWorkflowHost {
             .await;
         let summary = self
             .settle_council(&request, &run_id, &job_id, &outcome)
-            .await?;
+            .await
+            .map_err(NativeDispatchFailure::Uncertain)?;
         if outcome.status == CouncilRunStatus::Completed {
             Ok(CouncilTurn {
                 run_id,
                 job_id: None,
                 output: summary,
             })
+        } else if outcome.status == CouncilRunStatus::Uncertain {
+            Err(NativeDispatchFailure::Uncertain(summary))
         } else {
-            Err(summary)
+            Err(summary.into())
         }
     }
 }

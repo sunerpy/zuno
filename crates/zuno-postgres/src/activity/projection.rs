@@ -73,6 +73,16 @@ pub(crate) async fn part(
     if let SessionItem::Invocation { invocation } = &mut item.item {
         if let Some(job) = execution_job {
             enrich_invocation(connection, owner, &record.session_id, &job, invocation).await?;
+            let workflow: Option<String> = query_scalar("SELECT w.job_id FROM zuno_enterprise_preview.runtime_workflow w
+                JOIN zuno_enterprise_preview.runtime_child c ON c.tenant_id=w.tenant_id AND c.principal_id=w.principal_id AND c.job_id=w.job_id
+                WHERE w.tenant_id=$1 AND w.principal_id=$2 AND w.parent_job_id=$3 AND w.parent_session_id=$4 AND c.invocation_id=$5")
+                .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(&job).bind(&record.session_id).bind(invocation.id.as_str())
+                .fetch_optional(&mut *connection).await.map_err(database_error)?;
+            if let Some(job) = workflow {
+                item.actions.push(UiAction::ViewWorkflow {
+                    job_id: JobId::new(job).map_err(ApplicationError::storage)?,
+                });
+            }
         } else if invocation.state == InvocationState::Running {
             invocation.state = InvocationState::Uncertain;
         }

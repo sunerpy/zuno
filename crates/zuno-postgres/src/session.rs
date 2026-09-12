@@ -99,10 +99,13 @@ impl SessionPersistence for PostgresSessionPersistence {
     async fn list(&self, request: SessionPageRequest) -> Result<SessionPage, ApplicationError> {
         let mut tx = scoped_transaction(&self.pool, &self.principal).await?;
         let rows = sqlx_core::query::query(
-            "SELECT id,workspace_id,title,time_created,time_updated FROM zuno_enterprise_preview.session
-             WHERE tenant_id=$1 AND principal_id=$2
-               AND ($3::bigint IS NULL OR time_updated<$3 OR (time_updated=$3 AND id<$4))
-             ORDER BY time_updated DESC,id DESC LIMIT $5",
+            "SELECT s.id,s.workspace_id,s.title,s.time_created,s.time_updated FROM zuno_enterprise_preview.session s
+             WHERE s.tenant_id=$1 AND s.principal_id=$2
+               AND NOT EXISTS(SELECT 1 FROM zuno_enterprise_preview.runtime_workflow w
+                 JOIN zuno_enterprise_preview.runtime_child c ON c.tenant_id=w.tenant_id AND c.principal_id=w.principal_id AND c.job_id=w.job_id
+                 WHERE c.tenant_id=s.tenant_id AND c.principal_id=s.principal_id AND c.child_session_id=s.id)
+               AND ($3::bigint IS NULL OR s.time_updated<$3 OR (s.time_updated=$3 AND s.id<$4))
+             ORDER BY s.time_updated DESC,s.id DESC LIMIT $5",
         ).bind(self.principal.tenant_id().as_str()).bind(self.principal.principal_id().as_str())
             .bind(request.after.as_ref().map(|cursor|cursor.updated_at))
             .bind(request.after.as_ref().map(|cursor|cursor.session_id.as_str()))

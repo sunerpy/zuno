@@ -61,6 +61,10 @@ impl RuntimeStore for PostgresRuntimeStore {
             let time = database_time(&mut tx).await?;
             expire_inflight(&mut tx, &owner, time).await?;
             children::drain(&mut tx, &owner).await?;
+            // Coordination has its own bounded async state. Keeping it inline
+            // would embed the full cancellation/completion chain in every
+            // ordinary Job claim, including claims with no active Workflow.
+            Box::pin(workflow::drain(&mut tx, &owner)).await?;
             waiting::wake_timers(&mut tx, &owner, time).await?;
             let time = database_time(&mut tx).await?;
             let candidate = query(
@@ -72,6 +76,8 @@ impl RuntimeStore for PostgresRuntimeStore {
                  JOIN zuno_enterprise_preview.input i
                    ON i.tenant_id=r.tenant_id AND i.principal_id=r.principal_id AND i.id=r.input_id
                  WHERE r.tenant_id=$1 AND r.principal_id=$2 AND r.phase='ready' AND r.ready_at<=$3
+                   AND NOT EXISTS(SELECT 1 FROM zuno_enterprise_preview.runtime_workflow w
+                     WHERE w.tenant_id=r.tenant_id AND w.principal_id=r.principal_id AND w.job_id=r.job_id)
                    AND ($4::jsonb IS NULL OR r.configuration IN (SELECT value FROM jsonb_array_elements($4::jsonb)))
                    AND s.lease_job_id IS NULL AND (s.current_job_id IS NULL OR s.current_job_id=r.job_id)
                    AND ((r.checkpoint_version=0 AND i.state='queued') OR (r.checkpoint_version>0 AND i.state='consumed'))

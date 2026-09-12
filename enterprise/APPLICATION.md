@@ -31,6 +31,7 @@ bootstrap remains an explicit schema-owner operation.
 | `POST /sessions/{session}/turns` | Atomic input and Job admission |
 | `GET /sessions/{session}/requests/{request}` | Original authorized admission receipt after an uncertain response |
 | `GET /jobs/{job}` | Public Job identity, phase and input version |
+| `GET /jobs/{job}/workflow` | Authorized Workflow state, typed nodes, dependencies and public waits |
 | `POST /jobs/{job}/cancel` | Durable tree cancellation, old-lease fencing and operation stop intent |
 | `GET /approvals/{approval}` | Authorized approval presentation |
 | `POST /approvals/{approval}/answer` | Idempotent human decision |

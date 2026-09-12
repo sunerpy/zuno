@@ -174,7 +174,7 @@ message／part、等待 Job 和输入回执。BFF 与 Worker 的网络验证使�
 
 数据所有者在有界阻塞容量中执行共享 Memory 服务，每个请求共用一个事务。主体／工作区
 验证、候选 CAS、来源重验、授权、学习租约与结果／审计保持同一边界。Worker 使用内部
-协议 8，不接收数据库 provider 或 pool。已实现能力和待实现生产者见 [Memory](MEMORY.zh.md)。
+协议 9，不接收数据库 provider 或 pool。已实现能力和待实现生产者见 [Memory](MEMORY.zh.md)。
 
 ## 子任务执行会话关联
 
@@ -206,3 +206,7 @@ message／part、等待 Job 和输入回执。BFF 与 Worker 的网络验证使�
 ## 格式 14：临时实时进度
 
 格式 14 增加 `live_progress` 与执行状态变化时的原子清理触发器。验证原始消息／Job、租约、摘要和序号，仅显示当前有效租约下、来源消息仍未完成且未过期的快照。固定格式 13 迁移保留持久活动和 Memory 数据。
+
+## 格式 15：持久 Workflow 协调
+
+`runtime_workflow`、`runtime_workflow_node` 保存固定 DAG、原生 Job 关联、逻辑节点容量、有序结果及精确依赖输入。Agent Worker 不领取协调 Job；节点接纳在当前授权与短事务锁下完成。格式 14 fixture 验证会话、消息、Memory、持久 frame 和临时行保留，以及 marker 前故障回滚。详见 [Workflow](WORKFLOW.zh.md)。

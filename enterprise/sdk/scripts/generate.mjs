@@ -12,7 +12,7 @@ const directory = fileURLToPath(new URL("../src/generated", import.meta.url));
 const checking = process.argv.includes("--check");
 for (const [name,crate,example,title,sourceName,validatorName,roots] of [
   ["activity","zuno-types","activity_schema","ActivityProtocol","zuno-types/activity.rs","validators.mjs",["HistoryPage","FramePage","CommittedFrame","LiveFrame"]],
-  ["application","zuno-application","application_schema","ApplicationProtocol","zuno-application/api.rs","application-validators.mjs",["WorkspaceView","SessionSummary","SessionPage","JobView","ApprovalView","InputVersionView","CancellationReceipt"]],
+  ["application","zuno-application","application_schema","ApplicationProtocol","zuno-application/api.rs","application-validators.mjs",["WorkspaceView","SessionSummary","SessionPage","JobView","ApprovalView","InputVersionView","CancellationReceipt","WorkflowRunView"]],
 ]) {
 const source = execFileSync(
   "cargo", ["run", "--quiet", "-p", crate, "--example", example],

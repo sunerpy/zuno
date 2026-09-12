@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::orchestration_dispatch::{OrchestrationDispatch, validate_pending};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -117,7 +118,7 @@ pub trait CouncilHost: Send + Sync + 'static {
         &self,
         request: CouncilRequest,
         cancellation: CancellationToken,
-    ) -> Result<CouncilTurn, String>;
+    ) -> Result<OrchestrationDispatch<CouncilTurn>, ToolError>;
 }
 
 /// Model-facing selection of a verified Council preset.
@@ -280,6 +281,16 @@ impl TypedTool for CouncilTool {
     }
 
     async fn run(&self, params: CouncilParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        self.dispatch(params, ctx).await?.into_ready(WIRE_ID)
+    }
+}
+
+impl CouncilTool {
+    pub async fn dispatch(
+        &self,
+        params: CouncilParams,
+        ctx: ToolContext,
+    ) -> Result<OrchestrationDispatch<ToolOutput>, ToolError> {
         let name = params.preset.trim();
         if name.is_empty() {
             return Err(invalid("`preset` must not be empty"));
@@ -421,14 +432,26 @@ impl TypedTool for CouncilTool {
                     dispatch.await
                 }
             }
+        }?;
+        let turn = match turn {
+            OrchestrationDispatch::Ready(turn) => turn,
+            OrchestrationDispatch::Pending(reference) => {
+                validate_pending(WIRE_ID, &ctx, background, &reference)?;
+                return Ok(OrchestrationDispatch::Pending(reference));
+            }
+        };
+        if !background && turn.job_id.is_some() {
+            return Err(failed(
+                "foreground orchestration is still running; return a durable Pending wait"
+                    .to_owned(),
+            ));
         }
-        .map_err(failed)?;
         if background && turn.job_id.is_none() {
             return Err(failed(
                 "a background Council dispatch did not return a durable job id".to_owned(),
             ));
         }
-        Ok(render(&params, &turn))
+        Ok(OrchestrationDispatch::Ready(render(&params, &turn)))
     }
 }
 
@@ -571,17 +594,17 @@ mod tests {
             &self,
             request: CouncilRequest,
             _cancellation: CancellationToken,
-        ) -> Result<CouncilTurn, String> {
+        ) -> Result<OrchestrationDispatch<CouncilTurn>, ToolError> {
             let background = request.background;
             self.requests
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(request);
-            Ok(CouncilTurn {
+            Ok(OrchestrationDispatch::Ready(CouncilTurn {
                 run_id: "council_test".to_owned(),
                 job_id: (background && self.background_job).then(|| "job_test".to_owned()),
                 output: "synthesis".to_owned(),
-            })
+            }))
         }
     }
 
@@ -622,6 +645,47 @@ mod tests {
             crate::task::DelegationTargets::new(["explorer".to_owned(), "oracle".to_owned()])
                 .expect("targets"),
         )
+    }
+
+    struct SuspendedCouncil;
+    #[async_trait]
+    impl CouncilHost for SuspendedCouncil {
+        async fn dispatch(
+            &self,
+            _: CouncilRequest,
+            _: CancellationToken,
+        ) -> Result<OrchestrationDispatch<CouncilTurn>, ToolError> {
+            Ok(OrchestrationDispatch::Pending(zuno_types::wait::WaitRef {
+                id: zuno_types::identity::WaitId::new("wait-council").unwrap(),
+                turn_id: zuno_types::identity::TurnId::new("turn-parent").unwrap(),
+                invocation_id: zuno_types::identity::InvocationId::new("call_council").unwrap(),
+                arguments_sha256: "b".repeat(64),
+                target: zuno_types::wait::WaitTarget::Child {
+                    job_id: zuno_types::identity::JobId::new("job-council").unwrap(),
+                },
+                continuation: zuno_types::wait::WaitContinuation::CurrentTurn,
+            }))
+        }
+    }
+    #[tokio::test]
+    async fn a_council_wait_keeps_the_original_call_open_until_durable_completion() {
+        let tool = CouncilTool::new([preset()], task(), Arc::new(SuspendedCouncil)).unwrap();
+        let ctx = || {
+            ToolContext::new(
+                "ses_parent",
+                "msg_parent",
+                "call_council",
+                "build",
+                Arc::new(AllowAll),
+                Arc::new(NeverInterrupted),
+            )
+        };
+        assert!(matches!(
+            tool.dispatch(params(false), ctx()).await.unwrap(),
+            OrchestrationDispatch::Pending(_)
+        ));
+        assert!(tool.run(params(false), ctx()).await.is_err());
+        assert!(tool.dispatch(params(true), ctx()).await.is_err());
     }
 
     fn orchestration_snapshot() -> Arc<AttemptSnapshot> {

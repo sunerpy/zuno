@@ -116,3 +116,5 @@ also starts a control plane, gateway and two independent Worker binaries; see
 ## Data-owner cancellation
 
 The gateway supervisor also polls authenticated `internal/gateway/v1/cancellations`. This service-only path returns immutable admissions for stopped Jobs and stays valid after Worker revocation. It cannot start new operations. Docker stop and its actual terminal receipt remain separate; completed facts are preserved and unknown outcomes remain uncertain. See [control](CONTROL.md).
+
+Gateway protocol 3 permits child-workspace preparation from a data-owner-verified Workflow group workspace. That source must already exist; the exact child, source and gateway assignment remain bound to the signed request. Ordinary commands still require the executing session.

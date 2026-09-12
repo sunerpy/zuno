@@ -36,6 +36,14 @@ pub(super) async fn root_in(
     let expected = integer(request.expected_input_version)?;
     // Every session/input writer acquires this row before runtime state.
     let session = read_session(tx, principal, request.session_id.as_str(), true).await?;
+    let coordinator: bool = query_scalar("SELECT EXISTS(SELECT 1 FROM zuno_enterprise_preview.runtime_workflow w
+        JOIN zuno_enterprise_preview.runtime_child c ON c.tenant_id=w.tenant_id AND c.principal_id=w.principal_id AND c.job_id=w.job_id
+        WHERE w.tenant_id=$1 AND w.principal_id=$2 AND c.child_session_id=$3)")
+        .bind(principal.tenant_id().as_str()).bind(principal.principal_id().as_str()).bind(request.session_id.as_str())
+        .fetch_one(&mut **tx).await.map_err(database_error)?;
+    if coordinator {
+        return Err(ApplicationError::Forbidden);
+    }
     let owner = principal.owner();
     let key = request_key(principal, &request.session_id, &request.request_id);
     let id = format!("job_{key}");

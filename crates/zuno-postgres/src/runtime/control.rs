@@ -49,109 +49,7 @@ impl RuntimeControl for PostgresRuntimeStore {
         }
 
         let time = database_time(&mut tx).await?;
-        let mut queue = VecDeque::from([root.id.clone()]);
-        let mut seen = BTreeSet::new();
-        let mut stopped = Vec::new();
-        let mut operations = Vec::new();
-        while let Some(id) = queue.pop_front() {
-            if !seen.insert(id.clone()) {
-                return Err(ApplicationError::Invalid(
-                    "cyclic child job graph".to_owned(),
-                ));
-            }
-            let job = read_job(&mut tx, &owner, id.as_str()).await?;
-            // Dispatch also takes its parent's session lock. Once held, the
-            // subtree cannot grow behind this traversal. Child completion never
-            // takes its parent's session lock.
-            lock_session(&mut tx, &job).await?;
-            let job = read_job(&mut tx, &owner, id.as_str()).await?;
-            let descendants: Vec<String> = query_scalar(
-                "SELECT activated_job_id AS id FROM zuno_enterprise_preview.runtime_child
-                 WHERE tenant_id=$1 AND principal_id=$2 AND parent_job_id=$3
-                   AND activated_job_id IS NOT NULL
-                 UNION SELECT job_id AS id FROM zuno_enterprise_preview.runtime_continuation
-                 WHERE tenant_id=$1 AND principal_id=$2 AND parent_job_id=$3 ORDER BY id",
-            )
-            .bind(owner.tenant_id.as_str())
-            .bind(owner.principal_id.as_str())
-            .bind(id.as_str())
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(database_error)?;
-            for child in descendants {
-                queue.push_back(JobId::new(child).map_err(ApplicationError::storage)?);
-            }
-            query(
-                "INSERT INTO zuno_enterprise_preview.runtime_stop
-                 (tenant_id,principal_id,job_id,root_job_id,time_requested)
-                 VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
-            )
-            .bind(owner.tenant_id.as_str())
-            .bind(owner.principal_id.as_str())
-            .bind(id.as_str())
-            .bind(root.id.as_str())
-            .bind(time)
-            .execute(&mut *tx)
-            .await
-            .map_err(database_error)?;
-            children::retire_staged(&mut tx, &job, time).await?;
-            query(
-                "INSERT INTO zuno_enterprise_preview.gateway_cancellation_delivery(tenant_id,principal_id,operation_id)
-                 SELECT tenant_id,principal_id,operation_id FROM zuno_enterprise_preview.gateway_operation
-                 WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND completion IS NULL ON CONFLICT DO NOTHING",
-            )
-            .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(id.as_str())
-            .execute(&mut *tx).await.map_err(database_error)?;
-            let pending: Vec<String> = query_scalar(
-                "SELECT operation_id FROM zuno_enterprise_preview.gateway_operation
-                 WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND completion IS NULL ORDER BY operation_id",
-            )
-            .bind(owner.tenant_id.as_str())
-            .bind(owner.principal_id.as_str())
-            .bind(id.as_str())
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(database_error)?;
-            for operation in pending {
-                operations.push(OperationId::new(operation).map_err(ApplicationError::storage)?);
-            }
-            if matches!(
-                job.phase,
-                JobPhase::Completed | JobPhase::Failed | JobPhase::Cancelled
-            ) {
-                continue;
-            }
-            // Uncertainty is evidence, not an executable phase to relabel.
-            if job.phase != JobPhase::Uncertain {
-                settle_cancelled(&mut tx, &job, &request.reason, time).await?;
-            }
-            query(
-                "UPDATE zuno_enterprise_preview.runtime_attempt SET state='lost',finished_at=$4
-                 WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND state='running'",
-            )
-            .bind(owner.tenant_id.as_str())
-            .bind(owner.principal_id.as_str())
-            .bind(id.as_str())
-            .bind(time)
-            .execute(&mut *tx)
-            .await
-            .map_err(database_error)?;
-            query(
-                "UPDATE zuno_enterprise_preview.runtime_session SET lease_epoch=lease_epoch+1,
-                   lease_job_id=NULL,lease_attempt_id=NULL,lease_worker_id=NULL,lease_expires=NULL,
-                   current_job_id=CASE WHEN $4 THEN current_job_id ELSE NULL END
-                 WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3 AND current_job_id=$5",
-            )
-            .bind(owner.tenant_id.as_str())
-            .bind(owner.principal_id.as_str())
-            .bind(job.session_id.as_str())
-            .bind(job.phase == JobPhase::Uncertain)
-            .bind(id.as_str())
-            .execute(&mut *tx)
-            .await
-            .map_err(database_error)?;
-            stopped.push(id);
-        }
+        let (stopped, operations) = cancel_tree_in(&mut tx, &root, &request.reason, time).await?;
         let receipt = CancellationReceipt {
             request_id: request.request_id,
             job_id: root.id.clone(),
@@ -191,7 +89,122 @@ impl RuntimeControl for PostgresRuntimeStore {
     }
 }
 
-async fn lock_session(
+/// A data-owner coordinator may stop only Jobs in its verified subtree. Callers
+/// retain their coordination/session locks through this transaction.
+pub(super) async fn cancel_tree_in(
+    tx: &mut Transaction<'_, Postgres>,
+    root: &RuntimeJob,
+    reason: &str,
+    time: i64,
+) -> Result<(Vec<JobId>, Vec<OperationId>), ApplicationError> {
+    let owner = root.principal.owner();
+    let mut queue = VecDeque::from([root.id.clone()]);
+    let mut seen = BTreeSet::new();
+    let mut stopped = Vec::new();
+    let mut operations = Vec::new();
+    while let Some(id) = queue.pop_front() {
+        if !seen.insert(id.clone()) {
+            return Err(ApplicationError::Invalid(
+                "cyclic child job graph".to_owned(),
+            ));
+        }
+        let job = read_job(tx, &owner, id.as_str()).await?;
+        // Dispatch also takes its parent's session lock. Once held, the
+        // subtree cannot grow behind this traversal. Child completion never
+        // takes its parent's session lock.
+        lock_session(tx, &job).await?;
+        let job = read_job(tx, &owner, id.as_str()).await?;
+        let descendants: Vec<String> = query_scalar(
+            "SELECT activated_job_id AS id FROM zuno_enterprise_preview.runtime_child
+             WHERE tenant_id=$1 AND principal_id=$2 AND parent_job_id=$3
+               AND activated_job_id IS NOT NULL
+             UNION SELECT job_id AS id FROM zuno_enterprise_preview.runtime_continuation
+             WHERE tenant_id=$1 AND principal_id=$2 AND parent_job_id=$3 ORDER BY id",
+        )
+        .bind(owner.tenant_id.as_str())
+        .bind(owner.principal_id.as_str())
+        .bind(id.as_str())
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(database_error)?;
+        for child in descendants {
+            queue.push_back(JobId::new(child).map_err(ApplicationError::storage)?);
+        }
+        query(
+            "INSERT INTO zuno_enterprise_preview.runtime_stop
+             (tenant_id,principal_id,job_id,root_job_id,time_requested)
+             VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
+        )
+        .bind(owner.tenant_id.as_str())
+        .bind(owner.principal_id.as_str())
+        .bind(id.as_str())
+        .bind(root.id.as_str())
+        .bind(time)
+        .execute(&mut **tx)
+        .await
+        .map_err(database_error)?;
+        children::retire_staged(tx, &job, time).await?;
+        query(
+            "INSERT INTO zuno_enterprise_preview.gateway_cancellation_delivery(tenant_id,principal_id,operation_id)
+             SELECT tenant_id,principal_id,operation_id FROM zuno_enterprise_preview.gateway_operation
+             WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND completion IS NULL ON CONFLICT DO NOTHING",
+        )
+        .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(id.as_str())
+        .execute(&mut **tx).await.map_err(database_error)?;
+        let pending: Vec<String> = query_scalar(
+            "SELECT operation_id FROM zuno_enterprise_preview.gateway_operation
+             WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND completion IS NULL ORDER BY operation_id",
+        )
+        .bind(owner.tenant_id.as_str())
+        .bind(owner.principal_id.as_str())
+        .bind(id.as_str())
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(database_error)?;
+        for operation in pending {
+            operations.push(OperationId::new(operation).map_err(ApplicationError::storage)?);
+        }
+        if matches!(
+            job.phase,
+            JobPhase::Completed | JobPhase::Failed | JobPhase::Cancelled
+        ) {
+            continue;
+        }
+        // Uncertainty is evidence, not an executable phase to relabel.
+        if job.phase != JobPhase::Uncertain {
+            settle_cancelled(tx, &job, reason, time).await?;
+        }
+        query(
+            "UPDATE zuno_enterprise_preview.runtime_attempt SET state='lost',finished_at=$4
+             WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND state='running'",
+        )
+        .bind(owner.tenant_id.as_str())
+        .bind(owner.principal_id.as_str())
+        .bind(id.as_str())
+        .bind(time)
+        .execute(&mut **tx)
+        .await
+        .map_err(database_error)?;
+        query(
+            "UPDATE zuno_enterprise_preview.runtime_session SET lease_epoch=lease_epoch+1,
+               lease_job_id=NULL,lease_attempt_id=NULL,lease_worker_id=NULL,lease_expires=NULL,
+               current_job_id=CASE WHEN $4 THEN current_job_id ELSE NULL END
+             WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3 AND current_job_id=$5",
+        )
+        .bind(owner.tenant_id.as_str())
+        .bind(owner.principal_id.as_str())
+        .bind(job.session_id.as_str())
+        .bind(job.phase == JobPhase::Uncertain)
+        .bind(id.as_str())
+        .execute(&mut **tx)
+        .await
+        .map_err(database_error)?;
+        stopped.push(id);
+    }
+    Ok((stopped, operations))
+}
+
+pub(super) async fn lock_session(
     tx: &mut Transaction<'_, Postgres>,
     job: &RuntimeJob,
 ) -> Result<(), ApplicationError> {
@@ -245,6 +258,10 @@ async fn settle_cancelled(
     query("UPDATE zuno_enterprise_preview.input_execution_receipt SET state='cancelled',completed_at=COALESCE(completed_at,$4),time_updated=$4
         WHERE tenant_id=$1 AND principal_id=$2 AND input_id=$3 AND state IN('admitted','recorded','applied')")
         .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(job.input_id.as_str()).bind(time)
+        .execute(&mut **tx).await.map_err(database_error)?;
+    query("UPDATE zuno_enterprise_preview.runtime_workflow SET state='cancelled',revision=revision+1,time_updated=$4
+        WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND state IN('preparing','prepared','active')")
+        .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(job.id.as_str()).bind(time)
         .execute(&mut **tx).await.map_err(database_error)?;
     emit(
         tx,

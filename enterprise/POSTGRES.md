@@ -187,7 +187,7 @@ limit. No incomplete history is treated as an exact old context window.
 
 The captured format-5 fixture preserves pending waits, Job budgets, lease state,
 messages and usage across failed/successful format-6 migration. The internal Worker
-protocol is version 8; it is separate from public UI DTOs. Its compatible claims,
+protocol is version 9; it is separate from public UI DTOs. Its compatible claims,
 stable input timestamps and bounded grant renewal are described in [Workers](WORKERS.md).
 
 ## Browser authentication state
@@ -235,7 +235,7 @@ browser and operation data before the marker advances.
 The data owner runs the shared Memory service in bounded blocking capacity with
 one transaction per request. Actor/workspace checks, candidate CAS, source
 revalidation, consent, learning lease checks and result/audit commit stay together.
-Workers use internal protocol 8 and never receive this provider or pool.
+Workers use internal protocol 9 and never receive this provider or pool.
 See [Memory](MEMORY.md) for implemented behavior and remaining producers.
 
 ## Child execution-session binding
@@ -277,3 +277,7 @@ Format 13 adds owner-scoped public activity counters, items and immutable frames
 ## Format 14: transient live progress
 
 Format 14 adds `live_progress` and an atomic cleanup trigger on execution changes. Original message/Job binding, lease, snapshot digest and sequence are verified. Only active, fresh pending-message snapshots can be read. Exact format-13 migration preserves durable activity and Memory rows.
+
+## Format 15: durable Workflow coordination
+
+`runtime_workflow` and `runtime_workflow_node` retain the fixed DAG, native Job links, logical node capacity, ordered results and exact dependency inputs. Agent Workers never claim coordination Jobs. Current authorization and short transaction locks govern node admission. The format-14 fixture preserves sessions, messages, Memory, committed frames and live rows, including rollback before the marker. See [Workflow](WORKFLOW.md).

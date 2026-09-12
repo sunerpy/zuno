@@ -2223,9 +2223,11 @@ pub async fn run_turn(
     events: TurnEventSender,
 ) -> Result<TurnOutcome, TurnError> {
     let turn_span = span::turn(&request.session_id, &request.turn_id);
-    match run_turn_in_span(request, &mut context, events, turn_span.clone(), None, None)
-        .instrument(turn_span)
-        .await?
+    match Box::pin(
+        run_turn_in_span(request, &mut context, events, turn_span.clone(), None, None)
+            .instrument(turn_span),
+    )
+    .await?
     {
         crate::advance::LoopOutcome::Completed(outcome) => Ok(outcome),
         crate::advance::LoopOutcome::Progressed(_) | crate::advance::LoopOutcome::Waiting(_) => {
@@ -2258,15 +2260,17 @@ pub async fn advance_turn(
     };
     let checkpoint = admission.checkpoint.take();
     let turn_span = span::turn(&request.run.session_id, &request.run.turn_id);
-    let result = run_turn_in_span(
-        request.run.clone(),
-        &mut context,
-        events,
-        turn_span.clone(),
-        checkpoint,
-        Some(request.max_steps),
+    let result = Box::pin(
+        run_turn_in_span(
+            request.run.clone(),
+            &mut context,
+            events,
+            turn_span.clone(),
+            checkpoint,
+            Some(request.max_steps),
+        )
+        .instrument(turn_span),
     )
-    .instrument(turn_span)
     .await;
     let checkpoint = store
         .persistence

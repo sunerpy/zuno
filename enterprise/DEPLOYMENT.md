@@ -122,7 +122,7 @@ SIGTERM stops admission and drains bounded work. TLS connections and receipt
 delivery have bounded shutdown. Gateway shutdown does not declare its external
 commands complete; their ledger and containers remain independently recoverable.
 
-Worker protocol 8 carries checkpoint schema 4. The driver reads schema 3 only
+Worker protocol 9 carries checkpoint schema 4. The driver reads schema 3 only
 where it proves an unsubmitted wait; it never reinterprets an old record as
 submitted execution. Drain incompatible Workers before changing the control
 protocol and retain their definitions and durable data. Full rolling-upgrade and
@@ -144,3 +144,5 @@ and the full failure matrix. No preview release is enabled by building this bina
 See [中文](DEPLOYMENT.zh.md), [platforms](PLATFORMS.md) and [status](STATUS.md).
 
 Worker `liveMillis` defaults to 500 milliseconds, accepts 100–5000, or null to disable transient publication. Live progress is a bounded replaceable snapshot; it never holds model execution or replaces committed history. See [activity](ACTIVITY.md).
+
+Optional `workflows` installs bounded templates over the existing child target catalog. They use a non-model coordination Job, independent node workspaces and strict command approvals. See [Workflow configuration and limits](WORKFLOW.md).

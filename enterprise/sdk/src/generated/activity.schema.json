@@ -1328,6 +1328,23 @@
         {
           "type": "object",
           "properties": {
+            "jobId": {
+              "$ref": "#/$defs/JobId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "view_workflow"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "jobId"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "approvalId": {
               "$ref": "#/$defs/ApprovalId"
             },

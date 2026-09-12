@@ -26,6 +26,7 @@ HttpOnly Cookie，写请求必须携带精确 Origin 与 `x-zuno-csrf: 1`。
 | `POST /sessions/{session}/turns` | 原子接纳输入和 Job |
 | `GET /sessions/{session}/requests/{request}` | 响应不确定时查询原始接纳回执，重新验证归属 |
 | `GET /jobs/{job}` | 公共 Job 标识、阶段及输入版本 |
+| `GET /jobs/{job}/workflow` | 已授权 Workflow 状态、类型化节点、依赖与公共等待 |
 | `POST /jobs/{job}/cancel` | 持久取消任务树、撤销旧租约并记录外部操作停止意图 |
 | `GET /approvals/{approval}` | 经过授权的审批展示 |
 | `POST /approvals/{approval}/answer` | 幂等人工决定 |

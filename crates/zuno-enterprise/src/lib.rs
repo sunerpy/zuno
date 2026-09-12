@@ -9,6 +9,7 @@ pub use http::serve as serve_tls;
 pub mod profile;
 pub mod service;
 pub mod web;
+mod workflows;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

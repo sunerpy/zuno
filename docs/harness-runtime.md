@@ -2984,3 +2984,6 @@ Enterprise Workers may publish bounded live snapshots independently of committed
 
 
 The enterprise React workbench consumes public `AgentApplication` and activity DTOs generated from Rust. The optional control-plane Web adapter serves an immutable bundle alongside the same-origin OIDC BFF; UI actions still pass current data-owner authorization. Browser identity binding and abortable per-session subscriptions prevent stale account/session responses from steering current work. See `enterprise/WEB.md` in the preview archive.
+
+
+Workflow and Council host dispatch now distinguish a ready result from a durable pending invocation, preserving typed tool failures. The native Workflow host and enterprise coordinator share DAG readiness/logical-capacity decisions and bounded dependency-result input. A trusted uncertain external completion is consumed once; a later bounded advance requires inspection. Enterprise coordination and node approval are documented in `enterprise/WORKFLOW.md`.

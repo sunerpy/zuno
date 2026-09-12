@@ -116,6 +116,7 @@ pub mod diff;
 pub mod edit;
 pub mod format;
 pub mod navigation;
+pub mod orchestration_dispatch;
 pub mod output_policy;
 pub mod read;
 pub mod report_write;

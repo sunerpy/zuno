@@ -1,11 +1,11 @@
 import { ActivityClient } from "./client.js";
 import type {
   WorkspaceView, SessionPage, SessionSummary, CreateSession, JobView,
-  SubmitTurn, InputVersionView, ApprovalView, ApprovalDecision, CancelJob, CancellationReceipt,
+  SubmitTurn, InputVersionView, ApprovalView, ApprovalDecision, CancelJob, CancellationReceipt, WorkflowRunView,
 } from "./generated/application.js";
 import {
   validateWorkspaceView, validateSessionPage, validateSessionSummary, validateJobView,
-  validateInputVersionView, validateApprovalView, validateCancellationReceipt,
+  validateInputVersionView, validateApprovalView, validateCancellationReceipt, validateWorkflowRunView,
 } from "./generated/application-validators.mjs";
 
 function checked<T>(value: unknown, validate: (value: unknown) => unknown): T {
@@ -18,6 +18,11 @@ function id(value: string): string {
 }
 
 export class EnterpriseClient extends ActivityClient {
+  async workflow(job: string, signal?: AbortSignal): Promise<WorkflowRunView> {
+    const value = checked<WorkflowRunView>(await this.get(new URL(`jobs/${id(job)}/workflow`, this.base), signal), validateWorkflowRunView);
+    if (value.jobId !== job) throw new Error("Workflow response identity mismatch");
+    return value;
+  }
   async workspaces(signal?: AbortSignal): Promise<WorkspaceView[]> {
     const value = await this.get(new URL("workspaces", this.base), signal);
     if (!Array.isArray(value) || value.length > 128) throw new Error("Invalid workspace list");

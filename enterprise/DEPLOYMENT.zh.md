@@ -90,7 +90,7 @@ Entra 使用对应的 `config`。Introspection 使用 `config`、`clientId` 和
 SIGTERM 停止新接纳并排空有界工作，TLS 连接与回执投递的退出也有期限。停止网关不表示
 外部命令已经完成，ledger 与容器仍按独立生命周期恢复。
 
-Worker 协议 8 承载检查点 schema 4。旧 schema 3 只按未提交等待读取，不能被解释成已经
+Worker 协议 9 承载检查点 schema 4。旧 schema 3 只按未提交等待读取，不能被解释成已经
 交给执行器。切换控制协议前排空不兼容 Worker，并保留定义和持久数据；完整滚动升级、
 备份恢复验收仍属 P6。
 
@@ -114,3 +114,5 @@ Web／ACP 功能及完整故障矩阵仍需继续完成。构建此二进制不�
 原生 `task`；工作区准备在子执行前完成。完整流程见[工作区](WORKSPACES.zh.md)。
 
 Worker 的 `liveMillis` 默认 500 毫秒，允许 100–5000，设为 null 关闭。实时进度是有界、可替换的快照，不阻塞模型执行，不替代持久历史。见[活动协议](ACTIVITY.zh.md)。
+
+可选 `workflows` 在已有子任务目录上安装有界模板，使用不运行模型的协调 Job、独立节点工作区及严格命令审批。配置与限制见 [Workflow](WORKFLOW.zh.md)。

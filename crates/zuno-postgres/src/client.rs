@@ -15,6 +15,115 @@ pub struct ClientJobState {
 }
 
 impl PostgresBackend {
+    pub async fn client_workflow(
+        &self,
+        principal: &PrincipalScope,
+        id: &JobId,
+    ) -> Result<zuno_application::workflow::WorkflowRunView, ApplicationError> {
+        use zuno_application::workflow::{NodeRunView, WorkflowRunView};
+        use zuno_types::{
+            activity::InvocationState,
+            identity::{NodeRunId, WorkflowRunId},
+        };
+        let mut tx = scoped_transaction(&self.pool, principal).await?;
+        let row = query("SELECT run_id,plan->'template'->>'name' AS name,plan->'template'->'nodes' AS nodes,state
+            FROM zuno_enterprise_preview.runtime_workflow WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3")
+            .bind(principal.tenant_id().as_str()).bind(principal.principal_id().as_str()).bind(id.as_str())
+            .fetch_one(&mut *tx).await.map_err(database_error)?;
+        let run_id =
+            WorkflowRunId::new(row.try_get::<String, _>("run_id").map_err(database_error)?)
+                .map_err(ApplicationError::storage)?;
+        let definition: Vec<zuno_orchestration::WorkflowNodeDescriptor> =
+            serde_json::from_value(row.try_get("nodes").map_err(database_error)?)
+                .map_err(ApplicationError::storage)?;
+        let rows = query("SELECT n.node_run_id,n.node_id,n.child_job_id,COALESCE(r.phase,n.state) AS state,n.position,r.turn_id
+            FROM zuno_enterprise_preview.runtime_workflow_node n
+            LEFT JOIN zuno_enterprise_preview.runtime_job r ON r.tenant_id=n.tenant_id AND r.principal_id=n.principal_id AND r.job_id=n.child_job_id
+            WHERE n.tenant_id=$1 AND n.principal_id=$2 AND n.run_id=$3 ORDER BY n.position LIMIT 65")
+            .bind(principal.tenant_id().as_str()).bind(principal.principal_id().as_str()).bind(run_id.as_str())
+            .fetch_all(&mut *tx).await.map_err(database_error)?;
+        if rows.len() > 64 {
+            return Err(ApplicationError::Conflict);
+        }
+        let mut nodes = Vec::new();
+        for node in rows {
+            let job = JobId::new(
+                node.try_get::<String, _>("child_job_id")
+                    .map_err(database_error)?,
+            )
+            .map_err(ApplicationError::storage)?;
+            let position: i32 = node.try_get("position").map_err(database_error)?;
+            let configured = usize::try_from(position)
+                .ok()
+                .and_then(|position| definition.get(position))
+                .ok_or(ApplicationError::Conflict)?;
+            let node_id: String = node.try_get("node_id").map_err(database_error)?;
+            if configured.id != node_id {
+                return Err(ApplicationError::Conflict);
+            }
+            let phase: String = node.try_get("state").map_err(database_error)?;
+            let state = match phase.as_str() {
+                "pending" | "ready" => InvocationState::Queued,
+                "running" => InvocationState::Running,
+                "waiting" | "paused" => InvocationState::Waiting,
+                "completed" => InvocationState::Succeeded,
+                "failed" => InvocationState::Failed,
+                "cancelled" => InvocationState::Cancelled,
+                "uncertain" => InvocationState::Uncertain,
+                _ => return Err(ApplicationError::Conflict),
+            };
+            let raw: Vec<serde_json::Value> = query_scalar("SELECT reference FROM zuno_enterprise_preview.runtime_wait
+                WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND state IN('pending','ready') ORDER BY id LIMIT 65")
+                .bind(principal.tenant_id().as_str()).bind(principal.principal_id().as_str()).bind(job.as_str())
+                .fetch_all(&mut *tx).await.map_err(database_error)?;
+            if raw.len() > 64 {
+                return Err(ApplicationError::Conflict);
+            }
+            let turn: Option<String> = node.try_get("turn_id").map_err(database_error)?;
+            let waits = raw
+                .into_iter()
+                .map(|value| {
+                    let reference: WaitRef =
+                        serde_json::from_value(value).map_err(ApplicationError::storage)?;
+                    reference
+                        .validate()
+                        .map_err(|value| ApplicationError::Invalid(value.to_owned()))?;
+                    if turn.as_deref() != Some(reference.turn_id.as_str()) {
+                        return Err(ApplicationError::Conflict);
+                    }
+                    Ok(zuno_application::api::JobWaitView {
+                        invocation_id: reference.invocation_id,
+                        target: reference.target,
+                    })
+                })
+                .collect::<Result<Vec<_>, ApplicationError>>()?;
+            nodes.push(NodeRunView {
+                id: NodeRunId::new(
+                    node.try_get::<String, _>("node_run_id")
+                        .map_err(database_error)?,
+                )
+                .map_err(ApplicationError::storage)?,
+                node_id,
+                job_id: job,
+                state,
+                depends_on: configured.depends_on.clone(),
+                waits,
+            });
+        }
+        let view = WorkflowRunView {
+            id: run_id,
+            job_id: id.clone(),
+            name: row.try_get("name").map_err(database_error)?,
+            state: serde_json::from_value(serde_json::Value::String(
+                row.try_get("state").map_err(database_error)?,
+            ))
+            .map_err(ApplicationError::storage)?,
+            nodes,
+        };
+        tx.commit().await.map_err(database_error)?;
+        Ok(view)
+    }
+
     pub async fn client_submission(
         &self,
         principal: &PrincipalScope,

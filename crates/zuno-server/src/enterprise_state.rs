@@ -15,6 +15,9 @@ use zuno_application::child::{
     ChildCommand, ChildDefinitionCatalog, ChildDispatchStore, ChildReply,
 };
 use zuno_application::runtime::{JobFinish, LeaseDuration, RuntimeStore};
+use zuno_application::workflow::{
+    WorkflowCommand, WorkflowDefinitionCatalog, WorkflowDispatch, WorkflowStore,
+};
 use zuno_engine::state::wire::{MAX_WORKER_FRAME_BYTES, StateRequest, StateResponse, execute};
 use zuno_engine::state::{TurnPersistence, TurnStateError, TurnStateScope};
 use zuno_identity::worker::{
@@ -39,6 +42,7 @@ pub struct WorkerStateService {
     lease_duration: LeaseDuration,
     memory: Option<PostgresMemoryBackend>,
     children: Option<Arc<dyn ChildDefinitionCatalog>>,
+    workflows: Option<Arc<dyn WorkflowDefinitionCatalog>>,
 }
 impl WorkerStateService {
     pub fn new(
@@ -56,6 +60,7 @@ impl WorkerStateService {
             lease_duration,
             memory: None,
             children: None,
+            workflows: None,
         }
     }
 
@@ -66,6 +71,11 @@ impl WorkerStateService {
 
     pub fn with_children(mut self, children: Arc<dyn ChildDefinitionCatalog>) -> Self {
         self.children = Some(children);
+        self
+    }
+
+    pub fn with_workflows(mut self, workflows: Arc<dyn WorkflowDefinitionCatalog>) -> Self {
+        self.workflows = Some(workflows);
         self
     }
 
@@ -81,6 +91,12 @@ impl WorkerStateService {
         }
         if self.children.is_some() {
             router = router.route(&format!("/{}", zuno_worker::CHILD_PATH), post(child_call));
+        }
+        if self.workflows.is_some() {
+            router = router.route(
+                &format!("/{}", zuno_worker::WORKFLOW_PATH),
+                post(workflow_call),
+            );
         }
         router
             .layer(DefaultBodyLimit::max(MAX_WORKER_FRAME_BYTES))
@@ -162,6 +178,38 @@ async fn child_call(
                     .map_err(child_error)?,
             }
         }
+    };
+    Ok(Json(reply))
+}
+
+async fn workflow_call(
+    State(service): State<WorkerStateService>,
+    Extension(worker): Extension<AuthenticatedWorker>,
+    headers: HeaderMap,
+    Json(command): Json<WorkflowCommand>,
+) -> Result<Json<WorkflowDispatch>, ApiFailure> {
+    let grant = service.grant(&worker, &headers)?;
+    let runtime = service.backend.runtime(service.tenant.clone());
+    let reply = match command {
+        WorkflowCommand::Dispatch { invocation } => {
+            let parent = runtime
+                .get(&grant.lease().owner, &grant.lease().job_id)
+                .await
+                .map_err(child_error)?;
+            let definition = service
+                .workflows
+                .as_ref()
+                .and_then(|catalog| catalog.resolve(&parent.configuration, &invocation.template))
+                .ok_or(ApiFailure(StatusCode::FORBIDDEN))?;
+            runtime
+                .dispatch_workflow(grant.lease(), *invocation, &definition)
+                .await
+                .map_err(child_error)?
+        }
+        WorkflowCommand::Prepare { job_id } => runtime
+            .prepare_workflow(grant.lease(), &job_id)
+            .await
+            .map_err(child_error)?,
     };
     Ok(Json(reply))
 }

@@ -317,6 +317,10 @@ async fn control(options: ControlConfig, shutdown: InterruptSignal) -> Result<()
     );
     let definitions = config::definitions(&options.definitions).await?;
     let children = Arc::new(crate::children::ConfiguredChildren::new(&definitions)?);
+    let workflows = Arc::new(crate::workflows::ConfiguredWorkflows::new(
+        &definitions,
+        &children,
+    )?);
     let deployments = definitions
         .iter()
         .map(|definition| {
@@ -364,6 +368,9 @@ async fn control(options: ControlConfig, shutdown: InterruptSignal) -> Result<()
     .with_memory(memory);
     if !children.is_empty() {
         worker_state = worker_state.with_children(children);
+    }
+    if !workflows.is_empty() {
+        worker_state = worker_state.with_workflows(workflows);
     }
     let mut routes = application
         .clone()
