@@ -174,7 +174,7 @@ message／part、等待 Job 和输入回执。BFF 与 Worker 的网络验证使�
 
 数据所有者在有界阻塞容量中执行共享 Memory 服务，每个请求共用一个事务。主体／工作区
 验证、候选 CAS、来源重验、授权、学习租约与结果／审计保持同一边界。Worker 使用内部
-协议 10，不接收数据库 provider 或 pool。已实现能力和待实现生产者见 [Memory](MEMORY.zh.md)。
+协议 11，不接收数据库 provider 或 pool。已实现能力和待实现生产者见 [Memory](MEMORY.zh.md)。
 
 ## 子任务执行会话关联
 
@@ -221,3 +221,13 @@ message／part、等待 Job 和输入回执。BFF 与 Worker 的网络验证使�
 迁移测试保留代表性 Job、消息、Memory、frame 和 Workflow／节点，检查 DDL
 失败回滚、新 RLS 表及 marker。比较历史 Job 行时只排除新增的可空列，旧格式来源摘要
 和结构 manifest 仍需通过校验。详见 [Council 执行](WORKFLOW.zh.md#持久-council)。
+
+## 格式 17：工作区审批合并
+
+`gateway_merge_operation`、`gateway_merge_attempt` 和
+`gateway_merge_cancellation` 保存不可变提案、执行接纳身份、回执和取消投递。
+批准检查与执行接纳同事务提交，命令与合并操作 ID 共用作用域化 advisory lock，
+完成结果与原等待的唤醒原子提交。固定格式 16 fixture 的来源摘要为
+`b539bf863f4192d81cc8189ec65f2900b4fd589e7e8e00e34d1ff2e77d1464f1`，
+验证会话、消息、Memory、活动、Job 和 Council 期限在迁移成功及 DDL 失败回滚中保留。
+新表全部使用所有者 RLS，取消目录函数只返回有界坐标。

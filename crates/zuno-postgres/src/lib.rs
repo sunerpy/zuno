@@ -21,6 +21,7 @@ mod tests;
 mod turn;
 #[cfg(test)]
 mod turn_tests;
+mod workspace_merge;
 
 pub use activity::PostgresActivityPersistence;
 pub use authorization::{PostgresOrganizationStore, bootstrap_organization};
@@ -32,6 +33,7 @@ pub use operation::PostgresOperationStore;
 pub use runtime::PostgresRuntimeStore;
 pub use session::PostgresSessionPersistence;
 pub use turn::PostgresTurnPersistence;
+pub use workspace_merge::PostgresWorkspaceMergeStore;
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -91,6 +93,12 @@ pub struct PostgresBackend {
 }
 
 impl PostgresBackend {
+    pub fn workspace_merges(
+        &self,
+        gateway: zuno_types::identity::GatewayId,
+    ) -> PostgresWorkspaceMergeStore {
+        PostgresWorkspaceMergeStore::new(self.clone(), gateway)
+    }
     pub fn gateway_operations(
         &self,
         gateway: zuno_types::identity::GatewayId,

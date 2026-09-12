@@ -93,17 +93,17 @@ Schema 和 SDK；客户端与 Docker 工作流中的实验浏览器检查需要�
 SIGTERM 停止新接纳并排空有界工作，TLS 连接与回执投递的退出也有期限。停止网关不表示
 外部命令已经完成，ledger 与容器仍按独立生命周期恢复。
 
-Worker 协议 10 承载检查点 schema 4。旧 schema 3 只按未提交等待读取，不能被解释成已经
+Worker 协议 11 承载检查点 schema 4。旧 schema 3 只按未提交等待读取，不能被解释成已经
 交给执行器。切换控制协议前排空不兼容 Worker，并保留定义和持久数据；完整滚动升级、
 备份恢复验收仍属 P6。
 
 `python3 scripts/check_enterprise_docker.py` 会启动真实可执行文件：一个控制面、
 一个网关和两个独立 Worker。真实 TLS RSA issuer、原生兼容模型传输、PostgreSQL 和
 rootless Docker 验证双用户、私有 Memory 读写及提示刷新、审批等待期间撤销 Memory 使用、
-父／子工作区分支、十四次模型请求、四次命令审批、两个 Worker 参与、每命令一次操作及 SIGTERM
+父／子工作区分支、Workflow／Council／合并执行和明确审批、两个 Worker 参与、每命令一次操作及 SIGTERM
 退出。这是测试提供商证据，不是实际 Entra 租户验证。
 
-工作区初始导入、后台／共享 Memory、子工作区审批合并、Workflow／Council、剩余
+工作区初始导入、后台／共享 Memory、剩余
 Web／ACP 功能及完整故障矩阵仍需继续完成。构建此二进制不会启用预览发布。
 
 参见 [English](DEPLOYMENT.md)、[平台](PLATFORMS.zh.md)及[进度](STATUS.md)。
@@ -127,3 +127,5 @@ Agent 的 `mode` 默认 `agent`，保留现有定义的规范化摘要。`mode: 
 不代表分布式 Council 编排已完成。
 
 可选 `councils` 安装原生 `council_run`，提供持久席位以及模型专用修正／综合。模型绑定、quorum、容量和期限由不可变定义控制，见 [Council 配置](WORKFLOW.zh.md#持久-council)。
+
+网关 `mergeParallelism` 默认 2，允许 1–16 个后台合并任务；退出时有界排空，日志和回执可在重启后恢复。控制面的 `gatewayRootCertificate` 可为配置网关的审批内容下载设置私有 CA，省略时使用系统信任库。查看变更不需要活跃 Worker 租约，客户端也不会收到 Worker 凭证。

@@ -66,6 +66,36 @@ impl GatewayServiceAuthority {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct GatewayTicket(JobGrantToken);
+/// A separate, read-only delegation. It cannot validate as an execution ticket.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct GatewayReadTicket(JobGrantToken);
+impl GatewayReadTicket {
+    pub fn expose(&self) -> &str {
+        self.0.expose()
+    }
+}
+impl fmt::Debug for GatewayReadTicket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("GatewayReadTicket([redacted])")
+    }
+}
+impl TryFrom<String> for GatewayReadTicket {
+    type Error = WorkerAuthError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Ok(Self(JobGrantToken::try_from(value)?))
+    }
+}
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReadClaims {
+    version: u32,
+    purpose: String,
+    gateway: GatewayId,
+    viewer: zuno_types::identity::PrincipalScope,
+    request_sha256: String,
+    expires_at_ms: i64,
+}
 impl GatewayTicket {
     pub fn expose(&self) -> &str {
         self.0.expose()
@@ -121,6 +151,76 @@ pub struct GatewayTicketAuthority {
     lifetime_ms: i64,
 }
 impl GatewayTicketAuthority {
+    pub fn issue_read(
+        &self,
+        viewer: &zuno_types::identity::PrincipalScope,
+        gateway: GatewayId,
+        request: &zuno_application::workspace_merge::MergeContentRequest,
+        now_ms: i64,
+    ) -> Result<GatewayReadTicket, WorkerAuthError> {
+        if now_ms < 0 || viewer.kind() != zuno_types::identity::PrincipalKind::User {
+            return Err(WorkerAuthError::Denied);
+        }
+        let claims = ReadClaims {
+            version: 1,
+            purpose: "zuno.enterprise.gateway-read".to_owned(),
+            gateway,
+            viewer: viewer.clone(),
+            request_sha256: read_digest(request)?,
+            expires_at_ms: now_ms.saturating_add(self.lifetime_ms),
+        };
+        let payload = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).map_err(|_| WorkerAuthError::InvalidGrant)?);
+        let signed = format!("{}.{}", self.active, payload);
+        let tag = hmac::sign(
+            self.keys.get(&self.active).expect("validated key"),
+            signed.as_bytes(),
+        );
+        GatewayReadTicket::try_from(format!("{signed}.{}", URL_SAFE_NO_PAD.encode(tag.as_ref())))
+    }
+    pub fn verify_read(
+        &self,
+        gateway: &AuthenticatedGateway,
+        ticket: &GatewayReadTicket,
+        request: &zuno_application::workspace_merge::MergeContentRequest,
+        now_ms: i64,
+    ) -> Result<zuno_types::identity::PrincipalScope, WorkerAuthError> {
+        let parts = ticket.expose().split('.').collect::<Vec<_>>();
+        let [key_id, payload, signature] = parts.as_slice() else {
+            return Err(WorkerAuthError::InvalidGrant);
+        };
+        let key = self
+            .keys
+            .get(*key_id)
+            .ok_or(WorkerAuthError::InvalidGrant)?;
+        let tag = URL_SAFE_NO_PAD
+            .decode(signature)
+            .map_err(|_| WorkerAuthError::InvalidGrant)?;
+        hmac::verify(key, format!("{key_id}.{payload}").as_bytes(), &tag)
+            .map_err(|_| WorkerAuthError::InvalidGrant)?;
+        let claims: ReadClaims = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(payload)
+                .map_err(|_| WorkerAuthError::InvalidGrant)?,
+        )
+        .map_err(|_| WorkerAuthError::InvalidGrant)?;
+        if claims.version != 1
+            || claims.purpose != "zuno.enterprise.gateway-read"
+            || claims.gateway != *gateway.id()
+            || claims.viewer.tenant_id() != &gateway.subject().tenant_id
+            || claims.viewer.kind() != zuno_types::identity::PrincipalKind::User
+            || claims.request_sha256 != read_digest(request)?
+        {
+            return Err(WorkerAuthError::Denied);
+        }
+        if now_ms < 0
+            || now_ms >= claims.expires_at_ms
+            || now_ms >= gateway.identity.expires_at_ms()
+        {
+            return Err(WorkerAuthError::Expired);
+        }
+        Ok(claims.viewer)
+    }
     pub fn new(
         active: String,
         keys: Vec<(String, Vec<u8>)>,
@@ -199,6 +299,9 @@ impl GatewayTicketAuthority {
         let key_id = parts.next().ok_or(WorkerAuthError::InvalidGrant)?;
         let payload = parts.next().ok_or(WorkerAuthError::InvalidGrant)?;
         let signature = parts.next().ok_or(WorkerAuthError::InvalidGrant)?;
+        if parts.next().is_some() {
+            return Err(WorkerAuthError::InvalidGrant);
+        }
         let key = self.keys.get(key_id).ok_or(WorkerAuthError::InvalidGrant)?;
         let tag = URL_SAFE_NO_PAD
             .decode(signature)
@@ -240,6 +343,15 @@ fn request_digest(request: &GatewayRequest) -> Result<String, WorkerAuthError> {
     let bytes = request
         .encode()
         .map_err(|_| WorkerAuthError::InvalidGrant)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+fn read_digest(
+    request: &zuno_application::workspace_merge::MergeContentRequest,
+) -> Result<String, WorkerAuthError> {
+    let bytes = serde_json::to_vec(request).map_err(|_| WorkerAuthError::InvalidGrant)?;
+    if bytes.len() > 8192 {
+        return Err(WorkerAuthError::InvalidGrant);
+    }
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
@@ -294,6 +406,60 @@ mod tests {
     }
     fn tickets(key: &str, entries: Vec<(String, Vec<u8>)>) -> GatewayTicketAuthority {
         GatewayTicketAuthority::new(key.to_owned(), entries, 5000).unwrap()
+    }
+
+    #[tokio::test]
+    async fn review_tickets_bind_viewer_file_and_gateway_and_cannot_execute() {
+        use zuno_application::workspace_merge::{
+            MergeContentRequest, MergeContentSide, WorkspacePath,
+        };
+        let gateways = GatewayServiceAuthority::new(
+            Arc::new(Verifier),
+            [
+                (subject("gateway-a"), GatewayId::new("a").unwrap()),
+                (subject("gateway-b"), GatewayId::new("b").unwrap()),
+            ]
+            .into(),
+        )
+        .unwrap();
+        let a = gateways.authenticate("gateway-a").await.unwrap();
+        let b = gateways.authenticate("gateway-b").await.unwrap();
+        let authority = tickets("current", vec![("current".to_owned(), vec![2; 32])]);
+        let viewer = PrincipalScope::new(
+            TenantId::new("tenant").unwrap(),
+            PrincipalId::new("viewer").unwrap(),
+            PrincipalKind::User,
+            Some(ClientId::new("web").unwrap()),
+            std::num::NonZeroU64::MIN,
+        );
+        let request = MergeContentRequest {
+            approval_id: ApprovalId::new("approval").unwrap(),
+            side: MergeContentSide::Child,
+            path: WorkspacePath::new("file").unwrap(),
+        };
+        let ticket = authority
+            .issue_read(&viewer, GatewayId::new("a").unwrap(), &request, 1000)
+            .unwrap();
+        assert_eq!(
+            authority.verify_read(&a, &ticket, &request, 2000).unwrap(),
+            viewer
+        );
+        assert!(authority.verify_read(&b, &ticket, &request, 2000).is_err());
+        assert!(authority.verify_read(&a, &ticket, &request, 6000).is_err());
+        let mut other = request.clone();
+        other.path = WorkspacePath::new("secret").unwrap();
+        assert!(authority.verify_read(&a, &ticket, &other, 2000).is_err());
+        assert!(
+            authority
+                .verify(
+                    &a,
+                    &GatewayTicket::try_from(ticket.expose().to_owned()).unwrap(),
+                    &GatewayRequest::new(GatewayCommand::Acquire).unwrap(),
+                    2000
+                )
+                .is_err()
+        );
+        assert!(GatewayReadTicket::try_from(format!("{}.extra", ticket.expose())).is_err());
     }
 
     #[tokio::test]

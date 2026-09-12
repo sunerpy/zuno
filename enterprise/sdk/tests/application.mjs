@@ -69,3 +69,27 @@ test("Council phases, timeout outcomes and exact deadlines remain typed and priv
   value.council.lease = "private-worker-state";
   await assert.rejects(client.workflow("job"), /Invalid enterprise application/);
 });
+
+test("merge review is approval-bound and content streams preserve BFF identity without exposing a Worker grant", async () => {
+  const value = { approvalId: "approval", operationId: "operation", childJobId: "child", admitted: false,
+    plan: { baseTree: "a".repeat(64), parentTree: "b".repeat(64), childTree: "c".repeat(64), changes: [] } };
+  const requests = [];
+  const client = new EnterpriseClient({ baseUrl: "https://enterprise.example/app/api/v1/", browserContext: () => "context",
+    fetch: async (url, init) => {
+      requests.push({ url: new URL(url), init });
+      if (new URL(url).pathname.endsWith("/content")) return new Response(new Uint8Array([0, 255]), { headers: {
+        "content-type": "application/octet-stream", "content-length": "2", "x-zuno-content-sha256": "a".repeat(64),
+      } });
+      return response(value);
+    } });
+  assert.equal((await client.mergeReview("approval")).operationId, "operation");
+  await assert.rejects(client.mergeReview("different"), /identity mismatch/);
+  const downloaded = await client.mergeContent("approval", "child", "folder/file\nname");
+  assert.deepEqual([...new Uint8Array(await downloaded.arrayBuffer())], [0, 255]);
+  const request = requests.at(-1);
+  assert.equal(request.url.searchParams.get("path"), "folder/file\nname");
+  assert.equal(request.init.headers.get("x-zuno-browser-context"), "context");
+  assert.equal(request.init.headers.has("x-zuno-job-grant"), false);
+  assert.equal(request.init.redirect, "error");
+  await assert.rejects(client.mergeContent("approval", "child", "../secret"), /Invalid merge content/);
+});

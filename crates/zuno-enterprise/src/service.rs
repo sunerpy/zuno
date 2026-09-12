@@ -232,7 +232,8 @@ async fn gateway(
         &state_directory.join("gateway.sqlite"),
         state,
     )
-    .await?;
+    .await?
+    .with_merge_parallelism(options.merge_parallelism)?;
     let delivery = gateway.clone();
     let stopped = shutdown.clone();
     let supervisor = tokio::spawn(async move {
@@ -253,28 +254,30 @@ async fn gateway(
         }
     });
     let mut supervisor = supervisor;
-    let server = crate::http::serve(&options.tls, gateway.router(), shutdown.clone());
+    let server = crate::http::serve(&options.tls, gateway.clone().router(), shutdown.clone());
     tokio::pin!(server);
-    let result = tokio::select! {
-        result = &mut server => result,
+    let (result, supervisor_finished) = tokio::select! {
+        result = &mut server => (result,false),
         finished = &mut supervisor => {
             let requested = shutdown.is_set();
             shutdown.fire();
             let result = server.await;
-            if finished.is_err() || !requested {
-                return Err(invalid("gateway receipt supervisor stopped unexpectedly"));
-            }
-            return result;
+            let result=if finished.is_err() || !requested {
+                Err(invalid("gateway receipt supervisor stopped unexpectedly"))
+            }else {result};
+            (result,true)
         }
     };
     shutdown.fire();
-    if tokio::time::timeout(Duration::from_secs(31), &mut supervisor)
-        .await
-        .is_err()
+    if !supervisor_finished
+        && tokio::time::timeout(Duration::from_secs(31), &mut supervisor)
+            .await
+            .is_err()
     {
         supervisor.abort();
         let _ = supervisor.await;
     }
+    gateway.drain_merges(Duration::from_secs(30)).await;
     result
 }
 
@@ -366,9 +369,19 @@ async fn control(options: ControlConfig, shutdown: InterruptSignal) -> Result<()
     let memory =
         zuno_postgres::PostgresMemoryBackend::new(backend.clone(), options.memory.limits())
             .map_err(|_| invalid("invalid Memory service configuration"))?;
-    let application =
+    let mut application =
         EnterpriseApplication::new(backend.clone(), options.tenant_id.clone(), active)?
             .with_memory(memory.clone());
+    if has_environments {
+        application = application.with_merge_reader(Arc::new(
+            zuno_server::merge_review::MergeReviewReader::new(
+                backend.clone(),
+                tickets.clone(),
+                assignments.clone(),
+                certificate(options.gateway_root_certificate.as_ref()).await?,
+            )?,
+        ));
+    }
     let mut worker_state = WorkerStateService::new(
         backend.clone(),
         workers.clone(),

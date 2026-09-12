@@ -35,7 +35,7 @@
 
 ## 私有协议
 
-`GatewayRequest` 为版本 2，使用有界的 tagged enum：
+`GatewayRequest` 为版本 4，使用有界的 tagged enum：
 
 | 命令 | 行为 |
 | --- | --- |
@@ -46,6 +46,15 @@
 | `submit_command` | 重新检查租约与审批后提交 |
 | `inspect` | 在分配环境内查询原操作回执 |
 | `output` | 使用 offset 和前缀摘要读取有界输出 |
+| `preview_workspace_merge` | 比较经过来源验证的已完成子孙任务与父工作区 |
+| `prepare_workspace_merge` | 保存不可变提案并取得人工审批 |
+| `submit_workspace_merge` | 在当前批准下接纳网关后台执行 |
+| `inspect_workspace_merge` | 查询原合并回执 |
+
+审批内容使用独立只读协议和票据用途，入口为
+`/internal/execution/v1/workspace-merge/read`。兑换时通过控制面再次检查审批查看权限，
+不携带 Worker 租约，也不能代替执行票据。公共下载经
+`/approvals/{approval}/merge/content` 流式代理，见[工作区合并](WORKSPACES.zh.md#子工作区审批合并)。
 
 它们属于 Worker／网关私有消息，公共 Web 活动使用独立投影。此版本的 Worker HTTP
 不开放任意环境销毁、分支目标选择或管理级取消。子工作区准备绑定已接纳关系和回执，
@@ -91,4 +100,4 @@ socket 会使该 gate 失败。可以通过 `ZUNO_ROOTLESS_DOCKER_SOCKET` 指定
 
 网关 supervisor 通过独立服务认证轮询 `internal/gateway/v1/cancellations`，领取已停止 Job 的不可变操作接纳记录。该入口在 Worker 撤权后仍有效，只允许停止原操作；完成事实保持原样，不确定状态继续核查。见[控制](CONTROL.zh.md)。
 
-网关协议 3 允许从数据所有者验证过的 Workflow 协调工作区准备子工作区；源工作区必须已经存在，具体子 Job、源与网关绑定保持在签名请求内。普通命令仍要求执行会话一致。
+网关协议 4 允许从数据所有者验证过的 Workflow 协调工作区准备子工作区；源工作区必须已经存在，具体子 Job、源与网关绑定保持在签名请求内。普通命令仍要求执行会话一致。

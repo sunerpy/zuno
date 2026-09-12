@@ -47,7 +47,7 @@ A child requiring a workspace remains unclaimable until preparation is durably
 confirmed. Background dispatch also waits for this preparation before returning
 an executable Job handle.
 
-Worker protocol 10 requests `PrepareChildWorkspace` through gateway protocol 3.
+Worker protocol 11 requests `PrepareChildWorkspace` through gateway protocol 4.
 The request carries only a staged child Job ID. The control plane verifies the
 parent lease and child relation, resolves both environment specifications and
 records the workspace admission. The Worker cannot choose another volume, image,
@@ -78,6 +78,55 @@ Workspace inheritance does not approve commands. Child command preparation and
 execution use the same current-user approval and fencing checks as root commands.
 Child writes stay in the child volume; integrating them into the parent remains
 a separate approved merge operation.
+
+## Approved workspace merge
+
+Definitions with an installed child catalog expose `workspace_merge`. Arguments
+are `childJobId` and optional `resolutions`, a map of logical paths to `parent`
+or `child`. The source must be a completed descendant of this Job with no newer
+input and a provable fork baseline on the assigned gateway. Workflow nodes use
+the original group's fork as their baseline. Unproven legacy/resumed-child
+origins fail closed.
+
+The gateway compares baseline, parent and child snapshots. It preserves
+parent-only edits, accepts independent child edits and reports simultaneous
+changes to one entry as conflicts. Comparison is per entry; it does not perform
+line-level text merging. File/directory and link conflicts require consistent
+explicit resolutions before approval. Changing choices changes the binding.
+Empty changes return without mutation.
+
+Plans retain file sizes/digests, permissions and numeric ownership. Binary files,
+symlinks, hardlinks and root metadata are preserved without host extraction.
+Limits are 512 MiB per snapshot, 50,000 tree entries, 1,024 changed entries and a
+512 KiB manifest. UTF-8 paths are logical names; `.` identifies the workspace root.
+
+Every applied merge requires current human approval. Ownership/mode changes and
+sensitive repository metadata require a designated approver. Under either API
+prefix, `GET /approvals/{approval}/merge` returns the typed plan.
+`GET /approvals/{approval}/merge/content?side=parent&path=...` streams exact
+`base`, `parent` or `child` bytes for a changed entry. An independent short-lived
+read ticket is redeemed by the authenticated gateway and rechecks viewer policy.
+It cannot execute tools and never enters a Web DTO. Downloads are no-store/nosniff
+attachments with an immutable SHA-256; the control plane checks size and digest.
+
+Approval binds the Job, original invocation, plan, lineage and resource versions.
+Approval checking and execution admission commit together. The Worker then waits
+durably and releases its slot. A bounded gateway task restores a fresh volume,
+reads it back and compares the tree, then atomically publishes its pointer,
+revision and receipt. The parent is never partially overwritten.
+
+The journal preserves reservations, retry deadlines and receipt acknowledgements.
+Restart reconstructs execution; a lost response returns the original receipt.
+Cancellation before submit creates a never-startable tombstone without seizing
+another operation's slot. Cancellation and publication compete atomically;
+committed facts remain authoritative. Truthful receipts remain deliverable after
+Worker lease loss and are consumed once.
+
+Gateway ledger 4 and PostgreSQL preview format 17 add guarded migrations.
+Worker protocol 11 and gateway protocol 4 require matching roles. The SDK exposes
+`mergeReview` and streaming `mergeContent`; `UiAction::ViewWorkspaceMerge` identifies
+review. App UI remains deferred to Penpot. Cross-gateway transfer, remote artifact
+storage and full retention/backup/rolling-upgrade acceptance remain separate work.
 
 ## Migrations and evidence
 

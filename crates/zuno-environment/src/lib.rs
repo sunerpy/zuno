@@ -6,9 +6,12 @@ mod authority;
 mod docker;
 mod gateway;
 mod ledger;
+mod merge_executor;
+pub mod workspace_merge;
 
 pub use authority::OrganizationOperationAuthority;
 pub use gateway::DockerGateway;
+pub use merge_executor::MergeExecutor;
 
 use zuno_application::ApplicationError;
 

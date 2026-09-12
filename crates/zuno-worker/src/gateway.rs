@@ -67,6 +67,65 @@ pub struct GatewayStateClient {
     control: WorkerClient,
 }
 impl GatewayStateClient {
+    pub async fn merge_read_context(
+        &self,
+        ticket: &zuno_identity::gateway::GatewayReadTicket,
+        request: &zuno_application::workspace_merge::MergeContentRequest,
+    ) -> Result<zuno_application::workspace_merge::MergeContentContext, ApplicationError> {
+        let bytes = self
+            .control
+            .post_header(
+                GATEWAY_MERGE_READ_RESOLVE_PATH,
+                Some((GATEWAY_READ_TICKET_HEADER, ticket.expose())),
+                serde_json::to_vec(request).map_err(ApplicationError::storage)?,
+            )
+            .await
+            .map_err(state_error)?;
+        serde_json::from_slice(&bytes).map_err(ApplicationError::storage)
+    }
+    pub async fn prepare_merge(
+        &self,
+        request: zuno_application::workspace_merge::GatewayMergeRequest,
+    ) -> Result<ApprovalRecord, ApplicationError> {
+        let bytes = self
+            .control
+            .post(
+                GATEWAY_MERGE_PREPARE_PATH,
+                None,
+                serde_json::to_vec(&request).map_err(ApplicationError::storage)?,
+            )
+            .await
+            .map_err(state_error)?;
+        serde_json::from_slice(&bytes).map_err(ApplicationError::storage)
+    }
+    pub async fn merge_cancellations(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<zuno_application::workspace_merge::WorkspaceMergeAdmission>, ApplicationError>
+    {
+        if !(1..=32).contains(&limit) {
+            return Err(ApplicationError::Invalid(
+                "invalid merge cancellation limit".to_owned(),
+            ));
+        }
+        let bytes = self
+            .control
+            .post(
+                GATEWAY_MERGE_CANCELLATIONS_PATH,
+                None,
+                serde_json::to_vec(&limit).map_err(ApplicationError::storage)?,
+            )
+            .await
+            .map_err(state_error)?;
+        let result: Vec<zuno_application::workspace_merge::WorkspaceMergeAdmission> =
+            serde_json::from_slice(&bytes).map_err(ApplicationError::storage)?;
+        if result.len() > limit as usize {
+            return Err(ApplicationError::Invalid(
+                "unbounded merge cancellation response".to_owned(),
+            ));
+        }
+        Ok(result)
+    }
     pub async fn cancellations(
         &self,
         limit: u32,
@@ -167,6 +226,68 @@ impl GatewayStateClient {
         self.control
             .post(
                 GATEWAY_CHILD_WORKSPACE_PATH,
+                None,
+                serde_json::to_vec(completion).map_err(ApplicationError::storage)?,
+            )
+            .await
+            .map_err(state_error)?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl zuno_application::workspace_merge::WorkspaceMergeAuthority for GatewayStateClient {
+    async fn authorize_merge(
+        &self,
+        lease: &ExecutionLease,
+        environment: &Environment,
+        operation: &zuno_application::workspace_merge::WorkspaceMergeOperation,
+    ) -> Result<(), ApplicationError> {
+        let request = zuno_application::workspace_merge::GatewayMergeRequest {
+            lease: lease.clone(),
+            environment: environment.clone(),
+            operation: operation.clone(),
+        };
+        let bytes = self
+            .control
+            .post(
+                GATEWAY_MERGE_AUTHORIZE_PATH,
+                None,
+                serde_json::to_vec(&request).map_err(ApplicationError::storage)?,
+            )
+            .await
+            .map_err(state_error)?;
+        let checked: CheckedApproval =
+            serde_json::from_slice(&bytes).map_err(ApplicationError::storage)?;
+        if checked.lease.owner != lease.owner
+            || checked.lease.job_id != lease.job_id
+            || checked.lease.session_id != lease.session_id
+            || checked.lease.attempt_id != lease.attempt_id
+            || checked.lease.worker != lease.worker
+            || checked.lease.epoch != lease.epoch
+            || checked.lease.checkpoint_version != lease.checkpoint_version
+            || checked.lease.expires_at_ms < lease.expires_at_ms
+            || checked.binding.operation_id != operation.id
+            || checked.binding.invocation_id != operation.invocation_id
+            || checked.binding.job_id != lease.job_id
+            || checked.binding.session_id != lease.session_id
+            || checked.binding.arguments_sha256 != operation.plan.digest()
+        {
+            return Err(ApplicationError::Forbidden);
+        }
+        Ok(())
+    }
+}
+#[async_trait]
+impl zuno_application::workspace_merge::WorkspaceMergeCompletionSink for GatewayStateClient {
+    async fn publish_merge(
+        &self,
+        completion: &zuno_application::workspace_merge::WorkspaceMergeCompletion,
+    ) -> Result<(), ApplicationError> {
+        completion.validate()?;
+        self.control
+            .post(
+                GATEWAY_MERGE_COMPLETION_PATH,
                 None,
                 serde_json::to_vec(completion).map_err(ApplicationError::storage)?,
             )
@@ -310,6 +431,43 @@ impl GatewayClient {
             serde_json::from_slice(&bytes).map_err(ApplicationError::storage)?;
         use zuno_application::environment::wire::GatewayCommand;
         let matches = match (&request.command, &reply) {
+            (
+                GatewayCommand::PreviewWorkspaceMerge {
+                    id,
+                    invocation_id,
+                    child_job_id,
+                },
+                GatewayReply::WorkspaceMergePreview(operation),
+            ) => {
+                operation.id == *id
+                    && operation.invocation_id == *invocation_id
+                    && operation.child_job_id == *child_job_id
+                    && operation.environment_id == issued.assignment.environment.id
+                    && operation.validate().is_ok()
+            }
+            (
+                GatewayCommand::PrepareWorkspaceMerge { operation },
+                GatewayReply::Approval(approval),
+            ) => {
+                approval.binding.operation_id == operation.id
+                    && approval.binding.invocation_id == operation.invocation_id
+                    && approval.binding.arguments_sha256 == operation.plan.digest()
+            }
+            (
+                GatewayCommand::SubmitWorkspaceMerge { operation },
+                GatewayReply::WorkspaceMergeReceipt(receipt),
+            ) => {
+                receipt.id == operation.id
+                    && receipt.environment_id == issued.assignment.environment.id
+                    && receipt.plan_digest == operation.plan.digest()
+            }
+            (
+                GatewayCommand::InspectWorkspaceMerge { operation_id },
+                GatewayReply::WorkspaceMergeReceipt(receipt),
+            ) => {
+                receipt.id == *operation_id
+                    && receipt.environment_id == issued.assignment.environment.id
+            }
             (
                 GatewayCommand::Acquire | GatewayCommand::Get,
                 GatewayReply::Environment(environment),

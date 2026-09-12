@@ -215,6 +215,31 @@ async fn enrich_invocation(
             }
         }
     }
+    let merge=query("SELECT offer,completion FROM zuno_enterprise_preview.gateway_merge_operation
+        WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3 AND invocation_id=$4 AND job_id=$5 AND admitted")
+        .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(session).bind(invocation.id.as_str()).bind(job)
+        .fetch_optional(&mut *connection).await.map_err(database_error)?;
+    if let Some(merge) = merge {
+        let admission: zuno_application::workspace_merge::WorkspaceMergeAdmission =
+            serde_json::from_value(merge.try_get("offer").map_err(database_error)?)
+                .map_err(ApplicationError::storage)?;
+        invocation.location = ExecutionLocation::Enterprise {
+            environment_id: admission.environment.spec.id,
+        };
+        invocation.isolation = Isolation::Enforced;
+        let raw: Option<Value> = merge.try_get("completion").map_err(database_error)?;
+        if let Some(raw) = raw {
+            let completion: zuno_application::workspace_merge::WorkspaceMergeCompletion =
+                serde_json::from_value(raw).map_err(ApplicationError::storage)?;
+            completion.validate()?;
+            if completion.receipt.state
+                == zuno_application::workspace_merge::WorkspaceMergeState::Cancelled
+            {
+                invocation.state = InvocationState::Cancelled;
+                invocation.waiting_for = None;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -342,7 +367,7 @@ async fn approval(
     id: &str,
 ) -> Result<(), ApplicationError> {
     let row = query(
-        "SELECT job_id,state,presentation,created_at FROM zuno_enterprise_preview.operation_approval
+        "SELECT job_id,state,presentation,created_at,operation_id FROM zuno_enterprise_preview.operation_approval
          WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3 AND id=$4",
     ).bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(session).bind(id)
         .fetch_one(&mut *connection).await.map_err(database_error)?;
@@ -354,6 +379,20 @@ async fn approval(
         "revoked" | "invalidated" => ApprovalStatus::Revoked,
         _ => return Err(ApplicationError::Conflict),
     };
+    let is_merge: bool = query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM zuno_enterprise_preview.gateway_merge_operation
+        WHERE tenant_id=$1 AND principal_id=$2 AND operation_id=$3 AND job_id=$4)",
+    )
+    .bind(owner.tenant_id.as_str())
+    .bind(owner.principal_id.as_str())
+    .bind(
+        row.try_get::<String, _>("operation_id")
+            .map_err(database_error)?,
+    )
+    .bind(row.try_get::<String, _>("job_id").map_err(database_error)?)
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(database_error)?;
     let record = ItemRecord {
         id: format!("approval:{id}"),
         parent_id: None,
@@ -372,7 +411,13 @@ async fn approval(
         },
         // Audience/organization policy are checked by the current approval API,
         // not cached as a transferable right in this immutable frame.
-        actions: Vec::new(),
+        actions: if is_merge {
+            vec![UiAction::ViewWorkspaceMerge {
+                approval_id: ApprovalId::new(id).map_err(ApplicationError::storage)?,
+            }]
+        } else {
+            Vec::new()
+        },
     };
     publish(connection, owner, session, record).await
 }

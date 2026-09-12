@@ -30,6 +30,7 @@ pub struct GatewayExecutionService {
     id: GatewayId,
     gateway: Arc<DockerGateway>,
     state: GatewayStateClient,
+    merges: Arc<zuno_environment::MergeExecutor>,
 }
 impl GatewayExecutionService {
     /// Host lifecycle calls this bounded scan repeatedly with interruptible
@@ -48,6 +49,15 @@ impl GatewayExecutionService {
             }
         }
         let delivered = self.gateway.deliver_completions(&self.state, limit).await?;
+        for admission in self.state.merge_cancellations(limit.min(32)).await? {
+            if admission.gateway_id != self.id {
+                return Err(ApplicationError::Forbidden);
+            }
+            if let Err(error) = self.gateway.cancel_admitted_workspace_merge(&admission) {
+                failure.get_or_insert(error);
+            }
+        }
+        self.merges.advance()?;
         if let Some(error) = failure {
             return Err(error);
         }
@@ -68,12 +78,37 @@ impl GatewayExecutionService {
     ) -> Result<Self, ApplicationError> {
         let gateway =
             Arc::new(DockerGateway::connect(socket, ledger, Arc::new(state.clone())).await?);
-        Ok(Self { id, gateway, state })
+        let merges = Arc::new(zuno_environment::MergeExecutor::new(
+            gateway.clone(),
+            Arc::new(state.clone()),
+            2,
+        )?);
+        Ok(Self {
+            id,
+            gateway,
+            state,
+            merges,
+        })
+    }
+    pub fn with_merge_parallelism(mut self, parallelism: u32) -> Result<Self, ApplicationError> {
+        self.merges = Arc::new(zuno_environment::MergeExecutor::new(
+            self.gateway.clone(),
+            Arc::new(self.state.clone()),
+            parallelism,
+        )?);
+        Ok(self)
+    }
+    pub async fn drain_merges(&self, timeout: std::time::Duration) {
+        self.merges.drain(timeout).await;
     }
 
     pub fn router(self) -> Router {
         Router::new()
             .route(&format!("/{GATEWAY_EXECUTE_PATH}"), post(execute))
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_MERGE_READ_PATH),
+                post(read_merge_content),
+            )
             .layer(DefaultBodyLimit::max(MAX_GATEWAY_FRAME_BYTES))
             .with_state(self)
     }
@@ -102,6 +137,59 @@ impl GatewayExecutionService {
             return Err(ApplicationError::Forbidden);
         }
         let reply = match request.command {
+            GatewayCommand::PreviewWorkspaceMerge {
+                id,
+                invocation_id,
+                child_job_id,
+            } => {
+                let source = context.merge_source.ok_or(ApplicationError::Forbidden)?;
+                if source.child_job_id != child_job_id || source.gateway_id != self.id {
+                    return Err(ApplicationError::Forbidden);
+                }
+                GatewayReply::WorkspaceMergePreview(Box::new(
+                    self.gateway
+                        .preview_workspace_merge(
+                            &context.lease,
+                            zuno_application::workspace_merge::WorkspaceMergePreviewRequest {
+                                id,
+                                invocation_id,
+                                child_job_id,
+                                environment_id: context.assignment.environment.id,
+                                source_id: source.source_environment.id,
+                                base: source.base,
+                            },
+                        )
+                        .await?,
+                ))
+            }
+            GatewayCommand::PrepareWorkspaceMerge { operation } => {
+                GatewayReply::Approval(Box::new(
+                    self.state
+                        .prepare_merge(zuno_application::workspace_merge::GatewayMergeRequest {
+                            lease: context.lease.clone(),
+                            environment: self.environment(&context).await?,
+                            operation: *operation,
+                        })
+                        .await?,
+                ))
+            }
+            GatewayCommand::SubmitWorkspaceMerge { operation } => {
+                let result = self
+                    .gateway
+                    .admit_workspace_merge(&context.lease, &operation, &self.state)
+                    .await?;
+                self.merges.advance()?;
+                GatewayReply::WorkspaceMergeReceipt(result)
+            }
+            GatewayCommand::InspectWorkspaceMerge { operation_id } => {
+                let result = self
+                    .gateway
+                    .workspace_merge_status(&context.lease.owner, &operation_id)?;
+                if result.environment_id != context.assignment.environment.id {
+                    return Err(ApplicationError::Forbidden);
+                }
+                GatewayReply::WorkspaceMergeReceipt(result)
+            }
             GatewayCommand::Acquire => GatewayReply::Environment(if context.existing_workspace {
                 self.environment(&context).await?
             } else {
@@ -187,6 +275,85 @@ impl GatewayExecutionService {
         };
         Ok(reply)
     }
+}
+
+async fn read_merge_content(
+    State(service): State<GatewayExecutionService>,
+    headers: HeaderMap,
+    Json(request): Json<zuno_application::workspace_merge::MergeContentRequest>,
+) -> Result<Response, Failure> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let values = headers.get_all(zuno_worker::GATEWAY_READ_TICKET_HEADER);
+    if values.iter().count() != 1 {
+        return Err(Failure(ApplicationError::Forbidden));
+    }
+    let ticket = zuno_identity::gateway::GatewayReadTicket::try_from(
+        values
+            .iter()
+            .next()
+            .and_then(|value| value.to_str().ok())
+            .ok_or(Failure(ApplicationError::Forbidden))?
+            .to_owned(),
+    )
+    .map_err(|_| Failure(ApplicationError::Forbidden))?;
+    let context = service.state.merge_read_context(&ticket, &request).await?;
+    if context.gateway_id != service.id {
+        return Err(Failure(ApplicationError::Forbidden));
+    }
+    let content = service
+        .gateway
+        .read_workspace_merge_content(context)
+        .await?;
+    let (body, size, sha) = match content {
+        zuno_environment::workspace_merge::WorkspaceContent::File {
+            file,
+            offset,
+            bytes,
+            sha256,
+        } => {
+            let mut file = tokio::fs::File::from_std(file);
+            file.seek(std::io::SeekFrom::Start(offset))
+                .await
+                .map_err(ApplicationError::storage)?;
+            (
+                axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file.take(bytes))),
+                bytes,
+                sha256,
+            )
+        }
+        zuno_environment::workspace_merge::WorkspaceContent::Text { bytes, sha256 } => (
+            axum::body::Body::from(bytes.clone()),
+            bytes.len() as u64,
+            sha256,
+        ),
+    };
+    let mut response = Response::new(body);
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/octet-stream"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        header::HeaderValue::from_static("attachment"),
+    );
+    headers.insert(
+        "x-content-type-options",
+        header::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        "x-zuno-content-sha256",
+        header::HeaderValue::from_str(&sha).map_err(ApplicationError::storage)?,
+    );
+    headers.insert(
+        header::CONTENT_LENGTH,
+        header::HeaderValue::from_str(&size.to_string()).map_err(ApplicationError::storage)?,
+    );
+    Ok(response)
 }
 
 struct Failure(ApplicationError);

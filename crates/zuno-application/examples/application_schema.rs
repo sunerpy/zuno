@@ -4,6 +4,7 @@ use zuno_application::{
     api::{ApprovalDecision, ApprovalView, InputVersionView, JobView, SubmitTurn, WorkspaceView},
     control::{CancelJob, CancellationReceipt},
     workflow::WorkflowRunView,
+    workspace_merge::{MergeContentRequest, WorkspaceMergeView},
 };
 
 #[derive(JsonSchema)]
@@ -24,6 +25,8 @@ struct ApplicationProtocol {
     cancel: CancelJob,
     cancellation: CancellationReceipt,
     workflow: WorkflowRunView,
+    workspace_merge: WorkspaceMergeView,
+    merge_content: MergeContentRequest,
 }
 fn main() {
     println!(

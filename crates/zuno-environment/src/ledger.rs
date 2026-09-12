@@ -1,18 +1,25 @@
 use crate::storage;
 mod forks;
+mod merges;
 pub(crate) use forks::ForkPreparation;
+pub(crate) use merges::MergeRecord;
 const SCHEMA: &str = include_str!("schema.sql");
 const DELIVERY_SCHEMA: &str = include_str!("schema_delivery.sql");
 const FORK_SCHEMA: &str = include_str!("schema_fork.sql");
-const FORMAT: i64 = 3;
+const MERGE_SCHEMA: &str = include_str!("schema_merge.sql");
+const FORMAT: i64 = 4;
 
 fn source_digest(version: i64) -> String {
     if version == 1 {
         zuno_orchestration::sha256_text(SCHEMA)
     } else if version == 2 {
         zuno_orchestration::sha256_text(&format!("{SCHEMA}\n{DELIVERY_SCHEMA}"))
-    } else {
+    } else if version == 3 {
         zuno_orchestration::sha256_text(&format!("{SCHEMA}\n{DELIVERY_SCHEMA}\n{FORK_SCHEMA}"))
+    } else {
+        zuno_orchestration::sha256_text(&format!(
+            "{SCHEMA}\n{DELIVERY_SCHEMA}\n{FORK_SCHEMA}\n{MERGE_SCHEMA}"
+        ))
     }
 }
 
@@ -106,7 +113,10 @@ impl Ledger {
                 if version < 2 {
                     tx.execute_batch(DELIVERY_SCHEMA).map_err(storage)?;
                 }
-                tx.execute_batch(FORK_SCHEMA).map_err(storage)?;
+                if version < 3 {
+                    tx.execute_batch(FORK_SCHEMA).map_err(storage)?;
+                }
+                tx.execute_batch(MERGE_SCHEMA).map_err(storage)?;
                 tx.execute(
                     "UPDATE gateway_format SET version=?1,source_digest=?2,manifest=?3 WHERE singleton=1 AND version=?4",
                     params![FORMAT,source_digest(FORMAT),manifest(&tx)?,version],
@@ -128,6 +138,7 @@ impl Ledger {
             tx.execute_batch(SCHEMA).map_err(storage)?;
             tx.execute_batch(DELIVERY_SCHEMA).map_err(storage)?;
             tx.execute_batch(FORK_SCHEMA).map_err(storage)?;
+            tx.execute_batch(MERGE_SCHEMA).map_err(storage)?;
             tx.execute(
                 "INSERT INTO gateway_format VALUES(1,?1,'enterprise-preview',?2,?3)",
                 params![FORMAT, source_digest(FORMAT), manifest(&tx)?],
@@ -319,6 +330,11 @@ impl Ledger {
             )
             .map_err(storage)?;
         if pending {
+            return Err(ApplicationError::Conflict);
+        }
+        let merge_pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_merge WHERE tenant=?1 AND principal=?2 AND environment_id=?3 AND acknowledged=0)",
+            params![owner.tenant_id.as_str(),owner.principal_id.as_str(),id.as_str()],|row|row.get(0)).map_err(storage)?;
+        if merge_pending {
             return Err(ApplicationError::Conflict);
         }
         if state == "released" {
@@ -521,6 +537,11 @@ impl Ledger {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(storage)?;
         let owner = &lease.owner;
+        let merge_exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_merge WHERE tenant=?1 AND principal=?2 AND id=?3)",
+            params![owner.tenant_id.as_str(),owner.principal_id.as_str(),request.id.as_str()],|row|row.get(0)).map_err(storage)?;
+        if merge_exists {
+            return Err(ApplicationError::Conflict);
+        }
         let digest = zuno_orchestration::sha256_json(&serde_json::json!([
             lease.job_id,
             lease.session_id,
@@ -783,7 +804,7 @@ mod tests {
         ExecutionAttemptId, InvocationId, JobId, PrincipalScope, SessionId, WorkerInstanceId,
     };
 
-    fn fixture() -> (tempfile::TempDir, Ledger, ExecutionLease, CommandOperation) {
+    pub(super) fn fixture() -> (tempfile::TempDir, Ledger, ExecutionLease, CommandOperation) {
         let directory = tempfile::tempdir().unwrap();
         let ledger = Ledger::open(&directory.path().join("gateway.sqlite")).unwrap();
         let owner = PrincipalScope::local().owner();

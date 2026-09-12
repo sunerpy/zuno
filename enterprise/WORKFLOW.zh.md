@@ -68,8 +68,8 @@ Worker 更换不改变节点身份或输入。Workflow 完成、原生 Job 结�
 
 PostgreSQL 预览格式 15 增加 Workflow／节点协调和固定依赖输入。精确格式 14 fixture
 验证会话、消息、Memory、持久 frame 和临时行在迁移及回滚中保留；更旧的受支持格式
-仍在同一受保护事务内前进。Worker 协议 10 承载 Workflow 命令，检查点 schema 4 保持不变，
-网关协议 3 校验 Workflow 工作区准备。控制面与 Worker 使用匹配版本，契约更新时重新生成公共 SDK。
+仍在同一受保护事务内前进。Worker 协议 11 承载 Workflow 命令，检查点 schema 4 保持不变，
+网关协议 4 校验 Workflow 工作区准备。控制面与 Worker 使用匹配版本，契约更新时重新生成公共 SDK。
 
 ## 持久 Council
 
@@ -106,8 +106,8 @@ Job，不重放原 Agent 的命令。修正次数和来源完成摘要持久保�
 
 PostgreSQL 格式 16 增加作用域化 Council、席位状态、尝试来源和可选 Job 截止时间。
 精确格式 15 fixture 验证原有 Job、Workflow／节点、消息、Memory 和活动 frame
-保留，并检查 marker 前故障原子回滚。Worker 协议 10 增加内部 Council 接纳；
-网关协议 3 和检查点 schema 4 保持不变。`WorkflowRunView.kind` 区分 `workflow`
+保留，并检查 marker 前故障原子回滚。Worker 协议 11 增加内部 Council 接纳；
+网关协议 4 和检查点 schema 4 保持不变。`WorkflowRunView.kind` 区分 `workflow`
 与 `council`，可选 `council` 视图包含类型化阶段、席位状态、次数和十进制精确期限。
 公开视图不包含私有配置、提示词、租约或凭证。
 

@@ -1,11 +1,11 @@
 import { ActivityClient } from "./client.js";
 import type {
   WorkspaceView, SessionPage, SessionSummary, CreateSession, JobView,
-  SubmitTurn, InputVersionView, ApprovalView, ApprovalDecision, CancelJob, CancellationReceipt, WorkflowRunView,
+  SubmitTurn, InputVersionView, ApprovalView, ApprovalDecision, CancelJob, CancellationReceipt, WorkflowRunView, WorkspaceMergeView, MergeContentSide,
 } from "./generated/application.js";
 import {
   validateWorkspaceView, validateSessionPage, validateSessionSummary, validateJobView,
-  validateInputVersionView, validateApprovalView, validateCancellationReceipt, validateWorkflowRunView,
+  validateInputVersionView, validateApprovalView, validateCancellationReceipt, validateWorkflowRunView, validateWorkspaceMergeView, validateMergeContentRequest,
 } from "./generated/application-validators.mjs";
 
 function checked<T>(value: unknown, validate: (value: unknown) => unknown): T {
@@ -18,6 +18,26 @@ function id(value: string): string {
 }
 
 export class EnterpriseClient extends ActivityClient {
+  async mergeReview(approval: string, signal?: AbortSignal): Promise<WorkspaceMergeView> {
+    const value = checked<WorkspaceMergeView>(await this.get(new URL(`approvals/${id(approval)}/merge`, this.base), signal), validateWorkspaceMergeView);
+    if (value.approvalId !== approval) throw new Error("Merge review identity mismatch");
+    return value;
+  }
+  /** Stream reviewed bytes through the authenticated API; the caller owns consumption and cancellation. */
+  async mergeContent(approval: string, side: MergeContentSide, path: string, signal?: AbortSignal): Promise<Response> {
+    if (!validateMergeContentRequest({ approvalId: approval, side, path })) throw new Error("Invalid merge content request");
+    const url = new URL(`approvals/${id(approval)}/merge/content`, this.base);
+    url.searchParams.set("side", side); url.searchParams.set("path", path);
+    const response = await this.response(url, signal, "GET", undefined, "application/octet-stream", 600000);
+    const length = response.headers.get("content-length") ?? "";
+    if (response.headers.get("content-type") !== "application/octet-stream" || !response.body ||
+        !/^(0|[1-9][0-9]*)$/.test(length) || BigInt(length) > 512n * 1024n * 1024n ||
+        !/^[0-9a-f]{64}$/.test(response.headers.get("x-zuno-content-sha256") ?? "")) {
+      await response.body?.cancel();
+      throw new Error("Invalid merge content response");
+    }
+    return response;
+  }
   async workflow(job: string, signal?: AbortSignal): Promise<WorkflowRunView> {
     const value = checked<WorkflowRunView>(await this.get(new URL(`jobs/${id(job)}/workflow`, this.base), signal), validateWorkflowRunView);
     if (value.jobId !== job) throw new Error("Workflow response identity mismatch");

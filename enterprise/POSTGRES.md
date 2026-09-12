@@ -187,7 +187,7 @@ limit. No incomplete history is treated as an exact old context window.
 
 The captured format-5 fixture preserves pending waits, Job budgets, lease state,
 messages and usage across failed/successful format-6 migration. The internal Worker
-protocol is version 10; it is separate from public UI DTOs. Its compatible claims,
+protocol is version 11; it is separate from public UI DTOs. Its compatible claims,
 stable input timestamps and bounded grant renewal are described in [Workers](WORKERS.md).
 
 ## Browser authentication state
@@ -235,7 +235,7 @@ browser and operation data before the marker advances.
 The data owner runs the shared Memory service in bounded blocking capacity with
 one transaction per request. Actor/workspace checks, candidate CAS, source
 revalidation, consent, learning lease checks and result/audit commit stay together.
-Workers use internal protocol 10 and never receive this provider or pool.
+Workers use internal protocol 11 and never receive this provider or pool.
 See [Memory](MEMORY.md) for implemented behavior and remaining producers.
 
 ## Child execution-session binding
@@ -295,3 +295,16 @@ Workflow/node rows and verify DDL failure rollback, new RLS tables and the marke
 Only the newly added nullable column is excluded when comparing historical Job
 rows. The source digest and structural manifest of every prior format remain
 validated. See [Council execution](WORKFLOW.md#durable-council).
+
+## Format 17: approved workspace merge
+
+`gateway_merge_operation`, `gateway_merge_attempt` and
+`gateway_merge_cancellation` retain immutable offers, admitted execution
+identities, receipts and cancellation delivery. Existing approval checking and
+operation admission share one transaction; command and merge IDs share a scoped
+advisory lock. Completion publication and the original wait's wakeup are atomic.
+The exact format-16 fixture uses source digest
+`b539bf863f4192d81cc8189ec65f2900b4fd589e7e8e00e34d1ff2e77d1464f1`
+and verifies preserved sessions, messages, Memory, activity, Jobs and Council
+deadlines through successful migration and failed-DDL rollback. All new tables
+use owner RLS; the cancellation helper returns bounded coordinates only.

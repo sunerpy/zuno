@@ -14,6 +14,7 @@ pub mod environment;
 pub mod live;
 pub mod runtime;
 pub mod workflow;
+pub mod workspace_merge;
 
 use std::sync::Arc;
 

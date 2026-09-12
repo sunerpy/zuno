@@ -2999,3 +2999,12 @@ receipt inspection, and completion consumption preserves the original tool call.
 The public protocol has typed Council phases and seat states; App design and UI
 delivery remain deferred to Penpot. See the preview guides for `agent.mode` and
 `enterprise/WORKFLOW.md`.
+
+Enterprise workspace merge uses the existing durable operation wait. The data
+owner verifies completed-child lineage and current human approval; the gateway
+restores and verifies a new volume, then atomically publishes its pointer and
+receipt. Worker slots are released during execution. A separate read-only ticket
+lets authorized approval viewers stream the immutable before/after content
+without a Worker lease. Late receipts remain durable facts and are consumed once.
+See `enterprise/WORKSPACES.md` in the preview archive; UI design remains deferred
+to Penpot.

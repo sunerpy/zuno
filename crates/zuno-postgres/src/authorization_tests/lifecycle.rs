@@ -109,15 +109,37 @@ pub(super) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
         f.authority.check_execution(&f.lease, command.clone()).await,
         Err(ApplicationError::LeaseLost)
     ));
-    let resumed = f
-        .runtime
-        .claim(
-            &WorkerInstanceId::new("replacement").unwrap(),
-            LeaseDuration::new(300_000).unwrap(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+    // The rejected old lease can still hold its row lock until SQLx's queued
+    // rollback completes. Claim intentionally skips locks instead of blocking
+    // other sessions, so allow that documented nonblocking result.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    let resumed = loop {
+        let claimed = f
+            .runtime
+            .claim(
+                &WorkerInstanceId::new("replacement").unwrap(),
+                LeaseDuration::new(300_000).unwrap(),
+            )
+            .await
+            .unwrap();
+        if claimed.is_some() || tokio::time::Instant::now() >= deadline {
+            break claimed;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    let resumed = match resumed {
+        Some(job) => job,
+        None => {
+            let state:serde_json::Value=query_scalar("SELECT jsonb_build_object('job',to_jsonb(j),'session',to_jsonb(s),'input',to_jsonb(i),
+                'clock',floor(extract(epoch FROM clock_timestamp())*1000)::bigint)
+                FROM zuno_enterprise_preview.runtime_job j
+                JOIN zuno_enterprise_preview.runtime_session s ON s.tenant_id=j.tenant_id AND s.principal_id=j.principal_id AND s.session_id=j.session_id
+                JOIN zuno_enterprise_preview.input i ON i.tenant_id=j.tenant_id AND i.principal_id=j.principal_id AND i.id=j.input_id
+                WHERE j.tenant_id=$1 AND j.job_id=$2")
+                .bind(f.owner.tenant_id().as_str()).bind(f.job.id.as_str()).fetch_one(admin).await.unwrap();
+            panic!("checkpointed approval Job was not claimable: {state}");
+        }
+    };
     let reused = f
         .authority
         .admit(&resumed.lease, command.clone())

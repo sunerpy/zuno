@@ -48,7 +48,7 @@ operation; an earlier approval or revision cannot authorize a different operatio
 
 ## Private protocol
 
-`GatewayRequest` is protocol version 2, with bounded tagged commands:
+`GatewayRequest` is protocol version 4, with bounded tagged commands:
 
 | Command | Behavior |
 | --- | --- |
@@ -59,6 +59,17 @@ operation; an earlier approval or revision cannot authorize a different operatio
 | `submit_command` | Submit after fresh lease and approval checks |
 | `inspect` | Read the original operation receipt within the assigned environment |
 | `output` | Read bounded output using an offset and authenticated prefix digest |
+| `preview_workspace_merge` | Compare a verified completed descendant with the parent workspace |
+| `prepare_workspace_merge` | Persist the immutable offer and obtain human approval |
+| `submit_workspace_merge` | Admit gateway-owned background work under current approval |
+| `inspect_workspace_merge` | Query the original merge receipt |
+
+Approval content uses a separate read-only protocol and ticket purpose at
+`/internal/execution/v1/workspace-merge/read`. Gateway redemption rechecks the
+viewer's current approval access through the control plane. It carries no Worker
+lease and cannot be substituted for an execution ticket. Public downloads stream
+through `/approvals/{approval}/merge/content`; details and limits are in
+[workspace merge](WORKSPACES.md#approved-workspace-merge).
 
 These are private Worker/gateway messages. Public Web activity remains a separate
 projection. Worker HTTP exposes no arbitrary environment destruction, fork target
@@ -117,4 +128,4 @@ also starts a control plane, gateway and two independent Worker binaries; see
 
 The gateway supervisor also polls authenticated `internal/gateway/v1/cancellations`. This service-only path returns immutable admissions for stopped Jobs and stays valid after Worker revocation. It cannot start new operations. Docker stop and its actual terminal receipt remain separate; completed facts are preserved and unknown outcomes remain uncertain. See [control](CONTROL.md).
 
-Gateway protocol 3 permits child-workspace preparation from a data-owner-verified Workflow group workspace. That source must already exist; the exact child, source and gateway assignment remain bound to the signed request. Ordinary commands still require the executing session.
+Gateway protocol 4 permits child-workspace preparation from a data-owner-verified Workflow group workspace. That source must already exist; the exact child, source and gateway assignment remain bound to the signed request. Ordinary commands still require the executing session.

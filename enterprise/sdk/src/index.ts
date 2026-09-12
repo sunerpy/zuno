@@ -9,4 +9,5 @@ export type {
   ApprovalState, JobPhase,
   WorkflowRunView, NodeRunView, WorkflowState, WorkflowKind,
   CouncilView, CouncilPhase, CouncilSeatView, CouncilSeatState,
+  WorkspaceMergeView, WorkspaceMergePlan, WorkspaceChange, WorkspaceEntry, WorkspacePath, MergeChoice, MergeContentSide, MergeContentRequest,
 } from "./generated/application.js";

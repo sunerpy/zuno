@@ -227,11 +227,41 @@ impl PostgresOperationStore {
     }
 }
 
+pub(crate) async fn identity_lock(
+    tx: &mut Transaction<'_, Postgres>,
+    owner: &PrincipalKey,
+    id: &OperationId,
+) -> Result<(), ApplicationError> {
+    query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(format!(
+            "zuno.enterprise.operation:{}",
+            zuno_orchestration::sha256_json(&json!([owner, id]))
+        ))
+        .execute(&mut **tx)
+        .await
+        .map_err(database_error)?;
+    Ok(())
+}
+
 pub(crate) async fn admit_in(
     tx: &mut Transaction<'_, Postgres>,
     checked: &CheckedApproval,
     admission: &OperationAdmission,
 ) -> Result<(), ApplicationError> {
+    identity_lock(tx, &admission.lease.owner, &admission.operation.id).await?;
+    let conflict: bool = sqlx_core::query_scalar::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM zuno_enterprise_preview.gateway_merge_operation
+        WHERE tenant_id=$1 AND principal_id=$2 AND operation_id=$3)",
+    )
+    .bind(admission.lease.owner.tenant_id.as_str())
+    .bind(admission.lease.owner.principal_id.as_str())
+    .bind(admission.operation.id.as_str())
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(database_error)?;
+    if conflict {
+        return Err(ApplicationError::Conflict);
+    }
     admission.operation.validate()?;
     admission.environment.spec.validate()?;
     if admission.lease.owner != checked.lease.owner

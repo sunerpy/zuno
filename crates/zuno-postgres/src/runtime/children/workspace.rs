@@ -71,7 +71,88 @@ async fn preparation(
     Ok(Some((admission, receipt)))
 }
 
+pub(crate) async fn merge_source_in(
+    tx: &mut Transaction<'_, Postgres>,
+    lease: &ExecutionLease,
+    child: &JobId,
+) -> Result<zuno_application::workspace_merge::WorkspaceMergeSource, ApplicationError> {
+    let parent = authorized_parent(tx, lease).await?;
+    let job = read_job(tx, &lease.owner, child.as_str()).await?;
+    if job.id == parent.id || job.phase != JobPhase::Completed {
+        return Err(ApplicationError::Conflict);
+    }
+    super::super::control::lock_session(tx, &job).await?;
+    let current_input =
+        super::super::input_version(tx, &lease.owner, job.session_id.as_str()).await?;
+    if unsigned(current_input)? != job.input_version {
+        return Err(ApplicationError::Conflict);
+    }
+    let (source_admission, source_receipt) = preparation(tx, &lease.owner, child)
+        .await?
+        .ok_or(ApplicationError::Forbidden)?;
+    let source_receipt = source_receipt.ok_or(ApplicationError::Conflict)?;
+    if source_receipt.target.spec.session_id != job.session_id {
+        return Err(ApplicationError::Conflict);
+    }
+    let gateway = source_admission.assignment.gateway_id;
+    let mut cursor = child.clone();
+    let mut seen = std::collections::BTreeSet::new();
+    let base = loop {
+        if seen.len() >= 64 || !seen.insert(cursor.clone()) {
+            return Err(ApplicationError::Forbidden);
+        }
+        let record = read(tx, &lease.owner, &cursor).await?;
+        if !matches!(record.state.as_str(), "completed" | "consumed")
+            || record.ticket.workspace == ChildWorkspaceState::ModelOnly
+        {
+            return Err(ApplicationError::Forbidden);
+        }
+        let (admission, receipt) = preparation(tx, &lease.owner, &cursor)
+            .await?
+            .ok_or(ApplicationError::Forbidden)?;
+        if admission.assignment.gateway_id != gateway {
+            return Err(ApplicationError::Forbidden);
+        }
+        let receipt = receipt.ok_or(ApplicationError::Conflict)?;
+        if record.parent_job_id == parent.id {
+            if record.parent_session_id != parent.session_id
+                || admission.assignment.parent.session_id != parent.session_id
+            {
+                return Err(ApplicationError::Forbidden);
+            }
+            break receipt.snapshot.ok_or(ApplicationError::Forbidden)?;
+        }
+        cursor = record.parent_job_id;
+    };
+    let source = zuno_application::workspace_merge::WorkspaceMergeSource {
+        child_job_id: job.id,
+        child_session_id: job.session_id,
+        child_configuration: job.configuration,
+        child_input_version: job.input_version,
+        gateway_id: gateway,
+        source_environment: source_receipt.target.spec,
+        base,
+    };
+    verify_lease(tx, lease).await?;
+    Ok(source)
+}
+
 impl PostgresRuntimeStore {
+    /// Resolve the earliest fork below this parent as the common baseline, so
+    /// nested Agent/Workflow contributions include their inherited changes.
+    /// A child with new input or without a provable fork cannot be published.
+    pub async fn workspace_merge_source(
+        &self,
+        lease: &ExecutionLease,
+        child: &JobId,
+    ) -> Result<zuno_application::workspace_merge::WorkspaceMergeSource, ApplicationError> {
+        self.check_owner(&lease.owner)?;
+        let mut tx = owner_transaction(&self.pool, &lease.owner).await?;
+        let source = merge_source_in(&mut tx, lease, child).await?;
+        tx.commit().await.map_err(database_error)?;
+        Ok(source)
+    }
+
     pub async fn child_workspace(
         &self,
         lease: &ExecutionLease,
