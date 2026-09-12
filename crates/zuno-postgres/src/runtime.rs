@@ -3,7 +3,9 @@
 mod admission;
 pub(crate) use admission::request_key;
 pub(crate) mod children;
+pub(crate) use children::merge_source_in;
 mod control;
+pub(crate) use control::lock_session as lock_job_session;
 mod store;
 mod transactions;
 pub(crate) mod waiting;

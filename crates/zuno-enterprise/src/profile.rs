@@ -250,6 +250,12 @@ impl WorkerServiceFactory for ConfiguredWorkerFactory {
                         .map_err(|_| WorkerError::Configuration)?,
                 );
             }
+            dispatcher = Arc::new(zuno_worker::workspace_merge::WorkspaceMergeDispatcher::new(
+                dispatcher,
+                self.state.clone(),
+                execution.clone(),
+                self.gateway.clone(),
+            ));
         }
         Ok(WorkerTurnServices {
             configuration: entry.definition.reference(),

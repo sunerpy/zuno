@@ -1,5 +1,10 @@
 use super::*;
 
+pub(super) enum GatewayAdmission<'a> {
+    Command(&'a zuno_application::environment::OperationAdmission),
+    WorkspaceMerge(&'a zuno_application::workspace_merge::WorkspaceMergeAdmission),
+}
+
 fn approval_id(owner: &PrincipalKey, binding: &ApprovalBinding) -> String {
     format!(
         "apr_{}",
@@ -128,7 +133,7 @@ pub(super) async fn check_execution_with_admission(
     store: &PostgresOrganizationStore,
     lease: &ExecutionLease,
     proposal: ApprovalProposal,
-    admission: Option<&zuno_application::environment::OperationAdmission>,
+    admission: Option<GatewayAdmission<'_>>,
 ) -> Result<CheckedApproval, ApplicationError> {
     proposal.validate()?;
     store.check_tenant(&lease.owner.tenant_id)?;
@@ -220,8 +225,14 @@ pub(super) async fn check_execution_with_admission(
         },
         valid_until_ms,
     };
-    if let Some(admission) = admission {
-        crate::operation::admit_in(&mut tx, &checked, admission).await?;
+    match admission {
+        Some(GatewayAdmission::Command(admission)) => {
+            crate::operation::admit_in(&mut tx, &checked, admission).await?
+        }
+        Some(GatewayAdmission::WorkspaceMerge(admission)) => {
+            crate::workspace_merge::admit_in(&mut tx, &checked, admission).await?
+        }
+        None => {}
     }
     if valid_until_ms <= database_time(&mut tx).await? {
         return Err(ApplicationError::LeaseLost);

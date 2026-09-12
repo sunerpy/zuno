@@ -10,6 +10,7 @@ mod presentation_tests;
 pub mod runtime;
 pub mod tools;
 pub mod workflow;
+pub mod workspace_merge;
 
 use async_trait::async_trait;
 use futures::StreamExt as _;
@@ -46,7 +47,15 @@ pub const GATEWAY_AUTHORIZE_PATH: &str = "internal/gateway/v1/authorize";
 pub const GATEWAY_COMPLETION_PATH: &str = "internal/gateway/v1/completion";
 pub const GATEWAY_CANCELLATIONS_PATH: &str = "internal/gateway/v1/cancellations";
 pub const GATEWAY_CHILD_WORKSPACE_PATH: &str = "internal/gateway/v1/child-workspace";
+pub const GATEWAY_MERGE_PREPARE_PATH: &str = "internal/gateway/v1/workspace-merge/prepare";
+pub const GATEWAY_MERGE_AUTHORIZE_PATH: &str = "internal/gateway/v1/workspace-merge/authorize";
+pub const GATEWAY_MERGE_COMPLETION_PATH: &str = "internal/gateway/v1/workspace-merge/completion";
+pub const GATEWAY_MERGE_CANCELLATIONS_PATH: &str =
+    "internal/gateway/v1/workspace-merge/cancellations";
 pub const GATEWAY_TICKET_HEADER: &str = "x-zuno-gateway-ticket";
+pub const GATEWAY_MERGE_READ_RESOLVE_PATH: &str = "internal/gateway/v1/workspace-merge/read";
+pub const GATEWAY_MERGE_READ_PATH: &str = "internal/execution/v1/workspace-merge/read";
+pub const GATEWAY_READ_TICKET_HEADER: &str = "x-zuno-read-ticket";
 pub const GATEWAY_EXECUTE_PATH: &str = "internal/execution/v1/request";
 
 /// Older checkpoints did not record display provenance. That absence may be

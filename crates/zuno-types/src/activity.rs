@@ -287,6 +287,7 @@ pub enum TerminalChannel {
 pub enum UiAction {
     View { resource_id: String },
     ViewWorkflow { job_id: JobId },
+    ViewWorkspaceMerge { approval_id: ApprovalId },
     Approve { approval_id: ApprovalId },
     Reject { approval_id: ApprovalId },
     Answer { question_id: String },

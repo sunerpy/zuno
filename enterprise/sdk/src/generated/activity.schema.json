@@ -1350,6 +1350,23 @@
             },
             "kind": {
               "type": "string",
+              "const": "view_workspace_merge"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "approvalId"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "approvalId": {
+              "$ref": "#/$defs/ApprovalId"
+            },
+            "kind": {
+              "type": "string",
               "const": "approve"
             }
           },

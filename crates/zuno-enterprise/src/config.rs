@@ -140,6 +140,11 @@ pub struct GatewayConfig {
     pub docker_socket: PathBuf,
     #[serde(default = "poll")]
     pub delivery_millis: u64,
+    #[serde(default = "merge_parallelism")]
+    pub merge_parallelism: u32,
+}
+fn merge_parallelism() -> u32 {
+    2
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -209,6 +214,8 @@ pub struct ControlConfig {
     pub gateways: Vec<GatewaySubject>,
     pub job_keys: KeyFiles,
     pub gateway_keys: KeyFiles,
+    #[serde(default)]
+    pub gateway_root_certificate: Option<PathBuf>,
     pub definitions: Vec<PathBuf>,
     pub active_definitions: Vec<DefinitionKey>,
     pub browser: Option<BrowserConfig>,

@@ -83,6 +83,32 @@ fn relative(path: &Path) -> Result<Vec<String>, ApplicationError> {
         .collect()
 }
 
+/// Docker's extractor deliberately skips metadata for a "." directory entry.
+/// The private restore helper applies only these bounded numeric root facts
+/// after the archive contents have landed in an unpublished volume.
+pub(crate) fn root_metadata(source: &Path) -> Result<Option<(u32, u32, u32)>, ApplicationError> {
+    let mut archive = tar::Archive::new(std::fs::File::open(source).map_err(storage)?);
+    let mut metadata = None;
+    for entry in archive.entries().map_err(storage)? {
+        let entry = entry.map_err(storage)?;
+        if relative(&entry.path().map_err(storage)?)? == ["workspace"] {
+            if !entry.header().entry_type().is_dir() || metadata.is_some() {
+                return Err(ApplicationError::Conflict);
+            }
+            let mode = entry.header().mode().map_err(storage)?;
+            if mode & !0o1777 != 0 {
+                return Err(ApplicationError::Forbidden);
+            }
+            metadata = Some((
+                mode,
+                u32::try_from(entry.header().uid().map_err(storage)?).map_err(storage)?,
+                u32::try_from(entry.header().gid().map_err(storage)?).map_err(storage)?,
+            ));
+        }
+    }
+    Ok(metadata)
+}
+
 /// Docker's archive API checks writability at the destination mount. Strip the
 /// verified top-level workspace directory while streaming, without extracting
 /// any member into the gateway host filesystem.

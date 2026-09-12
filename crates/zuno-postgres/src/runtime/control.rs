@@ -164,6 +164,18 @@ pub(super) async fn cancel_tree_in(
         for operation in pending {
             operations.push(OperationId::new(operation).map_err(ApplicationError::storage)?);
         }
+        query("INSERT INTO zuno_enterprise_preview.gateway_merge_cancellation(tenant_id,principal_id,operation_id)
+            SELECT tenant_id,principal_id,operation_id FROM zuno_enterprise_preview.gateway_merge_operation
+            WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND admitted AND completion IS NULL ON CONFLICT DO NOTHING")
+            .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(id.as_str())
+            .execute(&mut **tx).await.map_err(database_error)?;
+        let pending:Vec<String>=query_scalar("SELECT operation_id FROM zuno_enterprise_preview.gateway_merge_operation
+            WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND admitted AND completion IS NULL ORDER BY operation_id")
+            .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(id.as_str())
+            .fetch_all(&mut **tx).await.map_err(database_error)?;
+        for operation in pending {
+            operations.push(OperationId::new(operation).map_err(ApplicationError::storage)?);
+        }
         if matches!(
             job.phase,
             JobPhase::Completed | JobPhase::Failed | JobPhase::Cancelled
@@ -204,7 +216,7 @@ pub(super) async fn cancel_tree_in(
     Ok((stopped, operations))
 }
 
-pub(super) async fn lock_session(
+pub(crate) async fn lock_session(
     tx: &mut Transaction<'_, Postgres>,
     job: &RuntimeJob,
 ) -> Result<(), ApplicationError> {

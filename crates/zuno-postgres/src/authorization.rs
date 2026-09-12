@@ -1,6 +1,7 @@
 mod administration;
 mod approvals;
 mod decisions;
+pub(crate) use decisions::read_in as visible_approval_in;
 
 use crate::runtime::verify_lease;
 use crate::session::emit;
@@ -39,8 +40,26 @@ impl PostgresOrganizationStore {
         proposal: ApprovalProposal,
         admission: &zuno_application::environment::OperationAdmission,
     ) -> Result<CheckedApproval, ApplicationError> {
-        approvals::check_execution_with_admission(self, &admission.lease, proposal, Some(admission))
-            .await
+        approvals::check_execution_with_admission(
+            self,
+            &admission.lease,
+            proposal,
+            Some(approvals::GatewayAdmission::Command(admission)),
+        )
+        .await
+    }
+    pub async fn check_workspace_merge_execution(
+        &self,
+        proposal: ApprovalProposal,
+        admission: &zuno_application::workspace_merge::WorkspaceMergeAdmission,
+    ) -> Result<CheckedApproval, ApplicationError> {
+        approvals::check_execution_with_admission(
+            self,
+            &admission.lease,
+            proposal,
+            Some(approvals::GatewayAdmission::WorkspaceMerge(admission)),
+        )
+        .await
     }
 
     pub(crate) fn new(pool: PgPool, tenant: TenantId) -> Self {

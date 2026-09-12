@@ -51,6 +51,7 @@ pub struct EnterpriseApplication {
     tenant: TenantId,
     workspaces: Arc<BTreeMap<WorkspaceId, ApplicationWorkspace>>,
     memory: Option<PostgresMemoryBackend>,
+    merge_reader: Option<Arc<crate::merge_review::MergeReviewReader>>,
 }
 
 impl EnterpriseApplication {
@@ -84,11 +85,19 @@ impl EnterpriseApplication {
             tenant,
             workspaces: Arc::new(installed),
             memory: None,
+            merge_reader: None,
         })
     }
 
     pub fn with_memory(mut self, memory: PostgresMemoryBackend) -> Self {
         self.memory = Some(memory);
+        self
+    }
+    pub fn with_merge_reader(
+        mut self,
+        reader: Arc<crate::merge_review::MergeReviewReader>,
+    ) -> Self {
+        self.merge_reader = Some(reader);
         self
     }
 
@@ -125,7 +134,11 @@ impl EnterpriseApplication {
             .route("/jobs/{job}/workflow", get(workflow))
             .route("/jobs/{job}/cancel", post(cancel_job))
             .route("/approvals/{approval}", get(approval))
+            .route("/approvals/{approval}/merge", get(merge_review))
             .route("/approvals/{approval}/answer", post(answer));
+        if self.merge_reader.is_some() {
+            router = router.route("/approvals/{approval}/merge/content", get(merge_content));
+        }
         if self.memory.is_some() {
             router = router.route("/workspaces/{workspace}/memory", post(memory_request));
         }
@@ -167,6 +180,55 @@ impl EnterpriseApplication {
     fn sessions(&self, principal: PrincipalScope) -> AgentApplication {
         AgentApplication::new(Arc::new(self.backend.sessions(principal)))
     }
+}
+
+async fn merge_review(
+    State(service): State<EnterpriseApplication>,
+    Extension(identity): Extension<VerifiedIdentity>,
+    Path(approval): Path<ApprovalId>,
+) -> Result<Json<zuno_application::workspace_merge::WorkspaceMergeView>, Failure> {
+    let principal = service.principal(&identity).await?;
+    let (admission, admitted) = service
+        .backend
+        .workspace_merge_for_approval(&principal, &approval)
+        .await?;
+    Ok(Json(
+        zuno_application::workspace_merge::WorkspaceMergeView {
+            approval_id: approval,
+            operation_id: admission.operation.id,
+            child_job_id: admission.operation.child_job_id,
+            plan: admission.operation.plan,
+            admitted,
+        },
+    ))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MergeContentQuery {
+    side: zuno_application::workspace_merge::MergeContentSide,
+    path: zuno_application::workspace_merge::WorkspacePath,
+}
+async fn merge_content(
+    State(service): State<EnterpriseApplication>,
+    Extension(identity): Extension<VerifiedIdentity>,
+    Path(approval): Path<ApprovalId>,
+    Query(query): Query<MergeContentQuery>,
+) -> Result<Response, Failure> {
+    let principal = service.principal(&identity).await?;
+    let reader = service
+        .merge_reader
+        .as_ref()
+        .ok_or(Failure(StatusCode::NOT_FOUND))?;
+    Ok(reader
+        .content(
+            &principal,
+            zuno_application::workspace_merge::MergeContentRequest {
+                approval_id: approval,
+                side: query.side,
+                path: query.path,
+            },
+        )
+        .await?)
 }
 
 async fn memory_request(

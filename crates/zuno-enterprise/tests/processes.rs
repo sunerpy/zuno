@@ -38,6 +38,8 @@ mod browser;
 mod completion;
 #[path = "processes/council.rs"]
 mod council;
+#[path = "processes/merge.rs"]
+mod merge;
 #[path = "processes/workflow.rs"]
 mod workflow;
 
@@ -167,6 +169,9 @@ async fn model(
     }
     if user.contains("COUNCIL-PROBE") {
         return council::model(&body);
+    }
+    if user.contains("MERGE-PROBE") {
+        return merge::model(&body);
     }
     if user.contains("BROWSER-PROBE") {
         let completed = has_tool("browser-command");
@@ -548,6 +553,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
             root,
             "control",
             ServiceRole::ControlPlane(Box::new(ControlConfig {
+                gateway_root_certificate: Some(fixture.root_certificate.clone()),
                 web_assets_directory: browser_assets,
                 memory: Default::default(),
                 tenant_id: tenant.clone(),
@@ -610,6 +616,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
             root,
             "gateway",
             ServiceRole::Gateway(GatewayConfig {
+                merge_parallelism: 2,
                 id: GatewayId::new("native").unwrap(),
                 tls: fixture.tls(gateway_address),
                 state: state("gateway"),
@@ -954,6 +961,17 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
         council_operations,
         final_operations + 2,
         "seat commands execute once across model-only format correction"
+    );
+    merge::verify(&http, &control_url, &tokens["alice"], &tokens["bob"]).await;
+    assert_eq!(
+        issuer.model_requests.load(Ordering::SeqCst),
+        if browser_enabled { 42 } else { 40 }
+    );
+    let merged:i64=query_scalar("SELECT count(*) FROM zuno_enterprise_preview.gateway_merge_operation WHERE tenant_id=$1 AND completion IS NOT NULL")
+        .bind(tenant.as_str()).fetch_one(&admin).await.unwrap();
+    assert_eq!(
+        merged, 1,
+        "one durable merge receipt per logical invocation"
     );
     for child in &mut children {
         assert!(

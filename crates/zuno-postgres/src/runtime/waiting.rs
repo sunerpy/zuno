@@ -97,13 +97,19 @@ async fn operation_ready(
         return Ok(None);
     };
     let owner = job.principal.owner();
-    let row=query(
-        "SELECT invocation_id,completion FROM zuno_enterprise_preview.gateway_operation
-         WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND session_id=$4 AND operation_id=$5",
+    let rows=query(
+        "SELECT invocation_id,completion,completion_digest,'command' AS producer FROM zuno_enterprise_preview.gateway_operation
+         WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND session_id=$4 AND operation_id=$5
+         UNION ALL SELECT invocation_id,completion,completion_digest,'workspace_merge' AS producer FROM zuno_enterprise_preview.gateway_merge_operation
+         WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND session_id=$4 AND operation_id=$5 AND admitted",
     ).bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(job.id.as_str())
-        .bind(job.session_id.as_str()).bind(operation_id.as_str()).fetch_optional(&mut **tx).await.map_err(database_error)?;
+        .bind(job.session_id.as_str()).bind(operation_id.as_str()).fetch_all(&mut **tx).await.map_err(database_error)?;
     // Other installed operation producers may use the same generic wait port.
-    let Some(row) = row else { return Ok(None) };
+    let row = match rows.as_slice() {
+        [] => return Ok(None),
+        [row] => row,
+        _ => return Err(ApplicationError::Conflict),
+    };
     if row
         .try_get::<String, _>("invocation_id")
         .map_err(database_error)?
@@ -117,6 +123,54 @@ async fn operation_ready(
     else {
         return Ok(None);
     };
+    if row
+        .try_get::<Option<String>, _>("completion_digest")
+        .map_err(database_error)?
+        .as_deref()
+        != Some(zuno_orchestration::sha256_json(&raw).as_str())
+    {
+        return Err(ApplicationError::Conflict);
+    }
+    if row
+        .try_get::<String, _>("producer")
+        .map_err(database_error)?
+        == "workspace_merge"
+    {
+        let completion: zuno_application::workspace_merge::WorkspaceMergeCompletion =
+            serde_json::from_value(raw).map_err(ApplicationError::storage)?;
+        completion.validate()?;
+        if completion.lease.owner != owner
+            || completion.lease.job_id != job.id
+            || completion.operation.id != *operation_id
+            || completion.operation.invocation_id != reference.invocation_id
+        {
+            return Err(ApplicationError::Conflict);
+        }
+        let output = zuno_tool::ToolOutput::text(
+            "Workspace merge",
+            serde_json::to_string(&completion.receipt).map_err(ApplicationError::storage)?,
+        );
+        let result = if completion.receipt.state
+            == zuno_application::workspace_merge::WorkspaceMergeState::Committed
+        {
+            zuno_engine::r#loop::ToolDispatchResult::success(output)
+        } else {
+            zuno_engine::r#loop::ToolDispatchResult::error(output)
+        };
+        return Ok(Some(WaitCompletion::tool_result(
+            zuno_types::identity::CompletionId::new(format!(
+                "cmp_{}",
+                zuno_orchestration::sha256_json(&json!([
+                    "workspace-merge-result",
+                    operation_id,
+                    reference.id
+                ]))
+            ))
+            .expect("derived identity"),
+            reference.clone(),
+            result,
+        )));
+    }
     let completion: zuno_application::environment::OperationCompletion =
         serde_json::from_value(raw).map_err(ApplicationError::storage)?;
     completion.validate()?;

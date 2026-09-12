@@ -74,6 +74,10 @@ impl DockerGateway {
         if let Some(nonce) = self.ledger.fork_nonce(owner, &spec.id)? {
             labels["zuno.fork"] = json!(nonce);
         }
+        if let Some(record) = self.ledger.active_volume(owner, &spec.id)? {
+            labels["zuno.merge"] = json!(record.request.id);
+            labels["zuno.merge.nonce"] = json!(record.nonce);
+        }
         Ok(labels)
     }
 
@@ -208,6 +212,8 @@ impl DockerGateway {
         );
         self.remove_transfer_helper(&environment, &name).await?;
         let volume = Self::volume(owner, &spec.id);
+        self.cleanup_root_metadata(&volume, &self.storage_labels(owner, &spec)?, &path)
+            .await?;
         match self
             .docker
             .json(Method::GET, &format!("/volumes/{volume}"), None)
@@ -256,6 +262,13 @@ impl DockerGateway {
         let cleanup = self.remove_transfer_helper(&environment, &name).await;
         result?;
         cleanup?;
+        self.restore_root_metadata(
+            &environment,
+            &volume,
+            &self.storage_labels(owner, &spec)?,
+            &path,
+        )
+        .await?;
         self.ledger.finish_fork(owner, &spec)
     }
 }

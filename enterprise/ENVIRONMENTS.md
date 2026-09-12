@@ -41,8 +41,9 @@ existing `RuntimeStore` and `OrganizationStore` to check a stable approval bindi
 resolved environment revision, command hash and current lease. There is no
 production allow-all default. This adapter is for a trusted composition root;
 separated gateway deployment still requires authenticated remote authority ports.
-Cancelling currently requires that authority as well; operator cancellation after
-lease revocation remains part of the unfinished distributed control integration.
+Current execution still requires that authority. A separate authenticated data-owner
+cancellation path can stop an already admitted operation after lease revocation;
+it cannot authorize another start.
 
 Output pages use logical byte offsets and a prefix digest, including stdout/stderr
 identity. Reads stream through Docker frames with bounded page memory. A missing or
@@ -65,9 +66,23 @@ removes only the environment's retained command containers and volume, then comm
 a tombstone. Repeating release is safe; acquire cannot silently recreate a released
 environment or a workspace whose volume disappeared.
 
+Restore images must provide `/bin/sh`, `chmod` and `chown`. Docker skips the
+metadata of a `.` archive member, so a bounded helper restores only the validated
+numeric root mode/UID/GID in the unpublished volume. It has a read-only root,
+no network or credentials, resource limits, and only the namespace capabilities
+needed for ownership/mode restoration. Helpers carry exact request/nonce labels;
+restart removes only a matching helper before rebuilding an unpublished target.
+All volume mounts disable implicit image population with `NoCopy`.
+
+Ledger format 4 adds merge reservations, active-volume pointers and acknowledged
+receipts. The background executor persists positive retry deadlines, bounds
+concurrency and drains on shutdown. Release cannot discard unacknowledged merge
+evidence. Prior volume generations and immutable snapshots remain retained for
+the pending retention/GC work; see [approved merges](WORKSPACES.md#approved-workspace-merge).
+
 Snapshot artifact storage is currently the gateway's private filesystem. A
-replaceable remote artifact backend, durable recovery of partially provisioned
-forks and snapshot retention/garbage collection remain required for complete
+replaceable remote artifact backend and snapshot/generation retention and garbage
+collection remain required for complete
 enterprise deployment.
 
 ## Native validation

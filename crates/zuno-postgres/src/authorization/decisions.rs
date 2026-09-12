@@ -14,11 +14,21 @@ pub(super) async fn read(
 ) -> Result<ApprovalRecord, ApplicationError> {
     store.check_tenant(viewer.tenant_id())?;
     let mut tx = owner_transaction(&store.pool, &viewer.owner()).await?;
-    let access = access_in(&mut tx, &viewer.owner()).await?;
+    let record = read_in(&mut tx, viewer, id).await?;
+    tx.commit().await.map_err(database_error)?;
+    Ok(record)
+}
+
+pub(crate) async fn read_in(
+    tx: &mut Transaction<'_, Postgres>,
+    viewer: &PrincipalScope,
+    id: &ApprovalId,
+) -> Result<ApprovalRecord, ApplicationError> {
+    let access = access_in(tx, &viewer.owner()).await?;
     if !viewer_active(&access, viewer) {
         return Err(ApplicationError::Forbidden);
     }
-    let (owner, _) = coordinates(&mut tx, viewer.tenant_id(), id).await?;
+    let (owner, _) = coordinates(tx, viewer.tenant_id(), id).await?;
     if owner != viewer.owner()
         && !matches!(
             access.member.role,
@@ -27,12 +37,11 @@ pub(super) async fn read(
     {
         return Err(ApplicationError::NotFound);
     }
-    set_owner(&mut tx, &owner).await?;
-    let record = record_in(&mut tx, &owner, id.as_str(), false).await?;
+    set_owner(tx, &owner).await?;
+    let record = record_in(tx, &owner, id.as_str(), false).await?;
     if !visible(&access, viewer, &record) {
         return Err(ApplicationError::NotFound);
     }
-    tx.commit().await.map_err(database_error)?;
     Ok(record)
 }
 

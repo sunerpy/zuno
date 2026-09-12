@@ -88,8 +88,8 @@ The typed view is the contract for a future App client. App design and UI delive
 PostgreSQL preview format 15 adds workflow/node coordination and frozen dependency
 inputs. The exact format-14 fixture preserves sessions, messages, Memory, committed
 frames and live rows through migration and rollback. Earlier supported formats
-advance in the same guarded transaction. Worker protocol 10 carries workflow
-commands; checkpoint schema 4 is unchanged and gateway protocol 3 validates Workflow workspace preparation. Use matching
+advance in the same guarded transaction. Worker protocol 11 carries workflow
+commands; checkpoint schema 4 is unchanged and gateway protocol 4 validates Workflow workspace preparation. Use matching
 control-plane/Worker versions and regenerate the public SDK when updating these contracts.
 
 ## Durable Council
@@ -140,7 +140,7 @@ Cancellation fences the tree, and a new Worker rechecks current authority.
 PostgreSQL format 16 adds scoped Council state, seat outcomes, attempt provenance
 and optional Job deadlines. Exact format-15 migration preserves existing Jobs,
 Workflow/node rows, messages, Memory and activity frames, with rollback before
-the marker. Worker protocol 10 adds internal Council admission; gateway protocol
+the marker. Worker protocol 11 adds internal Council admission; gateway protocol
 3 and checkpoint schema 4 remain unchanged. `WorkflowRunView.kind` distinguishes
 `workflow` and `council`; its optional `council` view carries typed phases, seat
 states, attempt counts and exact decimal deadlines. Private configuration,

@@ -24,6 +24,9 @@
     "job": {
       "$ref": "#/$defs/JobView"
     },
+    "merge_content": {
+      "$ref": "#/$defs/MergeContentRequest"
+    },
     "session": {
       "$ref": "#/$defs/SessionSummary"
     },
@@ -38,6 +41,9 @@
     },
     "workspace": {
       "$ref": "#/$defs/WorkspaceView"
+    },
+    "workspace_merge": {
+      "$ref": "#/$defs/WorkspaceMergeView"
     }
   },
   "required": [
@@ -52,7 +58,9 @@
     "answer",
     "cancel",
     "cancellation",
-    "workflow"
+    "workflow",
+    "workspace_merge",
+    "merge_content"
   ],
   "$defs": {
     "ApprovalAnswer": {
@@ -499,6 +507,42 @@
         "target"
       ]
     },
+    "MergeChoice": {
+      "type": "string",
+      "enum": [
+        "parent",
+        "child",
+        "conflict"
+      ]
+    },
+    "MergeContentRequest": {
+      "type": "object",
+      "properties": {
+        "approvalId": {
+          "$ref": "#/$defs/ApprovalId"
+        },
+        "path": {
+          "$ref": "#/$defs/WorkspacePath"
+        },
+        "side": {
+          "$ref": "#/$defs/MergeContentSide"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "approvalId",
+        "side",
+        "path"
+      ]
+    },
+    "MergeContentSide": {
+      "type": "string",
+      "enum": [
+        "base",
+        "parent",
+        "child"
+      ]
+    },
     "NodeRunId": {
       "type": "string",
       "maxLength": 128,
@@ -857,11 +901,238 @@
         "uncertain"
       ]
     },
+    "WorkspaceChange": {
+      "type": "object",
+      "properties": {
+        "base": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkspaceEntry"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "child": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkspaceEntry"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "choice": {
+          "$ref": "#/$defs/MergeChoice"
+        },
+        "parent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkspaceEntry"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "path": {
+          "$ref": "#/$defs/WorkspacePath"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "choice"
+      ]
+    },
+    "WorkspaceEntry": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "gid": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "directory"
+            },
+            "mode": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "uid": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "mode",
+            "uid",
+            "gid"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "bytes": {
+              "$ref": "#/$defs/Counter"
+            },
+            "gid": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "file"
+            },
+            "mode": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "sha256": {
+              "type": "string"
+            },
+            "uid": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "mode",
+            "uid",
+            "gid",
+            "sha256",
+            "bytes"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "gid": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "symlink"
+            },
+            "target": {
+              "type": "string"
+            },
+            "uid": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "uid",
+            "gid",
+            "target"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "hardlink"
+            },
+            "target": {
+              "$ref": "#/$defs/WorkspacePath"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "target"
+          ]
+        }
+      ]
+    },
     "WorkspaceId": {
       "type": "string",
       "maxLength": 128,
       "minLength": 1,
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "WorkspaceMergePlan": {
+      "type": "object",
+      "properties": {
+        "baseTree": {
+          "type": "string"
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkspaceChange"
+          }
+        },
+        "childTree": {
+          "type": "string"
+        },
+        "parentTree": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "baseTree",
+        "parentTree",
+        "childTree",
+        "changes"
+      ]
+    },
+    "WorkspaceMergeView": {
+      "type": "object",
+      "properties": {
+        "admitted": {
+          "type": "boolean"
+        },
+        "approvalId": {
+          "$ref": "#/$defs/ApprovalId"
+        },
+        "childJobId": {
+          "$ref": "#/$defs/JobId"
+        },
+        "operationId": {
+          "$ref": "#/$defs/OperationId"
+        },
+        "plan": {
+          "$ref": "#/$defs/WorkspaceMergePlan"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "approvalId",
+        "operationId",
+        "childJobId",
+        "plan",
+        "admitted"
+      ]
+    },
+    "WorkspacePath": {
+      "type": "string",
+      "maxLength": 4096,
+      "minLength": 1,
+      "pattern": "^\\.$|^(?!\\.{1,2}(?:/|$))(?![\\s\\S]*/\\.{1,2}(?:/|$))[^/\\u0000]+(?:/[^/\\u0000]+)*$"
     },
     "WorkspaceView": {
       "type": "object",

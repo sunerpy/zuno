@@ -79,3 +79,11 @@ disabled; personal HTTP/TUI/ACP platform behavior is unchanged.
 
 See [中文](APPLICATION.zh.md), [authorization](AUTHORIZATION.md),
 [browser login](BROWSER.md), [Memory](MEMORY.md) and [status](STATUS.md).
+
+Approval review includes `GET /approvals/{approval}/merge` for a typed
+`WorkspaceMergeView` and `GET /approvals/{approval}/merge/content` with `side`
+(`base`, `parent`, `child`) and a logical `path`. Visibility follows the current
+approval viewer policy. Only changed entries are readable. The content route is
+installed with the configured gateway reader; it streams immutable bytes with
+size/SHA validation and never returns a Worker credential. See
+[workspace merge](WORKSPACES.md#approved-workspace-merge).

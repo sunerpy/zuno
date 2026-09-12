@@ -62,3 +62,9 @@ ACP bridge 不应为了跳过 HITL 而加入审批应用白名单。审批决定
 
 参见 [English](APPLICATION.md)、[授权](AUTHORIZATION.zh.md)、
 [浏览器登录](BROWSER.zh.md)和[进度](STATUS.md)。
+
+审批查看增加 `GET /approvals/{approval}/merge`，返回类型化 `WorkspaceMergeView`；
+`GET /approvals/{approval}/merge/content` 接受 `side`（`base`、`parent`、`child`）
+和逻辑 `path`。权限遵循当前审批查看策略，只允许读取变化条目。内容路由在装配网关 reader
+后注册，流式校验不可变内容的长度和 SHA，不返回 Worker 凭证。详见
+[工作区合并](WORKSPACES.zh.md#子工作区审批合并)。

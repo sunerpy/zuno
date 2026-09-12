@@ -22,6 +22,10 @@ export type UiAction =
     }
   | {
       approvalId: ApprovalId;
+      kind: "view_workspace_merge";
+    }
+  | {
+      approvalId: ApprovalId;
       kind: "approve";
     }
   | {

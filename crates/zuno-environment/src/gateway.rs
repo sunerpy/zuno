@@ -1,3 +1,5 @@
+mod merge;
+mod metadata;
 mod workspace;
 
 use crate::docker::Docker;
@@ -232,6 +234,16 @@ impl DockerGateway {
             zuno_orchestration::sha256_json(&json!([owner, id]))
         )
     }
+    fn storage_volume(
+        &self,
+        owner: &PrincipalKey,
+        id: &EnvironmentId,
+    ) -> Result<String, ApplicationError> {
+        Ok(self
+            .ledger
+            .active_volume(owner, id)?
+            .map_or_else(|| Self::volume(owner, id), |record| record.volume))
+    }
     fn container(owner: &PrincipalKey, id: &OperationId) -> String {
         format!(
             "zuno-op-{}",
@@ -272,7 +284,7 @@ impl DockerGateway {
             "Image":environment.spec.image,"Cmd":["true"],"Labels":self.storage_labels(&environment.owner,&environment.spec)?,
             "HostConfig":{"ReadonlyRootfs":true,"NetworkMode":"none","CapDrop":["ALL"],"SecurityOpt":["no-new-privileges"],
                 "Memory":environment.spec.memory_bytes,"PidsLimit":environment.spec.pids_limit,
-                "Mounts":[{"Type":"volume","Source":Self::volume(&environment.owner,&environment.spec.id),"Target":"/workspace","ReadOnly":readonly}]}
+                "Mounts":[{"Type":"volume","Source":self.storage_volume(&environment.owner,&environment.spec.id)?,"Target":"/workspace","VolumeOptions":{"NoCopy":true},"ReadOnly":readonly}]}
         });
         self.docker
             .json(
@@ -284,7 +296,7 @@ impl DockerGateway {
         Ok(())
     }
     async fn volume_exists(&self, environment: &Environment) -> Result<(), ApplicationError> {
-        let volume = Self::volume(&environment.owner, &environment.spec.id);
+        let volume = self.storage_volume(&environment.owner, &environment.spec.id)?;
         let info = self
             .docker
             .json(Method::GET, &format!("/volumes/{volume}"), None)
@@ -332,7 +344,7 @@ impl DockerGateway {
                 "SecurityOpt":["no-new-privileges"],
                 "Memory":spec.memory_bytes,"NanoCpus":u64::from(spec.cpu_millis)*1_000_000,
                 "PidsLimit":spec.pids_limit,
-                "Mounts":[{"Type":"volume","Source":Self::volume(&environment.owner,&spec.id),"Target":"/workspace"}],
+                "Mounts":[{"Type":"volume","Source":self.storage_volume(&environment.owner,&spec.id)?,"Target":"/workspace","VolumeOptions":{"NoCopy":true}}],
                 "Tmpfs":{"/tmp":"rw,noexec,nosuid,size=16777216"},
                 "LogConfig":{"Type":"json-file","Config":{}},
             },
@@ -523,7 +535,7 @@ impl EnvironmentProvider for DockerGateway {
                 .json(Method::DELETE, &format!("/containers/{container}"), None)
                 .await?;
         }
-        let volume = Self::volume(owner, id);
+        let volume = self.storage_volume(owner, id)?;
         match self
             .docker
             .json(Method::GET, &format!("/volumes/{volume}"), None)
@@ -550,11 +562,7 @@ impl EnvironmentProvider for DockerGateway {
         }
         match self
             .docker
-            .json(
-                Method::DELETE,
-                &format!("/volumes/{}", Self::volume(owner, id)),
-                None,
-            )
+            .json(Method::DELETE, &format!("/volumes/{volume}"), None)
             .await
         {
             Ok(_) | Err(ApplicationError::NotFound) => {}

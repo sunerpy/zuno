@@ -216,11 +216,17 @@ impl PostgresBackend {
         .await
         .map_err(database_error)?;
         let pending: Vec<String> = query_scalar(
-            "SELECT o.operation_id FROM zuno_enterprise_preview.gateway_operation o
+            "SELECT operation_id FROM (
+             SELECT o.operation_id FROM zuno_enterprise_preview.gateway_operation o
              JOIN zuno_enterprise_preview.runtime_stop s
                ON s.tenant_id=o.tenant_id AND s.principal_id=o.principal_id AND s.job_id=o.job_id
              WHERE o.tenant_id=$1 AND o.principal_id=$2 AND (s.root_job_id=$3 OR s.job_id=$3)
-               AND o.completion IS NULL ORDER BY o.operation_id",
+               AND o.completion IS NULL
+             UNION ALL SELECT o.operation_id FROM zuno_enterprise_preview.gateway_merge_operation o
+             JOIN zuno_enterprise_preview.runtime_stop s
+               ON s.tenant_id=o.tenant_id AND s.principal_id=o.principal_id AND s.job_id=o.job_id
+             WHERE o.tenant_id=$1 AND o.principal_id=$2 AND (s.root_job_id=$3 OR s.job_id=$3)
+               AND o.admitted AND o.completion IS NULL) pending ORDER BY operation_id",
         )
         .bind(principal.tenant_id().as_str())
         .bind(principal.principal_id().as_str())

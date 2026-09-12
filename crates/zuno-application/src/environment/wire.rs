@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{ApplicationError, authorization::ApprovalRecord, runtime::ExecutionLease};
 
-pub const GATEWAY_PROTOCOL_VERSION: u32 = 3;
+pub const GATEWAY_PROTOCOL_VERSION: u32 = 4;
 pub const MAX_GATEWAY_FRAME_BYTES: usize = 1024 * 1024;
 
 /// A data-owner response, never a caller-selected deployment.
@@ -32,6 +32,8 @@ pub struct GatewayExecutionContext {
     pub child_workspace: Option<ChildWorkspaceAssignment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prepared_workspace: Option<ChildWorkspaceReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_source: Option<crate::workspace_merge::WorkspaceMergeSource>,
 }
 
 /// Only an authenticated, assigned gateway may present these observed facts.
@@ -53,6 +55,20 @@ pub enum GatewayCommand {
     PrepareChildWorkspace {
         child_job_id: JobId,
     },
+    PreviewWorkspaceMerge {
+        id: OperationId,
+        invocation_id: zuno_types::identity::InvocationId,
+        child_job_id: JobId,
+    },
+    PrepareWorkspaceMerge {
+        operation: Box<crate::workspace_merge::WorkspaceMergeOperation>,
+    },
+    SubmitWorkspaceMerge {
+        operation: Box<crate::workspace_merge::WorkspaceMergeOperation>,
+    },
+    InspectWorkspaceMerge {
+        operation_id: OperationId,
+    },
     PrepareCommand {
         operation: CommandOperation,
     },
@@ -72,6 +88,8 @@ pub enum GatewayCommand {
 impl GatewayCommand {
     pub fn validate(&self) -> Result<(), ApplicationError> {
         match self {
+            Self::PrepareWorkspaceMerge { operation }
+            | Self::SubmitWorkspaceMerge { operation } => operation.validate(),
             Self::PrepareCommand { operation } | Self::SubmitCommand { operation } => {
                 operation.validate()
             }
@@ -162,6 +180,8 @@ pub enum GatewayReply {
     Operation(OperationReceipt),
     Output(OutputPage),
     ChildWorkspace(ChildWorkspaceReceipt),
+    WorkspaceMergePreview(Box<crate::workspace_merge::WorkspaceMergeOperation>),
+    WorkspaceMergeReceipt(crate::workspace_merge::WorkspaceMergeReceipt),
 }
 
 #[cfg(test)]

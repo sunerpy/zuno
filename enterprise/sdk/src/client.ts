@@ -93,8 +93,11 @@ export class ActivityClient {
     url.searchParams.set("limit", limit.toString());
     return url;
   }
-  protected async get(url: URL, signal?: AbortSignal, method = "GET", body?: unknown): Promise<unknown> {
-    const headers = new Headers({ accept: "application/json" });
+  protected async response(url: URL, signal?: AbortSignal, method = "GET", body?: unknown, accept = "application/json", timeout = 15000): Promise<Response> {
+    if (url.origin !== this.base.origin || !url.pathname.startsWith(this.base.pathname) || url.username || url.password || url.hash) {
+      throw new Error("Enterprise request escaped its configured API");
+    }
+    const headers = new Headers({ accept });
     const context = this.options.browserContext?.();
     if (context !== undefined) headers.set("x-zuno-browser-context", context);
     if (this.options.accessToken) headers.set("authorization", `Bearer ${await this.options.accessToken()}`);
@@ -103,12 +106,16 @@ export class ActivityClient {
     const response = await this.request(url, {
       method, body: body === undefined ? undefined : JSON.stringify(body),
       headers, credentials: this.options.accessToken ? "omit" : "same-origin",
-      cache: "no-store", redirect: "error", signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
+      cache: "no-store", redirect: "error", signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeout)]) : AbortSignal.timeout(timeout),
     });
     if (!response.ok) {
       await response.body?.cancel();
       throw new EnterpriseHttpError(response.status);
     }
+    return response;
+  }
+  protected async get(url: URL, signal?: AbortSignal, method = "GET", body?: unknown): Promise<unknown> {
+    const response = await this.response(url, signal, method, body);
     if (response.status === 204) return null;
     if (!response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
       await response.body?.cancel();

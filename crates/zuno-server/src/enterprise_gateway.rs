@@ -1,4 +1,5 @@
 //! Data-owner endpoints for gateway delegation and current operation approval.
+mod merge;
 
 use axum::{
     Json, Router,
@@ -82,6 +83,26 @@ impl GatewayControlService {
                 &format!("/{GATEWAY_CHILD_WORKSPACE_PATH}"),
                 post(child_workspace_completed),
             )
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_MERGE_PREPARE_PATH),
+                post(merge::prepare),
+            )
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_MERGE_AUTHORIZE_PATH),
+                post(merge::authorize),
+            )
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_MERGE_COMPLETION_PATH),
+                post(merge::complete),
+            )
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_MERGE_CANCELLATIONS_PATH),
+                post(merge::cancellations),
+            )
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_MERGE_READ_RESOLVE_PATH),
+                post(merge::read_context),
+            )
             .layer(DefaultBodyLimit::max(MAX_GATEWAY_FRAME_BYTES))
             .with_state(self)
     }
@@ -138,6 +159,7 @@ impl GatewayControlService {
             existing_workspace: workspace.is_some(),
             child_workspace: None,
             prepared_workspace: None,
+            merge_source: None,
         })
     }
 
@@ -307,6 +329,12 @@ fn now() -> Result<i64, Failure> {
         .ok_or(Failure(StatusCode::SERVICE_UNAVAILABLE))
 }
 fn target(request: &GatewayRequest, context: &GatewayExecutionContext) -> Result<(), Failure> {
+    if let GatewayCommand::PrepareWorkspaceMerge { operation }
+    | GatewayCommand::SubmitWorkspaceMerge { operation } = &request.command
+        && operation.environment_id != context.assignment.environment.id
+    {
+        return Err(Failure(StatusCode::FORBIDDEN));
+    }
     if let GatewayCommand::PrepareCommand { operation }
     | GatewayCommand::SubmitCommand { operation } = &request.command
         && operation.environment_id != context.assignment.environment.id
@@ -335,6 +363,7 @@ async fn issue_ticket(
     let request = GatewayRequest::decode(&bytes).map_err(application)?;
     let mut context = service.context(grant.lease()).await?;
     service.child_context(&request, &mut context).await?;
+    service.merge_context(&request, &mut context).await?;
     target(&request, &context)?;
     let ticket = service
         .tickets
@@ -369,6 +398,7 @@ async fn resolve(
         return Err(Failure(StatusCode::FORBIDDEN));
     }
     service.child_context(&request, &mut context).await?;
+    service.merge_context(&request, &mut context).await?;
     target(&request, &context)?;
     Ok(Json(context))
 }

@@ -7,7 +7,7 @@ use zuno_application::ApplicationError;
 use crate::database_error;
 
 pub const PREVIEW_SCHEMA: &str = "zuno_enterprise_preview";
-pub(crate) const FORMAT: i32 = 16;
+pub(crate) const FORMAT: i32 = 17;
 const TABLES: &[&str] = &["workspace", "session", "request_receipt", "input", "event"];
 const RUNTIME_TABLES: &[&str] = &[
     "agent_job",
@@ -42,6 +42,12 @@ const COUNCIL_TABLES: &[&str] = &[
     "runtime_council",
     "runtime_council_seat",
     "runtime_council_attempt",
+];
+const MERGE_DDL: &str = include_str!("schema_merge.sql");
+const MERGE_TABLES: &[&str] = &[
+    "gateway_merge_operation",
+    "gateway_merge_attempt",
+    "gateway_merge_cancellation",
 ];
 const LIVE_TABLES: &[&str] = &["live_progress"];
 const ACTIVITY_TABLES: &[&str] = &["activity_session", "activity_item", "activity_frame"];
@@ -135,9 +141,13 @@ fn source_digest(version: i32) -> String {
         zuno_orchestration::sha256_text(&format!(
             "15\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{WAIT_DDL}\n{CONTEXT_DDL}\n{BROWSER_DDL}\n{OPERATION_DDL}\n{MEMORY_DDL}\n{CHILD_DDL}\n{CHILD_WORKSPACE_DDL}\n{CONTROL_DDL}\n{ACTIVITY_DDL}\n{LIVE_DDL}\n{WORKFLOW_DDL}\n{POLICY}\n{TENANT_POLICY}"
         ))
+    } else if version == 16 {
+        zuno_orchestration::sha256_text(&format!(
+            "16\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{WAIT_DDL}\n{CONTEXT_DDL}\n{BROWSER_DDL}\n{OPERATION_DDL}\n{MEMORY_DDL}\n{CHILD_DDL}\n{CHILD_WORKSPACE_DDL}\n{CONTROL_DDL}\n{ACTIVITY_DDL}\n{LIVE_DDL}\n{WORKFLOW_DDL}\n{COUNCIL_DDL}\n{POLICY}\n{TENANT_POLICY}"
+        ))
     } else {
         zuno_orchestration::sha256_text(&format!(
-            "{FORMAT}\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{WAIT_DDL}\n{CONTEXT_DDL}\n{BROWSER_DDL}\n{OPERATION_DDL}\n{MEMORY_DDL}\n{CHILD_DDL}\n{CHILD_WORKSPACE_DDL}\n{CONTROL_DDL}\n{ACTIVITY_DDL}\n{LIVE_DDL}\n{WORKFLOW_DDL}\n{COUNCIL_DDL}\n{POLICY}\n{TENANT_POLICY}"
+            "{FORMAT}\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{WAIT_DDL}\n{CONTEXT_DDL}\n{BROWSER_DDL}\n{OPERATION_DDL}\n{MEMORY_DDL}\n{CHILD_DDL}\n{CHILD_WORKSPACE_DDL}\n{CONTROL_DDL}\n{ACTIVITY_DDL}\n{LIVE_DDL}\n{WORKFLOW_DDL}\n{COUNCIL_DDL}\n{MERGE_DDL}\n{POLICY}\n{TENANT_POLICY}"
         ))
     }
 }
@@ -252,7 +262,10 @@ pub async fn migrate(admin: &PgPool, runtime_role: &str) -> Result<(), Applicati
                 if version < 15 {
                     install_workflow(&mut tx).await?;
                 }
-                install_council(&mut tx).await?;
+                if version < 16 {
+                    install_council(&mut tx).await?;
+                }
+                install_merge(&mut tx).await?;
                 if version < 13 {
                     crate::activity::backfill(&mut tx).await?;
                 }
@@ -310,6 +323,7 @@ pub async fn migrate(admin: &PgPool, runtime_role: &str) -> Result<(), Applicati
     install_live(&mut tx).await?;
     install_workflow(&mut tx).await?;
     install_council(&mut tx).await?;
+    install_merge(&mut tx).await?;
     crate::activity::backfill(&mut tx).await?;
     sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
         "REVOKE ALL ON SCHEMA {PREVIEW_SCHEMA} FROM PUBLIC;
@@ -528,6 +542,7 @@ async fn grant_runtime(connection: &mut PgConnection, role: &str) -> Result<(), 
         .chain(LIVE_TABLES)
         .chain(WORKFLOW_TABLES)
         .chain(COUNCIL_TABLES)
+        .chain(MERGE_TABLES)
         .chain(["gateway_operation", "gateway_operation_attempt"].iter())
         .chain(["organization_policy", "organization_audit"].iter())
     {
@@ -542,6 +557,7 @@ async fn grant_runtime(connection: &mut PgConnection, role: &str) -> Result<(), 
         "GRANT EXECUTE ON FUNCTION {PREVIEW_SCHEMA}.clear_live_progress() TO \"{role}\";
          GRANT EXECUTE ON FUNCTION {PREVIEW_SCHEMA}.create_activity_session() TO \"{role}\";
          GRANT EXECUTE ON FUNCTION {PREVIEW_SCHEMA}.gateway_cancellations(text,text,integer) TO \"{role}\";
+         GRANT EXECUTE ON FUNCTION {PREVIEW_SCHEMA}.gateway_merge_cancellations(text,text,integer) TO \"{role}\";
          GRANT EXECUTE ON FUNCTION {PREVIEW_SCHEMA}.dispatch_owners(text) TO \"{role}\";
          GRANT EXECUTE ON FUNCTION {PREVIEW_SCHEMA}.create_runtime_session() TO \"{role}\";
          GRANT EXECUTE ON FUNCTION {PREVIEW_SCHEMA}.advance_input_version() TO \"{role}\";
@@ -570,6 +586,22 @@ async fn install_turn(connection: &mut PgConnection) -> Result<(), ApplicationEr
         .execute(&mut *connection)
         .await
         .map_err(database_error)?;
+    }
+    Ok(())
+}
+
+async fn install_merge(connection: &mut PgConnection) -> Result<(), ApplicationError> {
+    sqlx_core::raw_sql::raw_sql(MERGE_DDL)
+        .execute(&mut *connection)
+        .await
+        .map_err(database_error)?;
+    for table in MERGE_TABLES {
+        sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
+            "ALTER TABLE {PREVIEW_SCHEMA}.{table} ENABLE ROW LEVEL SECURITY;
+             ALTER TABLE {PREVIEW_SCHEMA}.{table} FORCE ROW LEVEL SECURITY;
+             CREATE POLICY owner_scope ON {PREVIEW_SCHEMA}.{table} USING ({POLICY}) WITH CHECK ({POLICY});
+             REVOKE ALL ON {PREVIEW_SCHEMA}.{table} FROM PUBLIC;"
+        ))).execute(&mut *connection).await.map_err(database_error)?;
     }
     Ok(())
 }
@@ -1433,6 +1465,37 @@ pub(crate) async fn install_format_fifteen_fixture(
     let manifest = schema_manifest(&mut tx).await?;
     sqlx_core::query::query("UPDATE zuno_enterprise_preview.schema_format SET version=15,source_digest=$1,manifest=$2 WHERE singleton=1")
         .bind("412f668e781e311d6ddf76fd51a1314ace1b6423f1b33c67ceaac053ce40661c").bind(manifest)
+        .execute(&mut *tx).await.map_err(database_error)?;
+    tx.commit().await.map_err(database_error)
+}
+
+#[cfg(test)]
+pub(crate) async fn install_format_sixteen_fixture(
+    pool: &PgPool,
+    role: &str,
+) -> Result<(), ApplicationError> {
+    install_format_fifteen_fixture(pool, role).await?;
+    let mut tx = pool.begin().await.map_err(database_error)?;
+    sqlx_core::raw_sql::raw_sql(include_str!("fixtures/format16-council.sql"))
+        .execute(&mut *tx)
+        .await
+        .map_err(database_error)?;
+    for table in [
+        "runtime_council",
+        "runtime_council_seat",
+        "runtime_council_attempt",
+    ] {
+        sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
+            "ALTER TABLE {PREVIEW_SCHEMA}.{table} ENABLE ROW LEVEL SECURITY;
+             ALTER TABLE {PREVIEW_SCHEMA}.{table} FORCE ROW LEVEL SECURITY;
+             CREATE POLICY owner_scope ON {PREVIEW_SCHEMA}.{table} USING ({POLICY}) WITH CHECK ({POLICY});
+             REVOKE ALL ON {PREVIEW_SCHEMA}.{table} FROM PUBLIC;
+             GRANT SELECT,INSERT,UPDATE,DELETE ON {PREVIEW_SCHEMA}.{table} TO \"{role}\";"
+        ))).execute(&mut *tx).await.map_err(database_error)?;
+    }
+    let manifest = schema_manifest(&mut tx).await?;
+    sqlx_core::query::query("UPDATE zuno_enterprise_preview.schema_format SET version=16,source_digest=$1,manifest=$2 WHERE singleton=1")
+        .bind("b539bf863f4192d81cc8189ec65f2900b4fd589e7e8e00e34d1ff2e77d1464f1").bind(manifest)
         .execute(&mut *tx).await.map_err(database_error)?;
     tx.commit().await.map_err(database_error)
 }

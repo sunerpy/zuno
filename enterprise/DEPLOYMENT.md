@@ -126,7 +126,7 @@ SIGTERM stops admission and drains bounded work. TLS connections and receipt
 delivery have bounded shutdown. Gateway shutdown does not declare its external
 commands complete; their ledger and containers remain independently recoverable.
 
-Worker protocol 10 carries checkpoint schema 4. The driver reads schema 3 only
+Worker protocol 11 carries checkpoint schema 4. The driver reads schema 3 only
 where it proves an unsubmitted wait; it never reinterprets an old record as
 submitted execution. Drain incompatible Workers before changing the control
 protocol and retain their definitions and durable data. Full rolling-upgrade and
@@ -136,13 +136,12 @@ backup/restore acceptance remain P6 work.
 plane, a gateway and two independent Worker processes. A real TLS RSA issuer,
 native compatible model transport, PostgreSQL and rootless Docker verify two
 users, private Memory reads and updates, fresh prompts after changes, Memory-use
-revocation during approval waits, parent/child workspace forks, fourteen model
-requests, four command approvals, both Workers participating, one operation per
+revocation during approval waits, parent/child workspace forks, Workflow/Council/merge execution, explicit approvals, both Workers participating, one operation per
 command and SIGTERM cleanup. This is fixture provider evidence,
 not a live Entra tenant.
 
 Remaining work includes richer workspace provisioning, background/shared Memory,
-approved child merges, distributed Workflow/Council, remaining Web/ACP features
+remaining Web/ACP features
 and the full failure matrix. No preview release is enabled by building this binary.
 
 See [中文](DEPLOYMENT.zh.md), [platforms](PLATFORMS.md) and [status](STATUS.md).
@@ -160,3 +159,5 @@ as explicitly configured model-only children. This is a backend primitive for
 internal completions; it does not enable distributed Council coordination.
 
 Optional `councils` installs native `council_run` with durable seats and completion-only repair/synthesis profiles. Model bindings, quorum, capacity and deadlines belong to the immutable definition. See [Council configuration](WORKFLOW.md#durable-council).
+
+Gateway `mergeParallelism` defaults to 2 and accepts 1–16 background merge tasks. The gateway drains these tasks on shutdown; their journal and receipts survive interruption. Control-plane `gatewayRootCertificate` configures an optional private CA for authenticated review downloads from the configured gateway. Omit it for system trust. Review downloads require no active Worker lease and expose no Worker credential to clients.

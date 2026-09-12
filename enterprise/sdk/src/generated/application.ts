@@ -54,6 +54,8 @@ export type WaitTarget =
       deadline_ms: number;
       kind: "timer";
     };
+export type WorkspacePath = string;
+export type MergeContentSide = "base" | "parent" | "child";
 export type Counter = string;
 export type CouncilPhase = "seats" | "stopping" | "synthesis" | "completed" | "failed" | "cancelled" | "uncertain";
 export type CouncilSeatState =
@@ -73,6 +75,32 @@ export type NodeRunId = string;
 export type InvocationState =
   "queued" | "waiting" | "running" | "succeeded" | "failed" | "denied" | "cancelled" | "uncertain";
 export type WorkflowState = "preparing" | "prepared" | "active" | "completed" | "failed" | "cancelled" | "uncertain";
+export type WorkspaceEntry =
+  | {
+      gid: number;
+      kind: "directory";
+      mode: number;
+      uid: number;
+    }
+  | {
+      bytes: Counter;
+      gid: number;
+      kind: "file";
+      mode: number;
+      sha256: string;
+      uid: number;
+    }
+  | {
+      gid: number;
+      kind: "symlink";
+      target: string;
+      uid: number;
+    }
+  | {
+      kind: "hardlink";
+      target: WorkspacePath;
+    };
+export type MergeChoice = "parent" | "child" | "conflict";
 
 export interface ApplicationProtocol {
   answer: ApprovalDecision;
@@ -82,11 +110,13 @@ export interface ApplicationProtocol {
   create_session: CreateSession;
   input_version: InputVersionView;
   job: JobView;
+  merge_content: MergeContentRequest;
   session: SessionSummary;
   sessions: SessionPage;
   submit_turn: SubmitTurn;
   workflow: WorkflowRunView;
   workspace: WorkspaceView;
+  workspace_merge: WorkspaceMergeView;
 }
 export interface ApprovalDecision {
   answer: ApprovalAnswer;
@@ -170,6 +200,11 @@ export interface JobWaitView {
   invocationId: InvocationId;
   target: WaitTarget;
 }
+export interface MergeContentRequest {
+  approvalId: ApprovalId;
+  path: WorkspacePath;
+  side: MergeContentSide;
+}
 /**
  * A session's public summary. Filesystem locations remain backend-owned.
  */
@@ -231,4 +266,24 @@ export interface NodeRunView {
 export interface WorkspaceView {
   id: WorkspaceId;
   title: string;
+}
+export interface WorkspaceMergeView {
+  admitted: boolean;
+  approvalId: ApprovalId;
+  childJobId: JobId;
+  operationId: OperationId;
+  plan: WorkspaceMergePlan;
+}
+export interface WorkspaceMergePlan {
+  baseTree: string;
+  changes: WorkspaceChange[];
+  childTree: string;
+  parentTree: string;
+}
+export interface WorkspaceChange {
+  base?: WorkspaceEntry | null;
+  child?: WorkspaceEntry | null;
+  choice: MergeChoice;
+  parent?: WorkspaceEntry | null;
+  path: WorkspacePath;
 }
