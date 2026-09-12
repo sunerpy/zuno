@@ -1,6 +1,6 @@
 use crate::storage;
 use sha2::{Digest, Sha256};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path};
 use zuno_application::ApplicationError;
 
@@ -29,6 +29,7 @@ pub(crate) fn verify(
     if bytes != expected_bytes || hex::encode(digest.finalize()) != expected_sha {
         return Err(ApplicationError::Conflict);
     }
+    bounded_headers(path, expected_bytes)?;
     let file = std::fs::File::open(path).map_err(storage)?;
     let mut archive = tar::Archive::new(file);
     for entry in archive.entries().map_err(storage)? {
@@ -66,6 +67,57 @@ pub(crate) fn verify(
         } else if !kind.is_file() && !kind.is_dir() {
             return Err(ApplicationError::Forbidden);
         }
+    }
+    Ok(())
+}
+
+/// Bound extension-header allocation before the tar decoder processes PAX or
+/// GNU long-name payloads. File data is skipped by offset, never buffered.
+fn bounded_headers(path: &Path, bytes: u64) -> Result<(), ApplicationError> {
+    let mut file = std::fs::File::open(path).map_err(storage)?;
+    let mut position = 0u64;
+    let mut count = 0usize;
+    while position < bytes {
+        if bytes - position < 512 {
+            return Err(ApplicationError::Conflict);
+        }
+        file.seek(SeekFrom::Start(position)).map_err(storage)?;
+        let mut block = [0u8; 512];
+        file.read_exact(&mut block).map_err(storage)?;
+        if block.iter().all(|byte| *byte == 0) {
+            return Ok(());
+        }
+        count += 1;
+        if count > 100_000 {
+            return Err(ApplicationError::Invalid(
+                "workspace archive has too many headers".to_owned(),
+            ));
+        }
+        let header = tar::Header::from_byte_slice(&block);
+        let kind = header.entry_type();
+        let size = header.size().map_err(storage)?;
+        if kind.is_gnu_sparse() {
+            return Err(ApplicationError::Forbidden);
+        }
+        if (kind.is_gnu_longname()
+            || kind.is_gnu_longlink()
+            || kind.is_pax_global_extensions()
+            || kind.is_pax_local_extensions())
+            && size > 65536
+        {
+            return Err(ApplicationError::Invalid(
+                "workspace archive metadata exceeds its bound".to_owned(),
+            ));
+        }
+        let padded = size
+            .checked_add(511)
+            .map(|value| (value / 512) * 512)
+            .ok_or(ApplicationError::Conflict)?;
+        position = position
+            .checked_add(512)
+            .and_then(|position| position.checked_add(padded))
+            .filter(|position| *position <= bytes)
+            .ok_or(ApplicationError::Conflict)?;
     }
     Ok(())
 }
@@ -160,6 +212,28 @@ pub(crate) fn for_restore(source: &Path, destination: &Path) -> Result<u64, Appl
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn untrusted_extension_headers_are_bounded_before_tar_allocation() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("oversized.tar");
+        let mut header = tar::Header::new_gnu();
+        header.set_path("pax").unwrap();
+        header.set_entry_type(tar::EntryType::XHeader);
+        header.set_size(65537);
+        header.set_mode(0o644);
+        header.set_cksum();
+        let mut bytes = header.as_bytes().to_vec();
+        bytes.resize(512 + 66048, 0);
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(
+            verify(
+                &path,
+                &hex::encode(Sha256::digest(&bytes)),
+                bytes.len() as u64
+            )
+            .is_err()
+        );
+    }
     fn archive(path: &Path, link: Option<&str>) -> (String, u64) {
         let file = std::fs::File::create(path).unwrap();
         let mut builder = tar::Builder::new(file);

@@ -33,10 +33,10 @@ mod events;
 pub mod gateway_configuration;
 #[cfg(feature = "enterprise")]
 pub mod gateway_execution;
-#[cfg(feature = "enterprise")]
-pub mod merge_review;
 mod request_broker;
 mod server;
+#[cfg(feature = "enterprise")]
+pub mod workspace_gateway;
 
 pub use auth::AuthConfig;
 pub use directory::RequestDirectory;

@@ -56,6 +56,11 @@ pub const GATEWAY_TICKET_HEADER: &str = "x-zuno-gateway-ticket";
 pub const GATEWAY_MERGE_READ_RESOLVE_PATH: &str = "internal/gateway/v1/workspace-merge/read";
 pub const GATEWAY_MERGE_READ_PATH: &str = "internal/execution/v1/workspace-merge/read";
 pub const GATEWAY_READ_TICKET_HEADER: &str = "x-zuno-read-ticket";
+pub const GATEWAY_IMPORT_TICKET_HEADER: &str = "x-zuno-import-ticket";
+pub const GATEWAY_IMPORT_RESOLVE_PATH: &str = "internal/gateway/v1/workspace-import/resolve";
+pub const GATEWAY_IMPORT_AUTHORIZE_PATH: &str = "internal/gateway/v1/workspace-import/authorize";
+pub const GATEWAY_IMPORT_COMPLETE_PATH: &str = "internal/gateway/v1/workspace-import/complete";
+pub const GATEWAY_IMPORT_PATH: &str = "internal/execution/v1/workspace-import";
 pub const GATEWAY_EXECUTE_PATH: &str = "internal/execution/v1/request";
 
 /// Older checkpoints did not record display provenance. That absence may be

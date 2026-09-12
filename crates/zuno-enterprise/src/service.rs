@@ -373,8 +373,8 @@ async fn control(options: ControlConfig, shutdown: InterruptSignal) -> Result<()
         EnterpriseApplication::new(backend.clone(), options.tenant_id.clone(), active)?
             .with_memory(memory.clone());
     if has_environments {
-        application = application.with_merge_reader(Arc::new(
-            zuno_server::merge_review::MergeReviewReader::new(
+        application = application.with_workspace_gateway(Arc::new(
+            zuno_server::workspace_gateway::GatewayWorkspaceClient::new(
                 backend.clone(),
                 tickets.clone(),
                 assignments.clone(),

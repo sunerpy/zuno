@@ -9,6 +9,9 @@
     "approval": {
       "$ref": "#/$defs/ApprovalView"
     },
+    "begin_workspace_import": {
+      "$ref": "#/$defs/BeginWorkspaceImport"
+    },
     "cancel": {
       "$ref": "#/$defs/CancelJob"
     },
@@ -42,6 +45,9 @@
     "workspace": {
       "$ref": "#/$defs/WorkspaceView"
     },
+    "workspace_import": {
+      "$ref": "#/$defs/WorkspaceImportView"
+    },
     "workspace_merge": {
       "$ref": "#/$defs/WorkspaceMergeView"
     }
@@ -60,7 +66,9 @@
     "cancellation",
     "workflow",
     "workspace_merge",
-    "merge_content"
+    "merge_content",
+    "begin_workspace_import",
+    "workspace_import"
   ],
   "$defs": {
     "ApprovalAnswer": {
@@ -185,6 +193,30 @@
         "state",
         "presentation",
         "expiresAtMs"
+      ]
+    },
+    "BeginWorkspaceImport": {
+      "type": "object",
+      "properties": {
+        "bytes": {
+          "$ref": "#/$defs/Counter"
+        },
+        "expectedInputVersion": {
+          "$ref": "#/$defs/Counter"
+        },
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "sha256": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "requestId",
+        "expectedInputVersion",
+        "sha256",
+        "bytes"
       ]
     },
     "CancelJob": {
@@ -1072,6 +1104,53 @@
       "maxLength": 128,
       "minLength": 1,
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "WorkspaceImportId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "WorkspaceImportState": {
+      "type": "string",
+      "enum": [
+        "uploading",
+        "initializing",
+        "ready",
+        "cancelled"
+      ]
+    },
+    "WorkspaceImportView": {
+      "type": "object",
+      "properties": {
+        "bytes": {
+          "$ref": "#/$defs/Counter"
+        },
+        "createdAt": {
+          "$ref": "#/$defs/Counter"
+        },
+        "id": {
+          "$ref": "#/$defs/WorkspaceImportId"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "sha256": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/WorkspaceImportState"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "sessionId",
+        "state",
+        "sha256",
+        "bytes",
+        "createdAt"
+      ]
     },
     "WorkspaceMergePlan": {
       "type": "object",

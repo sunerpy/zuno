@@ -3,6 +3,7 @@
 mod activity;
 mod children;
 mod concurrency;
+mod import;
 mod live;
 mod recovery;
 
@@ -83,6 +84,7 @@ async fn consume(admin: &PgPool, job: &RuntimeJob) {
         .execute(admin).await.unwrap();
 }
 pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool) {
+    Box::pin(import::exercise(backend, admin)).await;
     for (tenant, subject) in [
         ("runtime-concurrency", "alice"),
         ("runtime-concurrency", "bob"),

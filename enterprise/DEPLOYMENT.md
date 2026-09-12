@@ -169,3 +169,10 @@ existing native role fixture using the extracted binary. The default fixture
 profile is `release`; `--profile dev` is available for local driver checks. This
 does not publish or install the binary. Library/HTTP contract gates remain
 separate required checks.
+
+The configured workspace gateway client also proxies initial archive uploads using
+`gatewayRootCertificate` trust. No new storage path or Docker endpoint is accepted
+from the public client. The selected deployment is pinned for initialization and
+subsequent imported-session admission. Clients provide an uncompressed tar with a
+`workspace/` root and use the typed import API before submitting the first turn.
+PAX/GNU extension metadata is capped at 64 KiB per header; sparse entries are rejected.

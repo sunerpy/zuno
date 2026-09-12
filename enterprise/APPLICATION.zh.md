@@ -68,3 +68,10 @@ ACP bridge 不应为了跳过 HITL 而加入审批应用白名单。审批决定
 和逻辑 `path`。权限遵循当前审批查看策略，只允许读取变化条目。内容路由在装配网关 reader
 后注册，流式校验不可变内容的长度和 SHA，不返回 Worker 凭证。详见
 [工作区合并](WORKSPACES.zh.md#子工作区审批合并)。
+
+初始工作区导入提供 `POST /sessions/{session}/workspace/imports`、
+`GET`／`DELETE /sessions/{session}/workspace/imports/{import}` 和
+`PUT /sessions/{session}/workspace/imports/{import}/archive`。Begin 声明精确 SHA／大小
+及输入版本 0；上传为原始 `application/x-tar` 字节。仅当前审批应用中的认证用户可以
+初始化，导入与首轮输入不能同时接纳。恢复接纳前可取消；开始后重试同一归档或查看状态。
+详见[项目初始化](WORKSPACES.zh.md#初始化项目)。

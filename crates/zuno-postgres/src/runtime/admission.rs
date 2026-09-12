@@ -65,6 +65,13 @@ pub(super) async fn root_in(
     if input_version(tx, &owner, request.session_id.as_str()).await? != expected {
         return Err(ApplicationError::Conflict);
     }
+    crate::workspace_import::require_initialized(
+        tx,
+        principal,
+        &request.session_id,
+        &request.configuration,
+    )
+    .await?;
     let time = database_time(tx).await?;
     let turn = format!("turn_{key}");
     let input = format!("msg_{key}");

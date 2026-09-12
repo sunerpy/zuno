@@ -21,6 +21,7 @@ mod tests;
 mod turn;
 #[cfg(test)]
 mod turn_tests;
+mod workspace_import;
 mod workspace_merge;
 
 pub use activity::PostgresActivityPersistence;

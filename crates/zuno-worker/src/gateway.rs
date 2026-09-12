@@ -67,6 +67,23 @@ pub struct GatewayStateClient {
     control: WorkerClient,
 }
 impl GatewayStateClient {
+    pub async fn import_context(
+        &self,
+        ticket: &zuno_identity::gateway::GatewayImportTicket,
+        request: &zuno_application::workspace_import::WorkspaceUploadRequest,
+    ) -> Result<zuno_application::workspace_import::WorkspaceImportAssignment, ApplicationError>
+    {
+        let bytes = self
+            .control
+            .post_header(
+                GATEWAY_IMPORT_RESOLVE_PATH,
+                Some((GATEWAY_IMPORT_TICKET_HEADER, ticket.expose())),
+                serde_json::to_vec(request).map_err(ApplicationError::storage)?,
+            )
+            .await
+            .map_err(state_error)?;
+        serde_json::from_slice(&bytes).map_err(ApplicationError::storage)
+    }
     pub async fn merge_read_context(
         &self,
         ticket: &zuno_identity::gateway::GatewayReadTicket,
@@ -228,6 +245,47 @@ impl GatewayStateClient {
                 GATEWAY_CHILD_WORKSPACE_PATH,
                 None,
                 serde_json::to_vec(completion).map_err(ApplicationError::storage)?,
+            )
+            .await
+            .map_err(state_error)?;
+        Ok(())
+    }
+}
+#[async_trait]
+impl zuno_application::workspace_import::WorkspaceInitializationAuthority for GatewayStateClient {
+    async fn authorize_initialization(
+        &self,
+        assigned: &zuno_application::workspace_import::WorkspaceImportAssignment,
+    ) -> Result<Option<zuno_application::workspace_import::WorkspaceImportReceipt>, ApplicationError>
+    {
+        let response = self
+            .control
+            .post(
+                GATEWAY_IMPORT_AUTHORIZE_PATH,
+                None,
+                serde_json::to_vec(assigned).map_err(ApplicationError::storage)?,
+            )
+            .await
+            .map_err(state_error)?;
+        serde_json::from_slice(&response).map_err(ApplicationError::storage)
+    }
+    async fn initialized(
+        &self,
+        assigned: &zuno_application::workspace_import::WorkspaceImportAssignment,
+        receipt: &zuno_application::workspace_import::WorkspaceImportReceipt,
+    ) -> Result<(), ApplicationError> {
+        assigned.validate_receipt(receipt)?;
+        self.control
+            .post(
+                GATEWAY_IMPORT_COMPLETE_PATH,
+                None,
+                serde_json::to_vec(
+                    &zuno_application::workspace_import::WorkspaceInitializationCompletion {
+                        assignment: assigned.clone(),
+                        receipt: receipt.clone(),
+                    },
+                )
+                .map_err(ApplicationError::storage)?,
             )
             .await
             .map_err(state_error)?;

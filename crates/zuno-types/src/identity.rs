@@ -123,6 +123,10 @@ identity_id!(
     WorkspaceId,
     "An owned workspace identity rather than a machine path."
 );
+identity_id!(
+    WorkspaceImportId,
+    "A stable, owner-scoped workspace initialization."
+);
 identity_id!(GroupId, "An organization-managed group identity.");
 identity_id!(
     SessionId,

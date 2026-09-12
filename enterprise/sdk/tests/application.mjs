@@ -93,3 +93,25 @@ test("merge review is approval-bound and content streams preserve BFF identity w
   assert.equal(request.init.redirect, "error");
   await assert.rejects(client.mergeContent("approval", "child", "../secret"), /Invalid merge content/);
 });
+
+test("workspace archive upload keeps raw bytes and request identity with explicit BFF CSRF", async () => {
+  const value = { id: "import", sessionId: "session", state: "uploading", sha256: "a".repeat(64), bytes: "4", createdAt: "1" };
+  const calls = [];
+  const client = new EnterpriseClient({ baseUrl: "https://enterprise.example/app/api/v1/", browserContext: () => "context",
+    fetch: async (url, init) => {
+      calls.push({ url: new URL(url), init });
+      return response({ ...value, state: init.method === "PUT" ? "ready" : value.state });
+    } });
+  const prepared = await client.beginWorkspaceImport("session", { requestId: "request", expectedInputVersion: "0", sha256: value.sha256, bytes: "4" });
+  assert.equal(prepared.id, "import");
+  const bytes = new Blob([new Uint8Array([0, 1, 2, 255])]);
+  assert.equal((await client.uploadWorkspaceArchive("session", "import", bytes)).state, "ready");
+  const call = calls.at(-1);
+  assert.equal(call.init.method, "PUT");
+  assert.equal(call.init.headers.get("content-type"), "application/x-tar");
+  assert.equal(call.init.headers.get("x-zuno-csrf"), "1");
+  assert.equal(call.init.headers.get("x-zuno-browser-context"), "context");
+  assert.deepEqual([...new Uint8Array(await call.init.body.arrayBuffer())], [0, 1, 2, 255]);
+  await assert.rejects(client.workspaceImport("other-session", "import"), /identity mismatch/);
+  await assert.rejects(client.uploadWorkspaceArchive("session", "import", new Blob([])), /bound/);
+});

@@ -1,11 +1,11 @@
 import { ActivityClient } from "./client.js";
 import type {
   WorkspaceView, SessionPage, SessionSummary, CreateSession, JobView,
-  SubmitTurn, InputVersionView, ApprovalView, ApprovalDecision, CancelJob, CancellationReceipt, WorkflowRunView, WorkspaceMergeView, MergeContentSide,
+  SubmitTurn, InputVersionView, ApprovalView, ApprovalDecision, CancelJob, CancellationReceipt, WorkflowRunView, WorkspaceMergeView, MergeContentSide, BeginWorkspaceImport, WorkspaceImportView,
 } from "./generated/application.js";
 import {
   validateWorkspaceView, validateSessionPage, validateSessionSummary, validateJobView,
-  validateInputVersionView, validateApprovalView, validateCancellationReceipt, validateWorkflowRunView, validateWorkspaceMergeView, validateMergeContentRequest,
+  validateInputVersionView, validateApprovalView, validateCancellationReceipt, validateWorkflowRunView, validateWorkspaceMergeView, validateMergeContentRequest, validateWorkspaceImportView,
 } from "./generated/application-validators.mjs";
 
 function checked<T>(value: unknown, validate: (value: unknown) => unknown): T {
@@ -18,6 +18,29 @@ function id(value: string): string {
 }
 
 export class EnterpriseClient extends ActivityClient {
+  async beginWorkspaceImport(session: string, request: BeginWorkspaceImport, signal?: AbortSignal): Promise<WorkspaceImportView> {
+    const value = checked<WorkspaceImportView>(await this.get(new URL(`sessions/${id(session)}/workspace/imports`, this.base), signal, "POST", request), validateWorkspaceImportView);
+    if (value.sessionId !== session || value.sha256 !== request.sha256 || value.bytes !== request.bytes) throw new Error("Workspace import identity mismatch");
+    return value;
+  }
+  async workspaceImport(session: string, upload: string, signal?: AbortSignal): Promise<WorkspaceImportView> {
+    const value = checked<WorkspaceImportView>(await this.get(new URL(`sessions/${id(session)}/workspace/imports/${id(upload)}`, this.base), signal), validateWorkspaceImportView);
+    if (value.sessionId !== session || value.id !== upload) throw new Error("Workspace import identity mismatch");
+    return value;
+  }
+  async cancelWorkspaceImport(session: string, upload: string, signal?: AbortSignal): Promise<WorkspaceImportView> {
+    const value = checked<WorkspaceImportView>(await this.get(new URL(`sessions/${id(session)}/workspace/imports/${id(upload)}`, this.base), signal, "DELETE"), validateWorkspaceImportView);
+    if (value.sessionId !== session || value.id !== upload) throw new Error("Workspace import identity mismatch");
+    return value;
+  }
+  async uploadWorkspaceArchive(session: string, upload: string, archive: Blob, signal?: AbortSignal): Promise<WorkspaceImportView> {
+    if (archive.size <= 0 || archive.size > 512 * 1024 * 1024) throw new Error("Workspace archive exceeds its bound");
+    const response = await this.response(new URL(`sessions/${id(session)}/workspace/imports/${id(upload)}/archive`, this.base),
+      signal, "PUT", undefined, "application/json", 600000, archive);
+    const value = checked<WorkspaceImportView>(await this.json(response), validateWorkspaceImportView);
+    if (value.sessionId !== session || value.id !== upload || value.bytes !== archive.size.toString()) throw new Error("Workspace import identity mismatch");
+    return value;
+  }
   async mergeReview(approval: string, signal?: AbortSignal): Promise<WorkspaceMergeView> {
     const value = checked<WorkspaceMergeView>(await this.get(new URL(`approvals/${id(approval)}/merge`, this.base), signal), validateWorkspaceMergeView);
     if (value.approvalId !== approval) throw new Error("Merge review identity mismatch");

@@ -1362,6 +1362,27 @@
         {
           "type": "object",
           "properties": {
+            "importId": {
+              "$ref": "#/$defs/WorkspaceImportId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "view_workspace_import"
+            },
+            "sessionId": {
+              "$ref": "#/$defs/SessionId"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "sessionId",
+            "importId"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "approvalId": {
               "$ref": "#/$defs/ApprovalId"
             },
@@ -1551,6 +1572,12 @@
         "cancelled",
         "uncertain"
       ]
+    },
+    "WorkspaceImportId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
     }
   },
   "$id": "zuno-activity-v1"

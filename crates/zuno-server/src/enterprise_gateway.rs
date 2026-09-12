@@ -1,4 +1,5 @@
 //! Data-owner endpoints for gateway delegation and current operation approval.
+mod import;
 mod merge;
 
 use axum::{
@@ -70,6 +71,18 @@ impl GatewayControlService {
 
     pub fn router(self) -> Router {
         Router::new()
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_IMPORT_RESOLVE_PATH),
+                post(import::resolve),
+            )
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_IMPORT_AUTHORIZE_PATH),
+                post(import::authorize),
+            )
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_IMPORT_COMPLETE_PATH),
+                post(import::complete),
+            )
             .route(&format!("/{GATEWAY_TICKET_PATH}"), post(issue_ticket))
             .route(&format!("/{GATEWAY_RESOLVE_PATH}"), post(resolve))
             .route(&format!("/{GATEWAY_PREPARE_PATH}"), post(prepare))
@@ -153,10 +166,22 @@ impl GatewayControlService {
         {
             return Err(Failure(StatusCode::FORBIDDEN));
         }
+        let imported = self
+            .backend
+            .imported_workspace(&lease.owner, &lease.session_id)
+            .await
+            .map_err(application)?;
+        if let Some((initial, receipt)) = &imported
+            && (initial.gateway_id != assignment.gateway_id
+                || receipt.environment.spec != assignment.environment
+                || workspace.is_some())
+        {
+            return Err(Failure(StatusCode::FORBIDDEN));
+        }
         Ok(GatewayExecutionContext {
             lease: lease.clone(),
             assignment,
-            existing_workspace: workspace.is_some(),
+            existing_workspace: workspace.is_some() || imported.is_some(),
             child_workspace: None,
             prepared_workspace: None,
             merge_source: None,

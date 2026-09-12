@@ -25,6 +25,11 @@ export type UiAction =
       kind: "view_workspace_merge";
     }
   | {
+      importId: WorkspaceImportId;
+      kind: "view_workspace_import";
+      sessionId: SessionId;
+    }
+  | {
       approvalId: ApprovalId;
       kind: "approve";
     }
@@ -47,6 +52,8 @@ export type UiAction =
     };
 export type JobId = string;
 export type ApprovalId = string;
+export type WorkspaceImportId = string;
+export type SessionId = string;
 export type TurnId = string;
 export type SessionItem =
   | {
@@ -231,7 +238,6 @@ export type ApprovalStatus = "pending" | "approved" | "rejected" | "expired" | "
 export type PlanStepStatus = "pending" | "in_progress" | "completed" | "superseded";
 export type WorkState =
   "pending" | "active" | "waiting" | "paused" | "completed" | "failed" | "cancelled" | "uncertain";
-export type SessionId = string;
 export type LiveEvent =
   | {
       items: LiveItem[];

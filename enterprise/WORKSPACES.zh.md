@@ -4,6 +4,34 @@
 可以在不同 Linux 机器上运行；首个 Docker fork 适配器要求父子环境属于同一配置网关，
 尚未公布跨网关快照传输能力。
 
+## 初始化项目
+
+经过认证、使用配置中审批应用的用户，可以在根会话接纳首轮输入前初始化项目。
+先创建会话，再向 `POST /sessions/{session}/workspace/imports` 提交
+`requestId`、`expectedInputVersion: "0"`、归档 `sha256` 和十进制字符串 `bytes`。
+通过 `PUT /sessions/{session}/workspace/imports/{import}/archive` 上传相同的未压缩
+tar 字节，类型为 `application/x-tar`；API 和 BFF 前缀共用契约。
+`GET /sessions/{session}/workspace/imports/{import}` 返回类型化状态。
+
+归档条目必须位于 `workspace/` 下，总量不超过 512 MiB，只接受受支持的 UTF-8 文件、
+目录、符号链接和硬链接。拒绝特殊文件、set-id 模式、越界链接、重复条目和结构冲突。
+初始化将 UID／GID 规范化为运行用户 `0:0`，保留内容、普通权限及安全链接；数据流式写入
+私有暂存文件，不解包到网关宿主。
+
+导入接纳与首轮输入通过同一会话锁串行化，上传／恢复期间不接纳 Job。控制面固定所有者、
+配置和环境；独立短期上传票据不能执行命令，也不能读取其他资源。字节校验后，网关再次
+检查当前初始化权限，复用持久分叉机制发布环境并提交匹配回执。就绪工作区始终按已有
+环境打开，卷丢失不能静默变成空目录。
+
+相同请求和上传（包括并发重试）返回同一结果，不同字节或参数冲突。初始化开始前可对
+import 资源发送 `DELETE` 取消；恢复已开始时，重试相同归档或查看状态。不能通过初始化
+覆盖就绪数据；取消后的上传可在任何输入接纳前重新创建。当前适配器固定所选配置，
+配置／环境变化需显式迁移。之后 Agent 执行命令仍需独立审批。
+
+SDK 提供 `beginWorkspaceImport`、`workspaceImport`、`uploadWorkspaceArchive`、
+`cancelWorkspaceImport`。就绪导入以 artifact 和 `ViewWorkspaceImport` 投影，不暴露
+私有配置或凭证。PostgreSQL 格式 18 在控制面重启后保留状态。
+
 ## 配置目标
 
 在控制面及兼容 Worker 安装子定义。以下命令只验证并输出规范化引用，不启动服务或读取
