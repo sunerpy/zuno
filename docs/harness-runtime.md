@@ -271,10 +271,26 @@ never parsed as evidence that work completed or as a substitute for a typed wait
 `plan_update` prevents the model from creating or mutating a new strategic Plan;
 existing Plans remain durable, projected, and recoverable.
 
+Automatic recognition of a legacy ordinary pause runs only while promoting real
+user input, with no failed bridge and sufficient evidence from the original
+cycle, native events, and their timing. Successful follow-up replies alone do not prove pause
+origin. Existing v0.10.32 failed bridges did not retain complete preceding pause
+provenance: a bridge can overwrite `timeUpdated` after a later unknown pause with
+the same scheduling values. Matching those values cannot establish continuity.
+These bridges and unknown pauses remain gated; ordinary Work recovery requires
+explicit `/resume` and all existing authorization and safety checks.
+Missing, pruned, unknown-version, changed or out-of-window evidence also leaves
+the pause intact. The audit does not scan arbitrary historical cancellations,
+reset or replay old failed receipts, bypass Goal or human-request authority, or
+authorize Automatic/Recovery wakes and old callbacks.
+
 The boundary follows local Codex `9ba1d9eb5bbbd87ba2fc528d91ad239eea975ee9`:
-`core/src/session/turn_input.rs` separates User/Automatic/Recovery and starts or
-steers user input; `core/src/tasks/mod.rs` cancels active task work, while the TUI
-Goal menu handles explicit Goal resume separately. The Goal tool/spec were also
+`protocol/src/turn_input.rs:178` states that `TurnInputSubmission::Started` and
+`Steered` acknowledge admission for turn processing, without waiting for hooks,
+model-context updates, rollout persistence, or sampling.
+`core/src/session/turn_input.rs` separately classifies User/Automatic/Recovery;
+`core/src/tasks/mod.rs` cancels active task work, while the TUI Goal menu handles
+explicit Goal resume separately. The Goal tool/spec were also
 checked at `eaa8b6d91701d6cabe464141facc677e5915fbfc`. Zuno's durable cycle ledger,
 report-transfer receipts and host-counted blocker audits are native adaptations,
 not claims that Codex exposes these database or protocol APIs.
@@ -1299,9 +1315,43 @@ settles completion. Same-cycle recovery transfers receipt ownership explicitly;
 an unrelated turn cannot complete a receipt. Optional client message IDs are
 session-scoped and payload-validated, never derived by deduplicating text.
 
-Standard ACP prompt requests observe that receipt until the associated outcome,
-while `session/steer` returns immediate admission. Disconnect drops an observer;
-it is not implicit withdrawal or evidence that an old owner has stopped.
+For a consumed input already recorded in history but never applied, the native
+session-control transaction can persist `session.input.execution_gate` (stored
+as `session.input.execution_gate.1`) with the input ID, gate and time. The same
+writer snapshot reads execution eligibility and publishes the receipt. The
+optional `InputAdmissionReceipt.executionGate` is projected from that durable
+event; format 15 and its schema are unchanged. The receipt remains `recorded`,
+with no `appliedAt`, `completedAt`, or `turnId`, instead of becoming `failed`
+merely because the drive reached an execution gate without sampling.
+
+The input persistence transaction returns the captured cycle ID to the drive
+owner as part of its commit result; capture does not require a fallible read
+after commit. A late failure fallback rechecks receipt state, gate, turn binding,
+the input's expected cycle and the current session cycle inside the transaction
+that would update the receipt. An absent locally captured cycle permits only
+an input that is still unconsumed and unbound. A superseded owner cannot fail an
+input that native recovery has already taken over.
+
+`executionGate` freezes `reason`, `recovery`, `executionRevision`, `cycleId`,
+and optional `requestId`/`sourceId`. Its typed recovery is diagnostic, not
+authorization. Ordinary `/resume` first validates the existing Work revision,
+Plan and Goal authority, exact human/external waits, authentication, budget,
+blocked state and native uncertain-outcome evidence. On success, the same
+transaction carries only the matching gated, unapplied anchor into the new
+cycle and records `session.input.execution_recovered`; it does not re-admit or
+insert the original text. The gate stays observable until a real turn binds
+the input, after which the ordinary application/completion path owns progress.
+This path never resets a `failed`, `cancelled`, `applied`, or `completed` receipt
+and never authorizes an old-cycle callback.
+
+Standard ACP prompt requests observe the receipt until an associated outcome,
+including a saved execution gate. A gate returns `-32005` with
+`admission: "accepted"`, `reason: "executionGated"`, `recoveryRequired: true`,
+and `receipt` in the error data: clients must not resend the saved input.
+Duplicate message IDs observe the same gate even in the recovery handoff gap.
+`session/steer` returns immediate admission, which does not attest to sampling.
+Disconnect drops an observer; it is not implicit withdrawal or evidence that
+an old owner has stopped.
 
 Every multi-statement write transaction reserves SQLite's writer with `BEGIN IMMEDIATE`,
 including transactions opened through a caller-owned turn connection. This lets the configured

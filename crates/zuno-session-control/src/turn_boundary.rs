@@ -139,6 +139,10 @@ impl SessionControlService {
         })?;
         if input.state != zuno_db::inbox::SubmissionState::Promoted
             || !matches!(
+                input.trigger_kind,
+                InputTriggerKind::User | InputTriggerKind::Legacy
+            )
+            || !matches!(
                 zuno_db::inbox::DurableInputKind::classify(&input.prompt),
                 Some(
                     zuno_db::inbox::DurableInputKind::User
@@ -158,13 +162,13 @@ impl SessionControlService {
         let previous_scheduling = state.scheduling.clone();
         let prior = session_work_cycle::current_in(tx, session_id)?;
         let prior_scope = prior.clone();
+        let legacy_interruption = legacy_user_cancel_in(tx, &state)?;
         let proven_cancel = prior.as_ref().is_some_and(|cycle| {
             cycle
                 .stopped
                 .as_ref()
                 .is_some_and(|stop| stop.user_cancelled)
-        }) || (prior.is_none()
-            && legacy_user_cancel_in(tx, &state, message_id)?);
+        }) || legacy_interruption.is_some();
         let uncertain = !zuno_db::message::MessageStore::new(tx)
             .pending_uncertain_tool_calls(session_id, 0)?
             .is_empty();
@@ -291,7 +295,8 @@ impl SessionControlService {
                 "session.work_cycle.started",
                 json!({"cycle": cycle, "inputId": input_id, "time": at_ms,
                     "previousCycleId":previous_cycle_id,"previousScheduling":previous_scheduling,
-                    "legacyInterruption":prior_scope.is_none() && proven_cancel,
+                    "legacyInterruption":legacy_interruption.is_some(),
+                    "legacyInterruptionProof":legacy_interruption.as_ref().map(LegacyInterruptionProof::event_data),
                     "protectedGateRetained":protected,
                 })
                 .as_object()
@@ -403,64 +408,360 @@ impl SessionControlService {
     }
 }
 
-/// Only typed interrupted assistant checkpoints from the released host count.
-/// Inspect the last assistant before this input; never match natural-language text
-/// or use an older interruption to clear a later explicit pause.
+struct LegacyInterruptionProof {
+    origin_cycle_id: String,
+    turn_id: String,
+    executing_sequence: i64,
+    turn_started_sequence: i64,
+    cancellation_sequence: i64,
+    paused_sequence: i64,
+}
+
+impl LegacyInterruptionProof {
+    fn event_data(&self) -> serde_json::Value {
+        json!({
+            "originCycleId":self.origin_cycle_id,
+            "turnId":self.turn_id,
+            "executingSequence":self.executing_sequence,
+            "turnStartedSequence":self.turn_started_sequence,
+            "cancellationSequence":self.cancellation_sequence,
+            "pausedSequence":self.paused_sequence,
+        })
+    }
+}
+
+struct LegacyBoundaryEvent {
+    sequence: i64,
+    kind: String,
+    data: serde_json::Value,
+}
+
+/// Audit only on promotion of a real user input. An automatic wake cannot call
+/// this repair. The latest driver pause, not an arbitrary historical AbortError,
+/// must project the original turn stop. v31 could first project that pause while
+/// completing a later user turn. This proof only applies before any native input
+/// cycle was created. A v32 retained-gate cycle overwrote the previous state's
+/// timestamp without recording pause provenance; it requires explicit resume.
+///
+/// Missing, unknown-version, changed or overly long provenance stays gated.
+/// This is a bounded read of native lifecycle facts, never assistant prose,
+/// a database migration, or permission to replay an earlier failed input.
+/// In particular, the old latest-Abort/turn/anchor-only shortcut cannot prove
+/// pause origin: a later independent pause leaves those same three values.
+/// Fully evidenced latest interruptions still qualify; incomplete old records
+/// require explicit native resume instead of silently acquiring authority.
 fn legacy_user_cancel_in(
     connection: &zuno_db::Connection,
     state: &SessionExecutionState,
-    message_id: &str,
-) -> Result<bool, zuno_error::DbError> {
-    use rusqlite::OptionalExtension as _;
-    let Some(anchor) = state
+) -> Result<Option<LegacyInterruptionProof>, zuno_error::DbError> {
+    let Some(scheduling) = state.scheduling.as_ref().filter(|scheduling| {
+        state.phase == SessionExecutionPhase::Paused
+            && scheduling.readiness
+                == (SessionReadiness::Paused {
+                    reason: SessionPauseReason::User,
+                })
+    }) else {
+        return Ok(None);
+    };
+    let Some(token) = state
         .continuation
         .as_ref()
-        .and_then(|token| token.anchor_message_id.as_deref())
+        .filter(|token| state.cycle_id.as_deref() == Some(&token.cycle_id))
     else {
-        return Ok(false);
+        return Ok(None);
     };
-    struct LegacyStopEvidence {
-        name: Option<String>,
-        reason: Option<String>,
-        parent: Option<String>,
-        turn: Option<String>,
+    // Reject before searching historical cancellations. A retained v32 cycle
+    // cannot distinguish the old interruption from a later same-valued pause.
+    if session_work_cycle::current_in(connection, &state.session_id)?.is_some() {
+        return Ok(None);
     }
-    let proof: Option<LegacyStopEvidence> = connection
+    // This compatibility proof is for ordinary conversations with no human
+    // authority history. A cancelled required question also leaves paused/user.
+    // Legacy records cannot prove its pause was superseded merely because the
+    // request is no longer pending or a v32 bridge changed time_updated.
+    let other_authority: bool = connection
         .query_row(
-            "SELECT json_extract(data,'$.error.name'),json_extract(data,'$.error.data.reason'), \
-         json_extract(data,'$.parentID'),json_extract(data,'$.turnID') \
-         FROM message WHERE session_id=?1 AND id<>?2 AND json_extract(data,'$.role')='assistant' \
-         ORDER BY time_created DESC,id DESC LIMIT 1",
-            rusqlite::params![state.session_id, message_id],
-            |row| {
-                Ok(LegacyStopEvidence {
-                    name: row.get(0)?,
-                    reason: row.get(1)?,
-                    parent: row.get(2)?,
-                    turn: row.get(3)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(open::map_error)?;
-    let latest_turn: Option<String> = connection
-        .query_row(
-            "SELECT json_extract(data,'$.turnID') FROM event WHERE aggregate_id=?1 \
-         AND type='session.turn.started.1' ORDER BY seq DESC LIMIT 1",
+            "SELECT EXISTS(SELECT 1 FROM goal WHERE session_id=?1) \
+                 OR EXISTS(SELECT 1 FROM human_request WHERE session_id=?1)",
             [&state.session_id],
             |row| row.get(0),
         )
-        .optional()
-        .map_err(open::map_error)?
-        .flatten();
-    Ok(proof.is_some_and(|proof| {
-        proof.name.as_deref() == Some("AbortError")
-            && matches!(
-                proof.reason.as_deref(),
-                Some("user_cancel" | "request_cancelled")
-            )
-            && proof.parent.as_deref() == Some(anchor)
-            && proof.turn.is_some()
-            && proof.turn == latest_turn
+        .map_err(open::map_error)?;
+    if other_authority {
+        return Ok(None);
+    }
+
+    let Some(events) = legacy_boundary_events_in(connection, &state.session_id)? else {
+        return Ok(None);
+    };
+    let mut phases = events
+        .iter()
+        .rev()
+        .filter(|event| event.kind.starts_with("session.driver.phase."));
+    let (Some(paused), Some(executing)) = (phases.next(), phases.next()) else {
+        return Ok(None);
+    };
+    let Some(origin) = paused.data["cycleId"].as_str() else {
+        return Ok(None);
+    };
+    if paused.kind != "session.driver.phase.1"
+        || paused.data["phase"] != "paused"
+        || paused.data["reason"] != "user"
+        || paused.data["pauseReason"] != "user"
+        || executing.kind != "session.driver.phase.1"
+        || executing.data["phase"] != "executing"
+        || executing.data["cycleId"] != origin
+        || !executing.data["pauseReason"].is_null()
+        || (!paused.data["progressFingerprint"].is_null()
+            && !paused.data["progressFingerprint"].is_string())
+        || (!paused.data["unchangedProgressCount"].is_null()
+            && paused.data["unchangedProgressCount"].as_u64().is_none())
+        || paused.data["progressFingerprint"].as_str() != scheduling.progress_fingerprint.as_deref()
+        || paused.data["unchangedProgressCount"].as_u64().unwrap_or(0)
+            != u64::from(scheduling.unchanged_progress_count)
+        || token.cycle_id != origin
+    {
+        return Ok(None);
+    }
+    let start = events.iter().find(|event| {
+        event.sequence > executing.sequence
+            && event.sequence < paused.sequence
+            && event.kind.starts_with("session.turn.started.")
+    });
+    let Some(start) = start else {
+        return Ok(None);
+    };
+    let (Some(turn), Some(anchor)) = (
+        start.data["turnID"].as_str(),
+        start.data["anchorMessageID"].as_str(),
+    ) else {
+        return Ok(None);
+    };
+    if start.kind != "session.turn.started.1"
+        || !legacy_turn_receipt_in(connection, &state.session_id, start, "cancelled")?
+        || !legacy_cancel_checkpoint_in(connection, &state.session_id, turn, anchor)?
+    {
+        return Ok(None);
+    }
+    let Some(cancelled) = events.iter().find(|event| {
+        event.sequence > start.sequence
+            && event.sequence < paused.sequence
+            && event.kind == "session.input.receipt.1"
+            && event.data["turnId"] == turn
+            && event.data["inputId"] == anchor
+            && event.data["state"] == "cancelled"
+            && event.data["stopReason"] == "cancelled"
+    }) else {
+        return Ok(None);
+    };
+
+    let mut current_anchor = anchor.to_owned();
+    let mut last_terminal_sequence = cancelled.sequence;
+    let mut last_followup_turn = None;
+    for event in events
+        .iter()
+        .filter(|event| event.sequence > start.sequence)
+    {
+        if event.kind.starts_with("question.") || event.kind.starts_with("session.work_cycle.") {
+            // A later native authority/cycle event breaks the direct proof,
+            // even if its materialized row is absent. Never infer missing pause
+            // provenance by following previousCycleId/previousScheduling.
+            return Ok(None);
+        } else if event.kind.starts_with("session.turn.started.") {
+            // The v31 host could answer subsequent user queries without changing
+            // the original paused row. They must really have completed.
+            if event.kind != "session.turn.started.1"
+                || event.sequence <= last_terminal_sequence
+                || !legacy_turn_receipt_in(connection, &state.session_id, event, "completed")?
+            {
+                return Ok(None);
+            }
+            let Some(completed) = events.iter().find(|receipt| {
+                receipt.sequence > event.sequence
+                    && receipt.kind == "session.input.receipt.1"
+                    && receipt.data["inputId"] == event.data["anchorMessageID"]
+                    && receipt.data["turnId"] == event.data["turnID"]
+                    && receipt.data["state"] == "completed"
+                    && receipt.data["stopReason"] == "end_turn"
+            }) else {
+                return Ok(None);
+            };
+            last_terminal_sequence = completed.sequence;
+            last_followup_turn = event.data["turnID"].as_str();
+            current_anchor = event.data["anchorMessageID"]
+                .as_str()
+                .expect("validated user anchor")
+                .to_owned();
+        }
+    }
+    if token.anchor_message_id.as_deref() != Some(current_anchor.as_str()) {
+        return Ok(None);
+    }
+    if let Some(turn) = last_followup_turn {
+        // v31 record_continuation changes anchor/time during the user prelude,
+        // while leaving the scheduling gate alone. A later unexplained state
+        // write is not attributable to that prelude. This does not invent a
+        // timestamp for the original pause.
+        let prelude: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_input i JOIN session_input_receipt r ON r.input_id=i.id \
+             WHERE i.session_id=?1 AND i.id=?2 AND r.turn_id=?3 \
+               AND i.time_created<=?4 AND r.applied_at>=?4)",
+            rusqlite::params![state.session_id,current_anchor,turn,state.time_updated],
+            |row| row.get(0),
+        ).map_err(open::map_error)?;
+        if !prelude {
+            return Ok(None);
+        }
+    }
+    Ok(Some(LegacyInterruptionProof {
+        origin_cycle_id: origin.to_owned(),
+        turn_id: turn.to_owned(),
+        executing_sequence: executing.sequence,
+        turn_started_sequence: start.sequence,
+        cancellation_sequence: cancelled.sequence,
+        paused_sequence: paused.sequence,
     }))
+}
+
+/// Bound both memory and provenance work. If the relevant origin was pruned or
+/// lies beyond this window, explicit native resume remains the safe path.
+fn legacy_boundary_events_in(
+    connection: &zuno_db::Connection,
+    session_id: &str,
+) -> Result<Option<Vec<LegacyBoundaryEvent>>, zuno_error::DbError> {
+    const MAX_EVENTS: usize = 1_024;
+    let mut statement = connection
+        .prepare(
+            "SELECT seq,type,data FROM event WHERE aggregate_id=?1 AND ( \
+               (type>='session.driver.phase.' AND type<'session.driver.phase/') OR \
+               (type>='session.turn.started.' AND type<'session.turn.started/') OR \
+               (type>='session.input.receipt.' AND type<'session.input.receipt/') OR \
+               (type>='question.' AND type<'question/') OR \
+               (type>='session.work_cycle.' AND type<'session.work_cycle/')) \
+             ORDER BY seq DESC LIMIT 1025",
+        )
+        .map_err(open::map_error)?;
+    let rows = statement
+        .query_map([session_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(open::map_error)?;
+    let mut events = Vec::new();
+    for row in rows {
+        let (sequence, kind, data) = row.map_err(open::map_error)?;
+        let Ok(data) = serde_json::from_str(&data) else {
+            return Ok(None);
+        };
+        if events.len() == MAX_EVENTS {
+            return Ok(None);
+        }
+        events.push(LegacyBoundaryEvent {
+            sequence,
+            kind,
+            data,
+        });
+    }
+    events.reverse();
+    Ok(Some(events))
+}
+
+fn legacy_turn_receipt_in(
+    connection: &zuno_db::Connection,
+    session_id: &str,
+    start: &LegacyBoundaryEvent,
+    expected_state: &str,
+) -> Result<bool, zuno_error::DbError> {
+    let (Some(turn), Some(anchor)) = (
+        start.data["turnID"].as_str(),
+        start.data["anchorMessageID"].as_str(),
+    ) else {
+        return Ok(false);
+    };
+    if start.data["turnTrigger"] != "user" {
+        return Ok(false);
+    }
+    let Some(input) = zuno_db::inbox::read_in(connection, session_id, anchor)? else {
+        return Ok(false);
+    };
+    if !legacy_real_user(&input)
+        || input.state != zuno_db::inbox::SubmissionState::Consumed
+        || input.cycle_id.is_some()
+        || input.admitted_sequence >= start.sequence
+    {
+        return Ok(false);
+    }
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_input_receipt r JOIN message m ON m.id=r.input_id \
+             WHERE r.input_id=?1 AND m.session_id=?2 AND json_extract(m.data,'$.role')='user' \
+               AND r.turn_id=?3 AND r.state=?4 AND r.applied_at IS NOT NULL \
+               AND r.completed_at IS NOT NULL AND r.stop_reason=?5 AND r.error IS NULL)",
+            rusqlite::params![
+                anchor,
+                session_id,
+                turn,
+                expected_state,
+                if expected_state == "cancelled" {
+                    "cancelled"
+                } else {
+                    "end_turn"
+                },
+            ],
+            |row| row.get(0),
+        )
+        .map_err(open::map_error)
+}
+
+fn legacy_cancel_checkpoint_in(
+    connection: &zuno_db::Connection,
+    session_id: &str,
+    turn_id: &str,
+    anchor: &str,
+) -> Result<bool, zuno_error::DbError> {
+    use rusqlite::OptionalExtension as _;
+    let checkpoint: Option<String> = connection
+        .query_row(
+            "SELECT data FROM message WHERE session_id=?1 \
+               AND json_extract(data,'$.role')='assistant' \
+               AND json_extract(data,'$.turnID')=?2 ORDER BY time_created DESC,id DESC LIMIT 1",
+            [session_id, turn_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(open::map_error)?;
+    let Some(checkpoint) =
+        checkpoint.and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+    else {
+        return Ok(false);
+    };
+    Ok(checkpoint["parentID"] == anchor
+        && checkpoint["error"]["name"] == "AbortError"
+        && matches!(
+            checkpoint["error"]["data"]["reason"].as_str(),
+            Some("user_cancel" | "request_cancelled")
+        )
+        && matches!(
+            checkpoint["error"]["data"]["source"].as_str(),
+            Some("acp" | "tui" | "api")
+        ))
+}
+
+fn legacy_real_user(input: &zuno_db::inbox::SessionInput) -> bool {
+    use zuno_db::inbox::DurableInputKind as Kind;
+    // Released ACP/TUI producers used NewSessionInput's Legacy default.
+    // Executed turns additionally require turnTrigger=user.
+    matches!(
+        (input.trigger_kind, Kind::classify(&input.prompt)),
+        (
+            InputTriggerKind::User,
+            Some(Kind::User | Kind::TuiPrompt | Kind::AcpPrompt | Kind::HostMessage)
+        ) | (
+            InputTriggerKind::Legacy,
+            Some(Kind::User | Kind::TuiPrompt | Kind::AcpPrompt)
+        )
+    )
 }

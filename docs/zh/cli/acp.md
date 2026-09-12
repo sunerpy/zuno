@@ -38,7 +38,7 @@ runtime，避免重复网络或子进程握手。结构性 MCP 配置发生变�
 日志会记录锁等待、解析、关闭、打开和总耗时，但不会记录所选值或凭据。
 
 忙碌时到达的 `session/prompt` 先进入持久 inbox，再于安全点 steer 或保留排队。
-该 RPC 等待这条输入的关联处理结果，返回合法 `stopReason`，不再用 `-32001` busy
+该 RPC 等待这条输入的关联处理结果，正常完成时返回合法 `stopReason`，不再用 `-32001` busy
 表示接收成功。执行由会话持有，不依赖某个 RPC 观察者存活；`_meta.zuno.receipt`
 区分已接收、已写入历史、已进入模型与执行终态。
 
@@ -139,6 +139,41 @@ T1 的 session-only 通知如果在 T2 运行时到达，可能取消 T2。需�
 响应后复用 wire ID 会获得新的内部请求身份；使用 `_meta.zuno.messageId` 幂等重试时，
 仍只观察原持久输入。撤回不能取消无关的 Agent 到客户端 RPC。`-32800` 表示请求撤回，
 不表示工具副作用已回滚；应通过持久回执观察执行结果。
+
+## 已保存输入与执行门禁
+
+输入可以已经消费并写入历史，但原生执行仍被门禁阻止。此时 `InputAdmissionReceipt`
+保持 `recorded`，附带可选 `executionGate`，`appliedAt`、`completedAt`、`turnId`
+均缺省。门禁不会把这条已保存但未应用的输入改为 `failed`，也不证明模型已开始采样。
+
+这种情况下，`session/prompt` 返回 JSON-RPC error `-32005`，其 `error.data` 包含
+`admission: "accepted"`、`reason: "executionGated"`、`recoveryRequired: true`
+和权威 `receipt`。消息已经保存，不要作为新输入重发。重连后以相同
+`_meta.zuno.messageId` 重试，只会观察原回执。
+
+`executionGate` 包含：
+
+| 字段 | 含义 |
+| --- | --- |
+| `reason` | `user`、`authentication`、`turn_budget`、`uncertain_side_effect`、`blocked`、`waiting_human`、`waiting_external`、`no_progress`、`no_executable_work` 或 `execution_unavailable` |
+| `recovery` | `resume_work`、`resume_goal`、`start_work`、`resolve_human_request`、`wait_for_event`、`reauthenticate`、`inspect_outcome`、`review_budget` 或 `inspect_session` |
+| `executionRevision`、`cycleId` | 作出门禁决定时的原生执行 revision 与周期 |
+| `requestId`、`sourceId` | 可选的待答人工请求或所等待外部来源的身份 |
+
+恢复值只是提示，不授予权限，也不承诺一条命令即可解除门禁。`start_work` 指向 Start Work
+的 Plan 授权，`/resume` 不能代替。普通 `/resume` 必须先通过
+既有 Work、Plan、Goal、等待、认证、预算、blocked 状态及未知副作用审计，随后才把匹配的
+gated 且未应用 anchor 绑定到新周期，不会重复插入原文。直到真实 turn 绑定这条输入前，
+重复观察者仍可收到相同 gate；之后应用与完成按正常回执生命周期推进。既有 `failed`、
+`cancelled`、`applied`、`completed` 回执不会重置。
+
+这不改变普通 Stop 的边界：下一条新消息可正常运行。中断 Goal 仍需显式 Goal 恢复控制，
+旧周期 callback 也不能复活已停止的工作。
+
+自动识别旧普通停止要求没有失败桥接，且原始周期、原生事件及时间证据充分。
+既有 v0.10.32 failed 桥接缺少完整的前序暂停来源；这些桥接和未知暂停仍保留门禁。
+普通 Work 恢复需要显式 `/resume`，并通过上述全部审计，不会重开旧 `failed` 回执。
+上文的重连与恢复行为适用于本补丁中回执保持 `recorded` 的新 gated 输入。
 
 ## Goal 续跑
 

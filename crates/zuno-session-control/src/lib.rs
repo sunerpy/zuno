@@ -6,6 +6,7 @@
 //! and admits the control input before any of those facts become visible.
 
 mod goal_resume;
+mod input_gate;
 mod question;
 mod turn_boundary;
 pub use goal_resume::GoalResumeOutcome;
@@ -761,6 +762,9 @@ impl SessionControlService {
             {
                 return Err(rejected("the authorized Plan changed; obtain fresh Plan authorization"));
             }
+            if let Some(anchor) = state.continuation.as_ref().and_then(|token| token.anchor_message_id.as_deref()) {
+                input_gate::defer_input_in(tx, &state, anchor, at_ms)?;
+            }
             let continuation = ContinuationToken {
                 cycle_id: format!("cycle_{}", Uuid::now_v7().simple()),
                 identity: state.work_identity.clone().ok_or_else(|| rejected("the Work identity is missing"))?,
@@ -783,6 +787,12 @@ impl SessionControlService {
             state.time_updated = at_ms;
             let state = update_in(tx, expected_revision, state)?;
             Self::authorize_cycle_in(tx, session_id, state.continuation.as_ref().expect("resume token"), at_ms)?;
+            let continuation = state.continuation.as_ref().expect("resume token");
+            if let Some(anchor) = &continuation.anchor_message_id {
+                zuno_db::input_receipt::recover_gated_input_in(
+                    tx, session_id, anchor, &continuation.cycle_id, at_ms,
+                )?;
+            }
             Ok(ResumeWorkOutcome { state, input })
         })
     }

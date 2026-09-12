@@ -5,7 +5,8 @@ use std::sync::Arc;
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 use zuno_error::DbError;
 use zuno_types::admission::{
-    InputAdmissionReceipt, InputReceiptDelivery, InputReceiptState, InputStopReason,
+    InputAdmissionReceipt, InputExecutionGate, InputReceiptDelivery, InputReceiptState,
+    InputStopReason,
 };
 
 use crate::event_log::{NewSessionEvent, append_in, query_error};
@@ -172,6 +173,83 @@ impl InputReceiptStore {
         })
     }
 
+    /// An old drive may finish after native recovery has taken over. Only the
+    /// still-current original cycle may fail an unbound, never-applied input.
+    /// Eligibility and mutation share one transaction, including gate projection.
+    pub fn fail_unapplied_input(
+        &self,
+        session_id: &str,
+        input_id: &str,
+        expected_cycle: &str,
+        error: &str,
+        cancelled: bool,
+        at_ms: i64,
+    ) -> Result<bool, DbError> {
+        self.fail_unapplied_in_scope(
+            session_id,
+            input_id,
+            Some(expected_cycle),
+            error,
+            cancelled,
+            at_ms,
+        )
+    }
+
+    /// A failure before history persistence may only retire an input that is
+    /// still unconsumed and unbound. An absent locally captured cycle is not
+    /// evidence that another owner has not already promoted the input.
+    pub fn fail_unrecorded_input(
+        &self,
+        session_id: &str,
+        input_id: &str,
+        error: &str,
+        cancelled: bool,
+        at_ms: i64,
+    ) -> Result<bool, DbError> {
+        self.fail_unapplied_in_scope(session_id, input_id, None, error, cancelled, at_ms)
+    }
+
+    fn fail_unapplied_in_scope(
+        &self,
+        session_id: &str,
+        input_id: &str,
+        expected_cycle: Option<&str>,
+        error: &str,
+        cancelled: bool,
+        at_ms: i64,
+    ) -> Result<bool, DbError> {
+        self.pool.transaction(|tx| {
+            let Some(receipt) = get_in(tx, session_id, input_id)? else {
+                return Ok(false);
+            };
+            if receipt.state.is_terminal() || receipt.execution_gate.is_some()
+                || receipt.turn_id.is_some() || receipt.applied_at.is_some()
+            {
+                return Ok(false);
+            }
+            let error = &error[..error.floor_char_boundary(4_096)];
+            let changed = tx.execute(
+                "UPDATE session_input_receipt
+                 SET state=?4,error=?5,completed_at=?6,stop_reason=?7,time_updated=MAX(time_updated,?6)
+                 WHERE input_id=?1 AND turn_id IS NULL AND applied_at IS NULL
+                   AND state IN ('admitted','recorded')
+                   AND EXISTS(SELECT 1 FROM session_input i WHERE i.id=?1 AND i.session_id=?2
+                       AND ((?3 IS NULL AND i.cycle_id IS NULL
+                             AND i.state IN ('queued','steering','promoted'))
+                            OR (?3 IS NOT NULL AND i.cycle_id=?3 AND EXISTS(
+                                SELECT 1 FROM session_execution_state s
+                                WHERE s.session_id=i.session_id AND s.cycle_id=?3))))",
+                params![input_id, session_id, expected_cycle,
+                    if cancelled { "cancelled" } else { "failed" },
+                    error, at_ms, cancelled.then_some("cancelled")],
+            ).map_err(map_error)?;
+            if changed != 0 {
+                publish_in(tx, session_id, input_id)?;
+            }
+            Ok(changed != 0)
+        })
+    }
+
     /// Transfer pending receipts only for an explicitly recovered logical turn.
     pub fn handoff_turn(
         &self,
@@ -278,6 +356,7 @@ struct RawReceipt {
     completed_at: Option<i64>,
     stop_reason: Option<String>,
     error: Option<String>,
+    execution_gate: Option<String>,
     time_updated: i64,
 }
 
@@ -289,7 +368,13 @@ pub fn get_in(
     let raw = connection
         .query_row(
             "SELECT i.session_id,i.id,i.source_key,i.admitted_seq,r.delivery,r.state,
-                r.turn_id,r.applied_at,r.completed_at,r.stop_reason,r.error,r.time_updated
+                r.turn_id,r.applied_at,r.completed_at,r.stop_reason,r.error,r.time_updated,
+                CASE WHEN r.state='recorded' AND r.turn_id IS NULL AND r.applied_at IS NULL
+                THEN (SELECT json_extract(e.data,'$.gate') FROM event e
+                      WHERE e.aggregate_id=i.session_id AND e.seq>=i.admitted_seq
+                        AND e.type='session.input.execution_gate.1'
+                        AND json_extract(e.data,'$.inputId')=i.id
+                      ORDER BY e.seq DESC LIMIT 1) END
          FROM session_input i JOIN session_input_receipt r ON r.input_id=i.id
          WHERE i.session_id=?1 AND i.id=?2",
             params![session_id, input_id],
@@ -307,6 +392,7 @@ pub fn get_in(
                     stop_reason: row.get(9)?,
                     error: row.get(10)?,
                     time_updated: row.get(11)?,
+                    execution_gate: row.get(12)?,
                 })
             },
         )
@@ -337,10 +423,105 @@ pub fn get_in(
             completed_at: raw.completed_at,
             stop_reason,
             error: raw.error,
+            execution_gate: raw
+                .execution_gate
+                .map(|value| serde_json::from_str(&value).map_err(query_error))
+                .transpose()?,
             time_updated: raw.time_updated,
         })
     })
     .transpose()
+}
+
+/// Record a native gate without inventing failure, cancellation or model usage.
+/// Caller holds the execution-state transaction and owns this consumed input.
+pub fn record_execution_gate_in(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    input_id: &str,
+    gate: &InputExecutionGate,
+    at_ms: i64,
+) -> Result<bool, DbError> {
+    let Some(receipt) = get_in(tx, session_id, input_id)? else {
+        return Ok(false);
+    };
+    if receipt.state != InputReceiptState::Recorded
+        || receipt.turn_id.is_some()
+        || receipt.applied_at.is_some()
+    {
+        return Ok(false);
+    }
+    if gate.execution_revision < 1 || gate.cycle_id.trim().is_empty() {
+        return Err(conflict(input_id, "invalid native execution gate"));
+    }
+    if receipt.execution_gate.as_ref() == Some(gate) {
+        return Ok(true);
+    }
+    let changed = tx
+        .execute(
+            "UPDATE session_input_receipt SET time_updated=MAX(time_updated,?3)
+         WHERE input_id=?1 AND state='recorded' AND turn_id IS NULL AND applied_at IS NULL
+         AND EXISTS(SELECT 1 FROM session_input i WHERE i.id=?1 AND i.session_id=?2
+                    AND i.state='consumed' AND i.cycle_id=?4)",
+            params![input_id, session_id, at_ms, gate.cycle_id],
+        )
+        .map_err(map_error)?;
+    if changed == 0 {
+        return Ok(false);
+    }
+    append_in(
+        tx,
+        session_id,
+        NewSessionEvent::new(
+            "session.input.execution_gate",
+            serde_json::json!({"inputId":input_id,"gate":gate,"time":at_ms})
+                .as_object()
+                .expect("object")
+                .clone(),
+        )?,
+    )?;
+    publish_in(tx, session_id, input_id)?;
+    Ok(true)
+}
+
+/// Carry only a positively identified, never-applied input into an explicitly
+/// authorized recovery cycle. Keep its gate receipt until a real turn binds it:
+/// a duplicate observer in the handoff gap must not infer execution or failure.
+pub fn recover_gated_input_in(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    input_id: &str,
+    cycle_id: &str,
+    at_ms: i64,
+) -> Result<bool, DbError> {
+    let Some(receipt) = get_in(tx, session_id, input_id)? else {
+        return Ok(false);
+    };
+    let Some(gate) = receipt.execution_gate else {
+        return Ok(false);
+    };
+    let changed = tx.execute(
+        "UPDATE session_input SET cycle_id=?3,revision=revision+1,time_updated=MAX(time_updated,?4)
+         WHERE id=?1 AND session_id=?2 AND state='consumed' AND cycle_id=?5
+           AND EXISTS(SELECT 1 FROM session_input_receipt r WHERE r.input_id=?1
+                      AND r.state='recorded' AND r.turn_id IS NULL AND r.applied_at IS NULL)",
+        params![input_id, session_id, cycle_id, at_ms, gate.cycle_id],
+    ).map_err(map_error)?;
+    if changed != 0 {
+        append_in(
+            tx,
+            session_id,
+            NewSessionEvent::new(
+                "session.input.execution_recovered",
+                serde_json::json!({"inputId":input_id,"originCycleId":gate.cycle_id,
+                "cycleId":cycle_id,"time":at_ms})
+                .as_object()
+                .expect("object")
+                .clone(),
+            )?,
+        )?;
+    }
+    Ok(changed != 0)
 }
 
 fn publish_in(tx: &Transaction<'_>, session_id: &str, input_id: &str) -> Result<(), DbError> {

@@ -2368,6 +2368,7 @@ fn runtime_consistency_guides_publish_the_native_contracts_and_source_mapping() 
                 "InputAdmissionReceipt",
                 "GoalResumeRequest",
                 "ContextUsageSnapshot",
+                "executionGate",
                 "73,948",
                 "149,501",
                 "repair-history",
@@ -2395,6 +2396,10 @@ fn runtime_consistency_guides_publish_the_native_contracts_and_source_mapping() 
                 "_meta.zuno.receipt",
                 "stopReason",
                 "Resume goal / Keep paused",
+                "executionGate",
+                "executionGated",
+                "-32005",
+                "/resume",
             ],
         );
     }

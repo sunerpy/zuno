@@ -162,13 +162,36 @@ An interrupted Goal remains paused. Independent conversation still works; resumi
 the Goal requires the explicit Resume goal choice or `/goal resume`. Skipping the
 choice is not consent. Approval, Plan, authentication, budget and uncertain-side-effect
 barriers remain separate. `/resume` never certifies that an uncertain operation was
-inspected. Unidentified legacy pauses are retained; only matching typed interruption
-evidence can classify an old pause as an ordinary stopped turn when new input arrives.
+inspected.
 
-After confirmation the interface keeps the stopping state visible and suppresses late
+An old ordinary pause can be recognized automatically when new user input arrives
+only if there is no failed bridge and the original cycle, native events, and
+timing provide sufficient interruption evidence. Successful follow-up replies
+alone do not establish that authority. Existing v0.10.32 failed bridges did not
+retain complete preceding pause provenance, so they and unknown pauses remain
+gated and require explicit `/resume` for ordinary Work recovery. All existing
+recovery checks still apply. Finding a cancellation elsewhere in history is not
+enough; old failed receipts are not reset, reopened, or replayed.
+
+After a stop is confirmed, the interface keeps the stopping state visible and suppresses late
 provider or tool output until a terminal event establishes the boundary. Durable
 persistence still runs. A side effect that completed before cancellation remains an
 observed result and is never mechanically replayed.
+
+An execution gate is different from rejecting a message. If a new input was saved
+to history but could not be applied, its receipt stays `recorded` and carries
+`executionGate`, without `appliedAt`, `completedAt`, or `turnId`. ACP reports
+`-32005` with `admission: "accepted"` and `reason: "executionGated"`. Do not
+resend the message: inspect the receipt's recovery hint and the recorded gate.
+The hint does not authorize recovery or bypass any of the barriers above.
+
+When ordinary `/resume` passes its native checks, it carries only the matching
+gated, unapplied anchor into the new cycle, without recording the text twice.
+A duplicate message-ID request may still observe the same gate until a real
+turn binds the input; normal application and completion follow. This does not
+reset existing failed, cancelled, applied, or completed receipts, resume a paused
+Goal, or authorize old callbacks. See [ACP execution gates](/cli/acp#saved-input-and-execution-gates)
+for the receipt fields and client behavior.
 
 ## Retry and recovery
 
