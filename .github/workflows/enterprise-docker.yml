@@ -15,10 +15,11 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+    timeout-minutes: 25
     env:
       CARGO_INCREMENTAL: "0"
       ZUNO_POSTGRES_BINDIR: /usr/lib/postgresql/16/bin
+      ZUNO_ENTERPRISE_WEB_DIST: ${{ github.workspace }}/enterprise/web/dist
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -30,6 +31,20 @@ jobs:
         with:
           prefix-key: enterprise-preview-docker
           key: ${{ runner.os }}-${{ runner.arch }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            enterprise/sdk/package-lock.json
+            enterprise/web/package-lock.json
+      - name: Prepare the actual Web bundle and native browser
+        run: |
+          npm --prefix enterprise/sdk ci --ignore-scripts --no-audit --no-fund
+          npm --prefix enterprise/web ci --ignore-scripts --no-audit --no-fund
+          npm --prefix enterprise/web run build
+          cd enterprise/web
+          npx playwright install --with-deps chromium
       - name: Ensure rootless prerequisites
         run: |
           set -euo pipefail

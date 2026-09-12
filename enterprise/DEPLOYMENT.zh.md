@@ -56,6 +56,7 @@ Shell 语法需要显式调用 shell；它不替换个人 shell 的完整语义�
 | `activeDefinitions` | 新会话明确选择的 `{id,version}` |
 | `leaseMillis` | 数据库租期，1000–300000，默认 30000 |
 | `browser` | 可选 OIDC BFF 配置 |
+| `webAssetsDirectory` | 可选 Web 资源包绝对目录，必须同时配置 `browser` |
 
 签名文件保存原始密钥字节，由 authority 校验长度和轮换集合；密钥值不能放入定义或请求 DTO。
 
@@ -68,6 +69,8 @@ Entra 使用对应的 `config`。Introspection 使用 `config`、`clientId` 和
 可选 browser 配置包含 `authority`、`clientId`、`clientSecretFile`、`redirectUri`、
 `scopes`、可选 `rootCertificate` 及 `encryptionKeys`，通过 OIDC code／PKCE 和同一
 用户 verifier 登录。详见 [BFF](BROWSER.zh.md)。
+可选 [Web 工作台](WEB.zh.md) 位于 `/app/`，预览压缩包的 `web/` 目录包含已验证资源。
+部署静态资源不会启用其他能力，也不会放宽认证。
 
 ## 初始化与身份检查
 
@@ -97,8 +100,8 @@ rootless Docker 验证双用户、私有 Memory 读写及提示刷新、审批�
 父／子工作区分支、十四次模型请求、四次命令审批、两个 Worker 参与、每命令一次操作及 SIGTERM
 退出。这是测试提供商证据，不是实际 Entra 租户验证。
 
-工作区初始导入、后台／共享 Memory、Workflow／Council、公共历史／临时事件、
-React／ACP 及完整故障矩阵仍需继续完成。构建此二进制不会启用预览发布。
+工作区初始导入、后台／共享 Memory、子工作区审批合并、Workflow／Council、剩余
+Web／ACP 功能及完整故障矩阵仍需继续完成。构建此二进制不会启用预览发布。
 
 参见 [English](DEPLOYMENT.md)、[平台](PLATFORMS.zh.md)及[进度](STATUS.md)。
 

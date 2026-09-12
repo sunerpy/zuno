@@ -244,10 +244,25 @@ async fn start(
         .post(base.join(LOGIN_PATH).unwrap())
         .header(header::ORIGIN, base.origin().ascii_serialization())
         .header(CSRF_HEADER, "1")
+        .header(
+            header::ACCEPT,
+            if subject == "alice" {
+                "application/json"
+            } else {
+                "text/html"
+            },
+        )
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.status(),
+        if subject == "alice" {
+            StatusCode::OK
+        } else {
+            StatusCode::SEE_OTHER
+        }
+    );
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     let binding = cookie(response.headers(), LOGIN_COOKIE);
     let attributes = response
@@ -261,7 +276,12 @@ async fn start(
     for attribute in ["Secure", "HttpOnly", "SameSite=Lax", "Path=/"] {
         assert!(attributes.contains(attribute))
     }
-    let location = url::Url::parse(response.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+    let location = if subject == "alice" {
+        let value: Value = response.json().await.unwrap();
+        url::Url::parse(value["authorizationUrl"].as_str().unwrap()).unwrap()
+    } else {
+        url::Url::parse(response.headers()[header::LOCATION].to_str().unwrap()).unwrap()
+    };
     let fields = location
         .query_pairs()
         .into_owned()
@@ -519,6 +539,37 @@ async fn browsers_use_pkce_across_bff_replicas_and_keep_sessions_private_revocab
     )
     .await
     .unwrap();
+    let correct_context = serde_json::to_string(&[
+        a["tenantId"].as_str().unwrap(),
+        a["principalId"].as_str().unwrap(),
+        a["clientId"].as_str().unwrap(),
+    ])
+    .unwrap();
+    assert_eq!(
+        client
+            .get(application_url.clone())
+            .header(header::COOKIE, &alice)
+            .header("x-zuno-browser-context", &correct_context)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        client
+            .get(application_url.clone())
+            .header(header::COOKIE, &alice)
+            .header(
+                "x-zuno-browser-context",
+                "[\"browser-http\",\"another-account\",\"web\"]"
+            )
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
     let creation =
         json!({"requestId":"browser-session","workspaceId":"workspace","title":"Browser work"});
     assert_eq!(

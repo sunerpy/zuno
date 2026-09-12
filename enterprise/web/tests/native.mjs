@@ -1,0 +1,45 @@
+// Invoked only by the real TLS/PostgreSQL/Docker executable fixture.
+import { chromium, expect } from "@playwright/test";
+const origin = new URL(process.argv[2]).origin;
+const browser = await chromium.launch();
+try {
+  const context = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1280, height: 900 } });
+  const page = await context.newPage();
+  const errors = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  const response = await page.goto(`${origin}/app/`);
+  expect(response.headers()["content-security-policy"]).not.toContain("unsafe-inline");
+  const notModified = await context.request.get(`${origin}/app/`, { headers: { "if-none-match": response.headers().etag } });
+  expect(notModified.status()).toBe(304);
+  const notice = await context.request.get(`${origin}/app/assets/licenses.txt`);
+  expect(notice.status()).toBe(200);
+  expect(notice.headers()["content-type"]).toContain("text/plain");
+  expect(await notice.text()).toContain("SIL OPEN FONT LICENSE");
+  expect((await context.request.get(`${origin}/app/assets/unknown.key`)).status()).toBe(404);
+  await page.getByRole("button", { name: "使用企业账号登录" }).click();
+  await expect(page.getByRole("heading", { name: "开始一项任务" })).toBeVisible();
+  const cookie = (await context.cookies()).find((cookie) => cookie.name === "__Host-zuno_preview_session");
+  expect(cookie?.httpOnly).toBe(true); expect(cookie?.secure).toBe(true);
+  const sessions = page.locator(".session-row");
+  expect(await sessions.count()).toBeGreaterThan(0);
+  await sessions.first().click();
+  await expect(page.getByText("Run once for alice", { exact: true })).toBeVisible();
+  await expect(page.getByText("Run once for bob", { exact: true })).not.toBeAttached();
+  await page.getByRole("button", { name: "＋ 新建会话" }).click();
+  await page.getByLabel("任务内容").fill("BROWSER-PROBE alice");
+  await page.getByRole("button", { name: "发送 ↑", exact: true }).click();
+  await expect(page.getByRole("button", { name: "查看审批", exact: true })).toBeVisible({ timeout: 30000 });
+  await expect(page.getByText("BROWSER-COMPLETE: 已完成批准的命令。", { exact: true })).not.toBeAttached();
+  await page.getByRole("button", { name: "查看审批", exact: true }).click();
+  await expect(page.locator(".details-panel")).toContainText("browser-operation-ok");
+  await page.getByRole("button", { name: "批准此操作" }).click();
+  await expect(page.locator(".details-panel").getByText("已批准", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "关闭详情" }).click();
+  await expect(page.getByText("BROWSER-COMPLETE: 已完成批准的命令。", { exact: true })).toBeVisible({ timeout: 30000 });
+  expect(await page.evaluate(() => [localStorage.length, sessionStorage.length])).toEqual([0, 0]);
+  expect(errors).toEqual([]);
+  if (process.env.ZUNO_WEB_NATIVE_OUTPUT) await page.screenshot({ path: process.env.ZUNO_WEB_NATIVE_OUTPUT });
+  await page.getByRole("button", { name: "退出登录" }).click();
+  await expect(page.getByRole("heading", { name: "进入你的工作区" })).toBeVisible();
+  console.log("Native Web: OIDC/PKCE login, private history, input admission, explicit approval, Docker receipt, continued model output and logout passed");
+} finally { await browser.close(); }

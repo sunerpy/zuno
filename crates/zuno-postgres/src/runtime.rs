@@ -1,6 +1,7 @@
 //! Tenant-bound scheduling in the data owner, never in an Agent Worker.
 
 mod admission;
+pub(crate) use admission::request_key;
 pub(crate) mod children;
 mod control;
 mod store;

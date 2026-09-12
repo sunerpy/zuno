@@ -7,8 +7,8 @@ and ACP clients.
 
 ## Delivery status
 
-The preview starts from Zuno v0.10.29 at
-`d1212860dba6a6b420ce81d444ace58feaf0adb5`. Enterprise features are not advertised
+The preview originally started from Zuno v0.10.29 and now incorporates v0.10.31 at
+`5619205d60aef572e484646dd9ab0563e1ef8066`. Enterprise features are not advertised
 until their provider, consumer, entry point, and acceptance tests are present.
 See [STATUS.md](STATUS.md) for completed work and remaining gates.
 
@@ -82,6 +82,8 @@ Child workspace forks and executable target configuration: [English](WORKSPACES.
 Durable job/tree cancellation and observed process stops: [English](CONTROL.md), [中文](CONTROL.zh.md).
 
 Public activity enums, history and TypeScript SDK: [English](ACTIVITY.md), [中文](ACTIVITY.zh.md).
+
+React session workbench, browser validation and static deployment: [English](WEB.md), [中文](WEB.zh.md).
 
 Preview documentation archives contain the tracked guides, example configurations
 and license notices from the exact release commit. Local edits and untracked files

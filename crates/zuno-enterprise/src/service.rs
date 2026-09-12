@@ -279,6 +279,9 @@ async fn gateway(
 }
 
 async fn control(options: ControlConfig, shutdown: InterruptSignal) -> Result<(), Error> {
+    if options.web_assets_directory.is_some() && options.browser.is_none() {
+        return Err(invalid("Web assets require browser OIDC configuration"));
+    }
     let lease = options.lease()?;
     let backend = PostgresBackend::connect(options.database.options().await?).await?;
     let users = crate::identity::verifier(&options.user_identity).await?;
@@ -383,6 +386,9 @@ async fn control(options: ControlConfig, shutdown: InterruptSignal) -> Result<()
         routes = routes
             .merge(application.browser_router(&browser))
             .merge(browser.router());
+    }
+    if let Some(directory) = &options.web_assets_directory {
+        routes = routes.merge(crate::web::WebAssets::load(directory).await?.router());
     }
     crate::http::serve(&options.tls, routes, shutdown).await
 }

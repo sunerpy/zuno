@@ -15,6 +15,24 @@ pub struct ClientJobState {
 }
 
 impl PostgresBackend {
+    pub async fn client_submission(
+        &self,
+        principal: &PrincipalScope,
+        session: &SessionId,
+        request: &zuno_types::identity::RequestId,
+    ) -> Result<ClientJobState, ApplicationError> {
+        let id = JobId::new(format!(
+            "job_{}",
+            runtime::request_key(principal, session, request)
+        ))
+        .map_err(ApplicationError::storage)?;
+        let state = self.client_job(principal, &id).await?;
+        if state.job.session_id != *session {
+            return Err(ApplicationError::Conflict);
+        }
+        Ok(state)
+    }
+
     pub async fn client_job(
         &self,
         principal: &PrincipalScope,

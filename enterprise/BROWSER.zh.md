@@ -1,9 +1,8 @@
 # 企业浏览器认证
 
 BFF 复用[通用 OAuth2／OIDC 适配器](AUTHENTICATION.zh.md)，Entra 是其中一种提供商
-配置。`EnterpriseBrowser` 已有真实的登录、回调、会话查询和注销处理器，作为宿主装配
-组件提供；企业 CLI 启动、Profile 装配和 React 应用仍有独立交付要求，见
-[实施状态](STATUS.md)。
+配置。`EnterpriseBrowser` 提供真实的登录、回调、会话查询和注销处理器。企业控制面
+角色装配 BFF，并可从已校验静态资源包提供 [React 工作台](WEB.zh.md)。
 
 ## 接口与归属
 
@@ -68,7 +67,7 @@ nonce、时间、authorized party，以及存在时的 access-token hash。资�
 
 | 请求 | 行为 |
 | --- | --- |
-| `POST /auth/login` | 持久化登录事务、设置绑定 Cookie，携带 code＋PKCE 参数跳转 |
+| `POST /auth/login` | 持久化登录事务并设置绑定 Cookie；`Accept: application/json` 返回 `{authorizationUrl}`，其他请求携带 code＋PKCE 参数跳转 |
 | `GET /auth/callback` | 校验绑定 state、单次消费、兑换并验证 token、创建不透明会话，跳转 `/` |
 | `GET /auth/session` | 返回经过认证的租户、主体、应用和到期时间 |
 | `POST /auth/logout` | 撤销当前会话并使 Cookie 到期 |
@@ -91,14 +90,20 @@ Cookie 名为 `__Host-zuno_preview_login` 和 `__Host-zuno_preview_session`，
 所有者事务中检查当前组织策略，不能凭该中间件授予工具或 Memory 权限。外部 Bearer
 API 和内部 Worker 接口保留独立认证边界。
 
+Web 登录请求接收 JSON，再通过顶层导航进入返回的 HTTPS 认证地址，避免 fetch 跟随
+跨域 IdP 重定向。已登录 Web 请求还通过 `x-zuno-browser-context` 携带 JSON
+`[tenantId, principalId, clientId]`；提供该头时必须与 Cookie 验证后的身份完全一致，
+重复或不匹配均拒绝。它防止旧标签页在 Cookie 换号后借新账号提交，不能替代认证及当前
+组织授权。
+
 ## 恢复与验证
 
 Token POST 不重定向、不自动重试。响应丢失或失败后重新登录，不能重放已消费的授权
 事务。状态服务故障返回不可用；注销未提交时保留 Cookie，允许用户重试。
 
 会话按期限到期并支持本地注销。本阶段未实现 refresh token、IdP back-channel logout
-或真实 Entra 应用注册。当前组织授权独立于上游 token 有效期；真实提供商及浏览器 UI
-仍需单独运行证据。
+或真实 Entra 应用注册。当前组织授权独立于上游 token 有效期；真实提供商仍需单独
+验收，原生浏览器／服务验证见 [Web](WEB.zh.md)。
 
 运行 `cargo test -p zuno-identity` 和 `python3 scripts/check_enterprise_postgres.py`。
 后者使用临时 TLS 证书、RSA 签名的真实 HTTPS OIDC 测试服务、两个 BFF 实例及

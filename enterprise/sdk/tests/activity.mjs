@@ -65,6 +65,32 @@ test("a bounded history window preserves the committed cursor", () => {
   assert.deepEqual(state.items().map((row) => row.record.id), ["b", "c"]);
 });
 
+test("older history remains readable past the window limit while live commits advance", () => {
+  const state = new ActivityState("session", 2);
+  state.replaceHistory(history([item(3, 3, "c"), item(4, 4, "d")], 4));
+  state.mergeHistory(history([item(1, 1, "a"), item(2, 2, "b")], 4), { retain: "older" });
+  state.apply(page([frame(5, "e"), frame(6, "a", "updated", 1)]));
+  assert.equal(state.cursor, "6");
+  assert.equal(state.historicalWindow, true);
+  assert.deepEqual(state.items().map((row) => row.record.id), ["a", "b"]);
+  assert.equal(state.items()[0].record.item.content[0].text, "updated");
+  state.replaceHistory(history([item(4, 4, "d"), item(5, 5, "e")], 6));
+  assert.equal(state.historicalWindow, false);
+  assert.deepEqual(state.items().map((row) => row.record.id), ["d", "e"]);
+});
+
+test("a late historical page cannot resurrect a removed record", () => {
+  const state = new ActivityState("session", 2);
+  state.replaceHistory(history([item(2, 2, "b")], 2));
+  state.apply(page([{ version: 1, sessionId: "session", sequence: "3", event: { kind: "remove", id: "a" } }]));
+  state.mergeHistory(history([item(1, 1, "a")], 2), { retain: "older" });
+  assert.deepEqual(state.items().map((row) => row.record.id), ["b"]);
+  const removals = ["b", "c"].map((id, i) => ({ version: 1, sessionId: "session", sequence: String(i + 4), event: { kind: "remove", id } }));
+  assert.throws(() => state.apply(page(removals)), /bounded removal window/);
+  assert.equal(state.cursor, "3");
+  assert.deepEqual(state.items().map((row) => row.record.id), ["b"]);
+});
+
 test("invalid protocol data and private envelope fields are rejected", () => {
   for (const change of [
     (value) => { value.version = 2; },

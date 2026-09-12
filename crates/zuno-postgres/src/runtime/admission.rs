@@ -1,6 +1,20 @@
 //! Shared root admission for authenticated user input and native completion delivery.
 use super::*;
 
+pub(crate) fn request_key(
+    principal: &PrincipalScope,
+    session: &SessionId,
+    request: &zuno_types::identity::RequestId,
+) -> String {
+    zuno_orchestration::sha256_json(&json!([
+        "root-job",
+        principal.owner(),
+        principal.client_id(),
+        session,
+        request
+    ]))
+}
+
 pub(super) async fn root_in(
     tx: &mut Transaction<'_, Postgres>,
     principal: &PrincipalScope,
@@ -23,13 +37,7 @@ pub(super) async fn root_in(
     // Every session/input writer acquires this row before runtime state.
     let session = read_session(tx, principal, request.session_id.as_str(), true).await?;
     let owner = principal.owner();
-    let key = zuno_orchestration::sha256_json(&json!([
-        "root-job",
-        owner,
-        principal.client_id(),
-        request.session_id,
-        request.request_id,
-    ]));
+    let key = request_key(principal, &request.session_id, &request.request_id);
     let id = format!("job_{key}");
     let digest = zuno_orchestration::sha256_json(&match completion {
         Some(envelope) => json!([request, envelope]),

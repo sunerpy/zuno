@@ -2,9 +2,8 @@
 
 The BFF uses the [general OAuth2/OIDC adapter](AUTHENTICATION.md). Entra is one
 provider configuration. `EnterpriseBrowser` has real login, callback, session
-and logout handlers; it is a host assembly component, not a registered
-enterprise CLI command. Runtime/profile startup and the React application remain
-separate work recorded in [STATUS.md](STATUS.md).
+and logout handlers. The enterprise control-plane role mounts the BFF and
+optionally serves the [React workbench](WEB.md) from a validated static bundle.
 
 ## Ports and ownership
 
@@ -80,7 +79,7 @@ does not supply browser identity proof through this login flow.
 
 | Request | Behavior |
 | --- | --- |
-| `POST /auth/login` | Persist a login transaction, set its binding cookie, redirect with code + PKCE parameters |
+| `POST /auth/login` | Persist a login transaction and set its binding cookie; return `{authorizationUrl}` for `Accept: application/json`, otherwise redirect with code + PKCE parameters |
 | `GET /auth/callback` | Validate the bound state, consume it once, exchange and verify tokens, create an opaque session, redirect to `/` |
 | `GET /auth/session` | Return the authenticated tenant, principal, application and expiry |
 | `POST /auth/logout` | Revoke the current session and expire its cookie |
@@ -110,6 +109,14 @@ transactional authorization; this middleware does not grant tool or Memory
 permissions. External bearer API and internal Worker routes use their own
 authentication surfaces.
 
+The Web login request asks for JSON and performs a top-level navigation to the
+returned HTTPS authorization URL. Fetch does not follow a cross-origin IdP
+redirect. Authenticated Web requests also carry `x-zuno-browser-context` as a
+JSON tuple `[tenantId, principalId, clientId]`. When supplied, it must exactly
+match the verified cookie identity; duplicates and mismatches are rejected.
+This prevents a stale tab from submitting under another account after a cookie
+change and never replaces authentication or current organization authorization.
+
 ## Recovery and validation
 
 Token exchange does not follow redirects or retry POSTs. A lost/failed response
@@ -120,8 +127,8 @@ success or a guessed logout; a failed logout keeps the cookie for retry.
 Sessions expire at their bounded deadline and support explicit local logout.
 This phase does not implement refresh tokens, IdP back-channel logout or a live
 Entra app registration. Current organization authorization is independent of
-upstream token expiry. Live-provider and real browser UI validation remain
-separate acceptance evidence.
+upstream token expiry. Live-provider validation remains separate acceptance
+evidence; native browser/service validation is described in [Web](WEB.md).
 
 Run `cargo test -p zuno-identity` and
 `python3 scripts/check_enterprise_postgres.py`. The latter uses temporary TLS

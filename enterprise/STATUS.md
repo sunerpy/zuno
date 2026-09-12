@@ -9,7 +9,7 @@ Original baseline: `v0.10.29`, `d1212860dba6a6b420ce81d444ace58feaf0adb5`.
 | P2 | In progress | PostgreSQL, generic OAuth2/OIDC, BFF, scoped private Memory, organization policy and HITL integrated; shared/automatic Memory and full fault acceptance remain |
 | P3 | In progress | Independent control/gateway/two-Worker executable loop validated; full fault/operational acceptance remains |
 | P4 | In progress | Child dispatch, persistent waits, workspace forks and Job cancellation implemented; approved merge and Workflow/Council remain |
-| P5 | In progress | Public enums, transactional history/frames and generated TypeScript activity SDK implemented; live producers, Web, full ACP/TUI adapters remain |
+| P5 | In progress | Public enums, transactional history/frames, live progress, generated SDK and session Web workbench implemented; remaining Web features and full ACP/TUI adapters remain |
 | P6 | Pending | Fault injection, native artifacts, preview publication |
 
 Publication remains disabled until the first runnable root-task preview has
@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p5-live`.
+- Current phase branch: `codex/enterprise-p5-web`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -400,3 +400,13 @@ CI run 34676688599 subsequently passed all gates at `9d558b7b360289dc9d6a428bc4f
 - Worker-side coalescing, private authenticated writes, active-only public snapshot reads and SDK generation handling are implemented. Original message/Job identity, lease and sequence fence publication. Checkpoints/retries/execution changes clear drafts; no encrypted fields or authoritative usage enter live frames.
 - PostgreSQL format 14 has exact format-13 migration/rollback coverage. PostgreSQL/HTTPS and 12 SDK tests pass, including observation before provider completion. Final native Docker/PostgreSQL/HTTPS/independent-process, workspace check/Clippy, docs/release-surface and formatting gates pass.
 - React Web, full ACP/TUI, approved workspace merge, Workflow/Council, remaining Memory producers and P6 work continue. Preview publication remains disabled.
+
+## React session workbench
+
+- Live progress PR #214 passed CI 34691457384 and merged only into preview at `8806d2a67d0e29f28396dee09dffa0d08e52407c`.
+- Public application DTOs now generate Schema/TypeScript/standalone validators. The SDK adds actual session, admission-receipt, Job/control and approval methods. Older history remains readable inside a bounded window while live cursors advance.
+- React implements owned sessions, input admission, folded thinking, typed invocation details, explicit approvals, reconnect recovery, focus-managed mobile drawers, dark mode and reduced motion. Uncertain submissions retain their original input and ID; stale account/session responses cannot replace current content.
+- Control-plane `webAssetsDirectory` serves a bounded immutable bundle only with OIDC configured. JSON login navigation and verified browser-context binding preserve the BFF authority. The preview workflow packages the client job's tested bundle with both native Linux binaries.
+- Seven Chromium fixture scenarios and seventeen SDK tests pass. Real TLS/PostgreSQL/Docker/four-process verification also passes with Chromium login, private history, explicit command approval and continued model output. The identity/model issuer is a fixture. Workspace check/Clippy, formatting, 100 documentation/release contracts and preview workflow checks pass. Remote preview CI remains required before integration.
+- The linked Figma workbench uses existing design-system controls and was compared with the rendered browser. Temporary capture content was removed. EN/ZH Web/deployment/auth/API guides and preview entry links are updated; generated client contracts are committed together. Stable docs publication does not apply to this preview-only delivery.
+- Remaining Web management/run-graph/Memory features, full ACP/TUI, approved child merge, Workflow/Council, remaining Memory producers and P6 remain active. No preview release is enabled by this batch.

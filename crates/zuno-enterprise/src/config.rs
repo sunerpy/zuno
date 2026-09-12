@@ -212,6 +212,9 @@ pub struct ControlConfig {
     pub definitions: Vec<PathBuf>,
     pub active_definitions: Vec<DefinitionKey>,
     pub browser: Option<BrowserConfig>,
+    /// Optional immutable browser bundle; requires the OIDC BFF.
+    #[serde(default)]
+    pub web_assets_directory: Option<PathBuf>,
     #[serde(default)]
     pub memory: MemoryConfig,
     #[serde(default = "lease")]

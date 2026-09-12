@@ -172,6 +172,18 @@ async fn authenticate(
     next: Next,
 ) -> Result<Response, Failure> {
     let identity = service.identity(request.headers()).await?;
+    const CONTEXT: &str = "x-zuno-browser-context";
+    if request.headers().contains_key(CONTEXT) {
+        let expected = serde_json::to_string(&[
+            identity.tenant_id().as_str(),
+            identity.principal_id().as_str(),
+            identity.client_id().as_str(),
+        ])
+        .map_err(|_| Failure(StatusCode::SERVICE_UNAVAILABLE))?;
+        if unique_header(request.headers(), CONTEXT) != Some(expected.as_str()) {
+            return Err(Failure(StatusCode::UNAUTHORIZED));
+        }
+    }
     request.extensions_mut().insert(identity);
     Ok(next.run(request).await)
 }
@@ -228,9 +240,25 @@ fn redirect(location: &str) -> Result<Response, Failure> {
         .into_response())
 }
 
-async fn login(State(service): State<EnterpriseBrowser>) -> Result<Response, Failure> {
+async fn login(
+    State(service): State<EnterpriseBrowser>,
+    headers: HeaderMap,
+) -> Result<Response, Failure> {
     let start = service.login.begin().await.map_err(login_error)?;
-    let mut response = redirect(start.authorization_url.as_str())?;
+    let wants_json = unique_header(&headers, header::ACCEPT.as_str()).is_some_and(|accept| {
+        accept.split(',').any(|entry| {
+            entry
+                .split(';')
+                .next()
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+        })
+    });
+    let mut response = if wants_json {
+        Json(serde_json::json!({"authorizationUrl":start.authorization_url.as_str()}))
+            .into_response()
+    } else {
+        redirect(start.authorization_url.as_str())?
+    };
     response.headers_mut().append(
         header::SET_COOKIE,
         cookie(
