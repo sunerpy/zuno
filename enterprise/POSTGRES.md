@@ -187,7 +187,7 @@ limit. No incomplete history is treated as an exact old context window.
 
 The captured format-5 fixture preserves pending waits, Job budgets, lease state,
 messages and usage across failed/successful format-6 migration. The internal Worker
-protocol is version 6; it is separate from public UI DTOs. Its compatible claims,
+protocol is version 7; it is separate from public UI DTOs. Its compatible claims,
 stable input timestamps and bounded grant renewal are described in [Workers](WORKERS.md).
 
 ## Browser authentication state
@@ -235,7 +235,7 @@ browser and operation data before the marker advances.
 The data owner runs the shared Memory service in bounded blocking capacity with
 one transaction per request. Actor/workspace checks, candidate CAS, source
 revalidation, consent, learning lease checks and result/audit commit stay together.
-Workers use internal protocol 6 and never receive this provider or pool.
+Workers use internal protocol 7 and never receive this provider or pool.
 See [Memory](MEMORY.md) for implemented behavior and remaining producers.
 
 ## Child execution-session binding
@@ -249,5 +249,19 @@ The format-9 fixture includes real private Memory and policy values along with
 the previous runtime history. Migration failure restores the old constraints
 and marker; success preserves all rows. A storage regression verifies that a
 child execution takes the child's slot while retaining its delegating parent.
-This schema boundary does not register a remote child-dispatch endpoint: atomic
-dispatch, persistent foreground waiting and completion delivery remain P4 work.
+Atomic child dispatch, persistent waiting and completion are described in
+[child dispatch](CHILDREN.md); workspace preparation extends the boundary below.
+
+## Child workspace admission
+
+Format 11 adds `child_workspace_preparation`, workspace policy/readiness and
+inherited delegation-depth limits. A staged child with pending workspace cannot
+be claimed or activated by its parent's checkpoint. Only the assigned gateway
+may publish the matching immutable preparation receipt. Late facts are retained
+without restoring the old parent lease.
+
+The exact format-10 fixture preserves previous columns and separately verifies
+the new defaults: root sessions retain their configured maximum, while legacy
+children cannot infer additional delegation authority. Forward migration performs
+the backfill and restores forced RLS before updating the marker.
+See [workspace preparation](WORKSPACES.md).

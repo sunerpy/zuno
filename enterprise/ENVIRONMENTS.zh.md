@@ -1,7 +1,8 @@
 # Rootless 执行环境
 
-预览库 `zuno-environment` 实现 `EnvironmentProvider` 与 `OperationGateway`，尚未注册为
-Agent 工具或企业启动命令。持久审批等待、Gateway 认证服务与 Worker Profile 装配仍需接入。
+预览库 `zuno-environment` 实现 `EnvironmentProvider` 与 `OperationGateway`，企业可执行
+文件已装配认证网关、当前人工审批及 Worker 工具。子工作区准备绑定控制面解析的暂存 Job，
+不向 Worker 提供任意生命周期操作；详见[部署](DEPLOYMENT.zh.md)及[工作区](WORKSPACES.zh.md)。
 
 ## 隔离与归属
 

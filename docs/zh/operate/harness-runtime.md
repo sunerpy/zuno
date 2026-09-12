@@ -286,7 +286,7 @@ CLI 启动。无法抓取的远程规则来源使用同一类非致命 notice，
 持久化接口返回领域错误，不要求外部后端构造 SQLite 错误。`Unavailable` 与 `Conflict`
 保留类型化学习恢复，本地数据库错误维持原有分类；`InvalidData` 将损坏／不兼容状态
 与可修正提案区分。PostgreSQL 数据所有者现已注入当前组织、私有生成授权及逻辑存储；
-候选、文档、证据、请求回执和审计共用有界事务，召回重新验证来源。Worker 协议 6 通过
+候选、文档、证据、请求回执和审计共用有界事务，召回重新验证来源。Worker 协议 7 通过
 工作负载身份与 Job grant 调用异步 `MemoryDataService`，不接收数据库 pool。
 
 企业 Worker profile 安装 `memory_read`、`memory_update` 与 `DynamicContextRefresher`。

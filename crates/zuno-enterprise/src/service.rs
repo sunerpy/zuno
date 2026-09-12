@@ -312,6 +312,7 @@ async fn control(options: ControlConfig, shutdown: InterruptSignal) -> Result<()
         .map_err(|_| invalid("invalid gateway signing keys"))?,
     );
     let definitions = config::definitions(&options.definitions).await?;
+    let children = Arc::new(crate::children::ConfiguredChildren::new(&definitions)?);
     let deployments = definitions
         .iter()
         .map(|definition| {
@@ -349,20 +350,21 @@ async fn control(options: ControlConfig, shutdown: InterruptSignal) -> Result<()
     let application =
         EnterpriseApplication::new(backend.clone(), options.tenant_id.clone(), active)?
             .with_memory(memory.clone());
+    let mut worker_state = WorkerStateService::new(
+        backend.clone(),
+        workers.clone(),
+        grants.clone(),
+        options.tenant_id.clone(),
+        lease,
+    )
+    .with_memory(memory);
+    if !children.is_empty() {
+        worker_state = worker_state.with_children(children);
+    }
     let mut routes = application
         .clone()
         .api_router(users.clone())
-        .merge(
-            WorkerStateService::new(
-                backend.clone(),
-                workers.clone(),
-                grants.clone(),
-                options.tenant_id.clone(),
-                lease,
-            )
-            .with_memory(memory)
-            .router(),
-        )
+        .merge(worker_state.router())
         .merge(
             GatewayControlService::new(
                 backend.clone(),

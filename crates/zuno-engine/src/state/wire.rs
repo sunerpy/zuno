@@ -15,7 +15,7 @@ use zuno_db::message::{MessageRecord, MessageWithParts, PartRecord};
 use zuno_db::provider_backoff::ProviderBackoffCheckpoint;
 use zuno_types::identity::{InputId, SessionId, TurnId};
 
-pub const WORKER_PROTOCOL_VERSION: u32 = 6;
+pub const WORKER_PROTOCOL_VERSION: u32 = 7;
 pub const MAX_WORKER_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -1,13 +1,18 @@
 use crate::storage;
+mod forks;
+pub(crate) use forks::ForkPreparation;
 const SCHEMA: &str = include_str!("schema.sql");
 const DELIVERY_SCHEMA: &str = include_str!("schema_delivery.sql");
-const FORMAT: i64 = 2;
+const FORK_SCHEMA: &str = include_str!("schema_fork.sql");
+const FORMAT: i64 = 3;
 
 fn source_digest(version: i64) -> String {
     if version == 1 {
         zuno_orchestration::sha256_text(SCHEMA)
-    } else {
+    } else if version == 2 {
         zuno_orchestration::sha256_text(&format!("{SCHEMA}\n{DELIVERY_SCHEMA}"))
+    } else {
+        zuno_orchestration::sha256_text(&format!("{SCHEMA}\n{DELIVERY_SCHEMA}\n{FORK_SCHEMA}"))
     }
 }
 
@@ -98,10 +103,13 @@ impl Ledger {
                 ));
             }
             if version < FORMAT {
-                tx.execute_batch(DELIVERY_SCHEMA).map_err(storage)?;
+                if version < 2 {
+                    tx.execute_batch(DELIVERY_SCHEMA).map_err(storage)?;
+                }
+                tx.execute_batch(FORK_SCHEMA).map_err(storage)?;
                 tx.execute(
-                    "UPDATE gateway_format SET version=?1,source_digest=?2,manifest=?3 WHERE singleton=1 AND version=1",
-                    params![FORMAT,source_digest(FORMAT),manifest(&tx)?],
+                    "UPDATE gateway_format SET version=?1,source_digest=?2,manifest=?3 WHERE singleton=1 AND version=?4",
+                    params![FORMAT,source_digest(FORMAT),manifest(&tx)?,version],
                 ).map_err(storage)?;
             }
         } else {
@@ -119,6 +127,7 @@ impl Ledger {
             }
             tx.execute_batch(SCHEMA).map_err(storage)?;
             tx.execute_batch(DELIVERY_SCHEMA).map_err(storage)?;
+            tx.execute_batch(FORK_SCHEMA).map_err(storage)?;
             tx.execute(
                 "INSERT INTO gateway_format VALUES(1,?1,'enterprise-preview',?2,?3)",
                 params![FORMAT, source_digest(FORMAT), manifest(&tx)?],
@@ -174,6 +183,13 @@ impl Ledger {
         let tx = connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(storage)?;
+        let reserved:bool=tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM environment_fork WHERE tenant=?1 AND principal=?2 AND environment_id=?3)",
+            params![owner.tenant_id.as_str(),owner.principal_id.as_str(),spec.id.as_str()],|row|row.get(0),
+        ).map_err(storage)?;
+        if reserved {
+            return Err(ApplicationError::Conflict);
+        }
         let value = serde_json::to_string(spec).map_err(storage)?;
         tx.execute(
             "INSERT INTO environment(tenant,principal,id,spec,revision) VALUES(?1,?2,?3,?4,1)

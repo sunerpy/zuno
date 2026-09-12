@@ -1,4 +1,5 @@
 use super::*;
+mod workspace;
 use zuno_application::child::{
     ChildDefinitionGrant, ChildDelivery, ChildDispatchStore, ChildInvocation,
 };
@@ -59,6 +60,38 @@ pub(super) async fn execution_binding(backend: &PostgresBackend, admin: &PgPool)
     ] {
         background_delivery(backend, admin, delivery, cancelled).await;
     }
+    workspace::exercise(backend, admin).await;
+    parent_depth_limit_is_not_raised_by_child_definition(backend, admin).await;
+}
+
+async fn parent_depth_limit_is_not_raised_by_child_definition(
+    backend: &PostgresBackend,
+    admin: &PgPool,
+) {
+    let (actor, parent) = parent(backend, admin, "child-inherited-depth").await;
+    let runtime = backend.runtime(actor.tenant_id().clone());
+    let mut outer = grant(&parent.job);
+    outer.maximum_depth = 1;
+    runtime
+        .dispatch_child(&parent.lease, invocation(ChildDelivery::Quiet), &outer)
+        .await
+        .unwrap();
+    let child = runtime
+        .claim(&worker("one-hop"), duration())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut wider = grant(&child.job);
+    wider.maximum_depth = 16;
+    assert!(
+        matches!(
+            runtime
+                .dispatch_child(&child.lease, invocation(ChildDelivery::Quiet), &wider)
+                .await,
+            Err(ApplicationError::Forbidden)
+        ),
+        "a child definition cannot expand the delegation depth authorized by its parent"
+    );
 }
 
 async fn resumed_child_has_one_pending_admission(backend: &PostgresBackend, admin: &PgPool) {
@@ -172,6 +205,7 @@ fn grant(parent: &RuntimeJob) -> ChildDefinitionGrant {
         },
         maximum_depth: 2,
         maximum_children: 4,
+        workspace: zuno_application::child::ChildWorkspacePolicy::ModelOnly,
     }
 }
 async fn parent(

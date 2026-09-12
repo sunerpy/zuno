@@ -29,8 +29,9 @@ use zuno_identity::{
 use zuno_postgres::PostgresBackend;
 use zuno_types::identity::TenantId;
 use zuno_worker::{
-    GATEWAY_AUTHORIZE_PATH, GATEWAY_COMPLETION_PATH, GATEWAY_PREPARE_PATH, GATEWAY_RESOLVE_PATH,
-    GATEWAY_TICKET_HEADER, GATEWAY_TICKET_PATH, GRANT_HEADER, IssuedGatewayRequest,
+    GATEWAY_AUTHORIZE_PATH, GATEWAY_CHILD_WORKSPACE_PATH, GATEWAY_COMPLETION_PATH,
+    GATEWAY_PREPARE_PATH, GATEWAY_RESOLVE_PATH, GATEWAY_TICKET_HEADER, GATEWAY_TICKET_PATH,
+    GRANT_HEADER, IssuedGatewayRequest,
 };
 
 use crate::gateway_configuration::GatewayConfigurationResolver;
@@ -73,6 +74,10 @@ impl GatewayControlService {
             .route(&format!("/{GATEWAY_PREPARE_PATH}"), post(prepare))
             .route(&format!("/{GATEWAY_AUTHORIZE_PATH}"), post(authorize))
             .route(&format!("/{GATEWAY_COMPLETION_PATH}"), post(completion))
+            .route(
+                &format!("/{GATEWAY_CHILD_WORKSPACE_PATH}"),
+                post(child_workspace_completed),
+            )
             .layer(DefaultBodyLimit::max(MAX_GATEWAY_FRAME_BYTES))
             .with_state(self)
     }
@@ -104,15 +109,72 @@ impl GatewayControlService {
             .get(&lease.owner, &lease.job_id)
             .await
             .map_err(application)?;
-        let assignment = self.configuration.resolve(&job).map_err(application)?;
+        let assignment = self
+            .configuration
+            .resolve(&self.tenant, &job.configuration, &job.session_id)
+            .map_err(application)?;
         assignment.environment.validate().map_err(application)?;
         if assignment.environment.session_id != lease.session_id {
+            return Err(Failure(StatusCode::FORBIDDEN));
+        }
+        let workspace = self
+            .backend
+            .runtime(self.tenant.clone())
+            .execution_workspace(lease)
+            .await
+            .map_err(application)?;
+        if let Some((gateway, receipt)) = &workspace
+            && (*gateway != assignment.gateway_id || receipt.target.spec != assignment.environment)
+        {
             return Err(Failure(StatusCode::FORBIDDEN));
         }
         Ok(GatewayExecutionContext {
             lease: lease.clone(),
             assignment,
+            existing_workspace: workspace.is_some(),
+            child_workspace: None,
+            prepared_workspace: None,
         })
+    }
+
+    async fn child_context(
+        &self,
+        request: &GatewayRequest,
+        context: &mut GatewayExecutionContext,
+    ) -> Result<(), Failure> {
+        let GatewayCommand::PrepareChildWorkspace { child_job_id } = &request.command else {
+            return Ok(());
+        };
+        let runtime = self.backend.runtime(self.tenant.clone());
+        let info = runtime
+            .child_workspace(&context.lease, child_job_id)
+            .await
+            .map_err(application)?;
+        let target = self
+            .configuration
+            .resolve(&self.tenant, &info.configuration, &info.child_session_id)
+            .map_err(application)?;
+        // This Docker gateway owns both volumes. Transfer to another gateway
+        // requires a separate authenticated snapshot transport.
+        if target.gateway_id != context.assignment.gateway_id
+            || target.endpoint != context.assignment.endpoint
+        {
+            return Err(Failure(StatusCode::FORBIDDEN));
+        }
+        let assignment = zuno_application::child::ChildWorkspaceAssignment {
+            child_job_id: child_job_id.clone(),
+            gateway_id: target.gateway_id,
+            parent: context.assignment.environment.clone(),
+            target: target.environment,
+            resume: info.resume,
+        };
+        runtime
+            .admit_child_workspace(&context.lease, &assignment)
+            .await
+            .map_err(application)?;
+        context.child_workspace = Some(assignment);
+        context.prepared_workspace = info.receipt;
+        Ok(())
     }
 
     async fn gateway(&self, headers: &HeaderMap) -> Result<AuthenticatedGateway, Failure> {
@@ -235,7 +297,8 @@ async fn issue_ticket(
         .verify(&worker, &grant, now()?)
         .map_err(authentication)?;
     let request = GatewayRequest::decode(&bytes).map_err(application)?;
-    let context = service.context(grant.lease()).await?;
+    let mut context = service.context(grant.lease()).await?;
+    service.child_context(&request, &mut context).await?;
     target(&request, &context)?;
     let ticket = service
         .tickets
@@ -265,10 +328,11 @@ async fn resolve(
         .tickets
         .verify(&gateway, &ticket, &request, now()?)
         .map_err(authentication)?;
-    let context = service.context(verified.lease()).await?;
+    let mut context = service.context(verified.lease()).await?;
     if *gateway.id() != context.assignment.gateway_id {
         return Err(Failure(StatusCode::FORBIDDEN));
     }
+    service.child_context(&request, &mut context).await?;
     target(&request, &context)?;
     Ok(Json(context))
 }
@@ -334,6 +398,24 @@ async fn completion(
         .backend
         .gateway_operations(gateway.id().clone())
         .complete(&completion)
+        .await
+        .map_err(application)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn child_workspace_completed(
+    State(service): State<GatewayControlService>,
+    headers: HeaderMap,
+    Json(completion): Json<zuno_application::child::ChildWorkspaceCompletion>,
+) -> Result<StatusCode, Failure> {
+    let gateway = service.gateway(&headers).await?;
+    if completion.lease.owner.tenant_id != service.tenant {
+        return Err(Failure(StatusCode::FORBIDDEN));
+    }
+    service
+        .backend
+        .runtime(service.tenant)
+        .complete_child_workspace(gateway.id(), &completion)
         .await
         .map_err(application)?;
     Ok(StatusCode::NO_CONTENT)

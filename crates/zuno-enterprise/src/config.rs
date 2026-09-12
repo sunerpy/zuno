@@ -310,6 +310,15 @@ pub struct Definition {
     pub model: ModelDefinition,
     pub budget: BudgetDefinition,
     pub environment: EnvironmentDefinition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<DelegationDefinition>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DelegationDefinition {
+    pub targets: Vec<ConfigurationRef>,
+    pub maximum_depth: u32,
+    pub maximum_children: u32,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -376,6 +385,19 @@ impl Definition {
     pub fn validate(&self) -> Result<(), Error> {
         self.reference().validate()?;
         self.selection().validate()?;
+        if let Some(delegation) = &self.delegation
+            && (delegation.targets.is_empty()
+                || delegation.targets.len() > 64
+                || !(1..=16).contains(&delegation.maximum_depth)
+                || !(1..=256).contains(&delegation.maximum_children))
+        {
+            return Err(invalid("invalid configured delegation targets or limits"));
+        }
+        if let Some(delegation) = &self.delegation {
+            for target in &delegation.targets {
+                target.validate()?;
+            }
+        }
         if self.agent.system_prompt.trim().is_empty()
             || self.agent.system_prompt.len() > 262144
             || self.agent.max_steps.get() > 4096

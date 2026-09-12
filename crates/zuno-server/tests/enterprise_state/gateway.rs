@@ -16,6 +16,8 @@ use zuno_worker::gateway::{GatewayClient, GatewayStateClient};
 
 #[path = "gateway_root.rs"]
 mod root;
+#[path = "gateway/workspace.rs"]
+mod workspace;
 
 const IMAGE: &str = "public.ecr.aws/docker/library/alpine@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce";
 
@@ -28,6 +30,23 @@ async fn lose_first_completion_response(
     let completion = request.uri().path().ends_with("/gateway/v1/completion");
     let response = next.run(request).await;
     if completion && response.status().is_success() && !lost.swap(true, Ordering::SeqCst) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    response
+}
+
+async fn lose_first_workspace_response(
+    axum::extract::State(lost): axum::extract::State<Arc<std::sync::atomic::AtomicBool>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let workspace = request
+        .uri()
+        .path()
+        .ends_with("/gateway/v1/child-workspace");
+    let response = next.run(request).await;
+    if workspace && response.status().is_success() && !lost.swap(true, Ordering::SeqCst) {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     response
@@ -235,14 +254,18 @@ async fn gateway_requests_are_scoped_authenticated_and_still_require_current_hum
         LeaseDuration::new(300000).unwrap(),
     );
     let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let routes =
-        worker_state
-            .router()
-            .merge(control.router())
-            .layer(axum::middleware::from_fn_with_state(
-                lost.clone(),
-                lose_first_completion_response,
-            ));
+    let workspace_lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let routes = worker_state
+        .router()
+        .merge(control.router())
+        .layer(axum::middleware::from_fn_with_state(
+            lost.clone(),
+            lose_first_completion_response,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            workspace_lost.clone(),
+            lose_first_workspace_response,
+        ));
     let (endpoint, control_server) = tls_server(routes, &fixture).await;
     let certificate =
         reqwest::Certificate::from_pem(&std::fs::read(&fixture.root_certificate).unwrap()).unwrap();
@@ -362,6 +385,7 @@ async fn gateway_requests_are_scoped_authenticated_and_still_require_current_hum
     let mut delivery = None;
     let mut execution_server = None;
     let client = GatewayClient::new(Some(certificate.clone())).unwrap();
+    let mut child_workspace = None;
     if let Some(socket) = socket {
         let service = GatewayExecutionService::connect(
             GatewayId::new("gateway").unwrap(),
@@ -584,6 +608,24 @@ async fn gateway_requests_are_scoped_authenticated_and_still_require_current_hum
             b"ran\n"
         );
     }
+    if let Some(delivery) = &delivery {
+        child_workspace = Some(
+            workspace::exercise(
+                &root::Context {
+                    backend: &backend,
+                    actor: &actor,
+                    worker: &worker,
+                    delivery,
+                    certificate: certificate.clone(),
+                    configuration: &configuration,
+                },
+                &execution,
+                &client,
+            )
+            .await,
+        );
+        assert!(workspace_lost.load(Ordering::SeqCst));
+    }
     query("UPDATE zuno_enterprise_preview.runtime_session SET lease_expires=0 WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3")
         .bind(tenant.as_str()).bind(actor.principal_id().as_str()).bind(job.session_id.as_str()).execute(&admin).await.unwrap();
     assert!(worker.gateway_ticket(&execution, &request).await.is_err());
@@ -594,8 +636,15 @@ async fn gateway_requests_are_scoped_authenticated_and_still_require_current_hum
             "a lost post-commit response must remain unacknowledged at the gateway"
         );
         assert!(lost.load(Ordering::SeqCst));
-        assert_eq!(delivery.deliver_completions(128).await.unwrap(), 2);
+        assert_eq!(delivery.deliver_completions(128).await.unwrap(), 3);
         assert_eq!(delivery.deliver_completions(128).await.unwrap(), 0);
+        if let Some((id, revision)) = &child_workspace {
+            delivery
+                .environments()
+                .release(&actor.owner(), id, *revision)
+                .await
+                .unwrap();
+        }
         let saved = backend
             .gateway_operations(GatewayId::new("gateway").unwrap())
             .completion(&actor.owner(), &command.id)
@@ -625,7 +674,7 @@ async fn gateway_requests_are_scoped_authenticated_and_still_require_current_hum
             "SELECT count(*) FROM zuno_enterprise_preview.event WHERE tenant_id=$1 AND principal_id=$2 AND type='runtime.operation.completed'",
         ).bind(tenant.as_str()).bind(actor.principal_id().as_str()).fetch_one(&admin).await.unwrap();
         assert_eq!(
-            count, 2,
+            count, 3,
             "lost acknowledgements must not duplicate completion facts"
         );
         root::exercise(root::Context {

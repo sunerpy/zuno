@@ -77,6 +77,8 @@ Scoped private Memory, consent and source validity: [English](MEMORY.md), [中�
 
 Native child admission, pending results and completion: [English](CHILDREN.md), [中文](CHILDREN.zh.md).
 
+Child workspace forks and executable target configuration: [English](WORKSPACES.md), [中文](WORKSPACES.zh.md).
+
 Preview documentation archives contain the tracked guides, example configurations
 and license notices from the exact release commit. Local edits and untracked files
 are excluded; these archives do not update the stable documentation site.

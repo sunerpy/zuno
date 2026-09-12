@@ -132,14 +132,19 @@ async fn model(
             .iter()
             .any(|message| message["role"] == "tool" && message["tool_call_id"] == id)
     };
-    let completed = has_tool("native-command");
     let live_context = messages
         .iter()
         .filter(|message| message["role"] == "system" || message["role"] == "developer")
         .map(Value::to_string)
         .collect::<Vec<_>>()
         .join("\n");
-    if completed {
+    let is_child = live_context.contains("CHILD-EXECUTOR");
+    let completed = if is_child {
+        has_tool("child-command")
+    } else {
+        has_tool("native-child")
+    };
+    if is_child || has_tool("native-command") {
         assert!(
             !live_context.contains("MEMORY-PROBE-"),
             "revoked Memory must not return from the checkpoint"
@@ -151,8 +156,29 @@ async fn model(
             "{live_context}"
         );
     }
-    let delta = if completed {
+    let delta = if is_child && !completed {
+        json!({"role":"assistant","tool_calls":[{
+            "index":0,"id":"child-command","type":"function","function":{
+                "name":"environment_command","arguments":json!({"argv":["sh","-c",
+                    "test \"$(cat /workspace/native-once)\" = once; printf child > /workspace/native-once; printf 'child-workspace-ok\\n'"
+                ]}).to_string()
+            }
+        }]})
+    } else if is_child {
+        json!({"role":"assistant","content":format!("CHILD-VERIFIED-{name}")})
+    } else if completed {
+        assert!(body.to_string().contains(&format!("CHILD-VERIFIED-{name}")));
         json!({"role":"assistant","content":"Completed the approved operation."})
+    } else if has_tool("native-command") {
+        json!({"role":"assistant","tool_calls":[{
+            "index":0,"id":"native-child","type":"function","function":{
+                "name":"task","arguments":json!({
+                    "agent":"workspace-helper","objective":format!("Inspect inherited workspace for {name}"),
+                    "deliverable":"A verified workspace result","instructions":format!("Verify inherited parent files for {name} in the child workspace."),
+                    "success_evidence":"Read the inherited file and change only the child's copy."
+                }).to_string()
+            }
+        }]})
     } else if !has_tool("native-memory-read") {
         json!({"role":"assistant","tool_calls":[{
             "index":0,"id":"native-memory-read","type":"function","function":{
@@ -394,7 +420,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
     let control_address = address();
     let gateway_address = address();
     let control_url = format!("https://{control_address}/");
-    let definition:Definition=serde_json::from_value(json!({
+    let mut definition:Definition=serde_json::from_value(json!({
         "id":"native","version":1,"workspace":{"id":"workspace","title":"Workspace"},
         "agent":{"name":"build","systemPrompt":"Complete the user's task through approved tools.","maxSteps":8},
         "model":{"providerId":"fixture","modelId":"model","transport":"openai-compatible","surface":"chat",
@@ -404,6 +430,29 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
             "image":"public.ecr.aws/docker/library/alpine@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce",
             "memoryBytes":67108864,"pidsLimit":32,"cpuMillis":500},
     })).unwrap();
+    let mut child_definition = definition.clone();
+    child_definition.id = zuno_types::identity::ConfigurationId::new("native-child").unwrap();
+    child_definition.agent.name = "workspace-helper".to_owned();
+    child_definition.agent.system_prompt="CHILD-EXECUTOR: inspect inherited files and keep edits inside the assigned child workspace.".to_owned();
+    let child_definition_file = root.join("child-definition.json");
+    write(
+        &child_definition_file,
+        serde_json::to_vec(&child_definition).unwrap(),
+    );
+    let reference = tokio::process::Command::new(env!("CARGO_BIN_EXE_zuno-enterprise"))
+        .arg("--definition-ref")
+        .arg(&child_definition_file)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .unwrap();
+    assert!(reference.status.success());
+    let child_reference = serde_json::from_slice(&reference.stdout).unwrap();
+    definition.delegation = Some(DelegationDefinition {
+        targets: vec![child_reference],
+        maximum_depth: 2,
+        maximum_children: 4,
+    });
     let definition_file = root.join("definition.json");
     write(&definition_file, serde_json::to_vec(&definition).unwrap());
     let job_key = root.join("job.key");
@@ -450,7 +499,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
                         path: gateway_key,
                     }],
                 },
-                definitions: vec![definition_file.clone()],
+                definitions: vec![definition_file.clone(), child_definition_file.clone()],
                 active_definitions: vec![DefinitionKey {
                     id: definition.id.clone(),
                     version: 1,
@@ -489,7 +538,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
                 ServiceRole::Worker(WorkerConfig {
                     instance_prefix: name.to_owned(),
                     state: state("worker"),
-                    definitions: vec![definition_file.clone()],
+                    definitions: vec![definition_file.clone(), child_definition_file.clone()],
                     credentials: [(
                         "model".to_owned(),
                         ModelCredential {
@@ -608,6 +657,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
         jobs.push((name, job["id"].as_str().unwrap().to_owned()));
     }
     let mut approved = std::collections::BTreeSet::new();
+    let mut memory_disabled = std::collections::BTreeSet::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         let mut completed = 0;
@@ -684,17 +734,47 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
                     "unexpected Job state {job}; events={events:?}; operations={operations:?}; ledger={states:?}; docker={docker_states:?}; logs={logs:?}"
                 );
             }
-            for wait in job["waits"].as_array().unwrap() {
-                if wait["target"]["kind"] == "approval" {
-                    let id = wait["target"]["approval_id"].as_str().unwrap();
-                    if approved.insert(id.to_owned()) {
-                        let disabled:Value = http.post(format!("{control_url}api/v1/workspaces/workspace/memory"))
+            let mut waiting_jobs = vec![job.clone()];
+            let mut cursor = 0;
+            while cursor < waiting_jobs.len() {
+                let current = waiting_jobs[cursor].clone();
+                cursor += 1;
+                for wait in current["waits"].as_array().unwrap() {
+                    if wait["target"]["kind"] == "child" {
+                        let child_id = wait["target"]["job_id"].as_str().unwrap();
+                        let child: Value = http
+                            .get(format!("{control_url}api/v1/jobs/{child_id}"))
+                            .bearer_auth(&tokens[name])
+                            .send()
+                            .await
+                            .unwrap()
+                            .error_for_status()
+                            .unwrap()
+                            .json()
+                            .await
+                            .unwrap();
+                        assert!(
+                            matches!(
+                                child["phase"].as_str(),
+                                Some("ready" | "running" | "waiting" | "completed")
+                            ),
+                            "child failed: {child}"
+                        );
+                        waiting_jobs.push(child);
+                        assert!(waiting_jobs.len() <= 16, "bounded child fixture");
+                    }
+                    if wait["target"]["kind"] == "approval" {
+                        let id = wait["target"]["approval_id"].as_str().unwrap();
+                        if approved.insert(id.to_owned()) {
+                            if memory_disabled.insert(*name) {
+                                let disabled:Value = http.post(format!("{control_url}api/v1/workspaces/workspace/memory"))
                             .bearer_auth(&tokens[name]).json(&json!({
                                 "requestId":"disable-memory","command":{"kind":"set_policy","sessionId":null,
                                     "expectedRevision":1,"useMemories":false,"generatePrivate":false}
                             })).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
-                        assert!(disabled["result"]["Ok"].is_object(), "{disabled}");
-                        http.post(format!("{control_url}api/v1/approvals/{id}/answer"))
+                                assert!(disabled["result"]["Ok"].is_object(), "{disabled}");
+                            }
+                            http.post(format!("{control_url}api/v1/approvals/{id}/answer"))
                             .bearer_auth(&tokens[name])
                             .json(&json!({"requestId":format!("approve-{id}"),"answer":"approve"}))
                             .send()
@@ -702,6 +782,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
                             .unwrap()
                             .error_for_status()
                             .unwrap();
+                        }
                     }
                 }
             }
@@ -715,14 +796,17 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert_eq!(approved.len(), 2);
-    assert_eq!(issuer.model_requests.load(Ordering::SeqCst), 8);
+    assert_eq!(approved.len(), 4);
+    assert_eq!(issuer.model_requests.load(Ordering::SeqCst), 14);
     let attempts:i64=query_scalar("SELECT count(DISTINCT worker_id) FROM zuno_enterprise_preview.runtime_attempt WHERE tenant_id=$1")
         .bind(tenant.as_str()).fetch_one(&admin).await.unwrap();
     assert_eq!(attempts, 2, "both independent Workers must participate");
     let operations:i64=query_scalar("SELECT count(*) FROM zuno_enterprise_preview.gateway_operation WHERE tenant_id=$1 AND completion IS NOT NULL")
         .bind(tenant.as_str()).fetch_one(&admin).await.unwrap();
-    assert_eq!(operations, 2, "one admitted execution per logical command");
+    assert_eq!(
+        operations, 4,
+        "one admitted execution per logical parent or child command"
+    );
     for child in &mut children {
         assert!(
             tokio::process::Command::new("kill")

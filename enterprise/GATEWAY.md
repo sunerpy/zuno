@@ -48,26 +48,28 @@ operation; an earlier approval or revision cannot authorize a different operatio
 
 ## Private protocol
 
-`GatewayRequest` is protocol version 1, with bounded tagged commands:
+`GatewayRequest` is protocol version 2, with bounded tagged commands:
 
 | Command | Behavior |
 | --- | --- |
 | `acquire` | Acquire the data-owner-selected session environment |
 | `get` | Read and validate that environment |
+| `prepare_child_workspace` | Prepare only the server-resolved staged child workspace |
 | `prepare_command` | Resolve the environment and obtain its durable approval |
 | `submit_command` | Submit after fresh lease and approval checks |
 | `inspect` | Read the original operation receipt within the assigned environment |
 | `output` | Read bounded output using an offset and authenticated prefix digest |
 
 These are private Worker/gateway messages. Public Web activity remains a separate
-projection. Worker HTTP does not expose environment destruction, forking or
-administrative cancellation in this version.
+projection. Worker HTTP exposes no arbitrary environment destruction, fork target
+selection or administrative cancellation. Child workspace preparation uses its
+own admitted relation and receipt; it does not authorize child commands.
 
 The control plane provides `/internal/worker/v1/gateway-ticket`,
 `/internal/gateway/v1/resolve`, `/prepare` and `/authorize`. The execution gateway
 provides `/internal/execution/v1/request`. Hosts register these real handlers only
-after assembling their providers. Standalone role startup and Agent tool assembly
-are separate delivery items; these modules alone do not enable an enterprise CLI.
+after assembling their providers. The standalone executable installs these services;
+validated child target configuration adds the scoped workspace preparation path.
 
 Worker-to-control calls use the Worker token plus its Job grant. Gateway-to-control
 calls use the gateway's workload token. Worker-to-gateway calls send only the

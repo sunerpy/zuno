@@ -1,15 +1,16 @@
 //! Private gateway protocol. It contains no host paths, Docker socket or DB
 //! credentials. Public activity projections use a different protocol.
 
+use crate::child::{ChildWorkspaceAssignment, ChildWorkspaceReceipt};
 use serde::{Deserialize, Serialize};
-use zuno_types::identity::{GatewayId, OperationId};
+use zuno_types::identity::{GatewayId, JobId, OperationId};
 
 use super::{
     CommandOperation, Environment, EnvironmentSpec, OperationReceipt, OutputCursor, OutputPage,
 };
 use crate::{ApplicationError, authorization::ApprovalRecord, runtime::ExecutionLease};
 
-pub const GATEWAY_PROTOCOL_VERSION: u32 = 1;
+pub const GATEWAY_PROTOCOL_VERSION: u32 = 2;
 pub const MAX_GATEWAY_FRAME_BYTES: usize = 1024 * 1024;
 
 /// A data-owner response, never a caller-selected deployment.
@@ -26,6 +27,11 @@ pub struct GatewayAssignment {
 pub struct GatewayExecutionContext {
     pub lease: ExecutionLease,
     pub assignment: GatewayAssignment,
+    pub existing_workspace: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_workspace: Option<ChildWorkspaceAssignment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_workspace: Option<ChildWorkspaceReceipt>,
 }
 
 /// Only an authenticated, assigned gateway may present these observed facts.
@@ -38,12 +44,15 @@ pub struct GatewayOperationRequest {
 }
 
 /// The environment is selected by the data owner for the signed Job context.
-/// Lifecycle destruction/forking are not Worker commands in this version.
+/// A child workspace may only be prepared for a server-resolved staged child.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayCommand {
     Acquire,
     Get,
+    PrepareChildWorkspace {
+        child_job_id: JobId,
+    },
     PrepareCommand {
         operation: CommandOperation,
     },
@@ -152,6 +161,7 @@ pub enum GatewayReply {
     Approval(Box<ApprovalRecord>),
     Operation(OperationReceipt),
     Output(OutputPage),
+    ChildWorkspace(ChildWorkspaceReceipt),
 }
 
 #[cfg(test)]

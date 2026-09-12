@@ -1,11 +1,12 @@
 //! Native child Job admission. The host resolves a configuration grant; wire
 //! intent cannot grant itself another model, owner or delegation limit.
 
+use crate::environment::{Environment, EnvironmentSnapshot, EnvironmentSpec};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zuno_types::{
-    identity::{InvocationId, JobId, SessionId},
+    identity::{GatewayId, InvocationId, JobId, SessionId},
     wait::WaitRef,
 };
 
@@ -75,6 +76,23 @@ pub struct ChildDefinitionGrant {
     pub selection: JobInputSelection,
     pub maximum_depth: u32,
     pub maximum_children: u32,
+    pub workspace: ChildWorkspacePolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildWorkspacePolicy {
+    /// An explicitly tool-less Agent does not receive an execution environment.
+    ModelOnly,
+    ForkParent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildWorkspaceState {
+    ModelOnly,
+    Pending,
+    Ready,
 }
 impl ChildDefinitionGrant {
     pub fn validate(&self) -> Result<(), ApplicationError> {
@@ -97,6 +115,44 @@ pub struct ChildDispatch {
     pub session_id: SessionId,
     pub wait: WaitRef,
     pub delivery: ChildDelivery,
+    pub workspace: ChildWorkspaceState,
+}
+
+/// Immutable, control-plane selected bounds for workspace preparation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChildWorkspaceAssignment {
+    pub child_job_id: JobId,
+    pub gateway_id: GatewayId,
+    pub parent: EnvironmentSpec,
+    pub target: EnvironmentSpec,
+    pub resume: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChildWorkspaceReceipt {
+    pub child_job_id: JobId,
+    pub parent_environment_id: zuno_types::identity::EnvironmentId,
+    pub snapshot: Option<EnvironmentSnapshot>,
+    /// The admitted target and its initial/observed revision, not a live query.
+    pub target: Environment,
+}
+
+/// Workload-authenticated gateway fact. A late fact is retained after lease loss.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChildWorkspaceCompletion {
+    pub lease: ExecutionLease,
+    pub receipt: ChildWorkspaceReceipt,
+}
+
+/// Data-owner lookup before the child execution session exists.
+pub struct ChildWorkspaceInfo {
+    pub child_session_id: SessionId,
+    pub configuration: ConfigurationRef,
+    pub resume: bool,
+    pub receipt: Option<ChildWorkspaceReceipt>,
 }
 
 #[async_trait]
