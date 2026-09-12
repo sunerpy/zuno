@@ -354,6 +354,12 @@ run, so the 170-second attachment suite, 132-second tools suite, and 66-second T
 suite start immediately on a fresh runner instead of becoming final stragglers.
 The private captured Cargo environment is never uploaded.
 
+Goal recovery integration probes capture each finite CLI run into files and wait
+for its process exit within a separate deadline. Inherited output handles must
+not turn a cancelled pipe read into an unbounded test-runtime shutdown. On
+failure the probe writes the captured stdout/stderr directly to the suite log
+before reporting the failed deadline. ACP exchanges retain their own deadlines.
+
 ## Timing evidence
 
 Measure from release-PR creation to public release publication, including runner

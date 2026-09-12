@@ -325,6 +325,16 @@ the same complete execution identity. The executable fixture renews every 100ms
 to exercise this boundary directly; persistent diagnostics retain ledger, Docker
 and driver facts if a future failure occurs.
 
+CI run 34675496698 passed both Linux Docker lanes, including the independent
+process fixture. The personal Windows test job timed out in `goal_uncertain`
+after its first CLI launch; the suite's captured log had no child diagnostics.
+The fixture now captures finite CLI output into files, bounds process waiting
+independently of pipe EOF and reports child diagnostics before a timeout panic.
+The Linux Goal test, workspace check and Clippy passed. Windows verification of
+this follow-up remains pending; the earlier timeout is not counted as a pass.
+
+CI run 34676688599 subsequently passed all gates at `9d558b7b360289dc9d6a428bc4f3ee855d573ac7`, including personal Windows and both Linux Docker lanes. PR #204 merged only into `codex/enterprise-preview` as `21ddba66790c00868ab0ac0d3beb1bf05576a727`; no release was created.
+
 ## Logical Memory storage boundary
 
 - `MemoryService` now supports validated logical document keys independently of optional local file projection. Shared candidate/revision/evidence/undo behavior is preserved; logical mode refuses file imports and never treats a document key as a host path.
