@@ -2,6 +2,7 @@
 
 pub mod gateway;
 pub mod runtime;
+pub mod tools;
 
 use async_trait::async_trait;
 use futures::StreamExt as _;
@@ -406,6 +407,7 @@ pub fn validate_configurations(configurations: &[ConfigurationRef]) -> Result<()
     Ok(())
 }
 
+#[derive(Clone)]
 pub struct WorkerExecution {
     pub job: RuntimeJob,
     pub input: zuno_application::runtime::JobInput,

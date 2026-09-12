@@ -25,8 +25,11 @@ use crate::prompt::PromptTraceSet;
 pub use crate::r#loop::tool_step::ToolStepCheckpoint;
 
 const EVENT_TYPE: &str = "runtime.driver.advance";
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 pub const DRIVER_CHECKPOINT_VERSION: u32 = SCHEMA_VERSION;
+pub const fn supports_checkpoint_schema(version: u32) -> bool {
+    matches!(version, 3 | 4)
+}
 const MAX_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
 
 /// A durable reference, not a caller-supplied replacement checkpoint body.
@@ -289,10 +292,32 @@ fn digest(request: &AdvanceRequest) -> String {
 fn decode(event: &SessionEvent) -> Result<AdvanceRecord, AdvanceError> {
     let record: AdvanceRecord = serde_json::from_value(Value::Object(event.properties.clone()))
         .map_err(|error| AdvanceError::InvalidCheckpoint(error.to_string()))?;
-    if event.version != 1 || record.schema_version != SCHEMA_VERSION {
+    if event.version != 1 || !supports_checkpoint_schema(record.schema_version) {
         return Err(AdvanceError::InvalidCheckpoint(
             "unsupported checkpoint schema".to_owned(),
         ));
+    }
+    // Older checkpoints can describe only waits before external handoff. Never
+    // reinterpret an injected new execution proof under an old schema version.
+    if record.schema_version == 3 {
+        let checkpoint = match &record.state {
+            AdvanceState::Checkpointed { checkpoint } | AdvanceState::Waiting { checkpoint } => {
+                Some(checkpoint)
+            }
+            _ => None,
+        };
+        if checkpoint
+            .and_then(|checkpoint| checkpoint.tool_step.as_ref())
+            .is_some_and(|phase| {
+                phase.pending.iter().any(|pending| {
+                    pending.dispatch != crate::r#loop::tool_step::PendingDispatch::NotStarted
+                })
+            })
+        {
+            return Err(AdvanceError::InvalidCheckpoint(
+                "legacy checkpoint cannot prove external handoff".to_owned(),
+            ));
+        }
     }
     Ok(record)
 }

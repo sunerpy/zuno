@@ -66,6 +66,216 @@ fn completion(reference: WaitRef) -> WaitCompletion {
     )
 }
 
+struct SubmittedDispatcher {
+    inner: DeferredDispatcher,
+    submissions: Arc<AtomicUsize>,
+    approval_after_submission: bool,
+}
+
+#[async_trait]
+impl ToolDispatcher for SubmittedDispatcher {
+    fn available_tools(&self) -> AvailableTools {
+        self.inner.available_tools()
+    }
+
+    async fn prepare(&self, request: DispatchRequest) -> PreparedToolDispatch {
+        let dispatch = self.inner.prepare(request).await;
+        if let PreparedToolDispatch::Pending(mut reference) = dispatch {
+            if self.approval_after_submission {
+                reference.target = WaitTarget::Approval {
+                    approval_id: zuno_types::identity::ApprovalId::new("too-late").unwrap(),
+                };
+            }
+            let submissions = self.submissions.clone();
+            PreparedToolDispatch::deferred(Box::pin(async move {
+                submissions.fetch_add(1, Ordering::SeqCst);
+                zuno_engine::r#loop::ToolDispatchOutcome::Pending(reference)
+            }))
+        } else {
+            dispatch
+        }
+    }
+}
+
+#[tokio::test]
+async fn submitted_operation_wait_preserves_handoff_and_consumes_without_resubmission() {
+    let mut connection = seeded();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let submissions = Arc::new(AtomicUsize::new(0));
+    let dispatcher = SubmittedDispatcher {
+        inner: deferred(&order),
+        submissions: submissions.clone(),
+        approval_after_submission: false,
+    };
+    let provider = Arc::new(ScriptedProvider::new(provider_events(&[
+        ("wait", "remote command"),
+        ("after", "after"),
+    ])));
+    let budget = Arc::new(BudgetProbe::default());
+    let (outcome, _) = advance(
+        &mut connection,
+        provider.clone(),
+        &dispatcher,
+        request(),
+        budget.clone(),
+    )
+    .await;
+    let AdvanceOutcome::Waiting { checkpoint, waits } = outcome.unwrap() else {
+        panic!("submitted operation wait")
+    };
+    assert_eq!(submissions.load(Ordering::SeqCst), 1);
+    assert!(order.lock().unwrap().is_empty());
+    let original = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .unwrap()
+        .into_iter()
+        .flat_map(|message| message.parts)
+        .find(|part| part.data.get("callID").and_then(Value::as_str) == Some("wait"))
+        .unwrap();
+    assert!(
+        original.data["state"]["dispatchedAtMs"].as_i64().is_some(),
+        "external submission must have a durable handoff before it can return Pending"
+    );
+    let stored =
+        zuno_db::event_log::latest_of_type_in(&connection, SESSION_ID, "runtime.driver.advance")
+            .unwrap()
+            .unwrap();
+    let unfinished: Vec<_> = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .unwrap()
+        .into_iter()
+        .flat_map(|message| message.parts)
+        .filter(|part| part.kind == PartKind::Tool && part.data["state"]["status"] == "pending")
+        .collect();
+    assert_eq!(stored.properties["schemaVersion"], 4);
+    assert!(zuno_engine::advance::protects_unfinished(&stored, &unfinished).unwrap());
+    let mut forged_legacy = stored.clone();
+    forged_legacy
+        .properties
+        .insert("schemaVersion".to_owned(), json!(3));
+    assert!(zuno_engine::advance::protects_unfinished(&forged_legacy, &unfinished).is_err());
+    let mut unexplained = unfinished.clone();
+    unexplained
+        .iter_mut()
+        .find(|part| part.id == original.id)
+        .unwrap()
+        .data["state"]
+        .as_object_mut()
+        .unwrap()
+        .remove("dispatchedAtMs");
+    assert!(!zuno_engine::advance::protects_unfinished(&stored, &unexplained).unwrap());
+    publish_sqlite_completion(&mut connection, &scope(), &completion(waits[0].clone())).unwrap();
+    let consume = request().resume(checkpoint);
+    let (outcome, _) = advance(
+        &mut connection,
+        provider.clone(),
+        &dispatcher,
+        consume.clone(),
+        budget.clone(),
+    )
+    .await;
+    let AdvanceOutcome::Progressed { checkpoint } = outcome.unwrap() else {
+        panic!("consumed original result")
+    };
+    let (repeated, _) = advance(
+        &mut connection,
+        provider.clone(),
+        &dispatcher,
+        consume,
+        budget.clone(),
+    )
+    .await;
+    assert!(matches!(repeated, Ok(AdvanceOutcome::Progressed { .. })));
+    assert_eq!(provider.requests().len(), 1);
+    advance(
+        &mut connection,
+        provider.clone(),
+        &dispatcher,
+        request().resume(checkpoint),
+        budget,
+    )
+    .await
+    .0
+    .unwrap();
+    assert_eq!(submissions.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.requests().len(), 2);
+    assert_eq!(*order.lock().unwrap(), ["after"]);
+}
+
+#[tokio::test]
+async fn submitted_calls_cannot_turn_into_replayable_approval_waits() {
+    let mut connection = seeded();
+    let submissions = Arc::new(AtomicUsize::new(0));
+    let dispatcher = SubmittedDispatcher {
+        inner: deferred(&Arc::new(Mutex::new(Vec::new()))),
+        submissions: submissions.clone(),
+        approval_after_submission: true,
+    };
+    let provider = Arc::new(ScriptedProvider::new(provider_events(&[(
+        "wait", "remote",
+    )])));
+    let (outcome, _) = advance(
+        &mut connection,
+        provider,
+        &dispatcher,
+        request(),
+        Arc::new(NoopBudgetPolicy),
+    )
+    .await;
+    assert!(outcome.is_err());
+    assert_eq!(submissions.load(Ordering::SeqCst), 1);
+    let last =
+        zuno_db::event_log::latest_of_type_in(&connection, SESSION_ID, "runtime.driver.advance")
+            .unwrap()
+            .unwrap();
+    assert!(
+        zuno_engine::advance::pending_waits(&last)
+            .unwrap()
+            .is_empty()
+    );
+    let original = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .unwrap()
+        .into_iter()
+        .flat_map(|message| message.parts)
+        .find(|part| part.data.get("callID").and_then(Value::as_str) == Some("wait"))
+        .unwrap();
+    assert!(original.data["state"]["dispatchedAtMs"].as_i64().is_some());
+}
+
+#[tokio::test]
+async fn an_unbounded_driver_refuses_deferred_execution_before_handoff() {
+    let mut connection = seeded();
+    let submissions = Arc::new(AtomicUsize::new(0));
+    let dispatcher = SubmittedDispatcher {
+        inner: deferred(&Arc::new(Mutex::new(Vec::new()))),
+        submissions: submissions.clone(),
+        approval_after_submission: false,
+    };
+    let provider = Arc::new(ScriptedProvider::new(provider_events(&[(
+        "wait", "remote",
+    )])));
+    let providers = registry(provider);
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+    let (outcome, _) = tokio::join!(
+        run_turn(
+            request().run,
+            TurnContext::new(
+                &mut connection,
+                &providers,
+                &Resolver,
+                &dispatcher,
+                &interrupt
+            ),
+            sender
+        ),
+        collect_events(receiver),
+    );
+    assert!(outcome.is_err());
+    assert_eq!(submissions.load(Ordering::SeqCst), 0);
+}
+
 #[test]
 fn legacy_completion_facts_are_preserved_without_becoming_approval_grants() {
     use zuno_engine::wait::{WaitOutcome, decode_completion};
@@ -181,6 +391,14 @@ async fn approval_readiness_does_not_settle_the_tool_or_spend_its_budget() {
     let AdvanceOutcome::Waiting { checkpoint, waits } = outcome.unwrap() else {
         panic!("approval wait")
     };
+    // Exact older shape: schema 3 has no proof of submitted execution.
+    connection
+        .execute(
+            "UPDATE event SET data=json_remove(json_set(data,'$.schemaVersion',3),
+         '$.state.checkpoint.toolStep.pending[0].dispatch') WHERE aggregate_id=?1 AND seq=?2",
+            (SESSION_ID, checkpoint.sequence()),
+        )
+        .unwrap();
     assert_eq!(*order.lock().unwrap(), ["before"]);
     dispatcher.approved.store(true, Ordering::SeqCst);
     publish_sqlite_completion(

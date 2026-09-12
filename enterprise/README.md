@@ -70,3 +70,5 @@ Enterprise Linux and personal cross-platform boundaries: [English](PLATFORMS.md)
 Bounded Worker execution and renewal: [English](WORKERS.md), [中文](WORKERS.zh.md).
 
 Enterprise session, Job and approval API: [English](APPLICATION.md), [中文](APPLICATION.zh.md).
+
+Executable roles and deployment templates: [English](DEPLOYMENT.md), [中文](DEPLOYMENT.zh.md).

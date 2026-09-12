@@ -4,11 +4,23 @@
 use super::*;
 use zuno_types::wait::WaitRef;
 
+/// A wait before handoff may recheck approval; a submitted call only consumes
+/// an authoritative result and must never enter preparation again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingDispatch {
+    #[default]
+    NotStarted,
+    Submitted,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PendingToolCall {
     pub index: usize,
     pub reference: WaitRef,
+    #[serde(default)]
+    pub dispatch: PendingDispatch,
 }
 
 /// Data required to resume the tool phase without another model request.
@@ -143,11 +155,14 @@ pub(super) async fn execute(
                         &orchestration_snapshot,
                     ))
                     .await;
-                let deferred = matches!(&dispatch, PreparedToolDispatch::Pending(_));
+                let deferred = matches!(
+                    &dispatch,
+                    PreparedToolDispatch::Pending(_) | PreparedToolDispatch::DeferredExecution(_)
+                );
+                if deferred && !bounded {
+                    return Err(crate::state::TurnStateError::InvalidData.into());
+                }
                 if let PreparedToolDispatch::Pending(reference) = &dispatch {
-                    if !bounded {
-                        return Err(crate::state::TurnStateError::InvalidData.into());
-                    }
                     crate::wait::validate_binding(reference, request, &call)?;
                 }
                 prepared.push((call_index, call, display_name, ui_intent, dispatch));
@@ -180,7 +195,11 @@ pub(super) async fn execute(
                     calls: prepared
                         .iter()
                         .filter(|(_, _, _, _, dispatch)| {
-                            matches!(dispatch, PreparedToolDispatch::Execution(_))
+                            matches!(
+                                dispatch,
+                                PreparedToolDispatch::Execution(_)
+                                    | PreparedToolDispatch::DeferredExecution(_)
+                            )
                         })
                         .map(|(call_index, call, display_name, ui_intent, _)| {
                             (*call_index, call, display_name.as_str(), *ui_intent)
@@ -190,6 +209,12 @@ pub(super) async fn execute(
             )
             .await?;
 
+            let submitted: BTreeSet<_> = prepared
+                .iter()
+                .filter_map(|(index, _, _, _, dispatch)| {
+                    matches!(dispatch, PreparedToolDispatch::DeferredExecution(_)).then_some(*index)
+                })
+                .collect();
             let completed = if first_policy == ToolConcurrencyPolicy::Exclusive {
                 let (call_index, call, display_name, ui_intent, dispatch) =
                     prepared.pop().expect("exclusive group contains one call");
@@ -223,7 +248,23 @@ pub(super) async fn execute(
                         results.push((index, call, display, intent, *result));
                     }
                     ToolDispatchOutcome::Pending(reference) => {
-                        phase.pending.push(PendingToolCall { index, reference });
+                        crate::wait::validate_binding(&reference, request, &call)?;
+                        let dispatch = if submitted.contains(&index) {
+                            if matches!(
+                                reference.target,
+                                zuno_types::wait::WaitTarget::Approval { .. }
+                            ) {
+                                return Err(crate::state::TurnStateError::InvalidData.into());
+                            }
+                            PendingDispatch::Submitted
+                        } else {
+                            PendingDispatch::NotStarted
+                        };
+                        phase.pending.push(PendingToolCall {
+                            index,
+                            reference,
+                            dispatch,
+                        });
                     }
                 }
             }
@@ -450,6 +491,11 @@ impl ToolStepCheckpoint {
             if pending.index >= self.next_call
                 || !indices.insert(pending.index)
                 || !waits.insert(&pending.reference.id)
+                || (pending.dispatch == PendingDispatch::Submitted
+                    && matches!(
+                        pending.reference.target,
+                        zuno_types::wait::WaitTarget::Approval { .. }
+                    ))
             {
                 return Err(crate::state::TurnStateError::InvalidData.into());
             }
@@ -475,7 +521,7 @@ impl ToolStepCheckpoint {
         let pending: BTreeMap<_, _> = self
             .pending
             .iter()
-            .map(|pending| (pending.index, &pending.reference))
+            .map(|pending| (pending.index, pending))
             .collect();
         let expected: BTreeMap<_, _> = self
             .calls
@@ -515,14 +561,24 @@ impl ToolStepCheckpoint {
                     .and_then(|state| state.get("status"))
                     .and_then(Value::as_str)
                     != Some("pending")
-                || state.is_some_and(|state| state.get(DISPATCH_STARTED_FIELD).is_some())
             {
+                return Ok(false);
+            }
+            let started = state.and_then(|state| state.get(DISPATCH_STARTED_FIELD));
+            let expects_started = pending
+                .get(index)
+                .is_some_and(|pending| pending.dispatch == PendingDispatch::Submitted);
+            if expects_started {
+                if started.and_then(Value::as_i64).is_none_or(|time| time < 0) {
+                    return Ok(false);
+                }
+            } else if started.is_some() {
                 return Ok(false);
             }
             let marker = state.and_then(|state| state.get("waitRef"));
             match pending.get(index) {
-                Some(reference) => {
-                    let expected = json!(reference);
+                Some(pending) => {
+                    let expected = json!(pending.reference);
                     if marker != Some(&expected) && (registered || marker.is_some()) {
                         return Ok(false);
                     }
@@ -595,6 +651,7 @@ pub fn consume(
             // Preparation stops at the first wait. Rechecking only that final,
             // undispatched call cannot replay earlier effects in this group.
             if phase.pending.len() != 1
+                || pending.dispatch != PendingDispatch::NotStarted
                 || pending.index + 1 != phase.next_call
                 || !phase.covers_unfinished(
                     &request.session_id,

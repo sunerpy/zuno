@@ -126,8 +126,11 @@ database authority. The Worker client has no PostgreSQL dependency.
 around the complete advance, including initialization. Its monotonic stop bound
 subtracts request latency; database time remains authoritative. Input timestamps
 and checkpoint budgets survive Worker changes. See [Worker host](../enterprise/WORKERS.md).
-Enterprise launch/profile and tool assembly are still required for a runnable
-distributed deployment. A lost state-service acknowledgement pauses recovery;
+The enterprise executable now composes native provider factories, a shared driver
+profile and the authenticated gateway tool. Deferred submission records handoff
+before an effect and checkpoints a typed submitted wait afterward; it cannot
+become an approval replay. Schema 4 preserves safe schema-3 continuation and
+budgets. See [deployment](../enterprise/DEPLOYMENT.md). A lost state-service acknowledgement pauses recovery;
 it never authorizes mechanical effect replay.
 
 ### Bounded driver checkpoints

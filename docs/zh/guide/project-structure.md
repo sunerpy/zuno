@@ -1,6 +1,6 @@
 # 项目结构与执行流
 
-修改行为之前，先用本页找到负责它的 crate。Zuno 是一个包含 54 个 crate 的 Rust
+修改行为之前，先用本页找到负责它的 crate。Zuno 是一个包含 55 个 crate 的 Rust
 workspace。`crates/zuno-cli` 构建最终的 `zuno` 二进制，其余 crate 把协议、运行时、
 存储、工具和客户端职责从入口程序中分离出来。
 
@@ -33,6 +33,7 @@ workspace。`crates/zuno-cli` 构建最终的 `zuno` 二进制，其余 crate �
 | Crate | 职责 |
 | --- | --- |
 | `zuno-cli`（`zuno`） | 解析命令、加载配置、组装默认 harness，并提供发布的可执行文件 |
+| `zuno-enterprise` | 独立企业预览的 Linux 控制面、Worker、网关及初始化可执行入口 |
 | `zuno-tui` | 终端视图、输入、快捷键、主题与渲染；不拥有私有 Agent 循环 |
 | `zuno-server` | 默认提供个人 HTTP／SSE／PTY projection；Linux 企业服务通过显式 `enterprise` feature 启用 |
 | `zuno-acp` | Zed 等编辑器使用的 Agent Client Protocol adapter |

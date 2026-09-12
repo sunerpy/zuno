@@ -32,6 +32,7 @@ pub struct WorkerTurnServices {
     pub dynamic_context: DynamicContext,
     pub executor_directory: String,
     pub steps_per_advance: NonZeroU32,
+    pub context_limit: Option<u64>,
 }
 
 #[async_trait]
@@ -328,12 +329,16 @@ async fn advance_with_services(
             .await
             .map_err(|error| WorkerError::Advance(AdvanceError::Turn(error)))?;
     }
+    let mut run = RunTurnRequest::new(
+        execution.job.session_id.to_string(),
+        execution.job.turn_id.to_string(),
+        services.dynamic_context,
+    );
+    if let Some(limit) = services.context_limit {
+        run = run.with_context_limit(limit);
+    }
     let mut request = AdvanceRequest::new(
-        RunTurnRequest::new(
-            execution.job.session_id.to_string(),
-            execution.job.turn_id.to_string(),
-            services.dynamic_context,
-        ),
+        run,
         services.configuration.sha256,
         services.steps_per_advance,
     )

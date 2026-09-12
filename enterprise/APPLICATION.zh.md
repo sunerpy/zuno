@@ -38,14 +38,15 @@ PostgreSQL 使用同一契约。省略选择项保留已有会话选择和旧请
 角色、发起人／指定审批人范围、过期时间、策略及受信任审批应用。普通 API 客户端和
 ACP bridge 不应为了跳过 HITL 而加入审批应用白名单。审批决定不是工具完成或 Worker 凭证。
 
-公共 Job DTO 不包含检查点、租约、凭证、配置、私有续接块或任意存储结果。完整历史与
+公共 Job DTO 提供类型化等待目标，客户端可据此发现审批 ID；不包含检查点、租约、凭证、
+配置、私有续接块或任意存储结果。完整历史与
 临时活动由独立活动协议承载；当前不注册占位的历史、取消或流式路由。
 
 `python3 scripts/check_enterprise_postgres.py` 通过真实 TLS／PostgreSQL 验证
 双用户、CAS／重放冲突、配置选择、跨归属拒绝、审批限制和撤权。BFF 用例跨两个副本
 访问真实应用接口，包含 CSRF 和退出登录；SQLite 用例验证选择项和改变内容后的拒绝。
 
-独立角色、生产 Worker／工具装配及 P3–P6 故障验收仍需完成。预览发布保持关闭，
+独立角色与网关命令装配见[部署](DEPLOYMENT.zh.md)，完整 P3–P6 故障验收仍需完成。预览发布保持关闭，
 个人 HTTP／TUI／ACP 平台行为不变。
 
 参见 [English](APPLICATION.md)、[授权](AUTHORIZATION.zh.md)、

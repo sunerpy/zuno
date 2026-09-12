@@ -65,6 +65,19 @@ PostgreSQL and HTTPS contracts. Tests exercise post-commit response loss, repeat
 publication, expired Worker leases, forged attempts/changed outputs, release
 before acknowledgement, restart and migration preservation.
 
+Receipt inspection shares the environment's submission boundary. A live
+`Starting` operation cannot be reclassified from a transient Docker `created`
+observation while its submitter is still active. Background delivery skips busy
+environments and continues scanning others; direct inspection waits for that
+specific boundary. After a process restart, an unexplained start still requires
+the existing conservative reconciliation and is never automatically replayed.
+
+Gateway authorization compares the stable owner, Job/session, attempt, worker,
+epoch and checkpoint identity. A response may extend the lease expiry after a
+concurrent Worker renewal. That extension is accepted; an identity change or
+shorter expiry is refused. Renewal does not require a new human approval for the
+same authorized invocation.
+
 See [中文](OPERATION_RESULTS.zh.md), [gateway](GATEWAY.md) and
 [waiting](WAITING.md). These storage/transport pieces do not by themselves enable
 an enterprise runtime command or certify the remaining Worker/Workflow/Web work.

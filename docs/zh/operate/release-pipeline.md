@@ -265,6 +265,10 @@ x86_64 Windows 制品构建单独占 16 分 12 秒。
 170 秒 attachment suite、132 秒 tools suite 与 66 秒 TUI suite，不再让它们成为最后长尾。
 捕获的私有 Cargo 环境永远不会上传。
 
+Goal 恢复集成测试把每次有限 CLI 运行的输出写入文件，并在独立期限内等待进程退出。
+继承的输出句柄不能让取消后的管道读取继续阻塞测试运行时退出。失败时先将捕获的
+stdout／stderr 直接写入 suite 日志，再报告期限失败；ACP 交互仍有各自的超时限制。
+
 ## 时延证据
 
 从 release PR 创建开始计时，到公开 release 发布结束，runner 排队也计入。只有连续三次

@@ -297,3 +297,38 @@ the leftover directory. Cleanup now retries only sharing violations within the
 existing cleanup budget and reports a persistent failure instead of success.
 All 41 local CI-tool tests pass (three platform-specific tests skipped); native
 Windows rerun remains required. Both pipeline guides document the behavior.
+
+## Independent executable roles and gateway tools
+
+- Worker PR #202 passed CI `34668613673` and merged at `4f47b2ade957cc2da68ab510812f3d5b6abd36a9`. Application PR #203 passed CI `34669238534` and merged at `cee0f3fed19c05d44d79d9816fe65646dddd1eb0`.
+- `DeferredExecution` now records tool handoff before submitting an external effect. Checkpoint schema 4 distinguishes unsubmitted approval waits from submitted operation waits; schema 3 is retained as unsubmitted state. Worker protocol 5 rejects incompatible claimants before acquiring work.
+- Focused failing tests demonstrated a missing handoff and failed schema-3 takeover. The repaired tests verify submitted result consumption without replay, refusal of approval-after-submission, unbounded-driver refusal, legacy takeover, and unchanged budgets.
+- `GatewayToolDispatcher` provides the explicit argv `environment_command` capability, preserving the existing personal shell contract. A shared-kernel/HTTPS/Docker test crosses approval, command submission, receipt delivery and five Worker claims with one actual command execution.
+- The new `zuno-enterprise` executable composes real control-plane, Worker, gateway, migration and identity roles. Definitions are immutable, credentials are separate, models reuse native factories, the gateway has a receipt supervisor, and service shutdown drains bounded work.
+- A separate executable test starts one control plane, one gateway and two Worker processes against real TLS/RSA, the native compatible model transport, PostgreSQL and rootless Docker. Two users complete separate approvals and Jobs, both Workers participate, and exactly two command operations are recorded. The final native run also passed SIGTERM draining for all four processes.
+- Public Job views now expose safe typed wait targets so clients can discover approval IDs. They still omit grants, checkpoints and private replay material. Full final-message/activity projection, workspace provisioning, enterprise Memory, distributed children/Workflow/Council, React/ACP and P6 acceptance remain outstanding.
+- Documentation impact: both deployment guides and typed templates, Worker/wait/state/application/runtime references and workspace inventories are updated. No release is enabled; documentation remains an isolated preview artifact.
+- Validation passed: enterprise configuration/budget tests, shared dispatch tests, real Docker/PostgreSQL/HTTPS/independent-process contracts, workspace check and Clippy, 100 documentation/release contracts, CI-tool and preview publisher tests, personal dependency isolation, formatting and diff checks. The explicit crate roster and both inventories now contain 55 crates. Remote CI remains required before integration.
+
+PR #204's independent-process CI reported uncertain Jobs on both Linux
+architectures. A controlled real-Docker regression reproduced receipt observation
+changing an active `Starting` operation to `Uncertain` before Docker start
+completed. Direct inspection now waits for the environment's submit boundary;
+background delivery skips it and continues other work. Observation refreshes the
+ledger under that boundary, preserving conservative recovery after a restart.
+
+Repeated native validation exposed a second cause: the authority returned an
+extended lease after renewal, while the gateway compared the entire lease for
+equality and rejected it. A deterministic renewal-between-authorization test
+reproduced `Forbidden`. The client now accepts only a non-shortening expiry with
+the same complete execution identity. The executable fixture renews every 100ms
+to exercise this boundary directly; persistent diagnostics retain ledger, Docker
+and driver facts if a future failure occurs.
+
+CI run 34675496698 passed both Linux Docker lanes, including the independent
+process fixture. The personal Windows test job timed out in `goal_uncertain`
+after its first CLI launch; the suite's captured log had no child diagnostics.
+The fixture now captures finite CLI output into files, bounds process waiting
+independently of pipe EOF and reports child diagnostics before a timeout panic.
+The Linux Goal test, workspace check and Clippy passed. Windows verification of
+this follow-up remains pending; the earlier timeout is not counted as a pass.

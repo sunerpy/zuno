@@ -79,15 +79,22 @@ pub struct CommandOperation {
 }
 impl CommandOperation {
     pub fn validate(&self) -> Result<(), ApplicationError> {
-        if self.expected_revision == 0
-            || self.argv.is_empty()
-            || self.argv.len() > 128
-            || self.argv[0].is_empty()
-            || self
-                .argv
+        if self.expected_revision == 0 {
+            return Err(ApplicationError::Invalid(
+                "invalid environment revision".to_owned(),
+            ));
+        }
+        Self::validate_arguments(&self.argv)
+    }
+
+    pub fn validate_arguments(argv: &[String]) -> Result<(), ApplicationError> {
+        if argv.is_empty()
+            || argv.len() > 128
+            || argv[0].is_empty()
+            || argv
                 .iter()
                 .any(|arg| arg.len() > 65536 || arg.contains('\0'))
-            || self.argv.iter().map(String::len).sum::<usize>() > 262144
+            || argv.iter().map(String::len).sum::<usize>() > 262144
         {
             return Err(ApplicationError::Invalid(
                 "invalid bounded command operation".to_owned(),

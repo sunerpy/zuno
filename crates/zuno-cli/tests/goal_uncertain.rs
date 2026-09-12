@@ -46,6 +46,43 @@ fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_zuno"))
 }
 
+/// Wait for process exit independently of inherited pipe EOF. Tokio's Windows
+/// anonymous-pipe reads can outlive a cancelled output future and then prevent
+/// the test runtime from shutting down. Files also retain the failure evidence.
+async fn run_captured(command: &mut tokio::process::Command) -> std::process::Output {
+    let capture = tempfile::tempdir().expect("command captures");
+    let stdout_path = capture.path().join("stdout");
+    let stderr_path = capture.path().join("stderr");
+    command
+        .stdin(Stdio::null())
+        .stdout(std::fs::File::create(&stdout_path).expect("stdout capture"))
+        .stderr(std::fs::File::create(&stderr_path).expect("stderr capture"))
+        .kill_on_drop(true);
+    let mut child = command.spawn().expect("launch production CLI");
+    let status = tokio::time::timeout(RUN_TIMEOUT, child.wait()).await;
+    if status.is_err() {
+        let _ = tokio::time::timeout(Duration::from_secs(5), child.kill()).await;
+    }
+    let stdout = std::fs::read(&stdout_path).expect("read stdout capture");
+    let stderr = std::fs::read(&stderr_path).expect("read stderr capture");
+    // Direct writes survive libtest's output buffering on a stalled runtime.
+    if !matches!(&status, Ok(Ok(status)) if status.success()) {
+        let _ = writeln!(
+            std::io::stderr(),
+            "goal-uncertain: child exit {status:?}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr),
+        );
+    }
+    std::process::Output {
+        status: status
+            .expect("production CLI must exit inside its budget")
+            .expect("wait for production CLI"),
+        stdout,
+        stderr,
+    }
+}
+
 fn text_response(text: &str) -> MockResponse {
     let chunk = json!({
         "choices": [{
@@ -279,12 +316,8 @@ async fn a_lost_side_effect_pauses_the_goal_and_survives_a_pause_that_was_never_
         .current_dir(env.working_dir())
         .env_clear()
         .envs(variables.clone());
-    command.kill_on_drop(true);
     stage("run the guard-failure turn");
-    let output = tokio::time::timeout(RUN_TIMEOUT, command.output())
-        .await
-        .expect("the first run must finish inside its budget")
-        .expect("launch production CLI");
+    let output = run_captured(&mut command).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     stage("guard-failure turn exited");
@@ -384,12 +417,8 @@ async fn a_lost_side_effect_pauses_the_goal_and_survives_a_pause_that_was_never_
         .current_dir(env.working_dir())
         .env_clear()
         .envs(variables.clone());
-    command.kill_on_drop(true);
     stage("restart and inspect the durable obligation");
-    let output = tokio::time::timeout(RUN_TIMEOUT, command.output())
-        .await
-        .expect("the restarted run must finish inside its budget")
-        .expect("relaunch production CLI");
+    let output = run_captured(&mut command).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     stage("restart inspection exited");

@@ -10,11 +10,13 @@ ENTERPRISE_DIRECTORIES = (
     "crates/zuno-postgres/",
     "crates/zuno-environment/",
     "crates/zuno-worker/",
+    "crates/zuno-enterprise/",
     "crates/zuno-server/tests/enterprise_state/",
 )
 ENTERPRISE_FILES = {
     "crates/zuno-server/tests/enterprise_state.rs",
     "crates/zuno-server/src/enterprise_browser.rs",
+    "crates/zuno-server/src/enterprise_application.rs",
     "crates/zuno-server/src/enterprise_gateway.rs",
     "crates/zuno-server/src/enterprise_state.rs",
     "crates/zuno-server/src/gateway_configuration.rs",

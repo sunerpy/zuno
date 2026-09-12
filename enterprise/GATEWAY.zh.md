@@ -80,3 +80,7 @@ socket 会使该 gate 失败。可以通过 `ZUNO_ROOTLESS_DOCKER_SOCKET` 指定
 
 另见 [English](GATEWAY.md)、[rootless 后端](ENVIRONMENTS.zh.md)、
 [身份](AUTHENTICATION.zh.md)和[审批接续](WAITING.zh.md)。
+
+`GatewayToolDispatcher` 已通过此传输实现 `environment_command`，审批等待发生在执行前，
+操作等待发生在持久交接之后。可执行网关运行回执投递 supervisor；原生 runner 还会启动
+控制面、网关和两个独立 Worker 二进制，详见[部署](DEPLOYMENT.zh.md)。

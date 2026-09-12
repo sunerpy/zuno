@@ -253,7 +253,7 @@ pub(crate) async fn reclaimable_checkpoint(
         return Ok(false);
     };
     if checkpoint.driver != "default"
-        || checkpoint.schema_version != zuno_engine::advance::DRIVER_CHECKPOINT_VERSION
+        || !zuno_engine::advance::supports_checkpoint_schema(checkpoint.schema_version)
     {
         return Ok(false);
     }
