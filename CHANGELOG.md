@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.33](https://github.com/sunerpy/zuno/compare/v0.10.32...v0.10.33) (2026-09-12)
+
+
+### Bug Fixes
+
+* **session:** 修复暂停输入回执与恢复边界 ([32b0459](https://github.com/sunerpy/zuno/commit/32b0459566794ea1825af3229fe3eb8a3c605b4b))
+
 ## [0.10.32](https://github.com/sunerpy/zuno/compare/v0.10.31...v0.10.32) (2026-09-12)
 
 
