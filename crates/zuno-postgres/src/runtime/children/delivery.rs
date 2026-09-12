@@ -31,7 +31,7 @@ pub(crate) async fn completed(
     if record.ticket.session_id != job.session_id || record.state != "active" {
         return Err(ApplicationError::Conflict);
     }
-    let workflow = super::super::workflow::result(tx, job, phase).await?;
+    let workflow = Box::pin(super::super::workflow::result(tx, job, phase)).await?;
     let (text, assistant_id) = if let Some(text) = &workflow {
         (text.clone(), None)
     } else if phase == "completed" {

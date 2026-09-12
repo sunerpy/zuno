@@ -258,7 +258,7 @@ async fn activate(
     set_state(tx, coordinator, run, "active").await?;
     // Node admission and dependency advancement are performed in this same
     // transaction by the shared coordinator below.
-    advance(tx, coordinator, run).await
+    Box::pin(advance(tx, coordinator, run)).await
 }
 
 pub(super) async fn identity(

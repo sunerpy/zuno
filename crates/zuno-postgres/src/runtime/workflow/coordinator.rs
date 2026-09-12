@@ -321,17 +321,17 @@ pub(in crate::runtime) async fn drain(
             )
             .await?;
         } else if run.state == "active" {
-            advance(tx, &coordinator, &run).await?;
+            Box::pin(advance(tx, &coordinator, &run)).await?;
         } else {
             let parent = read_job(tx, owner, run.parent.as_str()).await?;
             if parent.phase != JobPhase::Running {
                 let now = database_time(tx).await?;
-                super::control::cancel_tree_in(
+                Box::pin(super::control::cancel_tree_in(
                     tx,
                     &coordinator,
                     "parent did not retain the prepared workflow",
                     now,
-                )
+                ))
                 .await?;
                 set_state(tx, &coordinator, &run, "cancelled").await?;
             }

@@ -348,7 +348,7 @@ pub(crate) async fn activate_wait(
     if record.state == "staged" {
         activate(tx, parent, &record).await?;
     }
-    super::workflow::activate_wait(tx, parent, job_id).await?;
+    Box::pin(super::workflow::activate_wait(tx, parent, job_id)).await?;
     Ok(())
 }
 

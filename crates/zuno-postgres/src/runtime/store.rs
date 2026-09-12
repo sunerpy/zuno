@@ -61,7 +61,10 @@ impl RuntimeStore for PostgresRuntimeStore {
             let time = database_time(&mut tx).await?;
             expire_inflight(&mut tx, &owner, time).await?;
             children::drain(&mut tx, &owner).await?;
-            workflow::drain(&mut tx, &owner).await?;
+            // Coordination has its own bounded async state. Keeping it inline
+            // would embed the full cancellation/completion chain in every
+            // ordinary Job claim, including claims with no active Workflow.
+            Box::pin(workflow::drain(&mut tx, &owner)).await?;
             waiting::wake_timers(&mut tx, &owner, time).await?;
             let time = database_time(&mut tx).await?;
             let candidate = query(

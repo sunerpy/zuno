@@ -94,7 +94,7 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool) {
     }
     concurrency::exercise(backend, admin).await;
     recovery::exercise(backend, admin).await;
-    children::execution_binding(backend, admin).await;
+    Box::pin(children::execution_binding(backend, admin)).await;
     activity::exercise(backend, admin).await;
     live::exercise(backend, admin).await;
 }
