@@ -411,12 +411,40 @@ async fn repair_and_quorum(backend: &PostgresBackend, admin: &PgPool) {
     let store = backend.runtime(actor.tenant_id().clone());
     let worker_one = worker("one");
     let worker_two = worker("two");
+    // A non-blocking claim may see no candidate while the other transaction
+    // advances the coordinator or locks a session. Keep both claimers racing,
+    // but do not require every individual poll to find work.
+    async fn claim_seat(
+        store: &crate::PostgresRuntimeStore,
+        admin: &PgPool,
+        actor: &PrincipalScope,
+        worker: &zuno_types::identity::WorkerInstanceId,
+    ) -> zuno_application::runtime::ClaimedJob {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            if let Some(job) = store.claim(worker, duration()).await.unwrap() {
+                return job;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let state: serde_json::Value = query_scalar(
+                    "SELECT jsonb_build_object(
+                        'jobs',(SELECT jsonb_agg(jsonb_build_object('job',job_id,'phase',phase,
+                            'session',session_id,'readyAt',ready_at))
+                            FROM zuno_enterprise_preview.runtime_job WHERE tenant_id=$1 AND principal_id=$2),
+                        'sessions',(SELECT jsonb_agg(to_jsonb(s))
+                            FROM zuno_enterprise_preview.runtime_session s WHERE tenant_id=$1 AND principal_id=$2),
+                        'clockMs',floor(extract(epoch FROM clock_timestamp())*1000)::bigint)"
+                ).bind(actor.tenant_id().as_str()).bind(actor.principal_id().as_str())
+                    .fetch_one(admin).await.unwrap();
+                panic!("Council seat remained unclaimable: {state}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
     let (one, two) = tokio::join!(
-        store.claim(&worker_one, duration()),
-        store.claim(&worker_two, duration())
+        claim_seat(&store, admin, &actor, &worker_one),
+        claim_seat(&store, admin, &actor, &worker_two)
     );
-    let one = one.unwrap().unwrap();
-    let two = two.unwrap().unwrap();
     assert_ne!(one.job.id, two.job.id);
     complete_child_with_text(backend, admin, &one, "not valid structured data").await;
     complete_child_with_text(backend, admin, &two, &answer("agree")).await;

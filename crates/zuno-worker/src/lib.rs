@@ -62,6 +62,19 @@ pub const GATEWAY_IMPORT_AUTHORIZE_PATH: &str = "internal/gateway/v1/workspace-i
 pub const GATEWAY_IMPORT_COMPLETE_PATH: &str = "internal/gateway/v1/workspace-import/complete";
 pub const GATEWAY_IMPORT_PATH: &str = "internal/execution/v1/workspace-import";
 pub const GATEWAY_EXECUTE_PATH: &str = "internal/execution/v1/request";
+pub const GATEWAY_SNAPSHOT_TICKET_PATH: &str = "internal/gateway/v1/snapshot/ticket";
+pub const GATEWAY_SNAPSHOT_RESOLVE_PATH: &str = "internal/gateway/v1/snapshot/resolve";
+pub const GATEWAY_SNAPSHOT_COMPLETE_PATH: &str = "internal/gateway/v1/snapshot/complete";
+pub const GATEWAY_SNAPSHOT_FACT_PATH: &str = "internal/gateway/v1/snapshot/fact";
+pub const GATEWAY_SNAPSHOT_EXPORT_PATH: &str = "internal/execution/v1/snapshot";
+pub const GATEWAY_SNAPSHOT_TICKET_HEADER: &str = "x-zuno-snapshot-ticket";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IssuedSnapshotTransfer {
+    pub context: zuno_application::workspace_transfer::SnapshotTransferContext,
+    pub ticket: zuno_identity::gateway::GatewaySnapshotTicket,
+}
 
 /// Older checkpoints did not record display provenance. That absence may be
 /// filled by the installed adapter; every execution-relevant declaration field

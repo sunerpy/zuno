@@ -218,7 +218,7 @@ async fn gateway(
     if !(100..=30000).contains(&options.delivery_millis) {
         return Err(invalid("gateway delivery interval must be 100–30000ms"));
     }
-    let state = GatewayStateClient::new(
+    let mut state = GatewayStateClient::new(
         config::https_endpoint(&options.state.endpoint)?,
         Arc::new(FileAccessTokenSource::new(
             options.state.access_token_file.clone(),
@@ -226,6 +226,11 @@ async fn gateway(
         certificate(options.state.root_certificate.as_ref()).await?,
     )
     .map_err(|_| invalid("invalid gateway state client"))?;
+    if let Some(certificate) = certificate(options.snapshot_root_certificate.as_ref()).await? {
+        state = state
+            .with_snapshot_certificate(certificate)
+            .map_err(|_| invalid("invalid gateway snapshot client"))?;
+    }
     let gateway = GatewayExecutionService::connect(
         options.id,
         &options.docker_socket,
@@ -233,7 +238,8 @@ async fn gateway(
         state,
     )
     .await?
-    .with_merge_parallelism(options.merge_parallelism)?;
+    .with_merge_parallelism(options.merge_parallelism)?
+    .with_snapshot_parallelism(options.snapshot_parallelism)?;
     let delivery = gateway.clone();
     let stopped = shutdown.clone();
     let supervisor = tokio::spawn(async move {

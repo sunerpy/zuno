@@ -48,7 +48,7 @@ operation; an earlier approval or revision cannot authorize a different operatio
 
 ## Private protocol
 
-`GatewayRequest` is protocol version 4, with bounded tagged commands:
+`GatewayRequest` is protocol version 5, with bounded tagged commands:
 
 | Command | Behavior |
 | --- | --- |
@@ -128,4 +128,14 @@ also starts a control plane, gateway and two independent Worker binaries; see
 
 The gateway supervisor also polls authenticated `internal/gateway/v1/cancellations`. This service-only path returns immutable admissions for stopped Jobs and stays valid after Worker revocation. It cannot start new operations. Docker stop and its actual terminal receipt remain separate; completed facts are preserved and unknown outcomes remain uncertain. See [control](CONTROL.md).
 
-Gateway protocol 4 permits child-workspace preparation from a data-owner-verified Workflow group workspace. That source must already exist; the exact child, source and gateway assignment remain bound to the signed request. Ordinary commands still require the executing session.
+Gateway protocol 5 routes child preparation to the target gateway and separately
+identifies the authorized source, including an existing Workflow group workspace.
+Ordinary commands still require the executing session.
+
+Snapshot exchange uses `/internal/execution/v1/snapshot` with a distinct
+`x-zuno-snapshot-ticket`. Control-plane `/internal/gateway/v1/snapshot/`
+`ticket`, `resolve`, `complete` and `fact` handlers bind routing, current
+authorization and the immutable source receipt. The 1 MiB JSON frame bound still
+applies; only the authenticated archive body uses the separate 512 MiB limit.
+The source's service token is never sent to its peer.
+See [workspace transfer](WORKSPACES.md#transfer-between-gateways).

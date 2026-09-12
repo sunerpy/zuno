@@ -16,6 +16,7 @@ pub mod runtime;
 pub mod workflow;
 pub mod workspace_import;
 pub mod workspace_merge;
+pub mod workspace_transfer;
 
 use std::sync::Arc;
 

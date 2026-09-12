@@ -142,8 +142,16 @@ pub struct GatewayConfig {
     pub delivery_millis: u64,
     #[serde(default = "merge_parallelism")]
     pub merge_parallelism: u32,
+    #[serde(default = "snapshot_parallelism")]
+    pub snapshot_parallelism: u32,
+    /// Peer gateways may use a different private CA from the control plane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_root_certificate: Option<PathBuf>,
 }
 fn merge_parallelism() -> u32 {
+    2
+}
+fn snapshot_parallelism() -> u32 {
     2
 }
 #[derive(Clone, Serialize, Deserialize)]

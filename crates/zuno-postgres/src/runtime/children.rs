@@ -4,7 +4,7 @@ mod delivery;
 mod workspace;
 pub(crate) use delivery::validate_completion_input;
 pub(crate) use delivery::{completed, drain, ready};
-pub(crate) use workspace::merge_source_in;
+pub(crate) use workspace::{merge_source_in, validate_snapshot_transfer_in};
 
 use super::*;
 use zuno_application::child::{
