@@ -147,5 +147,12 @@ UI and the complete P6 fault matrix remain separate work. The maintenance storag
 contract is implemented; it does not advertise an automatic enterprise extraction
 producer or bypass independent Skill evaluation/application review.
 
+The shared learning model runner now accepts an asynchronous
+`LearningModelJournal`. Typed request/outcome records and normalized usage can be
+handled by the data owner instead of requiring a local Worker database. The local
+SQLite adapter and its consumers are implemented; enterprise scheduling,
+learning authorization, budget settlement and the remote journal still require
+their complete provider/consumer path before automatic producers are registered.
+
 See [中文](MEMORY.zh.md), [PostgreSQL](POSTGRES.md), [application API](APPLICATION.md)
 and [deployment](DEPLOYMENT.md).

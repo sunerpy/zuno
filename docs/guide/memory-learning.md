@@ -264,6 +264,19 @@ and provider request ID. `/learn` shows job state, attempt count, next deadline,
 recent errors. Check the job result as well as the provider outcome: a completed
 provider response can still fail JSON or evidence validation.
 
+Outcome receipts also contain `usage`: uncached input, cache reads/writes, output,
+optional reasoning detail, total tokens and provider-attempt count. Cache tokens
+are counted once, and reasoning remains inside output. Partial stream reports
+are combined; provider rollback discards partial answer text while retaining
+observed usage from that attempt. A missing, incomplete or non-terminal report has
+`accounted: false`, so zero recorded tokens do not establish zero consumption.
+
+The request journal must accept the prepared request before the provider is
+contacted. Its wait shares the model deadline. A terminal receipt has a separate
+I/O allowance capped at 30 seconds; this cannot start another model request.
+An unrecorded outcome is reported as a failure. When both the provider and journal
+fail, typed provider recovery and a longer `Retry-After` remain intact.
+
 ### Inspect and repair learning history
 
 Historical repair works on the current project's legacy extraction jobs.

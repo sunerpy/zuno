@@ -1455,6 +1455,17 @@ including sampling support and output limits. Diagnostic records retain bounded,
 redacted provider response details, HTTP status and request identity. A historical
 400 is a diagnostic task, not authorization to retry unchanged input or select
 another model blindly.
+Learning model I/O uses `LearningModelJournal`, with typed request and outcome
+records. The SQLite adapter preserves the existing session-event vocabulary and
+performs database work off the async reactor. The model runner awaits request
+admission within its execution deadline; outcome receipt I/O is separately bounded
+to at most 30 seconds. Journal failure cannot become successful extraction or
+trigger an inline replay. Combined provider/journal failure preserves typed
+recovery and the longer retry deadline.
+Learning outcome usage retains partial reports and discarded provider-attempt
+costs, normalizes cache buckets once, keeps reasoning inside output and marks
+incomplete reports as unaccounted. The port permits a data-owner state adapter;
+it does not register an automatic enterprise producer.
 There is no quota-percentage, daily-token, or currency budget; eligibility,
 idempotency, the wake cap, the three-attempt ceiling, and `learning.execution`
 input/output/step and total-time limits bound background work.

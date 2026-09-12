@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p4-workspace-transfer`.
+- Current phase branch: `codex/enterprise-p2-memory-producers`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -476,3 +476,11 @@ Workflow PR #218 initially exposed an arm64 stack overflow in the PostgreSQL con
 - Local validation covers the real control plane, two gateway processes/ledgers and two Workers, 42 fixture model requests, remote child/Workflow/Council workspaces, approved return merge/content review and drain. Provider faults cover truncation, cancellation, corrupt/repeated bytes, changed source contents and restart after publication. PostgreSQL covers authenticated source facts, conflicting receipts, expired leases, legacy re-admission and atomic migration; five HTTPS cases pass.
 - Documentation impact: English/Chinese architecture, configuration, workspace, gateway, workflow, child and PostgreSQL guides are updated. The 21 SDK tests and generated-schema drift checks pass, as do 16 archive/publication contracts. Preview artifact proof now requires all five actual process images and workspace-transfer evidence.
 - Current-commit Linux amd64/arm64 CI is still required before preview integration. Unproven resumed baselines, remote artifact retention, Memory producers, ACP/TUI, quotas, backup/rolling upgrade and remaining P6 acceptance remain open. UI files stay unchanged and excluded; App design/delivery awaits Penpot. No preview version/tag or Release is enabled.
+
+## Learning model journal and usage foundation
+
+- PR #228's amd64 Docker run exposed an existing Council fixture assumption: concurrent non-blocking claims may temporarily return no candidate during coordination. The isolated fix keeps both claimers competing, bounds polling to one second and captures persistent Job/session state on failure. Exact-tree PostgreSQL/HTTPS and shared gates passed before commit `516923c6` updated the preview PR; current-head CI remains required.
+- `LearningModelClient` now uses the async `LearningModelJournal` port. Typed request/outcome records have a real SQLite adapter and updated local consumers. A refused or stalled request journal prevents provider contact. An unrecorded outcome cannot become successful extraction or trigger immediate replay; combined journal/provider failures retain typed recovery and the longer retry deadline.
+- Learning outcomes record disjoint input/cache/output buckets, optional reasoning detail, total tokens and provider attempts. Partial usage reports combine without charging cache twice. Provider rollback clears text but retains observed usage; missing/incomplete/non-terminal usage stays explicitly unaccounted. Timeout and failed stream receipts retain available usage.
+- Learning/Memory suites passed 215 tests, native wire tests passed 3, and CLI learning tests passed 9. The regression first failed against the original implementation because the outcome had no usage. English/Chinese user and architecture guides document the journal boundary and accounting; public UI files remain deferred and unchanged.
+- This completes the shared local journal interface/provider/consumer. Enterprise automatic extraction still needs configured models, separate consent, scoped scheduling/leases, remote journal and atomic budget/Memory settlement. These producers and APIs remain unregistered; the full backend plan remains active.

@@ -113,5 +113,9 @@ PostgreSQL 预览格式 9 新增 Memory 表和强制 RLS。格式 1–8 原子�
 后台提取调度、组织共享 Memory、学习管理 UI 和完整 P6 故障验收仍待后续实现。维护
 存储契约已实现，不表示企业自动提取生产者已开放；Skill 评测及应用仍需独立审核。
 
+共享学习模型现可注入异步 `LearningModelJournal`，类型化请求／终态记录及规范化用量
+可由数据所有者处理，无需依赖 Worker 本地数据库。SQLite 适配器及本地消费者已接通；
+企业调度、学习授权、预算结算和远端日志仍需完整接通提供者与消费者后，才注册自动生产者。
+
 参见 [English](MEMORY.md)、[PostgreSQL](POSTGRES.zh.md)、
 [应用 API](APPLICATION.zh.md)及[部署](DEPLOYMENT.zh.md)。

@@ -12478,7 +12478,9 @@ mod learning_runtime {
                 sampling_params: true,
             },
             limits: zuno_config::ResolvedLearningConfig::default(),
-            events: zuno_db::event_log::SessionEventLog::new(pool),
+            journal: Arc::new(zuno_learning::SqliteLearningModelJournal::new(
+                zuno_db::event_log::SessionEventLog::new(pool),
+            )),
         };
         (extractor, events, requests)
     }

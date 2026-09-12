@@ -11,7 +11,6 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tracing::Instrument as _;
 use zuno_config::ResolvedLearningConfig;
-use zuno_db::event_log::{NewSessionEvent, SessionEventLog};
 use zuno_error::{LearningError, ProviderError};
 use zuno_llm::{
     event::{FinishReason, Message, Role, StreamEvent},
@@ -41,7 +40,7 @@ pub struct LearningModel {
 pub struct LearningModelClient {
     pub provider: Arc<dyn Provider>,
     pub model: LearningModel,
-    pub events: SessionEventLog,
+    pub journal: Arc<dyn crate::LearningModelJournal>,
     pub limits: ResolvedLearningConfig,
 }
 
@@ -114,6 +113,8 @@ impl LearningModelClient {
         tools: Vec<ToolSchema>,
         schema: Option<&Value>,
     ) -> Result<StreamAccumulator> {
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_millis(self.limits.execution_timeout_ms);
         let mut parameters = self.model.parameters.clone();
         let mut output_limit = u64::from(self.limits.execution_max_output_tokens);
         if output_limit == 0 {
@@ -206,14 +207,27 @@ impl LearningModelClient {
             ));
         }
         let request_id = format!("learning_request_{}", uuid::Uuid::now_v7().simple());
-        self.event(session_id, &format!("{operation}.request"), json!({
-            "requestID":request_id,
-            "extractorVersion":LEARNING_EXTRACTOR_VERSION,
-            "model":{"providerID":self.model.provider_id,"modelID":self.model.model_id,
-                "wireID":self.model.wire_id},
-            "tools": &tool_values, "request": &input, "promptDigest":crate::digest_text(&input.to_string()),
-            "compaction":"disabled",
-        }))?;
+        tokio::time::timeout_at(
+            deadline,
+            self.journal.record(crate::LearningModelRecord {
+                session_id: session_id.to_owned(),
+                operation: operation.to_owned(),
+                event: crate::LearningModelEvent::Request {
+                    request_id: request_id.clone(),
+                    extractor_version: LEARNING_EXTRACTOR_VERSION.to_owned(),
+                    model: crate::LearningModelIdentity {
+                        provider_id: self.model.provider_id.clone(),
+                        model_id: self.model.model_id.clone(),
+                        wire_id: self.model.wire_id.clone(),
+                    },
+                    tools: tool_values,
+                    prompt_digest: crate::digest_text(&input.to_string()),
+                    request: input,
+                },
+            }),
+        )
+        .await
+        .map_err(journal_timeout)??;
         let purpose = if operation.starts_with("learning.evaluation") {
             ProviderRequestContext::Evaluation
         } else {
@@ -233,9 +247,10 @@ impl LearningModelClient {
             true,
             operation,
         );
-        let result = tokio::time::timeout(
-            Duration::from_millis(self.limits.execution_timeout_ms),
-            self.collect(request, !tools.is_empty()),
+        let mut usage = crate::usage::UsageTracker::default();
+        let result = tokio::time::timeout_at(
+            deadline,
+            self.collect(request, !tools.is_empty(), &mut usage),
         )
         .instrument(span.clone())
         .await
@@ -247,19 +262,20 @@ impl LearningModelClient {
             result.as_ref().err().map(|_| "learning_request"),
             None,
         );
-        match &result {
-            Ok(output) => self.event(
-                session_id,
-                &format!("{operation}.outcome"),
-                json!({
-                    "requestID":request_id,
-                    "status":"completed", "output":output.text(),
-                    "outputDigest":crate::digest_text(output.text()),
-                    "toolCalls":output.tool_calls().iter().map(|call| json!({
-                        "id":call.id,"name":call.name,"arguments":call.raw_input
-                    })).collect::<Vec<_>>()
-                }),
-            )?,
+        let outcome = match &result {
+            Ok(output) => crate::LearningModelOutcome::Completed {
+                output: output.text().to_owned(),
+                output_digest: crate::digest_text(output.text()),
+                tool_calls: output
+                    .tool_calls()
+                    .iter()
+                    .map(|call| crate::LearningToolCall {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        arguments: call.raw_input.clone(),
+                    })
+                    .collect(),
+            },
             Err(error) => {
                 let provider_diagnostic = match error {
                     LearningServiceError::ExtractorProvider { source, .. } => {
@@ -267,21 +283,43 @@ impl LearningModelClient {
                     }
                     _ => None,
                 };
-                self.event(
-                    session_id,
-                    &format!("{operation}.outcome"),
-                    json!({"requestID":request_id,"status":"failed","error":error.diagnostic(),
-                        "providerDiagnostic":provider_diagnostic}),
-                )?;
+                crate::LearningModelOutcome::Failed {
+                    error: error.diagnostic(),
+                    provider_diagnostic,
+                }
             }
+        };
+        // An outcome may follow a timed-out provider attempt. Give its durable
+        // receipt separate bounded I/O time without extending model execution.
+        let recorded = tokio::time::timeout(
+            Duration::from_millis(self.limits.execution_timeout_ms.min(30_000)),
+            self.journal.record(crate::LearningModelRecord {
+                session_id: session_id.to_owned(),
+                operation: operation.to_owned(),
+                event: crate::LearningModelEvent::Outcome {
+                    request_id,
+                    outcome,
+                    usage: usage.snapshot(),
+                },
+            }),
+        )
+        .await
+        .map_err(journal_timeout)
+        .and_then(|value| value);
+        match recorded {
+            Ok(()) => result,
+            Err(journal) => Err(LearningServiceError::OutcomeJournal {
+                journal: Box::new(journal),
+                provider: result.err().map(Box::new),
+            }),
         }
-        result
     }
 
     async fn collect(
         &self,
         request: CompletionRequest,
         tools_allowed: bool,
+        usage: &mut crate::usage::UsageTracker,
     ) -> Result<StreamAccumulator> {
         let mut stream = self.provider.stream(request);
         let max_bytes = (self.limits.execution_max_output_tokens as usize)
@@ -294,6 +332,7 @@ impl LearningModelClient {
         let mut event_count = 0usize;
         while let Some(event) = stream.next().await {
             let event = event.map_err(provider_error)?;
+            usage.observe(&event)?;
             event_count += 1;
             if event_count > 100_000 {
                 return Err(invalid("learning provider exceeded the stream event limit"));
@@ -348,13 +387,6 @@ impl LearningModelClient {
             ));
         }
         Ok(output)
-    }
-
-    pub fn event(&self, session_id: &str, kind: &str, value: Value) -> Result<()> {
-        let properties = value.as_object().cloned().expect("event object");
-        self.events
-            .append(session_id, NewSessionEvent::new(kind, properties)?)?;
-        Ok(())
     }
 }
 
@@ -466,5 +498,11 @@ fn provider_error(source: ProviderError) -> LearningServiceError {
     LearningServiceError::ExtractorProvider {
         version: LEARNING_EXTRACTOR_VERSION.to_owned(),
         source,
+    }
+}
+
+fn journal_timeout(source: tokio::time::error::Elapsed) -> LearningServiceError {
+    LearningServiceError::Journal {
+        source: Box::new(source),
     }
 }

@@ -78,8 +78,13 @@ fn answer(text: &str) -> Vec<StreamEvent> {
 
 fn client(
     replies: Vec<Vec<StreamEvent>>,
-) -> (LearningModelClient, Arc<Mutex<Vec<CompletionRequest>>>) {
+) -> (
+    LearningModelClient,
+    Arc<Mutex<Vec<CompletionRequest>>>,
+    zuno_db::event_log::SessionEventLog,
+) {
     let requests = Arc::new(Mutex::new(Vec::new()));
+    let events = zuno_db::event_log::SessionEventLog::new(pool());
     (
         LearningModelClient {
             provider: Arc::new(ScriptedProvider {
@@ -95,10 +100,13 @@ fn client(
                 headers: Default::default(),
                 sampling_params: true,
             },
-            events: zuno_db::event_log::SessionEventLog::new(pool()),
+            journal: Arc::new(zuno_learning::SqliteLearningModelJournal::new(
+                events.clone(),
+            )),
             limits: ResolvedLearningConfig::default(),
         },
         requests,
+        events,
     )
 }
 
@@ -153,7 +161,8 @@ async fn assert_learning_output_limit_reaches_native_wire(surface: ApiSurface, w
             128,
         ),
     ] {
-        let (mut client, requests) = client(vec![answer(r#"{"experiences":[],"memories":[]}"#)]);
+        let (mut client, requests, events) =
+            client(vec![answer(r#"{"experiences":[],"memories":[]}"#)]);
         client.model.surface = surface;
         client.model.parameters = serde_json::from_value(source_parameters).expect("model options");
         client.limits.execution_max_output_tokens = 512;
@@ -198,7 +207,7 @@ async fn assert_learning_output_limit_reaches_native_wire(surface: ApiSurface, w
             "the normalized learning limit must use the foreground native configuration path"
         );
         assert_eq!(
-            client.events.read_after("s", None).expect("audit events")[0].properties["request"]["parameters"]
+            events.read_after("s", None).expect("audit events")[0].properties["request"]["parameters"]
                 [generation::MAX_TOKENS],
             expected_limit,
             "the durable request records the bounded semantic cap before native lowering"

@@ -114,25 +114,296 @@ fn answer(text: &str) -> Reply {
         },
     ])
 }
-fn client(replies: Vec<Reply>) -> (LearningModelClient, Arc<Mutex<Vec<CompletionRequest>>>) {
+
+#[tokio::test]
+async fn learning_usage_is_durable_and_partial_reports_do_not_count_cache_twice() {
+    use zuno_llm::event::PromptAccounting;
+    let (client, _) = client(vec![Reply::Events(vec![
+        StreamEvent::TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: None,
+            reasoning_tokens: None,
+            cache_read_input_tokens: Some(30),
+            cache_write_input_tokens: Some(10),
+            accounting: PromptAccounting::CacheInsideInput,
+        },
+        StreamEvent::TextDelta(r#"{"experiences":[],"memories":[]}"#.to_owned()),
+        StreamEvent::TokenUsage {
+            input_tokens: None,
+            output_tokens: Some(20),
+            reasoning_tokens: Some(5),
+            cache_read_input_tokens: None,
+            cache_write_input_tokens: None,
+            accounting: PromptAccounting::CacheInsideInput,
+        },
+        StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::Stop),
+        },
+    ])]);
+    client.extract(request()).await.unwrap();
+    let events = client.events.read_after("s", None).unwrap();
+    let usage = &events.last().unwrap().properties["usage"];
+    assert_eq!(usage["inputTokens"], 60);
+    assert_eq!(usage["cacheReadInputTokens"], 30);
+    assert_eq!(usage["cacheWriteInputTokens"], 10);
+    assert_eq!(usage["outputTokens"], 20);
+    assert_eq!(usage["reasoningTokens"], 5);
+    assert_eq!(usage["totalTokens"], 120);
+    assert_eq!(usage["accounted"], true);
+}
+
+#[tokio::test]
+async fn a_rejected_model_journal_prevents_the_provider_request() {
+    struct Denied;
+    #[async_trait]
+    impl zuno_learning::LearningModelJournal for Denied {
+        async fn record(&self, _: zuno_learning::LearningModelRecord) -> zuno_learning::Result<()> {
+            Err(zuno_memory::MemoryServiceError::Denied.into())
+        }
+    }
+    let (mut client, requests) = client(Vec::new());
+    client.journal = Arc::new(Denied);
+    assert!(matches!(
+        client.extract(request()).await,
+        Err(zuno_learning::LearningServiceError::Memory(
+            zuno_memory::MemoryServiceError::Denied
+        ))
+    ));
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_model_journal_cannot_hold_the_worker_forever() {
+    struct Stalled;
+    #[async_trait]
+    impl zuno_learning::LearningModelJournal for Stalled {
+        async fn record(&self, _: zuno_learning::LearningModelRecord) -> zuno_learning::Result<()> {
+            std::future::pending().await
+        }
+    }
+    let (mut client, requests) = client(Vec::new());
+    client.journal = Arc::new(Stalled);
+    client.limits.execution_timeout_ms = 50;
+    assert!(matches!(
+        client.extract(request()).await,
+        Err(zuno_learning::LearningServiceError::Journal { .. })
+    ));
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn learning_outcomes_can_be_journaled_without_a_sqlite_dependency() {
+    struct Records(Mutex<Vec<zuno_learning::LearningModelRecord>>);
+    #[async_trait]
+    impl zuno_learning::LearningModelJournal for Records {
+        async fn record(
+            &self,
+            record: zuno_learning::LearningModelRecord,
+        ) -> zuno_learning::Result<()> {
+            self.0.lock().unwrap().push(record);
+            Ok(())
+        }
+    }
+    let records = Arc::new(Records(Mutex::new(Vec::new())));
+    let (mut client, requests) = client(vec![answer(r#"{"experiences":[],"memories":[]}"#)]);
+    client.model.headers.insert(
+        "Authorization".to_owned(),
+        "Bearer never-log-this-key".to_owned(),
+    );
+    client.journal = records.clone();
+    client.extract(request()).await.unwrap();
+    let recorded = records.0.lock().unwrap();
+    assert_eq!(recorded.len(), 2);
+    assert!(matches!(
+        recorded[0].event,
+        zuno_learning::LearningModelEvent::Request { .. }
+    ));
+    assert!(matches!(&recorded[1].event,
+        zuno_learning::LearningModelEvent::Outcome { usage, .. } if !usage.accounted && usage.provider_attempts==1));
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert!(client.events.read_after("s", None).unwrap().is_empty());
+    assert!(
+        !serde_json::to_string(&*recorded)
+            .unwrap()
+            .contains("never-log-this-key")
+    );
+}
+
+#[tokio::test]
+async fn an_unrecorded_model_outcome_is_not_returned_as_success() {
+    struct RefuseOutcome;
+    #[async_trait]
+    impl zuno_learning::LearningModelJournal for RefuseOutcome {
+        async fn record(
+            &self,
+            record: zuno_learning::LearningModelRecord,
+        ) -> zuno_learning::Result<()> {
+            if matches!(
+                record.event,
+                zuno_learning::LearningModelEvent::Outcome { .. }
+            ) {
+                Err(zuno_memory::MemoryServiceError::Unavailable.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let (mut client, requests) = client(vec![answer(r#"{"experiences":[],"memories":[]}"#)]);
+    client.journal = Arc::new(RefuseOutcome);
+    assert!(matches!(
+        client.extract(request()).await,
+        Err(zuno_learning::LearningServiceError::OutcomeJournal { provider: None, .. })
+    ));
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "a journal failure must not replay the model"
+    );
+}
+
+#[tokio::test]
+async fn journal_failure_preserves_provider_retry_after_and_observed_failure_usage() {
+    struct RefuseOutcome;
+    #[async_trait]
+    impl zuno_learning::LearningModelJournal for RefuseOutcome {
+        async fn record(
+            &self,
+            record: zuno_learning::LearningModelRecord,
+        ) -> zuno_learning::Result<()> {
+            if matches!(
+                record.event,
+                zuno_learning::LearningModelEvent::Outcome { .. }
+            ) {
+                Err(zuno_memory::MemoryServiceError::Unavailable.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let delay = std::time::Duration::from_secs(37);
+    let (mut denied, requests) = client(vec![Reply::Failure(
+        zuno_error::ProviderError::RateLimited {
+            retry_after: Some(delay),
+        },
+    )]);
+    denied.journal = Arc::new(RefuseOutcome);
+    let error = denied.extract(request()).await.unwrap_err();
+    assert_eq!(
+        error.recovery(),
+        zuno_error::Recovery::Retry { after: Some(delay) }
+    );
+    assert_eq!(requests.lock().unwrap().len(), 1);
+
+    let (client, _) = client(vec![Reply::Events(vec![
+        StreamEvent::TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: None,
+            reasoning_tokens: None,
+            cache_read_input_tokens: None,
+            cache_write_input_tokens: None,
+            accounting: zuno_llm::event::PromptAccounting::CacheInsideInput,
+        },
+        StreamEvent::Error {
+            message: "rate limit".to_owned(),
+            retry_after: Some(delay),
+        },
+    ])]);
+    assert_eq!(
+        client.extract(request()).await.unwrap_err().recovery(),
+        zuno_error::Recovery::Retry { after: Some(delay) }
+    );
+    let events = client.events.read_after("s", None).unwrap();
+    let last = &events.last().unwrap().properties;
+    assert_eq!(last["status"], "failed");
+    assert_eq!(last["usage"]["inputTokens"], 10);
+    assert_eq!(last["usage"]["accounted"], false);
+}
+
+#[tokio::test]
+async fn provider_rollback_discards_text_but_retains_observed_learning_usage() {
+    use zuno_llm::event::PromptAccounting;
+    let usage = |input, output, accounting| StreamEvent::TokenUsage {
+        input_tokens: Some(input),
+        output_tokens: Some(output),
+        reasoning_tokens: None,
+        cache_read_input_tokens: Some(5),
+        cache_write_input_tokens: Some(0),
+        accounting,
+    };
+    let (client, _) = client(vec![Reply::Events(vec![
+        usage(10, 2, PromptAccounting::CacheBesideInput),
+        StreamEvent::TextDelta("discarded".to_owned()),
+        StreamEvent::RetryRollback { attempt: 1, max: 2 },
+        usage(20, 3, PromptAccounting::CacheInsideInput),
+        StreamEvent::TextDelta(r#"{"experiences":[],"memories":[]}"#.to_owned()),
+        StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::Stop),
+        },
+    ])]);
+    client.extract(request()).await.unwrap();
+    let events = client.events.read_after("s", None).unwrap();
+    let outcome = &events.last().unwrap().properties;
+    assert!(!outcome["output"].as_str().unwrap().contains("discarded"));
+    assert_eq!(outcome["usage"]["inputTokens"], 25);
+    assert_eq!(outcome["usage"]["cacheReadInputTokens"], 10);
+    assert_eq!(outcome["usage"]["outputTokens"], 5);
+    assert_eq!(outcome["usage"]["totalTokens"], 40);
+    assert_eq!(outcome["usage"]["providerAttempts"], 2);
+    assert_eq!(
+        outcome["usage"]["accounted"], false,
+        "the discarded attempt has observed counts but no terminal measurement"
+    );
+}
+
+struct FixtureClient {
+    inner: LearningModelClient,
+    events: zuno_db::event_log::SessionEventLog,
+}
+impl std::ops::Deref for FixtureClient {
+    type Target = LearningModelClient;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+impl std::ops::DerefMut for FixtureClient {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+impl FixtureClient {
+    fn set_events(&mut self, events: zuno_db::event_log::SessionEventLog) {
+        self.inner.journal = Arc::new(zuno_learning::SqliteLearningModelJournal::new(
+            events.clone(),
+        ));
+        self.events = events;
+    }
+}
+
+fn client(replies: Vec<Reply>) -> (FixtureClient, Arc<Mutex<Vec<CompletionRequest>>>) {
     let requests = Arc::new(Mutex::new(Vec::new()));
+    let events = zuno_db::event_log::SessionEventLog::new(pool());
     (
-        LearningModelClient {
-            provider: Arc::new(ScriptedProvider {
-                replies: Mutex::new(replies.into()),
-                requests: requests.clone(),
-            }),
-            model: LearningModel {
-                provider_id: "test".to_owned(),
-                model_id: "model".to_owned(),
-                wire_id: "model".to_owned(),
-                surface: ApiSurface::Chat,
-                parameters: Default::default(),
-                headers: Default::default(),
-                sampling_params: true,
+        FixtureClient {
+            inner: LearningModelClient {
+                provider: Arc::new(ScriptedProvider {
+                    replies: Mutex::new(replies.into()),
+                    requests: requests.clone(),
+                }),
+                model: LearningModel {
+                    provider_id: "test".to_owned(),
+                    model_id: "model".to_owned(),
+                    wire_id: "model".to_owned(),
+                    surface: ApiSurface::Chat,
+                    parameters: Default::default(),
+                    headers: Default::default(),
+                    sampling_params: true,
+                },
+                journal: Arc::new(zuno_learning::SqliteLearningModelJournal::new(
+                    events.clone(),
+                )),
+                limits: ResolvedLearningConfig::default(),
             },
-            events: zuno_db::event_log::SessionEventLog::new(pool()),
-            limits: ResolvedLearningConfig::default(),
+            events,
         },
         requests,
     )
@@ -256,7 +527,7 @@ async fn copying_the_model_visible_source_id_preserves_verified_evidence() {
     client.provider = Arc::new(CopyingProvider {
         requests: requests.clone(),
     });
-    client.events = zuno_db::event_log::SessionEventLog::new(pool.clone());
+    client.set_events(zuno_db::event_log::SessionEventLog::new(pool.clone()));
     let output = client.extract(input).await.expect("extract");
     let events = client.events.read_after("s", None).expect("receipts");
     let stored = ExperienceService::new(pool.clone(), None)
@@ -655,7 +926,7 @@ async fn candidate_execution_reads_cassette_results_before_a_blind_grading_reque
         ),
     ]);
     let evaluator = ProviderSkillEvaluator {
-        client,
+        client: client.inner,
         session_id: "s".to_owned(),
     };
     let result = evaluator
@@ -877,10 +1148,10 @@ async fn startup_catchup_is_idempotent_and_project_work_outlives_the_registering
         0
     );
     let (mut client, requests) = client(vec![answer(r#"{"experiences":[],"memories":[]}"#)]);
-    client.events = zuno_db::event_log::SessionEventLog::new(pool.clone());
+    client.set_events(zuno_db::event_log::SessionEventLog::new(pool.clone()));
     let service = zuno_learning::ProjectLearningService {
         scheduler,
-        extractor: Arc::new(client),
+        extractor: Arc::new(client.inner),
         experiences: ExperienceService::new(pool.clone(), None),
         patterns: PatternMiner::new(pool.clone(), settings.clone()),
         skills: zuno_learning::SkillCandidateService::new(pool.clone(), settings),
