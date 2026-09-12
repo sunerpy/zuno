@@ -474,16 +474,23 @@ async fn native_file_inspection_reads_real_state_under_stop_without_a_model_or_r
         std::fs::read_to_string(&target).unwrap(),
         "observed contents\n"
     );
-    let (part_id, call_id): (String, String) = host.connection.query_row(
-        "SELECT id,json_extract(data,'$.callID') FROM part WHERE session_id=?1 AND json_extract(data,'$.tool')='write'",
-        [&host.session_id], |row| Ok((row.get(0)?,row.get(1)?)),
+    let (part_id, call_id, reported_path): (String, String, String) = host.connection.query_row(
+        "SELECT id,json_extract(data,'$.callID'),json_extract(data,'$.state.metadata.filepath') \
+         FROM part WHERE session_id=?1 AND json_extract(data,'$.tool')='write'",
+        [&host.session_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
     ).unwrap();
     let witness: i64 = host.connection.query_row(
         "SELECT count(*) FROM event WHERE aggregate_id=?1 AND type='native.filesystem.intent.1'",
         [&host.session_id], |row| row.get(0),
     ).unwrap();
     assert_eq!(witness, 1, "the real native tool must publish the witness");
-    let uncertainty = json!({"tool":"write","callID":call_id,"appliedPaths":[zuno_paths::wire_path(&target)],
+    // Model the native write's reported path, including Windows' canonical
+    // verbatim prefix, rather than a caller's pre-resolution spelling.
+    assert_eq!(
+        reported_path,
+        zuno_paths::wire_path(&target.canonicalize().unwrap())
+    );
+    let uncertainty = json!({"tool":"write","callID":call_id,"appliedPaths":[reported_path],
         "cause":"lost_outcome","observedAtMs":zuno_db::message::now_millis()});
     host.connection.execute(
         "UPDATE part SET data=json_set(data,'$.state.status','error','$.state.outcome','uncertain', \
