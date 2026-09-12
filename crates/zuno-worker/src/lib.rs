@@ -69,6 +69,14 @@ struct WorkerCredential {
     lease: ExecutionLease,
     grant: JobGrantToken,
     deadline: tokio::time::Instant,
+    boundary_committed: bool,
+}
+
+#[derive(Debug)]
+pub enum LeaseRenewal {
+    Renewed(Box<ExecutionLease>),
+    /// This Worker received an authoritative checkpoint/finish acknowledgement.
+    Released,
 }
 
 fn grant_deadline(
@@ -145,6 +153,7 @@ impl WorkerClient {
         execution: &WorkerExecution,
         outcome: zuno_application::runtime::JobFinish,
     ) -> Result<(), TurnStateError> {
+        let _gate = execution.lease_gate.lock().await;
         outcome
             .validate()
             .map_err(|_| TurnStateError::InvalidData)?;
@@ -160,6 +169,11 @@ impl WorkerClient {
             serde_json::to_vec(&outcome).map_err(|_| TurnStateError::InvalidData)?,
         )
         .await?;
+        execution
+            .credential
+            .write()
+            .map_err(|_| TurnStateError::InvalidData)?
+            .boundary_committed = true;
         Ok(())
     }
 
@@ -288,25 +302,30 @@ impl WorkerClient {
                 Ok(WorkerExecution {
                     job: value.job,
                     input: value.input,
+                    lease_gate: Arc::new(tokio::sync::Mutex::new(())),
                     credential: Arc::new(RwLock::new(WorkerCredential {
                         lease: value.lease,
                         grant: value.grant,
                         deadline: grant_deadline(started, value.valid_for_ms)?,
+                        boundary_committed: false,
                     })),
                 })
             })
             .transpose()
     }
 
-    pub async fn renew(
-        &self,
-        execution: &WorkerExecution,
-    ) -> Result<ExecutionLease, TurnStateError> {
+    pub async fn renew(&self, execution: &WorkerExecution) -> Result<LeaseRenewal, TurnStateError> {
+        // A successful boundary releases its DB lease before the response
+        // reaches this process. Do not race a renewal against that final POST.
+        let _gate = execution.lease_gate.lock().await;
         let (old, grant) = {
             let current = execution
                 .credential
                 .read()
                 .map_err(|_| TurnStateError::InvalidData)?;
+            if current.boundary_committed {
+                return Ok(LeaseRenewal::Released);
+            }
             (current.lease.clone(), current.grant.clone())
         };
         let started = tokio::time::Instant::now();
@@ -334,9 +353,10 @@ impl WorkerClient {
                 lease: next.lease,
                 grant: next.grant,
                 deadline,
+                boundary_committed: false,
             };
         }
-        Ok(current.lease.clone())
+        Ok(LeaseRenewal::Renewed(Box::new(current.lease.clone())))
     }
 
     pub fn persistence(
@@ -348,6 +368,7 @@ impl WorkerClient {
             Arc::new(HttpStateTransport {
                 client: self.clone(),
                 credential: Arc::clone(&execution.credential),
+                lease_gate: Arc::clone(&execution.lease_gate),
             }),
             TurnStateScope {
                 owner: execution.job.principal.owner(),
@@ -377,6 +398,7 @@ pub struct WorkerExecution {
     pub job: RuntimeJob,
     pub input: zuno_application::runtime::JobInput,
     credential: Arc<RwLock<WorkerCredential>>,
+    lease_gate: Arc<tokio::sync::Mutex<()>>,
 }
 impl WorkerExecution {
     pub fn deadline(&self) -> Result<tokio::time::Instant, TurnStateError> {
@@ -395,10 +417,20 @@ impl WorkerExecution {
 struct HttpStateTransport {
     client: WorkerClient,
     credential: Arc<RwLock<WorkerCredential>>,
+    lease_gate: Arc<tokio::sync::Mutex<()>>,
 }
 #[async_trait]
 impl StateTransport for HttpStateTransport {
     async fn exchange(&self, request: StateRequest) -> Result<StateResponse, TurnStateError> {
+        let boundary = matches!(
+            &request.command,
+            zuno_engine::state::wire::StateCommand::CommitAdvance { .. }
+        );
+        let _gate = if boundary {
+            Some(self.lease_gate.lock().await)
+        } else {
+            None
+        };
         let grant = self
             .credential
             .read()
@@ -409,7 +441,19 @@ impl StateTransport for HttpStateTransport {
             .client
             .post(STATE_PATH, Some(&grant), request.encode()?)
             .await?;
-        StateResponse::decode(&bytes)
+        let response = StateResponse::decode(&bytes)?;
+        if boundary
+            && matches!(
+                &response.result,
+                Ok(zuno_engine::state::wire::StateReply::Checkpoint(_))
+            )
+        {
+            self.credential
+                .write()
+                .map_err(|_| TurnStateError::InvalidData)?
+                .boundary_committed = true;
+        }
+        Ok(response)
     }
 }
 

@@ -29,6 +29,12 @@ block the advancing future; expiry or renewal failure stops it. No failed POST i
 mechanically repeated and no loss of authority is converted into success.
 Database time and current epoch remain authoritative for every durable mutation.
 
+Renewal and the final checkpoint/finish POST are serialized for one claim.
+The checkpoint transaction releases the database lease before its HTTP response
+arrives; a concurrent renewal must not mistake that normal handoff for lease loss.
+After a validated acknowledgement the local claim is retired and no further
+renewal is sent. An unknown/failed commit response still grants no replay.
+
 The root input's database admission timestamp travels with its stable ID. The
 materializer reuses that timestamp and part identity across Worker changes.
 Consumed input and provider-applied input retain their separate durable meanings.

@@ -279,13 +279,38 @@ async fn worker_runtimes_renew_and_resume_shared_kernel_without_replaying_input_
                 let enabled = failure_switch.clone();
                 let count = failure_count.clone();
                 async move {
+                    let (parts, body) = request.into_parts();
+                    let bytes = axum::body::to_bytes(
+                        body,
+                        zuno_engine::state::wire::MAX_WORKER_FRAME_BYTES,
+                    )
+                    .await
+                    .unwrap();
+                    let delayed_boundary = parts.uri.path()
+                        == format!("/{}", zuno_worker::STATE_PATH)
+                        && zuno_engine::state::wire::StateRequest::decode(&bytes).is_ok_and(
+                            |request| {
+                                matches!(
+                                    request.command,
+                                    zuno_engine::state::wire::StateCommand::CommitAdvance { .. }
+                                )
+                            },
+                        );
+                    let request =
+                        axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes));
                     if request.uri().path() == format!("/{}", zuno_worker::RENEW_PATH)
                         && enabled.load(Ordering::SeqCst)
                     {
                         count.fetch_add(1, Ordering::SeqCst);
                         axum::response::IntoResponse::into_response(StatusCode::SERVICE_UNAVAILABLE)
                     } else {
-                        next.run(request).await
+                        let response = next.run(request).await;
+                        if delayed_boundary && response.status().is_success() {
+                            // The database has released this lease, but its
+                            // checkpoint acknowledgement is still in transit.
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        }
+                        response
                     }
                 }
             },
