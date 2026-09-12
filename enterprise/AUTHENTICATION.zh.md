@@ -153,3 +153,6 @@ Debug 输出隐藏凭证；命令容器和公共 Web DTO 不得接收它。
 POST 不重放、续租及两次租约之间的真实内核接续。它仍在一个测试进程内运行；独立 Worker
 进程、Docker 网关及企业启动／Profile 装配仍有单独验收。BFF 网络与存储验证见
 [浏览器认证](BROWSER.zh.md)，真实身份提供商验证仍待完成。
+
+[应用适配器](APPLICATION.zh.md)已将委派用户 access token 和 BFF Cookie 接入同一组
+会话／Job／审批处理器，并在数据事务内重查当前组织权限。

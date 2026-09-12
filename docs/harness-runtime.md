@@ -81,8 +81,10 @@ The existing local profile constructs an explicit local scope. Enterprise hosts
 must authenticate a caller before supplying another scope; serialized scope data
 is not an authorization grant. Ownership checks do not replace current operation
 policy or shared-resource ACLs. Format 13 stores private session ownership
-independently from editable metadata. Remote authentication remains a separate
-enterprise implementation stage.
+independently from editable metadata. Enterprise application routes bind verified
+API/BFF identities to the same scope, and their PostgreSQL transactions recheck
+current organization policy through commit. Worker authentication remains a
+separate workload and lease boundary. See [application API](../enterprise/APPLICATION.md).
 
 ### Turn persistence
 
@@ -199,8 +201,10 @@ its original creation receipt.
 Session creation, ownership and its audit event commit together. Input admission
 and caller attribution commit with the existing native inbox event. The queued
 payload keeps the existing `user` shape and captures the session's Agent/model
-selection. Admission is not execution: Job scheduling, input-version CAS, steering,
-enterprise authorization and Memory/backend coordination remain separate work.
+selection. Admission is not execution. Enterprise application routes now connect
+Job scheduling, input-version CAS and current organization authorization.
+Configured Agent/model overrides commit with the same admission and participate
+in deduplication. Steering and Memory/backend coordination remain separate work.
 This local binding is not an execution sandbox or a multi-user filesystem.
 Cancelling an API future does not release its blocking capacity until the database
 operation actually finishes.

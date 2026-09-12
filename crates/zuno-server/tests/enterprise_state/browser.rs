@@ -356,9 +356,33 @@ async fn browsers_use_pkce_across_bff_replicas_and_keep_sessions_private_revocab
         &base.join(CALLBACK_PATH).unwrap(),
     )
     .await;
+    let application = zuno_server::enterprise_application::EnterpriseApplication::new(
+        backend.clone(),
+        TenantId::new("browser-http").unwrap(),
+        vec![zuno_server::enterprise_application::ApplicationWorkspace {
+            id: WorkspaceId::new("workspace").unwrap(),
+            title: "Workspace".to_owned(),
+            configuration: ConfigurationRef {
+                id: ConfigurationId::new("browser").unwrap(),
+                version: 1,
+                sha256: "c".repeat(64),
+            },
+            selection: zuno_application::runtime::JobInputSelection {
+                agent: "build".to_owned(),
+                model: zuno_application::runtime::JobInputModel {
+                    provider_id: "wire-test".to_owned(),
+                    model_id: "model".to_owned(),
+                },
+            },
+        }],
+    )
+    .unwrap();
     let routes = Router::new().fallback(replicas).with_state(Replicas {
-        first: first.router(),
-        second: second.router(),
+        first: application
+            .clone()
+            .browser_router(&first)
+            .merge(first.router()),
+        second: application.browser_router(&second).merge(second.router()),
     });
     let (_, bff_server) = tls_server_at(routes, &fixture, listener).await;
     let client = reqwest::Client::builder()
@@ -464,6 +488,79 @@ async fn browsers_use_pkce_across_bff_replicas_and_keep_sessions_private_revocab
         .unwrap();
     assert_eq!(a["tenantId"], "browser-http");
     assert!(a.get("accessToken").is_none() && a.get("idToken").is_none());
+    let application_url = base.join("/app/api/v1/sessions").unwrap();
+    assert_eq!(
+        client
+            .get(application_url.clone())
+            .header(header::COOKIE, &alice)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN,
+        "a valid login does not create organization membership"
+    );
+    let owner = PrincipalKey {
+        tenant_id: TenantId::new("browser-http").unwrap(),
+        principal_id: PrincipalId::new(a["principalId"].as_str().unwrap()).unwrap(),
+    };
+    let application_id = ClientId::new(a["clientId"].as_str().unwrap()).unwrap();
+    bootstrap_organization(
+        &migrator,
+        &OrganizationPolicy {
+            tenant_id: owner.tenant_id.clone(),
+            revision: NonZeroU64::MIN,
+            allowed_apps: [application_id.clone()].into(),
+            approval_apps: [application_id.clone()].into(),
+            auto_read_apps: [application_id].into(),
+            approval_lifetime_seconds: 300,
+        },
+        &owner,
+    )
+    .await
+    .unwrap();
+    let creation =
+        json!({"requestId":"browser-session","workspaceId":"workspace","title":"Browser work"});
+    assert_eq!(
+        client
+            .post(application_url.clone())
+            .header(header::COOKIE, &alice)
+            .json(&creation)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let created = client
+        .post(application_url.clone())
+        .header(header::COOKIE, &alice)
+        .header(header::ORIGIN, base.origin().ascii_serialization())
+        .header(CSRF_HEADER, "1")
+        .json(&creation)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created: Value = created.json().await.unwrap();
+    let owned_url = base
+        .join(&format!(
+            "/app/api/v1/sessions/{}",
+            created["id"].as_str().unwrap()
+        ))
+        .unwrap();
+    assert_eq!(
+        client
+            .get(owned_url.clone())
+            .header(header::COOKIE, &alice)
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap(),
+        created
+    );
     let (callback, binding) = start(&client, &base, &issuer, "bob").await;
     let response = client
         .get(callback)
@@ -483,6 +580,19 @@ async fn browsers_use_pkce_across_bff_replicas_and_keep_sessions_private_revocab
         .await
         .unwrap();
     assert_ne!(a["principalId"], b["principalId"]);
+    query("INSERT INTO zuno_enterprise_preview.organization_member(tenant_id,principal_id,role,active)
+           VALUES('browser-http',$1,'member',true)")
+        .bind(b["principalId"].as_str().unwrap()).execute(&admin).await.unwrap();
+    assert_eq!(
+        client
+            .get(owned_url.clone())
+            .header(header::COOKIE, &bob)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
     assert_eq!(
         client
             .get(base.join(SESSION_PATH).unwrap())
@@ -550,6 +660,16 @@ async fn browsers_use_pkce_across_bff_replicas_and_keep_sessions_private_revocab
     assert_eq!(
         client
             .get(base.join(SESSION_PATH).unwrap())
+            .header(header::COOKIE, &alice)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        client
+            .get(owned_url)
             .header(header::COOKIE, &alice)
             .send()
             .await

@@ -269,3 +269,11 @@ CI tests and personal dependency verification pass. Native CI is being rerun.
 - Two runtime instances exercise the same kernel without duplicate input, provider requests or tool execution. Fault injection rejects renewal before dispatch, and the finish route refuses optimistic success. This remains same-process integration evidence; standalone enterprise services and root-tool assembly are still required.
 - A retained driver event sender reproduced a false lease-loss report after a committed checkpoint. The host now uses nonblocking observations and a bounded final event drain, independent of sender/profile lifetime.
 - Documentation impact: both Worker guides, PostgreSQL/wait guides and preview navigation are updated. Preview documents remain isolated tag artifacts, and no stable site publication or release is enabled.
+
+## Public enterprise application
+
+- `EnterpriseApplication` connects verified delegated-user API tokens and BFF cookies to shared session creation/listing, atomic Job admission, public Job/input-version reads and policy-checked approval decisions. Public DTOs exclude Worker credentials, leases, configuration and private replay checkpoints.
+- PostgreSQL user-facing transactions now hold current organization policy/member checks through commit. A targeted old-revision/revoked-member regression failed before this change; refused session/input/Job actions now leave no new session facts.
+- Optional Agent/model selection is admitted atomically and included in request deduplication by both SQLite and PostgreSQL. Omission preserves existing session selection and old request digests. A focused SQLite regression reproduced ignored explicit selection before the implementation.
+- Real PostgreSQL/HTTPS fixtures cover two users, CAS/idempotency, configured input, cross-owner refusal, approval application restrictions, revocation and BFF application access. Standalone enterprise processes, production Worker/tool assembly, activity projection and remaining P3–P6 acceptance are still outstanding.
+- Documentation impact: both application guides, identity/state/wait/runtime references and preview navigation are updated. Publication remains disabled and personal platform commitments remain unchanged.

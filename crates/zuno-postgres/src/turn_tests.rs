@@ -164,6 +164,7 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
         .submit(
             &actor,
             JobSubmission {
+                selection: None,
                 session_id: session.id.clone(),
                 request_id: RequestId::new("input").unwrap(),
                 expected_input_version: 0,
@@ -416,6 +417,7 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
         .submit(
             &actor,
             JobSubmission {
+                selection: None,
                 session_id: session.id.clone(),
                 request_id: RequestId::new("rollback-input").unwrap(),
                 expected_input_version: 1,

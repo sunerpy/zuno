@@ -100,6 +100,7 @@ async fn fixture(
         .submit(
             &owner,
             JobSubmission {
+                selection: None,
                 session_id: session.id,
                 request_id: RequestId::new("job").unwrap(),
                 expected_input_version: 0,

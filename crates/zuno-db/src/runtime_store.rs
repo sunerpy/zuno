@@ -128,6 +128,9 @@ impl RuntimeStore for SqliteRuntimeStore {
         request: JobSubmission,
     ) -> Result<RuntimeJob, ApplicationError> {
         request.configuration.validate()?;
+        if let Some(selection) = &request.selection {
+            selection.validate()?;
+        }
         if request.text.trim().is_empty()
             || request.text.len() > zuno_application::MAX_INPUT_BYTES
             || request.text.contains('\0')
@@ -161,11 +164,19 @@ impl RuntimeStore for SqliteRuntimeStore {
                 session::decode_model_reference(raw)
                     .ok_or_else(|| storage(std::io::Error::other("invalid stored model selection")))
             }).transpose()?;
+            let (agent, model) = match &request.selection {
+                Some(selection) => (Some(selection.agent.clone()), Some(json!({
+                    "providerId":selection.model.provider_id,"modelId":selection.model.model_id,
+                }))),
+                None => (session.agent, model.map(|model|json!({
+                    "providerId":model.provider_id,"modelId":model.model_id,
+                }))),
+            };
             crate::inbox::admit_in(tx, NewSessionInput::new(
                 &input_id, request.session_id.as_str(), json!({
                     "kind":"user","prompt":{"text":request.text,"files":[],"agents":[]},
-                    "agent":session.agent,
-                    "model":model.map(|model| json!({"providerId":model.provider_id,"modelId":model.model_id})),
+                    "agent":agent,
+                    "model":model,
                 }), InputDelivery::Queue, time,
             ).with_source_key(format!("runtime:{key}")).with_trigger_kind(InputTriggerKind::User))?;
             crate::job::create_in(tx, NewAgentJob::new(

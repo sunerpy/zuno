@@ -20,6 +20,8 @@ mod browser_auth;
 mod directory;
 mod discovery;
 #[cfg(feature = "enterprise")]
+pub mod enterprise_application;
+#[cfg(feature = "enterprise")]
 pub mod enterprise_browser;
 #[cfg(feature = "enterprise")]
 pub mod enterprise_gateway;
