@@ -28,11 +28,13 @@ zuno-engine = { workspace = true }
 zuno-error = { workspace = true }
 zuno-db = { workspace = true }
 zuno-llm = { workspace = true }
+zuno-memory = { workspace = true }
 zuno-runtime = { workspace = true }
 zuno-identity = { workspace = true }
 zuno-network = { workspace = true }
 zuno-orchestration = { workspace = true }
 zuno-tool = { workspace = true }
+zuno-tools = { workspace = true }
 zuno-types = { workspace = true }
 
 [dev-dependencies]

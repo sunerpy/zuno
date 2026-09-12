@@ -606,7 +606,7 @@ struct FreshBeforeRequest {
 
 #[async_trait]
 impl zuno_engine::r#loop::DynamicContextRefresher for FreshBeforeRequest {
-    async fn before_request(&self, _session: &str) -> Result<Option<DynamicContext>, String> {
+    async fn before_request(&self, _session: &str) -> Result<Option<DynamicContext>, TurnError> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         if call == 2 {
             assert!(
@@ -623,7 +623,7 @@ impl zuno_engine::r#loop::DynamicContextRefresher for FreshBeforeRequest {
         &self,
         _session: &str,
         _refresh: zuno_tool::ToolDynamicContextRefresh,
-    ) -> Result<DynamicContext, String> {
+    ) -> Result<DynamicContext, TurnError> {
         panic!("this fixture emits no tool refresh marker")
     }
 }
@@ -707,9 +707,65 @@ struct PublishOriginalTerminal {
     calls: std::sync::atomic::AtomicUsize,
 }
 
+struct UnavailableContext;
+#[async_trait]
+impl zuno_engine::r#loop::DynamicContextRefresher for UnavailableContext {
+    async fn before_request(&self, _session: &str) -> Result<Option<DynamicContext>, TurnError> {
+        Err(zuno_engine::state::TurnStateError::Unavailable.into())
+    }
+    async fn refresh(
+        &self,
+        _session: &str,
+        _refresh: zuno_tool::ToolDynamicContextRefresh,
+    ) -> Result<DynamicContext, TurnError> {
+        Err(zuno_engine::state::TurnStateError::Unavailable.into())
+    }
+}
+
+#[tokio::test]
+async fn unavailable_context_keeps_its_recovery_class_and_never_sends_stale_memory() {
+    let mut connection = seeded();
+    put_user(
+        &connection,
+        "context-user",
+        10,
+        "Respect current Memory authority.",
+    );
+    let provider = Arc::new(FakeProvider::new(vec![text_response(
+        "must not run",
+        10,
+        1,
+    )]));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+    let turn = run_turn(
+        request("unavailable-context"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        )
+        .with_dynamic_context_refresher(&UnavailableContext),
+        sender,
+    );
+    let (outcome, _) = tokio::join!(turn, collect_events(receiver));
+    assert!(matches!(
+        outcome,
+        Err(TurnError::State(
+            zuno_engine::state::TurnStateError::Unavailable
+        ))
+    ));
+    assert!(provider.requests().is_empty());
+}
+
 #[async_trait]
 impl zuno_engine::r#loop::DynamicContextRefresher for PublishOriginalTerminal {
-    async fn before_request(&self, _session: &str) -> Result<Option<DynamicContext>, String> {
+    async fn before_request(&self, _session: &str) -> Result<Option<DynamicContext>, TurnError> {
         let connection = self.connection.lock().unwrap();
         match self.calls.fetch_add(1, Ordering::SeqCst) + 1 {
             2 => put_user(
@@ -741,7 +797,7 @@ impl zuno_engine::r#loop::DynamicContextRefresher for PublishOriginalTerminal {
         &self,
         _session: &str,
         _refresh: zuno_tool::ToolDynamicContextRefresh,
-    ) -> Result<DynamicContext, String> {
+    ) -> Result<DynamicContext, TurnError> {
         panic!("no tool refresh marker")
     }
 }

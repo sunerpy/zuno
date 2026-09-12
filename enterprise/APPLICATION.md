@@ -29,6 +29,7 @@ bootstrap remains an explicit schema-owner operation.
 | `GET /jobs/{job}` | Public Job identity, phase and input version |
 | `GET /approvals/{approval}` | Authorized approval presentation |
 | `POST /approvals/{approval}/answer` | Idempotent human decision |
+| `POST /workspaces/{workspace}/memory` | Typed private Memory requests, when the backend is installed |
 
 Turn requests contain `requestId`, `expectedInputVersion` and `text`. Versions are
 canonical decimal strings to preserve JavaScript precision. Repeating an identical
@@ -66,4 +67,4 @@ Full P3–P6 fault acceptance is still required. Publication remains
 disabled; personal HTTP/TUI/ACP platform behavior is unchanged.
 
 See [中文](APPLICATION.zh.md), [authorization](AUTHORIZATION.md),
-[browser login](BROWSER.md) and [status](STATUS.md).
+[browser login](BROWSER.md), [Memory](MEMORY.md) and [status](STATUS.md).

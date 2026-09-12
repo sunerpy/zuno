@@ -87,16 +87,20 @@ Entra 使用对应的 `config`。Introspection 使用 `config`、`clientId` 和
 SIGTERM 停止新接纳并排空有界工作，TLS 连接与回执投递的退出也有期限。停止网关不表示
 外部命令已经完成，ledger 与容器仍按独立生命周期恢复。
 
-Worker 协议 5 承载检查点 schema 4。旧 schema 3 只按未提交等待读取，不能被解释成已经
+Worker 协议 6 承载检查点 schema 4。旧 schema 3 只按未提交等待读取，不能被解释成已经
 交给执行器。切换控制协议前排空不兼容 Worker，并保留定义和持久数据；完整滚动升级、
 备份恢复验收仍属 P6。
 
 `python3 scripts/check_enterprise_docker.py` 会启动真实可执行文件：一个控制面、
 一个网关和两个独立 Worker。真实 TLS RSA issuer、原生兼容模型传输、PostgreSQL 和
-rootless Docker 验证双用户、两次审批、两个 Worker 参与、每命令一次操作及 SIGTERM
+rootless Docker 验证双用户、私有 Memory 读写及提示刷新、审批等待期间撤销 Memory 使用、
+两次审批、两个 Worker 参与、每命令一次操作及 SIGTERM
 退出。这是测试提供商证据，不是实际 Entra 租户验证。
 
-工作区初始化、企业 Memory、分布式子任务／Workflow／Council、公共历史／临时事件、
+工作区初始化、后台／共享 Memory、分布式子任务／Workflow／Council、公共历史／临时事件、
 React／ACP 及完整故障矩阵仍需继续完成。构建此二进制不会启用预览发布。
 
 参见 [English](DEPLOYMENT.md)、[平台](PLATFORMS.zh.md)及[进度](STATUS.md)。
+
+控制面可选 `memory` 配置事务并发数、事务期限及字符预算；省略使用默认值。
+这不会开启用户生成授权，完整字段和行为见 [Memory](MEMORY.zh.md)。

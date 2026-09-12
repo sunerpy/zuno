@@ -72,3 +72,9 @@ Bounded Worker execution and renewal: [English](WORKERS.md), [中文](WORKERS.zh
 Enterprise session, Job and approval API: [English](APPLICATION.md), [中文](APPLICATION.zh.md).
 
 Executable roles and deployment templates: [English](DEPLOYMENT.md), [中文](DEPLOYMENT.zh.md).
+
+Scoped private Memory, consent and source validity: [English](MEMORY.md), [中文](MEMORY.zh.md).
+
+Preview documentation archives contain the tracked guides, example configurations
+and license notices from the exact release commit. Local edits and untracked files
+are excluded; these archives do not update the stable documentation site.

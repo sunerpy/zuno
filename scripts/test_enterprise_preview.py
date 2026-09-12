@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+import zipfile
 from unittest.mock import patch
 
 import enterprise_preview as preview
@@ -113,6 +114,28 @@ class PreviewTests(unittest.TestCase):
             asset.write_bytes(asset.read_bytes() + b"modified")
             with self.assertRaisesRegex(preview.InvalidPreview, "size mismatch"):
                 preview.verify(self.root, dist, ref, sha)
+
+    def test_preview_docs_include_tracked_guides_templates_and_licenses(self):
+        files = {
+            "MEMORY.md": "Memory guide\n",
+            "MEMORY.zh.md": "Memory 中文\n",
+            "examples/worker.json": '{"example":true}\n',
+            "licenses/example.txt": "license\n",
+        }
+        for name, text in files.items():
+            path = self.root / "enterprise" / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        dist, ref, sha = self.candidate()
+        (self.root / "enterprise" / "untracked-private.md").write_text("never publish")
+        (self.root / "enterprise" / "MEMORY.md").write_text("unreviewed local edit")
+        with patch.dict(os.environ, {}, clear=True):
+            preview.seal(self.root, dist, ref, sha)
+        with zipfile.ZipFile(dist / "enterprise-docs.zip") as archive:
+            for name, text in files.items():
+                self.assertIn("enterprise/" + name, archive.namelist())
+                self.assertEqual(archive.read("enterprise/" + name), text.encode())
+            self.assertNotIn("enterprise/untracked-private.md", archive.namelist())
 
     def test_candidate_requires_complete_matrix_and_exact_source(self):
         dist, ref, sha = self.candidate()

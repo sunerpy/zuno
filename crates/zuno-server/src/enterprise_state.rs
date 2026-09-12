@@ -18,7 +18,9 @@ use zuno_identity::worker::{
     AuthenticatedWorker, JobGrantAuthority, JobGrantToken, VerifiedJobGrant, WorkerAuthError,
     WorkerAuthority,
 };
+use zuno_memory::remote::{MemoryDataService, MemoryRequest, MemoryResponse};
 use zuno_postgres::PostgresBackend;
+use zuno_postgres::PostgresMemoryBackend;
 use zuno_types::identity::TenantId;
 use zuno_worker::{
     CLAIM_PATH, ClaimRequest, FINISH_PATH, GRANT_HEADER, GrantedJob, RENEW_PATH, RenewedLease,
@@ -32,6 +34,7 @@ pub struct WorkerStateService {
     grants: Arc<JobGrantAuthority>,
     tenant: TenantId,
     lease_duration: LeaseDuration,
+    memory: Option<PostgresMemoryBackend>,
 }
 impl WorkerStateService {
     pub fn new(
@@ -47,15 +50,25 @@ impl WorkerStateService {
             grants,
             tenant,
             lease_duration,
+            memory: None,
         }
     }
 
+    pub fn with_memory(mut self, memory: PostgresMemoryBackend) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
     pub fn router(self) -> Router {
-        Router::new()
+        let mut router = Router::new()
             .route(&format!("/{CLAIM_PATH}"), post(claim))
             .route(&format!("/{RENEW_PATH}"), post(renew))
             .route(&format!("/{STATE_PATH}"), post(state_call))
-            .route(&format!("/{FINISH_PATH}"), post(finish))
+            .route(&format!("/{FINISH_PATH}"), post(finish));
+        if self.memory.is_some() {
+            router = router.route(&format!("/{}", zuno_worker::MEMORY_PATH), post(memory_call));
+        }
+        router
             .layer(DefaultBodyLimit::max(MAX_WORKER_FRAME_BYTES))
             .route_layer(middleware::from_fn_with_state(self.clone(), authenticate))
             .with_state(self)
@@ -80,6 +93,31 @@ impl WorkerStateService {
             .verify(worker, &token, now_ms()?)
             .map_err(auth_error)
     }
+}
+
+async fn memory_call(
+    State(service): State<WorkerStateService>,
+    Extension(worker): Extension<AuthenticatedWorker>,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Result<Json<MemoryResponse>, ApiFailure> {
+    let grant = service.grant(&worker, &headers)?;
+    if bytes.len() > 65_536 {
+        return Err(ApiFailure(StatusCode::PAYLOAD_TOO_LARGE));
+    }
+    let request: MemoryRequest =
+        serde_json::from_slice(&bytes).map_err(|_| ApiFailure(StatusCode::BAD_REQUEST))?;
+    let memory = service
+        .memory
+        .as_ref()
+        .ok_or(ApiFailure(StatusCode::NOT_FOUND))?;
+    Ok(Json(MemoryResponse {
+        result: memory
+            .for_worker(grant.lease().clone())
+            .request(request)
+            .await
+            .map_err(Into::into),
+    }))
 }
 
 struct ApiFailure(StatusCode);

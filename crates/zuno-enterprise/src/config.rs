@@ -206,8 +206,37 @@ pub struct ControlConfig {
     pub definitions: Vec<PathBuf>,
     pub active_definitions: Vec<DefinitionKey>,
     pub browser: Option<BrowserConfig>,
+    #[serde(default)]
+    pub memory: MemoryConfig,
     #[serde(default = "lease")]
     pub lease_millis: u32,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemoryConfig {
+    pub concurrent_transactions: usize,
+    pub global_characters: usize,
+    pub project_characters: usize,
+    pub transaction_timeout_millis: u64,
+}
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            concurrent_transactions: 4,
+            global_characters: 2200,
+            project_characters: 3000,
+            transaction_timeout_millis: 10000,
+        }
+    }
+}
+impl MemoryConfig {
+    pub fn limits(&self) -> zuno_postgres::MemoryStoreLimits {
+        zuno_postgres::MemoryStoreLimits {
+            concurrent_transactions: self.concurrent_transactions,
+            scopes: zuno_memory::ScopeLimits::new(self.global_characters, self.project_characters),
+            transaction_timeout: std::time::Duration::from_millis(self.transaction_timeout_millis),
+        }
+    }
 }
 fn lease() -> u32 {
     30000

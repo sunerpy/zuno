@@ -12,7 +12,8 @@ use zuno_types::MemoryScope;
 const COLUMNS: &str = "path, scope, revision, entries, content_digest, projected_revision, \
     projection_error, time_created, time_updated";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResidentMemoryDocument {
     pub path: String,
     pub scope: MemoryScope,
@@ -27,7 +28,8 @@ pub struct ResidentMemoryDocument {
 
 /// One consistent read view. Invalidated automatic entries remain in history but
 /// are not returned as usable recall while maintenance catches up.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResidentMemoryView {
     pub document: ResidentMemoryDocument,
     pub entries: Vec<String>,

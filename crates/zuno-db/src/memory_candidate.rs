@@ -15,7 +15,8 @@ const COLUMNS: &str = "id, target, target_path, action, content, old_text, reaso
     after_entries, error, time_created, time_updated, time_applied, base_revision, evidence";
 
 /// A validated candidate waiting to be inserted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NewMemoryCandidate {
     pub id: String,
     pub target: MemoryScope,
@@ -35,7 +36,8 @@ pub struct NewMemoryCandidate {
 }
 
 /// Stored candidate, including snapshots used for apply/undo reconciliation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MemoryCandidateRecord {
     pub projection: MemoryCandidateProjection,
     pub target_path: String,
@@ -55,7 +57,8 @@ impl MemoryCandidateRecord {
 }
 
 /// Whether an idempotent candidate call inserted a new row or reused its source twin.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MemoryCandidateInsert {
     pub record: MemoryCandidateRecord,
     pub inserted: bool,

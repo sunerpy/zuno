@@ -69,6 +69,7 @@ Docker socket. See [environment requirements](ENVIRONMENTS.md).
 | `activeDefinitions` | Explicit `{id,version}` selections for new sessions |
 | `leaseMillis` | Database lease lifetime, 1000–300000; default 30000 |
 | `browser` | Optional OIDC BFF configuration |
+| `memory` | Optional transaction concurrency/deadline and character budgets; defaults documented in [Memory](MEMORY.md) |
 
 Key files contain raw key bytes. The HMAC authorities validate key sizes and
 rotation sets; do not place key values in the definition or request DTOs.
@@ -110,7 +111,7 @@ SIGTERM stops admission and drains bounded work. TLS connections and receipt
 delivery have bounded shutdown. Gateway shutdown does not declare its external
 commands complete; their ledger and containers remain independently recoverable.
 
-Worker protocol 5 carries checkpoint schema 4. The driver reads schema 3 only
+Worker protocol 6 carries checkpoint schema 4. The driver reads schema 3 only
 where it proves an unsubmitted wait; it never reinterprets an old record as
 submitted execution. Drain incompatible Workers before changing the control
 protocol and retain their definitions and durable data. Full rolling-upgrade and
@@ -119,10 +120,12 @@ backup/restore acceptance remain P6 work.
 `python3 scripts/check_enterprise_docker.py` now runs the binary with a control
 plane, a gateway and two independent Worker processes. A real TLS RSA issuer,
 native compatible model transport, PostgreSQL and rootless Docker verify two
-users, two approvals, both Workers participating, one operation per command and
-SIGTERM cleanup. This is fixture provider evidence, not a live Entra tenant.
+users, private Memory reads and updates, fresh prompts after changes, Memory-use
+revocation during approval waits, two approvals, both Workers participating, one
+operation per command and SIGTERM cleanup. This is fixture provider evidence,
+not a live Entra tenant.
 
-Remaining work includes richer workspace provisioning, enterprise Memory,
+Remaining work includes richer workspace provisioning, background/shared Memory,
 distributed children/Workflow/Council, public transcript/live projection,
 React/ACP clients and the full failure matrix. No preview release is enabled by
 building this binary.

@@ -113,14 +113,14 @@ Completion payload schema 2 stores the tagged outcome. Earlier preview result
 facts remain readable and deduplicate against the same logical completion without
 rewriting the stored event. An old fact that confused approval with a tool result
 is refused. Driver checkpoint schema 4 reads safe schema-3 boundaries without
-resetting budget or replaying tools. Worker protocol 5 carries the submitted-wait
+resetting budget or replaying tools. Worker protocol 6 carries the submitted-wait
 state; completion publication remains a separate state-owner port.
 
 ## Storage and verification
 
 SQLite reuses indexed immutable session events. Stable core format 14 is separate
 from preview runtime overlay 1. PostgreSQL preview format 5 adds `runtime_wait`, forced owner RLS, timer/Job
-indexes and a typed waiting Job phase. Current PostgreSQL format 8 also stores operation admission/results, browser authentication, canonical context and input execution
+indexes and a typed waiting Job phase. Current PostgreSQL format 9 also stores operation admission/results, browser authentication, canonical context and input execution
 receipts; formats 1–7 migrate forward atomically.
 The format-4 fixture retains captured turn DDL, its original source digest,
 messages, signed metadata, usage, Job budget and lease state.
@@ -131,7 +131,7 @@ budget refusal before remaining tools. The real PostgreSQL contract covers
 competing claims, independent sessions, early completion, timers, paused parents,
 cross-owner denial, failed consumption followed by checkpoint takeover, and
 failed/successful migration. The authenticated HTTPS contract carries the same
-wait and consumption through the separately versioned Worker protocol (version 5).
+wait and consumption through the separately versioned Worker protocol (version 6).
 
 These tests do not certify independently launched Workers, gateway-to-tool
 assembly, distributed child/Council orchestration or a complete enterprise UI.

@@ -73,6 +73,7 @@
 pub mod authority;
 pub mod error;
 pub mod persistence;
+pub mod remote;
 pub mod render;
 pub mod scope;
 pub mod service;

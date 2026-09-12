@@ -127,6 +127,7 @@ impl Recoverable for LearningServiceError {
             }
             Self::Memory(
                 MemoryServiceError::Denied
+                | MemoryServiceError::InvalidData
                 | MemoryServiceError::Resident(_)
                 | MemoryServiceError::Invalid(_),
             ) => Recovery::Fail,

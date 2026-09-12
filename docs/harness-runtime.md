@@ -1307,8 +1307,21 @@ is refused in this mode; unexplained legacy in-flight state requires inspection.
 The persistence port returns domain errors rather than requiring every backend
 to manufacture a SQLite failure. `Unavailable` and `Conflict` retain typed
 learning recovery; local database failures retain their original variants.
-Enterprise authorization and the PostgreSQL provider remain subsequent
-integration work, not capabilities implied by logical document support alone.
+`InvalidData` distinguishes corrupt/incompatible state from a correctable proposal.
+The PostgreSQL data owner now injects current organization and private-generation
+authorization with the logical provider. One bounded transaction contains
+candidate/document/evidence updates, request receipts and audit; source validity
+is rechecked on recall. Worker protocol 6 calls the async `MemoryDataService`,
+with workload identity and a Job grant, rather than exposing a pool.
+
+Enterprise Worker profiles install `memory_read`, `memory_update` and a
+`DynamicContextRefresher`. Before every model request, including checkpoint
+takeover, current Memory replaces the prior dynamic snapshot. Empty or revoked
+Memory never falls back to a recovered value. Context refresh preserves typed
+state failures; an unavailable authority cannot become a stale-context provider
+request. Private generation requires explicit user consent; organization-shared
+Memory and automatic extraction producers remain separate implementation work.
+See [enterprise Memory](../enterprise/MEMORY.md).
 
 Resident Memory has one model-visible mutation boundary: `memory_update`. It
 validates add/replace/remove operations and inserts a durable `MemoryCandidate`;

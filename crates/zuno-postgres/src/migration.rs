@@ -7,7 +7,7 @@ use zuno_application::ApplicationError;
 use crate::database_error;
 
 pub const PREVIEW_SCHEMA: &str = "zuno_enterprise_preview";
-pub(crate) const FORMAT: i32 = 8;
+pub(crate) const FORMAT: i32 = 9;
 const TABLES: &[&str] = &["workspace", "session", "request_receipt", "input", "event"];
 const RUNTIME_TABLES: &[&str] = &[
     "agent_job",
@@ -27,6 +27,21 @@ const CONTEXT_TABLES: &[&str] = &["context_usage", "input_execution_receipt"];
 const BROWSER_DDL: &str = include_str!("schema_browser.sql");
 const BROWSER_TABLES: &[&str] = &["browser_login", "browser_session", "authentication_audit"];
 const OPERATION_DDL: &str = include_str!("schema_operation.sql");
+const MEMORY_DDL: &str = include_str!("schema_memory.sql");
+const MEMORY_TABLES: &[&str] = &[
+    "memory_policy",
+    "session_memory_policy",
+    "memory_document",
+    "memory_revision",
+    "memory_candidate",
+    "memory_evidence",
+    "memory_provenance",
+    "memory_retired",
+    "learning_job",
+    "memory_maintenance_state",
+    "memory_request",
+    "memory_audit",
+];
 const TURN_TABLES: &[&str] = &["message", "part", "provider_retry_backoff"];
 const AUTHORIZATION_TABLES: &[&str] = &[
     "organization_member",
@@ -65,9 +80,13 @@ fn source_digest(version: i32) -> String {
         zuno_orchestration::sha256_text(&format!(
             "7\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{WAIT_DDL}\n{CONTEXT_DDL}\n{BROWSER_DDL}\n{POLICY}\n{TENANT_POLICY}"
         ))
+    } else if version == 8 {
+        zuno_orchestration::sha256_text(&format!(
+            "8\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{WAIT_DDL}\n{CONTEXT_DDL}\n{BROWSER_DDL}\n{OPERATION_DDL}\n{POLICY}\n{TENANT_POLICY}"
+        ))
     } else {
         zuno_orchestration::sha256_text(&format!(
-            "{FORMAT}\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{WAIT_DDL}\n{CONTEXT_DDL}\n{BROWSER_DDL}\n{OPERATION_DDL}\n{POLICY}\n{TENANT_POLICY}"
+            "{FORMAT}\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{WAIT_DDL}\n{CONTEXT_DDL}\n{BROWSER_DDL}\n{OPERATION_DDL}\n{MEMORY_DDL}\n{POLICY}\n{TENANT_POLICY}"
         ))
     }
 }
@@ -158,7 +177,10 @@ pub async fn migrate(admin: &PgPool, runtime_role: &str) -> Result<(), Applicati
                 if version < 7 {
                     install_browser(&mut tx).await?;
                 }
-                install_operations(&mut tx).await?;
+                if version < 8 {
+                    install_operations(&mut tx).await?;
+                }
+                install_memory(&mut tx).await?;
                 grant_runtime(&mut tx, runtime_role).await?;
                 let manifest = schema_manifest(&mut tx).await?;
                 let changed = sqlx_core::query::query(
@@ -205,6 +227,7 @@ pub async fn migrate(admin: &PgPool, runtime_role: &str) -> Result<(), Applicati
     install_context(&mut tx).await?;
     install_browser(&mut tx).await?;
     install_operations(&mut tx).await?;
+    install_memory(&mut tx).await?;
     sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
         "REVOKE ALL ON SCHEMA {PREVIEW_SCHEMA} FROM PUBLIC;
          CREATE TABLE {PREVIEW_SCHEMA}.schema_format(
@@ -414,6 +437,7 @@ async fn grant_runtime(connection: &mut PgConnection, role: &str) -> Result<(), 
         .chain(WAIT_TABLES)
         .chain(CONTEXT_TABLES)
         .chain(BROWSER_TABLES)
+        .chain(MEMORY_TABLES)
         .chain(["gateway_operation", "gateway_operation_attempt"].iter())
         .chain(["organization_policy", "organization_audit"].iter())
     {
@@ -453,6 +477,22 @@ async fn install_turn(connection: &mut PgConnection) -> Result<(), ApplicationEr
         .execute(&mut *connection)
         .await
         .map_err(database_error)?;
+    }
+    Ok(())
+}
+
+async fn install_memory(connection: &mut PgConnection) -> Result<(), ApplicationError> {
+    sqlx_core::raw_sql::raw_sql(MEMORY_DDL)
+        .execute(&mut *connection)
+        .await
+        .map_err(database_error)?;
+    for table in MEMORY_TABLES {
+        sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
+            "ALTER TABLE {PREVIEW_SCHEMA}.{table} ENABLE ROW LEVEL SECURITY;
+             ALTER TABLE {PREVIEW_SCHEMA}.{table} FORCE ROW LEVEL SECURITY;
+             CREATE POLICY owner_scope ON {PREVIEW_SCHEMA}.{table} USING ({POLICY}) WITH CHECK ({POLICY});
+             REVOKE ALL ON {PREVIEW_SCHEMA}.{table} FROM PUBLIC;"
+        ))).execute(&mut *connection).await.map_err(database_error)?;
     }
     Ok(())
 }
@@ -858,6 +898,78 @@ pub(crate) async fn install_format_seven_fixture(
     sqlx_core::query::query(
         "UPDATE zuno_enterprise_preview.schema_format SET version=7,source_digest=$1,manifest=$2 WHERE singleton=1",
     ).bind("586f151d533db57c4e742ef5c828bff69edbf80d94f14747e9f0536fa8e779e1")
+        .bind(manifest).execute(&mut *tx).await.map_err(database_error)?;
+    tx.commit().await.map_err(database_error)
+}
+
+#[cfg(test)]
+pub(crate) async fn install_format_eight_fixture(
+    pool: &PgPool,
+    role: &str,
+) -> Result<(), ApplicationError> {
+    install_format_seven_fixture(pool, role).await?;
+    let mut tx = pool.begin().await.map_err(database_error)?;
+    // Captured from enterprise process baseline 7d74412a; never edit this DDL
+    // when changing the current format.
+    sqlx_core::raw_sql::raw_sql(include_str!("fixtures/format8-operation.sql"))
+        .execute(&mut *tx)
+        .await
+        .map_err(database_error)?;
+    for table in ["gateway_operation", "gateway_operation_attempt"] {
+        sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
+            "ALTER TABLE {PREVIEW_SCHEMA}.{table} ENABLE ROW LEVEL SECURITY;
+             ALTER TABLE {PREVIEW_SCHEMA}.{table} FORCE ROW LEVEL SECURITY;
+             CREATE POLICY owner_scope ON {PREVIEW_SCHEMA}.{table} USING ({POLICY}) WITH CHECK ({POLICY});
+             REVOKE ALL ON {PREVIEW_SCHEMA}.{table} FROM PUBLIC;
+             GRANT SELECT,INSERT,UPDATE,DELETE ON {PREVIEW_SCHEMA}.{table} TO \"{role}\";"
+        ))).execute(&mut *tx).await.map_err(database_error)?;
+    }
+    sqlx_core::raw_sql::raw_sql(
+        "SELECT set_config('zuno.tenant_id','migration-fixture',true),set_config('zuno.principal_id','owner',true);",
+    ).execute(&mut *tx).await.map_err(database_error)?;
+    use zuno_application::{environment::*, runtime::ExecutionLease};
+    use zuno_types::identity::*;
+    let owner = PrincipalKey {
+        tenant_id: TenantId::new("migration-fixture").unwrap(),
+        principal_id: PrincipalId::new("owner").unwrap(),
+    };
+    let admission=OperationAdmission {
+        gateway_id:GatewayId::new("legacy-gateway").unwrap(),
+        lease:ExecutionLease {
+            owner:owner.clone(),job_id:JobId::new("legacy-job").unwrap(),session_id:SessionId::new("legacy-session").unwrap(),
+            attempt_id:ExecutionAttemptId::new("legacy-attempt").unwrap(),worker:WorkerInstanceId::new("legacy-worker").unwrap(),
+            epoch:7,checkpoint_version:2,expires_at_ms:4102444800000,
+        },
+        environment:Environment {
+            owner:owner.clone(),revision:1,spec:EnvironmentSpec {
+                id:EnvironmentId::new("legacy-session").unwrap(),session_id:SessionId::new("legacy-session").unwrap(),
+                image:"fixture@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                memory_bytes:67108864,pids_limit:32,cpu_millis:500,
+            },
+        },
+        operation:CommandOperation {
+            id:OperationId::new("legacy-operation").unwrap(),invocation_id:InvocationId::new("legacy-pending").unwrap(),
+            environment_id:EnvironmentId::new("legacy-session").unwrap(),expected_revision:1,
+            argv:vec!["printf".to_owned(),"preserved".to_owned()],
+        },
+    };
+    let digest = zuno_orchestration::sha256_json(&serde_json::json!([
+        admission.gateway_id,
+        owner,
+        admission.lease.job_id,
+        admission.lease.session_id,
+        admission.environment,
+        admission.operation,
+    ]));
+    sqlx_core::query::query(
+        "INSERT INTO zuno_enterprise_preview.gateway_operation(
+           tenant_id,principal_id,operation_id,gateway_id,job_id,session_id,invocation_id,admission,admission_digest,time_admitted)
+         VALUES('migration-fixture','owner','legacy-operation','legacy-gateway','legacy-job','legacy-session',
+           'legacy-pending',$1,$2,1007)",
+    ).bind(serde_json::json!(admission)).bind(digest).execute(&mut *tx).await.map_err(database_error)?;
+    let manifest = schema_manifest(&mut tx).await?;
+    sqlx_core::query::query("UPDATE zuno_enterprise_preview.schema_format SET version=8,source_digest=$1,manifest=$2 WHERE singleton=1")
+        .bind("9a9d1f8ab3aa8879f0a2a4ac10888acba4a91aa44c7ad3365ea1498a56af0583")
         .bind(manifest).execute(&mut *tx).await.map_err(database_error)?;
     tx.commit().await.map_err(database_error)
 }

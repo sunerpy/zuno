@@ -46,6 +46,7 @@ impl WorkerServiceFactory for Factory {
             driver: Arc::new(DefaultAgentDriver),
             budget: Arc::new(NoopBudgetPolicy),
             dynamic_context: DynamicContext::default(),
+            dynamic_context_refresher: None,
             executor_directory: "/workspace".to_owned(),
             steps_per_advance: NonZeroU32::MIN,
             context_limit: None,

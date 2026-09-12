@@ -1359,7 +1359,7 @@ pub trait ToolDispatcher: Send + Sync {
 pub trait DynamicContextRefresher: Send + Sync {
     /// Refresh host-owned Memory/work state without exposing a storage connection
     /// to the shared kernel or serializing a live host into a checkpoint.
-    async fn before_request(&self, _session_id: &str) -> Result<Option<DynamicContext>, String> {
+    async fn before_request(&self, _session_id: &str) -> Result<Option<DynamicContext>, TurnError> {
         Ok(None)
     }
 
@@ -1367,7 +1367,7 @@ pub trait DynamicContextRefresher: Send + Sync {
         &self,
         session_id: &str,
         refresh: ToolDynamicContextRefresh,
-    ) -> Result<DynamicContext, String>;
+    ) -> Result<DynamicContext, TurnError>;
 }
 
 /// Why a turn started and where its execution identity comes from.
@@ -2495,10 +2495,7 @@ async fn run_turn_in_span(
                 ) => result.map_err(TurnError::Hook)?,
             }
             if let Some(refresher) = context.dynamic_context_refresher
-                && let Some(refreshed) = refresher
-                    .before_request(&request.session_id)
-                    .await
-                    .map_err(|detail| TurnError::DynamicContextRefresh { detail })?
+                && let Some(refreshed) = refresher.before_request(&request.session_id).await?
             {
                 current_dynamic_context = refreshed.clone();
                 request.dynamic_context = refreshed;
@@ -3759,10 +3756,7 @@ async fn run_turn_in_span(
                     ),
                 }
             })?;
-            current_dynamic_context = refresher
-                .refresh(&request.session_id, refresh)
-                .await
-                .map_err(|detail| TurnError::DynamicContextRefresh { detail })?;
+            current_dynamic_context = refresher.refresh(&request.session_id, refresh).await?;
         }
 
         if injected.count > 0 {

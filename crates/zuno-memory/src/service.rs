@@ -141,7 +141,8 @@ pub trait MemoryObserver: Send + Sync {
 }
 
 /// One immutable resident version selected for a model request or client view.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MemorySnapshot {
     pub scope: MemoryScope,
     pub revision: i64,
@@ -162,6 +163,8 @@ pub enum MemoryServiceError {
     Unavailable,
     #[error("Memory state changed concurrently")]
     Conflict,
+    #[error("Memory state is corrupt or incompatible")]
+    InvalidData,
     #[error(transparent)]
     Database(#[from] zuno_error::DbError),
     #[error(transparent)]
@@ -177,7 +180,11 @@ impl MemoryServiceError {
         match self {
             Self::Invalid(_) => true,
             Self::Resident(error) => error.is_proposal_correctable(),
-            Self::Database(_) | Self::Denied | Self::Unavailable | Self::Conflict => false,
+            Self::Database(_)
+            | Self::Denied
+            | Self::Unavailable
+            | Self::Conflict
+            | Self::InvalidData => false,
         }
     }
 }

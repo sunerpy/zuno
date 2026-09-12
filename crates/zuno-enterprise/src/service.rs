@@ -343,8 +343,12 @@ async fn control(options: ControlConfig, shutdown: InterruptSignal) -> Result<()
             selection: definition.selection(),
         });
     }
+    let memory =
+        zuno_postgres::PostgresMemoryBackend::new(backend.clone(), options.memory.limits())
+            .map_err(|_| invalid("invalid Memory service configuration"))?;
     let application =
-        EnterpriseApplication::new(backend.clone(), options.tenant_id.clone(), active)?;
+        EnterpriseApplication::new(backend.clone(), options.tenant_id.clone(), active)?
+            .with_memory(memory.clone());
     let mut routes = application
         .clone()
         .api_router(users.clone())
@@ -356,6 +360,7 @@ async fn control(options: ControlConfig, shutdown: InterruptSignal) -> Result<()
                 options.tenant_id.clone(),
                 lease,
             )
+            .with_memory(memory)
             .router(),
         )
         .merge(

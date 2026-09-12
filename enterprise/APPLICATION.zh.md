@@ -24,6 +24,7 @@ HttpOnly Cookie，写请求必须携带精确 Origin 与 `x-zuno-csrf: 1`。
 | `GET /jobs/{job}` | 公共 Job 标识、阶段及输入版本 |
 | `GET /approvals/{approval}` | 经过授权的审批展示 |
 | `POST /approvals/{approval}/answer` | 幂等人工决定 |
+| `POST /workspaces/{workspace}/memory` | 安装真实后端后提供类型化私有 Memory 操作 |
 
 回合请求包含 `requestId`、`expectedInputVersion` 和 `text`。版本使用规范十进制
 字符串，避免 JavaScript 精度损失。相同请求可取回原接纳结果；旧版本的新请求或改变

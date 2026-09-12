@@ -469,7 +469,9 @@ impl MemoryStore {
 }
 
 /// Validate resident mutations against an authoritative entry snapshot without I/O.
-pub(crate) fn preview_entries(
+/// Validate a bounded in-memory edit without filesystem access. Persistence
+/// adapters use the same validation when checking an atomic commit's snapshots.
+pub fn preview_entries(
     scope: Scope,
     limit: usize,
     entries: &[String],

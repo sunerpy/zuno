@@ -365,6 +365,8 @@ async fn authenticated_workers_resume_the_kernel_over_https_without_database_cre
         .unwrap();
     let failures = Arc::new(AtomicUsize::new(0));
     let failure_count = Arc::clone(&failures);
+    let memory_backend =
+        zuno_postgres::PostgresMemoryBackend::new(backend.clone(), Default::default()).unwrap();
     let routes = WorkerStateService::new(
         backend.clone(),
         authority,
@@ -372,6 +374,7 @@ async fn authenticated_workers_resume_the_kernel_over_https_without_database_cre
         tenant,
         LeaseDuration::new(30_000).unwrap(),
     )
+    .with_memory(memory_backend)
     .router()
     .route(
         "/failure/internal/worker/v1/claim",
@@ -460,6 +463,37 @@ async fn authenticated_workers_resume_the_kernel_over_https_without_database_cre
         .unwrap()
         .unwrap();
     assert_eq!(first.input.text, "Inspect fixture");
+    {
+        use zuno_memory::{
+            MemoryServiceError,
+            remote::{MemoryCommand, MemoryDataService, MemoryReply, MemoryRequest},
+        };
+        let memory = client.memory(&first);
+        let read = memory
+            .request(MemoryRequest {
+                request_id: RequestId::new("memory-read").unwrap(),
+                command: MemoryCommand::Read,
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(read, MemoryReply::Snapshot { documents } if documents.iter().all(|document| document.content.is_empty()))
+        );
+        assert!(matches!(
+            memory
+                .request(MemoryRequest {
+                    request_id: RequestId::new("memory-consent-forgery").unwrap(),
+                    command: MemoryCommand::SetPolicy {
+                        session_id: None,
+                        expected_revision: 0,
+                        use_memories: true,
+                        generate_private: true
+                    },
+                })
+                .await,
+            Err(MemoryServiceError::Denied)
+        ));
+    }
     client.renew(&first).await.unwrap();
     let state = Arc::new(
         client
