@@ -11,6 +11,16 @@ use zuno_environment::DockerGateway;
 use zuno_types::identity::*;
 
 struct Authority(AtomicBool);
+#[derive(Default)]
+struct Sink(std::sync::Mutex<Vec<OperationCompletion>>);
+#[async_trait]
+impl OperationCompletionSink for Sink {
+    async fn publish(&self, completion: &OperationCompletion) -> Result<(), ApplicationError> {
+        completion.validate()?;
+        self.0.lock().unwrap().push(completion.clone());
+        Ok(())
+    }
+}
 #[async_trait]
 impl OperationAuthority for Authority {
     async fn authorize(
@@ -53,6 +63,7 @@ async fn terminal(
 #[tokio::test]
 #[ignore = "set ZUNO_ROOTLESS_DOCKER_SOCKET to an isolated rootless Docker daemon"]
 async fn rootless_gateway_reopens_receipts_without_replaying_the_command() {
+    let sink = Sink::default();
     let socket = std::env::var("ZUNO_ROOTLESS_DOCKER_SOCKET").unwrap();
     let directory = tempfile::tempdir().unwrap();
     use std::os::unix::fs::PermissionsExt;
@@ -180,6 +191,7 @@ async fn rootless_gateway_reopens_receipts_without_replaying_the_command() {
             .await
             .is_err()
     );
+    gateway.deliver_completions(&sink, 128).await.unwrap();
     gateway.release(&owner, &branch.id, 2).await.unwrap();
     assert!(gateway.get(&owner, &branch.id).await.is_err());
     let pending = CommandOperation {
@@ -195,6 +207,7 @@ async fn rootless_gateway_reopens_receipts_without_replaying_the_command() {
         terminal(&gateway, &owner, &pending.id).await.phase,
         OperationPhase::Cancelled
     );
+    gateway.deliver_completions(&sink, 128).await.unwrap();
     gateway.release(&owner, &spec.id, 3).await.unwrap();
     gateway.release(&owner, &spec.id, 3).await.unwrap();
     assert!(gateway.get(&owner, &spec.id).await.is_err());

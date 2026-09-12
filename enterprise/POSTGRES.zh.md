@@ -152,3 +152,13 @@ Worker、执行不确定性、闲置所有者分页、RLS 和审核写入失败�
 格式 1–6 均原子前向迁移。捕获的格式 6 fixture 在失败和成功迁移前后保留会话、
 message／part、等待 Job 和输入回执。BFF 与 Worker 的网络验证使用同一临时 TLS 集群
 中的独立数据库。完整接口见[浏览器认证](BROWSER.zh.md)。
+
+## 操作准入与完成
+
+格式 8 增加 `gateway_operation` 与 `gateway_operation_attempt`。网关执行授权在当前
+审批／租约验证的同一事务中记录逻辑操作和准入 attempt。完成回执核对经过认证的网关
+及这些不可变记录，允许真实结果在原租约失效后到达；回执、完成事件和对应等待就绪原子
+提交，改变内容或未经准入的事实被拒绝。
+
+精确格式 7 fixture 在 DDL 故障回滚和成功迁移时保留会话、message／part、Job、等待
+及有效浏览器会话。网关确认、输出上限与独立父消费边界见[操作结果投递](OPERATION_RESULTS.zh.md)。

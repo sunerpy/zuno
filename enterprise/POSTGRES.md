@@ -205,3 +205,17 @@ Formats 1–6 migrate atomically. The captured format-6 fixture retains native
 sessions, message parts, waiting Jobs and input receipts across a failed and a
 successful browser-schema migration. BFF and Worker network fixtures run in
 separate temporary databases in the same isolated verification cluster.
+
+## Operation admission and completion
+
+Format 8 adds `gateway_operation` and `gateway_operation_attempt`. Gateway
+execution authorization records the logical operation and admitted attempt in
+the same transaction as current approval/lease verification. Completion checks
+the authenticated gateway and those immutable records; a truthful receipt may
+arrive after the original lease expired. Receipt, completion event and matching
+wait readiness commit together. Changed or unadmitted facts are refused.
+
+The exact format-7 fixture preserves sessions, message parts, Jobs, waits and a
+valid browser session across injected DDL failure and successful migration.
+See [operation result delivery](OPERATION_RESULTS.md) for gateway acknowledgement,
+output bounds and the separate parent-consumption boundary.

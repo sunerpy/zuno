@@ -7,6 +7,7 @@ mod browser;
 #[cfg(test)]
 mod browser_tests;
 mod migration;
+mod operation;
 mod runtime;
 #[cfg(test)]
 mod runtime_tests;
@@ -20,6 +21,7 @@ mod turn_tests;
 pub use authorization::{PostgresOrganizationStore, bootstrap_organization};
 pub use browser::{BrowserStoreLimits, PostgresBrowserStore};
 pub use migration::{PREVIEW_SCHEMA, migrate};
+pub use operation::PostgresOperationStore;
 pub use runtime::PostgresRuntimeStore;
 pub use session::PostgresSessionPersistence;
 pub use turn::PostgresTurnPersistence;
@@ -82,6 +84,13 @@ pub struct PostgresBackend {
 }
 
 impl PostgresBackend {
+    pub fn gateway_operations(
+        &self,
+        gateway: zuno_types::identity::GatewayId,
+    ) -> PostgresOperationStore {
+        PostgresOperationStore::new(self.clone(), gateway)
+    }
+
     /// Authentication state is accessible only to the host's BFF, under its fixed
     /// deployment tenant. Public requests cannot select this scope.
     pub fn browser_sessions(

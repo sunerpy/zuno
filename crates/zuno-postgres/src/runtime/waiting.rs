@@ -88,6 +88,97 @@ pub(crate) async fn approval_changed(
     Ok(())
 }
 
+async fn operation_ready(
+    tx: &mut Transaction<'_, Postgres>,
+    job: &RuntimeJob,
+    reference: &WaitRef,
+) -> Result<Option<WaitCompletion>, ApplicationError> {
+    let WaitTarget::Operation { operation_id } = &reference.target else {
+        return Ok(None);
+    };
+    let owner = job.principal.owner();
+    let row=query(
+        "SELECT invocation_id,completion FROM zuno_enterprise_preview.gateway_operation
+         WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND session_id=$4 AND operation_id=$5",
+    ).bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(job.id.as_str())
+        .bind(job.session_id.as_str()).bind(operation_id.as_str()).fetch_optional(&mut **tx).await.map_err(database_error)?;
+    // Other installed operation producers may use the same generic wait port.
+    let Some(row) = row else { return Ok(None) };
+    if row
+        .try_get::<String, _>("invocation_id")
+        .map_err(database_error)?
+        != reference.invocation_id.as_str()
+    {
+        return Err(ApplicationError::Conflict);
+    }
+    let Some(raw) = row
+        .try_get::<Option<Value>, _>("completion")
+        .map_err(database_error)?
+    else {
+        return Ok(None);
+    };
+    let completion: zuno_application::environment::OperationCompletion =
+        serde_json::from_value(raw).map_err(ApplicationError::storage)?;
+    completion.validate()?;
+    let chunks = completion
+        .output
+        .iter()
+        .map(|chunk| {
+            json!({
+                "channel":chunk.channel,"text":String::from_utf8_lossy(&chunk.bytes),
+            })
+        })
+        .collect::<Vec<_>>();
+    let output=zuno_tool::ToolOutput::text("Command result",serde_json::to_string(&json!({
+        "operationId":operation_id,"status":completion.receipt.phase,
+        "exitCode":completion.receipt.exit_code,"output":chunks,"truncated":completion.output_truncated,
+    })).map_err(ApplicationError::storage)?);
+    let result = if completion.receipt.phase
+        == zuno_application::environment::OperationPhase::Completed
+        && completion.receipt.exit_code == Some(0)
+    {
+        zuno_engine::r#loop::ToolDispatchResult::success(output)
+    } else {
+        zuno_engine::r#loop::ToolDispatchResult::error(output)
+    };
+    Ok(Some(WaitCompletion::tool_result(
+        zuno_types::identity::CompletionId::new(format!(
+            "cmp_{}",
+            zuno_orchestration::sha256_json(&json!([
+                "operation-result",
+                operation_id,
+                reference.id
+            ]),)
+        ))
+        .expect("derived identity"),
+        reference.clone(),
+        result,
+    )))
+}
+
+pub(crate) async fn operation_completed(
+    tx: &mut Transaction<'_, Postgres>,
+    job: &RuntimeJob,
+    operation_id: &zuno_types::identity::OperationId,
+) -> Result<(), ApplicationError> {
+    let owner = job.principal.owner();
+    let rows=query(
+        "SELECT reference FROM zuno_enterprise_preview.runtime_wait WHERE tenant_id=$1 AND principal_id=$2
+         AND job_id=$3 AND state='pending' AND reference->'target'->>'kind'='operation'
+         AND reference->'target'->>'operation_id'=$4",
+    ).bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(job.id.as_str()).bind(operation_id.as_str())
+        .fetch_all(&mut **tx).await.map_err(database_error)?;
+    for row in rows {
+        let reference: WaitRef =
+            serde_json::from_value(row.try_get("reference").map_err(database_error)?)
+                .map_err(ApplicationError::storage)?;
+        if let Some(completion) = operation_ready(tx, job, &reference).await? {
+            publish(tx, job, &completion).await?;
+        }
+    }
+    Ok(())
+}
+
 fn scope(job: &RuntimeJob) -> TurnStateScope {
     TurnStateScope {
         owner: job.principal.owner(),
@@ -191,6 +282,9 @@ pub(crate) async fn register(
         if let Some(completion) = approval_ready(tx, job, reference).await? {
             // The human may have answered before the Worker persisted its wait.
             // Both paths hold the same session lock, closing the lost wakeup.
+            publish(tx, job, &completion).await?;
+        }
+        if let Some(completion) = operation_ready(tx, job, reference).await? {
             publish(tx, job, &completion).await?;
         }
         let ready = completion(tx, &scope, reference).await?;

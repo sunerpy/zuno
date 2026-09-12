@@ -7,7 +7,7 @@ use zuno_application::ApplicationError;
 use crate::database_error;
 
 pub const PREVIEW_SCHEMA: &str = "zuno_enterprise_preview";
-pub(crate) const FORMAT: i32 = 7;
+pub(crate) const FORMAT: i32 = 8;
 const TABLES: &[&str] = &["workspace", "session", "request_receipt", "input", "event"];
 const RUNTIME_TABLES: &[&str] = &[
     "agent_job",
@@ -26,6 +26,7 @@ const CONTEXT_DDL: &str = include_str!("schema_context.sql");
 const CONTEXT_TABLES: &[&str] = &["context_usage", "input_execution_receipt"];
 const BROWSER_DDL: &str = include_str!("schema_browser.sql");
 const BROWSER_TABLES: &[&str] = &["browser_login", "browser_session", "authentication_audit"];
+const OPERATION_DDL: &str = include_str!("schema_operation.sql");
 const TURN_TABLES: &[&str] = &["message", "part", "provider_retry_backoff"];
 const AUTHORIZATION_TABLES: &[&str] = &[
     "organization_member",
@@ -60,9 +61,13 @@ fn source_digest(version: i32) -> String {
         zuno_orchestration::sha256_text(&format!(
             "6\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{WAIT_DDL}\n{CONTEXT_DDL}\n{POLICY}\n{TENANT_POLICY}"
         ))
+    } else if version == 7 {
+        zuno_orchestration::sha256_text(&format!(
+            "7\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{WAIT_DDL}\n{CONTEXT_DDL}\n{BROWSER_DDL}\n{POLICY}\n{TENANT_POLICY}"
+        ))
     } else {
         zuno_orchestration::sha256_text(&format!(
-            "{FORMAT}\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{WAIT_DDL}\n{CONTEXT_DDL}\n{BROWSER_DDL}\n{POLICY}\n{TENANT_POLICY}"
+            "{FORMAT}\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{WAIT_DDL}\n{CONTEXT_DDL}\n{BROWSER_DDL}\n{OPERATION_DDL}\n{POLICY}\n{TENANT_POLICY}"
         ))
     }
 }
@@ -150,7 +155,10 @@ pub async fn migrate(admin: &PgPool, runtime_role: &str) -> Result<(), Applicati
                 if version < 6 {
                     install_context(&mut tx).await?;
                 }
-                install_browser(&mut tx).await?;
+                if version < 7 {
+                    install_browser(&mut tx).await?;
+                }
+                install_operations(&mut tx).await?;
                 grant_runtime(&mut tx, runtime_role).await?;
                 let manifest = schema_manifest(&mut tx).await?;
                 let changed = sqlx_core::query::query(
@@ -196,6 +204,7 @@ pub async fn migrate(admin: &PgPool, runtime_role: &str) -> Result<(), Applicati
     install_waits(&mut tx).await?;
     install_context(&mut tx).await?;
     install_browser(&mut tx).await?;
+    install_operations(&mut tx).await?;
     sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
         "REVOKE ALL ON SCHEMA {PREVIEW_SCHEMA} FROM PUBLIC;
          CREATE TABLE {PREVIEW_SCHEMA}.schema_format(
@@ -405,6 +414,7 @@ async fn grant_runtime(connection: &mut PgConnection, role: &str) -> Result<(), 
         .chain(WAIT_TABLES)
         .chain(CONTEXT_TABLES)
         .chain(BROWSER_TABLES)
+        .chain(["gateway_operation", "gateway_operation_attempt"].iter())
         .chain(["organization_policy", "organization_audit"].iter())
     {
         sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
@@ -489,6 +499,22 @@ async fn install_browser(connection: &mut PgConnection) -> Result<(), Applicatio
             "ALTER TABLE {PREVIEW_SCHEMA}.{table} ENABLE ROW LEVEL SECURITY;
              ALTER TABLE {PREVIEW_SCHEMA}.{table} FORCE ROW LEVEL SECURITY;
              CREATE POLICY tenant_scope ON {PREVIEW_SCHEMA}.{table} USING ({TENANT_POLICY}) WITH CHECK ({TENANT_POLICY});
+             REVOKE ALL ON {PREVIEW_SCHEMA}.{table} FROM PUBLIC;"
+        ))).execute(&mut *connection).await.map_err(database_error)?;
+    }
+    Ok(())
+}
+
+async fn install_operations(connection: &mut PgConnection) -> Result<(), ApplicationError> {
+    sqlx_core::raw_sql::raw_sql(OPERATION_DDL)
+        .execute(&mut *connection)
+        .await
+        .map_err(database_error)?;
+    for table in ["gateway_operation", "gateway_operation_attempt"] {
+        sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
+            "ALTER TABLE {PREVIEW_SCHEMA}.{table} ENABLE ROW LEVEL SECURITY;
+             ALTER TABLE {PREVIEW_SCHEMA}.{table} FORCE ROW LEVEL SECURITY;
+             CREATE POLICY owner_scope ON {PREVIEW_SCHEMA}.{table} USING ({POLICY}) WITH CHECK ({POLICY});
              REVOKE ALL ON {PREVIEW_SCHEMA}.{table} FROM PUBLIC;"
         ))).execute(&mut *connection).await.map_err(database_error)?;
     }
@@ -786,6 +812,52 @@ pub(crate) async fn install_format_six_fixture(
     sqlx_core::query::query(
         "UPDATE zuno_enterprise_preview.schema_format SET version=6,source_digest=$1,manifest=$2 WHERE singleton=1",
     ).bind("2565cfd11e0788374407875f0490cdde315df809a6e36d027058fecba1378396")
+        .bind(manifest).execute(&mut *tx).await.map_err(database_error)?;
+    tx.commit().await.map_err(database_error)
+}
+
+#[cfg(test)]
+pub(crate) async fn install_format_seven_fixture(
+    pool: &PgPool,
+    role: &str,
+) -> Result<(), ApplicationError> {
+    install_format_six_fixture(pool, role).await?;
+    let mut tx = pool.begin().await.map_err(database_error)?;
+    sqlx_core::raw_sql::raw_sql(include_str!("fixtures/format7-browser.sql"))
+        .execute(&mut *tx)
+        .await
+        .map_err(database_error)?;
+    for table in BROWSER_TABLES {
+        sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
+            "ALTER TABLE {PREVIEW_SCHEMA}.{table} ENABLE ROW LEVEL SECURITY;
+             ALTER TABLE {PREVIEW_SCHEMA}.{table} FORCE ROW LEVEL SECURITY;
+             CREATE POLICY tenant_scope ON {PREVIEW_SCHEMA}.{table} USING ({TENANT_POLICY}) WITH CHECK ({TENANT_POLICY});
+             REVOKE ALL ON {PREVIEW_SCHEMA}.{table} FROM PUBLIC;
+             GRANT SELECT,INSERT,UPDATE,DELETE ON {PREVIEW_SCHEMA}.{table} TO \"{role}\";"
+        ))).execute(&mut *tx).await.map_err(database_error)?;
+    }
+    sqlx_core::raw_sql::raw_sql("SELECT set_config('zuno.tenant_id','migration-fixture',true);")
+        .execute(&mut *tx)
+        .await
+        .map_err(database_error)?;
+    let identity = zuno_identity::login_state::BrowserSessionRecord {
+        token_hash: [0xab; 32],
+        issuer: "https://identity.example".to_owned(),
+        tenant_id: zuno_types::identity::TenantId::new("migration-fixture").expect("fixture"),
+        principal_id: zuno_types::identity::PrincipalId::new("owner").expect("fixture"),
+        client_id: zuno_types::identity::ClientId::new("enterprise-web").expect("fixture"),
+        oauth_client_id: "enterprise-web".to_owned(),
+        expires_at: 4102444800,
+    };
+    sqlx_core::query::query(
+        "INSERT INTO zuno_enterprise_preview.browser_session(tenant_id,token_hash,principal_id,expires_at,identity)
+         VALUES('migration-fixture',$1,'owner',4102444800,$2)",
+    ).bind(identity.token_hash.as_slice()).bind(serde_json::json!(identity))
+        .execute(&mut *tx).await.map_err(database_error)?;
+    let manifest = schema_manifest(&mut tx).await?;
+    sqlx_core::query::query(
+        "UPDATE zuno_enterprise_preview.schema_format SET version=7,source_digest=$1,manifest=$2 WHERE singleton=1",
+    ).bind("586f151d533db57c4e742ef5c828bff69edbf80d94f14747e9f0536fa8e779e1")
         .bind(manifest).execute(&mut *tx).await.map_err(database_error)?;
     tx.commit().await.map_err(database_error)
 }

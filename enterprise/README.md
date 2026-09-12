@@ -62,3 +62,5 @@ Durable invocation waiting and consumption: [English](WAITING.md), [中文](WAIT
 Browser login and BFF session contracts: [English](BROWSER.md), [中文](BROWSER.zh.md).
 
 Authenticated gateway transport: [English](GATEWAY.md), [中文](GATEWAY.zh.md).
+
+Durable operation results and acknowledgement: [English](OPERATION_RESULTS.md), [中文](OPERATION_RESULTS.zh.md).

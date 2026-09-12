@@ -61,7 +61,7 @@ async fn input_version(
         .fetch_one(&mut **tx).await.map_err(database_error)
 }
 
-async fn read_job(
+pub(crate) async fn read_job(
     tx: &mut Transaction<'_, Postgres>,
     owner: &PrincipalKey,
     id: &str,

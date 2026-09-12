@@ -110,8 +110,8 @@ version 3; completion publication is a separate state-owner port.
 
 SQLite reuses indexed immutable session events. Stable core format 14 is separate
 from preview runtime overlay 1. PostgreSQL preview format 5 adds `runtime_wait`, forced owner RLS, timer/Job
-indexes and a typed waiting Job phase. Current PostgreSQL format 7 also stores browser authentication, canonical context and input execution
-receipts; formats 1–6 migrate forward atomically.
+indexes and a typed waiting Job phase. Current PostgreSQL format 8 also stores operation admission/results, browser authentication, canonical context and input execution
+receipts; formats 1–7 migrate forward atomically.
 The format-4 fixture retains captured turn DDL, its original source digest,
 messages, signed metadata, usage, Job budget and lease state.
 

@@ -29,8 +29,8 @@ use zuno_identity::{
 use zuno_postgres::PostgresBackend;
 use zuno_types::identity::TenantId;
 use zuno_worker::{
-    GATEWAY_AUTHORIZE_PATH, GATEWAY_PREPARE_PATH, GATEWAY_RESOLVE_PATH, GATEWAY_TICKET_HEADER,
-    GATEWAY_TICKET_PATH, GRANT_HEADER, IssuedGatewayRequest,
+    GATEWAY_AUTHORIZE_PATH, GATEWAY_COMPLETION_PATH, GATEWAY_PREPARE_PATH, GATEWAY_RESOLVE_PATH,
+    GATEWAY_TICKET_HEADER, GATEWAY_TICKET_PATH, GRANT_HEADER, IssuedGatewayRequest,
 };
 
 use crate::gateway_configuration::GatewayConfigurationResolver;
@@ -72,6 +72,7 @@ impl GatewayControlService {
             .route(&format!("/{GATEWAY_RESOLVE_PATH}"), post(resolve))
             .route(&format!("/{GATEWAY_PREPARE_PATH}"), post(prepare))
             .route(&format!("/{GATEWAY_AUTHORIZE_PATH}"), post(authorize))
+            .route(&format!("/{GATEWAY_COMPLETION_PATH}"), post(completion))
             .layer(DefaultBodyLimit::max(MAX_GATEWAY_FRAME_BYTES))
             .with_state(self)
     }
@@ -306,8 +307,34 @@ async fn authorize(
     let checked = service
         .backend
         .organizations(service.tenant.clone())
-        .check_execution(&request.lease, proposal)
+        .check_gateway_execution(
+            proposal,
+            &zuno_application::environment::OperationAdmission {
+                gateway_id: gateway.id().clone(),
+                lease: request.lease,
+                environment: request.environment,
+                operation: request.operation,
+            },
+        )
         .await
         .map_err(application)?;
     Ok(Json(checked))
+}
+
+async fn completion(
+    State(service): State<GatewayControlService>,
+    headers: HeaderMap,
+    Json(completion): Json<zuno_application::environment::OperationCompletion>,
+) -> Result<StatusCode, Failure> {
+    let gateway = service.gateway(&headers).await?;
+    if completion.lease.owner.tenant_id != service.tenant {
+        return Err(Failure(StatusCode::FORBIDDEN));
+    }
+    service
+        .backend
+        .gateway_operations(gateway.id().clone())
+        .complete(&completion)
+        .await
+        .map_err(application)?;
+    Ok(StatusCode::NO_CONTENT)
 }

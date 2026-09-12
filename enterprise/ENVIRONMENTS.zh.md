@@ -68,3 +68,7 @@ ZUNO_ROOTLESS_DOCKER_SOCKET=/run/user/1000/zuno-preview/docker.sock \
 后端的 Worker／控制面 HTTP 适配见[网关传输](GATEWAY.zh.md)。请求凭证不绕过操作
 审批，Docker gate 还通过临时 PostgreSQL／TLS 控制面验证真实 HTTP 执行路径。
 独立角色启动、Agent 工具装配及管理级取消仍有单独交付要求。
+
+账本格式 2 增加持久完成结果与确认。结果所有者确认前，环境释放会保留输出；
+有界投递扫描可在重启后恢复，响应不可用不会丢弃待投递条目。详见
+[操作结果](OPERATION_RESULTS.zh.md)。
