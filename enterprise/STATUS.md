@@ -216,3 +216,17 @@ verification is pending the next preview CI run. No release is enabled.
 - The real PostgreSQL/TLS/Docker fixture passed HITL refusal/approval, request/service/environment boundaries, output recovery, stale revision rejection and expired-lease refusal. A separately approved file read verifies one actual execution. Fixture corrections included the exact lease column, private directory mode and current environment revision.
 - The Docker runner now requires the combined gateway execution fixture on Linux amd64/arm64. Local validation passed 218 related tests, the complete rootless Docker/PostgreSQL/HTTPS runner, 100 documentation/release tests, 11 preview publisher tests, workspace check, Clippy, formatting, diff and actionlint checks. Worker normal dependencies still exclude PostgreSQL and the server crate. Remote CI remains pending.
 - Independent Worker/role startup, production Agent tool assembly, public application/approval APIs, cancellation propagation, Memory, Workflow/Council and Web remain outstanding. Preview publication remains disabled.
+
+## Gateway CI watcher follow-up
+
+PR #199 CI `34659258061` passed Linux, PostgreSQL and both Docker architectures.
+Windows reported all 1,000 burst paths without loss, but one path legitimately
+arrived in two debounce windows. The old test incorrectly required one total
+event per path across all windows. A controlled later write reproduced the
+1,001-event failure.
+
+The native fixture now checks full coverage, bounded storage, coalescing and
+preservation of a later-window update. A deterministic 1,000-path test separately
+requires exactly one event per path within a window. Production watcher timing
+and delivery behavior are unchanged. Documentation impact is limited to this
+test-contract explanation; no user configuration or behavior changed.
