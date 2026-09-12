@@ -809,7 +809,7 @@ async fn new_user_query_does_not_adopt_an_old_unfinished_plan() {
 }
 
 #[tokio::test]
-async fn ordinary_incomplete_plan_without_goal_pauses_after_one_provider_response() {
+async fn ordinary_plan_with_blocked_todo_without_goal_pauses_after_one_provider_response() {
     let (_directory, mut host, provider, work) = mock_provider_host(
         "build",
         vec![
@@ -825,13 +825,30 @@ async fn ordinary_incomplete_plan_without_goal_pauses_after_one_provider_respons
     )
     .await;
     let before = seed_scripted_plan(&work, &host.session_id, false);
+    work.update_items(
+        &host.session_id,
+        vec![zuno_tools::WorkItemChange::Add {
+            id: Some("blocked-current-step".to_owned()),
+            goal_id: None,
+            plan_step_id: Some(before.plan.as_ref().unwrap().steps[0].id.clone()),
+            parent_id: None,
+            subject: "Required dependency".to_owned(),
+            description: "An explicit blocker prevents the current step.".to_owned(),
+            active_form: None,
+            status: zuno_tools::WorkItemStatus::Blocked,
+            priority: zuno_tools::WorkItemPriority::Medium,
+            dependencies: vec![],
+            owner: Some("build".to_owned()),
+        }],
+    )
+    .unwrap();
     assert!(
         host.goal_store
             .goal(&host.session_id)
             .expect("Goal")
             .is_none()
     );
-    assert!(before.items.is_empty());
+    assert_eq!(work.items(&host.session_id).unwrap().len(), 1);
     let events = drive_user(&mut host, "Continue the current implementation.").await;
     assert_eq!(provider.calls(), 2);
     assert_eq!(completed_events(&events), 1);

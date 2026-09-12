@@ -259,8 +259,8 @@ pub struct TaskParams {
     pub contract: DelegationContract,
     /// The specific Agent to delegate to.
     pub agent: String,
-    /// Default foreground. Set true only for independent parallel work or an explicit
-    /// user request, not when waiting for this child is the only useful next action.
+    /// Default foreground. Set true only for an explicit parallel split while the
+    /// parent does independent local work; never detach merely to end its turn.
     #[serde(default)]
     pub background: Option<bool>,
     /// What to do with the terminal report of a background dispatch.
@@ -281,8 +281,8 @@ pub struct SelectableTaskParams {
     pub contract: DelegationContract,
     /// The specific Agent to delegate to.
     pub agent: String,
-    /// Default foreground. Set true only for independent parallel work or an explicit
-    /// user request, not when waiting for this child is the only useful next action.
+    /// Default foreground. Set true only for an explicit parallel split while the
+    /// parent does independent local work; never detach merely to end its turn.
     #[serde(default)]
     pub background: Option<bool>,
     /// What to do with the terminal report of a background dispatch.

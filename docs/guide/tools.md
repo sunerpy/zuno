@@ -46,8 +46,9 @@ call without automatically filling fields or starting a child.
 When waiting is the only useful next action, keep the command or child in the
 foreground. A `bg` handle or `backgroundPurpose: "remoteObserver"` does not mean
 the operation was detached: continue the same foreground handle and preserve
-steering/interruption. Use explicit background mode only for independent parallel
-work or a user request, not merely to end the main turn.
+steering/interruption. Use background mode only for an explicit parallel split
+with identified independent local work for the parent. Do that work after dispatch;
+never background the sole task and finalize while it runs.
 
 Use `task` for one bounded delegation, `workflow` for a configured dependency
 graph, and `council_run` for independent reports followed by synthesis.
@@ -96,8 +97,10 @@ saved Agent/model identity, and review state. Early approval waits for the sourc
 Plan turn's successful handoff. Changes or interruption invalidate stale consent.
 Draft review risk acceptance is explicit; the tool cannot provide it for the user.
 
-Automatic continuation requires runnable work. An unfinished Plan or blocked
-Todo alone is insufficient. `/resume` explicitly resumes previously authorized
+Automatic continuation requires runnable work. The current cycle's adopted,
+authorized `in_progress` Plan step is sufficient without duplicate Todos, but
+does not bypass linked Todo dependencies/owners, unsettled Jobs or recorded gates.
+An unowned Plan or blocked Todo alone is insufficient. `/resume` explicitly resumes previously authorized
 Work after a pause; it cannot bypass a pending human/external wait or authorize a
 Plan. A Goal must first be resumed with `/goal resume` when it is paused.
 

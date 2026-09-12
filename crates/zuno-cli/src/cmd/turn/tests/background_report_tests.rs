@@ -280,6 +280,28 @@ async fn completed_foreground_background_report_with_historical_goal_continues_s
     let plan = seed_scripted_plan(&work, &host.session_id, false)
         .plan
         .unwrap();
+    // The report turn settles its adopted Plan before finalizing. One callback
+    // owns one turn, which may include both a tool request and its final answer.
+    provider.scripts.lock().unwrap().push_front(vec![
+        StreamEvent::ToolUseStart {
+            id: "settle-observer-plan".to_owned(),
+            name: "plan_update".to_owned(),
+        },
+        StreamEvent::ToolInputDelta {
+            id: "settle-observer-plan".to_owned(),
+            delta: json!({
+                "action": "patch", "expected_revision": plan.revision,
+                "steps": [{"id": plan.steps[0].id, "status": "completed"}]
+            })
+            .to_string(),
+        },
+        StreamEvent::ToolUseEnd {
+            id: "settle-observer-plan".to_owned(),
+        },
+        StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::ToolCalls),
+        },
+    ]);
     cycle.plan_id = Some(plan.id.clone());
     host.database
         .transaction(|tx| {
@@ -312,8 +334,8 @@ async fn completed_foreground_background_report_with_historical_goal_continues_s
     let events = drive_reports(&mut host, std::slice::from_ref(&input)).await;
     assert_eq!(
         provider.calls(),
-        2,
-        "the callback adds exactly one provider request"
+        3,
+        "the callback has one tool request and one final answer in the same turn"
     );
     assert_eq!(completed_events(&events), 1);
     assert_eq!(turn_starts(&host), 2);
@@ -342,9 +364,17 @@ async fn completed_foreground_background_report_with_historical_goal_continues_s
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(provider_events_after - provider_events_before, 1);
+    assert_eq!(provider_events_after - provider_events_before, 2);
+    assert!(
+        work.plan(&host.session_id)
+            .unwrap()
+            .unwrap()
+            .steps
+            .iter()
+            .all(|step| step.status.is_terminal())
+    );
     drive_reports(&mut host, &[input]).await;
-    assert_eq!(provider.calls(), 2, "a consumed callback cannot run again");
+    assert_eq!(provider.calls(), 3, "a consumed callback cannot run again");
     host.shutdown().await.unwrap();
 }
 

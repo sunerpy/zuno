@@ -1,5 +1,7 @@
 //! What both surfaces must be able to trust about the shared composition root.
 
+#[path = "turn/tests/plan_execution_tests.rs"]
+mod plan_execution_tests;
 #[path = "turn/tests/scheduling_tests.rs"]
 mod scheduling_tests;
 
@@ -1862,7 +1864,7 @@ impl AgentDriver for ScriptedTurnDriver {
                     },
                 )
                 .expect("settle scripted Plan");
-                let changes = work
+                let changes: Vec<_> = work
                     .snapshot(&request.session_id)
                     .expect("scripted work")
                     .items
@@ -1882,8 +1884,10 @@ impl AgentDriver for ScriptedTurnDriver {
                         owner: item.owner,
                     })
                     .collect();
-                work.update_items(&request.session_id, changes)
-                    .expect("settle scripted runnable Todos");
+                if !changes.is_empty() {
+                    work.update_items(&request.session_id, changes)
+                        .expect("settle scripted runnable Todos");
+                }
             }
             Ok(TurnOutcome::Completed {
                 assistant_message_id: format!("msg_scripted_{call}"),

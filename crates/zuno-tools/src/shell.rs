@@ -155,8 +155,8 @@ pub struct ShellParams {
     /// The command's working directory, relative to the workspace when not absolute.
     #[serde(default)]
     pub workdir: Option<String>,
-    /// Defaults to false. Set true only for independent parallel work or an explicit
-    /// user request; keep a serial command or CI wait in the foreground.
+    /// Defaults to false. Set true only for an explicit parallel split while doing
+    /// independent local work; serial critical-path waits keep the foreground handle.
     #[serde(default)]
     pub background: bool,
     /// Purpose only, in either execution mode. remoteObserver marks remote-state

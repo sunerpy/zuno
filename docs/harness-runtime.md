@@ -242,12 +242,23 @@ tool-result, and verification state:
   external source/cycle wait without consuming reconciliation attempts;
 - an active Goal owns the next durable continuation;
 - authorized ordinary Work continues from a durable `Recovery` token only when
-  the host proves executable Todo/dependency work. Unfinished Plan steps and
-  blocked Todos alone produce `no_executable_work`, not another provider call;
+  the host proves executable Todo/dependency work or the current cycle's adopted,
+  authorized `in_progress` Plan step. No duplicate Todo is required. Linked
+  unfinished Todos retain their owner/dependency gates; an unsettled child
+  result cannot be bypassed by the coarser Plan status. An unowned Plan or
+  blocked Todo alone produces `no_executable_work`, not another provider call;
 - the driver hashes authoritative Plan, Todo, Job, and Goal revisions into a
   progress fingerprint; three consecutive identical fingerprints pause with
   typed `no_progress`;
 - no reconciliation branch manufactures a generic human confirmation request.
+
+The step is selected by typed status, not array position or assistant promises
+about "next steps". A decision needed only by a later independent step does not
+block the current authorized work. Required waits must be recorded through native
+controls. Existing pauses are not cleared on upgrade. Codex `9ba1d9eb5b`'s
+`core/src/tools/handlers/plan_spec.rs` likewise represents the current step with
+`in_progress`; Zuno adapts that representation to its own durable cycle and
+reconciliation service, not a claim that Codex auto-runs every unfinished Plan.
 
 Unreconciled work means durably recorded work. A Work-mode `Optional` decision
 is not recorded work, so a request that creates no Plan, Todo, or Job settles
@@ -2573,8 +2584,10 @@ Choose foreground when waiting is the only useful next action, including one
 serial command, child result, CI run, release or deployment dependency. Duration
 and task count alone are not reasons to detach. The purpose
 `backgroundPurpose: "remoteObserver"` works in either mode; it does not enable
-`background: true`. Detach only for independent parallel work or an explicit user
-request. This is model guidance, not a new task-count heuristic or tool gate.
+`background: true`. Detach only for an explicit parallel split: identify the
+independent work the parent will perform locally before dispatch, then perform
+it. Never detach the sole task and finalize while it runs. This is model
+guidance, not a new task-count heuristic or tool gate.
 
 The design reference is Codex `9ba1d9eb5b`'s unified execution handle and
 `write_stdin` continuation (`core/src/tools/handlers/unified_exec.rs`,
@@ -2582,6 +2595,10 @@ The design reference is Codex `9ba1d9eb5b`'s unified execution handle and
 not imply completion or require creating a separate observer agent. Zuno keeps
 its existing foreground handle, event-driven wait and cancellation contracts;
 it does not copy Codex's timing constants or tool wire shape.
+Codex's `core/src/tools/handlers/multi_agents_spec.rs` additionally requires
+identifying critical-path versus parallel sidecar work before delegation, keeping
+immediate blocking work local, and doing non-overlapping local work while a child
+runs. This is the source for Zuno's explicit parallel-split guidance.
 
 `shell` registers a command with the process-owned
 `BackgroundExecutionService` before spawning it. Explicit background mode and a
@@ -2607,8 +2624,8 @@ budgets still apply.
 Foreground terminal output, completion ownership and the original tool's
 verification receipt commit together before the handle is consumed. It does not
 also produce a detached callback. Serial CI/status dependencies therefore remain
-foreground by default; independent parallel work or an explicit user request
-can select detached execution.
+foreground by default; only explicitly planned independent work alongside
+useful mainline work selects detached execution.
 
 Durable commands keep a bounded 2 MiB live tail, persist complete output
 separately, and record status under `.zuno/background`. Each execution owns

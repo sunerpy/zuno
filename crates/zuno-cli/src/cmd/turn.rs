@@ -8895,7 +8895,7 @@ impl TurnHost {
                     let (code, detail) = if reason == PlanPauseReason::NoExecutableWork {
                         (
                             "no_executable_work",
-                            "Automatic recovery paused: unfinished Plan or blocked Todo state does not identify executable work. Resolve the recorded wait or explicitly resume.",
+                            "Automatic recovery paused: no runnable step or Todo is owned by the current work cycle. Inspect the work state and any recorded gates before continuing.",
                         )
                     } else {
                         (
@@ -9374,7 +9374,7 @@ impl TurnHost {
                 zuno_tools::WorkItemStatus::Completed | zuno_tools::WorkItemStatus::Cancelled
             )
         });
-        let executable_work = work.items.iter().any(|item| {
+        let executable_todo = work.items.iter().any(|item| {
             matches!(
                 item.status,
                 zuno_tools::WorkItemStatus::Pending | zuno_tools::WorkItemStatus::InProgress
@@ -9467,6 +9467,31 @@ impl TurnHost {
                     _ => true,
                 }
             });
+        // A Plan is sufficient to represent work: do not require a duplicate
+        // Todo for its current step. Only an explicitly adopted Work Plan may
+        // supply this evidence; old Plans and assistant prose cannot. Where a
+        // step has unfinished Todos, their ownership/dependencies decide, not
+        // the coarser Plan status. An unsettled child still owns its result.
+        let executable_plan = work_authorized
+            && !active_job
+            && scope.as_ref().is_some_and(|scope| {
+                scope.stopped.is_none()
+                    && work.plan.as_ref().is_some_and(|plan| {
+                        scope.plan_id.as_deref() == Some(plan.id.as_str())
+                            && plan.steps.iter().any(|step| {
+                                step.status == zuno_tools::PlanStepStatus::InProgress
+                                    && !work.items.iter().any(|item| {
+                                        item.plan_step_id.as_deref() == Some(step.id.as_str())
+                                            && !matches!(
+                                                item.status,
+                                                zuno_tools::WorkItemStatus::Completed
+                                                    | zuno_tools::WorkItemStatus::Cancelled
+                                            )
+                                    })
+                            })
+                    })
+            });
+        let executable_work = executable_todo || executable_plan;
         let input = PlanReconciliationInput {
             plan_exists,
             plan_terminal,

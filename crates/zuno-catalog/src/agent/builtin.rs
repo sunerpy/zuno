@@ -1093,7 +1093,11 @@ mod tests {
         assert!(rubric.contains("do not detach merely to end the turn"));
         assert!(rubric.contains("same handle"));
         assert!(rubric.contains("steering/interruption"));
-        assert!(rubric.contains("independent parallel work or an explicit user request"));
+        assert!(rubric.contains("requires an explicit parallel split"));
+        assert!(
+            rubric.contains("identify the independent work you will do locally before dispatch")
+        );
+        assert!(rubric.contains("Do not background the sole task and finalize while it runs"));
     }
 
     fn verification_rubric(prompt: &str) -> &str {
@@ -1211,7 +1215,7 @@ mod tests {
             "Source-string assertions alone do not establish runtime behavior",
             "prompt-output contract tests establish only the rendered prompt contract",
             "serial CI waits in the same foreground workflow",
-            "Background work is for independent parallel work or an explicit user request",
+            "Background work requires an explicit parallel split",
             "A polling timeout is not remote failure",
             "inspect the authoritative run status",
             "no tool authority, runtime gate, or approval requirement",

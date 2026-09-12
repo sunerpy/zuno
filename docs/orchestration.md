@@ -490,14 +490,15 @@ Deferred reports stay durable and are not automatically replayed after an upgrad
 An explicit new user request can inspect existing results; do not restart the
 observer just because no model continuation appeared.
 
-Use background delegation for independent work that can run alongside the parent's
-current work, or when the user explicitly requests it. Keep a critical-path
-dependency in the foreground when there is nothing useful to do in parallel.
+Use background delegation only for explicitly planned independent work alongside
+the parent's local work. Identify what the parent will do before dispatch, then
+do that non-overlapping work. Never background the sole task and finalize while
+it runs. Keep critical-path dependencies local or in the foreground.
 
 Long-running alone does not select background mode. If waiting is the only
 useful next action, keep the main workflow foreground and await the same child
-or process handle. One task may still run in background when explicitly requested
-or while the parent performs independent work. A `remoteObserver` purpose does
+or process handle. A background dispatch requires identified independent
+mainline work, not merely a long runtime. A `remoteObserver` purpose does
 not itself detach a command. Do not end the turn merely to replace an existing
 foreground wait with a promised background callback.
 
