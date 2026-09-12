@@ -4,7 +4,7 @@ use zuno_types::execution::{
     TurnExecutionIdentity,
 };
 
-fn pause_session(client: &PromptClient, reason: SessionPauseReason) {
+pub(super) fn pause_session(client: &PromptClient, reason: SessionPauseReason) {
     materialize_acp_fixture_session(client.root.path(), &client.session_id, "test-model", None);
     let pool = Arc::new(zuno_db::Pool::open(&acp_database(client.root.path())).unwrap());
     let control = zuno_session_control::SessionControlService::new(Arc::clone(&pool));

@@ -489,7 +489,7 @@ The built-in catalog separates primary modes, delegable specialists, and hidden 
 
 `zuno-review` is a native Component publishing one typed `ReviewService`. It owns source
 and artifact probing, typed seat reports, the event-backed review projection and the four
-review tools. `review_open` invokes the configuration-owned `balanced-review` Council
+review tools. `review_open` invokes the pack-owned `balanced-review` Council
 through a host adapter; `council_run` is not exposed to the review model. A seat counts
 only after its `DelegationEvidenceReport` parses, its repository-relative anchors are
 reopened by the host, and a structured receipt binds the preset source, run, job, seat,
@@ -1125,6 +1125,13 @@ attempts, a 180-second window, 2-second initial delay, 30-second maximum delay,
 and 20 percent jitter. The policy is frozen with the resolved provider and is
 never sent upstream.
 
+Request/retry elapsed time is separate from the whole child task's wall clock.
+A direct `oracle` task may complete nine successful provider rounds before its
+last request and retries consume 510 seconds. That final request diagnostic
+does not bound the earlier rounds, tool execution, or total task duration.
+An absent last provider code does not imply that the task made no successful
+provider requests.
+
 The four native providers — OpenAI, Anthropic, Google, and Bedrock — do not read
 those keys. Each applies one fixed 330-second response-header deadline and no
 whole-request deadline, because a legitimate long turn has no upper bound the
@@ -1352,6 +1359,27 @@ Duplicate message IDs observe the same gate even in the recovery handoff gap.
 `session/steer` returns immediate admission, which does not attest to sampling.
 Disconnect drops an observer; it is not implicit withdrawal or evidence that
 an old owner has stopped.
+
+ACP binds a `session/prompt` carrying ordinary `/resume` to the native resume
+control input (`ctl_…`) and its `InputAdmissionReceipt`. The session owns the FIFO
+driver, which uses a session-scoped client connection independently of the RPC
+observer. Losing that observer does not drop the drive future or implicitly
+cancel its client requests; this independence does not extend execution beyond
+closure of the ACP connection, runtime, or process. `ClientConnection::session_scoped`
+still shares disconnect state. Connection EOF allows up to 25 ms to drain ready
+requests before runtime shutdown cancels a running resume control. Its data and
+`cancelled` receipt remain durable; `session/load` does not replay that control.
+A `Queued` control is admission evidence, not
+completion: the prompt waits for its associated native execution to complete,
+wait for human input, be cancelled, or fail. Receipt and publication tracking
+keep the response behind the associated outcome and its pending updates, so an
+early `end_turn` cannot clear the client's busy state and Stop control.
+
+Explicit `$/cancel_request` remains bound to the control input contributed by
+that request. If execution has started, withdrawal checks the selected input at
+the cancellation boundary. `session/cancel` retains its exact-turn validation
+and legacy current-target capture; neither path arms cancellation for a later
+turn. An unrelated turn's completion cannot settle the resume control's receipt.
 
 Every multi-statement write transaction reserves SQLite's writer with `BEGIN IMMEDIATE`,
 including transactions opened through a caller-owned turn connection. This lets the configured
@@ -2185,6 +2213,47 @@ the Agent to invoke `council_run` exactly once with background execution and
 `nextStep` delivery, while the base resolver remains byte-identical for later
 turns. A launch entered while another turn is active waits in the durable input
 queue instead of steering the in-flight model generation.
+
+The pack-owned `balanced-review` Council has a 600000 ms total deadline and
+reserves 60000 ms for synthesis. Its three seats share one 540000 ms deadline
+relative to the start of Council execution. This replaces the built-in
+180000/60000 ms split only; custom preset descriptors retain their own bounds.
+The descriptor remains frozen in the capability snapshot, and neither user JSON
+configuration nor model-facing tool arguments can override these budgets.
+
+For every seat attempt the host calculates the actual remaining hard time and
+the corresponding UTC deadline in Unix milliseconds, then includes both in the
+durable task prompt.
+Delegation queue wait and retries consume the same seat-phase budget. The
+monotonic host deadline enforces the limit; the prompt communicates it without
+granting more time. Its scope instruction asks for evidence-backed partial
+conclusions and explicit unknowns in the required report format, rather than
+requiring a complete repository scan.
+
+Seat execution status and report validity are separate facts. A cancelled,
+failed, timed-out, or uncertain seat can have successful provider requests and
+completed tools without an accepted terminal report. Timeout settlement retains
+any child-session identity and usage/progress already recorded. Quorum counts
+validated terminal reports only: `0/2` does not mean every provider request failed.
+Council success still requires quorum and successful synthesis; preserved
+progress cannot substitute for either. Another seat attempt is allowed only
+after native `Completed` with an invalid structured report, within the preset's
+retry count and the same deadline. Native failed/cancelled/uncertain results
+and host `Err` settle without replay; provider same-request recovery remains
+separate. A terminal failed task or Council is not automatically replayed.
+
+The state boundaries adopt local Codex
+`9ba1d9eb5bbbd87ba2fc528d91ad239eea975ee9`, without copying its timeout constants.
+In `codex-rs/core/src/guardian/review_session.rs:1573`,
+`run_before_review_deadline` distinguishes `TimedOut` from externally `Aborted`;
+`run_before_review_deadline_with_cancel` at line 1591 signals the owned child
+on either outcome. Separately,
+`codex-rs/core/src/tools/handlers/multi_agents/wait.rs:191` returns `timed_out`
+when no final status was observed; `wait_agent_times_out_when_status_is_not_final`
+in `multi_agents_tests.rs:3196` verifies that observation without inventing a
+remote failure. Zuno preserves this distinction between a wait ending and an
+owned execution deadline cancelling work. Its Council budgets, durable child
+receipts, quorum, and synthesis requirements remain native Zuno policy.
 
 ```json
 {

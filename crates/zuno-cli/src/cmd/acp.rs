@@ -2692,7 +2692,7 @@ impl AcpSession {
         {
             validate_session_command_arguments(command, &arguments)?;
             return self
-                .execute_mode_command(command, &arguments, withdrawable.request(), state, client)
+                .execute_mode_command(command, &arguments, withdrawable, state, client)
                 .await;
         }
         let activated = self.ensure_active(state.as_ref(), client.clone()).await?;
@@ -3089,7 +3089,20 @@ impl AcpSession {
         guard: &SessionRunGuard,
         scope: DurableInputScope,
     ) -> Result<Option<(Result<(), zuno_acp::RpcError>, ProjectedTurn)>, zuno_acp::RpcError> {
-        let (input_id, drivable, context_size, _active_input) = {
+        self.drive_durable_input(client, guard, scope, None).await
+    }
+
+    /// A preparing driver must not inherit cancellation from one input and
+    /// apply it to another. If its selected head changed, release this lease
+    /// and let a fresh owner serve the next FIFO input.
+    async fn drive_durable_input(
+        &self,
+        client: &zuno_acp::ClientConnection,
+        guard: &SessionRunGuard,
+        scope: DurableInputScope,
+        expected_input: Option<&str>,
+    ) -> Result<Option<(Result<(), zuno_acp::RpcError>, ProjectedTurn)>, zuno_acp::RpcError> {
+        let (input, drivable, context_size, _active_input) = {
             let resources = self.resources.lock().await;
             let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
             let inbox = resources.host.session_inbox();
@@ -3098,6 +3111,9 @@ impl AcpSession {
             else {
                 return Ok(None);
             };
+            if expected_input.is_some_and(|expected| expected != input.id) {
+                return Ok(None);
+            }
             // Bind before promotion. A concurrent withdrawal either wins the
             // durable pending-row cancellation or finds this exact native input.
             let active_input = guard.mark_input_started(&input.id).ok_or_else(|| {
@@ -3110,47 +3126,81 @@ impl AcpSession {
                 return Ok(None);
             };
             (
-                promoted.id,
+                promoted,
                 drivable,
                 resources.configuration.context_size,
                 active_input,
             )
         };
-        let publication = self.publications.begin(Some(&input_id));
+        let input_id = &input.id;
+        let publication = self.publications.begin(Some(input_id));
         let (events, receiver) = event_channel();
-        let drive = async {
-            let mut resources = self.resources.lock().await;
-            let resources = resources.as_mut().ok_or_else(|| self.closed_error())?;
-            let outcome = if let Some(continuation) = drivable.work_control {
-                resources
-                    .host
-                    .drive_promoted_start_work_with_guard(
-                        &input_id,
-                        continuation,
-                        guard,
-                        events.clone(),
-                    )
-                    .await
-            } else if drivable.content.is_empty() {
-                resources
-                    .host
-                    .drive_promoted_with_guard(&drivable.text, &input_id, guard, events.clone())
-                    .await
-            } else {
-                resources
-                    .host
-                    .drive_promoted_content_with_guard(
-                        &drivable.text,
-                        &drivable.content,
-                        &input_id,
-                        guard,
-                        events.clone(),
-                    )
-                    .await
+        let drive =
+            async {
+                let mut resources = self.resources.lock().await;
+                let resources = resources.as_mut().ok_or_else(|| self.closed_error())?;
+                let is_control = drivable.work_control.is_some();
+                let outcome = if let Some(continuation) = drivable.work_control {
+                    resources
+                        .host
+                        .drive_promoted_start_work_with_guard(
+                            input_id,
+                            continuation,
+                            guard,
+                            events.clone(),
+                        )
+                        .await
+                } else if drivable.content.is_empty() {
+                    resources
+                        .host
+                        .drive_promoted_with_guard(&drivable.text, input_id, guard, events.clone())
+                        .await
+                } else {
+                    resources
+                        .host
+                        .drive_promoted_content_with_guard(
+                            &drivable.text,
+                            &drivable.content,
+                            input_id,
+                            guard,
+                            events.clone(),
+                        )
+                        .await
+                };
+                if is_control {
+                    match &outcome {
+                        Err(error) => self.settle_control_start_failure(
+                            &input,
+                            &zuno_acp::RpcError::internal(error),
+                            guard.interrupt_signal().is_set(),
+                        ),
+                        Ok(()) => {
+                            // Every native pump uses this path. A control that
+                            // never reached an engine turn must not leave its RPC
+                            // indefinitely pending merely because its text is saved.
+                            if !resources
+                                .host
+                                .session_control_service()
+                                .defer_input_at_execution_gate(
+                                    &self.id,
+                                    input_id,
+                                    zuno_db::message::now_millis(),
+                                )
+                                .map_err(session_control_rpc_error)?
+                                && let Some(cycle) = &input.cycle_id
+                            {
+                                self.receipts.fail_unapplied_input(
+                                &self.id, input_id, cycle,
+                                "native Work control stopped before entering an engine turn",
+                                guard.interrupt_signal().is_set(), zuno_db::message::now_millis(),
+                            ).map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
+                            }
+                        }
+                    }
+                }
+                drop(events);
+                outcome.map_err(zuno_acp::RpcError::internal)
             };
-            drop(events);
-            outcome.map_err(zuno_acp::RpcError::internal)
-        };
         let projection = project_turn(
             &self.id,
             context_size,
@@ -3253,10 +3303,11 @@ impl AcpSession {
         self: &Arc<Self>,
         command: SessionCommand,
         arguments: &str,
-        request: &zuno_acp::RequestId,
+        withdrawable: &WithdrawablePrompt<'_>,
         state: Arc<AcpState>,
         client: zuno_acp::ClientConnection,
     ) -> Result<Value, zuno_acp::RpcError> {
+        let request = withdrawable.request();
         if matches!(command, SessionCommand::Plan | SessionCommand::StartPlan) {
             if self.control.status() == SessionStatus::Busy {
                 return Err(command_requires_idle_session(&self.id));
@@ -3308,6 +3359,9 @@ impl AcpSession {
         self.materialize_for_control().await?;
         match command {
             SessionCommand::ResumeWork => {
+                if withdrawable.withdrawn() {
+                    return Err(zuno_acp::RpcError::cancelled("resume request withdrawn"));
+                }
                 let service =
                     zuno_session_control::SessionControlService::new(Arc::new(durable_pool()?));
                 let execution = service
@@ -3319,11 +3373,11 @@ impl AcpSession {
                 let outcome = service
                     .resume_session(&self.id, execution.revision, zuno_db::message::now_millis())
                     .map_err(session_control_rpc_error)?;
-                let response = json!({
-                    "stopReason":"end_turn", "inputId":outcome.input.id,
-                    "cycleId":outcome.state.cycle_id, "started":"queued",
-                });
-                self.spawn_start_work_recovery(state, client);
+                let mut response = self
+                    .observe_work_control(&outcome.input, state, withdrawable, &client)
+                    .await?;
+                response["inputId"] = json!(outcome.input.id);
+                response["cycleId"] = json!(outcome.state.cycle_id);
                 Ok(response)
             }
             SessionCommand::StartWork => {

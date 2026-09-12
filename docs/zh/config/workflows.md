@@ -147,6 +147,12 @@ Workflow 是一份具名的、由配置拥有的 DAG 模板，由面向模型的
 
 节点指定的每个 Agent 都必须可以从正在运行的 Agent 委派过去。父级上的 `delegates` 是一份确切的允许列表，它同时作用于 workflow 节点和直接委派，因此 workflow 无法绕过一份被收窄的契约。参见[自定义 Agent](/zh/config/custom-agents)。
 
+Workflow 依赖要求节点成功结束。一个节点随后失败时，此前成功的模型请求或工具仍是
+诊断证据，但不能满足 `dependsOn`。发起替代工作前先检查持久 job 和子会话；
+终态失败的工作不会自动重放。内置 Council 的 600 秒总预算与 540 秒共享席位阶段
+只属于 `balanced-review`，不是 workflow 节点或普通 `task` 调用的超时字段。
+参见 [Council 预算与结果](/zh/guide/orchestration#council)。
+
 ## 参见
 
 - [编写 Skill](/zh/config/authoring-skills)

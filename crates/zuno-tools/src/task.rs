@@ -1346,6 +1346,22 @@ fn render(
     lines.push("<task_result>".to_owned());
     lines.push(bound_report(&turn.output, &turn.session_id));
     lines.push("</task_result>".to_owned());
+    if let Some(progress) = turn
+        .report_metadata
+        .as_ref()
+        .and_then(|value| value.get("progress"))
+    {
+        lines.push(format!(
+            "<execution_progress>{}</execution_progress>",
+            bound_report(&progress.to_string(), &turn.session_id)
+        ));
+        if matches!(
+            turn.state,
+            ChildTurnState::Failed | ChildTurnState::Cancelled | ChildTurnState::Uncertain
+        ) {
+            lines.push("<note>Native execution did not complete. Earlier successful calls are not a completed review; a final request timeout is not proof that the entire task had no progress or that the provider was unavailable. Inspect the retained child session before resuming; do not replay uncertain side effects.</note>".to_owned());
+        }
+    }
     lines.push("</task>".to_owned());
 
     let title = params.contract.objective.clone();

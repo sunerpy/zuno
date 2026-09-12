@@ -288,7 +288,16 @@ Goal 自己的显式预算始终优先。省略该字段即表示不设兜底上
 
 ## 原生 Council 启动器
 
-Council 让多个隔离的席位各自独立评估同一个问题，然后综合结论。席位、Agent、模型路由、法定人数、并发、重试策略、端到端超时、预留的综合时间以及输出上限都由配置拥有，模型不能在调用时改写它们。
+Council 让多个隔离席位独立评估同一个问题，再综合结论。内置 `balanced-review`
+descriptor 固定三个席位、quorum `2`、`max_parallel: 3`、总
+`deadline_ms: 600000` 与 `synthesis_timeout_ms: 60000`；剩余 540 秒由所有席位、
+排队和重试共享。只有这个内置 preset 的总预算从 180 秒提高，其他 preset descriptor
+保留自己的值。
+
+当前 `zuno.json` 没有 `council` 或 `councils` 字段，`council_run` 也不接受预算覆盖。
+用户可以配置 Agent 模型/推理路由及 `concurrency.delegations`，但它们不会修改 preset
+的截止时间或 quorum。Provider 传输超时与重试恢复是独立限制。
+参见 [Council 预算与结果](/zh/guide/orchestration#council)。
 
 ## 上下文压缩
 

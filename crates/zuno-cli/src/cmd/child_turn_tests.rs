@@ -19,6 +19,9 @@ use zuno_paths::{DbLocation, Env};
 use zuno_tool::{InterruptHandle, NeverInterrupted};
 use zuno_tools::task::ReportDelivery;
 
+#[path = "child_turn_tests_progress.rs"]
+mod progress_tests;
+
 fn no_interrupt() -> Arc<dyn InterruptHandle> {
     Arc::new(NeverInterrupted)
 }
@@ -2282,7 +2285,7 @@ async fn foreground_cancellation_cannot_be_reclassified_as_successful_completion
 }
 
 #[tokio::test]
-async fn foreground_child_failure_remains_a_tool_failure_after_job_settlement() {
+async fn foreground_child_failure_retains_its_identity_and_durable_report() {
     let fixture = Fixture::new();
     fixture.session("ses_owner", None);
     let host = fixture.host.clone();
@@ -2292,11 +2295,12 @@ async fn foreground_child_failure_remains_a_tool_failure_after_job_settlement() 
 
     fixture.runner.wait_for_starts(1).await;
     fixture.runner.complete_with(Err("provider failed"));
-    let error = task
+    let turn = task
         .await
         .expect("foreground task joined")
-        .expect_err("a failed child must remain a failed task tool");
-    assert!(error.to_string().contains("provider failed"), "{error}");
+        .expect("an admitted failed child must return its native terminal facts");
+    assert_eq!(turn.state, ChildTurnState::Failed);
+    assert_eq!(turn.output, "provider failed");
     let jobs = fixture
         .host
         .job_store
@@ -2305,6 +2309,12 @@ async fn foreground_child_failure_remains_a_tool_failure_after_job_settlement() 
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].status, zuno_db::job::JobStatus::Failed);
     assert_eq!(jobs[0].error.as_deref(), Some("provider failed"));
+    assert_eq!(jobs[0].subject, JobSubject::child_session(&turn.session_id));
+    assert_eq!(turn.report_metadata, jobs[0].result);
+    assert_eq!(
+        turn.report_metadata.as_ref().unwrap()["sessionId"],
+        turn.session_id
+    );
 }
 
 #[tokio::test]

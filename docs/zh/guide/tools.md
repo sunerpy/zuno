@@ -30,6 +30,22 @@
 启用记忆时提供受限 `memory_read` 和 `memory_update`；普通更新默认自动应用，显式配置复核策略时除外。
 当前 Agent 能够触达时会出现 `council_run`。
 
+## Task、workflow 与 Council 的结果
+
+`task` 用于一次有界委派，`workflow` 执行配置化依赖图，`council_run` 收集独立报告后
+合成。失败时先查看持久 job 与子会话证据：超时前可以已有成功模型请求和已完成工具。
+Provider 请求及重试时间与任务总耗时是两项度量；失败任务不会自动重放。
+有对应证据时，`<execution_progress>` 在 `<task_result>` 之外保留原生进展；
+进展本身不证明任务已完成。
+
+内置 `balanced-review` 从 600 秒总预算中预留 60 秒合成，剩余 540 秒由全部席位、
+排队和重试共享。每次尝试的持久提示包含剩余硬时间与 UTC 截止时间。`0/2` 统计有效终态
+报告与 quorum，不统计 provider 成功次数。取消、失败、超时或不确定状态保留已记录进展，
+但不能将进展当成有效报告；Council 成功仍要求满足 quorum 且合成成功。
+只有原生执行完成但结构化报告 invalid 时，才可消耗 preset 的有界重试；
+原生失败或 host `Err` 不会重放席位。
+范围、配置与恢复边界见 [Agent 编排](/zh/guide/orchestration)。
+
 ## 持久问题与等待
 
 问题具有稳定的请求 ID、问题项 ID 和 revision。TUI、HTTP、ACP 共用 `QuestionPort`，
