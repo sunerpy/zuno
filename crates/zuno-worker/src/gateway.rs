@@ -62,6 +62,34 @@ pub struct GatewayStateClient {
     control: WorkerClient,
 }
 impl GatewayStateClient {
+    pub async fn cancellations(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<zuno_application::environment::OperationAdmission>, ApplicationError> {
+        if !(1..=64).contains(&limit) {
+            return Err(ApplicationError::Invalid(
+                "invalid cancellation batch".to_owned(),
+            ));
+        }
+        let bytes = self
+            .control
+            .post(
+                GATEWAY_CANCELLATIONS_PATH,
+                None,
+                serde_json::to_vec(&limit).map_err(ApplicationError::storage)?,
+            )
+            .await
+            .map_err(state_error)?;
+        let pending: Vec<zuno_application::environment::OperationAdmission> =
+            serde_json::from_slice(&bytes).map_err(ApplicationError::storage)?;
+        if pending.len() > limit as usize {
+            return Err(ApplicationError::Invalid(
+                "unbounded cancellation response".to_owned(),
+            ));
+        }
+        Ok(pending)
+    }
+
     pub fn new(
         endpoint: Url,
         tokens: Arc<dyn AccessTokenSource>,

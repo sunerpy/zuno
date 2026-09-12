@@ -3,13 +3,15 @@
 use crate::{PostgresBackend, database_error, runtime, scoped_transaction};
 use sqlx_core::{query::query, query_scalar::query_scalar, row::Row};
 use zuno_application::{ApplicationError, runtime::RuntimeJob};
-use zuno_types::identity::{JobId, PrincipalScope, SessionId};
+use zuno_types::identity::{JobId, OperationId, PrincipalScope, SessionId};
 use zuno_types::wait::WaitRef;
 
 /// Internal read model; public protocols select their own safe fields.
 pub struct ClientJobState {
     pub job: RuntimeJob,
     pub waits: Vec<WaitRef>,
+    pub stop_requested: bool,
+    pub pending_operations: Vec<OperationId>,
 }
 
 impl PostgresBackend {
@@ -51,8 +53,40 @@ impl PostgresBackend {
             }
             waits.push(reference);
         }
+        let stop_requested: bool = query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM zuno_enterprise_preview.runtime_stop
+             WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3)",
+        )
+        .bind(principal.tenant_id().as_str())
+        .bind(principal.principal_id().as_str())
+        .bind(id.as_str())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(database_error)?;
+        let pending: Vec<String> = query_scalar(
+            "SELECT o.operation_id FROM zuno_enterprise_preview.gateway_operation o
+             JOIN zuno_enterprise_preview.runtime_stop s
+               ON s.tenant_id=o.tenant_id AND s.principal_id=o.principal_id AND s.job_id=o.job_id
+             WHERE o.tenant_id=$1 AND o.principal_id=$2 AND (s.root_job_id=$3 OR s.job_id=$3)
+               AND o.completion IS NULL ORDER BY o.operation_id",
+        )
+        .bind(principal.tenant_id().as_str())
+        .bind(principal.principal_id().as_str())
+        .bind(id.as_str())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(database_error)?;
+        let pending_operations = pending
+            .into_iter()
+            .map(|id| OperationId::new(id).map_err(ApplicationError::storage))
+            .collect::<Result<Vec<_>, _>>()?;
         tx.commit().await.map_err(database_error)?;
-        Ok(ClientJobState { job, waits })
+        Ok(ClientJobState {
+            job,
+            waits,
+            stop_requested,
+            pending_operations,
+        })
     }
 
     pub async fn client_input_version(

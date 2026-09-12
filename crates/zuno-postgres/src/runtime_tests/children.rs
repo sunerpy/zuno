@@ -62,6 +62,245 @@ pub(super) async fn execution_binding(backend: &PostgresBackend, admin: &PgPool)
     }
     workspace::exercise(backend, admin).await;
     parent_depth_limit_is_not_raised_by_child_definition(backend, admin).await;
+    cancellation_fences_the_tree_and_preserves_other_sessions(backend, admin).await;
+    completed_parent_cancellation_prevents_a_late_next_step(backend, admin, false).await;
+    completed_parent_cancellation_prevents_a_late_next_step(backend, admin, true).await;
+}
+
+async fn cancellation_fences_the_tree_and_preserves_other_sessions(
+    backend: &PostgresBackend,
+    admin: &PgPool,
+) {
+    use zuno_application::control::{CancelJob, RuntimeControl};
+    let (actor, root) = parent(backend, admin, "cancel-tree").await;
+    let runtime = backend.runtime(actor.tenant_id().clone());
+    runtime
+        .dispatch_child(
+            &root.lease,
+            invocation(ChildDelivery::NextStep),
+            &grant(&root.job),
+        )
+        .await
+        .unwrap();
+    let child = runtime
+        .claim(&worker("child"), duration())
+        .await
+        .unwrap()
+        .unwrap();
+    let staged = runtime
+        .dispatch_child(
+            &root.lease,
+            ChildInvocation {
+                invocation_id: InvocationId::new("staged").unwrap(),
+                logical_key: "staged".to_owned(),
+                ..invocation(ChildDelivery::Foreground)
+            },
+            &grant(&root.job),
+        )
+        .await
+        .unwrap();
+    runtime
+        .dispatch_child(
+            &child.lease,
+            invocation(ChildDelivery::Quiet),
+            &grant(&child.job),
+        )
+        .await
+        .unwrap();
+    let grandchild = runtime
+        .claim(&worker("grandchild"), duration())
+        .await
+        .unwrap()
+        .unwrap();
+    let independent = session(backend, &actor, "independent").await;
+    let other = runtime
+        .submit(&actor, submission(&independent, "independent-turn", 0))
+        .await
+        .unwrap();
+    let request = CancelJob {
+        request_id: RequestId::new("cancel-tree").unwrap(),
+        expected_turn_id: root.job.turn_id.clone(),
+        reason: "Task no longer needed".to_owned(),
+    };
+    raw_sql(
+        "CREATE FUNCTION public.refuse_stop_receipt() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.type='runtime.cancellation.requested' AND NEW.tenant_id='cancel-tree'
+        THEN RAISE EXCEPTION 'injected stop receipt failure'; END IF; RETURN NEW; END $$;
+        CREATE TRIGGER refuse_stop_receipt BEFORE INSERT ON zuno_enterprise_preview.event
+        FOR EACH ROW EXECUTE FUNCTION public.refuse_stop_receipt();",
+    )
+    .execute(admin)
+    .await
+    .unwrap();
+    assert!(
+        runtime
+            .cancel(&actor, &root.job.id, request.clone())
+            .await
+            .is_err()
+    );
+    raw_sql("DROP TRIGGER refuse_stop_receipt ON zuno_enterprise_preview.event; DROP FUNCTION public.refuse_stop_receipt();")
+        .execute(admin).await.unwrap();
+    for job in [&root, &child, &grandchild] {
+        runtime
+            .renew(&job.lease, duration())
+            .await
+            .expect("failed cancellation rolls back every lease fence");
+    }
+    let (first, repeated) = tokio::join!(
+        runtime.cancel(&actor, &root.job.id, request.clone()),
+        runtime.cancel(&actor, &root.job.id, request.clone())
+    );
+    let receipt = first.unwrap();
+    assert_eq!(
+        repeated.unwrap(),
+        receipt,
+        "competing cancellations consume one request"
+    );
+    assert_eq!(receipt.stopped_jobs.len(), 3);
+    for job in [&root, &child, &grandchild] {
+        assert_eq!(
+            runtime
+                .get(&actor.owner(), &job.job.id)
+                .await
+                .unwrap()
+                .phase,
+            JobPhase::Cancelled
+        );
+        assert!(matches!(
+            runtime.renew(&job.lease, duration()).await,
+            Err(ApplicationError::LeaseLost)
+        ));
+        assert!(matches!(
+            runtime
+                .finish(&job.lease, JobFinish::Completed { result: json!({}) })
+                .await,
+            Err(ApplicationError::LeaseLost)
+        ));
+    }
+    assert_eq!(
+        runtime.cancel(&actor, &root.job.id, request).await.unwrap(),
+        receipt
+    );
+    assert_eq!(query_scalar::<_,String>("SELECT state FROM zuno_enterprise_preview.runtime_child WHERE tenant_id=$1 AND job_id=$2")
+        .bind(actor.tenant_id().as_str()).bind(staged.job_id.as_str()).fetch_one(admin).await.unwrap(),"cancelled");
+    let next = runtime
+        .claim(&worker("available"), duration())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        next.job.id, other.id,
+        "cancelled descendants cannot block an independent session"
+    );
+    assert_eq!(
+        query_scalar::<_, i64>(
+            "SELECT count(*) FROM zuno_enterprise_preview.runtime_job WHERE tenant_id=$1"
+        )
+        .bind(actor.tenant_id().as_str())
+        .fetch_one(admin)
+        .await
+        .unwrap(),
+        4,
+        "cancelled nextStep children cannot silently start a new parent turn"
+    );
+}
+
+async fn completed_parent_cancellation_prevents_a_late_next_step(
+    backend: &PostgresBackend,
+    admin: &PgPool,
+    published: bool,
+) {
+    use zuno_application::control::{CancelJob, RuntimeControl};
+    let tenant = format!("cancel-completed-parent-{published}");
+    let (actor, root) = parent(backend, admin, &tenant).await;
+    let runtime = backend.runtime(actor.tenant_id().clone());
+    runtime
+        .dispatch_child(
+            &root.lease,
+            invocation(ChildDelivery::NextStep),
+            &grant(&root.job),
+        )
+        .await
+        .unwrap();
+    let child = runtime
+        .claim(&worker("completed-child"), duration())
+        .await
+        .unwrap()
+        .unwrap();
+    complete_child(backend, admin, &child).await;
+    consume(admin, &root.job).await;
+    runtime
+        .finish(
+            &root.lease,
+            JobFinish::Completed {
+                result: json!({"done":true}),
+            },
+        )
+        .await
+        .unwrap();
+    let continuation = if published {
+        Some(
+            runtime
+                .claim(&worker("early-notification"), duration())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+    let receipt = runtime
+        .cancel(
+            &actor,
+            &root.job.id,
+            CancelJob {
+                request_id: RequestId::new("close-tree").unwrap(),
+                expected_turn_id: root.job.turn_id.clone(),
+                reason: "Do not continue this task".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    if let Some(continuation) = continuation {
+        assert!(receipt.stopped_jobs.contains(&continuation.job.id));
+        assert!(matches!(
+            runtime.renew(&continuation.lease, duration()).await,
+            Err(ApplicationError::LeaseLost)
+        ));
+    }
+    assert!(
+        runtime
+            .claim(&worker("next-step"), duration())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        runtime
+            .get(&actor.owner(), &child.job.id)
+            .await
+            .unwrap()
+            .phase,
+        JobPhase::Completed
+    );
+    assert_eq!(
+        runtime
+            .get(&actor.owner(), &root.job.id)
+            .await
+            .unwrap()
+            .phase,
+        JobPhase::Completed
+    );
+    assert_eq!(
+        query_scalar::<_, i64>(
+            "SELECT count(*) FROM zuno_enterprise_preview.runtime_job WHERE tenant_id=$1"
+        )
+        .bind(actor.tenant_id().as_str())
+        .fetch_one(admin)
+        .await
+        .unwrap(),
+        2 + i64::from(published)
+    );
 }
 
 async fn parent_depth_limit_is_not_raised_by_child_definition(

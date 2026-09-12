@@ -29,6 +29,63 @@ pub struct DockerGateway {
     snapshots: PathBuf,
 }
 impl DockerGateway {
+    /// A trusted data-owner cancellation for an immutable admitted operation.
+    /// This path grants only stopping that operation, never starting it, and
+    /// remains usable after its Worker lease or user membership is revoked.
+    pub async fn cancel_admitted(
+        &self,
+        admission: &zuno_application::environment::OperationAdmission,
+    ) -> Result<OperationReceipt, ApplicationError> {
+        admission.operation.validate()?;
+        let lease = &admission.lease;
+        if admission.environment.owner != lease.owner
+            || admission.environment.spec.session_id != lease.session_id
+            || admission.environment.spec.id != admission.operation.environment_id
+        {
+            return Err(ApplicationError::Forbidden);
+        }
+        let control = self.control(&lease.owner, &admission.operation.environment_id)?;
+        let _guard = control.lock().await;
+        // Persist a never-startable tombstone if control admission committed
+        // before this gateway wrote its ledger. A delayed submit sees it too.
+        let operation = self.ledger.admit(
+            lease,
+            &admission.operation,
+            Self::container(&lease.owner, &admission.operation.id),
+        )?;
+        self.cancel_observed(&operation).await
+    }
+
+    async fn cancel_observed(
+        &self,
+        operation: &Operation,
+    ) -> Result<OperationReceipt, ApplicationError> {
+        let owner = &operation.owner;
+        let id = &operation.request.id;
+        if operation.receipt.phase == OperationPhase::Prepared {
+            return self.ledger.cancel_requested(owner, id);
+        }
+        let receipt = self.observe(operation).await?;
+        if matches!(
+            receipt.phase,
+            OperationPhase::Completed | OperationPhase::Cancelled
+        ) {
+            return Ok(receipt);
+        }
+        self.ledger.cancel_requested(owner, id)?;
+        let _ = self
+            .docker
+            .json(
+                Method::POST,
+                &format!("/containers/{}/stop?t=5", operation.container),
+                None,
+            )
+            .await;
+        // A lost stop acknowledgement is resolved from the original container.
+        // Missing/unreadable state remains Uncertain and is polled again.
+        self.observe(&self.ledger.operation(owner, id)?).await
+    }
+
     /// Reconstruct delivery work from the ledger after a gateway restart. A
     /// successful sink acknowledgement is persisted before output may be removed.
     pub async fn deliver_completions(
@@ -612,33 +669,6 @@ impl OperationGateway for DockerGateway {
         self.authority
             .authorize(lease, &environment, &operation.request)
             .await?;
-        let receipt = self.observe(&operation).await?;
-        if matches!(
-            receipt.phase,
-            OperationPhase::Completed | OperationPhase::Cancelled
-        ) {
-            return Ok(receipt);
-        }
-        let requested = self.ledger.cancel_requested(&lease.owner, id)?;
-        if requested.phase == OperationPhase::Cancelled {
-            return Ok(requested);
-        }
-        match self
-            .docker
-            .json(
-                Method::POST,
-                &format!("/containers/{}/stop?t=5", operation.container),
-                None,
-            )
-            .await
-        {
-            Ok(_) => {
-                self.observe(&self.ledger.operation(&lease.owner, id)?)
-                    .await
-            }
-            Err(_) => self
-                .ledger
-                .observed(&lease.owner, id, OperationPhase::Uncertain, None),
-        }
+        self.cancel_observed(&operation).await
     }
 }

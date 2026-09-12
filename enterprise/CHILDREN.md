@@ -64,7 +64,7 @@ The handler is mounted by `WorkerStateService::with_children` only when a real
 catalog is supplied. Standalone definitions with validated `delegation.targets`
 now install this catalog and the native task dispatcher. Child model and gateway
 selection are fixed by the referenced definitions, and workspace preparation gates
-execution. Full cancellation/merge, cross-gateway transfer and Workflow/Council
+execution. Job/tree cancellation is described in [control](CONTROL.md). Approved merge, cross-gateway transfer and Workflow/Council
 remain P4 work. See [workspace configuration](WORKSPACES.md).
 
 See [中文](CHILDREN.zh.md), [waiting](WAITING.md), [PostgreSQL](POSTGRES.md)

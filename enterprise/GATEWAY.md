@@ -112,3 +112,7 @@ Its approval wait precedes execution; its operation wait follows a durable hando
 The executable gateway runs the receipt-delivery supervisor. The native runner
 also starts a control plane, gateway and two independent Worker binaries; see
 [deployment](DEPLOYMENT.md).
+
+## Data-owner cancellation
+
+The gateway supervisor also polls authenticated `internal/gateway/v1/cancellations`. This service-only path returns immutable admissions for stopped Jobs and stays valid after Worker revocation. It cannot start new operations. Docker stop and its actual terminal receipt remain separate; completed facts are preserved and unknown outcomes remain uncertain. See [control](CONTROL.md).

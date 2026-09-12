@@ -243,10 +243,22 @@ pub(crate) async fn drain(
             json!({"jobID":id,"completion":envelope}),
         )
         .await?;
-        let wake_allowed = matches!(
-            parent.phase,
-            JobPhase::Ready | JobPhase::Running | JobPhase::Waiting | JobPhase::Completed
-        ) && envelope.payload["status"] != "uncertain";
+        let stopped: bool = query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM zuno_enterprise_preview.runtime_stop
+             WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3)",
+        )
+        .bind(owner.tenant_id.as_str())
+        .bind(owner.principal_id.as_str())
+        .bind(parent.id.as_str())
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(database_error)?;
+        let wake_allowed = !stopped
+            && matches!(
+                parent.phase,
+                JobPhase::Ready | JobPhase::Running | JobPhase::Waiting | JobPhase::Completed
+            )
+            && envelope.payload["status"] != "uncertain";
         let access = crate::authorization::access_in(tx, owner).await?;
         if record.ticket.delivery == ChildDelivery::NextStep
             && wake_allowed

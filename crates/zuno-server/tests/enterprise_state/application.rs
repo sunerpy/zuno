@@ -487,8 +487,94 @@ async fn public_application_keeps_users_isolated_and_requires_current_policy_for
         "approved"
     );
 
+    let cancel_path = format!("{job_path}/cancel");
+    let cancellation = json!({
+        "requestId":"stop-investigation","expectedTurnId":job["turnId"],
+        "reason":"The investigation is no longer needed"
+    });
+    let mut wrong_turn = cancellation.clone();
+    wrong_turn["expectedTurnId"] = json!("other-turn");
+    assert_eq!(
+        http.post(api(&cancel_path))
+            .bearer_auth("alice")
+            .json(&wrong_turn)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let cancelled = http
+        .post(api(&cancel_path))
+        .bearer_auth("alice")
+        .json(&cancellation)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        cancelled.status(),
+        StatusCode::OK,
+        "an authorized owner can durably cancel a running job without its Worker's lease"
+    );
+    let cancelled: Value = cancelled.json().await.unwrap();
+    assert_eq!(cancelled["jobId"], job["id"]);
+    assert!(
+        matches!(
+            runtime
+                .renew(&claimed.lease, LeaseDuration::new(300_000).unwrap())
+                .await,
+            Err(zuno_application::ApplicationError::LeaseLost)
+        ),
+        "cancellation must fence the old Worker before returning"
+    );
+    assert_eq!(
+        http.post(api(&cancel_path))
+            .bearer_auth("alice")
+            .json(&cancellation)
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap(),
+        cancelled,
+        "retry returns the durable cancellation receipt"
+    );
+    let mut changed_cancellation = cancellation.clone();
+    changed_cancellation["reason"] = json!("different intent");
+    assert_eq!(
+        http.post(api(&cancel_path))
+            .bearer_auth("alice")
+            .json(&changed_cancellation)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        http.post(api(&cancel_path))
+            .bearer_auth("bob")
+            .json(&cancellation)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
     query("UPDATE zuno_enterprise_preview.organization_member SET active=false WHERE tenant_id=$1 AND principal_id=$2")
         .bind(tenant.as_str()).bind(alice.principal_id().as_str()).execute(&admin).await.unwrap();
+    assert_eq!(
+        http.post(api(&cancel_path))
+            .bearer_auth("alice")
+            .json(&cancellation)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN,
+        "an old receipt does not bypass current membership checks"
+    );
     for path in [
         "workspaces".to_owned(),
         "sessions".to_owned(),

@@ -105,6 +105,24 @@ pub(super) async fn root_in(
     query("INSERT INTO zuno_enterprise_preview.runtime_owner_schedule(tenant_id,principal_id) VALUES($1,$2) ON CONFLICT DO NOTHING")
         .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str())
         .execute(&mut **tx).await.map_err(database_error)?;
+    if let Some(envelope) = completion {
+        let child = envelope
+            .payload
+            .get("jobId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ApplicationError::Invalid("completion lacks child identity".to_owned())
+            })?;
+        let changed = query(
+            "INSERT INTO zuno_enterprise_preview.runtime_continuation(tenant_id,principal_id,job_id,parent_job_id,source_child_id)
+             SELECT tenant_id,principal_id,$3,parent_job_id,job_id FROM zuno_enterprise_preview.runtime_child
+             WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$4 AND parent_session_id=$5",
+        ).bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(&id).bind(child)
+            .bind(request.session_id.as_str()).execute(&mut **tx).await.map_err(database_error)?.rows_affected();
+        if changed != 1 {
+            return Err(ApplicationError::Conflict);
+        }
+    }
     emit(tx,principal,request.session_id.as_str(),"runtime.job.admitted",json!({
         "jobID":id,"turnID":turn,"inputID":input,"inputVersion":version,"configuration":request.configuration,"principal":principal,
     })).await?;

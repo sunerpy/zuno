@@ -2,6 +2,7 @@
 
 mod admission;
 pub(crate) mod children;
+mod control;
 mod store;
 mod transactions;
 pub(crate) mod waiting;

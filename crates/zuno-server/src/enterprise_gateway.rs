@@ -29,9 +29,9 @@ use zuno_identity::{
 use zuno_postgres::PostgresBackend;
 use zuno_types::identity::TenantId;
 use zuno_worker::{
-    GATEWAY_AUTHORIZE_PATH, GATEWAY_CHILD_WORKSPACE_PATH, GATEWAY_COMPLETION_PATH,
-    GATEWAY_PREPARE_PATH, GATEWAY_RESOLVE_PATH, GATEWAY_TICKET_HEADER, GATEWAY_TICKET_PATH,
-    GRANT_HEADER, IssuedGatewayRequest,
+    GATEWAY_AUTHORIZE_PATH, GATEWAY_CANCELLATIONS_PATH, GATEWAY_CHILD_WORKSPACE_PATH,
+    GATEWAY_COMPLETION_PATH, GATEWAY_PREPARE_PATH, GATEWAY_RESOLVE_PATH, GATEWAY_TICKET_HEADER,
+    GATEWAY_TICKET_PATH, GRANT_HEADER, IssuedGatewayRequest,
 };
 
 use crate::gateway_configuration::GatewayConfigurationResolver;
@@ -74,6 +74,10 @@ impl GatewayControlService {
             .route(&format!("/{GATEWAY_PREPARE_PATH}"), post(prepare))
             .route(&format!("/{GATEWAY_AUTHORIZE_PATH}"), post(authorize))
             .route(&format!("/{GATEWAY_COMPLETION_PATH}"), post(completion))
+            .route(
+                &format!("/{GATEWAY_CANCELLATIONS_PATH}"),
+                post(cancellations),
+            )
             .route(
                 &format!("/{GATEWAY_CHILD_WORKSPACE_PATH}"),
                 post(child_workspace_completed),
@@ -207,6 +211,22 @@ impl GatewayControlService {
             Arc::new(self.backend.organizations(self.tenant.clone())),
         ))
     }
+}
+
+async fn cancellations(
+    State(service): State<GatewayControlService>,
+    headers: HeaderMap,
+    Json(limit): Json<u32>,
+) -> Result<Json<Vec<zuno_application::environment::OperationAdmission>>, Failure> {
+    let gateway = service.gateway(&headers).await?;
+    Ok(Json(
+        service
+            .backend
+            .gateway_operations(gateway.id().clone())
+            .cancellations(&service.tenant, limit)
+            .await
+            .map_err(application)?,
+    ))
 }
 
 struct Failure(StatusCode);

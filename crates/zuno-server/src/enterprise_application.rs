@@ -20,6 +20,7 @@ use zuno_application::{
         AnswerApproval, ApprovalAnswer, ApprovalBinding, ApprovalRecord, ApprovalState,
         OrganizationStore,
     },
+    control::{CancelJob, CancellationReceipt, RuntimeControl},
     runtime::{
         ConfigurationRef, JobDispatcher, JobInputSelection, JobPhase, JobSubmission, RuntimeJob,
     },
@@ -119,6 +120,7 @@ impl EnterpriseApplication {
             .route("/sessions/{session}/input-version", get(input_version))
             .route("/sessions/{session}/turns", post(submit_turn))
             .route("/jobs/{job}", get(job))
+            .route("/jobs/{job}/cancel", post(cancel_job))
             .route("/approvals/{approval}", get(approval))
             .route("/approvals/{approval}/answer", post(answer));
         if self.memory.is_some() {
@@ -192,6 +194,22 @@ async fn memory_request(
     }))
 }
 
+async fn cancel_job(
+    State(service): State<EnterpriseApplication>,
+    Extension(identity): Extension<VerifiedIdentity>,
+    Path(job): Path<JobId>,
+    Json(request): Json<CancelJob>,
+) -> Result<Json<CancellationReceipt>, Failure> {
+    let principal = service.principal(&identity).await?;
+    Ok(Json(
+        service
+            .backend
+            .runtime(service.tenant.clone())
+            .cancel(&principal, &job, request)
+            .await?,
+    ))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkspaceView {
@@ -211,6 +229,8 @@ pub struct JobView {
     pub input_version: String,
     /// Public waiting coordinates, without arguments, checkpoints or grants.
     pub waits: Vec<JobWaitView>,
+    pub stop_requested: bool,
+    pub pending_operations: Vec<zuno_types::identity::OperationId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,12 +249,16 @@ impl From<RuntimeJob> for JobView {
             phase: job.phase,
             input_version: job.input_version.to_string(),
             waits: Vec::new(),
+            stop_requested: false,
+            pending_operations: Vec::new(),
         }
     }
 }
 impl From<zuno_postgres::ClientJobState> for JobView {
     fn from(state: zuno_postgres::ClientJobState) -> Self {
         let mut view = Self::from(state.job);
+        view.stop_requested = state.stop_requested;
+        view.pending_operations = state.pending_operations;
         view.waits = state
             .waits
             .into_iter()

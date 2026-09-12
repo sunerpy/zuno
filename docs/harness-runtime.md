@@ -2975,3 +2975,5 @@ bootstrap query is removed before access logging, and non-loopback resolution
 rejects the mode even when Basic Auth is configured.
 
 The design sources and explicit adopt/adapt/reject decisions are recorded in [the harness comparison](design/harness-comparison.md).
+
+Enterprise Job cancellation uses the authenticated `RuntimeControl` port and a durable gateway outbox. Worker lease revocation and logical child completion commit together; external process termination is confirmed separately. See `enterprise/CONTROL.md` in the preview source archive.

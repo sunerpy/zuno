@@ -6,6 +6,7 @@
 
 pub mod authorization;
 pub mod child;
+pub mod control;
 pub mod environment;
 pub mod runtime;
 

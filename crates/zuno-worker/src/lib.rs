@@ -36,6 +36,7 @@ pub const GATEWAY_RESOLVE_PATH: &str = "internal/gateway/v1/resolve";
 pub const GATEWAY_PREPARE_PATH: &str = "internal/gateway/v1/prepare";
 pub const GATEWAY_AUTHORIZE_PATH: &str = "internal/gateway/v1/authorize";
 pub const GATEWAY_COMPLETION_PATH: &str = "internal/gateway/v1/completion";
+pub const GATEWAY_CANCELLATIONS_PATH: &str = "internal/gateway/v1/cancellations";
 pub const GATEWAY_CHILD_WORKSPACE_PATH: &str = "internal/gateway/v1/child-workspace";
 pub const GATEWAY_TICKET_HEADER: &str = "x-zuno-gateway-ticket";
 pub const GATEWAY_EXECUTE_PATH: &str = "internal/execution/v1/request";

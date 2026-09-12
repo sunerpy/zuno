@@ -8,6 +8,7 @@ use zuno_engine::wait::WaitOutcome;
 use zuno_types::wait::{WaitContinuation, WaitRef, WaitTarget};
 
 pub(super) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator: &PgPool) {
+    cancellation_batches_are_bounded_and_rotate(backend, admin, migrator).await;
     for early in [false, true] {
         let tenant = if early {
             "operation-early"
@@ -148,4 +149,100 @@ pub(super) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
         ).bind(tenant).fetch_one(admin).await.unwrap();
         assert_eq!(count, 1);
     }
+}
+
+async fn cancellation_batches_are_bounded_and_rotate(
+    backend: &PostgresBackend,
+    admin: &PgPool,
+    migrator: &PgPool,
+) {
+    use zuno_application::control::{CancelJob, RuntimeControl};
+    let f = fixture(backend, admin, migrator, "cancellation-batches").await;
+    let gateway = GatewayId::new("gateway").unwrap();
+    let environment = Environment {
+        owner: f.owner.owner(),
+        spec: EnvironmentSpec {
+            id: EnvironmentId::new("batch-environment").unwrap(),
+            session_id: f.job.session_id.clone(),
+            image: format!("fixture@sha256:{}", "a".repeat(64)),
+            memory_bytes: 64 * 1024 * 1024,
+            pids_limit: 32,
+            cpu_millis: 1000,
+        },
+        revision: 1,
+    };
+    for index in 0..6 {
+        let id = format!("batch-{index}");
+        let mut proposal = proposal(&f, &id, EffectKind::Process);
+        let operation = CommandOperation {
+            id: proposal.binding.operation_id.clone(),
+            invocation_id: proposal.binding.invocation_id.clone(),
+            environment_id: environment.spec.id.clone(),
+            expected_revision: 1,
+            argv: vec!["a".repeat(65536); 4],
+        };
+        proposal.binding.arguments_sha256 = zuno_orchestration::sha256_json(&json!(operation.argv));
+        proposal.binding.resources_sha256 = zuno_orchestration::sha256_json(&json!([
+            environment.owner,
+            environment.spec,
+            environment.revision,
+        ]));
+        let approval = f.authority.admit(&f.lease, proposal.clone()).await.unwrap();
+        f.authority
+            .answer(&f.owner, answer(&approval.id, &id))
+            .await
+            .unwrap();
+        f.authority
+            .check_gateway_execution(
+                proposal,
+                &OperationAdmission {
+                    gateway_id: gateway.clone(),
+                    lease: f.lease.clone(),
+                    environment: environment.clone(),
+                    operation,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    f.runtime
+        .cancel(
+            &f.owner,
+            &f.job.id,
+            CancelJob {
+                request_id: RequestId::new("stop-batch").unwrap(),
+                expected_turn_id: f.job.turn_id.clone(),
+                reason: "Cancel the bounded operation batch".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let store = backend.gateway_operations(gateway);
+    let first = store.cancellations(f.owner.tenant_id(), 64).await.unwrap();
+    let second = store.cancellations(f.owner.tenant_id(), 64).await.unwrap();
+    for batch in [&first, &second] {
+        assert!(!batch.is_empty());
+        assert!(
+            serde_json::to_vec(batch).unwrap().len()
+                <= zuno_application::environment::wire::MAX_GATEWAY_FRAME_BYTES
+        );
+    }
+    let ids: std::collections::BTreeSet<_> = first
+        .iter()
+        .chain(&second)
+        .map(|item| item.operation.id.clone())
+        .collect();
+    assert_eq!(
+        ids.len(),
+        6,
+        "unconfirmed cancellations must rotate instead of starving later operations"
+    );
+    assert!(
+        backend
+            .gateway_operations(GatewayId::new("other").unwrap())
+            .cancellations(f.owner.tenant_id(), 64)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

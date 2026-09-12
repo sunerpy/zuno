@@ -69,7 +69,8 @@ PostgreSQL 格式 11 增加作用域化准备／回执和继承深度上限，�
 
 独立可执行测试运行一个控制面、一个网关和两个 Worker，覆盖两个用户、真实父／子
 Job、十四次模型请求、四次人工命令审批、私有 Memory 及 SIGTERM 退出。模型采用确定性
-fixture；完整取消／可审批合并、跨网关传输、Workflow／Council 和剩余 P5–P6 验收继续推进。
+fixture；任务树取消见[控制](CONTROL.zh.md)。可审批合并、跨网关传输、
+Workflow／Council 和剩余 P5–P6 验收继续推进。
 
 参见 [English](WORKSPACES.md)、[子任务](CHILDREN.zh.md)、
 [部署](DEPLOYMENT.zh.md)及[平台](PLATFORMS.zh.md)。
