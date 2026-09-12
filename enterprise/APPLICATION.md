@@ -49,7 +49,8 @@ expiry, policy and the trusted approval application. Ordinary API clients and AC
 bridges must not join the approval-app allowlist merely to suppress HITL. A decision
 is neither tool completion nor a Worker credential.
 
-Public Job DTOs contain no checkpoints, leases, grants, configuration, private
+Public Job DTOs expose typed waiting targets so a client can discover its approval
+ID. They contain no checkpoints, leases, grants, configuration, private
 replay blocks or arbitrary stored results. Rich history/live activity uses the
 separate activity protocol; no placeholder history, cancellation or stream route
 is mounted.
@@ -60,8 +61,8 @@ denial, approval restrictions and revocation. The BFF fixture uses real applicat
 routes across two replicas, including CSRF and logout. SQLite tests verify selected
 input and changed replay refusal.
 
-Standalone roles, production Worker/tool assembly and P3–P6 fault acceptance are
-still required before advertising an enterprise deployment. Publication remains
+Standalone roles and gateway command assembly are documented in [deployment](DEPLOYMENT.md).
+Full P3–P6 fault acceptance is still required. Publication remains
 disabled; personal HTTP/TUI/ACP platform behavior is unchanged.
 
 See [中文](APPLICATION.zh.md), [authorization](AUTHORIZATION.md),

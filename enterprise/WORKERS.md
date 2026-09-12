@@ -7,13 +7,13 @@ shared `AgentDriver`, budget policy and executor-visible directory for each Job.
 The runtime calls the existing `AgentDriver::advance`; it does not copy the agent
 loop or create a second task identity.
 
-This library is an enterprise Linux service building block. It does not yet
-register a production enterprise command. The personal TUI/ACP platform contract
-is unchanged; see [platform boundaries](PLATFORMS.md).
+The `zuno-enterprise` binary now composes this library with the native provider
+factories and gateway tools; see [deployment](DEPLOYMENT.md). The personal TUI/ACP
+platform contract is unchanged; see [platform boundaries](PLATFORMS.md).
 
 ## Claims and lifetime
 
-Internal Worker protocol 4 requires the protocol version and a bounded, nonempty
+Internal Worker protocol 5 requires the protocol version and a bounded, nonempty
 set of configuration references on every claim. The PostgreSQL claim query
 matches the exact ID, version and SHA before acquiring the session. A Worker with
 an older definition leaves incompatible work eligible for another Worker.
@@ -45,7 +45,8 @@ unconfirmed boundary, never a reason to repeat the POST.
 The root input's database admission timestamp travels with its stable ID. The
 materializer reuses that timestamp and part identity across Worker changes.
 Consumed input and provider-applied input retain their separate durable meanings.
-Checkpoint schema 3 and its accumulated budgets are unchanged.
+Checkpoint schema 4 distinguishes unsubmitted and submitted waits. Schema 3
+remains readable as unsubmitted state; accumulated budgets are preserved.
 
 The internal finish route accepts fenced failure, cancellation or uncertainty.
 Successful completion must use the kernel's atomic settlement path. It cannot be
@@ -79,8 +80,9 @@ rejection before claiming, and stopping before dispatch when renewal fails.
 The instance test runs within one test process; it is not independent-process
 deployment evidence.
 
-Production profile/provider/tool assembly, standalone role commands, delivery
-supervision, remote cancellation and the remaining P3–P6 acceptance are still
-required. Preview publication remains disabled.
+The Docker runner additionally verifies the executable control plane, gateway and
+two independent Workers through the real provider transport and approval/result
+chain. Remote cancellation and remaining P3–P6 acceptance are still required.
+Preview publication remains disabled.
 
 See [中文](WORKERS.zh.md), [state service](POSTGRES.md) and [status](STATUS.md).

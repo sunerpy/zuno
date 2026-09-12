@@ -113,7 +113,10 @@ codec 和 HTTPS client 已接入内部认证状态路由，服务身份、签名
 校验；Worker client 不依赖 PostgreSQL。`WorkerRuntime` 管理兼容配置领取、有界槽位及覆盖
 初始化与推进的续租；单调时钟保守扣除请求延迟，数据库时间仍是权威。输入时间及检查点预算
 在 Worker 更换后保留，详见 [Worker 宿主](../../../enterprise/WORKERS.zh.md)。
-可运行的分布式部署仍需企业启动／Profile 及工具装配。状态确认丢失时暂停恢复，不因此自动重放副作用。
+企业可执行服务已装配原生提供商、共享 Driver Profile 和认证网关工具。延期执行先记录
+交接，再提交副作用并保存类型化已提交等待，不能转为审批重放。Schema 4 保留安全的
+schema-3 接续与预算，详见[部署](../../../enterprise/DEPLOYMENT.zh.md)。
+状态确认丢失时暂停恢复，不因此自动重放副作用。
 
 ## 持久运行时存储
 

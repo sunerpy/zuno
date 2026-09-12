@@ -333,6 +333,35 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
         runtime.get(&actor.owner(), &job.id).await.unwrap().phase,
         JobPhase::Ready
     );
+    // Preserve an exact schema-3 completed-step shape across an upgrade, then
+    // lose a claimant before it starts advancing that checkpoint.
+    query("UPDATE zuno_enterprise_preview.event SET data=jsonb_set(data,'{schemaVersion}','3'::jsonb)
+           WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3 AND type='runtime.driver.advance'")
+        .bind(actor.tenant_id().as_str()).bind(actor.principal_id().as_str()).bind(session.id.as_str())
+        .execute(admin).await.unwrap();
+    query("UPDATE zuno_enterprise_preview.runtime_job SET checkpoint=jsonb_set(checkpoint,'{schemaVersion}','3'::jsonb)
+           WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3")
+        .bind(actor.tenant_id().as_str()).bind(actor.principal_id().as_str()).bind(job.id.as_str())
+        .execute(admin).await.unwrap();
+    let abandoned = runtime
+        .claim(
+            &WorkerInstanceId::new("legacy-abandoned").unwrap(),
+            duration,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(abandoned.job.checkpoint.as_ref().unwrap().schema_version, 3);
+    query(
+        "UPDATE zuno_enterprise_preview.runtime_session SET lease_expires=0
+           WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3",
+    )
+    .bind(actor.tenant_id().as_str())
+    .bind(actor.principal_id().as_str())
+    .bind(session.id.as_str())
+    .execute(admin)
+    .await
+    .unwrap();
     let second = runtime
         .claim(&WorkerInstanceId::new("worker-second").unwrap(), duration)
         .await

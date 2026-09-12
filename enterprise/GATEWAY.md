@@ -104,3 +104,9 @@ IdP evidence. Native Linux amd64/arm64 CI remains required before certification.
 
 See [中文](GATEWAY.zh.md), [rootless backend](ENVIRONMENTS.md),
 [identity](AUTHENTICATION.md) and [approval continuation](WAITING.md).
+
+`GatewayToolDispatcher` now implements `environment_command` over this transport.
+Its approval wait precedes execution; its operation wait follows a durable handoff.
+The executable gateway runs the receipt-delivery supervisor. The native runner
+also starts a control plane, gateway and two independent Worker binaries; see
+[deployment](DEPLOYMENT.md).

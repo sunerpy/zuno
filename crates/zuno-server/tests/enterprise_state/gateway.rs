@@ -14,6 +14,9 @@ use zuno_server::{
 };
 use zuno_worker::gateway::{GatewayClient, GatewayStateClient};
 
+#[path = "gateway_root.rs"]
+mod root;
+
 const IMAGE: &str = "public.ecr.aws/docker/library/alpine@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce";
 
 async fn lose_first_completion_response(
@@ -358,7 +361,7 @@ async fn gateway_requests_are_scoped_authenticated_and_still_require_current_hum
     let mut host = None;
     let mut delivery = None;
     let mut execution_server = None;
-    let client = GatewayClient::new(Some(certificate)).unwrap();
+    let client = GatewayClient::new(Some(certificate.clone())).unwrap();
     if let Some(socket) = socket {
         let service = GatewayExecutionService::connect(
             GatewayId::new("gateway").unwrap(),
@@ -574,7 +577,7 @@ async fn gateway_requests_are_scoped_authenticated_and_still_require_current_hum
         .bind(tenant.as_str()).bind(actor.principal_id().as_str()).bind(job.session_id.as_str()).execute(&admin).await.unwrap();
     assert!(worker.gateway_ticket(&execution, &request).await.is_err());
     assert!(state.resolve(&issued.ticket, &request).await.is_err());
-    if let Some(delivery) = delivery {
+    if let Some(delivery) = &delivery {
         assert!(
             delivery.deliver_completions(128).await.is_err(),
             "a lost post-commit response must remain unacknowledged at the gateway"
@@ -614,6 +617,15 @@ async fn gateway_requests_are_scoped_authenticated_and_still_require_current_hum
             count, 2,
             "lost acknowledgements must not duplicate completion facts"
         );
+        root::exercise(root::Context {
+            backend: &backend,
+            actor: &actor,
+            worker: &worker,
+            delivery,
+            certificate: certificate.clone(),
+            configuration: &configuration,
+        })
+        .await;
     }
     if let Some(host) = host {
         let environment = host

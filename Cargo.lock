@@ -7772,6 +7772,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "zuno-enterprise"
+version = "0.10.31"
+dependencies = [
+ "async-trait",
+ "aws-lc-rs",
+ "axum",
+ "base64 0.23.1",
+ "clap",
+ "futures",
+ "hyper-util",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sqlx-core",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "url",
+ "uuid",
+ "zuno-application",
+ "zuno-auth",
+ "zuno-config",
+ "zuno-engine",
+ "zuno-error",
+ "zuno-identity",
+ "zuno-llm",
+ "zuno-network",
+ "zuno-observability",
+ "zuno-orchestration",
+ "zuno-permission",
+ "zuno-postgres",
+ "zuno-provider-anthropic",
+ "zuno-provider-bedrock",
+ "zuno-provider-compatible",
+ "zuno-provider-google",
+ "zuno-provider-openai",
+ "zuno-runtime",
+ "zuno-server",
+ "zuno-types",
+ "zuno-worker",
+]
+
+[[package]]
 name = "zuno-environment"
 version = "0.10.31"
 dependencies = [
@@ -8631,6 +8677,7 @@ dependencies = [
  "async-trait",
  "futures",
  "reqwest",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
@@ -8640,9 +8687,12 @@ dependencies = [
  "zuno-auth",
  "zuno-db",
  "zuno-engine",
+ "zuno-error",
  "zuno-identity",
  "zuno-llm",
  "zuno-network",
+ "zuno-orchestration",
  "zuno-runtime",
+ "zuno-tool",
  "zuno-types",
 ]

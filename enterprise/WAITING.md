@@ -5,9 +5,9 @@ The bounded driver can suspend an unfinished tool phase using
 completed `ToolDispatchResult`. A wait does not write a successful `running`
 message, finish the step, or start another provider request.
 
-This is an internal runtime capability. Enterprise launch assembly, distributed
-child/Workflow producers, human approval execution and public client projection
-remain separate deliveries. No new CLI command or public HTTP route is enabled.
+This is an internal runtime capability, now consumed by the enterprise executable
+and its gateway command tool. Distributed child/Workflow producers and public
+activity projection remain separate deliveries.
 
 ## Identities and execution
 
@@ -17,7 +17,7 @@ user input, child Job, external operation and database-clock timer. The bounded
 driver consumes `current_turn` results; a `next_turn` reference cannot silently
 become a current-turn continuation.
 
-Checkpoint schema 3 retains the original provider-visible declarations,
+Checkpoint schema 4 retains the original provider-visible declarations,
 orchestration snapshot, tool calls and positions, next unprepared call, pending
 references, and accumulated result effects. It also retains the existing prompt,
 usage, time and recovery state. No Future, provider object, cancellation handle,
@@ -27,6 +27,13 @@ Preparation stops at the first durable wait in a dispatch batch. Earlier
 independent calls still execute together. Later calls have not run their hooks
 or requested permission yet; they are prepared after continuation under current
 authority. Completed calls are not dispatched again.
+
+`PreparedToolDispatch::DeferredExecution` runs only after the durable handoff.
+It may return an operation wait after submission. `PendingDispatch::Submitted`
+then protects the exact started part; an approval wait remains `NotStarted`.
+A submitted call cannot turn into a re-preparable approval wait. Unbounded drivers
+reject deferred execution before handoff. Legacy schema 3 reads as `NotStarted`,
+and a forged submitted proof under that version is refused.
 
 The producer owns its durable prepared operation, actual argument approval,
 post-processing and authoritative receipt verification. Merely returning a wait
@@ -82,8 +89,9 @@ clients. Its provider must share the turn store's transaction domain. The produc
 must verify the actual operation, child or answer before publishing its result.
 Human approval readiness is integrated with the PostgreSQL state owner and shared
 driver. The [application API](APPLICATION.md) now supplies authenticated human
-approval endpoints. Production gateway dispatch, user-input adapters and
-cancellation/resume APIs still require their own consumers.
+approval endpoints, and the gateway dispatcher consumes that decision before
+submission. User-input adapters and cancellation/resume APIs still require their
+own consumers.
 
 ## Approval readiness
 
@@ -104,9 +112,9 @@ authorization and budgets. Approval cannot revive a superseded lease.
 Completion payload schema 2 stores the tagged outcome. Earlier preview result
 facts remain readable and deduplicate against the same logical completion without
 rewriting the stored event. An old fact that confused approval with a tool result
-is refused. The driver checkpoint remains schema 3. Worker protocol 4 carries
-compatible claims and grant lifetime; completion publication is a separate
-state-owner port.
+is refused. Driver checkpoint schema 4 reads safe schema-3 boundaries without
+resetting budget or replaying tools. Worker protocol 5 carries the submitted-wait
+state; completion publication remains a separate state-owner port.
 
 ## Storage and verification
 
@@ -123,7 +131,7 @@ budget refusal before remaining tools. The real PostgreSQL contract covers
 competing claims, independent sessions, early completion, timers, paused parents,
 cross-owner denial, failed consumption followed by checkpoint takeover, and
 failed/successful migration. The authenticated HTTPS contract carries the same
-wait and consumption through the separately versioned Worker protocol (version 4).
+wait and consumption through the separately versioned Worker protocol (version 5).
 
 These tests do not certify independently launched Workers, gateway-to-tool
 assembly, distributed child/Council orchestration or a complete enterprise UI.

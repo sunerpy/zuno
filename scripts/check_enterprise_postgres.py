@@ -121,6 +121,11 @@ def main():
                 ["cargo", "test", "-p", "zuno-server", "--features", "enterprise", "--test", "enterprise_state", "--", "--include-ignored"],
                 cwd=repository, env=environment, check=True,
             )
+            if environment.get("ZUNO_GATEWAY_TEST_REQUIRED") == "1":
+                subprocess.run(
+                    ["cargo", "test", "-p", "zuno-enterprise", "--test", "processes", "--", "--include-ignored"],
+                    cwd=repository, env=environment, check=True,
+                )
         except subprocess.CalledProcessError as error:
             setup.flush()
             if not error.cmd or error.cmd[0] != "cargo":

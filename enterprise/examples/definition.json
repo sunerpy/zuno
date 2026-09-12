@@ -1,0 +1,29 @@
+{
+  "id": "default",
+  "version": 1,
+  "workspace": {"id": "workspace", "title": "Private workspace"},
+  "agent": {
+    "name": "build",
+    "systemPrompt": "Work toward the user's active task. Use the available tools within their authorization boundaries and report verified results.",
+    "maxSteps": 32
+  },
+  "model": {
+    "providerId": "company-model",
+    "modelId": "configured-model",
+    "transport": "openai-compatible",
+    "surface": "chat",
+    "baseUrl": "https://models.example/v1",
+    "credential": "model",
+    "contextTokens": 128000,
+    "maxOutputTokens": 8192
+  },
+  "budget": {"tokens": 1000000, "toolCalls": 128, "durationSeconds": 3600},
+  "environment": {
+    "gatewayId": "gateway",
+    "endpoint": "https://gateway.example/",
+    "image": "public.ecr.aws/docker/library/alpine@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce",
+    "memoryBytes": 268435456,
+    "pidsLimit": 64,
+    "cpuMillis": 1000
+  }
+}

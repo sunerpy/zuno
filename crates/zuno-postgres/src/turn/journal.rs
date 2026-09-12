@@ -36,7 +36,7 @@ fn bound(request: &AdvanceRequest, job: &RuntimeJob) -> Result<(), AdvanceError>
     }
     if job.checkpoint.as_ref().is_some_and(|checkpoint| {
         checkpoint.driver != "default"
-            || checkpoint.schema_version != zuno_engine::advance::DRIVER_CHECKPOINT_VERSION
+            || !zuno_engine::advance::supports_checkpoint_schema(checkpoint.schema_version)
     }) {
         return Err(AdvanceError::Conflict);
     }

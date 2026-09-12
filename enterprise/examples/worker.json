@@ -1,0 +1,23 @@
+{
+  "stateDirectory": "/var/lib/zuno-enterprise-preview/worker-a",
+  "service": {
+    "kind": "worker",
+    "instancePrefix": "worker-a",
+    "state": {
+      "endpoint": "https://control.example/",
+      "accessTokenFile": "/run/secrets/zuno-worker.token",
+      "rootCertificate": "/etc/zuno-enterprise-preview/ca.pem"
+    },
+    "definitions": ["/etc/zuno-enterprise-preview/definition.json"],
+    "credentials": {
+      "model": {
+        "apiKeyFile": "/run/secrets/zuno-model.key",
+        "rootCertificate": "/etc/zuno-enterprise-preview/model-ca.pem"
+      }
+    },
+    "slots": 2,
+    "pollMillis": 500,
+    "renewMillis": 5000,
+    "drainSeconds": 30
+  }
+}

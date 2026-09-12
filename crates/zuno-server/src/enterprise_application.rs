@@ -168,6 +168,15 @@ pub struct JobView {
     pub phase: JobPhase,
     /// Decimal strings preserve exact counters in JavaScript clients.
     pub input_version: String,
+    /// Public waiting coordinates, without arguments, checkpoints or grants.
+    pub waits: Vec<JobWaitView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobWaitView {
+    pub invocation_id: zuno_types::identity::InvocationId,
+    pub target: zuno_types::wait::WaitTarget,
 }
 impl From<RuntimeJob> for JobView {
     fn from(job: RuntimeJob) -> Self {
@@ -178,7 +187,22 @@ impl From<RuntimeJob> for JobView {
             input_id: job.input_id,
             phase: job.phase,
             input_version: job.input_version.to_string(),
+            waits: Vec::new(),
         }
+    }
+}
+impl From<zuno_postgres::ClientJobState> for JobView {
+    fn from(state: zuno_postgres::ClientJobState) -> Self {
+        let mut view = Self::from(state.job);
+        view.waits = state
+            .waits
+            .into_iter()
+            .map(|wait| JobWaitView {
+                invocation_id: wait.invocation_id,
+                target: wait.target,
+            })
+            .collect();
+        view
     }
 }
 

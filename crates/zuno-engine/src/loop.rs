@@ -1275,6 +1275,8 @@ pub enum ToolDispatchOutcome {
 /// One dispatch boundary shared by local and durable executors.
 pub enum PreparedToolDispatch {
     Execution(BoxFuture<'static, ToolDispatchResult>),
+    /// A durable executor may yield a wait after a tracked external submission.
+    DeferredExecution(BoxFuture<'static, ToolDispatchOutcome>),
     Pending(zuno_types::wait::WaitRef),
 }
 
@@ -1283,6 +1285,11 @@ impl PreparedToolDispatch {
     #[must_use]
     pub fn new(execution: BoxFuture<'static, ToolDispatchResult>) -> Self {
         Self::Execution(execution)
+    }
+
+    #[must_use]
+    pub fn deferred(execution: BoxFuture<'static, ToolDispatchOutcome>) -> Self {
+        Self::DeferredExecution(execution)
     }
 
     /// Stage a result that was fully decided during preparation.
@@ -1295,6 +1302,7 @@ impl PreparedToolDispatch {
     pub async fn execute(self) -> ToolDispatchOutcome {
         match self {
             Self::Execution(execution) => ToolDispatchOutcome::Completed(Box::new(execution.await)),
+            Self::DeferredExecution(execution) => execution.await,
             Self::Pending(wait) => ToolDispatchOutcome::Pending(wait),
         }
     }

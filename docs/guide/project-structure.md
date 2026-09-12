@@ -1,7 +1,7 @@
 # Project structure and execution flow
 
 Use this page to find the crate that owns a behavior before changing it. Zuno is a
-single Rust workspace with 54 crates. `crates/zuno-cli` builds the `zuno` binary;
+single Rust workspace with 55 crates. `crates/zuno-cli` builds the `zuno` binary;
 the other crates keep protocol, runtime, storage, tool, and client concerns out of
 that entry point.
 
@@ -35,6 +35,7 @@ Every crate opts into the workspace lint policy. First-party code forbids
 | Crate | Responsibility |
 | --- | --- |
 | `zuno-cli` (`zuno`) | Parses commands, resolves configuration, assembles the default harness, and owns the shipped executable |
+| `zuno-enterprise` | Linux control plane, Worker, gateway and setup executables for the isolated enterprise preview |
 | `zuno-tui` | Terminal views, input handling, keybindings, themes, and rendering; it does not own an agent loop |
 | `zuno-server` | Personal HTTP/SSE/PTY projections by default; Linux enterprise services behind the explicit `enterprise` feature |
 | `zuno-acp` | Agent Client Protocol adapter used by editor clients such as Zed |

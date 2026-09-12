@@ -1,0 +1,20 @@
+{
+  "stateDirectory": "/var/lib/zuno-enterprise-preview/gateway",
+  "service": {
+    "kind": "gateway",
+    "id": "gateway",
+    "tls": {
+      "listen": "0.0.0.0:8443",
+      "certificateFile": "/etc/zuno-enterprise-preview/gateway.crt",
+      "privateKeyFile": "/run/secrets/zuno-gateway.key",
+      "maxConnections": 256
+    },
+    "state": {
+      "endpoint": "https://control.example/",
+      "accessTokenFile": "/run/secrets/zuno-gateway.token",
+      "rootCertificate": "/etc/zuno-enterprise-preview/ca.pem"
+    },
+    "dockerSocket": "/run/user/1000/docker.sock",
+    "deliveryMillis": 500
+  }
+}

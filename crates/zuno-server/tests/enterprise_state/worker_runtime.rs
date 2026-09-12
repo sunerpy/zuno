@@ -100,6 +100,7 @@ impl WorkerServiceFactory for Factory {
             dynamic_context: DynamicContext::default(),
             executor_directory: "/workspace".to_owned(),
             steps_per_advance: NonZeroU32::MIN,
+            context_limit: None,
         })
     }
 }

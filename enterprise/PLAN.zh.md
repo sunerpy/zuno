@@ -249,3 +249,10 @@ Web 可在协议稳定后并行开发。首个可运行预览具备根任务完�
 服务按 Linux amd64／arm64 验收，不承担 Windows 企业服务适配。个人模式的 TUI、
 ACP、本地 HTTP 和共享内核保留现有平台承诺；企业 Web 仍可由 Windows 浏览器访问。
 实现采用显式企业 feature 和独立 CI 包选择，具体约束见 [平台边界](PLATFORMS.zh.md)。
+
+## 实施补充：独立可执行角色
+
+2026-09-12 增加 `zuno-enterprise` crate，工作区明确清单从 54 增至 55，同步
+`crates.expected` 与中英文工作区枚举。此 crate 负责 Linux 企业控制面、Worker、网关、
+迁移和身份检查的装配入口；共享业务状态机仍归属原有组件。构建该二进制不代表 P0–P6
+全部完成或启用预览发布，具体能力与未完成项以 [STATUS.md](STATUS.md) 为准。
