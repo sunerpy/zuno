@@ -3,6 +3,8 @@
 
 mod admission;
 mod coordinator;
+mod council;
+pub(in crate::runtime) use council::expire as expire_councils;
 mod inputs;
 use coordinator::advance;
 pub(super) use coordinator::{drain, result};
@@ -43,6 +45,14 @@ struct Plan {
     template: WorkflowTemplateDescriptor,
     invocation: WorkflowInvocation,
     nodes: Vec<NodeDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    council: Option<CouncilPlan>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CouncilPlan {
+    preset: zuno_orchestration::CouncilPresetDescriptor,
+    repairs: std::collections::BTreeMap<String, NodeDefinition>,
 }
 impl Plan {
     fn new(
@@ -92,10 +102,43 @@ impl Plan {
                 })
             })
             .collect::<Result<Vec<_>, ApplicationError>>()?;
+        let council = grant
+            .council
+            .as_ref()
+            .map(|rules| {
+                zuno_engine::council::validate_policy(&rules.preset)
+                    .map_err(ApplicationError::storage)?;
+                let mut repairs = std::collections::BTreeMap::new();
+                for (seat, child) in &rules.repairs {
+                    child.validate()?;
+                    if child.parent != grant.group.child
+                        || child.workspace != ChildWorkspacePolicy::ModelOnly
+                    {
+                        return Err(ApplicationError::Forbidden);
+                    }
+                    repairs.insert(
+                        seat.clone(),
+                        NodeDefinition {
+                            id: seat.clone(),
+                            configuration: child.child.clone(),
+                            selection: child.selection.clone(),
+                            maximum_depth: child.maximum_depth,
+                            maximum_children: child.maximum_children,
+                            workspace: child.workspace,
+                        },
+                    );
+                }
+                Ok(CouncilPlan {
+                    preset: rules.preset.clone(),
+                    repairs,
+                })
+            })
+            .transpose()?;
         let plan = Self {
             template: grant.template.clone(),
             invocation,
             nodes,
+            council,
         };
         plan.graph()?;
         if serde_json::to_vec(&plan)
@@ -120,6 +163,30 @@ impl Plan {
             return Err(invalid(
                 "stored workflow nodes disagree with their definition",
             ));
+        }
+        if let Some(council) = &self.council {
+            zuno_engine::council::validate_policy(&council.preset)
+                .map_err(ApplicationError::storage)?;
+            if self.nodes.len() != council.preset.seats.len() + 1
+                || self.nodes.last().is_none_or(|node| {
+                    node.id != zuno_engine::council::SYNTHESIS_NODE
+                        || node.workspace != ChildWorkspacePolicy::ModelOnly
+                })
+                || council
+                    .preset
+                    .seats
+                    .iter()
+                    .enumerate()
+                    .any(|(index, seat)| {
+                        self.nodes[index].id != zuno_engine::council::seat_node(&seat.id)
+                            || (council.preset.retry_policy.max_retries > 0
+                                && !council.repairs.contains_key(&seat.id))
+                    })
+            {
+                return Err(invalid(
+                    "stored Council roles do not match its fixed preset",
+                ));
+            }
         }
         WorkflowGraph::new(
             self.template
@@ -256,6 +323,9 @@ async fn activate(
         return Err(ApplicationError::Conflict);
     }
     set_state(tx, coordinator, run, "active").await?;
+    if run.plan.council.is_some() {
+        return Box::pin(council::activate(tx, coordinator, run)).await;
+    }
     // Node admission and dependency advancement are performed in this same
     // transaction by the shared coordinator below.
     Box::pin(advance(tx, coordinator, run)).await

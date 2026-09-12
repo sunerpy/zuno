@@ -88,15 +88,19 @@ impl WorkflowStore for PostgresRuntimeStore {
                         template
                     ])),
                     logical_key: format!("workflow-node:{digest}"),
-                    prompt: template.prompt.as_ref().map_or_else(
-                        || run.plan.invocation.root.prompt.clone(),
-                        |instruction| {
-                            format!(
-                                "{}\n\nWorkflow node `{}` instruction:\n{}",
-                                run.plan.invocation.root.prompt, template.id, instruction
-                            )
-                        },
-                    ),
+                    prompt: if run.plan.council.is_some() {
+                        template.prompt.clone().ok_or(ApplicationError::Conflict)?
+                    } else {
+                        template.prompt.as_ref().map_or_else(
+                            || run.plan.invocation.root.prompt.clone(),
+                            |instruction| {
+                                format!(
+                                    "{}\n\nWorkflow node `{}` instruction:\n{}",
+                                    run.plan.invocation.root.prompt, template.id, instruction
+                                )
+                            },
+                        )
+                    },
                     description: template
                         .description
                         .clone()

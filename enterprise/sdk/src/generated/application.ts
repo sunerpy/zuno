@@ -54,7 +54,21 @@ export type WaitTarget =
       deadline_ms: number;
       kind: "timer";
     };
+export type Counter = string;
+export type CouncilPhase = "seats" | "stopping" | "synthesis" | "completed" | "failed" | "cancelled" | "uncertain";
+export type CouncilSeatState =
+  | "pending"
+  | "running"
+  | "waiting"
+  | "retrying"
+  | "completed"
+  | "invalid"
+  | "failed"
+  | "timed_out"
+  | "cancelled"
+  | "uncertain";
 export type WorkflowRunId = string;
+export type WorkflowKind = "workflow" | "council";
 export type NodeRunId = string;
 export type InvocationState =
   "queued" | "waiting" | "running" | "succeeded" | "failed" | "denied" | "cancelled" | "uncertain";
@@ -183,11 +197,28 @@ export interface SubmitTurn {
   text: string;
 }
 export interface WorkflowRunView {
+  council?: CouncilView | null;
   id: WorkflowRunId;
   jobId: JobId;
+  kind: WorkflowKind;
   name: string;
   nodes: NodeRunView[];
   state: WorkflowState;
+}
+export interface CouncilView {
+  deadline: Counter;
+  phase: CouncilPhase;
+  preset: string;
+  quorum: number;
+  seatDeadline: Counter;
+  seats: CouncilSeatView[];
+  synthesisDeadline?: Counter | null;
+}
+export interface CouncilSeatView {
+  attempts: number;
+  id: string;
+  jobId: JobId;
+  state: CouncilSeatState;
 }
 export interface NodeRunView {
   dependsOn: string[];

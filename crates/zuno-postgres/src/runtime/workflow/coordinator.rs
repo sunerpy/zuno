@@ -92,6 +92,9 @@ pub(super) async fn advance(
         )
         .await;
     }
+    if run.plan.council.is_some() {
+        return Box::pin(super::council::advance(tx, coordinator, run)).await;
+    }
     let phases = node_phases(tx, coordinator, run).await?;
     match run
         .plan
@@ -149,7 +152,7 @@ pub(super) async fn advance(
     }
 }
 
-async fn stop_nodes(
+pub(super) async fn stop_nodes(
     tx: &mut Transaction<'_, Postgres>,
     coordinator: &RuntimeJob,
     run: &Run,
@@ -174,7 +177,7 @@ async fn stop_nodes(
     Ok(())
 }
 
-async fn finish(
+pub(super) async fn finish(
     tx: &mut Transaction<'_, Postgres>,
     coordinator: &RuntimeJob,
     run: &Run,
@@ -241,6 +244,11 @@ pub(in crate::runtime) async fn result(
         return Ok(None);
     }
     let run = read(tx, &coordinator.principal.owner(), &coordinator.id).await?;
+    if run.plan.council.is_some() {
+        return super::council::summary(tx, coordinator, &run, phase)
+            .await
+            .map(Some);
+    }
     let phases = node_phases(tx, coordinator, &run).await?;
     if phase == "completed" && phases.iter().any(|state| *state != NodePhase::Completed) {
         return Err(invalid(

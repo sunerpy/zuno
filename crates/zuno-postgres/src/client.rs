@@ -26,7 +26,8 @@ impl PostgresBackend {
             identity::{NodeRunId, WorkflowRunId},
         };
         let mut tx = scoped_transaction(&self.pool, principal).await?;
-        let row = query("SELECT run_id,plan->'template'->>'name' AS name,plan->'template'->'nodes' AS nodes,state
+        let row = query("SELECT run_id,plan->'template'->>'name' AS name,plan->'template'->'nodes' AS nodes,state,
+            (plan->'council' IS NOT NULL) AS is_council
             FROM zuno_enterprise_preview.runtime_workflow WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3")
             .bind(principal.tenant_id().as_str()).bind(principal.principal_id().as_str()).bind(id.as_str())
             .fetch_one(&mut *tx).await.map_err(database_error)?;
@@ -110,8 +111,31 @@ impl PostgresBackend {
                 waits,
             });
         }
+        let council = query_scalar::<_,serde_json::Value>("SELECT jsonb_build_object(
+            'preset',w.plan->'council'->'preset'->>'name','quorum',w.plan->'council'->'preset'->'quorum',
+            'phase',CASE WHEN w.state IN('completed','failed','cancelled','uncertain') THEN w.state ELSE c.state END,
+            'seatDeadline',c.seat_deadline_at::text,'deadline',c.deadline_at::text,
+            'synthesisDeadline',c.synthesis_deadline_at::text,'seats',
+            (SELECT jsonb_agg(jsonb_build_object('id',s.seat_id,'jobId',n.child_job_id,'state',s.status,'attempts',s.attempts) ORDER BY n.position)
+             FROM zuno_enterprise_preview.runtime_council_seat s JOIN zuno_enterprise_preview.runtime_workflow_node n
+             ON n.tenant_id=s.tenant_id AND n.principal_id=s.principal_id AND n.node_run_id=s.node_run_id
+             WHERE s.tenant_id=c.tenant_id AND s.principal_id=c.principal_id AND s.run_id=c.run_id))
+            FROM zuno_enterprise_preview.runtime_council c JOIN zuno_enterprise_preview.runtime_workflow w
+              ON w.tenant_id=c.tenant_id AND w.principal_id=c.principal_id AND w.run_id=c.run_id
+            WHERE c.tenant_id=$1 AND c.principal_id=$2 AND c.run_id=$3")
+            .bind(principal.tenant_id().as_str()).bind(principal.principal_id().as_str()).bind(run_id.as_str())
+            .fetch_optional(&mut *tx).await.map_err(database_error)?
+            .map(serde_json::from_value).transpose().map_err(ApplicationError::storage)?;
         let view = WorkflowRunView {
             id: run_id,
+            kind: if row
+                .try_get::<bool, _>("is_council")
+                .map_err(database_error)?
+            {
+                zuno_application::workflow::WorkflowKind::Council
+            } else {
+                zuno_application::workflow::WorkflowKind::Workflow
+            },
             job_id: id.clone(),
             name: row.try_get("name").map_err(database_error)?,
             state: serde_json::from_value(serde_json::Value::String(
@@ -119,6 +143,7 @@ impl PostgresBackend {
             ))
             .map_err(ApplicationError::storage)?,
             nodes,
+            council,
         };
         tx.commit().await.map_err(database_error)?;
         Ok(view)

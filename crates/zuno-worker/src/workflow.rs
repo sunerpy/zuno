@@ -84,6 +84,100 @@ impl WorkerClient {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum GroupKind {
+    Workflow,
+    Council,
+}
+
+impl WorkerClient {
+    async fn prepare_group_command(
+        &self,
+        execution: &WorkerExecution,
+        job: zuno_types::identity::JobId,
+        kind: GroupKind,
+    ) -> Result<WorkflowDispatch, TurnStateError> {
+        match kind {
+            GroupKind::Workflow => {
+                self.workflow_command(execution, WorkflowCommand::Prepare { job_id: job })
+                    .await
+            }
+            GroupKind::Council => {
+                self.council_command(
+                    execution,
+                    zuno_application::council::CouncilCommand::Prepare { job_id: job },
+                )
+                .await
+            }
+        }
+    }
+
+    /// Workflow and Council share workspace preparation and immutable reply
+    /// validation. All execution still belongs to the native child Job runtime.
+    pub(crate) async fn prepare_group(
+        &self,
+        execution: &WorkerExecution,
+        gateway: &crate::gateway::GatewayClient,
+        first: WorkflowDispatch,
+        nodes: &[String],
+        kind: GroupKind,
+        cancellation: &CancellationToken,
+    ) -> Result<WorkflowDispatch, TurnStateError> {
+        self.workflow_workspace(execution, gateway, &first.group)
+            .await?;
+        let validate = |reply: &WorkflowDispatch| {
+            if reply.run_id != first.run_id
+                || reply.group.job_id != first.group.job_id
+                || reply.group.session_id != first.group.session_id
+                || reply.group.wait != first.group.wait
+                || reply.group.delivery != first.group.delivery
+                || reply.nodes.len() != nodes.len()
+                || reply
+                    .nodes
+                    .iter()
+                    .zip(nodes)
+                    .any(|(actual, expected)| &actual.node_id != expected)
+            {
+                Err(TurnStateError::InvalidData)
+            } else {
+                Ok(())
+            }
+        };
+        let mut prepared = self
+            .prepare_group_command(execution, first.group.job_id.clone(), kind)
+            .await?;
+        validate(&prepared)?;
+        for node in &prepared.nodes {
+            if cancellation.is_cancelled() {
+                return Err(TurnStateError::LeaseLost);
+            }
+            self.workflow_workspace(execution, gateway, &node.child)
+                .await?;
+        }
+        if !prepared.prepared {
+            let confirmed = self
+                .prepare_group_command(execution, first.group.job_id.clone(), kind)
+                .await?;
+            validate(&confirmed)?;
+            if confirmed.nodes.iter().zip(&prepared.nodes).any(|(a, b)| {
+                a.child.job_id != b.child.job_id || a.child.session_id != b.child.session_id
+            }) {
+                return Err(TurnStateError::InvalidData);
+            }
+            prepared = confirmed;
+        }
+        if !prepared.prepared
+            || prepared
+                .nodes
+                .iter()
+                .any(|node| node.child.workspace == ChildWorkspaceState::Pending)
+        {
+            return Err(TurnStateError::InvalidData);
+        }
+        Ok(prepared)
+    }
+}
+
 fn host_error(error: TurnStateError) -> ToolError {
     match error {
         TurnStateError::Forbidden => ToolError::Denied {
@@ -166,74 +260,22 @@ impl WorkflowHost for RemoteWorkflowHost {
             .await
             .map_err(host_error)?;
         self.validate(&first, delivery)?;
-        self.client
-            .workflow_workspace(&self.execution, &self.gateway, &first.group)
-            .await
-            .map_err(host_error)?;
-        let mut prepared = self
+        let prepared = self
             .client
-            .workflow_command(
+            .prepare_group(
                 &self.execution,
-                WorkflowCommand::Prepare {
-                    job_id: first.group.job_id.clone(),
-                },
+                &self.gateway,
+                first,
+                &request
+                    .nodes
+                    .iter()
+                    .map(|node| node.id.clone())
+                    .collect::<Vec<_>>(),
+                GroupKind::Workflow,
+                &cancellation,
             )
             .await
             .map_err(host_error)?;
-        self.validate(&prepared, delivery)?;
-        if prepared.run_id != first.run_id
-            || prepared.group.job_id != first.group.job_id
-            || prepared.nodes.len() != request.nodes.len()
-            || prepared
-                .nodes
-                .iter()
-                .zip(&request.nodes)
-                .any(|(actual, expected)| actual.node_id != expected.id)
-        {
-            return Err(host_error(TurnStateError::InvalidData));
-        }
-        for node in &prepared.nodes {
-            if cancellation.is_cancelled() {
-                return Err(host_error(TurnStateError::LeaseLost));
-            }
-            self.client
-                .workflow_workspace(&self.execution, &self.gateway, &node.child)
-                .await
-                .map_err(host_error)?;
-        }
-        if !prepared.prepared {
-            let confirmed = self
-                .client
-                .workflow_command(
-                    &self.execution,
-                    WorkflowCommand::Prepare {
-                        job_id: first.group.job_id.clone(),
-                    },
-                )
-                .await
-                .map_err(host_error)?;
-            self.validate(&confirmed, delivery)?;
-            if confirmed.run_id != prepared.run_id
-                || confirmed.group.job_id != prepared.group.job_id
-                || confirmed.nodes.len() != prepared.nodes.len()
-                || confirmed.nodes.iter().zip(&prepared.nodes).any(|(a, b)| {
-                    a.node_id != b.node_id
-                        || a.child.job_id != b.child.job_id
-                        || a.child.session_id != b.child.session_id
-                })
-            {
-                return Err(host_error(TurnStateError::InvalidData));
-            }
-            prepared = confirmed;
-        }
-        if !prepared.prepared
-            || prepared
-                .nodes
-                .iter()
-                .any(|node| node.child.workspace == ChildWorkspaceState::Pending)
-        {
-            return Err(host_error(TurnStateError::InvalidData));
-        }
         if delivery == ChildDelivery::Foreground {
             Ok(OrchestrationDispatch::Pending(prepared.group.wait))
         } else {

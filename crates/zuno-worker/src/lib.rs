@@ -1,6 +1,7 @@
 //! Worker-side transport. No PostgreSQL dependency or database credentials.
 
 pub mod child;
+pub mod council;
 pub mod gateway;
 pub mod live;
 pub mod memory;
@@ -35,6 +36,7 @@ pub const LIVE_PATH: &str = "internal/worker/v1/live";
 pub const MEMORY_PATH: &str = "internal/worker/v1/memory";
 pub const CHILD_PATH: &str = "internal/worker/v1/children";
 pub const WORKFLOW_PATH: &str = "internal/worker/v1/workflows";
+pub const COUNCIL_PATH: &str = "internal/worker/v1/councils";
 pub const FINISH_PATH: &str = "internal/worker/v1/finish";
 pub const GRANT_HEADER: &str = "x-zuno-job-grant";
 pub const GATEWAY_TICKET_PATH: &str = "internal/worker/v1/gateway-ticket";

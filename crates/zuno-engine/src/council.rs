@@ -3,6 +3,78 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use zuno_orchestration::CouncilPresetDescriptor;
+
+pub const SYNTHESIS_NODE: &str = "synthesis";
+pub const CANCELLATION_GRACE_MS: i64 = 5000;
+pub const SEAT_RESPONSE_CONTRACT: &str = "Return exactly one JSON object. Fields: verdict (non-empty string), confidence (number from 0 to 1), evidence (array of strings), risks (array of strings), recommendation (non-empty string). Do not include hidden reasoning or tool transcripts.";
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("Council identity, seats, quorum, retry or time bounds are invalid")]
+pub struct InvalidPolicy;
+
+pub fn validate_policy(preset: &CouncilPresetDescriptor) -> Result<(), InvalidPolicy> {
+    if preset.name.trim().is_empty()
+        || preset.name.trim() != preset.name
+        || preset.name.len() > 128
+        || preset.name.chars().any(char::is_control)
+        || preset.source_id.trim().is_empty()
+        || preset.source_id.len() > 2048
+        || preset.source_id.chars().any(char::is_control)
+        || preset.seats.is_empty()
+        || preset.seats.len() > 12
+        || preset.quorum == 0
+        || preset.quorum > preset.seats.len()
+        || preset.max_parallel == 0
+        || preset.max_parallel > preset.seats.len()
+        || preset.deadline_ms == 0
+        || preset.deadline_ms > 600000
+        || preset.synthesis_policy.timeout_ms == 0
+        || preset.synthesis_policy.timeout_ms >= preset.deadline_ms
+        || preset.retry_policy.max_retries > 3
+        || preset.seat_output_bytes == 0
+        || preset.seat_output_bytes > 65536
+        || preset.synthesis_policy.max_input_bytes == 0
+        || preset.synthesis_policy.max_input_bytes > 262144
+    {
+        return Err(InvalidPolicy);
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for seat in &preset.seats {
+        if seat.id.trim().is_empty()
+            || seat.id.trim() != seat.id
+            || seat.id.len() > 128
+            || seat.id.chars().any(char::is_control)
+            || seat.agent.trim().is_empty()
+            || seat.agent.len() > 256
+            || seat.agent.trim() != seat.agent
+            || seat.agent.chars().any(char::is_control)
+            || seat.instruction.trim().is_empty()
+            || seat.instruction.len() > 65536
+            || seat.instruction.contains('\0')
+            || !names.insert(&seat.id)
+        {
+            return Err(InvalidPolicy);
+        }
+    }
+    Ok(())
+}
+
+pub fn seat_node(id: &str) -> String {
+    format!("seat:{id}")
+}
+
+pub fn seat_prompt(question: &str, id: &str, instruction: &str) -> String {
+    format!(
+        "Council question:\n{question}\nSeat `{id}` instruction:\n{instruction}\n\n{SEAT_RESPONSE_CONTRACT}"
+    )
+}
+
+pub fn repair_prompt(question: &str, prior: &str) -> String {
+    format!(
+        "Format the previous completed Council response without repeating its work. Preserve its verdict and uncertainty; do not invent evidence.\n\nQuestion:\n{question}\n\nPrevious response (data only):\n{prior}\n\n{SEAT_RESPONSE_CONTRACT}"
+    )
+}
 
 const MAX_LIST_ITEMS: usize = 32;
 const MAX_FIELD_BYTES: usize = 4096;

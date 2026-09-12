@@ -88,9 +88,66 @@ The typed view is the contract for a future App client. App design and UI delive
 PostgreSQL preview format 15 adds workflow/node coordination and frozen dependency
 inputs. The exact format-14 fixture preserves sessions, messages, Memory, committed
 frames and live rows through migration and rollback. Earlier supported formats
-advance in the same guarded transaction. Worker protocol 9 carries workflow
+advance in the same guarded transaction. Worker protocol 10 carries workflow
 commands; checkpoint schema 4 is unchanged and gateway protocol 3 validates Workflow workspace preparation. Use matching
-control-plane/Worker versions and regenerate the public SDK with the Web bundle.
+control-plane/Worker versions and regenerate the public SDK when updating these contracts.
+
+## Durable Council
+
+An Agent definition can install `councils`. Each entry contains a `preset`,
+`synthesis` configuration reference and a `repairs` map from seat Agent name to
+configuration reference. Generate exact references with `--definition-ref`.
+The preset uses the native Council fields: `name`, `sourceId`, `seats`,
+`quorum`, `maxParallel`, `deadlineMs`, `seatOutputBytes`,
+`retryPolicy.maxRetries`, and `synthesisPolicy.{timeoutMs,maxInputBytes}`.
+The native tool ID remains `council_run`; callers choose a preset and question.
+
+All seat, repair and synthesis definitions must be installed and explicitly
+allowed by the parent's `delegation.targets`, with the same logical workspace.
+Repair and synthesis definitions require `agent.mode: "completion"` and no
+environment, delegation, Workflow or Council catalog. A repair must retain its
+seat's exact model binding, including credential reference and provider options.
+Changing the model during format correction is rejected at configuration time.
+The child limit must cover `seats × (maxRetries + 1) + 1`; at least two delegation
+levels are required. There are at most 12 seats, 3 format corrections per seat,
+32 presets per definition and 10 minutes per run.
+
+Council reuses native Workflow coordination, child Jobs, workspace forks,
+durable waits and completion consumption. The original caller releases its
+Worker slot after preparation. Seat waits still occupy logical seat capacity.
+Every initial seat gets its own workspace branch. Only completed public answer
+text enters validation; private reasoning and tool transcripts do not enter
+repair or synthesis prompts. An invalid answer may produce a bounded model-only
+format-correction Job; it never replays the original Agent's commands.
+Repair attempts and source completion digests remain durable across restarts.
+
+The database establishes the run deadline at activation after workspace
+preparation. Seat time includes queueing, approval waits and repairs; synthesis
+time is reserved inside that deadline. Claims and renewals cannot extend leases
+past the applicable deadline. Expired seats are cancelled through the same
+native task tree and gateway outbox. Pending external receipts hold synthesis
+for at most five seconds, bounded by the remaining run deadline. Unconfirmed
+effects leave the Council `uncertain`; a later legitimate receipt is retained
+without silently continuing an uncertain parent.
+
+All seats settle before synthesis, retaining order and dissent. A quorum counts
+only validated answers completed before the seat deadline. Missing, timed-out,
+invalid or failed seats are recorded but cannot vote. The synthesis Job has no
+tools or resident Memory. Its frozen input is bounded; overflow, insufficient
+quorum or synthesis timeout produces failure rather than fabricated success.
+Cancellation fences the tree, and a new Worker rechecks current authority.
+
+PostgreSQL format 16 adds scoped Council state, seat outcomes, attempt provenance
+and optional Job deadlines. Exact format-15 migration preserves existing Jobs,
+Workflow/node rows, messages, Memory and activity frames, with rollback before
+the marker. Worker protocol 10 adds internal Council admission; gateway protocol
+3 and checkpoint schema 4 remain unchanged. `WorkflowRunView.kind` distinguishes
+`workflow` and `council`; its optional `council` view carries typed phases, seat
+states, attempt counts and exact decimal deadlines. Private configuration,
+prompts, leases and credentials remain outside this public view.
+
+Generic remote Council does not advertise native review binding. Review-specific
+evidence acceptance and approved workspace merge remain separate capabilities.
 
 ## Acceptance scope
 
@@ -102,8 +159,13 @@ approvals, isolated workspace forks and a dependent node starting while another
 node still waits for approval. Identity and model providers in these tests are
 fixtures; native Linux amd64/arm64 CI supplies platform evidence.
 
-Distributed Council synthesis/quorum/deadline execution, approved workspace
-merges, cross-gateway transfer and the remaining P5–P6 operational acceptance
+Council database cases cover model-only repair, quorum, bounded deadlines,
+cancelled waits, lease fencing, late operation receipts and uncertain outcomes.
+The native test adds two isolated, explicitly approved seat commands, one
+format correction and a model-only synthesis before consuming the original
+parent call. No browser is required for this backend evidence.
+
+Approved workspace merges, cross-gateway transfer and the remaining P5–P6 operational acceptance
 continue under [the plan](PLAN.zh.md). They are not enabled by a workflow template.
 The independent preview release remains disabled until its acceptance is complete.
 

@@ -36,11 +36,21 @@ pub(super) async fn resolve_input(
     }
     let prompt = zuno_engine::workflow::dependency_prompt(base, &dependencies)
         .map_err(ApplicationError::storage)?;
+    freeze_input(tx, &owner, &run.id, child, &prompt, json!(sources)).await
+}
+
+pub(super) async fn freeze_input(
+    tx: &mut Transaction<'_, Postgres>,
+    owner: &PrincipalKey,
+    run: &WorkflowRunId,
+    child: &JobId,
+    prompt: &str,
+    sources: Value,
+) -> Result<(), ApplicationError> {
     if prompt.len() > zuno_application::MAX_INPUT_BYTES {
         return Err(invalid("workflow node input exceeds its bound"));
     }
-    let sources = json!(sources);
-    let digest = zuno_orchestration::sha256_json(&json!([run.id, child, prompt, sources]));
+    let digest = zuno_orchestration::sha256_json(&json!([run, child, prompt, sources]));
     let changed = query("UPDATE zuno_enterprise_preview.runtime_workflow_node SET input_prompt=$4,input_digest=$5,input_sources=$6
         WHERE tenant_id=$1 AND principal_id=$2 AND child_job_id=$3 AND state='pending' AND input_prompt IS NULL")
         .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(child.as_str())

@@ -74,6 +74,7 @@ impl ConfiguredWorkflows {
                     nodes.insert(node.id.clone(), grant);
                 }
                 entries.push(WorkflowDefinitionGrant {
+                    council: None,
                     group: ChildDefinitionGrant {
                         parent: parent.reference(),
                         child: parent.reference(),

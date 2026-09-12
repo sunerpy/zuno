@@ -46,7 +46,7 @@ test("creation and cancellation responses retain workspace and turn identity", a
 });
 
 test("workflow views preserve typed node dependencies and refuse a different run owner", async () => {
-  const value = { id: "run", jobId: "job", state: "active", name: "inspection", nodes: [
+  const value = { id: "run", kind: "workflow", jobId: "job", state: "active", name: "inspection", nodes: [
     { id: "node", nodeId: "review", jobId: "node-job", state: "waiting", dependsOn: ["scan"],
       waits: [{ invocationId: "call", target: { kind: "approval", approval_id: "approval" } }] },
   ] };
@@ -54,5 +54,18 @@ test("workflow views preserve typed node dependencies and refuse a different run
   assert.deepEqual((await client.workflow("job")).nodes[0].dependsOn, ["scan"]);
   await assert.rejects(client.workflow("other-job"), /identity mismatch/);
   value.nodes[0].lease = "private-worker-state";
+  await assert.rejects(client.workflow("job"), /Invalid enterprise application/);
+});
+
+test("Council phases, timeout outcomes and exact deadlines remain typed and private", async () => {
+  const value = { id: "run", kind: "council", jobId: "job", state: "active", name: "council:inspect", nodes: [],
+    council: { preset: "inspect", quorum: 1, phase: "stopping", seatDeadline: "9007199254740993", deadline: "9007199254741993", synthesisDeadline: null,
+      seats: [{ id: "seat", jobId: "seat-job", state: "timed_out", attempts: 2 }] } };
+  const client = new EnterpriseClient({ baseUrl: "https://enterprise.example/app/api/v1/", fetch: async () => response(value) });
+  assert.equal((await client.workflow("job")).council.seatDeadline, "9007199254740993");
+  value.council.seats[0].state = "invented-state";
+  await assert.rejects(client.workflow("job"), /Invalid enterprise application/);
+  value.council.seats[0].state = "timed_out";
+  value.council.lease = "private-worker-state";
   await assert.rejects(client.workflow("job"), /Invalid enterprise application/);
 });

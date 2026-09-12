@@ -234,6 +234,111 @@
         "pendingOperations"
       ]
     },
+    "CouncilPhase": {
+      "type": "string",
+      "enum": [
+        "seats",
+        "stopping",
+        "synthesis",
+        "completed",
+        "failed",
+        "cancelled",
+        "uncertain"
+      ]
+    },
+    "CouncilSeatState": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "running",
+        "waiting",
+        "retrying",
+        "completed",
+        "invalid",
+        "failed",
+        "timed_out",
+        "cancelled",
+        "uncertain"
+      ]
+    },
+    "CouncilSeatView": {
+      "type": "object",
+      "properties": {
+        "attempts": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "id": {
+          "type": "string"
+        },
+        "jobId": {
+          "$ref": "#/$defs/JobId"
+        },
+        "state": {
+          "$ref": "#/$defs/CouncilSeatState"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "jobId",
+        "state",
+        "attempts"
+      ]
+    },
+    "CouncilView": {
+      "type": "object",
+      "properties": {
+        "deadline": {
+          "$ref": "#/$defs/Counter"
+        },
+        "phase": {
+          "$ref": "#/$defs/CouncilPhase"
+        },
+        "preset": {
+          "type": "string"
+        },
+        "quorum": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "seatDeadline": {
+          "$ref": "#/$defs/Counter"
+        },
+        "seats": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CouncilSeatView"
+          }
+        },
+        "synthesisDeadline": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Counter"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "preset",
+        "quorum",
+        "phase",
+        "seatDeadline",
+        "deadline",
+        "seats"
+      ]
+    },
+    "Counter": {
+      "type": "string",
+      "maxLength": 20,
+      "pattern": "^(0|[1-9][0-9]{0,19})$"
+    },
     "CreateSession": {
       "type": "object",
       "properties": {
@@ -682,6 +787,13 @@
         }
       ]
     },
+    "WorkflowKind": {
+      "type": "string",
+      "enum": [
+        "workflow",
+        "council"
+      ]
+    },
     "WorkflowRunId": {
       "type": "string",
       "maxLength": 128,
@@ -691,11 +803,24 @@
     "WorkflowRunView": {
       "type": "object",
       "properties": {
+        "council": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CouncilView"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "id": {
           "$ref": "#/$defs/WorkflowRunId"
         },
         "jobId": {
           "$ref": "#/$defs/JobId"
+        },
+        "kind": {
+          "$ref": "#/$defs/WorkflowKind"
         },
         "name": {
           "type": "string"
@@ -713,6 +838,7 @@
       "additionalProperties": false,
       "required": [
         "id",
+        "kind",
         "jobId",
         "state",
         "name",

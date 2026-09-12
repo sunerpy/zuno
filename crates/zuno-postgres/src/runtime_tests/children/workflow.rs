@@ -23,6 +23,7 @@ fn definition(parent: &RuntimeJob) -> WorkflowDefinitionGrant {
     })
     .collect::<Vec<_>>();
     WorkflowDefinitionGrant {
+        council: None,
         group: grant(parent),
         nodes: nodes
             .iter()

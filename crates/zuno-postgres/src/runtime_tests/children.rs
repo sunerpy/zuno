@@ -1,4 +1,5 @@
 use super::*;
+mod council;
 mod workflow;
 mod workspace;
 use zuno_application::child::{
@@ -67,6 +68,7 @@ pub(super) async fn execution_binding(backend: &PostgresBackend, admin: &PgPool)
     completed_parent_cancellation_prevents_a_late_next_step(backend, admin, false).await;
     completed_parent_cancellation_prevents_a_late_next_step(backend, admin, true).await;
     workflow::exercise(backend, admin).await;
+    Box::pin(council::exercise(backend, admin)).await;
 }
 
 async fn cancellation_fences_the_tree_and_preserves_other_sessions(
@@ -477,6 +479,15 @@ async fn complete_child(
     admin: &PgPool,
     child: &zuno_application::runtime::ClaimedJob,
 ) {
+    complete_child_with_text(backend, admin, child, "Authoritative child answer").await;
+}
+
+async fn complete_child_with_text(
+    backend: &PostgresBackend,
+    admin: &PgPool,
+    child: &zuno_application::runtime::ClaimedJob,
+    text: &str,
+) {
     let owner = &child.lease.owner;
     let session = &child.job.session_id;
     consume(admin, &child.job).await;
@@ -487,7 +498,7 @@ async fn complete_child(
         .bind(json!({"id":id,"sessionID":session,"role":"assistant","time":{"created":100,"completed":101}}))
         .execute(admin).await.unwrap();
     for (suffix, kind, text) in [
-        ("text", "text", "Authoritative child answer"),
+        ("text", "text", text),
         (
             "thought",
             "reasoning",

@@ -7,5 +7,6 @@ export type {
   WorkspaceView, SessionPage, SessionSummary, SessionCursor, CreateSession, JobView,
   SubmitTurn, InputVersionView, ApprovalView, ApprovalDecision, CancelJob, CancellationReceipt,
   ApprovalState, JobPhase,
-  WorkflowRunView, NodeRunView, WorkflowState,
+  WorkflowRunView, NodeRunView, WorkflowState, WorkflowKind,
+  CouncilView, CouncilPhase, CouncilSeatView, CouncilSeatState,
 } from "./generated/application.js";

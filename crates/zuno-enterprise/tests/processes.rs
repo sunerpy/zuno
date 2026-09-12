@@ -36,6 +36,8 @@ use zuno_types::identity::*;
 mod browser;
 #[path = "processes/completion.rs"]
 mod completion;
+#[path = "processes/council.rs"]
+mod council;
 #[path = "processes/workflow.rs"]
 mod workflow;
 
@@ -162,6 +164,9 @@ async fn model(
     }
     if user.contains("WORKFLOW-PROBE") {
         return workflow::model(&body);
+    }
+    if user.contains("COUNCIL-PROBE") {
+        return council::model(&body);
     }
     if user.contains("BROWSER-PROBE") {
         let completed = has_tool("browser-command");
@@ -510,12 +515,22 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
         .unwrap();
     assert!(reference.status.success());
     let child_reference = serde_json::from_slice(&reference.stdout).unwrap();
+    let mut council_completion = completion::definition(&definition);
+    council_completion.id = ConfigurationId::new("council-completion").unwrap();
+    council_completion.agent.name = "council-completion".to_owned();
+    council_completion.workspace = definition.workspace.clone();
+    let council_completion_file = root.join("council-completion.json");
+    write(
+        &council_completion_file,
+        serde_json::to_vec(&council_completion).unwrap(),
+    );
     definition.delegation = Some(DelegationDefinition {
-        targets: vec![child_reference],
+        targets: vec![child_reference, council_completion.reference()],
         maximum_depth: 2,
-        maximum_children: 4,
+        maximum_children: 8,
     });
     definition.workflows = vec![workflow::template()];
+    definition.councils = vec![council::configuration(&council_completion)];
     let definition_file = root.join("definition.json");
     write(&definition_file, serde_json::to_vec(&definition).unwrap());
     let job_key = root.join("job.key");
@@ -567,6 +582,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
                     definition_file.clone(),
                     child_definition_file.clone(),
                     completion_file.clone(),
+                    council_completion_file.clone(),
                 ],
                 active_definitions: vec![
                     DefinitionKey {
@@ -617,6 +633,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
                         definition_file.clone(),
                         child_definition_file.clone(),
                         completion_file.clone(),
+                        council_completion_file.clone(),
                     ],
                     credentials: [(
                         "model".to_owned(),
@@ -920,6 +937,23 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
     assert_eq!(
         after_completion, final_operations,
         "completion mode cannot introduce an external operation"
+    );
+    council::verify(&http, &control_url, &tokens["alice"], &tokens["bob"]).await;
+    assert_eq!(
+        issuer.model_requests.load(Ordering::SeqCst),
+        if browser_enabled { 34 } else { 32 }
+    );
+    let council_operations: i64 = query_scalar(
+        "SELECT count(*) FROM zuno_enterprise_preview.gateway_operation WHERE tenant_id=$1",
+    )
+    .bind(tenant.as_str())
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        council_operations,
+        final_operations + 2,
+        "seat commands execute once across model-only format correction"
     );
     for child in &mut children {
         assert!(

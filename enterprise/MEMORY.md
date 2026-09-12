@@ -110,7 +110,7 @@ Candidate details and mutation replies return an opaque `stateDigest`. Manual
 rejects a candidate changed after review; clients must present the changed
 proposal instead of silently fetching a new digest and retrying approval.
 
-Internal Worker protocol 9 adds `POST /internal/worker/v1/memory`, authenticated
+Internal Worker protocol 10 adds `POST /internal/worker/v1/memory`, authenticated
 by both workload identity and the current Job grant. It exposes only scoped
 reads and foreground proposals. `memory_read` and `memory_update` retain the
 personal tools' argument schema. An unconfirmed update becomes an uncertain

@@ -71,7 +71,7 @@ pub(super) async fn upgrade(fixture: &Fixture, admin: &PgPool) {
             .fetch_one(&admin)
             .await
             .unwrap(),
-        15
+        migration::FORMAT
     );
     PostgresBackend::connect(database(fixture.options(false, 2)))
         .await

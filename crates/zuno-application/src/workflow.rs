@@ -26,14 +26,24 @@ pub enum WorkflowState {
     Uncertain,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowKind {
+    Workflow,
+    Council,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkflowRunView {
     pub id: WorkflowRunId,
+    pub kind: WorkflowKind,
     pub job_id: JobId,
     pub state: WorkflowState,
     pub name: String,
     pub nodes: Vec<NodeRunView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub council: Option<crate::council::CouncilView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -75,6 +85,7 @@ pub struct WorkflowDefinitionGrant {
     pub group: ChildDefinitionGrant,
     pub template: WorkflowTemplateDescriptor,
     pub nodes: BTreeMap<String, ChildDefinitionGrant>,
+    pub council: Option<crate::council::CouncilRules>,
 }
 
 pub trait WorkflowDefinitionCatalog: Send + Sync {

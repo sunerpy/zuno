@@ -250,6 +250,9 @@ async fn expire_inflight(
         "SELECT s.session_id FROM zuno_enterprise_preview.runtime_session s
          JOIN zuno_enterprise_preview.session session ON session.tenant_id=s.tenant_id AND session.principal_id=s.principal_id AND session.id=s.session_id
          WHERE s.tenant_id=$1 AND s.principal_id=$2 AND s.lease_job_id IS NOT NULL AND s.lease_expires<=$3
+           AND NOT EXISTS(SELECT 1 FROM zuno_enterprise_preview.runtime_job r
+             WHERE r.tenant_id=s.tenant_id AND r.principal_id=s.principal_id AND r.job_id=s.lease_job_id
+               AND r.deadline_at IS NOT NULL AND r.deadline_at<=$3)
          ORDER BY s.session_id LIMIT 64 FOR UPDATE OF session SKIP LOCKED",
     ).bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(time)
         .fetch_all(&mut **tx).await.map_err(database_error)?;
