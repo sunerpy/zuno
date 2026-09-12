@@ -19,6 +19,7 @@
 //! | `format-11.sql`| 11     | v0.10.28| automatic memory provenance and maintenance        |
 //! | `format-12.sql`| 12     | v0.10.29| question metadata and command receipt ledger       |
 //! | `format-13.sql`| 13     | v0.10.30| input receipts, context usage, goal-resume purpose |
+//! | `format-14.sql`| 14     | v0.10.31| host work cycles and Goal turn ledgers             |
 //!
 //! Every fixture is upgraded through the real entry point, [`migration::apply`],
 //! and the result is compared *structurally* with a database `apply` creates from
@@ -129,7 +130,7 @@ const FORMAT_TEN: Fixture = Fixture {
 };
 
 /// Every table `sqlite_master` lists once the current schema is in place.
-const CURRENT_TABLE_COUNT: usize = 61;
+const CURRENT_TABLE_COUNT: usize = 65;
 
 const FORMAT_ELEVEN: Fixture = Fixture {
     format: 11,
@@ -173,6 +174,22 @@ const FORMAT_THIRTEEN: Fixture = Fixture {
     table_count: 59,
 };
 
+const FORMAT_FOURTEEN: Fixture = Fixture {
+    format: 14,
+    release: "v0.10.31",
+    sql: concat!(
+        include_str!("fixtures/format-7.sql"),
+        include_str!("fixtures/format-8.sql"),
+        include_str!("fixtures/format-9.sql"),
+        include_str!("fixtures/format-10.sql"),
+        include_str!("fixtures/format-11.sql"),
+        include_str!("fixtures/format-12.sql"),
+        include_str!("fixtures/format-13.sql"),
+        include_str!("fixtures/format-14.sql")
+    ),
+    table_count: 61,
+};
+
 const SUPPORTED_FIXTURES: &[&Fixture] = &[
     &FORMAT_FIVE,
     &FORMAT_SIX,
@@ -183,6 +200,7 @@ const SUPPORTED_FIXTURES: &[&Fixture] = &[
     &FORMAT_ELEVEN,
     &FORMAT_TWELVE,
     &FORMAT_THIRTEEN,
+    &FORMAT_FOURTEEN,
 ];
 
 /// One additive upgrade step, described by what it must leave behind and by the
@@ -320,8 +338,8 @@ const MEMORY_RUNTIME: Step = Step {
 /// transaction. SQLite rejects the duplicate while *preparing* the statement, so
 /// it never reaches `SQLITE_TRACE_STMT`; the statement immediately before it is
 /// therefore the last one the trace can show before the rollback.
-const TRAP_INDEX: &str = "session_context_usage_updated_idx";
-const STATEMENT_BEFORE_TRAP: &str = "CREATE TABLE `session_context_usage`";
+const TRAP_INDEX: &str = "session_work_cycle_updated_idx";
+const STATEMENT_BEFORE_TRAP: &str = "CREATE TABLE session_work_cycle";
 
 const AUTOMATIC_MEMORY: Step = Step {
     name: "automatic memory (format 11 -> 12)",
@@ -356,6 +374,19 @@ const RUNTIME_CONSISTENCY: Step = Step {
     columns: &[],
 };
 
+const WORK_CYCLES: Step = Step {
+    name: "host work cycles and Goal turn ledgers (format 14 -> 15)",
+    first_statement: "CREATE TABLE goal_turn_observation",
+    tables: &[
+        "session_work_cycle",
+        "goal_turn_observation",
+        "goal_turn_audit",
+        "goal_cycle_failure",
+    ],
+    indexes: &["session_work_cycle_updated_idx"],
+    columns: &[],
+};
+
 fn steps_after(format: u32) -> &'static [&'static Step] {
     match format {
         5 => &[
@@ -368,6 +399,7 @@ fn steps_after(format: u32) -> &'static [&'static Step] {
             &AUTOMATIC_MEMORY,
             &QUESTIONS,
             &RUNTIME_CONSISTENCY,
+            &WORK_CYCLES,
         ],
         6 => &[
             &PLAN_STACK,
@@ -378,6 +410,7 @@ fn steps_after(format: u32) -> &'static [&'static Step] {
             &AUTOMATIC_MEMORY,
             &QUESTIONS,
             &RUNTIME_CONSISTENCY,
+            &WORK_CYCLES,
         ],
         7 => &[
             &VERIFICATION,
@@ -387,6 +420,7 @@ fn steps_after(format: u32) -> &'static [&'static Step] {
             &AUTOMATIC_MEMORY,
             &QUESTIONS,
             &RUNTIME_CONSISTENCY,
+            &WORK_CYCLES,
         ],
         8 => &[
             &MEMORY_POLICY,
@@ -395,6 +429,7 @@ fn steps_after(format: u32) -> &'static [&'static Step] {
             &AUTOMATIC_MEMORY,
             &QUESTIONS,
             &RUNTIME_CONSISTENCY,
+            &WORK_CYCLES,
         ],
         9 => &[
             &EXECUTION,
@@ -402,30 +437,339 @@ fn steps_after(format: u32) -> &'static [&'static Step] {
             &AUTOMATIC_MEMORY,
             &QUESTIONS,
             &RUNTIME_CONSISTENCY,
+            &WORK_CYCLES,
         ],
         10 => &[
             &MEMORY_RUNTIME,
             &AUTOMATIC_MEMORY,
             &QUESTIONS,
             &RUNTIME_CONSISTENCY,
+            &WORK_CYCLES,
         ],
-        11 => &[&AUTOMATIC_MEMORY, &QUESTIONS, &RUNTIME_CONSISTENCY],
-        12 => &[&QUESTIONS, &RUNTIME_CONSISTENCY],
-        13 => &[&RUNTIME_CONSISTENCY],
+        11 => &[
+            &AUTOMATIC_MEMORY,
+            &QUESTIONS,
+            &RUNTIME_CONSISTENCY,
+            &WORK_CYCLES,
+        ],
+        12 => &[&QUESTIONS, &RUNTIME_CONSISTENCY, &WORK_CYCLES],
+        13 => &[&RUNTIME_CONSISTENCY, &WORK_CYCLES],
+        14 => &[&WORK_CYCLES],
         other => panic!("no fixture describes format {other}"),
     }
 }
 
 #[test]
-fn published_fixture_matrix_covers_every_supported_format_five_through_thirteen() {
-    assert_eq!(migration::CURRENT_FORMAT, 14);
+fn published_fixture_matrix_covers_every_supported_format_five_through_fourteen() {
+    assert_eq!(migration::CURRENT_FORMAT, 15);
     assert_eq!(
         SUPPORTED_FIXTURES
             .iter()
             .map(|fixture| fixture.format)
             .collect::<Vec<_>>(),
-        (5..=13).collect::<Vec<_>>()
+        (5..=14).collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn format_fourteen_fixture_freezes_exact_v0_10_31_ddl_and_rows() {
+    let dir = temp_dir();
+    let connection = load_fixture(&dir.path().join("zuno.db"), &FORMAT_FOURTEEN);
+    assert_eq!(structure(&connection).format, Some(14));
+    assert_eq!(structure(&connection).tables.len(), 61);
+    let fixture = include_str!("fixtures/format-14.sql");
+    for (section, digest) in [
+        (
+            "goal_resume.sql",
+            "3f43111a4cb52969baf99f0aeb6ceb985bc7a8b1c5ac02c2a8db5b78f0b82884",
+        ),
+        (
+            "input_receipt.sql",
+            "089e57540e97618fdd337b76e7e7ea8bfde2a0ec71f9b0a6fe1d750ece5043e6",
+        ),
+        (
+            "context_usage.sql",
+            "f639d6495ddd5e84afef1ebf679820ab4e6ecbbde8a8f84e6e152de7de34bc96",
+        ),
+    ] {
+        let (_, published) = fixture
+            .split_once(&format!("-- BEGIN v0.10.31 {section}\n"))
+            .expect("frozen DDL start");
+        let (published, _) = published
+            .split_once(&format!("-- END v0.10.31 {section}\n"))
+            .expect("frozen DDL end");
+        assert_eq!(
+            hex::encode(Sha256::digest(published.as_bytes())),
+            digest,
+            "{section}"
+        );
+    }
+    assert_literal_values(&connection, REPRESENTATIVE_VALUES, "published format 14");
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT state FROM session_input_receipt WHERE input_id='inp_format14_completed'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("published receipt"),
+        "completed"
+    );
+}
+
+#[test]
+fn format_fourteen_upgrade_preserves_every_row_and_reaches_current_structure() {
+    assert_upgrade_preserves_rows_and_reaches_the_current_structure(&FORMAT_FOURTEEN);
+}
+
+#[test]
+fn format_fourteen_failed_upgrade_preserves_the_original_database() {
+    assert_failed_upgrade_leaves_the_database_untouched(&FORMAT_FOURTEEN);
+}
+
+#[test]
+fn format_fourteen_preserves_optional_paused_goal_and_never_infers_cycle_history() {
+    let dir = temp_dir();
+    let mut connection = load_fixture(&dir.path().join("zuno.db"), &FORMAT_FOURTEEN);
+    connection
+        .execute_batch(include_str!("fixtures/legacy-goal-format14.sql"))
+        .expect("optional published GoalStore tables and paused Goal");
+    connection
+        .execute_batch(
+            "CREATE TRIGGER forbid_goal_recovery BEFORE UPDATE ON goal BEGIN
+           SELECT RAISE(ABORT,'migration must not resume or rewrite a Goal');
+         END;",
+        )
+        .expect("forbid all Goal updates during migration");
+    let before = snapshot_rows(&connection, &structure(&connection));
+    let legacy_tables = [
+        "goal",
+        "goal_pause",
+        "goal_pending_failure_signal",
+        "goal_failure_streak",
+    ];
+    let legacy_ddl = object_ddl(&connection, &legacy_tables);
+    let (outcome, traced) = apply_traced(&mut connection);
+    outcome.expect("migrate without touching optional legacy Goal tables");
+    assert_rows_preserved(&connection, &before, &["zuno_schema"]);
+    assert_eq!(object_ddl(&connection, &legacy_tables), legacy_ddl);
+    assert!(
+        !traced
+            .iter()
+            .any(|sql| sql.to_ascii_uppercase().contains("ALTER TABLE GOAL")),
+        "optional old Goal schemas must not be altered: {traced:#?}"
+    );
+    for table in WORK_CYCLES.tables {
+        let count: i64 = connection
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("new ledger");
+        assert_eq!(
+            count, 0,
+            "{table} cannot inherit unbound old signals or work"
+        );
+    }
+    assert_eq!(
+        connection
+            .query_row("SELECT status FROM goal", [], |row| row.get::<_, String>(0))
+            .expect("Goal status"),
+        "paused"
+    );
+    let current_rows = snapshot_rows(&connection, &structure(&connection));
+    migration::apply(&mut connection).expect("validation-only reopen");
+    assert_rows_preserved(&connection, &current_rows, &[]);
+}
+
+#[test]
+fn corrupt_published_fourteen_is_rejected_without_creating_any_turn_ledger() {
+    for corruption in [
+        "DROP TABLE session_input_receipt",
+        "DROP TABLE session_context_usage",
+        "DROP INDEX session_input_receipt_turn_state_idx",
+        "DROP INDEX session_context_usage_updated_idx",
+        "DROP INDEX session_context_usage_updated_idx;
+         CREATE INDEX session_context_usage_updated_idx ON session_context_usage(source,session_id)",
+        "ALTER TABLE session_input_receipt DROP COLUMN error",
+        "ALTER TABLE session_execution_state DROP COLUMN scheduling",
+    ] {
+        let dir = temp_dir();
+        let mut connection = load_fixture(&dir.path().join("zuno.db"), &FORMAT_FOURTEEN);
+        connection.execute_batch(corruption).expect("damage the published format-14 structure");
+        let error = assert_rejected_without_mutation(&mut connection);
+        assert!(matches!(error, DbError::Schema { .. }), "{corruption}: {error:?}");
+        let inventory = structure(&connection);
+        assert_eq!(inventory.format, Some(14), "keep the real old marker");
+        for table in WORK_CYCLES.tables {
+            assert!(!inventory.tables.contains_key(*table), "{corruption}: {table}");
+        }
+    }
+}
+
+#[test]
+fn fresh_fifteen_creates_every_ledger_before_its_only_marker() {
+    let mut connection = open::open(&DbLocation::Memory).expect("empty database");
+    let (outcome, traced) = apply_traced(&mut connection);
+    outcome.expect("create format 15");
+    let final_index = traced
+        .iter()
+        .position(|sql| sql.contains("CREATE INDEX session_work_cycle_updated_idx"))
+        .expect("last new index");
+    let markers: Vec<_> = traced
+        .iter()
+        .enumerate()
+        .filter(|(_, sql)| sql.trim_start().starts_with("INSERT INTO zuno_schema"))
+        .collect();
+    assert_eq!(markers.len(), 1);
+    let marker = markers[0].0;
+    assert!(final_index < marker);
+    assert!(
+        traced[marker + 1..]
+            .iter()
+            .all(|sql| sql.trim_start().starts_with("--") || sql.trim() == "COMMIT"),
+        "{traced:#?}"
+    );
+    assert_eq!(last_top_level_statement(&traced), Some("COMMIT"));
+    assert_eq!(structure(&connection).format, Some(15));
+}
+
+#[test]
+fn current_turn_ledgers_fail_closed_for_missing_objects_and_weakened_contracts() {
+    for table in WORK_CYCLES.tables {
+        let mut connection = fresh_current();
+        connection
+            .execute_batch(&format!("DROP TABLE {table}"))
+            .expect("remove a current ledger");
+        assert!(matches!(
+            assert_rejected_without_mutation(&mut connection),
+            DbError::Schema { .. }
+        ));
+    }
+    let reference = fresh_current();
+    let cycle_ddl = object_ddl(
+        &reference,
+        &["session_work_cycle", "session_work_cycle_updated_idx"],
+    );
+    for (original, changed) in [
+        ("session_id TEXT NOT NULL", "session_id TEXT"),
+        (
+            "cycle_id TEXT NOT NULL",
+            "cycle_id TEXT DEFAULT '' NOT NULL",
+        ),
+        ("anchor_message_id TEXT", "\"anchor_message id\" TEXT"),
+        (
+            "data TEXT NOT NULL CHECK(json_valid(data))",
+            "data TEXT NOT NULL CHECK(1)",
+        ),
+        (
+            "time_updated INTEGER NOT NULL",
+            "time_updated TEXT NOT NULL",
+        ),
+        (
+            "PRIMARY KEY(session_id,cycle_id)",
+            "PRIMARY KEY(cycle_id,session_id)",
+        ),
+        (
+            "FOREIGN KEY(session_id) REFERENCES session(id) ON DELETE CASCADE",
+            "FOREIGN KEY(session_id) REFERENCES session(id)",
+        ),
+        (
+            "ON session_work_cycle(session_id,time_updated,cycle_id)",
+            "ON session_work_cycle(time_updated,session_id,cycle_id)",
+        ),
+        (
+            "CREATE INDEX session_work_cycle_updated_idx",
+            "CREATE UNIQUE INDEX session_work_cycle_updated_idx",
+        ),
+        (
+            "ON session_work_cycle(session_id,time_updated,cycle_id)",
+            "ON session_work_cycle(session_id,time_updated,cycle_id) WHERE anchor_message_id IS NOT NULL",
+        ),
+    ] {
+        assert!(
+            cycle_ddl.contains(original),
+            "non-vacuous corruption of {original}"
+        );
+        let mut connection = fresh_current();
+        connection
+            .execute_batch("DROP TABLE session_work_cycle")
+            .expect("replace cycle schema");
+        connection
+            .execute_batch(&cycle_ddl.replace(original, changed))
+            .expect("corrupt cycle DDL");
+        let error = assert_rejected_without_mutation(&mut connection);
+        assert!(
+            matches!(error, DbError::Schema { .. }),
+            "{original}: {error:?}"
+        );
+    }
+    let mut connection = fresh_current();
+    connection
+        .execute_batch("DROP INDEX session_work_cycle_updated_idx")
+        .expect("remove lookup");
+    assert!(matches!(
+        assert_rejected_without_mutation(&mut connection),
+        DbError::Schema { .. }
+    ));
+    for (table, original, changed) in [
+        (
+            "goal_turn_observation",
+            "signal TEXT NOT NULL CHECK(length(trim(signal)) > 0)",
+            "signal TEXT NOT NULL",
+        ),
+        (
+            "goal_turn_observation",
+            "turn_id TEXT NOT NULL",
+            "\"turn id\" TEXT NOT NULL",
+        ),
+        (
+            "goal_turn_audit",
+            "audit TEXT NOT NULL CHECK(json_valid(audit))",
+            "audit TEXT NOT NULL CHECK(1)",
+        ),
+        (
+            "goal_turn_audit",
+            "PRIMARY KEY(session_id, goal_id, cycle_id, turn_id)",
+            "PRIMARY KEY(session_id, goal_id, cycle_id)",
+        ),
+        (
+            "goal_cycle_failure",
+            "consecutive_turns BETWEEN 0 AND 3",
+            "consecutive_turns BETWEEN 0 AND 4",
+        ),
+        (
+            "goal_cycle_failure",
+            "active_turn_id TEXT NOT NULL",
+            "active_turn_id TEXT",
+        ),
+        (
+            "goal_cycle_failure",
+            "signal IS NULL AND consecutive_turns = 0",
+            "signal IS NULL",
+        ),
+    ] {
+        let ddl = object_ddl(&reference, &[table]);
+        assert!(ddl.contains(original));
+        let mut connection = fresh_current();
+        connection
+            .execute_batch(&format!("DROP TABLE {table}"))
+            .expect("replace Goal ledger");
+        // Renaming an identifier also changes the primary-key reference so SQLite
+        // accepts the corrupt DDL and validation, rather than construction, rejects it.
+        let corrupt = if changed.contains("\"turn id\"") {
+            ddl.replace("turn_id", "\"turn id\"")
+        } else {
+            ddl.replace(original, changed)
+        };
+        connection
+            .execute_batch(&corrupt)
+            .expect("corrupt Goal DDL");
+        let error = assert_rejected_without_mutation(&mut connection);
+        assert!(
+            matches!(error, DbError::Schema { .. }),
+            "{table}/{original}: {error:?}"
+        );
+    }
 }
 
 #[test]
@@ -1003,6 +1347,11 @@ fn load_fixture(path: &Path, fixture: &Fixture) -> Connection {
             .execute_batch(include_str!("fixtures/legacy-human-requests.sql"))
             .expect("seed released human-request payloads and responses");
     }
+    if fixture.format >= 14 {
+        // The frozen format-14 fixture already carries authoritative receipts.
+        // It must not be mistaken for a pre-receipt inbox needing a backfill.
+        return connection;
+    }
     // Seed data through columns shared by the published layouts. The frozen DDL
     // files stay untouched; the matrix must exercise a nonempty receipt backfill.
     for (ordinal, state) in [
@@ -1340,7 +1689,17 @@ fn assert_upgrade_preserves_rows_and_reaches_the_current_structure(fixture: &Fix
     let after = structure(&connection);
     assert_eq!(after.format, Some(migration::CURRENT_FORMAT), "{context}");
     assert_question_migration(&connection, fixture.format);
-    assert_legacy_input_receipts(&connection);
+    if fixture.format < 14 {
+        assert_legacy_input_receipts(&connection);
+    }
+    for table in WORK_CYCLES.tables {
+        let count: i64 = connection
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("new cycle ledger");
+        assert_eq!(count, 0, "migration must not infer rows for {table}");
+    }
 
     // (a) Every pre-existing value reads back byte-for-byte, and the literals the
     // fixture file spells out are still there. Only the marker row may differ.
@@ -1742,7 +2101,7 @@ fn a_failed_format_nine_upgrade_leaves_the_v0_10_21_database_untouched() {
 }
 
 // ---------------------------------------------------------------------------
-// Format 14: marker ordering, rollback after backfill, races, and closed shapes.
+// Current format: marker ordering, rollback after backfill, races, and closed shapes.
 // ---------------------------------------------------------------------------
 
 fn apply_traced(connection: &mut Connection) -> (Result<(), DbError>, Vec<String>) {
@@ -1818,14 +2177,16 @@ fn assert_rejected_without_mutation(connection: &mut Connection) -> DbError {
 // to question_interaction inside this trigger would invalidate the trigger while
 // format 14 rebuilds that table, aborting ALTER TABLE before the marker is reached.
 const MARKER_SCHEMA_GUARD: &str = "
-    SELECT CASE WHEN NEW.format <> 14
+    SELECT CASE WHEN NEW.format <> 15
       THEN RAISE(ABORT,'marker attempted an intermediate format') END;
     SELECT CASE WHEN
       (SELECT count(*) FROM sqlite_schema WHERE name IN (
         'question_interaction','question_action_receipt',
         'question_interaction_purpose_authorization_idx',
         'session_input_receipt','session_input_receipt_turn_state_idx',
-        'session_context_usage','session_context_usage_updated_idx')) <> 7
+        'session_context_usage','session_context_usage_updated_idx',
+        'session_work_cycle','session_work_cycle_updated_idx',
+        'goal_turn_observation','goal_turn_audit','goal_cycle_failure')) <> 12
       THEN RAISE(ABORT,'marker attempted before complete runtime schema') END;
     SELECT CASE WHEN NOT EXISTS(
       SELECT 1 FROM pragma_table_info('session_execution_state') WHERE name='scheduling')
@@ -1836,7 +2197,7 @@ const MARKER_SCHEMA_GUARD: &str = "
       THEN RAISE(ABORT,'marker attempted before goal-resume purpose') END;
 ";
 
-fn assert_receipt_backfill_precedes_the_only_marker(traced: &[String]) -> usize {
+fn assert_upgrade_precedes_the_only_marker(traced: &[String], old_format: u32) -> usize {
     let writes: Vec<_> = traced
         .iter()
         .enumerate()
@@ -1844,18 +2205,33 @@ fn assert_receipt_backfill_precedes_the_only_marker(traced: &[String]) -> usize 
         .collect();
     assert_eq!(writes.len(), 1, "one final marker write: {traced:#?}");
     let marker = writes[0].0;
-    let backfill = traced
-        .iter()
-        .position(|sql| sql.contains("INSERT INTO session_input_receipt"))
-        .expect("SQLite executed the input-receipt backfill");
     let begin = traced
         .iter()
         .position(|sql| sql.trim() == "BEGIN IMMEDIATE")
-        .expect("the backfill belongs to the migration transaction");
+        .expect("the upgrade owns an immediate transaction");
+    let cycle = traced
+        .iter()
+        .position(|sql| sql.contains("CREATE INDEX session_work_cycle_updated_idx"))
+        .expect("SQLite executed the final new index");
     assert!(
-        begin < backfill && backfill < marker,
-        "backfill must precede the marker inside the transaction: {traced:#?}"
+        begin < cycle && cycle < marker,
+        "new ledgers precede marker: {traced:#?}"
     );
+    let backfill = traced
+        .iter()
+        .position(|sql| sql.contains("INSERT INTO session_input_receipt"));
+    if old_format < 14 {
+        let backfill = backfill.expect("SQLite executed the legacy input-receipt backfill");
+        assert!(
+            begin < backfill && backfill < cycle,
+            "backfill order: {traced:#?}"
+        );
+    } else {
+        assert_eq!(
+            backfill, None,
+            "published receipts must not be backfilled again"
+        );
+    }
     marker
 }
 
@@ -1874,9 +2250,11 @@ fn every_supported_upgrade_finishes_runtime_schema_and_backfills_before_the_mark
         let (outcome, traced) = apply_traced(&mut connection);
         outcome.unwrap_or_else(|error| panic!("format {} marker order: {error:#}", fixture.format));
         assert_question_migration(&connection, fixture.format);
-        assert_legacy_input_receipts(&connection);
+        if fixture.format < 14 {
+            assert_legacy_input_receipts(&connection);
+        }
         assert_rows_preserved(&connection, &before, &["zuno_schema"]);
-        let marker = assert_receipt_backfill_precedes_the_only_marker(&traced);
+        let marker = assert_upgrade_precedes_the_only_marker(&traced, fixture.format);
         assert!(
             traced[marker + 1..]
                 .iter()
@@ -1884,7 +2262,7 @@ fn every_supported_upgrade_finishes_runtime_schema_and_backfills_before_the_mark
             "only trigger checks and COMMIT may follow the marker: {traced:#?}"
         );
         assert_eq!(last_top_level_statement(&traced), Some("COMMIT"));
-        assert_eq!(structure(&connection).format, Some(14));
+        assert_eq!(structure(&connection).format, Some(15));
     }
 }
 
@@ -1915,7 +2293,7 @@ fn a_marker_failure_rolls_back_runtime_receipts_question_rebuild_and_every_earli
             "format {} did not reach the intended failure: {error:#}",
             fixture.format
         );
-        assert_receipt_backfill_precedes_the_only_marker(&traced);
+        assert_upgrade_precedes_the_only_marker(&traced, fixture.format);
         assert_eq!(last_top_level_statement(&traced), Some("ROLLBACK"));
         assert!(!traced.iter().any(|sql| sql.trim() == "COMMIT"));
         assert_eq!(structure(&connection), before);
@@ -1926,7 +2304,9 @@ fn a_marker_failure_rolls_back_runtime_receipts_question_rebuild_and_every_earli
             .expect("remove the deliberate marker failure");
         migration::apply(&mut connection).expect("retry the same database");
         assert_question_migration(&connection, fixture.format);
-        assert_legacy_input_receipts(&connection);
+        if fixture.format < 14 {
+            assert_legacy_input_receipts(&connection);
+        }
         assert_rows_preserved(&connection, &rows_before, &["zuno_schema"]);
     }
 }
@@ -1967,7 +2347,9 @@ fn concurrent_fresh_and_every_supported_published_format_open_one_complete_schem
             assert_rows_preserved(&connection, &before, &["zuno_schema"]);
             if let Some(fixture) = fixture {
                 assert_question_migration(&connection, fixture.format);
-                assert_legacy_input_receipts(&connection);
+                if fixture.format < 14 {
+                    assert_legacy_input_receipts(&connection);
+                }
             }
             let rows = snapshot_rows(&connection, &expected);
             migration::apply(&mut connection).expect("validate again without another backfill");
@@ -1979,7 +2361,15 @@ fn concurrent_fresh_and_every_supported_published_format_open_one_complete_schem
 #[test]
 fn unsupported_unmarked_and_marker_only_published_databases_are_unchanged() {
     for fixture in SUPPORTED_FIXTURES {
-        for replacement in [None, Some(4), Some(13), Some(14), Some(15), Some(u32::MAX)] {
+        for replacement in [
+            None,
+            Some(4),
+            Some(13),
+            Some(14),
+            Some(15),
+            Some(16),
+            Some(u32::MAX),
+        ] {
             if replacement == Some(fixture.format) {
                 continue;
             }
@@ -1995,12 +2385,12 @@ fn unsupported_unmarked_and_marker_only_published_databases_are_unchanged() {
                     .expect("remove the marker");
             }
             let error = assert_rejected_without_mutation(&mut connection);
-            if matches!(replacement, Some(13 | 14)) {
+            if matches!(replacement, Some(13..=15)) {
                 assert!(matches!(error, DbError::Schema { .. }), "{error:?}");
             } else {
                 assert!(
                     matches!(error, DbError::SchemaMismatch {
-                expected: 14, observed
+                expected: 15, observed
             } if observed == replacement),
                     "{error:?}"
                 );
@@ -2014,7 +2404,7 @@ fn unsupported_unmarked_and_marker_only_published_databases_are_unchanged() {
         assert!(matches!(
             assert_rejected_without_mutation(&mut connection),
             DbError::SchemaMismatch {
-                expected: 14,
+                expected: 15,
                 observed: None
             }
         ));
@@ -2236,7 +2626,7 @@ fn current_runtime_tables_columns_and_required_indexes_must_exist() {
     ] {
         let dir = temp_dir();
         let mut connection = load_fixture(&dir.path().join("zuno.db"), &FORMAT_THIRTEEN);
-        migration::apply(&mut connection).expect("prepare a populated format 14");
+        migration::apply(&mut connection).expect("prepare a populated current format");
         connection
             .execute_batch(corruption)
             .expect("remove a required runtime object");
@@ -2245,7 +2635,7 @@ fn current_runtime_tables_columns_and_required_indexes_must_exist() {
             matches!(error, DbError::Schema { .. }),
             "{corruption}: {error:?}"
         );
-        assert_eq!(structure(&connection).format, Some(14));
+        assert_eq!(structure(&connection).format, Some(15));
     }
 }
 

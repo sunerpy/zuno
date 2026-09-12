@@ -58,9 +58,10 @@
 
 use crate::error::GoalError;
 use crate::status::GoalStatus;
-use crate::store::{Goal, GoalStore};
+use crate::store::{Goal, GoalRequestOwner, GoalStore};
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use zuno_engine::budget::{
     BudgetDecision, BudgetPolicyError, TurnAllowance, TurnBudgetPolicy, TurnUsageSnapshot,
 };
@@ -98,6 +99,10 @@ pub const SOFT_RESERVE_DIVISOR: i64 = 10;
 pub struct GoalBudgetPolicy {
     store: Arc<GoalStore>,
     allowance: TurnAllowance,
+    /// Per-request admission data for this host execution/policy lifetime.
+    /// Keep settled pins too: a duplicate response after Goal replacement must
+    /// not acquire the replacement's identity. Clones share the same pins.
+    request_owners: Arc<Mutex<HashMap<(String, String), GoalRequestOwner>>>,
 }
 
 impl GoalBudgetPolicy {
@@ -112,6 +117,7 @@ impl GoalBudgetPolicy {
         Self {
             store,
             allowance: TurnAllowance::UNLIMITED,
+            request_owners: Arc::default(),
         }
     }
 
@@ -134,6 +140,39 @@ impl GoalBudgetPolicy {
     /// that cannot be trusted.
     fn request_id(snapshot: &TurnUsageSnapshot<'_>) -> String {
         format!("{}:{}", snapshot.turn_id, snapshot.step)
+    }
+
+    fn capture_owner(
+        &self,
+        snapshot: &TurnUsageSnapshot<'_>,
+        goal: Option<&Goal>,
+    ) -> Result<GoalRequestOwner, BudgetPolicyError> {
+        let mut owners = self.request_owners.lock().map_err(|_| {
+            BudgetPolicyError::Permanent(
+                "provider-request Goal ownership lock is poisoned".to_owned(),
+            )
+        })?;
+        let owner = goal.map_or(GoalRequestOwner::Independent, |goal| {
+            GoalRequestOwner::Goal(goal.goal_id.clone())
+        });
+        Ok(owners
+            .entry((snapshot.session_id.to_owned(), Self::request_id(snapshot)))
+            .or_insert(owner)
+            .clone())
+    }
+
+    fn captured_owner(
+        &self,
+        snapshot: &TurnUsageSnapshot<'_>,
+    ) -> Result<Option<GoalRequestOwner>, BudgetPolicyError> {
+        let owners = self.request_owners.lock().map_err(|_| {
+            BudgetPolicyError::Permanent(
+                "provider-request Goal ownership lock is poisoned".to_owned(),
+            )
+        })?;
+        Ok(owners
+            .get(&(snapshot.session_id.to_owned(), Self::request_id(snapshot)))
+            .cloned())
     }
 
     /// Let a reached turn ceiling override anything but a stop.
@@ -180,14 +219,21 @@ impl TurnBudgetPolicy for GoalBudgetPolicy {
     ) -> Result<BudgetDecision, BudgetPolicyError> {
         let store = Arc::clone(&self.store);
         let session_id = snapshot.session_id.to_owned();
-        let goal = match tokio::task::spawn_blocking(move || store.goal(&session_id))
-            .await
-            .map_err(|error| {
-                BudgetPolicyError::Permanent(format!("reading the goal did not finish: {error}"))
-            })? {
+        let turn_id = snapshot.turn_id.to_owned();
+        let captured = self.captured_owner(snapshot)?;
+        let goal = match tokio::task::spawn_blocking(move || {
+            store.budget_goal_for_turn(&session_id, &turn_id, captured.as_ref())
+        })
+        .await
+        .map_err(|error| {
+            BudgetPolicyError::Permanent(format!("reading the goal did not finish: {error}"))
+        })? {
             Ok(goal) => goal,
             Err(error) => return store_failure("reading the goal", error),
         };
+        let owner = self.capture_owner(snapshot, goal.as_ref())?;
+        let goal =
+            goal.filter(|goal| matches!(&owner, GoalRequestOwner::Goal(id) if id == &goal.goal_id));
         let decision = decide(
             goal.as_ref(),
             Consulted::BeforeRequest,
@@ -210,14 +256,23 @@ impl TurnBudgetPolicy for GoalBudgetPolicy {
     ) -> Result<BudgetDecision, BudgetPolicyError> {
         let store = Arc::clone(&self.store);
         let session_id = snapshot.session_id.to_owned();
+        let turn_id = snapshot.turn_id.to_owned();
         let request_id = Self::request_id(snapshot);
+        let owner = self.captured_owner(snapshot)?;
         let tokens = i64::try_from(snapshot.last_request.total()).unwrap_or(i64::MAX);
         let measured = snapshot.last_request.accounted;
         let at_ms = crate::store::now_ms().map_err(|error| {
             BudgetPolicyError::Permanent(format!("goal budget clock is unusable: {error}"))
         })?;
         let recorded = match tokio::task::spawn_blocking(move || {
-            store.record_request_usage(&session_id, &request_id, tokens, at_ms)
+            store.record_budget_response(
+                &session_id,
+                &turn_id,
+                &request_id,
+                tokens,
+                at_ms,
+                owner.as_ref(),
+            )
         })
         .await
         .map_err(|error| {
@@ -456,6 +511,10 @@ fn decide(
     }
     BudgetDecision::Continue
 }
+
+#[cfg(test)]
+#[path = "budget_scope_tests.rs"]
+mod scope_tests;
 
 #[cfg(test)]
 mod tests {

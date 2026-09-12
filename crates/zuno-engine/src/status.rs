@@ -2,8 +2,9 @@
 //!
 //! The registry is intentionally not persisted. A guard is the exclusive lease for
 //! one session's live turn, and dropping it returns the session to idle. Control
-//! handles retain only a session id plus the registry, so an old UI handle always
-//! looks up the signal and soft-interrupt queue belonging to the current turn.
+//! handles retain a session id plus the registry. User cancellation must carry a
+//! turn/input identity or a captured cancellation target through to the signal
+//! boundary; a session-scoped handle alone cannot identify a delayed user's intent.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -75,7 +76,7 @@ pub struct SessionNotActive {
     session_id: String,
 }
 
-/// Why an explicit steer could not target the caller's expected engine turn.
+/// Why an exact operation could not target the caller's expected engine turn.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ExpectedTurnError {
     #[error("session `{session_id}` has no active turn")]
@@ -134,7 +135,9 @@ pub struct DiagnosticNoticeKey {
 #[derive(Debug)]
 struct ActiveSession {
     token: u64,
+    identity_epoch: u64,
     turn_id: Option<String>,
+    input_id: Option<String>,
     accepting_input: bool,
     interrupt: HardInterruptSignal,
     soft_interrupt: InterruptSignal,
@@ -178,7 +181,9 @@ impl SessionRunRegistry {
             session_id.clone(),
             ActiveSession {
                 token,
+                identity_epoch: 0,
                 turn_id: None,
+                input_id: None,
                 accepting_input: true,
                 interrupt: interrupt.clone(),
                 soft_interrupt: soft_interrupt.clone(),
@@ -217,8 +222,9 @@ impl SessionRunRegistry {
 
     /// Creates a reusable session control handle.
     ///
-    /// The handle deliberately captures no interrupt signal. Every operation resolves
-    /// the current active entry by session id, which keeps stale handles effective.
+    /// The handle deliberately captures no interrupt signal. User cancellation
+    /// passes an expected turn/input id or a captured target to its exact method;
+    /// retaining this session handle does not retain a turn's identity.
     #[must_use]
     pub fn control(&self, session_id: impl Into<String>) -> SessionControl {
         SessionControl {
@@ -245,6 +251,103 @@ impl SessionRunRegistry {
             .active
             .get(session_id)
             .and_then(|active| active.turn_id.clone())
+    }
+
+    /// Input selected by this lease's native driver, including pre-model setup.
+    #[must_use]
+    pub fn active_input_id(&self, session_id: &str) -> Option<String> {
+        self.lock_state()
+            .active
+            .get(session_id)
+            .and_then(|active| active.input_id.clone())
+    }
+
+    /// Capture the current lease and identity generation once, before awaiting.
+    ///
+    /// An unidentified lease can be captured, but any subsequent turn or input
+    /// binding invalidates that snapshot. No snapshot is manufactured while idle.
+    #[must_use]
+    pub fn cancel_target(&self, session_id: &str) -> Option<SessionCancelTarget> {
+        let state = self.lock_state();
+        let active = state.active.get(session_id)?;
+        Some(SessionCancelTarget {
+            registry: Arc::clone(&self.inner),
+            session_id: session_id.to_owned(),
+            token: active.token,
+            identity_epoch: active.identity_epoch,
+        })
+    }
+
+    /// Check a captured identity and fire its signal under the same registry lock.
+    /// A stale target is a no-op and never arms a future turn.
+    pub fn abort_target(
+        &self,
+        target: &SessionCancelTarget,
+        request: HardInterruptRequest,
+    ) -> bool {
+        if !Arc::ptr_eq(&self.inner, &target.registry) {
+            return false;
+        }
+        let state = self.lock_state();
+        state.active.get(&target.session_id).is_some_and(|active| {
+            if active.token != target.token || active.identity_epoch != target.identity_epoch {
+                return false;
+            }
+            let _accepted = active.interrupt.request(request);
+            true
+        })
+    }
+
+    /// Cancel exactly the named live engine turn, including its closing phase.
+    ///
+    /// Identity validation and the interrupt request are one atomic boundary.
+    /// Callers must retain their observed turn id across asynchronous work.
+    pub fn abort_turn(
+        &self,
+        session_id: &str,
+        expected_turn_id: &str,
+        request: HardInterruptRequest,
+    ) -> Result<(), ExpectedTurnError> {
+        let state = self.lock_state();
+        let active =
+            state
+                .active
+                .get(session_id)
+                .ok_or_else(|| ExpectedTurnError::NoActiveTurn {
+                    session_id: session_id.to_owned(),
+                })?;
+        let actual_turn_id = active.turn_id.as_deref().ok_or_else(|| {
+            ExpectedTurnError::ActiveTurnNotIdentified {
+                session_id: session_id.to_owned(),
+            }
+        })?;
+        if actual_turn_id != expected_turn_id {
+            return Err(ExpectedTurnError::Mismatch {
+                session_id: session_id.to_owned(),
+                expected_turn_id: expected_turn_id.to_owned(),
+                actual_turn_id: actual_turn_id.to_owned(),
+            });
+        }
+        let _accepted = active.interrupt.request(request);
+        Ok(())
+    }
+
+    /// Cancel only the input selected by the native driver, never another input
+    /// sharing its session or an already-delivered steer owned by a different turn.
+    pub fn abort_input(
+        &self,
+        session_id: &str,
+        input_id: &str,
+        request: HardInterruptRequest,
+    ) -> bool {
+        let state = self.lock_state();
+        state.active.get(session_id).is_some_and(|active| {
+            if active.input_id.as_deref() != Some(input_id) {
+                return false;
+            }
+            let _accepted = active.interrupt.request(request);
+            true
+        })
     }
 
     /// Returns a stable snapshot of every process-local active session id.
@@ -402,8 +505,33 @@ impl SessionRunRegistry {
             return false;
         }
         active.turn_id = Some(turn_id.to_owned());
+        active.identity_epoch += 1;
         active.accepting_input = true;
         true
+    }
+
+    fn set_input_id(&self, session_id: &str, token: u64, input_id: &str) -> bool {
+        let mut state = self.lock_state();
+        let Some(active) = state.active.get_mut(session_id) else {
+            return false;
+        };
+        if active.token != token {
+            return false;
+        }
+        active.input_id = Some(input_id.to_owned());
+        active.identity_epoch += 1;
+        true
+    }
+
+    fn clear_input_id(&self, session_id: &str, token: u64, input_id: &str) {
+        let mut state = self.lock_state();
+        if let Some(active) = state.active.get_mut(session_id)
+            && active.token == token
+            && active.input_id.as_deref() == Some(input_id)
+        {
+            active.input_id = None;
+            active.identity_epoch += 1;
+        }
     }
 
     fn try_finish_inputs(&self, session_id: &str, token: u64) -> bool {
@@ -428,6 +556,7 @@ impl SessionRunRegistry {
         };
         if active.token == token && active.turn_id.as_deref() == Some(turn_id) {
             active.turn_id = None;
+            active.identity_epoch += 1;
         }
     }
 
@@ -511,6 +640,16 @@ impl Default for SessionRunRegistry {
     }
 }
 
+/// Opaque process-local cancellation identity captured before asynchronous work.
+/// Bound to one registry, session, lease, and turn/input identity generation.
+#[derive(Debug, Clone)]
+pub struct SessionCancelTarget {
+    registry: Arc<RegistryInner>,
+    session_id: String,
+    token: u64,
+    identity_epoch: u64,
+}
+
 /// A session-scoped control object safe to retain across multiple turns.
 #[derive(Debug, Clone)]
 pub struct SessionControl {
@@ -537,6 +676,38 @@ impl SessionControl {
     #[must_use]
     pub fn active_turn_id(&self) -> Option<String> {
         self.registry.active_turn_id(&self.session_id)
+    }
+
+    #[must_use]
+    pub fn active_input_id(&self) -> Option<String> {
+        self.registry.active_input_id(&self.session_id)
+    }
+
+    #[must_use]
+    pub fn cancel_target(&self) -> Option<SessionCancelTarget> {
+        self.registry.cancel_target(&self.session_id)
+    }
+
+    pub fn abort_target(
+        &self,
+        target: &SessionCancelTarget,
+        request: HardInterruptRequest,
+    ) -> bool {
+        target.session_id == self.session_id && self.registry.abort_target(target, request)
+    }
+
+    pub fn abort_turn(
+        &self,
+        expected_turn_id: &str,
+        request: HardInterruptRequest,
+    ) -> Result<(), ExpectedTurnError> {
+        self.registry
+            .abort_turn(&self.session_id, expected_turn_id, request)
+    }
+
+    pub fn abort_input(&self, input_id: &str, request: HardInterruptRequest) -> bool {
+        self.registry
+            .abort_input(&self.session_id, input_id, request)
     }
 
     /// Aborts whichever turn is live now, not the turn that created this handle.
@@ -660,6 +831,20 @@ impl SessionRunGuard {
             })
     }
 
+    /// Bind the input before attempting its durable promotion. If cancellation
+    /// loses the pending-row race, `abort_input` can still stop exactly this input.
+    #[must_use]
+    pub fn mark_input_started(&self, input_id: &str) -> Option<SessionInputIdentityGuard> {
+        self.registry
+            .set_input_id(&self.session_id, self.token, input_id)
+            .then(|| SessionInputIdentityGuard {
+                registry: self.registry.clone(),
+                session_id: self.session_id.clone(),
+                token: self.token,
+                input_id: input_id.to_owned(),
+            })
+    }
+
     /// Atomically close admission only when no successfully accepted input remains.
     #[must_use]
     pub fn try_finish_inputs(&self) -> bool {
@@ -692,6 +877,22 @@ impl Drop for SessionTurnIdentityGuard {
     fn drop(&mut self) {
         self.registry
             .clear_turn_id(&self.session_id, self.token, &self.turn_id);
+    }
+}
+
+/// Clears a driver's input binding before the outer session lease is released.
+#[derive(Debug)]
+pub struct SessionInputIdentityGuard {
+    registry: SessionRunRegistry,
+    session_id: String,
+    token: u64,
+    input_id: String,
+}
+
+impl Drop for SessionInputIdentityGuard {
+    fn drop(&mut self) {
+        self.registry
+            .clear_input_id(&self.session_id, self.token, &self.input_id);
     }
 }
 

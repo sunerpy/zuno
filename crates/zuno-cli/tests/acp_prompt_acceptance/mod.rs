@@ -1,5 +1,6 @@
 use super::*;
 
+mod exact_cancellation;
 mod goal_resume;
 
 /// Every model response remains gated, including a request restarted by steering.

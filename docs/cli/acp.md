@@ -61,16 +61,18 @@ Rejections use `-32002` with `reason` equal to `noActiveTurn`,
 The expected turn is checked before the inbox transaction commits. If that turn
 ends or changes while admission waits for SQLite, the input and its admission
 event roll back together, so a rejected steer cannot reach a later turn.
-`session/cancel` remains the explicit session-wide stop control.
+Stop uses `session/cancel`; follow-up input uses prompt admission or
+`session/steer`, never cancellation followed by resubmission.
 
 A slash command cannot be steered and is refused with
 `reason: "commandRequiresIdleSession"` and nothing durable written; only text
 that resolves to a real command, Skill, or native control counts as a slash
 command, so a prompt that merely starts with `/` is admitted as ordinary content.
 
-Withdrawing a pending prompt with `$/cancel_request` retires the input contributed
-by that request when it has not entered the model. It cannot erase already
-processed input or withdraw the original on behalf of a duplicate retry observer.
+Withdrawing a pending prompt with `$/cancel_request` retires only the input
+contributed by that request. If its selected native input is already running,
+cancellation checks that input's identity at the signal boundary. It cannot erase
+processed history or withdraw the original on behalf of a duplicate retry observer.
 Disconnect is not withdrawal: accepted input and processing receipts remain durable.
 See [Zed ACP integration](/reference/zed-acp) for the full shape.
 
@@ -122,6 +124,46 @@ A smaller request estimate cannot replace a confirmed baseline. Partial usage
 frames merge as snapshots; compaction changes the epoch. `_meta.zuno.contextUsage`
 carries source, request identity, freshness and update time. Cumulative disjoint
 usage is separate from current occupancy; unknown values remain unknown.
+
+## Exact cancellation and legacy clients
+
+Initialize advertises `_meta.zuno.cancellation` with `version: 1`,
+`method: "session/cancel"`, `expectedTurnIdPath: "_meta.zuno.expectedTurnId"`,
+`legacySessionIdOnly: "currentTargetAtDispatch"` and `armsNextTurn: false`.
+Use the turn ID from a live `session/update`'s
+`params.update._meta.zuno.turnId`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "session/cancel",
+  "params": {
+    "sessionId": "ses_example",
+    "_meta": { "zuno": { "expectedTurnId": "turn_example" } }
+  }
+}
+```
+
+The expected ID must be a non-empty string of at most 256 bytes. Zuno validates
+the target under the same native lock that fires cancellation. A delayed T1
+cancel cannot interrupt T2. Inactive named targets, mismatched IDs and malformed
+exact metadata do not fall back to cancelling the current turn. This is a
+notification, so there is no JSON-RPC response; rejected notifications produce
+stderr diagnostics. Observe the original prompt's durable receipt and updates
+for the actual processing outcome.
+
+A legacy notification containing only `sessionId` captures the live target
+once when handled. Idle cancellation is a no-op; it never arms a future turn.
+The protocol provides no evidence of network-stale intent: a session-only T1
+cancel that arrives while T2 is live can cancel T2. Clients requiring an exact
+target must send the extension.
+
+`$/cancel_request` identifies the original client RPC by `requestId`, including
+its string/number type. Reusing a wire ID after its response creates a new
+internal request identity; an idempotent `_meta.zuno.messageId` retry still only
+observes the original durable input. Withdrawal cannot cancel an unrelated
+Agent-to-client RPC. `-32800` reports request withdrawal, not rollback of tool
+effects; use the durable receipt to observe execution.
 
 ## Goal continuation
 

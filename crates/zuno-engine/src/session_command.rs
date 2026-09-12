@@ -7,6 +7,8 @@ pub enum SessionCommand {
     Compact,
     /// Inspect or mutate the durable top-level goal for this session.
     Goal,
+    /// Inspect exact uncertain native file calls without entering the model.
+    InspectOutcome,
     /// Inspect or mutate durable experiences, patterns, feedback, and Skill candidates.
     Learn,
     /// Run the isolated learning extractor for the latest turn or full session.
@@ -25,9 +27,10 @@ pub enum SessionCommand {
 
 impl SessionCommand {
     /// Every native session command clients may advertise.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Compact,
         Self::Goal,
+        Self::InspectOutcome,
         Self::Learn,
         Self::Plan,
         Self::Questions,
@@ -43,6 +46,7 @@ impl SessionCommand {
         match self {
             Self::Compact => "compact",
             Self::Goal => "goal",
+            Self::InspectOutcome => "inspect-outcome",
             Self::Learn => "learn",
             Self::Reflect => "reflect",
             Self::Plan => "plan",
@@ -59,6 +63,9 @@ impl SessionCommand {
         match self {
             Self::Compact => "Summarize older context and keep the recent turn tail",
             Self::Goal => "Set, view, or manage the durable session goal",
+            Self::InspectOutcome => {
+                "Inspect exact uncertain native file outcomes without resuming work"
+            }
             Self::Learn => "View or manage durable user experiences and reviewed Skill candidates",
             Self::Reflect => "Extract learning from the latest turn or the durable session",
             Self::Plan => "Enter read-only Plan mode idempotently",
@@ -74,7 +81,7 @@ impl SessionCommand {
     pub const fn accepts_arguments(self) -> bool {
         matches!(
             self,
-            Self::Goal | Self::Learn | Self::Reflect | Self::StartWork
+            Self::Goal | Self::InspectOutcome | Self::Learn | Self::Reflect | Self::StartWork
         )
     }
 
@@ -83,6 +90,7 @@ impl SessionCommand {
     pub const fn input_hint(self) -> Option<&'static str> {
         match self {
             Self::Goal => Some("objective | action [value]"),
+            Self::InspectOutcome => Some("[part-id ...]"),
             Self::Learn => Some("remember|issue|solved|forget|promote|feedback ..."),
             Self::Reflect => Some("turn | session"),
             Self::StartWork => Some("[--accept-draft-risk <reason>]"),
@@ -128,6 +136,7 @@ mod tests {
             [
                 "compact",
                 "goal",
+                "inspect-outcome",
                 "learn",
                 "plan",
                 "questions",

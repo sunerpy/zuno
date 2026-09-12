@@ -147,11 +147,23 @@ note identity and content and remove that ledger.
 
 ## Interruption
 
-A hard interruption is session-scoped and linearizable across turn handoff. If the
-previous run guard has dropped but an admitted follow-up has not yet acquired its guard,
-the registry arms that next guard instead of discarding the interrupt: the turn starts
-with its interrupt signal set, emits the terminal interruption event, and issues no
-provider request.
+Stopping targets the current input or turn, not future conversation. TUI cancellation
+captures that identity; supporting ACP clients can send `expectedTurnId`. A delayed
+cancellation for T1 cannot cancel T2. Legacy session-only cancellation targets what is
+current when handled; without a turn identifier it cannot recover the sender's intent.
+
+After an ordinary stop, send a new message normally; `/resume` is not required.
+The new request has its own durable work scope. Old Plans remain visible as context,
+but a status question does not adopt them or automatically continue unfinished work.
+Only native Work authorization or a typed Plan/Todo mutation binds that work to a
+request. Old-cycle callbacks can be stored without waking a stopped cycle.
+
+An interrupted Goal remains paused. Independent conversation still works; resuming
+the Goal requires the explicit Resume goal choice or `/goal resume`. Skipping the
+choice is not consent. Approval, Plan, authentication, budget and uncertain-side-effect
+barriers remain separate. `/resume` never certifies that an uncertain operation was
+inspected. Unidentified legacy pauses are retained; only matching typed interruption
+evidence can classify an old pause as an ordinary stopped turn when new input arrives.
 
 After confirmation the interface keeps the stopping state visible and suppresses late
 provider or tool output until a terminal event establishes the boundary. Durable

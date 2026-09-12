@@ -16,19 +16,26 @@ pub const STEER_REJECTED_CODE: i64 = -32002;
 
 /// Transport-owned identity of one accepted client request.
 ///
-/// JSON-RPC ids may be strings or numbers, so the transport canonicalizes every
-/// accepted id into a single comparable key and hands that key to the Agent. An
-/// Agent keys per-request state on this instead of on the request's params: two
-/// requests can carry byte-identical params, so params cannot say which request
-/// owns a turn or which one a `$/cancel_request` withdrew.
+/// JSON-RPC ids may be reused after a response. The transport pairs their
+/// canonical wire key with a fresh invocation identity, so late withdrawal state
+/// and cleanup cannot alias a later request using the same wire id. Durable
+/// message idempotence remains the Agent's separate responsibility.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RequestId(String);
+pub struct RequestId {
+    wire_key: String,
+    invocation: u64,
+}
 
 impl RequestId {
-    /// Canonicalize a JSON-RPC id, rejecting shapes JSON-RPC 2.0 does not allow.
+    /// Allocate a new invocation identity for a valid JSON-RPC wire id.
+    /// Clone this value to retain ownership; parsing the same id creates a new one.
     #[must_use]
     pub fn from_json(value: &Value) -> Option<Self> {
-        id_key(value).map(Self)
+        static NEXT_INVOCATION: AtomicU64 = AtomicU64::new(1);
+        id_key(value).map(|wire_key| Self {
+            wire_key,
+            invocation: NEXT_INVOCATION.fetch_add(1, Ordering::Relaxed),
+        })
     }
 }
 
@@ -190,7 +197,10 @@ const INITIALIZED: u8 = 2;
 type Pending = HashMap<String, oneshot::Sender<Result<Value, RpcError>>>;
 
 struct InFlightRequest {
-    cancel: oneshot::Sender<RequestTermination>,
+    identity: RequestId,
+    // Keep the request id reserved after withdrawal until its worker has dropped
+    // the Agent future. Its cleanup must never remove a newly reused request id.
+    cancel: Option<oneshot::Sender<RequestTermination>>,
     method: String,
     params: Value,
     response_ready: Arc<AtomicBool>,
@@ -215,7 +225,7 @@ impl RequestTermination {
     }
 }
 
-type InFlight = HashMap<RequestId, InFlightRequest>;
+type InFlight = HashMap<String, InFlightRequest>;
 
 #[derive(Default)]
 struct PendingState {
@@ -475,16 +485,6 @@ impl ClientConnection {
         let _ignored = waiter.send(response);
     }
 
-    fn cancel_pending(&self, request_id: &Value) {
-        let Some(request_id) = id_key(request_id) else {
-            return;
-        };
-        let waiter = lock(&self.pending).waiters.remove(&request_id);
-        if let Some(waiter) = waiter {
-            let _ignored = waiter.send(Err(RpcError::cancelled("request cancelled")));
-        }
-    }
-
     fn close_pending(&self, error: RpcError) {
         let waiters = {
             let mut pending = lock(&self.pending);
@@ -620,15 +620,18 @@ where
             let params = frame.get("params").cloned().unwrap_or_else(|| json!({}));
 
             if method == "$/cancel_request" {
-                if let Some(request_id) = params.get("requestId") {
-                    if let Some((withdrawn, request)) = take_in_flight(&in_flight, request_id) {
-                        agent
-                            .request_cancelled(&request.method, &withdrawn, &request.params)
-                            .await;
-                        let _ignored = request.cancel.send(RequestTermination::Withdrawn);
+                if let Some(request_id) = params.get("requestId")
+                    && let Some((withdrawn, request)) = take_in_flight(&in_flight, request_id)
+                {
+                    agent
+                        .request_cancelled(&request.method, &withdrawn, &request.params)
+                        .await;
+                    if let Some(cancel) = request.cancel {
+                        let _ignored = cancel.send(RequestTermination::Withdrawn);
                     }
-                    client.cancel_pending(request_id);
                 }
+                // A peer withdraws only a request it authored. An unknown
+                // inbound id must not cancel an unrelated agent-to-client RPC.
                 continue;
             }
 
@@ -649,7 +652,7 @@ where
             }
 
             if let Some(id) = frame.get("id").cloned() {
-                let Some(request_key) = RequestId::from_json(&id) else {
+                let Some(request_identity) = RequestId::from_json(&id) else {
                     client
                         .response(
                             Value::Null,
@@ -659,6 +662,7 @@ where
                         .map_err(|_| ServeError::WriterClosed)?;
                     continue;
                 };
+                let request_key = request_identity.wire_key.clone();
                 if method == "initialize"
                     && initialized
                         .compare_exchange(
@@ -692,7 +696,8 @@ where
                         active.insert(
                             request_key.clone(),
                             InFlightRequest {
-                                cancel: cancel_tx,
+                                identity: request_identity.clone(),
+                                cancel: Some(cancel_tx),
                                 method: request_method.clone(),
                                 params: params.clone(),
                                 response_ready: Arc::clone(&response_ready),
@@ -720,7 +725,7 @@ where
                 requests.spawn(async move {
                     let request_client = client.request_scoped();
                     let result = tokio::select! {
-                        result = agent.request(&method, &request_key, params, request_client.clone()) => result,
+                        result = agent.request(&method, &request_identity, params, request_client.clone()) => result,
                         termination = cancel_rx => {
                             if let Err(error) = request_client.cancel_scoped_requests().await {
                                 eprintln!("ACP child request cancellation failed: {error}");
@@ -756,6 +761,15 @@ where
                 if method == "initialize" {
                     continue;
                 }
+                if method == "session/cancel" {
+                    // Bind cancellation before admitting a later frame. Running
+                    // this notification in the task set lets a following prompt
+                    // overtake even a cancellation already received on the wire.
+                    if let Err(error) = agent.notification(method, params, client.clone()).await {
+                        eprintln!("ACP notification failed: {error}");
+                    }
+                    continue;
+                }
                 let agent = Arc::clone(&agent);
                 let client = client.clone();
                 let method = method.to_owned();
@@ -788,11 +802,13 @@ where
             .filter_map(|key| active.remove(&key).map(|request| (key, request)))
             .collect::<Vec<_>>()
     };
-    for (withdrawn, request) in cancellations {
+    for (_, request) in cancellations {
         agent
-            .request_disconnected(&request.method, &withdrawn, &request.params)
+            .request_disconnected(&request.method, &request.identity, &request.params)
             .await;
-        let _ignored = request.cancel.send(RequestTermination::Disconnected);
+        if let Some(cancel) = request.cancel {
+            let _ignored = cancel.send(RequestTermination::Disconnected);
+        }
     }
     client.close_pending(RpcError::internal("ACP connection closed"));
     while requests.join_next().await.is_some() {}
@@ -875,9 +891,23 @@ fn take_in_flight(
     in_flight: &Mutex<InFlight>,
     request_id: &Value,
 ) -> Option<(RequestId, InFlightRequest)> {
-    let request_key = RequestId::from_json(request_id)?;
-    let request = lock(in_flight).remove(&request_key)?;
-    Some((request_key, request))
+    let request_key = id_key(request_id)?;
+    let mut active = lock(in_flight);
+    let request = active.get_mut(&request_key)?;
+    if request.response_ready.load(Ordering::Acquire) {
+        return None;
+    }
+    let cancel = request.cancel.take()?;
+    Some((
+        request.identity.clone(),
+        InFlightRequest {
+            identity: request.identity.clone(),
+            cancel: Some(cancel),
+            method: request.method.clone(),
+            params: request.params.clone(),
+            response_ready: Arc::clone(&request.response_ready),
+        },
+    ))
 }
 
 async fn write_frames<W>(
@@ -1495,9 +1525,15 @@ mod tests {
         // it under, not by its params: an Agent that keys per-request state on
         // params cannot tell two identical requests apart.
         let withdrawn = lock(&cancelled).clone();
-        assert_eq!(withdrawn, RequestId::from_json(&json!(2)));
+        assert_eq!(
+            withdrawn.as_ref().map(|id| id.wire_key.as_str()),
+            Some("n:2")
+        );
         assert_eq!(withdrawn, lock(&served).clone());
-        assert_ne!(withdrawn, RequestId::from_json(&json!("2")));
+        assert_ne!(
+            withdrawn.as_ref().map(|id| id.wire_key.as_str()),
+            Some("s:2")
+        );
         assert!(lock(&disconnected).is_none());
         assert!(dropped.load(AtomicOrdering::SeqCst));
 
@@ -1507,6 +1543,143 @@ mod tests {
             .expect("server exits")
             .expect("server task joins")
             .expect("server exits cleanly");
+    }
+
+    #[tokio::test]
+    async fn session_cancel_binds_before_dispatching_the_next_request() {
+        struct OrderedCancelAgent {
+            cancelling: Arc<Notify>,
+            release: Arc<Notify>,
+            bound: Arc<AtomicBool>,
+        }
+        #[async_trait]
+        impl Agent for OrderedCancelAgent {
+            async fn request(
+                &self,
+                method: &str,
+                _request: &RequestId,
+                _params: Value,
+                _client: ClientConnection,
+            ) -> Result<Value, RpcError> {
+                Ok(json!({
+                    "cancelBound": method == "initialize" || self.bound.load(Ordering::Acquire)
+                }))
+            }
+
+            async fn notification(
+                &self,
+                method: &str,
+                _params: Value,
+                _client: ClientConnection,
+            ) -> Result<(), RpcError> {
+                assert_eq!(method, "session/cancel");
+                self.cancelling.notify_one();
+                self.release.notified().await;
+                self.bound.store(true, Ordering::Release);
+                Ok(())
+            }
+        }
+        let cancelling = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let agent = OrderedCancelAgent {
+            cancelling: Arc::clone(&cancelling),
+            release: Arc::clone(&release),
+            bound: Arc::new(AtomicBool::new(false)),
+        };
+        let (mut input, reader) = tokio::io::duplex(4096);
+        let (writer, output) = tokio::io::duplex(4096);
+        let server = tokio::spawn(serve(agent, reader, writer));
+        let mut output = BufReader::new(output);
+        input
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n")
+            .await
+            .expect("initialize");
+        let mut line = String::new();
+        timeout(Duration::from_secs(2), output.read_line(&mut line))
+            .await
+            .expect("initialize response deadline")
+            .expect("initialize response");
+        input
+            .write_all(concat!(
+                "{\"jsonrpc\":\"2.0\",\"method\":\"session/cancel\",\"params\":{\"sessionId\":\"s\"}}\n",
+                "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"s\"}}\n",
+            ).as_bytes())
+            .await
+            .expect("cancel then new prompt");
+        timeout(Duration::from_secs(2), cancelling.notified())
+            .await
+            .expect("cancel reached the Agent");
+        line.clear();
+        let early = timeout(Duration::from_millis(50), output.read_line(&mut line)).await;
+        release.notify_one();
+        if early.is_err() {
+            timeout(Duration::from_secs(2), output.read_line(&mut line))
+                .await
+                .expect("next prompt response deadline")
+                .expect("next prompt response");
+        }
+        let response: Value = serde_json::from_str(&line).expect("next prompt response JSON");
+        input.shutdown().await.expect("close input");
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server deadline")
+            .expect("server task")
+            .expect("server result");
+        assert_eq!(
+            response["result"]["cancelBound"], true,
+            "the next request overtook the received session cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn reused_wire_request_ids_have_distinct_withdrawal_ownership() {
+        let agent = BlockingAgent::default();
+        let started = Arc::clone(&agent.started);
+        let served = Arc::clone(&agent.served);
+        let cancelled = Arc::clone(&agent.cancelled);
+        let (mut input, reader) = tokio::io::duplex(4096);
+        let (writer, output) = tokio::io::duplex(4096);
+        let server = tokio::spawn(serve(agent, reader, writer));
+        let mut output = BufReader::new(output);
+        let mut line = String::new();
+        input
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n")
+            .await
+            .expect("initialize");
+        timeout(Duration::from_secs(2), output.read_line(&mut line))
+            .await
+            .expect("initialize deadline")
+            .expect("initialize response");
+        let mut identities = Vec::new();
+        for _ in 0..2 {
+            input.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"ses_cancel\"}}\n")
+                .await.expect("prompt");
+            timeout(Duration::from_secs(2), started.notified())
+                .await
+                .expect("prompt starts");
+            identities.push(lock(&served).clone().expect("served identity"));
+            input.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"$/cancel_request\",\"params\":{\"requestId\":2}}\n")
+                .await.expect("withdraw prompt");
+            line.clear();
+            timeout(Duration::from_secs(2), output.read_line(&mut line))
+                .await
+                .expect("withdrawal deadline")
+                .expect("withdrawal response");
+            let response: Value = serde_json::from_str(&line).expect("response JSON");
+            assert_eq!(response["id"], 2);
+            assert_eq!(response["error"]["code"], -32800);
+            assert_eq!(lock(&cancelled).as_ref(), identities.last());
+        }
+        input.shutdown().await.expect("close input");
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server deadline")
+            .expect("server task")
+            .expect("server result");
+        assert_ne!(
+            identities[0], identities[1],
+            "late cleanup or pre-admission withdrawal state must not alias the next request"
+        );
     }
 
     #[tokio::test]
@@ -1557,7 +1730,7 @@ mod tests {
             lock(&cancelled).is_none(),
             "disconnect was reported as an explicit withdrawal of accepted input"
         );
-        assert_eq!(lock(&disconnected).clone(), RequestId::from_json(&json!(2)));
+        assert_eq!(lock(&disconnected).clone(), lock(&served).clone());
         assert!(dropped.load(AtomicOrdering::SeqCst));
         line.clear();
         output
@@ -1625,7 +1798,10 @@ mod tests {
                 .is_err()
         );
         assert!(lock(&cancelled).is_none());
-        assert_eq!(lock(&disconnected).clone(), RequestId::from_json(&json!(2)));
+        assert_eq!(
+            lock(&disconnected).as_ref().map(|id| id.wire_key.as_str()),
+            Some("n:2")
+        );
         assert!(dropped.load(AtomicOrdering::SeqCst));
         drop(input_writer);
     }
@@ -1766,7 +1942,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_request_cancels_agent_to_client_request() {
+    async fn cancel_request_does_not_cancel_a_request_authored_by_the_receiver() {
         let request_started = Arc::new(Notify::new());
         let agent = ClientRequestAgent {
             request_started: Arc::clone(&request_started),
@@ -1816,13 +1992,28 @@ mod tests {
             .expect("write cancellation");
 
         line.clear();
+        assert!(
+            timeout(Duration::from_millis(50), output.read_line(&mut line))
+                .await
+                .is_err(),
+            "a client withdrawal cancelled an agent-authored request: {line}"
+        );
+        let mut reply = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0", "id": request_id, "result": {"ok": true},
+        }))
+        .expect("client reply");
+        reply.push(b'\n');
+        input_writer
+            .write_all(&reply)
+            .await
+            .expect("answer agent request");
         timeout(Duration::from_secs(1), output.read_line(&mut line))
             .await
-            .expect("agent-to-client cancellation responds promptly")
-            .expect("read prompt cancellation response");
-        let response: Value = serde_json::from_str(&line).expect("cancellation response");
+            .expect("agent-to-client reply responds promptly")
+            .expect("read prompt response");
+        let response: Value = serde_json::from_str(&line).expect("prompt response");
         assert_eq!(response["id"], 2);
-        assert_eq!(response["error"]["code"], -32800);
+        assert_eq!(response["result"]["ok"], true);
 
         input_writer.shutdown().await.expect("close ACP input");
         timeout(Duration::from_secs(1), server)

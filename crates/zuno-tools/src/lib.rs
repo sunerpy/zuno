@@ -123,6 +123,7 @@ pub mod risk;
 pub mod session_message;
 pub mod shell;
 pub mod timeout;
+pub mod uncertain;
 pub mod write;
 
 pub use batch::{ExecuteParams, ExecuteTool, MAX_SUBCALLS, TOTAL_OUTPUT_BYTES};
@@ -164,12 +165,55 @@ impl FileTools {
     /// Create file tools that call `formatter` after every successful file write.
     pub fn with_formatter(workspace: &Path, formatter: Arc<dyn FileFormatter>) -> io::Result<Self> {
         let runtime = Arc::new(FileToolRuntime::new(workspace, formatter)?);
-        Ok(Self {
+        Ok(Self::from_runtime(runtime, None))
+    }
+
+    /// Assemble native file tools with a durable intent producer and a real
+    /// workspace-bound inspection service for native CLI/control consumers.
+    pub fn with_inspector(
+        database: Arc<zuno_db::Pool>,
+        workspace: &Path,
+    ) -> Result<(Self, Arc<uncertain::FileInspector>), uncertain::FileInspectionError> {
+        Self::with_inspector_and_formatter(database, workspace, Arc::new(NoopFormatter))
+    }
+
+    pub fn with_inspector_and_formatter(
+        database: Arc<zuno_db::Pool>,
+        workspace: &Path,
+        formatter: Arc<dyn FileFormatter>,
+    ) -> Result<(Self, Arc<uncertain::FileInspector>), uncertain::FileInspectionError> {
+        let runtime = Arc::new(FileToolRuntime::new(workspace, formatter)?);
+        let templates = Self::from_runtime(Arc::clone(&runtime), None);
+        let inspector = Arc::new(uncertain::FileInspector::open(database, workspace)?);
+        let recorder = inspector.recorder([
+            templates.write.definition().schema_identity(),
+            templates.edit.definition().schema_identity(),
+            templates.apply_patch.definition().schema_identity(),
+        ]);
+        Ok((Self::from_runtime(runtime, Some(recorder)), inspector))
+    }
+
+    fn from_runtime(
+        runtime: Arc<FileToolRuntime>,
+        recorder: Option<Arc<uncertain::NativeFileIntentRecorder>>,
+    ) -> Self {
+        let write = WriteTool::new(Arc::clone(&runtime));
+        let edit = EditTool::new(Arc::clone(&runtime));
+        let patch = ApplyPatchTool::new(Arc::clone(&runtime));
+        let (write, edit, patch) = match recorder {
+            Some(recorder) => (
+                write.with_intent_recorder(Arc::clone(&recorder)),
+                edit.with_intent_recorder(Arc::clone(&recorder)),
+                patch.with_intent_recorder(recorder),
+            ),
+            None => (write, edit, patch),
+        };
+        Self {
             read: erase(ReadTool::new(Arc::clone(&runtime))),
-            write: erase(WriteTool::new(Arc::clone(&runtime))),
-            edit: erase(EditTool::new(Arc::clone(&runtime))),
-            apply_patch: erase(ApplyPatchTool::new(runtime)),
-        })
+            write: erase(write),
+            edit: erase(edit),
+            apply_patch: erase(patch),
+        }
     }
 
     /// Return Zuno's provider-neutral model-visible file surface.

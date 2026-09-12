@@ -381,9 +381,10 @@ async fn a_lost_side_effect_pauses_the_goal_and_survives_a_pause_that_was_never_
     );
     assert_eq!(
         restarted.captured_count().await,
-        1,
-        "the asked question is answered, and the goal is not driven a single step further:\n{stdout}"
+        0,
+        "input is retained, but a protected uncertainty gate cannot start model execution:\n{stdout}"
     );
+    assert!(stdout.contains("uncertain_side_effect"), "{stdout}");
 
     let connection = Connection::open(&database).expect("reopen the session database");
     let (status, pause): (String, Option<String>) = connection
@@ -406,7 +407,7 @@ async fn a_lost_side_effect_pauses_the_goal_and_survives_a_pause_that_was_never_
         records[0]["state"]["uncertain"]
             .get("reconciledAtMs")
             .is_none(),
-        "a turn is not an inspection: only an explicit recovery action retires the call"
+        "a turn is not an inspection: only verified inspection retires the call"
     );
     // A generic Goal resume is consent to resume work, not proof that the
     // uncertain external effect was inspected. The native surface must keep

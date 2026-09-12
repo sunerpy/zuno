@@ -83,7 +83,7 @@ pub enum UpdateGoalStatus {
     Active,
     /// The objective and every requirement are proven complete.
     Complete,
-    /// The same true impasse persisted for three consecutive goal turns.
+    /// Stage a concrete impasse now; the host counts matching completed Goal turns.
     Blocked,
 }
 
@@ -127,7 +127,7 @@ pub struct WaivedCriterion {
 pub struct UpdateGoalParams {
     /// Revision returned by `goal_get`; stale revisions are rejected.
     pub expected_revision: i64,
-    /// Terminal status justified by an audit, or an idempotent progress confirmation.
+    /// Completion, a staged blocker observation, or an idempotent progress confirmation.
     pub status: UpdateGoalStatus,
     /// Concise reason for this update, retained with the durable tool call.
     #[serde(default)]
@@ -277,7 +277,6 @@ impl TypedTool for CreateGoalTool {
             ));
         }
         let store = Arc::clone(&self.store);
-        let session_id = ctx.session_id;
         let objective = params.objective;
         // Trimming and the refusal for an all-blank list both live in the store, so a
         // second caller of the model path cannot reintroduce the criteria-less goal by
@@ -285,7 +284,7 @@ impl TypedTool for CreateGoalTool {
         let success_criteria = params.success_criteria;
         let token_budget = params.token_budget;
         let created = tokio::task::spawn_blocking(move || {
-            store.create_goal_as_model(&session_id, &objective, &success_criteria, token_budget)
+            store.create_goal_from_tool(&ctx, &objective, &success_criteria, token_budget)
         })
         .await
         .map_err(|error| failed(CREATE_GOAL_TOOL_ID, error))?
@@ -339,7 +338,7 @@ impl TypedTool for UpdateGoalTool {
             ));
         }
         let store = Arc::clone(&self.store);
-        let session_id = ctx.session_id;
+        let session_id = ctx.session_id.clone();
         let progress = params.status.is_progress();
         let status = params.status.model_status();
         if progress {
@@ -413,15 +412,9 @@ impl TypedTool for UpdateGoalTool {
                 })
                 .collect::<Vec<_>>();
             let status_store = Arc::clone(&store);
-            let status_session_id = session_id.clone();
             let expected_revision = params.expected_revision;
             let goal = tokio::task::spawn_blocking(move || {
-                status_store.complete_as_model_with_criteria_checked(
-                    &status_session_id,
-                    expected_revision,
-                    &satisfy,
-                    &waive,
-                )
+                status_store.complete_goal_from_tool(&ctx, expected_revision, &satisfy, &waive)
             })
             .await
             .map_err(|error| failed(UPDATE_GOAL_TOOL_ID, error))?
@@ -435,72 +428,75 @@ impl TypedTool for UpdateGoalTool {
             return current_goal_output(&store, &session_id, goal).await;
         }
 
-        // A blocked report retains the accepted criterion updates even though the
-        // Goal stays unfinished; only completion claims are all-or-nothing.
-        let revision = apply_criteria_updates(
-            &store,
-            &session_id,
-            params.expected_revision,
-            params.satisfy_criteria,
-            params.waive_criteria,
-        )
-        .await?;
-        if matches!(status, ModelStatus::Blocked) {
-            let condition = params
-                .blocking_condition
-                .as_deref()
-                .map(str::trim)
-                .filter(|condition| !condition.is_empty())
-                .ok_or_else(|| {
-                    invalid(
-                        UPDATE_GOAL_TOOL_ID,
-                        "blocking_condition is required when status is blocked",
-                    )
-                })?
-                .to_owned();
-            let staged_store = Arc::clone(&store);
-            let staged_session_id = session_id.clone();
-            let staged = tokio::task::spawn_blocking(move || {
-                staged_store.stage_failure_signal_checked(&staged_session_id, &condition, revision)
-            })
-            .await
-            .map_err(|error| failed(UPDATE_GOAL_TOOL_ID, error))?
-            .map_err(|error| map_goal_error(UPDATE_GOAL_TOOL_ID, error))?;
-            if !staged {
-                return Err(invalid(
+        // Complete returned above. A blocker is bound to the immutable native
+        // Attempt, and its criteria and staging share the ownership-check transaction.
+        let condition = params
+            .blocking_condition
+            .as_deref()
+            .map(str::trim)
+            .filter(|condition| !condition.is_empty())
+            .ok_or_else(|| {
+                invalid(
                     UPDATE_GOAL_TOOL_ID,
-                    "cannot report a blocker because this session has no active goal",
-                ));
-            }
-            let read_store = Arc::clone(&store);
-            let read_session_id = session_id.clone();
-            let goal = tokio::task::spawn_blocking(move || read_store.goal(&read_session_id))
-                .await
-                .map_err(|error| failed(UPDATE_GOAL_TOOL_ID, error))?
-                .map_err(|error| map_goal_error(UPDATE_GOAL_TOOL_ID, error))?;
-            return current_goal_output(&store, &session_id, goal).await;
-        }
-        if params.blocking_condition.is_some() {
-            return Err(invalid(
-                UPDATE_GOAL_TOOL_ID,
-                "blocking_condition is only valid when status is blocked",
-            ));
-        }
-        let status_store = Arc::clone(&store);
-        let status_session_id = session_id.clone();
-        let goal = tokio::task::spawn_blocking(move || {
-            status_store.update_status_as_model_checked(&status_session_id, status, revision)
+                    "blocking_condition is required when status is blocked",
+                )
+            })?
+            .to_owned();
+        let satisfy = params
+            .satisfy_criteria
+            .into_iter()
+            .map(|item| CriterionSatisfaction {
+                criterion_id: item.criterion_id,
+                receipt_id: item.receipt_id,
+            })
+            .collect::<Vec<_>>();
+        let waive = params
+            .waive_criteria
+            .into_iter()
+            .map(|item| CriterionWaiver {
+                criterion_id: item.criterion_id,
+                reason: item.reason,
+            })
+            .collect::<Vec<_>>();
+        let observation = tokio::task::spawn_blocking(move || {
+            let identity = store.goal_turn_for_tool(&ctx)?;
+            store.stage_goal_turn_observation(
+                &session_id,
+                crate::GoalTurnObservationUpdate {
+                    identity: &identity,
+                    expected_revision: params.expected_revision,
+                    signal: &condition,
+                    satisfy: &satisfy,
+                    waive: &waive,
+                },
+            )
         })
         .await
         .map_err(|error| failed(UPDATE_GOAL_TOOL_ID, error))?
         .map_err(|error| map_goal_error(UPDATE_GOAL_TOOL_ID, error))?;
-        if goal.is_none() {
-            return Err(invalid(
-                UPDATE_GOAL_TOOL_ID,
-                "cannot update goal because this session has no goal",
-            ));
-        }
-        current_goal_output(&store, &session_id, goal).await
+        let mut output = criteria_output(
+            UPDATE_GOAL_TOOL_ID,
+            Some(observation.goal),
+            &observation.criteria,
+        )?;
+        output.title = "Goal blocker staged".to_owned();
+        output.output = format!(
+            "Blocking observation staged; blocked is not yet applied. \
+                 Completed-turn streak for this condition: {}/{}. \
+                 The host will count this observation when the Goal turn finishes.\n\n{}",
+            observation.completed_turn_streak,
+            crate::BLOCKED_TURN_THRESHOLD,
+            output.output,
+        );
+        Ok(output.with_metadata(
+            "blockedObservation",
+            serde_json::json!({
+                "disposition": "staged",
+                "completedTurnStreak": observation.completed_turn_streak,
+                "identity": observation.identity,
+                "threshold": crate::BLOCKED_TURN_THRESHOLD
+            }),
+        ))
     }
 }
 
@@ -732,67 +728,6 @@ fn validate_goal_request(params: &GoalRequestInputParams) -> Result<(), ToolErro
     Ok(())
 }
 
-/// Record every citation and waiver this call carries, before the status changes.
-///
-/// Sequential and revision-threaded deliberately. Each write bumps the goal
-/// revision, so the model's `expected_revision` guards the first one and each
-/// result guards the next; the status change then runs against the revision these
-/// writes produced. Passing the model's revision to every call instead would make
-/// any call that closes two criteria fail its own second write.
-///
-/// Stops at the first refusal, leaving earlier writes committed. That is the
-/// honest outcome: a citation that was accepted describes evidence that really
-/// exists, and rolling it back would ask the model to prove it twice.
-async fn apply_criteria_updates(
-    store: &Arc<GoalStore>,
-    session_id: &str,
-    expected_revision: i64,
-    satisfy: Vec<SatisfiedCriterion>,
-    waive: Vec<WaivedCriterion>,
-) -> Result<i64, ToolError> {
-    if satisfy.is_empty() && waive.is_empty() {
-        return Ok(expected_revision);
-    }
-    validate_criteria_updates(&satisfy, &waive)?;
-    let at_ms = crate::store::now_ms().map_err(|error| failed(UPDATE_GOAL_TOOL_ID, error))?;
-    let mut revision = expected_revision;
-    for satisfied in satisfy {
-        let call_store = Arc::clone(store);
-        let call_session_id = session_id.to_owned();
-        let outcome = tokio::task::spawn_blocking(move || {
-            call_store.satisfy_criterion(
-                &call_session_id,
-                revision,
-                satisfied.criterion_id.trim(),
-                satisfied.receipt_id.trim(),
-                at_ms,
-            )
-        })
-        .await
-        .map_err(|error| failed(UPDATE_GOAL_TOOL_ID, error))?
-        .map_err(|error| map_goal_error(UPDATE_GOAL_TOOL_ID, error))?;
-        revision = outcome.goal.revision;
-    }
-    for waived in waive {
-        let call_store = Arc::clone(store);
-        let call_session_id = session_id.to_owned();
-        let outcome = tokio::task::spawn_blocking(move || {
-            call_store.waive_criterion(
-                &call_session_id,
-                revision,
-                waived.criterion_id.trim(),
-                waived.reason.trim(),
-                at_ms,
-            )
-        })
-        .await
-        .map_err(|error| failed(UPDATE_GOAL_TOOL_ID, error))?
-        .map_err(|error| map_goal_error(UPDATE_GOAL_TOOL_ID, error))?;
-        revision = outcome.goal.revision;
-    }
-    Ok(revision)
-}
-
 fn validate_criteria_updates(
     satisfy: &[SatisfiedCriterion],
     waive: &[WaivedCriterion],
@@ -995,6 +930,10 @@ pub fn goal_from_metadata(output: &ToolOutput) -> Result<Option<Goal>, serde_jso
 #[cfg(test)]
 #[path = "tools_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "goal_creation_tests.rs"]
+mod goal_creation_tests;
 
 #[cfg(test)]
 #[path = "request_input_tests.rs"]

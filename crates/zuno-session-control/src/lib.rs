@@ -7,6 +7,7 @@
 
 mod goal_resume;
 mod question;
+mod turn_boundary;
 pub use goal_resume::GoalResumeOutcome;
 pub use question::QuestionService;
 
@@ -23,8 +24,8 @@ use zuno_review::{PlanReviewGate, ReviewError, ReviewStore};
 use zuno_tools::{WorkPlan, WorkStateError, WorkStateStore};
 use zuno_types::execution::{
     CollaborationMode, ContinuationToken, DraftReviewRiskAcceptance, InputTriggerKind,
-    SessionExecutionPhase, SessionExecutionState, SessionReadiness, SessionScheduling,
-    TurnExecutionIdentity,
+    SessionExecutionPhase, SessionExecutionState, SessionPauseReason, SessionReadiness,
+    SessionScheduling, TurnExecutionIdentity,
 };
 
 /// One user-visible Start Work disposition.
@@ -466,6 +467,9 @@ impl SessionControlService {
             state = update_in(transaction, expected, state)?;
             GoalStore::resume_for_work_in(transaction, request.session_id, request.at_ms)?
         };
+        if !already_authorized && let Some(token) = &state.continuation {
+            Self::authorize_cycle_in(transaction, request.session_id, token, request.at_ms)?;
+        }
         Ok(StartWorkOutcome {
             state,
             plan,
@@ -617,28 +621,81 @@ impl SessionControlService {
         at_ms: i64,
     ) -> Result<(), SessionControlError> {
         self.pool.try_transaction(|tx| {
-            if !GoalStore::goal_in(tx, session_id)?
-                .is_some_and(|goal| goal.status == zuno_goal::GoalStatus::Active)
-            {
-                return Ok(());
-            }
-            let Some(state) = read_in(tx, session_id)? else {
+            let Some(goal) = GoalStore::goal_in(tx, session_id)?
+                .filter(|goal| goal.status == zuno_goal::GoalStatus::Active)
+            else {
                 return Ok(());
             };
-            if state.mode == CollaborationMode::Work
-                && matches!(
+            let Some(mut state) = read_in(tx, session_id)? else {
+                return Ok(());
+            };
+            if state.mode != CollaborationMode::Work
+                || matches!(
                     state.scheduling.as_ref().map(|s| &s.readiness),
-                    Some(SessionReadiness::Paused { .. } | SessionReadiness::Completed)
+                    Some(
+                        SessionReadiness::WaitingHuman { .. }
+                            | SessionReadiness::WaitingExternal { .. }
+                            | SessionReadiness::Paused {
+                                reason: SessionPauseReason::Authentication
+                                    | SessionPauseReason::TurnBudget
+                                    | SessionPauseReason::UncertainSideEffect
+                                    | SessionPauseReason::Blocked
+                            }
+                    )
                 )
+                || !zuno_db::message::MessageStore::new(tx)
+                    .pending_uncertain_tool_calls(session_id, 0)?
+                    .is_empty()
             {
-                zuno_db::session_execution::set_scheduling_in(
+                return Ok(());
+            }
+            let scope = zuno_db::session_work_cycle::current_in(tx, session_id)?;
+            if scope.as_ref().is_none_or(|scope| {
+                scope.goal_id.as_deref() != Some(&goal.goal_id) || scope.stopped.is_some()
+            }) {
+                let cycle_id = format!("cycle_{}", Uuid::now_v7().simple());
+                let plan = WorkStateStore::plan_in(tx, session_id)?
+                    .filter(|plan| plan.goal_id.as_deref() == Some(&goal.goal_id));
+                let scope = zuno_db::session_work_cycle::SessionWorkCycle {
+                    session_id: session_id.to_owned(),
+                    cycle_id: cycle_id.clone(),
+                    anchor_message_id: state
+                        .continuation
+                        .as_ref()
+                        .and_then(|token| token.anchor_message_id.clone()),
+                    goal_id: Some(goal.goal_id.clone()),
+                    plan_id: plan.map(|plan| plan.id),
+                    active_turn_id: None,
+                    todo_ids: Default::default(),
+                    resumed_goal_cycles: Default::default(),
+                    stopped: None,
+                    scheduling: None,
+                };
+                zuno_db::session_work_cycle::save_in(tx, &scope, at_ms)?;
+                state.cycle_id = Some(cycle_id.clone());
+                if let Some(token) = &mut state.continuation {
+                    token.cycle_id = cycle_id;
+                    token.plan_id = scope.plan_id;
+                    token.plan_revision = WorkStateStore::plan_in(tx, session_id)?
+                        .filter(|plan| token.plan_id.as_deref() == Some(&plan.id))
+                        .map(|plan| plan.revision);
+                }
+                zuno_db::event_log::append_in(
                     tx,
                     session_id,
-                    state.revision,
-                    SessionScheduling::default(),
-                    at_ms,
+                    zuno_db::event_log::NewSessionEvent::new(
+                        "session.goal.execution_started",
+                        json!({"goalId":goal.goal_id,"cycleId":state.cycle_id,"time":at_ms})
+                            .as_object()
+                            .expect("object")
+                            .clone(),
+                    )?,
                 )?;
             }
+            state.scheduling = Some(SessionScheduling::default());
+            state.phase = SessionExecutionPhase::Running;
+            state.time_updated = at_ms;
+            update_in(tx, state.revision, state)?;
             Ok(())
         })
     }
@@ -673,6 +730,27 @@ impl SessionControlService {
             {
                 return Err(rejected("work is not paused, or an exact human/external wait is still pending"));
             }
+            if matches!(state.scheduling.as_ref().map(|s| &s.readiness),
+                Some(SessionReadiness::Paused {
+                    reason: SessionPauseReason::Authentication | SessionPauseReason::TurnBudget | SessionPauseReason::Blocked,
+                }))
+            {
+                return Err(rejected(
+                    "the authentication, turn-budget or blocked gate requires its own validated recovery",
+                ));
+            }
+            let messages = zuno_db::message::MessageStore::new(tx);
+            if !messages.pending_uncertain_tool_calls(session_id, 0)?.is_empty() {
+                return Err(rejected(
+                    "inspect authoritative state for unresolved tool outcomes before resuming; resume is not an inspection",
+                ));
+            }
+            if matches!(state.scheduling.as_ref().map(|s| &s.readiness),
+                Some(SessionReadiness::Paused { reason: SessionPauseReason::UncertainSideEffect }))
+                && !goal_resume::native_inspections_resolve_goal_in(tx, session_id, 0)?
+            {
+                return Err(rejected("the uncertainty gate needs matching native inspection evidence"));
+            }
             if GoalStore::goal_in(tx, session_id)?.is_some_and(|goal| goal.status != zuno_goal::GoalStatus::Active) {
                 return Err(rejected("resume the Goal explicitly first"));
             }
@@ -684,7 +762,7 @@ impl SessionControlService {
                 return Err(rejected("the authorized Plan changed; obtain fresh Plan authorization"));
             }
             let continuation = ContinuationToken {
-                cycle_id: state.cycle_id.clone().unwrap_or_else(|| format!("cycle_{}", Uuid::now_v7().simple())),
+                cycle_id: format!("cycle_{}", Uuid::now_v7().simple()),
                 identity: state.work_identity.clone().ok_or_else(|| rejected("the Work identity is missing"))?,
                 mode: CollaborationMode::Work,
                 plan_id: plan.as_ref().map(|plan| plan.id.clone()),
@@ -692,12 +770,6 @@ impl SessionControlService {
                 context_epoch: state.continuation.as_ref().map_or(0, |token| token.context_epoch),
                 anchor_message_id: state.continuation.as_ref().and_then(|token| token.anchor_message_id.clone()),
             };
-            // Like explicit Goal resume, this user control acknowledges the
-            // named uncertainty barrier. It never mechanically replays a tool.
-            let messages = zuno_db::message::MessageStore::new(tx);
-            let pending = messages.pending_uncertain_tool_calls(session_id, 0)?;
-            let part_ids = pending.into_iter().map(|call| call.part_id).collect::<Vec<_>>();
-            messages.reconcile_uncertain_tool_calls(&part_ids, at_ms)?;
             let input = admit_in(tx, NewSessionInput::new(
                 format!("ctl_{}", Uuid::now_v7().simple()), session_id,
                 json!({"kind":"sessionControl","control":"resume_work","continuation":continuation}),
@@ -710,6 +782,7 @@ impl SessionControlService {
             state.continuation = Some(continuation);
             state.time_updated = at_ms;
             let state = update_in(tx, expected_revision, state)?;
+            Self::authorize_cycle_in(tx, session_id, state.continuation.as_ref().expect("resume token"), at_ms)?;
             Ok(ResumeWorkOutcome { state, input })
         })
     }
@@ -840,6 +913,11 @@ impl SessionControlService {
             context_epoch,
             anchor_message_id,
         };
+        if zuno_db::session_work_cycle::read_in(&transaction, session_id, cycle_id)?.is_none() {
+            // Only the already-admitted continuation reaches this boundary.
+            // Existing scopes, including their stop, are never reopened here.
+            Self::authorize_cycle_in(&transaction, session_id, &token, at_ms)?;
+        }
         let expected = state.revision;
         state.cycle_id = Some(cycle_id.to_owned());
         if state

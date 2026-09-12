@@ -20,6 +20,8 @@ const SESSION: &str = "ses_control";
 mod goal_resume;
 #[path = "control/questions.rs"]
 mod questions;
+#[path = "control/turn_boundaries.rs"]
+mod turn_boundaries;
 
 struct Fixture {
     _spill: TempDir,

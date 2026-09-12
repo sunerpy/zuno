@@ -3,7 +3,7 @@
 use crate::retry::{
     GoalFailureDisposition, GoalRetryPolicy, GoalRetryState, GoalTerminalFailure, entropy, now_ms,
 };
-use crate::{FailureStreak, Goal, GoalError, GoalPauseState, GoalStatus, GoalStore, ModelStatus};
+use crate::{FailureStreak, Goal, GoalError, GoalPauseState, GoalStatus, GoalStore};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -34,8 +34,8 @@ Completion audit:
 - Call goal_update with status complete only when every requirement is proven and no required work remains.
 
 Blocked audit:
-- Do not mark blocked on the first occurrence.
-- The identical blocking condition must persist for three consecutive goal turns, including user-triggered and automatic turns.
+- Report a concrete blocking_condition with goal_update status blocked as soon as it prevents meaningful progress.
+- This stages an observation, not a terminal status. The host counts completed Goal turns and applies blocked after three matching turns; do not count three turns yourself before reporting.
 - Progress or a different condition resets the consecutive-turn count.
 - Hard, slow, uncertain, incomplete work, or work that would benefit from clarification is not itself blocked."#;
 
@@ -343,39 +343,7 @@ impl GoalContinuation {
         session_id: &str,
         outcome: GoalTurnOutcome<'_>,
     ) -> Result<BlockedAudit, GoalError> {
-        let staged = self.store.consume_staged_failure_signal(session_id)?;
-        let outcome = match (outcome, staged.as_deref()) {
-            (GoalTurnOutcome::Progress, Some(signal)) => GoalTurnOutcome::Blocking(signal),
-            (outcome, _) => outcome,
-        };
-        if self
-            .store
-            .goal(session_id)?
-            .is_none_or(|goal| goal.status != GoalStatus::Active)
-        {
-            return Ok(BlockedAudit::NoActiveGoal);
-        }
-        let Some(streak) = self.store.record_failure_signal(
-            session_id,
-            match outcome {
-                GoalTurnOutcome::Progress => None,
-                GoalTurnOutcome::Blocking(signal) => Some(signal),
-            },
-        )?
-        else {
-            return Ok(BlockedAudit::Reset);
-        };
-        if streak.consecutive_turns < BLOCKED_TURN_THRESHOLD {
-            return Ok(BlockedAudit::Pending(streak));
-        }
-        let updated = self
-            .store
-            .update_status_as_model(session_id, ModelStatus::Blocked)?;
-        if updated.is_some_and(|goal| goal.status == GoalStatus::Blocked) {
-            Ok(BlockedAudit::Blocked(streak))
-        } else {
-            Ok(BlockedAudit::NoActiveGoal)
-        }
+        self.store.record_turn_outcome(session_id, outcome)
     }
 
     /// Apply a typed terminal failure to the current active goal.

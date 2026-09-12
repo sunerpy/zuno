@@ -10,6 +10,7 @@
 //! rather than the absence of an error.
 
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use zuno_db::event_log::SessionEventLog;
@@ -25,6 +26,12 @@ use zuno_paths::DbLocation;
 
 const VERSION: &str = "1.18.13";
 const WORKTREE: &str = "/srv/app";
+const TURN_LEDGER_TABLES: [&str; 4] = [
+    "goal_cycle_failure",
+    "goal_turn_audit",
+    "goal_turn_observation",
+    "session_work_cycle",
+];
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -201,6 +208,85 @@ fn insert_retry_backoff(connection: &Connection, session_id: &str) {
         .expect("insert provider_retry_backoff");
 }
 
+/// Every session owns nonempty host-cycle data and each of the three Goal ledgers.
+/// These are opaque persisted bytes to deletion, independent of the host JSON version.
+fn insert_turn_ledgers(connection: &Connection, session_id: &str) {
+    let cycle_id = format!("cycle_{session_id}");
+    let goal_id = format!("goal_{session_id}");
+    let turn_id = format!("turn_{session_id}");
+    let data = json!({
+        "sessionId": session_id,
+        "cycleId": cycle_id,
+        "goalId": goal_id,
+        "stopped": {"turnId": turn_id, "userCancelled": true, "atMs": 2},
+        "fixtureNote": format!("Preserve {session_id} — 保留归属")
+    })
+    .to_string();
+    connection
+        .execute(
+            "INSERT INTO session_work_cycle
+         (session_id,cycle_id,anchor_message_id,data,time_created,time_updated)
+         VALUES (?1,?2,?3,?4,1,2)",
+            rusqlite::params![session_id, cycle_id, format!("msg_{session_id}"), data],
+        )
+        .expect("insert nonempty host work cycle");
+    connection
+        .execute(
+            "INSERT INTO goal_turn_observation
+         (session_id,goal_id,cycle_id,turn_id,signal,time_created)
+         VALUES (?1,?2,?3,?4,'provider:offline',1)",
+            rusqlite::params![session_id, goal_id, cycle_id, turn_id],
+        )
+        .expect("insert Goal observation");
+    connection
+        .execute(
+            "INSERT INTO goal_turn_audit
+         (session_id,goal_id,cycle_id,turn_id,audit,time_recorded)
+         VALUES (?1,?2,?3,?4,?5,2)",
+            rusqlite::params![
+                session_id,
+                goal_id,
+                cycle_id,
+                turn_id,
+                json!({"sessionId":session_id,"consecutiveTurns":2}).to_string()
+            ],
+        )
+        .expect("insert Goal audit");
+    connection
+        .execute(
+            "INSERT INTO goal_cycle_failure
+         (session_id,goal_id,cycle_id,active_turn_id,signal,consecutive_turns)
+         VALUES (?1,?2,?3,?4,'provider:offline',2)",
+            rusqlite::params![session_id, goal_id, cycle_id, turn_id],
+        )
+        .expect("insert Goal failure streak");
+}
+
+fn turn_ledger_rows(
+    connection: &Connection,
+    session_id: Option<&str>,
+) -> BTreeMap<&'static str, Vec<Vec<rusqlite::types::Value>>> {
+    TURN_LEDGER_TABLES
+        .into_iter()
+        .map(|table| {
+            let mut statement = connection.prepare(&format!(
+            "SELECT * FROM {table} WHERE ?1 IS NULL OR session_id=?1 ORDER BY session_id,rowid"
+        )).expect("prepare lifecycle snapshot");
+            let columns = statement.column_count();
+            let rows = statement
+                .query_map([session_id], |row| {
+                    (0..columns)
+                        .map(|column| row.get(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .expect("query lifecycle snapshot")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("read lifecycle snapshot");
+            (table, rows)
+        })
+        .collect()
+}
+
 fn insert_share(connection: &Connection, session_id: &str) {
     connection
         .execute(
@@ -312,6 +398,7 @@ impl Tree {
                 insert_verification_receipt(&connection, id);
                 insert_human_request(&connection, id);
                 insert_retry_backoff(&connection, id);
+                insert_turn_ledgers(&connection, id);
             }
             insert_share(&connection, "ses_root");
 
@@ -1677,6 +1764,19 @@ fn the_subtree_walk_returns_children_before_their_parent() {
 fn removing_a_parent_removes_the_whole_subtree_and_leaves_no_orphaned_parts() {
     let tree = Tree::build();
     let store = tree.store();
+    let bystander_turns = {
+        let connection = tree.connection();
+        for session_id in ["ses_root", "ses_child", "ses_grandchild", "ses_bystander"] {
+            for (table, rows) in turn_ledger_rows(&connection, Some(session_id)) {
+                assert_eq!(
+                    rows.len(),
+                    1,
+                    "{session_id} needs a nonempty {table} fixture"
+                );
+            }
+        }
+        turn_ledger_rows(&connection, Some("ses_bystander"))
+    };
 
     let before = {
         let connection = tree.connection();
@@ -1709,6 +1809,19 @@ fn removing_a_parent_removes_the_whole_subtree_and_leaves_no_orphaned_parts() {
     );
 
     let connection = tree.connection();
+    for session_id in ["ses_root", "ses_child", "ses_grandchild"] {
+        for (table, rows) in turn_ledger_rows(&connection, Some(session_id)) {
+            assert!(
+                rows.is_empty(),
+                "{table} retained deleted subtree member {session_id}"
+            );
+        }
+    }
+    assert_eq!(
+        turn_ledger_rows(&connection, Some("ses_bystander")),
+        bystander_turns,
+        "the bystander's stopped cycle and Goal history must remain byte-for-byte intact"
+    );
 
     // The subtree is gone, and nothing points at a session that no longer
     // exists.
@@ -1766,6 +1879,7 @@ fn removing_a_parent_removes_the_whole_subtree_and_leaves_no_orphaned_parts() {
         "session_input",
         "session_context_epoch",
         "session_share",
+        "session_work_cycle",
     ] {
         let remaining = count_for(
             &connection,
@@ -1931,8 +2045,8 @@ fn tables_no_session_cascade_reaches(connection: &Connection) -> Vec<(String, St
 /// cannot slip through: it fails this test until it is both seeded and swept.
 ///
 /// The scope is this crate's own schema. Tables another crate creates in the same pool —
-/// `zuno_goal`'s `goal*` set — carry a `session_id` with no foreign key and are not swept by
-/// either path; see the boundary note in `zuno_db::session_keys`.
+/// legacy `zuno_goal` tables such as `goal` and `goal_pause` — are not swept by either
+/// path. Format-15 Goal turn ledgers are declared here and belong to this sweep.
 #[test]
 fn removing_a_session_sweeps_every_table_no_cascade_reaches() {
     let tree = Tree::build();
@@ -1944,6 +2058,9 @@ fn removing_a_session_sweeps_every_table_no_cascade_reaches() {
     // this set; `remove` sweeps it anyway and the subtree test above pins that.
     let seeded = [
         ("event_sequence", "aggregate_id"),
+        ("goal_cycle_failure", "session_id"),
+        ("goal_turn_audit", "session_id"),
+        ("goal_turn_observation", "session_id"),
         ("human_request", "session_id"),
         ("part", "session_id"),
         ("provider_retry_backoff", "session_id"),
@@ -1958,15 +2075,17 @@ fn removing_a_session_sweeps_every_table_no_cascade_reaches() {
         "a session-keyed table with no foreign key on that key needs a fixture here and \
          an explicit statement in session::remove"
     );
-    for (table, key) in &seeded {
-        assert!(
-            count_for(
-                &connection,
-                &format!("SELECT count(*) FROM {table} WHERE {key} = ?1"),
-                "ses_child"
-            ) > 0,
-            "{table} must be seeded before the delete or the sweep proves nothing"
-        );
+    for session_id in ["ses_root", "ses_child", "ses_grandchild", "ses_bystander"] {
+        for (table, key) in &seeded {
+            assert!(
+                count_for(
+                    &connection,
+                    &format!("SELECT count(*) FROM {table} WHERE {key} = ?1"),
+                    session_id
+                ) > 0,
+                "{table}/{session_id} must be seeded before the delete"
+            );
+        }
     }
     drop(connection);
 
@@ -2001,11 +2120,25 @@ fn removing_a_session_sweeps_every_table_no_cascade_reaches() {
 #[test]
 fn removing_a_middle_session_keeps_its_parent_and_takes_its_child() {
     let tree = Tree::build();
+    let survivors = {
+        let connection = tree.connection();
+        ["ses_root", "ses_bystander"].map(|id| turn_ledger_rows(&connection, Some(id)))
+    };
     let store = tree.store();
     let removed = store.remove("ses_child").expect("remove the middle");
     assert_eq!(removed, vec!["ses_grandchild", "ses_child"]);
 
     let connection = tree.connection();
+    for (session_id, before) in ["ses_root", "ses_bystander"].into_iter().zip(survivors) {
+        assert_eq!(turn_ledger_rows(&connection, Some(session_id)), before);
+    }
+    for session_id in ["ses_child", "ses_grandchild"] {
+        assert!(
+            turn_ledger_rows(&connection, Some(session_id))
+                .values()
+                .all(Vec::is_empty)
+        );
+    }
     assert_eq!(
         count_for(
             &connection,
@@ -2139,6 +2272,7 @@ fn removing_a_missing_session_reports_not_found_and_changes_nothing() {
 #[test]
 fn a_failed_remove_rolls_the_whole_subtree_back() {
     let tree = Tree::build();
+    let turns_before = turn_ledger_rows(&tree.connection(), None);
     let error = tree
         .pool
         .transaction(|transaction| {
@@ -2160,6 +2294,106 @@ fn a_failed_remove_rolls_the_whole_subtree_back() {
     );
     assert_eq!(count(&connection, "SELECT count(*) FROM part"), 5);
     assert_eq!(count(&connection, "SELECT count(*) FROM event"), 8);
+    assert_eq!(
+        turn_ledger_rows(&connection, None),
+        turns_before,
+        "all ledger deletes roll back"
+    );
+}
+
+#[test]
+fn raw_session_cascade_and_service_purge_have_distinct_goal_ledger_effects() {
+    let tree = Tree::build();
+    let connection = tree.connection();
+    let bystander = turn_ledger_rows(&connection, Some("ses_bystander"));
+    connection
+        .execute("DELETE FROM session WHERE id='ses_grandchild'", [])
+        .expect("delete one leaf through SQLite only");
+    let remaining = turn_ledger_rows(&connection, Some("ses_grandchild"));
+    assert!(
+        remaining["session_work_cycle"].is_empty(),
+        "host cycles cascade on session deletion"
+    );
+    for table in [
+        "goal_cycle_failure",
+        "goal_turn_audit",
+        "goal_turn_observation",
+    ] {
+        assert_eq!(
+            remaining[table].len(),
+            1,
+            "{table} needs the service's explicit sweep"
+        );
+    }
+    assert_eq!(
+        turn_ledger_rows(&connection, Some("ses_bystander")),
+        bystander
+    );
+}
+
+#[test]
+fn service_purge_does_not_acquire_authority_over_an_operator_cycle_copy() {
+    let tree = Tree::build();
+    let snapshot = |connection: &Connection| {
+        let mut statement = connection.prepare(
+            "SELECT session_id,cycle_id,data FROM operator_cycle_copy ORDER BY session_id,cycle_id",
+        ).expect("operator copy query");
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .expect("operator copy rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("operator copy snapshot")
+    };
+    let before = {
+        let connection = tree.connection();
+        connection
+            .execute_batch(
+                "CREATE TABLE operator_cycle_copy AS
+             SELECT session_id,cycle_id,data FROM session_work_cycle;",
+            )
+            .expect("operator-owned copy with no cascade");
+        snapshot(&connection)
+    };
+    tree.store()
+        .remove("ses_root")
+        .expect("purge only the declared session subtree");
+    let connection = tree.connection();
+    assert_eq!(
+        count(&connection, "SELECT count(*) FROM operator_cycle_copy"),
+        4
+    );
+    assert_eq!(
+        snapshot(&connection),
+        before,
+        "operator-owned bytes are outside purge authority"
+    );
+    assert_eq!(
+        count(&connection, "SELECT count(*) FROM session_work_cycle"),
+        1
+    );
+    let bystander_cycle: String = connection
+        .query_row(
+            "SELECT data FROM session_work_cycle WHERE session_id='ses_bystander'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("surviving host cycle");
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT data FROM operator_cycle_copy WHERE session_id='ses_bystander'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("operator copy"),
+        bystander_cycle
+    );
 }
 
 #[test]

@@ -142,7 +142,7 @@ loop.
 | Delegation and child sessions | Every `task` call has a stable human-readable tool card plus raw details. If the client explicitly advertises the draft `clientCapabilities.subagents` object, Zuno advertises the matching session capability and additionally routes foreground child replay and live updates on the durable child session id. Spawn and terminal state stay on the direct parent route; child transcript, tools, reasoning, plan, and usage stay on the child route. Background children remain on the durable task/job lifecycle and are never represented as foreground native subagents. |
 | File edits and diffs | `edit`, `write`, and `apply_patch` share the `Editing files` edit card. A successful native mutation publishes only stable ACP `diff` content with an absolute path and exact `oldText`/`newText`; the original success text remains in `rawOutput` but is not duplicated in the visible content. A successful call with no diff keeps a short text fallback. Pre-write failures show actionable text without fabricated diffs. Partial or otherwise uncertain mutations are failed cards with observed paths/diffs and `_meta.zuno.outcome: "uncertain"`. Live delivery and replay use the same policy. A unified-diff text fallback remains only for tools that cannot provide typed file state. |
 | Human input | Ordinary tool permission uses `session/request_permission`; questions use the shared durable `QuestionPort`. Root Plan/Work/Goal sessions can publish optional `question_async`; required Work/Goal input records an exact human wait. Forms use native single/multiple controls and custom input. Drafts persist separately from answers; empty acceptance and native cancellation defer without consent. `questions/list` and `questions/respond` support later responses with stable IDs and revisions. Plan authorization remains explicit and handoff-gated. Delegated children report blockers to the parent. Permission grants remain separate, session-owned and cleared on close; question replies never create permission grants. |
-| Cancellation | Explicit `$/cancel_request` withdraws only the request's own pending contribution or targets the native input it actually owns; duplicate observers have no withdrawal authority. `session/cancel` is session-wide. EOF/write failure uses a separate disconnect callback: it drops transport observation, not durable input. Subsequent native process shutdown settles its actual interrupted outcome separately. No disconnected observer fabricates completion or replays consumed input. `session/close` joins root-owned work before disposing host/MCP/client resources. |
+| Cancellation | Explicit `$/cancel_request` withdraws only the request's own pending contribution or atomically targets its selected native input; duplicate observers have no withdrawal authority. Reused wire IDs receive distinct internal request identities. `session/cancel` accepts optional `_meta.zuno.expectedTurnId` and validates the target at the signal boundary. Legacy session-only cancellation captures the live target at dispatch, never arms a future turn, and cannot infer network-stale intent. EOF/write failure uses a separate disconnect callback: it drops transport observation, not durable input. Subsequent native process shutdown settles its actual interrupted outcome separately. No disconnected observer fabricates completion or replays consumed input. `session/close` joins root-owned work before disposing host/MCP/client resources. |
 | Durable load replay | Reconstructs a bounded retained suffix of user/assistant content, reasoning, tools, raw input/output, safe typed diffs and locations, resource links and image output, followed by the current plan and latest-context usage. Question and delegation tools replay as static cards while retaining raw details. When native subagents are negotiated, the durable child tree is restored in parent-before-child order and historical terminal state is conservatively `disconnected`. Omitted history is reported explicitly. |
 | ACP-provided MCP | Advertises stdio and Streamable HTTP; SSE remains `false`. New/load/resume validate the complete client list. Load/resume freeze it without starting transports; activation mounts an isolated bundle, publishes only after every required ACP server connects and discovers successfully, and rolls partial startup back in reverse order. Host-configured optional MCP may use an identity-bound cached tool directory and singleflight first-call connection; no stdio process is pooled across sessions. |
 | Client filesystem RPC | Not advertised. Agent file reads and writes use Zuno tools, sandbox/permission policy, and durable events; they do not masquerade as ACP client filesystem handlers. |
@@ -162,7 +162,7 @@ Zuno additionally advertises `_meta.zuno.steering` and accepts `session/steer` w
 `expectedTurnId`; turn-scoped updates expose that id in
 `_meta.zuno.turnId`. The method returns immediately after durable admission and
 exact-turn soft-interrupt routing, or fails with `-32002` and a typed reason.
-It does not change `session/cancel`, add a cancellation grace period, or create
+Steering does not send `session/cancel`, add a cancellation grace period, or create
 a second turn lifecycle.
 
 The reference is Codex `eaa8b6d91701d6cabe464141facc677e5915fbfc`:
@@ -182,6 +182,22 @@ of sending `session/cancel`; the Stop action should continue to cancel.
 Only user-audience notices are projected as tagged thought chunks. Diagnostic
 notices, including historical tool-declaration repair, are de-duplicated and
 logged without entering the ACP conversation.
+
+### Native cancellation boundary
+
+`SessionControl::abort_turn` checks the expected turn under the registry lock
+that fires its signal. Input cancellation uses the native driver's selected
+input binding; the ACP driver installs that binding before durable promotion.
+Cancelling a pending contribution and then checking its bound input covers the
+promotion race without retargeting another input.
+
+Local cancellation snapshots identify the registry, session, lease and turn/input
+identity generation. TUI captures a snapshot before dispatching a component event,
+then applies only the Stop requests emitted by that event. It neither queues a
+session-only abort for an asynchronous worker nor reuses it on the next event.
+Lifecycle teardown interrupts active work without arming a future turn.
+The ACP extension and legacy limits are documented in the
+[exact cancellation contract](../reference/zed-acp.md#exact-cancellation-extension).
 
 ### Draft native-subagent extension
 

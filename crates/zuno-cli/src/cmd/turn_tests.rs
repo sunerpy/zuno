@@ -7879,7 +7879,7 @@ fn durable_work_context_projects_plan_todos_jobs_reports_and_prior_receipt_from_
     )
     .expect("decode durable work context");
 
-    assert_eq!(snapshot["schemaVersion"], 3);
+    assert_eq!(snapshot["schemaVersion"], 4);
     assert_eq!(snapshot["plan"]["id"], "plan_durable");
     assert_eq!(snapshot["plan"]["revision"], 2);
     assert_eq!(snapshot["todos"][0]["id"], "todo_durable");
@@ -7913,6 +7913,7 @@ fn durable_work_context_projects_plan_todos_jobs_reports_and_prior_receipt_from_
 #[test]
 fn durable_work_context_has_a_deterministic_total_prompt_budget() {
     let snapshot = DurableWorkContextSnapshot {
+        work_scope: None,
         schema_version: DURABLE_WORK_CONTEXT_SCHEMA_VERSION,
         execution: None,
         questions: Vec::new(),
@@ -8316,6 +8317,7 @@ fn report_host_open_preserves_a_paused_goal_until_work_explicitly_starts() {
 #[test]
 fn the_turn_end_charges_usage_no_request_accounted_for() {
     let charged = |session: i64, goal: i64| GoalUsage {
+        ownership: GoalUsageOwnership::Legacy,
         tokens: session,
         confirmed_known: true,
         estimated_pending_prompt_tokens: None,
@@ -8399,6 +8401,7 @@ fn accounting_is_unknown_only_where_the_session_could_not_measure_the_spend() {
     let usage =
         |confirmed: i64, pending: Option<u64>, request_seq: i64, failed: u64, known: bool| {
             GoalUsage {
+                ownership: GoalUsageOwnership::Legacy,
                 tokens: confirmed,
                 confirmed_known: known,
                 estimated_pending_prompt_tokens: pending,

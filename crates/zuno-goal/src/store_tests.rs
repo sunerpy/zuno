@@ -3,6 +3,9 @@ use crate::spill::{MAX_OBJECTIVE_CHARS, OBJECTIVE_FILE_NAME};
 use rusqlite::TransactionBehavior;
 use tempfile::TempDir;
 
+#[path = "boundary_tests.rs"]
+mod boundary_tests;
+
 /// A store plus the temporary directory its spilled objectives live in.
 ///
 /// The spill directory is held here, not dropped at the end of the helper, or
@@ -252,6 +255,22 @@ fn matrix(budget: Budget, seeds: &[GoalStatus]) -> Vec<String> {
                     );
                     format!("{from:?} -> {to:?} | model  | REFUSED ({error})")
                 }
+                Ok(status) if from == GoalStatus::Paused => {
+                    let error = model
+                        .store
+                        .update_status_as_model(SESSION, status)
+                        .expect_err("a paused Goal requires native user authority");
+                    assert!(matches!(
+                        error,
+                        GoalError::CompletionRequiresUser { .. }
+                            | GoalError::GoalNotActive {
+                                status: GoalStatus::Paused,
+                                ..
+                            }
+                    ));
+                    assert_eq!(model.status(SESSION), from);
+                    format!("{from:?} -> {to:?} | model  | REFUSED ({error})")
+                }
                 Ok(status) => {
                     let updated = model
                         .store
@@ -307,9 +326,9 @@ fn every_transition_from_both_scopes_obeys_the_ownership_split() {
     let refused = rows.iter().filter(|row| row.contains("REFUSED")).count();
     assert_eq!(
         refused,
-        GoalStatus::ALL.len() * 5 + GoalStatus::ALL.len() * 2,
+        GoalStatus::ALL.len() * 5 + GoalStatus::ALL.len() * 2 + 2,
         "each start state refuses five system-owned statuses to the model \
-         and two model-owned statuses to the system"
+         and two model-owned statuses to the system, plus both model writes to a paused Goal"
     );
 }
 
@@ -3048,7 +3067,7 @@ fn criteria_and_completion_commit_as_one_goal_revision() {
 }
 
 #[test]
-fn a_change_goal_with_no_criteria_cannot_complete_at_all() {
+fn a_change_goal_with_no_declared_criteria_can_complete() {
     let fixture = Fixture::in_memory();
     let goal = fixture
         .store
@@ -3059,21 +3078,13 @@ fn a_change_goal_with_no_criteria_cannot_complete_at_all() {
         .escalate_to_change(SESSION, "wrote crates/zuno-goal/src/store.rs", 1_000)
         .expect("escalate to a change goal");
 
-    let refusal = fixture
+    let completed = fixture
         .store
         .complete_checked(SESSION, goal.revision)
-        .expect_err("an empty checklist is not a completed one");
-
-    assert!(matches!(
-        &refusal,
-        GoalError::EvidenceMissing { unsatisfied } if unsatisfied.is_empty()
-    ));
-    assert!(
-        refusal
-            .to_string()
-            .contains("cannot complete without success criteria"),
-        "the refusal says what is missing rather than which id: {refusal}"
-    );
+        .expect("a change must not invent a checklist")
+        .expect("goal exists");
+    assert_eq!(completed.status, GoalStatus::Complete);
+    assert!(fixture.store.criteria(SESSION).expect("ledger").is_empty());
 }
 
 #[test]
@@ -3261,23 +3272,10 @@ fn a_user_created_goal_with_no_criteria_completes_without_any_evidence() {
     );
 }
 
-/// The residual this crate could not close alone, now closed from the other side of the
-/// seam: a goal the *user* created with no criteria, a workspace edit made by running a
-/// command, and a model-reported completion. `shell` reports the paths it observed
-/// changing (`writtenPaths`), and the verification ledger drives the same two calls for
-/// that report as for every other mutating tool — [`GoalStore::escalate_to_change`] with
-/// the reason it renders, then [`GoalStore::mark_mutation`] at the same instant
-/// (`crates/zuno-cli/src/cmd/verification_ledger.rs`). That makes this a change goal with
-/// an empty checklist, and an empty checklist is not a completed one: the model is refused
-/// with [`GoalError::EvidenceMissing`] naming no criterion, because there is none to name.
-///
-/// The report is a lower bound, and only the reported shape is covered here. A target
-/// that is statically resolvable and in scope — `sed -i 's/foo/bar/' src/lib.rs` — is
-/// reported; one the shell expands — `$OUT`, `*.rs`, `$(ls)`, a here-doc, a redirection,
-/// the files `git apply` rewrites — is skipped rather than guessed, and a run that edits
-/// only through those still stays a question goal.
+/// A reported shell write retains its mutation mark without inventing a checklist
+/// for an ordinary user-created Goal.
 #[test]
-fn a_shell_reported_write_escalates_a_user_goal_so_the_model_cannot_complete_it_unmeasured() {
+fn a_shell_reported_write_retains_its_mark_without_inventing_criteria() {
     let fixture = Fixture::in_memory();
     let goal = fixture
         .store
@@ -3329,34 +3327,21 @@ fn a_shell_reported_write_escalates_a_user_goal_so_the_model_cannot_complete_it_
         "and visible to freshness, so a receipt recorded before this edit would be stale"
     );
 
-    let refusal = fixture
+    let completed = fixture
         .store
         .update_status_as_model(SESSION, ModelStatus::Complete)
-        .expect_err("a change goal with no checklist has nothing that could prove it done");
-
-    assert!(
-        matches!(&refusal, GoalError::EvidenceMissing { unsatisfied } if unsatisfied.is_empty()),
-        "an empty checklist is refused with no criterion id to name: {refusal}"
-    );
-    assert_eq!(
-        refusal.to_string(),
-        "goal cannot complete without recorded verification evidence: a goal that changes \
-         the workspace cannot complete without success criteria; propose success criteria \
-         with `goal_propose` before completing (an unfinished goal cannot be re-proposed, so \
-         this one has to be cancelled by the user first)",
-        "the refusal says what is missing and what the run can still do about it"
-    );
-    assert!(
-        matches!(
-            fixture.store.complete_as_model_checked(SESSION, goal.revision),
-            Err(GoalError::EvidenceMissing { unsatisfied }) if unsatisfied.is_empty()
-        ),
-        "the revision-guarded model entry point refuses the same way"
-    );
+        .expect("ordinary completion passes the remaining audits")
+        .expect("goal exists");
+    let repeated = fixture
+        .store
+        .complete_as_model_checked(SESSION, completed.revision)
+        .expect("the checked path agrees")
+        .expect("goal exists");
+    assert_eq!(repeated.status, GoalStatus::Complete);
     assert_eq!(
         fixture.status(SESSION),
-        GoalStatus::Active,
-        "a refused completion leaves the run going"
+        GoalStatus::Complete,
+        "the ordinary Goal is delivered"
     );
     assert_eq!(
         fixture.store.kind(SESSION).expect("read kind"),
@@ -3810,8 +3795,7 @@ fn an_archived_plan_of_an_earlier_goal_does_not_block_completion() {
 /// `the_model_cannot_propose_a_goal_that_names_no_check` pins. The name says which
 /// actor, because that is the only place this surface records it.
 #[test]
-fn a_user_created_goal_without_criteria_stays_a_question_until_its_first_write_and_then_cannot_complete()
- {
+fn a_user_created_goal_without_criteria_records_changes_and_can_complete() {
     let fixture = Fixture::in_memory();
     let created = fixture
         .store
@@ -3832,27 +3816,16 @@ fn a_user_created_goal_without_criteria_stays_a_question_until_its_first_write_a
         GoalKind::Change
     );
 
-    let refusal = fixture
+    let completed = fixture
         .store
         .complete_checked(SESSION, created.goal.revision)
-        .expect_err(
-            "a change goal with no criteria can only complete by assertion, which is refused",
-        );
-    assert!(matches!(
-        &refusal,
-        GoalError::EvidenceMissing { unsatisfied } if unsatisfied.is_empty()
-    ));
-    assert!(
-        refusal
-            .to_string()
-            .contains("propose success criteria with `goal_propose` before completing"),
-        "the refusal names the remedy instead of an id: {refusal}"
-    );
-    assert!(refusal.is_model_refusal(), "{refusal}");
+        .expect("native user completion does not require a retroactive checklist")
+        .expect("goal exists");
+    assert_eq!(completed.goal_id, created.goal.goal_id);
     assert_eq!(
         fixture.status(SESSION),
-        GoalStatus::Active,
-        "a refused completion leaves the run going"
+        GoalStatus::Complete,
+        "a legitimate ordinary Goal can finish"
     );
 }
 
@@ -5446,12 +5419,16 @@ fn a_goal_a_0_6_6_database_finished_reads_as_it_did_until_it_is_made_live_again(
         let document = crate::projection::render(&goal, &criteria, &notes);
         assert_eq!(document, crate::projection::render(&goal, &[], &notes));
         assert!(document.contains("_This goal has no success criteria._"));
-        // And a repeated `complete` is the same idempotent no-op it was.
-        let repeated = store
+        // A new completion audit cannot downgrade a declared contract merely because
+        // the old release never populated its ledger. Preserve the historical result.
+        let refusal = store
             .complete_as_model_checked(session_id, goal.revision)
-            .expect("a finished goal is not refused for evidence it was never asked for")
-            .expect("goal exists");
-        assert_eq!(repeated.status, expected);
+            .expect_err("a missing declared ledger fails closed");
+        assert!(matches!(
+            refusal,
+            GoalError::CriterionContractCorrupt { .. }
+        ));
+        assert_eq!(store.goal(session_id).unwrap(), Some(goal));
     }
 
     // Written back to a live status — the system's `active` here; the model's own

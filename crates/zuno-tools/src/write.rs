@@ -2,9 +2,10 @@ use crate::read::{
     FileToolRuntime, PathKind, check_interrupt, decode_text, encode_text, failed, invalid,
     publish_error, report_diff, report_formatting, report_post_write_warnings, uncertain,
 };
+use crate::uncertain::{NativeFileIntentRecorder, NativeFileKind};
 use async_trait::async_trait;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
@@ -14,7 +15,7 @@ use zuno_tool::{ToolContext, ToolOutput, TypedTool};
 /// The description the model reads.
 pub const DESCRIPTION: &str = include_str!("description/write.txt");
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WriteParams {
     /// The content to write to the file.
@@ -25,11 +26,20 @@ pub struct WriteParams {
 
 pub struct WriteTool {
     runtime: Arc<FileToolRuntime>,
+    intent_recorder: Option<Arc<NativeFileIntentRecorder>>,
 }
 
 impl WriteTool {
     pub(crate) fn new(runtime: Arc<FileToolRuntime>) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            intent_recorder: None,
+        }
+    }
+
+    pub(crate) fn with_intent_recorder(mut self, recorder: Arc<NativeFileIntentRecorder>) -> Self {
+        self.intent_recorder = Some(recorder);
+        self
     }
 }
 
@@ -56,6 +66,14 @@ impl TypedTool for WriteTool {
             .await?;
         let _guard = self.runtime.mutation.lock().await;
         check_interrupt("write", &ctx)?;
+        if let Some(recorder) = &self.intent_recorder {
+            recorder.record(
+                NativeFileKind::Write,
+                &params,
+                vec![target.canonical.clone()],
+                &ctx,
+            )?;
+        }
 
         // Every filesystem step below runs through this anchor, which is pinned to the
         // directory the user authorized. An ancestor swapped for a symlink after the

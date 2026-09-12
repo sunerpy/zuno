@@ -104,7 +104,14 @@ async fn mock_provider_host(
     let session_id = format!("ses_scheduling_{}", Uuid::now_v7().simple());
     let config = zuno_config::schema::Config::default();
     let mut entry = agent(agent_name);
-    entry.tools = Some(vec![zuno_tools::plan_exit::WIRE_ID.to_owned()]);
+    entry.tools = Some(vec![
+        zuno_tools::plan_exit::WIRE_ID.to_owned(),
+        zuno_tools::PLAN_UPDATE_TOOL_ID.to_owned(),
+        zuno_goal::UPDATE_GOAL_TOOL_ID.to_owned(),
+        zuno_goal::CREATE_GOAL_TOOL_ID.to_owned(),
+        "read".to_owned(),
+        "write".to_owned(),
+    ]);
     let profile = agent_profile(entry.clone(), directory.path(), &config);
     let mut turn_plan = plan_for(
         directory.path().to_str().expect("workspace"),
@@ -341,10 +348,474 @@ async fn deliver_exact_cycle_callback(host: &mut TurnHost) -> Vec<TurnEvent> {
 }
 
 #[tokio::test]
+async fn independent_user_input_does_not_spend_or_resume_an_old_goal_budget() {
+    for limited in [false, true] {
+        let response = vec![
+            StreamEvent::TextDelta("Independent answer.".to_owned()),
+            StreamEvent::TokenUsage {
+                input_tokens: Some(2),
+                output_tokens: Some(1),
+                reasoning_tokens: None,
+                cache_read_input_tokens: None,
+                cache_write_input_tokens: None,
+                accounting: zuno_llm::event::PromptAccounting::CacheInsideInput,
+            },
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::Stop),
+            },
+        ];
+        let (_directory, mut host, provider, _) = mock_provider_host("build", vec![response]).await;
+        host.goal_store
+            .create_goal(&host.session_id, "old unrelated objective", Some(1))
+            .unwrap();
+        if limited {
+            host.goal_store
+                .record_usage(&host.session_id, 1, 0, true)
+                .unwrap();
+        } else {
+            host.goal_store
+                .pause_with_reason(
+                    &host.session_id,
+                    zuno_goal::GoalPauseReason::UserInterruption,
+                )
+                .unwrap();
+        }
+        let before = host.goal_store.goal(&host.session_id).unwrap().unwrap();
+        drive_user(&mut host, "Answer this independent question.").await;
+        let after = host.goal_store.goal(&host.session_id).unwrap().unwrap();
+        assert_eq!(provider.calls(), 1);
+        assert_eq!(after.tokens_used, before.tokens_used);
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.goal_id, before.goal_id);
+        assert_eq!(
+            goal_usage(&host.connection, &host.session_id)
+                .unwrap()
+                .tokens,
+            3
+        );
+        host.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn proposed_goal_is_bound_and_its_blocker_settled_in_the_same_actual_turn() {
+    let (_directory, mut host, provider, _) = mock_provider_host("build", vec![
+        vec![
+            StreamEvent::ToolUseStart { id:"propose".to_owned(), name:"goal_propose".to_owned() },
+            StreamEvent::ToolInputDelta { id:"propose".to_owned(), delta:json!({
+                "objective":"Verify the supplied fixture", "success_criteria":["The required fixture passes validation"]
+            }).to_string() },
+            StreamEvent::ToolUseEnd { id:"propose".to_owned() },
+            StreamEvent::MessageEnd { stop_reason:Some(FinishReason::ToolCalls) },
+        ],
+        vec![
+            StreamEvent::ToolUseStart { id:"block".to_owned(), name:"goal_update".to_owned() },
+            StreamEvent::ToolInputDelta { id:"block".to_owned(), delta:json!({
+                "status":"blocked", "expected_revision":1, "blocking_condition":"The external fixture is missing"
+            }).to_string() },
+            StreamEvent::ToolUseEnd { id:"block".to_owned() },
+            StreamEvent::MessageEnd { stop_reason:Some(FinishReason::ToolCalls) },
+        ],
+        final_response("The blocking observation is recorded."),
+    ]).await;
+    drive_user(
+        &mut host,
+        "Propose the requested Goal and report its concrete blocker.",
+    )
+    .await;
+    assert_eq!(provider.calls(), 3);
+    let (count, streak): (i64, i64) = host.connection.query_row(
+        "SELECT count(*),max(json_extract(audit,'$.completedTurnStreak')) FROM goal_turn_audit WHERE session_id=?1",
+        [&host.session_id], |row| Ok((row.get(0)?,row.get(1)?)),
+    ).unwrap();
+    assert_eq!((count, streak), (1, 1));
+    assert_eq!(
+        host.goal_store
+            .goal(&host.session_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        GoalStatus::Active
+    );
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_file_inspection_reads_real_state_under_stop_without_a_model_or_resume() {
+    let (directory, mut host, provider, _) = mock_provider_host("build", Vec::new()).await;
+    host.goal_store
+        .create_goal(&host.session_id, "Write the requested fixture", None)
+        .unwrap();
+    let target = directory.path().join("delivered.txt");
+    provider.scripts.lock().unwrap().extend([
+        vec![
+            StreamEvent::ToolUseStart {
+                id: "native-write".to_owned(),
+                name: "write".to_owned(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "native-write".to_owned(),
+                delta: json!({
+                    "filePath":target, "content":"observed contents\n"
+                })
+                .to_string(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "native-write".to_owned(),
+            },
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::ToolCalls),
+            },
+        ],
+        final_response("The file is recorded."),
+    ]);
+    drive_user(&mut host, "Write the requested fixture.").await;
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "observed contents\n"
+    );
+    let (part_id, call_id, reported_path): (String, String, String) = host.connection.query_row(
+        "SELECT id,json_extract(data,'$.callID'),json_extract(data,'$.state.metadata.filepath') \
+         FROM part WHERE session_id=?1 AND json_extract(data,'$.tool')='write'",
+        [&host.session_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+    ).unwrap();
+    let witness: i64 = host.connection.query_row(
+        "SELECT count(*) FROM event WHERE aggregate_id=?1 AND type='native.filesystem.intent.1'",
+        [&host.session_id], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(witness, 1, "the real native tool must publish the witness");
+    // Model the native write's reported path, including Windows' canonical
+    // verbatim prefix, rather than a caller's pre-resolution spelling.
+    assert_eq!(
+        reported_path,
+        zuno_paths::wire_path(&target.canonicalize().unwrap())
+    );
+    let uncertainty = json!({"tool":"write","callID":call_id,"appliedPaths":[reported_path],
+        "cause":"lost_outcome","observedAtMs":zuno_db::message::now_millis()});
+    host.connection.execute(
+        "UPDATE part SET data=json_set(data,'$.state.status','error','$.state.outcome','uncertain', \
+         '$.state.uncertain',json(?2),'$.state.error','fixture lost final observation') WHERE id=?1",
+        rusqlite::params![part_id, uncertainty.to_string()],
+    ).unwrap();
+    let scope = zuno_db::session_work_cycle::current_in(&host.connection, &host.session_id)
+        .unwrap()
+        .unwrap();
+    host.session_control
+        .stop_turn(
+            &host.session_id,
+            &scope.cycle_id,
+            scope.active_turn_id.as_deref().unwrap(),
+            true,
+            zuno_db::message::now_millis(),
+        )
+        .unwrap();
+    host.goal_store
+        .pause_with_reason(
+            &host.session_id,
+            zuno_goal::GoalPauseReason::UncertainSideEffect,
+        )
+        .unwrap();
+    host.pause_execution(PlanPauseReason::Blocked).unwrap();
+    assert!(
+        host.pause_for_uncertain_side_effects()
+            .unwrap()
+            .blocks_execution()
+    );
+    assert_eq!(
+        execution(&host).scheduling.unwrap().readiness,
+        SessionReadiness::Paused {
+            reason: PlanPauseReason::Blocked
+        },
+        "reopening with an uncertainty debt must preserve an unrelated Blocked gate"
+    );
+    host.pause_execution(PlanPauseReason::UncertainSideEffect)
+        .unwrap();
+    let before = execution(&host);
+    let (sender, receiver) = zuno_engine::r#loop::event_channel();
+    let (result, events) = tokio::join!(
+        host.execute_session_command(SessionCommand::InspectOutcome, &part_id, sender),
+        collect_turn_events(receiver)
+    );
+    result.expect("native inspection works while the model loop is stopped");
+    let output = events
+        .iter()
+        .find_map(|event| match event {
+            TurnEvent::SessionCommandOutput {
+                command: SessionCommand::InspectOutcome,
+                content,
+            } => Some(serde_json::from_str::<Value>(content).unwrap()),
+            _ => None,
+        })
+        .expect("inspection receipt");
+    assert_eq!(output["source"], "native_file_state");
+    assert_eq!(output["actor"]["kind"], "native_control");
+    assert_eq!(output["calls"][0]["partId"], part_id);
+    assert!(output["calls"][0]["targets"][0]["sha256"].is_string());
+    assert_eq!(provider.calls(), 2);
+    assert_eq!(
+        execution(&host),
+        before,
+        "inspection must not resume execution"
+    );
+    let (outcome, inspected): (String, Option<i64>) = host.connection.query_row(
+        "SELECT json_extract(data,'$.state.outcome'),json_extract(data,'$.state.uncertain.reconciledAtMs') FROM part WHERE id=?1",
+        [&part_id], |row| Ok((row.get(0)?,row.get(1)?)),
+    ).unwrap();
+    assert_eq!(
+        outcome, "uncertain",
+        "inspection does not claim the original operation succeeded"
+    );
+    assert!(inspected.is_some());
+    let paused = host.goal_store.goal(&host.session_id).unwrap().unwrap();
+    assert_eq!(
+        paused.status,
+        GoalStatus::Paused,
+        "inspection itself is not Goal consent"
+    );
+    let request = zuno_types::goal_resume::GoalResumeRequest {
+        session_id: host.session_id.clone(),
+        goal_id: paused.goal_id,
+        expected_revision: paused.revision,
+        input_id: None,
+    };
+    let original: String = host
+        .connection
+        .query_row("SELECT data FROM part WHERE id=?1", [&part_id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let mut changed: Value = serde_json::from_str(&original).unwrap();
+    changed["state"]["uncertain"]["observedAtMs"] = json!(
+        changed["state"]["uncertain"]["observedAtMs"]
+            .as_i64()
+            .unwrap()
+            + 1
+    );
+    changed["state"]["uncertain"]["appliedPaths"] = json!(["different-target.txt"]);
+    host.connection
+        .execute(
+            "UPDATE part SET data=?2 WHERE id=?1",
+            rusqlite::params![part_id, changed.to_string()],
+        )
+        .unwrap();
+    assert!(
+        host.session_control
+            .resume_goal(&request, zuno_db::message::now_millis())
+            .is_err(),
+        "an old receipt cannot certify a changed uncertain invocation"
+    );
+    host.connection
+        .execute(
+            "UPDATE part SET data=?2 WHERE id=?1",
+            rusqlite::params![part_id, original],
+        )
+        .unwrap();
+    host.pause_execution(PlanPauseReason::Blocked).unwrap();
+    assert!(
+        host.session_control
+            .resume_goal(&request, zuno_db::message::now_millis())
+            .is_err(),
+        "inspection cannot waive an unrelated blocked gate"
+    );
+    host.pause_execution(PlanPauseReason::UncertainSideEffect)
+        .unwrap();
+    let resumed = host
+        .session_control
+        .resume_goal(&request, zuno_db::message::now_millis())
+        .expect("explicit resume follows a real completed inspection");
+    assert_eq!(resumed.goal.status, GoalStatus::Active);
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn criteria_less_changed_goal_completes_through_real_host_and_settles_its_turn() {
+    let (_directory, mut host, provider, _) = mock_provider_host(
+        "build",
+        vec![
+            vec![
+                StreamEvent::ToolUseStart {
+                    id: "complete-goal".to_owned(),
+                    name: "goal_update".to_owned(),
+                },
+                StreamEvent::ToolInputDelta {
+                    id: "complete-goal".to_owned(),
+                    delta: json!({"status":"complete","expected_revision":1}).to_string(),
+                },
+                StreamEvent::ToolUseEnd {
+                    id: "complete-goal".to_owned(),
+                },
+                StreamEvent::MessageEnd {
+                    stop_reason: Some(FinishReason::ToolCalls),
+                },
+            ],
+            final_response("The requested changes are complete."),
+        ],
+    )
+    .await;
+    let goal = host
+        .goal_store
+        .create_goal(&host.session_id, "Complete the requested change", None)
+        .unwrap();
+    host.goal_store
+        .escalate_to_change(&host.session_id, "fixture native write", 10)
+        .unwrap();
+    let events = drive_user(&mut host, "Finish the delivered change.").await;
+    assert_eq!(provider.calls(), 2);
+    assert_eq!(completed_events(&events), 1);
+    let completed = host.goal_store.goal(&host.session_id).unwrap().unwrap();
+    assert_eq!(completed.status, GoalStatus::Complete);
+    assert_eq!(completed.goal_id, goal.goal_id);
+    let audits: i64 = host
+        .connection
+        .query_row(
+            "SELECT count(*) FROM goal_turn_audit WHERE session_id=?1",
+            [&host.session_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        audits, 1,
+        "model completion must not invalidate its own host terminal audit"
+    );
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn blocker_is_counted_once_per_completed_real_goal_turn() {
+    let mut scripts = Vec::new();
+    for _ in 0..3 {
+        scripts.push(vec![
+            StreamEvent::ToolUseStart { id: "block-observation".to_owned(), name: "goal_update".to_owned() },
+            StreamEvent::ToolInputDelta { id: "block-observation".to_owned(), delta: json!({"status":"blocked","expected_revision":1,"blocking_condition":"external owner must provide the missing fixture"}).to_string() },
+            StreamEvent::ToolUseEnd { id: "block-observation".to_owned() },
+            StreamEvent::MessageEnd { stop_reason: Some(FinishReason::ToolCalls) },
+        ]);
+        scripts.push(final_response("The concrete blocker has been reported."));
+    }
+    let (_directory, mut host, provider, work) = mock_provider_host("build", scripts).await;
+    let goal = host
+        .goal_store
+        .create_goal(&host.session_id, "Work requiring an external fixture", None)
+        .unwrap();
+    work.update_items(&host.session_id, vec![serde_json::from_value(json!({
+        "action":"add", "id":"still-unfinished", "goal_id":goal.goal_id,
+        "subject":"Work retained while Goal is blocked", "description":"Do not treat this as ordinary automatic work",
+        "status":"pending", "priority":"medium"
+    })).unwrap()]).unwrap();
+    drive_user(&mut host, "Inspect and report the remaining blocker.").await;
+    assert_eq!(
+        host.goal_store
+            .goal(&host.session_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        GoalStatus::Active
+    );
+    for count in 2..=3 {
+        let (sender, receiver) = zuno_engine::r#loop::event_channel();
+        let (result, _) = tokio::join!(
+            host.continue_goal_if_idle(QueuedUserInput::Absent, sender),
+            collect_turn_events(receiver)
+        );
+        assert!(result.expect("native continuation completed"));
+        let audits: i64 = host
+            .connection
+            .query_row(
+                "SELECT count(*) FROM goal_turn_audit WHERE session_id=?1",
+                [&host.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audits, count);
+    }
+    assert_eq!(provider.calls(), 6);
+    assert_eq!(
+        host.goal_store
+            .goal(&host.session_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        GoalStatus::Blocked
+    );
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn stopped_input_allows_new_request_without_resume_or_old_plan_adoption() {
+    let (_directory, mut host, provider, work) =
+        mock_provider_host("build", vec![final_response("The new request is handled.")]).await;
+    let old_plan = seed_scripted_plan(&work, &host.session_id, false);
+    let guard = host.runs.begin_turn(host.session_id.clone()).unwrap();
+    assert!(host.runs.control(&host.session_id).abort_active(
+        zuno_engine::interrupt::HardInterruptRequest::new(
+            zuno_engine::interrupt::HardInterruptSource::Tui,
+            zuno_engine::interrupt::HardInterruptReason::UserCancel,
+        )
+    ));
+    let (sender, receiver) = zuno_engine::r#loop::event_channel();
+    let (result, _) = tokio::join!(
+        host.drive_with_message_id_and_guard(
+            "the stopped old task",
+            Some("stopped-input"),
+            &guard,
+            sender
+        ),
+        collect_turn_events(receiver)
+    );
+    result.expect("stopped user input");
+    let stopped_cycle = execution(&host).cycle_id.unwrap();
+    assert!(
+        zuno_db::session_work_cycle::is_stopped_in(
+            &host.connection,
+            &host.session_id,
+            &stopped_cycle
+        )
+        .unwrap()
+    );
+    drop(guard);
+    let events = drive_user(&mut host, "What is the current status?").await;
+    assert_eq!(provider.calls(), 1);
+    assert_eq!(completed_events(&events), 1);
+    assert_eq!(execution(&host).phase, SessionExecutionPhase::Completed);
+    assert_ne!(
+        execution(&host).cycle_id.as_deref(),
+        Some(stopped_cycle.as_str())
+    );
+    assert_eq!(work.snapshot(&host.session_id).unwrap(), old_plan);
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn new_user_query_does_not_adopt_an_old_unfinished_plan() {
+    let (_directory, mut host, provider, work) = mock_provider_host(
+        "build",
+        vec![final_response("Here is the requested status.")],
+    )
+    .await;
+    let before = seed_scripted_plan(&work, &host.session_id, false);
+    let events = drive_user(&mut host, "What is the current status?").await;
+    assert_eq!(provider.calls(), 1);
+    assert_eq!(completed_events(&events), 1);
+    assert_eq!(work.snapshot(&host.session_id).expect("work"), before);
+    assert_eq!(
+        execution(&host).phase,
+        SessionExecutionPhase::Completed,
+        "an untouched historical Plan must not become this query's work or pause it"
+    );
+    host.shutdown().await.expect("shutdown fixture");
+}
+
+#[tokio::test]
 async fn ordinary_incomplete_plan_without_goal_pauses_after_one_provider_response() {
     let (_directory, mut host, provider, work) = mock_provider_host(
         "build",
         vec![
+            vec![
+                StreamEvent::ToolUseStart { id: "adopt-plan".to_owned(), name: "plan_update".to_owned() },
+                StreamEvent::ToolInputDelta { id: "adopt-plan".to_owned(), delta: json!({"action":"patch","expected_revision":1,"title":"Current requested implementation"}).to_string() },
+                StreamEvent::ToolUseEnd { id: "adopt-plan".to_owned() },
+                StreamEvent::MessageEnd { stop_reason: Some(FinishReason::ToolCalls) },
+            ],
             final_response("The implementation summary is recorded."),
             final_response("The recorded status is unchanged."),
         ],
@@ -358,8 +829,8 @@ async fn ordinary_incomplete_plan_without_goal_pauses_after_one_provider_respons
             .is_none()
     );
     assert!(before.items.is_empty());
-    let events = drive_user(&mut host, "Summarize the current implementation.").await;
-    assert_eq!(provider.calls(), 1);
+    let events = drive_user(&mut host, "Continue the current implementation.").await;
+    assert_eq!(provider.calls(), 2);
     assert_eq!(completed_events(&events), 1);
     assert_eq!(final_messages(&host), 1);
     assert_eq!(turn_starts(&host), 1);
@@ -369,7 +840,8 @@ async fn ordinary_incomplete_plan_without_goal_pauses_after_one_provider_respons
             .expect("Goal")
             .is_none()
     );
-    assert_eq!(work.snapshot(&host.session_id).expect("work"), before);
+    let before_query = work.snapshot(&host.session_id).expect("work");
+    assert_eq!(before_query.plan.as_ref().unwrap().revision, 2);
     let paused = execution(&host);
     assert_eq!(paused.mode, CollaborationMode::Work);
     assert_eq!(paused.phase, SessionExecutionPhase::Paused);
@@ -389,7 +861,7 @@ async fn ordinary_incomplete_plan_without_goal_pauses_after_one_provider_respons
         .expect("driver");
 
     let callback_events = deliver_exact_cycle_callback(&mut host).await;
-    assert_eq!(provider.calls(), 1);
+    assert_eq!(provider.calls(), 2);
     assert_eq!(completed_events(&callback_events), 0);
     assert_eq!(final_messages(&host), 1);
     assert_eq!(turn_starts(&host), 1);
@@ -404,22 +876,16 @@ async fn ordinary_incomplete_plan_without_goal_pauses_after_one_provider_respons
     let query_events = drive_user(&mut host, "What is the current status?").await;
     assert_eq!(
         provider.calls(),
-        2,
+        3,
         "one explicit query, without an automatic follow-up"
     );
     assert_eq!(completed_events(&query_events), 1);
     assert_eq!(final_messages(&host), 2);
     let after_query = execution(&host);
-    assert_eq!(after_query.phase, SessionExecutionPhase::Paused);
-    assert_eq!(after_query.scheduling, paused.scheduling);
-    assert_eq!(after_query.cycle_id, paused.cycle_id);
+    assert_eq!(after_query.phase, SessionExecutionPhase::Completed);
+    assert_ne!(after_query.cycle_id, paused.cycle_id);
     assert_eq!(after_query.work_identity, paused.work_identity);
-    assert_eq!(
-        host.plan_reconciliation
-            .projection(&host.session_id)
-            .expect("phase"),
-        Some(phase)
-    );
+    assert_eq!(work.snapshot(&host.session_id).expect("work"), before_query);
     host.shutdown().await.expect("shutdown fixture");
 }
 
@@ -648,7 +1114,7 @@ async fn goalless_pending_question_survives_durable_context_rebuild_without_assi
     assert!(!rendered.contains("FREEFORM_RISK_MUST_NOT_ENTER_BOUNDED_CONTEXT"));
     let snapshot: Value = serde_json::from_str(rendered.lines().last().expect("snapshot JSON"))
         .expect("typed context");
-    assert_eq!(snapshot["schemaVersion"], 3);
+    assert_eq!(snapshot["schemaVersion"], 4);
     assert_eq!(snapshot["execution"]["mode"], "work");
     assert_eq!(snapshot["execution"]["phase"], "waiting");
     assert_eq!(snapshot["execution"]["cycleId"], "question-context-cycle");

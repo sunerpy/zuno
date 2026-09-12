@@ -1909,12 +1909,31 @@ impl TypedTool for PlanUpdateTool {
     async fn run(&self, params: Self::Params, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
         authorize(&ctx, PLAN_UPDATE_TOOL_ID).await?;
         let store = self.0.clone();
+        let cycle_id = ctx
+            .orchestration_snapshot()
+            .and_then(|snapshot| snapshot.cycle_id.clone());
         let session_id = ctx.session_id;
         let title = params.result_title();
-        let plan = tokio::task::spawn_blocking(move || store.mutate_plan(&session_id, params))
-            .await
-            .map_err(|error| failed(PLAN_UPDATE_TOOL_ID, error))?
-            .map_err(|error| map_error(PLAN_UPDATE_TOOL_ID, error))?;
+        let plan = tokio::task::spawn_blocking(move || {
+            let plan = store.mutate_plan(&session_id, params)?;
+            if let Some(cycle_id) = cycle_id {
+                store.pool.transaction(|tx| {
+                    zuno_db::session_work_cycle::adopt_in(
+                        tx,
+                        &session_id,
+                        &cycle_id,
+                        Some(&plan.id),
+                        [],
+                        zuno_db::message::now_millis(),
+                    )
+                    .map(|_| ())
+                })?;
+            }
+            Ok::<_, WorkStateError>(plan)
+        })
+        .await
+        .map_err(|error| failed(PLAN_UPDATE_TOOL_ID, error))?
+        .map_err(|error| map_error(PLAN_UPDATE_TOOL_ID, error))?;
         output(PLAN_UPDATE_TOOL_ID, title, "plan", Some(plan))
             .map(|output| output.with_dynamic_context_refresh(ToolDynamicContextRefresh::WorkPlan))
     }
@@ -1978,12 +1997,41 @@ impl TypedTool for TodoUpdateTool {
     async fn run(&self, params: Self::Params, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
         authorize(&ctx, TODO_UPDATE_TOOL_ID).await?;
         let store = self.0.clone();
+        let cycle_id = ctx
+            .orchestration_snapshot()
+            .and_then(|snapshot| snapshot.cycle_id.clone());
         let session_id = ctx.session_id;
-        let items =
-            tokio::task::spawn_blocking(move || store.update_items(&session_id, params.changes))
-                .await
-                .map_err(|error| failed(TODO_UPDATE_TOOL_ID, error))?
-                .map_err(|error| map_error(TODO_UPDATE_TOOL_ID, error))?;
+        let mut params = params;
+        let ids = params
+            .changes
+            .iter_mut()
+            .map(|change| match change {
+                WorkItemChange::Add { id, .. } => id
+                    .get_or_insert_with(|| format!("todo_{}", uuid::Uuid::new_v4().simple()))
+                    .clone(),
+                WorkItemChange::Update { id, .. } | WorkItemChange::Remove { id, .. } => id.clone(),
+            })
+            .collect::<Vec<_>>();
+        let items = tokio::task::spawn_blocking(move || {
+            let items = store.update_items(&session_id, params.changes)?;
+            if let Some(cycle_id) = cycle_id {
+                store.pool.transaction(|tx| {
+                    zuno_db::session_work_cycle::adopt_in(
+                        tx,
+                        &session_id,
+                        &cycle_id,
+                        None,
+                        ids,
+                        zuno_db::message::now_millis(),
+                    )
+                    .map(|_| ())
+                })?;
+            }
+            Ok::<_, WorkStateError>(items)
+        })
+        .await
+        .map_err(|error| failed(TODO_UPDATE_TOOL_ID, error))?
+        .map_err(|error| map_error(TODO_UPDATE_TOOL_ID, error))?;
         output(
             TODO_UPDATE_TOOL_ID,
             &format!("{} work items", items.len()),

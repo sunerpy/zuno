@@ -82,6 +82,7 @@ pub mod session_list;
 pub mod session_memory_policy;
 pub mod session_prune;
 pub mod session_wake;
+pub mod session_work_cycle;
 pub mod skill_candidate;
 pub mod vacuum;
 pub mod verification;

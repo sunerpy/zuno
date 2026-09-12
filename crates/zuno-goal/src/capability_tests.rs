@@ -897,6 +897,40 @@ fn a_model_written_guess_blocks_the_runs_own_completion_but_not_the_humans() {
     }
 }
 
+#[test]
+fn boundary_plain_changed_goal_keeps_capability_audit_for_both_authorities() {
+    for state in [
+        CapabilityClaimState::Inferred,
+        CapabilityClaimState::Unknown,
+    ] {
+        let fixture = Fixture::in_memory();
+        let goal = fixture
+            .store
+            .create_goal(SESSION, "configure provider", None)
+            .unwrap();
+        fixture
+            .store
+            .escalate_to_change(SESSION, "write config", goal.created_at_ms)
+            .unwrap();
+        fixture
+            .claim(state, &[], None, goal.created_at_ms + 1)
+            .unwrap();
+        for result in [
+            fixture
+                .store
+                .complete_as_model_checked(SESSION, goal.revision),
+            fixture.store.complete_checked(SESSION, goal.revision),
+        ] {
+            assert!(matches!(
+                result,
+                Err(GoalError::CapabilityUnverified { .. })
+            ));
+        }
+        assert_eq!(fixture.store.goal(SESSION).unwrap(), Some(goal));
+        assert!(fixture.store.criteria(SESSION).unwrap().is_empty());
+    }
+}
+
 /// The other direction of the same branch: a goal with no checklist and no claims is
 /// not held to evidence, because there is nothing recorded that could be verified and
 /// a run that was only ever asked a question must be able to finish.

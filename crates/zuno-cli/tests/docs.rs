@@ -1806,7 +1806,7 @@ fn database_docs_describe_the_guarded_chain_to_the_current_format() {
                 zuno_db::migration::CURRENT_FORMAT
             ),
             "Format 5",
-            "Formats 5–13",
+            "Formats 5–14",
             "`BEGIN IMMEDIATE`",
             "exact observed old format",
             "`resident_memory_provenance`",
@@ -1817,7 +1817,7 @@ fn database_docs_describe_the_guarded_chain_to_the_current_format() {
             "fails closed without modification",
             "format marker updated last",
             "A valid format-5, format-6,",
-            "format-13 database should open",
+            "format-14 database should open",
             "should open and migrate automatically",
         ],
     );
@@ -1930,7 +1930,7 @@ fn durable_state_guides_document_evidence_gated_completion() {
         "docs/guide/durable-state.md",
         &[
             "### Success criteria and evidence",
-            "cannot be completed on assertion alone",
+            "Declared success criteria remain evidence-gated",
             "`satisfy_criteria`",
             "`waive_criteria`",
             "[verification rcp_",
@@ -1938,7 +1938,7 @@ fn durable_state_guides_document_evidence_gated_completion() {
             "inferred rather than observed",
             "Evidence is bounded at both ends",
             "[goal evidence]",
-            "turns a question goal into a change goal",
+            "A file write changes the Goal's kind, not its original acceptance contract",
             "`.git/info/exclude`",
             "### Token budget",
             "around every provider request inside a turn",
@@ -1975,14 +1975,14 @@ fn durable_state_guides_document_evidence_gated_completion() {
         "docs/zh/guide/durable-state.md",
         &[
             "### 成功标准与证据",
-            "不能仅凭断言完成",
+            "已声明的成功标准仍须通过证据审计",
             "`satisfy_criteria`",
             "`waive_criteria`",
             "[verification rcp_",
             "推断得来、而非直接观测到的",
             "证据在两端都有边界",
             "[goal evidence]",
-            "转成 change Goal",
+            "文件写入会改变 Goal 的种类，不会改变它最初的验收契约",
             "`.git/info/exclude`",
             "### Token 预算",
             "每一次 provider request 前后执行",
@@ -2002,8 +2002,8 @@ fn durable_state_guides_document_evidence_gated_completion() {
             "没有可供记账的持久计数器",
             "Goal 已经结束的会话同样不受影响",
             "不会让回合停止",
-            "还会把模型已经完成的 Goal 改回暂停",
-            "响应仍然会记账到这个 Goal 上",
+            "向旧 Goal 收费或把它改回暂停",
+            "属于 Goal 的最终响应仍计入原请求所属 Goal",
             "`budget_limited` 是例外",
             "### 能力声明",
             "`capability_claim`",
@@ -2736,6 +2736,8 @@ fn uncertain_side_effect_docs_pin_the_durable_obligation_and_its_recovery_action
             "`lost_outcome` or `interrupted`",
             "A process that dies after that write",
             "does not\n  inherit the previous objective's obligations",
+            "`/inspect-outcome` is a",
+            "Report-delivery aliases do not authorize tool calls",
         ],
     );
     contains_all(
@@ -2745,6 +2747,8 @@ fn uncertain_side_effect_docs_pin_the_durable_obligation_and_its_recovery_action
             "`lost_outcome` 或 `interrupted`",
             "进程若死在这次写入之后、pause 行落盘之前",
             "所以新目标不会继承上一个目标的义务",
+            "`/inspect-outcome` 是不经过模型的原生文件检查",
+            "report-delivery alias 不授予工具调用权限",
         ],
     );
     contains_all(
@@ -2755,6 +2759,9 @@ fn uncertain_side_effect_docs_pin_the_durable_obligation_and_its_recovery_action
             "preserve the inspection obligation",
             "`interrupted` for a claim the interruption left unsettled",
             "leaves the pause missing and the obligation intact",
+            "`/inspect-outcome` lists pending part IDs",
+            "The original outcome remains `uncertain`",
+            "generic resume never writes it",
         ],
     );
     contains_all(
@@ -2765,6 +2772,22 @@ fn uncertain_side_effect_docs_pin_the_durable_obligation_and_its_recovery_action
             "不结清任何一条，因为它们都没有声称检查已经发生",
             "中断留下未结算声明是 `interrupted`",
             "pause 缺失而\n义务仍在",
+            "`/inspect-outcome` 列出待检查 part ID",
+            "通用恢复不会写入它",
+        ],
+    );
+    refuses_all(
+        "docs/guide/durable-state.md",
+        &[
+            "absent until an explicit recovery action retires the call",
+            "settle the relevant domain's reconciliation before resuming",
+        ],
+    );
+    refuses_all(
+        "docs/zh/guide/durable-state.md",
+        &[
+            "直到某个显式恢复动作结清该调用",
+            "先检查权威状态并完成相关领域的reconciliation，再恢复 Goal",
         ],
     );
 }

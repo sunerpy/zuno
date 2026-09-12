@@ -534,12 +534,59 @@ ordinary content, so it is admitted durably and steered like any other prompt
 rather than refused as an unresolvable command.
 
 Cancellation is keyed by RPC request identity, never by equal text.
-`$/cancel_request` withdraws that request's own still-pending contribution;
-`-32800` reports the withdrawal and its durable receipt. It cannot erase input
-already applied to a model request, and a duplicate-ID observer cannot withdraw
-the original contributor's input. Use `session/cancel` for an explicit
-session-wide interruption. Closing an observer, explicit withdrawal, and
+`$/cancel_request` withdraws that request's own still-pending contribution or
+interrupts the selected native input it owns, with an atomic identity check.
+`-32800` reports request withdrawal, not rollback of tool effects. It cannot erase
+input already applied to a model request, and an idempotent `messageId` observer
+cannot withdraw the original contributor's input. Reusing a JSON-RPC wire ID
+after a response creates a new internal request identity; old withdrawal state
+cannot attach to it. Client withdrawal never cancels an unrelated
+Agent-to-client request. Closing an observer, explicit withdrawal, and
 terminating the Zuno process are separate lifecycle events.
+
+### Exact cancellation extension
+
+Initialize advertises `_meta.zuno.cancellation`:
+
+```json
+{
+  "version": 1,
+  "method": "session/cancel",
+  "expectedTurnIdPath": "_meta.zuno.expectedTurnId",
+  "turnIdSource": "session/update._meta.zuno.turnId",
+  "legacySessionIdOnly": "currentTargetAtDispatch",
+  "armsNextTurn": false
+}
+```
+
+Copy the live turn identity from `params.update._meta.zuno.turnId` in a
+`session/update` notification into the cancellation notification's metadata:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "session/cancel",
+  "params": {
+    "sessionId": "ses_example",
+    "_meta": { "zuno": { "expectedTurnId": "turn_example" } }
+  }
+}
+```
+
+`expectedTurnId` is a non-empty string of at most 256 bytes. Target validation
+and signal delivery share the native registry lock. A delayed cancellation for
+T1 cannot interrupt T2; an inactive/mismatched target or invalid exact metadata
+never degrades into a session-only cancel. Notifications have no response ID:
+rejections go to stderr, while the original prompt receipt and durable updates
+report the actual outcome. A cancellation request is not proof that remote
+side effects were undone.
+
+Legacy `sessionId`-only notifications capture the current live target once at
+dispatch and do nothing while idle. They never arm the next turn. They cannot
+identify network-stale intent: a notification intended for T1 can cancel T2
+if T2 is already live when it arrives. Only clients supplying an exact identity
+receive the stronger target guarantee. Follow-up input remains prompt admission
+or `session/steer`; never cancel and resend to simulate steering.
 
 ### Delegated child sessions
 
