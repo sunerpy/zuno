@@ -204,8 +204,12 @@ impl CouncilTool {
                         )
                     });
                 let prompt = format!(
-                    "Council question:\n{}{}\nSeat `{}` instruction:\n{}\n\n{}",
-                    params.question, review_context, seat.id, seat.instruction, contract
+                    "Council question:\n{}{}\nSeat `{}` instruction:\n{}\n\nBudget: {} ms total; {} ms shared by the seat phase (including queueing and retries); {} ms reserved for synthesis. The host supplies the actual remaining deadline at attempt admission. Return focused evidence and explicit unknowns within the budget; incomplete coverage is not a passing review.\n\n{}",
+                    params.question, review_context, seat.id, seat.instruction,
+                    preset.deadline_ms,
+                    preset.deadline_ms.saturating_sub(preset.synthesis_policy.timeout_ms),
+                    preset.synthesis_policy.timeout_ms,
+                    contract
                 );
                 let description = Some(format!("{} / {}", preset.name, seat.id));
                 let plan = self
@@ -724,6 +728,7 @@ mod tests {
             );
             assert_eq!(seat.turn.workflow_node.as_deref(), Some(seat.id.as_str()));
             assert!(seat.turn.prompt.contains(SEAT_RESPONSE_CONTRACT));
+            assert!(seat.turn.prompt.contains("4000 ms shared"));
             assert!(!seat.turn.prompt.contains("Source snapshot id"));
             assert!(!seat.turn.background);
         }

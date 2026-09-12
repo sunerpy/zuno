@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rusqlite::{OptionalExtension, params};
 
@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::task::JoinSet;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 use zuno_db::inbox::{InputDelivery, NewSessionInput};
 use zuno_db::job::{
@@ -33,7 +33,7 @@ use zuno_review::{
 use zuno_tools::council::{
     CouncilHost, CouncilRequest, CouncilReviewBinding, CouncilSeatRequest, CouncilTurn,
 };
-use zuno_tools::task::{ChildTurn, ChildTurnRequest, ReportDelivery};
+use zuno_tools::task::{ChildTurn, ChildTurnRequest, ChildTurnState, ReportDelivery};
 use zuno_tools::work_state::{
     WorkItem, WorkItemChange, WorkItemPriority, WorkItemStatus, WorkStateStore,
 };
@@ -136,6 +136,9 @@ struct CouncilSeatResult {
     status: CouncilSeatStatus,
     attempts: usize,
     session_id: Option<String>,
+    /// Native settlement evidence is not a validated seat answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     verdict: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -164,6 +167,7 @@ impl CouncilSeatResult {
             status: CouncilSeatStatus::Completed,
             attempts,
             session_id: Some(session_id),
+            execution: None,
             verdict: None,
             confidence: None,
             evidence: Vec::new(),
@@ -198,6 +202,7 @@ impl CouncilSeatResult {
             status,
             attempts,
             session_id,
+            execution: None,
             verdict: None,
             confidence: None,
             evidence: Vec::new(),
@@ -251,6 +256,9 @@ impl CouncilOutcome {
             "question":request.question,
             "status":self.status.as_str(),
             "quorum":request.quorum,
+            "deadlineMs":request.deadline.as_millis(),
+            "seatPhaseMs":request.deadline.saturating_sub(request.synthesis_timeout).as_millis(),
+            "synthesisTimeoutMs":request.synthesis_timeout.as_millis(),
             "seats":self.seats,
             "synthesis":self.synthesis,
         })
@@ -286,6 +294,19 @@ impl CouncilOutcome {
                 self.message.as_deref().unwrap_or("uncertain")
             ),
         }];
+        lines.push(format!(
+            "Budget: {} ms total; {} ms shared seat phase (including admission and retries); {} ms reserved synthesis.",
+            request.deadline.as_millis(),
+            request.deadline.saturating_sub(request.synthesis_timeout).as_millis(),
+            request.synthesis_timeout.as_millis(),
+        ));
+        if self
+            .seats
+            .iter()
+            .any(|seat| seat.status == CouncilSeatStatus::TimedOut)
+        {
+            lines.push("Seat-phase expiry is a Council execution deadline, not evidence of provider unavailability. Completed calls or partial work are not a validated review; inspect the retained child evidence before choosing a narrower scope or a configured budget. Do not count self-review as quorum.".to_owned());
+        }
         for seat in &self.seats {
             lines.push(format!(
                 "\n### {} ({}) · {} · {} attempt(s)",
@@ -294,6 +315,18 @@ impl CouncilOutcome {
                 seat.status.as_str(),
                 seat.attempts
             ));
+            if let Some(session_id) = &seat.session_id {
+                lines.push(format!("Child session: {session_id}"));
+            }
+            if let Some(progress) = seat
+                .execution
+                .as_ref()
+                .and_then(|value| value.get("progress"))
+            {
+                lines.push(format!(
+                    "Native progress (not a review verdict): {progress}"
+                ));
+            }
             if let Some(report) = &seat.report {
                 lines.push(format!("Summary: {}", report.concise_summary));
                 lines.push(format!(
@@ -981,6 +1014,28 @@ impl NativeWorkflowHost {
             };
             match joined {
                 Ok((index, id, agent, elapsed_ms, Ok(turn))) => {
+                    if turn.state != ChildTurnState::Completed {
+                        run_cancellation.cancel();
+                        let confirmed = drain_cancelled(&mut tasks).await;
+                        let message = format!(
+                            "node `{id}` ended {}; child session `{}`: {}",
+                            turn.state.as_str(),
+                            turn.session_id,
+                            turn.output
+                        );
+                        let completed = ordered_results(&results);
+                        return if !confirmed
+                            || matches!(
+                                turn.state,
+                                ChildTurnState::Uncertain | ChildTurnState::Running
+                            ) {
+                            WorkflowOutcome::Uncertain { message, completed }
+                        } else if turn.state == ChildTurnState::Cancelled {
+                            WorkflowOutcome::Cancelled { message, completed }
+                        } else {
+                            WorkflowOutcome::Failed { message, completed }
+                        };
+                    }
                     completed_ids.insert(id.clone());
                     let session_id = turn.session_id;
                     results[index] = Some(NodeResult {
@@ -1151,7 +1206,7 @@ impl NativeWorkflowHost {
             while next < request.seats.len() && tasks.len() < request.max_parallel.max(1) {
                 if cancellation.is_cancelled() {
                     execution_cancellation.cancel();
-                    let confirmed = drain_council_cancelled(&mut tasks).await;
+                    let confirmed = drain_council_cancelled(&mut tasks, &mut results).await;
                     return interrupted_council_outcome(
                         request,
                         &results,
@@ -1167,7 +1222,7 @@ impl NativeWorkflowHost {
                     None,
                 ) {
                     execution_cancellation.cancel();
-                    let confirmed = drain_council_cancelled(&mut tasks).await;
+                    let confirmed = drain_council_cancelled(&mut tasks, &mut results).await;
                     let message = if confirmed {
                         format!(
                             "Council seat `{}` could not enter running state: {error}",
@@ -1227,7 +1282,7 @@ impl NativeWorkflowHost {
                 biased;
                 () = cancellation.cancelled() => {
                     execution_cancellation.cancel();
-                    let confirmed = drain_council_cancelled(&mut tasks).await;
+                    let confirmed = drain_council_cancelled(&mut tasks, &mut results).await;
                     return interrupted_council_outcome(
                         request,
                         &results,
@@ -1244,7 +1299,7 @@ impl NativeWorkflowHost {
                 Ok(joined) => joined,
                 Err(error) => {
                     execution_cancellation.cancel();
-                    let _confirmed = drain_council_cancelled(&mut tasks).await;
+                    let _confirmed = drain_council_cancelled(&mut tasks, &mut results).await;
                     return CouncilOutcome {
                         status: CouncilRunStatus::Uncertain,
                         message: Some(format!("a Council seat task was lost: {error}")),
@@ -1279,7 +1334,7 @@ impl NativeWorkflowHost {
                 tokens,
             ) {
                 execution_cancellation.cancel();
-                let confirmed = drain_council_cancelled(&mut tasks).await;
+                let confirmed = drain_council_cancelled(&mut tasks, &mut results).await;
                 results[index] = Some(result);
                 return CouncilOutcome {
                     status: CouncilRunStatus::Uncertain,
@@ -1885,7 +1940,14 @@ async fn run_council_seat(execution: CouncilSeatExecution) -> CouncilSeatResult 
             );
         }
         let attempt_cancellation = cancellation.child_token();
-        let future = runner.run(seat.turn.clone(), attempt_cancellation.clone());
+        let mut request = seat.turn.clone();
+        let remaining_ms = remaining.as_millis();
+        let deadline_unix_ms = zuno_db::message::now_millis()
+            .saturating_add(i64::try_from(remaining_ms).unwrap_or(i64::MAX));
+        request.prompt.push_str(&format!(
+            "\n<council_attempt_budget>\nAttempt {attempt}/{attempts_allowed}; at most {remaining_ms} ms remain in the shared seat phase, including admission queue, tools, provider requests and retries. Hard deadline: {deadline_unix_ms} Unix milliseconds. This deadline is enforced by the host and does not reset for this seat. Prioritize the assigned scope and concrete evidence; reserve time to return the required JSON with explicit gaps/unknowns. Do not exhaust the deadline browsing for exhaustive coverage or claim uninspected work passed.\n</council_attempt_budget>"
+        ));
+        let future = runner.run(request, attempt_cancellation.clone());
         tokio::pin!(future);
         let result = tokio::select! {
             // The runner commonly returns an error as it acknowledges cancellation. Give
@@ -1894,55 +1956,52 @@ async fn run_council_seat(execution: CouncilSeatExecution) -> CouncilSeatResult 
             biased;
             () = cancellation.cancelled() => {
                 attempt_cancellation.cancel();
-                return if timeout(CANCEL_DRAIN_TIMEOUT, &mut future).await.is_ok() {
-                    CouncilSeatResult::terminal(
-                        &seat,
-                        CouncilSeatStatus::Cancelled,
-                        attempt,
-                        last_session_id,
-                        "cancelled by the parent Council",
-                    )
-                } else {
-                    CouncilSeatResult::terminal(
-                        &seat,
-                        CouncilSeatStatus::Uncertain,
-                        attempt,
-                        last_session_id,
-                        "seat did not acknowledge cancellation before the safety timeout",
-                    )
-                };
+                return cancelled_council_seat(
+                    &seat, attempt, last_session_id,
+                    timeout(CANCEL_DRAIN_TIMEOUT, &mut future).await,
+                    CouncilSeatStatus::Cancelled, "cancelled by the parent Council",
+                );
             }
             result = timeout(remaining, &mut future) => result,
         };
         let turn = match result {
             Ok(Ok(turn)) => turn,
             Ok(Err(error)) => {
-                last_status = CouncilSeatStatus::Failed;
-                last_error = error;
-                continue;
+                // A host/provider failure is not permission to replay the child.
+                // The native provider owns bounded same-request recovery.
+                return CouncilSeatResult::terminal(
+                    &seat,
+                    CouncilSeatStatus::Failed,
+                    attempt,
+                    last_session_id,
+                    error,
+                );
             }
             Err(_) => {
                 attempt_cancellation.cancel();
-                return if timeout(CANCEL_DRAIN_TIMEOUT, &mut future).await.is_ok() {
-                    CouncilSeatResult::terminal(
-                        &seat,
-                        CouncilSeatStatus::TimedOut,
-                        attempt,
-                        last_session_id,
-                        "Council seat exceeded the seat-phase deadline",
-                    )
-                } else {
-                    CouncilSeatResult::terminal(
-                        &seat,
-                        CouncilSeatStatus::Uncertain,
-                        attempt,
-                        last_session_id,
-                        "timed-out seat did not acknowledge cancellation before the safety timeout",
-                    )
-                };
+                return cancelled_council_seat(
+                    &seat,
+                    attempt,
+                    last_session_id,
+                    timeout(CANCEL_DRAIN_TIMEOUT, &mut future).await,
+                    CouncilSeatStatus::TimedOut,
+                    "Council seat exceeded the seat-phase deadline",
+                );
             }
         };
         last_session_id = Some(turn.session_id.clone());
+        if turn.state != ChildTurnState::Completed {
+            let status = match turn.state {
+                ChildTurnState::Failed => CouncilSeatStatus::Failed,
+                ChildTurnState::Cancelled => CouncilSeatStatus::Cancelled,
+                ChildTurnState::Running | ChildTurnState::Uncertain => CouncilSeatStatus::Uncertain,
+                ChildTurnState::Completed => unreachable!("checked above"),
+            };
+            let mut result =
+                CouncilSeatResult::terminal(&seat, status, attempt, last_session_id, turn.output);
+            result.execution = turn.report_metadata;
+            return result;
+        }
         match parse_council_answer(
             &turn.output,
             output_limit,
@@ -1950,7 +2009,10 @@ async fn run_council_seat(execution: CouncilSeatExecution) -> CouncilSeatResult 
             review_source.as_ref(),
         ) {
             Ok(answer) => {
-                return CouncilSeatResult::completed(&seat, attempt, turn.session_id, answer);
+                let mut result =
+                    CouncilSeatResult::completed(&seat, attempt, turn.session_id, answer);
+                result.execution = turn.report_metadata;
+                return result;
             }
             Err(error) => {
                 last_status = CouncilSeatStatus::Invalid;
@@ -1965,6 +2027,59 @@ async fn run_council_seat(execution: CouncilSeatExecution) -> CouncilSeatResult 
         last_session_id,
         last_error,
     )
+}
+
+fn cancelled_council_seat(
+    seat: &CouncilSeatRequest,
+    attempt: usize,
+    previous_session_id: Option<String>,
+    drained: Result<Result<ChildTurn, String>, tokio::time::error::Elapsed>,
+    acknowledged_status: CouncilSeatStatus,
+    reason: &str,
+) -> CouncilSeatResult {
+    // Completion of the wait is not proof of settled execution. Only the native
+    // child's terminal state can acknowledge cancellation; retain its evidence
+    // even if it finished at the same instant as the deadline.
+    let (status, session_id, execution, error) = match drained {
+        Ok(Ok(turn)) => {
+            let uncertain = matches!(
+                turn.state,
+                ChildTurnState::Uncertain | ChildTurnState::Running
+            );
+            (
+                if uncertain {
+                    CouncilSeatStatus::Uncertain
+                } else {
+                    acknowledged_status
+                },
+                Some(turn.session_id),
+                turn.report_metadata,
+                if uncertain {
+                    format!(
+                        "{reason}; cancellation outcome requires inspection: {}",
+                        turn.output
+                    )
+                } else {
+                    reason.to_owned()
+                },
+            )
+        }
+        Ok(Err(error)) => (
+            CouncilSeatStatus::Uncertain,
+            previous_session_id,
+            None,
+            format!("{reason}; native settlement could not be confirmed: {error}"),
+        ),
+        Err(_) => (
+            CouncilSeatStatus::Uncertain,
+            previous_session_id,
+            None,
+            format!("{reason}; seat did not acknowledge cancellation before the safety timeout"),
+        ),
+    };
+    let mut result = CouncilSeatResult::terminal(seat, status, attempt, session_id, error);
+    result.execution = execution;
+    result
 }
 
 fn parse_council_answer(
@@ -2118,12 +2233,21 @@ fn synthesis_payload(
     request: &CouncilRequest,
     seats: &[CouncilSeatResult],
 ) -> Result<String, String> {
-    let payload = serde_json::to_string(&json!({
+    let mut value = json!({
         "question":request.question,
         "quorum":request.quorum,
         "seats":seats,
-    }))
-    .map_err(to_string)?;
+    });
+    // Native execution diagnostics belong to the durable result, not the bounded
+    // evidence payload. In particular, do not duplicate final text/usage/transcripts.
+    if let Some(seats) = value["seats"].as_array_mut() {
+        for seat in seats {
+            if let Some(seat) = seat.as_object_mut() {
+                seat.remove("execution");
+            }
+        }
+    }
+    let payload = serde_json::to_string(&value).map_err(to_string)?;
     if payload.len() > request.synthesis_input_bytes {
         return Err(format!(
             "structured Council synthesis input is {} bytes, exceeding the configured {}-byte bound",
@@ -2134,14 +2258,26 @@ fn synthesis_payload(
     Ok(payload)
 }
 
-async fn drain_council_cancelled(tasks: &mut JoinSet<CouncilJoin>) -> bool {
+async fn drain_council_cancelled(
+    tasks: &mut JoinSet<CouncilJoin>,
+    results: &mut [Option<CouncilSeatResult>],
+) -> bool {
+    let mut confirmed = true;
     if timeout(CANCEL_DRAIN_TIMEOUT, async {
-        while tasks.join_next().await.is_some() {}
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok((index, _, result)) => {
+                    confirmed &= result.status != CouncilSeatStatus::Uncertain;
+                    results[index] = Some(result);
+                }
+                Err(_) => confirmed = false,
+            }
+        }
     })
     .await
     .is_ok()
     {
-        return true;
+        return confirmed;
     }
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
@@ -2184,13 +2320,28 @@ fn ordered_results(results: &[Option<NodeResult>]) -> Vec<NodeResult> {
 }
 
 async fn drain_cancelled(tasks: &mut JoinSet<NodeJoin>) -> bool {
+    let mut confirmed = true;
     if timeout(CANCEL_DRAIN_TIMEOUT, async {
-        while tasks.join_next().await.is_some() {}
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok((_, _, _, _, Ok(turn))) => {
+                    confirmed &= matches!(
+                        turn.state,
+                        ChildTurnState::Completed
+                            | ChildTurnState::Failed
+                            | ChildTurnState::Cancelled
+                    );
+                }
+                // A lost task or failed settlement does not establish whether
+                // native execution (or its side effects) actually stopped.
+                _ => confirmed = false,
+            }
+        }
     })
     .await
     .is_ok()
     {
-        return true;
+        return confirmed;
     }
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}

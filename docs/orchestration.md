@@ -467,6 +467,15 @@ Use background delegation for independent research or long-running work. Keep a
 dependency on the critical path in the foreground unless the parent has other
 useful work and can reliably consume a later report.
 
+Task elapsed time includes every model request, tool call, and wait in the child.
+A provider timeout describes the request that failed and its retry recovery.
+For example, a direct `oracle` task can take 1594.7 seconds in total: nine
+model rounds succeed before its final request and retries consume 510 seconds.
+The 510 seconds is not a task-wide timeout, and an absent last provider error
+code does not erase the earlier successful requests. Inspect the child session,
+usage, and completed tools before deciding whether another task is needed.
+A terminal failed task is not automatically replayed.
+
 ## Interacting with an attached child
 
 The TUI treats each observed native child as a complete session surface rather than a
@@ -588,6 +597,46 @@ route.
 The TUI `/council` launcher adds a one-turn routing instruction that asks the
 current Agent to invoke `council_run` once in the background with `nextStep`
 delivery. The original user message and resulting job remain durable.
+
+The built-in `balanced-review` preset runs `explorer`, `librarian`, and `oracle`,
+with quorum two and up to three seats in parallel. Its time budget is:
+
+| Bound | Built-in value | Meaning |
+| --- | --- | --- |
+| Total deadline | `600000` ms (600 s) | Seats and synthesis share one run deadline |
+| Synthesis reserve | `60000` ms (60 s) | Maximum synthesis time reserved inside the total |
+| Shared seat phase | `540000` ms (540 s) | Total minus reserve; all seats and their retries share this deadline |
+
+The built-in total was previously 180 seconds, leaving only 120 seconds for
+seats. This change does not replace another preset descriptor's own bounds.
+These are frozen preset values, not `council_run` arguments or user JSON
+configuration fields. Team model-routing presets remain a separate setting.
+
+Before each seat attempt, the host adds the actual remaining hard time and UTC
+deadline to its durable task prompt. Waiting for delegation capacity consumes
+the same time; a retry does not start a fresh 540-second allowance. The seat
+should inspect evidence within the assigned scope, return supported partial
+conclusions, and identify unknowns in the required report format. It need not
+scan the whole repository to produce a useful, valid report.
+Reporting unknowns does not mark uninspected work as passed.
+
+Only a seat that completed natively but returned an invalid structured report
+may use another attempt within the preset's retry count and remaining deadline.
+Native `failed`, `cancelled`, or `uncertain` outcomes and a host `Err` do not
+replay the seat. Provider same-request recovery is a separate policy.
+
+Quorum counts accepted terminal seat reports, not successful provider requests
+or completed tool calls. A `0/2` result means no valid report against a quorum
+of two; it does not mean every provider request failed. Inspect each seat's
+outcome separately from its retained child session, usage, and progress.
+Timeout, cancellation, failure, and uncertainty do not turn that progress into
+a valid report. A timeout retains any child-session identity and usage/progress
+already recorded. Council success still requires quorum and successful
+synthesis; failed jobs are not automatically replayed.
+
+The durable Council result records `deadlineMs`, `seatPhaseMs`, and
+`synthesisTimeoutMs`. Each seat carries its `status` and `sessionId`; when
+available, `execution.progress` preserves native progress for inspection.
 
 Use Council when multiple independent perspectives should assess the same
 question. Use a workflow DAG when seats have different prompts or dependencies.

@@ -45,6 +45,28 @@ fn refuses_all(relative: &str, retired: &[&str]) {
 }
 
 #[test]
+fn council_budget_and_native_failure_evidence_are_documented_in_both_languages() {
+    for page in ["docs/orchestration.md", "docs/zh/guide/orchestration.md"] {
+        contains_all(
+            page,
+            &[
+                "600000",
+                "540000",
+                "60000",
+                "deadlineMs",
+                "seatPhaseMs",
+                "synthesisTimeoutMs",
+                "execution.progress",
+                "0/2",
+            ],
+        );
+    }
+    for page in ["docs/guide/tools.md", "docs/zh/guide/tools.md"] {
+        contains_all(page, &["<execution_progress>", "<task_result>"]);
+    }
+}
+
+#[test]
 fn session_retention_table_list_tracks_the_destructive_delete_order() {
     let text = read("docs/session-retention.md");
     let begin = text

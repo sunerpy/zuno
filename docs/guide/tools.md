@@ -34,6 +34,28 @@ Durable work state adds `plan_get`, `plan_update`, `todo_get`, `todo_update`, an
 updates apply automatically unless a review policy is explicitly configured, and
 `council_run` when the active agent can reach it.
 
+## Task, workflow, and Council outcomes
+
+Use `task` for one bounded delegation, `workflow` for a configured dependency
+graph, and `council_run` for independent reports followed by synthesis.
+Inspect the durable job and child-session evidence when one fails: successful
+model requests and completed tools can precede a timeout. Provider
+request/retry time and total task elapsed time are different measurements.
+A failed task is not automatically replayed.
+When available, its `<execution_progress>` block preserves native progress
+separately from `<task_result>`; progress alone does not attest to completion.
+
+The built-in `balanced-review` Council reserves 60 seconds of its 600-second
+total for synthesis, leaving one shared 540-second seat phase including queue
+waits and retries. Each attempt receives its remaining hard time and UTC
+deadline in the durable prompt. `0/2` counts valid terminal reports against
+quorum, not provider successes. Cancellation, failure, timeout, or uncertainty
+retain already recorded progress without turning it into a valid report;
+Council success still requires quorum and successful synthesis.
+Only a natively completed seat with an invalid structured report may use a
+bounded preset retry; a native failure or host `Err` never replays the seat.
+See [Agent orchestration](/orchestration) for scope, configuration, and recovery.
+
 ## Durable questions and waiting
 
 Questions have stable request/item IDs and a revision. TUI, HTTP, and ACP use the

@@ -357,17 +357,17 @@ const BALANCED_REVIEW_SEATS: [BuiltinCouncilSeatDescriptor; 3] = [
     BuiltinCouncilSeatDescriptor {
         id: "implementation-evidence",
         agent: "explorer",
-        instruction: "Inspect the relevant implementation and report concrete evidence, constraints, and unknowns.",
+        instruction: "Inspect only implementation paths relevant to the question. Report concrete evidence, constraints, and uninspected gaps. Do not repeat the contract or decision seat's full review.",
     },
     BuiltinCouncilSeatDescriptor {
         id: "contract-evidence",
         agent: "librarian",
-        instruction: "Inspect the relevant documented contracts and compatibility assumptions, then report evidence and gaps.",
+        instruction: "Inspect only documented contracts relevant to the question and check referenced implementation where needed. Report evidence and gaps; do not scan entire documentation or Skill libraries.",
     },
     BuiltinCouncilSeatDescriptor {
         id: "decision-review",
         agent: "oracle",
-        instruction: "Evaluate tradeoffs, failure modes, and alternatives, then recommend a decision grounded in the available evidence.",
+        instruction: "Evaluate critical tradeoffs, failure modes, and alternatives using focused evidence. Recommend a bounded conclusion with explicit unknowns; do not duplicate an exhaustive implementation or contract audit.",
     },
 ];
 
@@ -379,7 +379,9 @@ pub const COUNCILS: [BuiltinCouncilPresetDescriptor; 1] = [BuiltinCouncilPresetD
     seats: &BALANCED_REVIEW_SEATS,
     quorum: 2,
     max_parallel: 3,
-    deadline_ms: 180_000,
+    // Multi-turn repository review needs more than the old two-minute seat phase.
+    // Stay inside the existing ten-minute validated ceiling; overrides stay exact.
+    deadline_ms: 600_000,
     synthesis_timeout_ms: 60_000,
     max_retries: 1,
     seat_output_bytes: 16_384,

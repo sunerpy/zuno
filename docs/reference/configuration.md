@@ -682,6 +682,18 @@ state; set the top-level `preset` key to make a team the startup default.
 
 ## Native Council launcher
 
+The built-in `balanced-review` descriptor owns its three seats, quorum `2`,
+`max_parallel: 3`, total `deadline_ms: 600000`, and
+`synthesis_timeout_ms: 60000`. All seats share the remaining 540 seconds,
+including queue waits and retries. Only this built-in preset's total increases
+from 180 seconds; other preset descriptors retain their own values.
+
+There is currently no `council` or `councils` field in `zuno.json`, and
+`council_run` accepts no budget override. Agent model/reasoning routes and
+`concurrency.delegations` are user-configurable, but do not change the preset's
+deadline or quorum. Provider transport timeouts and retry recovery are separate
+limits. See [Council budgets and outcomes](/orchestration#council).
+
 The TUI exposes `/council` only when the active Agent's final capability
 snapshot can actually reach the native `council_run` tool. For example, the
 native `orchestrator` Agent exposes it while a non-delegating `build` Agent does

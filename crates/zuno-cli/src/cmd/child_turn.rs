@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use rusqlite::OptionalExtension as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -87,11 +88,53 @@ pub(crate) struct TaskReportMetadata {
     status: String,
     final_text: String,
     usage: TaskReportUsage,
+    progress: TaskReportProgress,
     changed_paths: Vec<String>,
     artifacts: Vec<zuno_tools::report_write::ReportArtifact>,
     verification_records: Vec<TaskVerificationRecord>,
     uncertain_side_effects: Vec<String>,
     evidence_errors: Vec<String>,
+}
+
+/// Fixed-size host diagnostics for this job, not inferred from model text.
+///
+/// Null means the durable evidence or its ownership could not be established.
+/// Request counts describe logical requests, not their individual retry attempts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskReportProgress {
+    completed_tool_calls: Option<u64>,
+    failed_tool_calls: Option<u64>,
+    completed_requests: Option<u64>,
+    failed_requests: Option<u64>,
+    last_request_id: Option<String>,
+    last_failure_kind: Option<String>,
+    elapsed_ms: Option<u64>,
+}
+
+impl TaskReportProgress {
+    fn failure_summary(&self) -> String {
+        let count =
+            |value: Option<u64>| value.map_or_else(|| "unknown".to_owned(), |n| n.to_string());
+        let mut summary = format!(
+            "Progress before failure: {} completed request(s), {} failed request(s); \
+             {} completed tool call(s), {} failed tool call(s).",
+            count(self.completed_requests),
+            count(self.failed_requests),
+            count(self.completed_tool_calls),
+            count(self.failed_tool_calls),
+        );
+        if let Some(elapsed) = self.elapsed_ms {
+            summary.push_str(&format!(" Elapsed: {elapsed} ms."));
+        }
+        if let Some(kind) = &self.last_failure_kind {
+            summary.push_str(&format!(" Last failure kind: {kind}."));
+        }
+        if let Some(id) = &self.last_request_id {
+            summary.push_str(&format!(" Last request: {id}."));
+        }
+        summary
+    }
 }
 
 struct TaskReportBuild<'a> {
@@ -1687,7 +1730,13 @@ fn settle_foreground_child(
             output,
             report_metadata: Some(report_metadata),
         }),
-        ForegroundChildOutcome::Failed(error) => Err(ChildTurnError::Host(error)),
+        ForegroundChildOutcome::Failed(error) => Ok(ChildTurn {
+            session_id: session_id.to_owned(),
+            job_id: None,
+            state: ChildTurnState::Failed,
+            output: error,
+            report_metadata: Some(report_metadata),
+        }),
         ForegroundChildOutcome::Cancelled(output) => Ok(ChildTurn {
             session_id: session_id.to_owned(),
             job_id: None,
@@ -2624,6 +2673,139 @@ fn child_answer(database: &zuno_db::pool::Pool, session_id: &str) -> Result<Stri
         .unwrap_or_default())
 }
 
+/// Read only fixed diagnostic fields. The read transaction keeps the job's
+/// upper evidence cursor and its aggregates on one snapshot during recovery.
+fn task_report_progress(
+    connection: &rusqlite::Connection,
+    job_id: Option<&str>,
+    parent_session_id: &str,
+    child_session_id: &str,
+    evidence_start_rowid: i64,
+) -> rusqlite::Result<TaskReportProgress> {
+    let Some(job_id) = job_id else {
+        return Ok(TaskReportProgress::default());
+    };
+    let snapshot = connection.unchecked_transaction()?;
+    let scope = snapshot
+        .query_row(
+            "SELECT j.evidence_start_rowid,j.time_created,j.time_completed,
+                (SELECT next.evidence_start_rowid FROM agent_job next
+                 WHERE next.parent_session_id=j.parent_session_id
+                   AND next.subject_kind='child-session'
+                   AND json_extract(next.subject_payload,'$.sessionID')=?3
+                   AND next.created_seq>j.created_seq
+                 ORDER BY next.created_seq LIMIT 1)
+             FROM agent_job j WHERE j.id=?1 AND j.parent_session_id=?2
+               AND j.subject_kind='child-session'
+               AND json_extract(j.subject_payload,'$.sessionID')=?3",
+            rusqlite::params![job_id, parent_session_id, child_session_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((after, started, completed, through)) = scope else {
+        return Ok(TaskReportProgress::default());
+    };
+    if after < 0 || after != evidence_start_rowid || through.is_some_and(|through| through < after)
+    {
+        return Ok(TaskReportProgress::default());
+    }
+    let through = through.unwrap_or(i64::MAX);
+    let (completed_tools, failed_tools) = snapshot.query_row(
+        "SELECT
+             count(CASE WHEN json_extract(data,'$.state.status')='completed' THEN 1 END),
+             count(CASE WHEN json_extract(data,'$.state.status')='error' THEN 1 END)
+         FROM part WHERE session_id=?1 AND rowid>?2 AND rowid<=?3
+           AND json_extract(data,'$.type')='tool'",
+        rusqlite::params![child_session_id, after, through],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    // Every native child drive admits a user input before sampling. Link the
+    // request's assistant to that input: a rejected request may have no assistant
+    // parts, so looking only for new assistant text would lose its failure.
+    // Selecting JSON scalar fields in SQL never reads reasoning or raw bodies.
+    let (known_requests, completed_requests, failed_requests, last_request_id, last_failure_kind) =
+        snapshot.query_row(
+            "WITH inputs AS (
+                 SELECT DISTINCT p.message_id FROM part p
+                 JOIN message m ON m.id=p.message_id AND m.session_id=p.session_id
+                 WHERE p.session_id=?1 AND p.rowid>?2 AND p.rowid<=?3
+                   AND json_extract(m.data,'$.role')='user'
+             ), requests AS (
+                 SELECT json_extract(e.data,'$.requestID') AS request_id,
+                        json_extract(e.data,'$.status') AS status,
+                        CASE WHEN json_type(e.data,'$.errorKind')='text'
+                               AND length(json_extract(e.data,'$.errorKind'))<=96
+                             THEN json_extract(e.data,'$.errorKind') END AS failure_kind,
+                        e.seq,
+                        row_number() OVER (
+                            PARTITION BY json_extract(e.data,'$.requestID')
+                            ORDER BY e.seq DESC
+                        ) AS ordinal
+                 FROM event e JOIN message m
+                   ON m.id=json_extract(e.data,'$.assistantMessageID')
+                  AND m.session_id=e.aggregate_id
+                 WHERE e.aggregate_id=?1 AND e.type='session.provider.request.1'
+                   AND json_type(e.data,'$.requestID')='text'
+                   AND json_extract(m.data,'$.role')='assistant'
+                   AND json_extract(m.data,'$.parentID') IN (SELECT message_id FROM inputs)
+             )
+             SELECT count(*),
+                    count(CASE WHEN status='completed' THEN 1 END),
+                    count(CASE WHEN status='failed' THEN 1 END),
+                    (SELECT CASE WHEN length(request_id)<=256 THEN request_id END
+                     FROM requests ORDER BY seq DESC LIMIT 1),
+                    (SELECT failure_kind FROM requests
+                     WHERE ordinal=1 AND status='failed' ORDER BY seq DESC LIMIT 1)
+             FROM requests WHERE ordinal=1",
+            rusqlite::params![child_session_id, after, through],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )?;
+    snapshot.commit()?;
+    Ok(TaskReportProgress {
+        completed_tool_calls: u64::try_from(completed_tools).ok(),
+        failed_tool_calls: u64::try_from(failed_tools).ok(),
+        completed_requests: (known_requests > 0)
+            .then(|| u64::try_from(completed_requests).ok())
+            .flatten(),
+        failed_requests: (known_requests > 0)
+            .then(|| u64::try_from(failed_requests).ok())
+            .flatten(),
+        last_request_id: last_request_id.filter(|value| {
+            !value.is_empty()
+                && value.len() <= 256
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_-.:".contains(&byte))
+        }),
+        last_failure_kind: last_failure_kind.filter(|value| {
+            !value.is_empty()
+                && value.len() <= 96
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        }),
+        elapsed_ms: completed
+            .unwrap_or_else(zuno_db::message::now_millis)
+            .checked_sub(started)
+            .and_then(|elapsed| u64::try_from(elapsed).ok()),
+    })
+}
+
 fn task_report_metadata(
     database: &zuno_db::pool::Pool,
     request: &ChildTurnRequest,
@@ -2640,12 +2822,23 @@ fn task_report_metadata(
     } = build;
     let mut evidence_errors = Vec::new();
     let mut usage = TaskReportUsage::default();
+    let mut progress = TaskReportProgress::default();
     let mut changed_paths = Vec::new();
     let mut artifacts = Vec::new();
     let mut verification_records = Vec::new();
 
     match database.open_connection() {
         Ok(connection) => {
+            match task_report_progress(
+                &connection,
+                job_id,
+                &request.parent_session_id,
+                child_session_id,
+                evidence_start_rowid,
+            ) {
+                Ok(diagnostic) => progress = diagnostic,
+                Err(_) => evidence_errors.push("progress evidence could not be read".to_owned()),
+            }
             match zuno_db::session::get(&connection, child_session_id) {
                 Ok(session) => usage = session.usage.snapshot().into(),
                 Err(error) => evidence_errors.push(format!("usage: {error}")),
@@ -2739,6 +2932,7 @@ fn task_report_metadata(
         status: status.to_owned(),
         final_text: final_text.to_owned(),
         usage,
+        progress,
         changed_paths,
         artifacts,
         verification_records,
@@ -2997,10 +3191,6 @@ impl ChildTurnHost for ChildSessionHost {
                             )
                         }
                         Err(error) => {
-                            let text = format!(
-                                "Background subagent `{background_session_id}` failed job \
-                         `{background_job_id}`: {error}"
-                            );
                             let metadata = task_report_metadata(
                                 &database,
                                 &request,
@@ -3013,6 +3203,11 @@ impl ChildTurnHost for ChildSessionHost {
                                     final_text: &error,
                                     uncertain_side_effects: Vec::new(),
                                 },
+                            );
+                            let text = format!(
+                                "Background subagent `{background_session_id}` failed job \
+                                 `{background_job_id}`: {error}\n\n{}",
+                                metadata.progress.failure_summary(),
                             );
                             (
                                 JobSettlement::failed(

@@ -577,6 +577,11 @@ Provider 条目中的类型化 `retry` 块不是 SDK option。`max_attempts` 包
 必须在窗口内完成。默认值是 3 次尝试、180 秒恢复窗口、2 秒初始延迟、30 秒最大延迟和
 20% 抖动。策略随解析后的 provider 冻结，绝不会发送给上游。
 
+请求及重试耗时与整个 child task 的墙上时间分开统计。直接 `oracle` 任务可能先成功
+完成九轮 provider 请求，最后一条请求及重试再消耗 510 秒；这个最终请求诊断不限制
+此前各轮、工具执行或整个任务的总耗时。缺少最后的 provider code 不表示此前没有
+成功的 provider 请求。
+
 流在没有终止标记的情况下结束，属于上游流不完整，而不是一次完成的回答。每个原生解码器都会
 报出携带 `upstream_stream_incomplete` 的 `ProviderError::Stream`，因此它可重试并允许替换
 已产生的部分输出：引擎发出 `RetryRollback`，丢弃被截断的流写出的内容，然后重放原样的请求。
@@ -605,6 +610,38 @@ Provider 条目中的类型化 `retry` 块不是 SDK option。`max_attempts` 包
 自动 Goal 续跑会检查 provider 真正保留的历史，而不是整个 message 表。若压缩边界从 assistant
 消息开始，导致保留后缀里没有真实 user turn，宿主会在下一轮前把 Goal objective 重新持久化为
 user anchor；合成的 compaction marker 永远不被当成用户授权。
+
+## Council 席位预算与终态
+
+第一方 pack 拥有的 `balanced-review` Council 总截止时间为 `600000` ms，
+其中预留 `60000` ms 合成；三个席位共享自 Council 开始执行起的 `540000` ms
+截止时间。这只替换内置 preset 原先的 `180000/60000` ms 分配，自定义 preset
+descriptor 保留自己的预算。Descriptor 冻结在 capability snapshot 中，用户 JSON
+配置和面向模型的工具参数均不能覆盖这些预算。
+
+每次席位尝试前，host 计算实际剩余硬时间及对应的 UTC 截止时间（Unix 毫秒），并将
+两者写入持久化任务提示。委派排队和重试消耗同一席位阶段预算。Host 的单调时钟截止时间执行硬限制，
+提示只告知时间，不授予额外时间。范围指令要求按规定报告格式优先返回有证据的局部结论
+及明确未知项，不要求扫完整个仓库。
+
+席位执行状态与报告有效性是两份事实。取消、失败、超时或不确定的席位可能已有成功
+provider 请求和已完成工具，却没有被接受的终态报告。超时结算保留已经存在的
+child session 身份与已记录的 usage/progress。Quorum 只统计有效终态报告，
+`0/2` 不等于所有 provider 请求失败。Council 成功仍要求满足 quorum 且合成成功，
+已有进展不能替代这两项要求。只有原生 `Completed` 但结构化报告 invalid 时，才允许
+在 preset 的重试次数和同一截止时间内再次尝试。原生 failed/cancelled/uncertain 结果与
+host `Err` 直接结算而不重放；provider 的同请求恢复保持独立。终态失败的 task 或
+Council 不会自动重放。
+
+状态边界采纳自本地 Codex `9ba1d9eb5bbbd87ba2fc528d91ad239eea975ee9`，不复制其超时常量。
+`codex-rs/core/src/guardian/review_session.rs:1573` 的 `run_before_review_deadline`
+区分 `TimedOut` 与外部取消的 `Aborted`；1591 行的
+`run_before_review_deadline_with_cancel` 在这两种结果下都通知所拥有的 child 取消。
+另一条观察路径 `codex-rs/core/src/tools/handlers/multi_agents/wait.rs:191` 在未观察到
+终态时返回 `timed_out`；`multi_agents_tests.rs:3196` 的
+`wait_agent_times_out_when_status_is_not_final` 验证该结果，不据此伪造远端失败。
+Zuno 保留“等待结束”和“拥有执行权的截止时间取消工作”的区别；Council 预算、
+持久 child 回执、quorum 与合成要求仍由 Zuno 自身定义。
 
 ## 文件工具的路径权威
 

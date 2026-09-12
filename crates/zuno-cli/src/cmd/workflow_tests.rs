@@ -185,6 +185,7 @@ struct RecordingRunner {
     attempts: Mutex<BTreeMap<String, usize>>,
     gates: Mutex<BTreeMap<String, Arc<tokio::sync::Semaphore>>>,
     cancel_before_success: Mutex<Option<CancellationToken>>,
+    prompts: Mutex<Vec<String>>,
 }
 
 impl RecordingRunner {
@@ -234,6 +235,18 @@ impl WorkflowNodeRunner for RecordingRunner {
         request: ChildTurnRequest,
         cancellation: CancellationToken,
     ) -> Result<ChildTurn, String> {
+        self.prompts
+            .lock()
+            .expect("prompts")
+            .push(request.prompt.clone());
+        let mut request = request;
+        // Host budget context is durable input, not part of the test runner's script.
+        request.prompt = request
+            .prompt
+            .split("\n<council_attempt_budget>")
+            .next()
+            .unwrap()
+            .to_owned();
         let label = request.description.unwrap_or_else(|| request.agent.clone());
         let attempt = {
             let mut attempts = self
@@ -252,14 +265,24 @@ impl WorkflowNodeRunner for RecordingRunner {
             .push(format!("start:{label}"));
         self.entered.notify_one();
 
-        if request.prompt == "wait" {
+        if matches!(request.prompt.as_str(), "wait" | "wait-uncertain") {
             cancellation.cancelled().await;
             self.active.fetch_sub(1, Ordering::SeqCst);
             self.events
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(format!("cancel:{label}"));
-            return Err("cancelled".to_owned());
+            return Ok(ChildTurn {
+                session_id: format!("ses_{label}_{attempt}"),
+                job_id: None,
+                state: if request.prompt == "wait-uncertain" {
+                    ChildTurnState::Uncertain
+                } else {
+                    ChildTurnState::Cancelled
+                },
+                output: "child cancellation settled".to_owned(),
+                report_metadata: Some(json!({"progress":{"completedToolCalls":13}})),
+            });
         }
 
         if request.prompt == "fail" {
@@ -307,7 +330,7 @@ impl WorkflowNodeRunner for RecordingRunner {
             parent.cancel();
         }
         let output = match request.prompt.as_str() {
-            "generic-agree" => json!({
+            "generic-agree" | "cancelled-valid" | "failed-valid" => json!({
                 "verdict":"approve",
                 "confidence":0.9,
                 "evidence":["generic Council evidence"],
@@ -371,7 +394,11 @@ impl WorkflowNodeRunner for RecordingRunner {
         Ok(ChildTurn {
             session_id: format!("ses_{label}_{attempt}"),
             job_id: None,
-            state: ChildTurnState::Completed,
+            state: match request.prompt.as_str() {
+                "cancelled-valid" => ChildTurnState::Cancelled,
+                "failed-valid" => ChildTurnState::Failed,
+                _ => ChildTurnState::Completed,
+            },
             output,
             report_metadata: None,
         })
@@ -1049,6 +1076,152 @@ async fn council_deadline_marks_the_seat_timed_out_without_synthesis() {
         job.result.as_ref().expect("result")["seats"][0]["status"],
         json!("timed_out")
     );
+    let result = job.result.as_ref().expect("result");
+    assert_eq!(result["seats"][0]["sessionId"], json!("ses_slow_1"));
+    assert_eq!(
+        result["seats"][0]["execution"]["progress"]["completedToolCalls"],
+        13
+    );
+    assert!(error.contains("not evidence of provider unavailability"));
+    assert!(error.contains("ses_slow_1"));
+    assert!(
+        fixture.runner.prompts.lock().expect("prompts")[0].contains("<council_attempt_budget>")
+    );
+}
+
+#[tokio::test]
+async fn council_noncompleted_native_child_is_never_a_valid_seat_or_replayed() {
+    for (prompt, status) in [("cancelled-valid", "cancelled"), ("failed-valid", "failed")] {
+        let fixture = Fixture::new();
+        let mut request = council_request(
+            &fixture.review_id,
+            &fixture.source_snapshot_id,
+            false,
+            vec![council_seat("terminal", "oracle", prompt)],
+            (1, 1, 1, Duration::from_secs(2)),
+        );
+        request.review = None;
+        CouncilHost::dispatch(&fixture.host, request, CancellationToken::new())
+            .await
+            .expect_err("valid-looking output cannot override the native terminal state");
+        assert!(fixture.synth.payloads.lock().expect("payloads").is_empty());
+        assert_eq!(
+            fixture.runner.attempts.lock().expect("attempts")["terminal"],
+            1
+        );
+        let job = fixture
+            .jobs
+            .list_for_parent("ses_parent")
+            .expect("jobs")
+            .into_iter()
+            .find(|job| matches!(job.subject, JobSubject::Workflow { .. }))
+            .expect("job");
+        assert_eq!(job.result.expect("result")["seats"][0]["status"], status);
+    }
+}
+
+#[tokio::test]
+async fn failed_native_workflow_node_does_not_unlock_dependents() {
+    let fixture = Fixture::new();
+    let request = fixture.request(
+        false,
+        vec![
+            node("failed", &[], "failed-valid"),
+            node("dependent", &["failed"], "agree"),
+        ],
+    );
+    WorkflowHost::dispatch(&fixture.host, request, CancellationToken::new())
+        .await
+        .expect_err("failed child cannot satisfy a dependency");
+    assert!(
+        !fixture
+            .runner
+            .events
+            .lock()
+            .expect("events")
+            .iter()
+            .any(|event| event == "start:dependent")
+    );
+}
+
+#[tokio::test]
+async fn failed_workflow_preserves_an_uncertain_sibling_cancel_outcome() {
+    let fixture = Fixture::new();
+    let request = fixture.request(
+        false,
+        vec![
+            node("failed", &[], "failed-valid"),
+            node("uncertain-sibling", &[], "wait-uncertain"),
+        ],
+    );
+    WorkflowHost::dispatch(&fixture.host, request, CancellationToken::new())
+        .await
+        .expect_err("sibling cancellation cannot be confirmed");
+    let job = fixture
+        .jobs
+        .list_for_parent("ses_parent")
+        .expect("jobs")
+        .into_iter()
+        .find(|job| matches!(job.subject, JobSubject::Workflow { .. }))
+        .expect("job");
+    assert_eq!(job.status, JobStatus::Uncertain);
+}
+
+#[tokio::test(start_paused = true)]
+async fn council_deadline_with_uncertain_child_is_not_acknowledged_cancellation() {
+    let fixture = Fixture::new();
+    let request = council_request(
+        &fixture.review_id,
+        &fixture.source_snapshot_id,
+        false,
+        vec![council_seat("uncertain", "oracle", "wait-uncertain")],
+        (1, 1, 0, Duration::from_millis(20)),
+    );
+    CouncilHost::dispatch(&fixture.host, request, CancellationToken::new())
+        .await
+        .expect_err("uncertain cancellation remains uncertain");
+    let job = fixture
+        .jobs
+        .list_for_parent("ses_parent")
+        .expect("jobs")
+        .into_iter()
+        .find(|job| matches!(job.subject, JobSubject::Workflow { .. }))
+        .expect("job");
+    assert_eq!(job.status, JobStatus::Uncertain);
+    assert_eq!(
+        job.result.expect("result")["seats"][0]["sessionId"],
+        "ses_uncertain_1"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn queued_council_seat_cannot_reset_the_shared_deadline() {
+    let fixture = Fixture::new();
+    let request = council_request(
+        &fixture.review_id,
+        &fixture.source_snapshot_id,
+        false,
+        vec![
+            council_seat("first", "explorer", "wait"),
+            council_seat("queued", "oracle", "agree"),
+        ],
+        (1, 1, 0, Duration::from_millis(20)),
+    );
+    CouncilHost::dispatch(&fixture.host, request, CancellationToken::new())
+        .await
+        .expect_err("queued work has no fresh seat allowance");
+    assert_eq!(fixture.runner.prompts.lock().expect("prompts").len(), 1);
+    let job = fixture
+        .jobs
+        .list_for_parent("ses_parent")
+        .expect("jobs")
+        .into_iter()
+        .find(|job| matches!(job.subject, JobSubject::Workflow { .. }))
+        .expect("job");
+    let result = job.result.expect("result");
+    assert_eq!(result["seats"][1]["attempts"], 0);
+    assert_eq!(result["seats"][1]["status"], "timed_out");
+    assert_eq!(result["seats"][1]["sessionId"], Value::Null);
 }
 
 #[tokio::test]
@@ -1098,6 +1271,10 @@ async fn background_council_cancellation_settles_job_and_work_items() {
     assert_eq!(
         job.result.as_ref().expect("cancelled result")["seats"][0]["status"],
         json!("cancelled")
+    );
+    assert_eq!(
+        job.result.as_ref().expect("cancelled result")["seats"][0]["sessionId"],
+        json!("ses_wait_1")
     );
     let items = fixture.work.items("ses_parent").expect("cancelled items");
     assert!(
