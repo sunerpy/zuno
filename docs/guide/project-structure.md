@@ -36,7 +36,7 @@ Every crate opts into the workspace lint policy. First-party code forbids
 | --- | --- |
 | `zuno-cli` (`zuno`) | Parses commands, resolves configuration, assembles the default harness, and owns the shipped executable |
 | `zuno-tui` | Terminal views, input handling, keybindings, themes, and rendering; it does not own an agent loop |
-| `zuno-server` | HTTP routes, authentication, SSE delivery, PTY access, and server projections |
+| `zuno-server` | Personal HTTP/SSE/PTY projections by default; Linux enterprise services behind the explicit `enterprise` feature |
 | `zuno-acp` | Agent Client Protocol adapter used by editor clients such as Zed |
 
 ### Runtime and orchestration

@@ -52,6 +52,7 @@ THREADS=${THREADS:-4}
 SUITE_TIMEOUT=${SUITE_TIMEOUT:-300}
 OFFLINE=${OFFLINE:---offline}
 RUN_DOCTESTS=${RUN_DOCTESTS:-1}
+CARGO_SURFACE=${CARGO_SURFACE:-workspace}
 # Windows commonly starts Python with a legacy console encoding such as GBK.
 # Test names and failure output are UTF-8 data, so one non-ASCII character must
 # not crash the scheduler before it writes codes.tsv and the final verdict.
@@ -84,6 +85,19 @@ if [[ -z "$PYTHON" ]]; then
   echo "Python is required to schedule the suites and parse Cargo's JSON output"
   exit 1
 fi
+
+CARGO_SCOPE_ARGS=(--workspace)
+case "$CARGO_SURFACE" in
+  workspace) ;;
+  personal)
+    scope_arguments=$("$PYTHON" "$ROOT/scripts/cargo_surface.py" args) || exit 1
+    mapfile -t CARGO_SCOPE_ARGS <<< "$scope_arguments"
+    ;;
+  *)
+    echo "CARGO_SURFACE must be workspace or personal"
+    exit 2
+    ;;
+esac
 
 rm -rf "$WORK"
 mkdir -p "$WORK/logs"
@@ -122,7 +136,7 @@ overall_start=$(date +%s.%N)
 # supported way to learn the executable paths, and the manifest directory is the
 # cwd cargo would have used.
 echo "==> building test binaries"
-if ! cargo test --workspace "${OFFLINE_ARGS[@]}" \
+if ! cargo test "${CARGO_SCOPE_ARGS[@]}" "${OFFLINE_ARGS[@]}" \
   --no-run \
   --timings \
   --message-format=json \
@@ -244,7 +258,7 @@ doctest_state=disabled
 if [[ "$RUN_DOCTESTS" == "1" ]]; then
   doctest_state=ran
   echo "==> running doctests"
-  cargo test --workspace "${OFFLINE_ARGS[@]}" \
+  cargo test "${CARGO_SCOPE_ARGS[@]}" "${OFFLINE_ARGS[@]}" \
     --doc \
     --no-fail-fast \
     2>&1 | tee "$WORK/doctests.log"

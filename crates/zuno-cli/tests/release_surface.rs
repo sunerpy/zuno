@@ -2794,13 +2794,14 @@ fn ci_reuses_bounded_compiler_snapshots_without_sharing_cargo_targets() {
     let windows_test = job_body(&ci, "windows-test").join("\n");
     let clippy_fetch = windows_clippy.find("cargo fetch --locked");
     let clippy_run = windows_clippy
-        .find("cargo clippy --locked --workspace --all-targets --timings -- -D warnings");
+        .find("python scripts/cargo_surface.py run clippy --locked --all-targets --timings -- -D warnings");
     assert!(
         clippy_fetch
             .zip(clippy_run)
             .is_some_and(|(fetch, run)| fetch < run)
     );
     assert!(!windows_clippy.contains("test-parallel.sh"));
+    assert!(windows_clippy.contains("python scripts/cargo_surface.py verify"));
     assert!(!windows_test.contains("cargo clippy"));
     for required in [
         "cargo fetch --locked",
@@ -2809,6 +2810,7 @@ fn ci_reuses_bounded_compiler_snapshots_without_sharing_cargo_targets() {
         "RUN_DOCTESTS: \"0\"",
         "CARGO_PROFILE_TEST_DEBUG: \"0\"",
         "CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: \"off\"",
+        "CARGO_SURFACE: personal",
     ] {
         assert!(
             windows_test.contains(required),

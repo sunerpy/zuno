@@ -40,3 +40,5 @@ jobs:
           "$ZUNO_POSTGRES_BINDIR/postgres" --version
       - name: Verify the PostgreSQL backend with real TLS and restricted roles
         run: python3 scripts/check_enterprise_postgres.py
+      - name: Check enterprise service code on its supported platform
+        run: cargo clippy -p zuno-server --features enterprise --all-targets -- -D warnings

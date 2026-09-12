@@ -19,12 +19,17 @@ mod auth;
 mod browser_auth;
 mod directory;
 mod discovery;
+#[cfg(feature = "enterprise")]
 pub mod enterprise_browser;
+#[cfg(feature = "enterprise")]
 pub mod enterprise_gateway;
+#[cfg(feature = "enterprise")]
 pub mod enterprise_state;
 mod event;
 mod events;
+#[cfg(feature = "enterprise")]
 pub mod gateway_configuration;
+#[cfg(feature = "enterprise")]
 pub mod gateway_execution;
 mod request_broker;
 mod server;

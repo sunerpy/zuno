@@ -239,3 +239,24 @@ test-contract explanation; no user configuration or behavior changed.
 - The full rootless Docker/PostgreSQL/HTTPS runner passed, including simulated response loss after control-plane commit, retry without duplicate events, old-lease receipts and both old-format migration/rollback fixtures. Workspace check and Clippy passed. Captured output is bounded and explicitly truncated.
 - Documentation/release checks, preview contracts, formatting and diff checks passed. Additional PostgreSQL tests verify early completion, receipt/readiness rollback and exactly one wait-completion fact.
 - Full Worker/command-dispatch consumption and a production delivery supervisor remain pending. This does not enable an enterprise runtime command or release.
+
+## Platform boundary amendment
+
+The user clarified that enterprise services require only Linux amd64/arm64;
+personal TUI/ACP and their shared runtime retain Windows support. Enterprise
+server modules and dependencies now require an explicit feature. Personal
+Windows CI selects the non-enterprise workspace surface and enterprise-only PR
+paths may skip Windows; shared or unknown changes remain conservative. The
+two-Linux-target preview artifact matrix remains unchanged. Remote CI is pending.
+Local verification passed: personal dependency graph (including build/dev edges),
+personal workspace check/Clippy, default and enterprise server builds, explicit
+enterprise PostgreSQL/HTTPS tests, 100 documentation/release tests, Python CI
+contracts, preview publisher tests, actionlint, formatting and diff checks.
+Native Windows validation will run on this shared-manifest change; enterprise-only
+changes can then skip that personal regression according to the path classifier.
+
+PR #200's first Windows scheduler run exposed CRLF translation in the Python-to-Bash
+argument stream (`--workspace` carried a trailing carriage return). A simulated
+Windows stdout regression reproduced the exact bytes before the fix. The selector
+now emits the argument protocol through binary stdout with LF delimiters; Python
+CI tests and personal dependency verification pass. Native CI is being rerun.

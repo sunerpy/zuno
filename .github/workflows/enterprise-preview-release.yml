@@ -37,6 +37,8 @@ jobs:
     needs: identify
     if: needs.identify.outputs.publish == 'true'
     uses: ./.github/workflows/ci.yml
+    with:
+      personal_checks: false
   postgres:
     needs: identify
     if: needs.identify.outputs.publish == 'true'
