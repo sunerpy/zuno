@@ -279,6 +279,10 @@ pub(crate) async fn register(
         if reference.turn_id != job.turn_id || !ids.insert(&reference.id) {
             return Err(ApplicationError::Conflict);
         }
+        super::children::activate_wait(tx, job, reference).await?;
+        if let Some(completion) = super::children::ready(tx, job, reference).await? {
+            publish(tx, job, &completion).await?;
+        }
         if let Some(completion) = approval_ready(tx, job, reference).await? {
             // The human may have answered before the Worker persisted its wait.
             // Both paths hold the same session lock, closing the lost wakeup.
@@ -342,6 +346,12 @@ pub(crate) async fn consume(
         if changed != 1 {
             return Err(ApplicationError::Conflict);
         }
+        if let WaitTarget::Child { job_id } = &completion.reference.target {
+            query("UPDATE zuno_enterprise_preview.runtime_child SET state='consumed',time_updated=$5
+                WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND parent_job_id=$4 AND state='completed'")
+                .bind(scope.owner.tenant_id.as_str()).bind(scope.owner.principal_id.as_str())
+                .bind(job_id.as_str()).bind(job.id.as_str()).bind(time).execute(&mut **tx).await.map_err(database_error)?;
+        }
     }
     Ok(())
 }
@@ -373,7 +383,7 @@ async fn wake(
     Ok(())
 }
 
-async fn publish(
+pub(super) async fn publish(
     tx: &mut Transaction<'_, Postgres>,
     job: &RuntimeJob,
     completion: &WaitCompletion,

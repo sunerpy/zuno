@@ -43,6 +43,7 @@ async fn checkpoint_phase_in(
     }
     require_consumed_input(tx, &job).await?;
     let time = database_time(tx).await?;
+    children::retire_staged(tx, &job, time).await?;
     query(
         "UPDATE zuno_enterprise_preview.runtime_job SET phase=$6,active_attempt_id=NULL,
            checkpoint=$4,checkpoint_version=checkpoint_version+1,ready_at=$5,time_updated=$5
@@ -91,6 +92,7 @@ pub(crate) async fn finish_in(
         JobFinish::Cancelled { reason } => ("cancelled", None, Some(reason)),
         JobFinish::Uncertain { reason } => ("uncertain", None, Some(reason)),
     };
+    children::retire_staged(tx, &job, time).await?;
     let settled = emit(
         tx,
         &job.principal,
@@ -105,8 +107,18 @@ pub(crate) async fn finish_in(
         "UPDATE zuno_enterprise_preview.agent_job SET status=$4,result=$5,error=$6,settled_seq=$7,time_completed=$8,time_updated=$8
          WHERE tenant_id=$1 AND principal_id=$2 AND id=$3",
     ).bind(lease.owner.tenant_id.as_str()).bind(lease.owner.principal_id.as_str()).bind(job.id.as_str())
-        .bind(phase).bind(result).bind(error).bind(settled).bind(time)
+        .bind(phase).bind(&result).bind(&error).bind(settled).bind(time)
         .execute(&mut **tx).await.map_err(database_error)?;
+    children::completed(
+        tx,
+        &job,
+        phase,
+        result.as_ref(),
+        error.as_deref(),
+        settled,
+        time,
+    )
+    .await?;
     if matches!(phase, "failed" | "cancelled") {
         let changed = query(
             "UPDATE zuno_enterprise_preview.input SET state=$4

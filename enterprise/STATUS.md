@@ -354,3 +354,17 @@ CI run 34676688599 subsequently passed all gates at `9d558b7b360289dc9d6a428bc4f
 - The full rootless-Docker fixture passed with four real executable processes, two users, eight provider requests, private Memory read/update, refresh before the next request, revocation during command-approval waits and checkpoint continuation. Both Workers participated; each approved command ran once. This is local Linux evidence; native arm64 CI and release acceptance remain required.
 - Preview documentation packaging now includes tracked guides, example configurations and licenses from the certified Git commit. A regression reproduced the old four-file-only archive; the corrected archive excludes untracked files and local edits.
 - Background extraction producers, organization-shared Memory/approval, distributed children/Workflow/Council, richer workspaces, public transcript/live projection, React/ACP clients and remaining P6 acceptance are not complete. Publication remains disabled.
+
+## P4 child storage boundary in progress
+
+- A real PostgreSQL regression confirmed that the original root-only foreign key could not retain a parent session while executing in a separate child session.
+- The format-10 migration separates these bindings and keeps the native Job identity. The real PostgreSQL suite passed the child execution-slot regression and frozen format-9 rollback/preservation test, including private Memory; all five authenticated HTTP suites also passed.
+- Child dispatch/host integration, completion production and consumption, background delivery, Workflow/Council and environment merge remain unregistered pending their complete implementations and tests.
+
+## P4 native child transactions and host seam
+
+- Added scoped child intent/definition grants, idempotent staging, atomic foreground activation with the parent checkpoint, immediate background admission, native completion envelopes and a durable parent outbox. Next-step report admission reuses the root transaction; quiet and stopped-parent behavior retain their boundaries.
+- Real PostgreSQL tests passed admission rollback, separate child slots, duplicate notifications/consumption and Worker replacement. The HTTPS fixture runs the native TaskTool through another child Worker and replacement parent, with one persisted original result and no extra model requests.
+- ChildTurnHost now distinguishes a returned result from Pending. A focused test rejected the earlier foreground-running result. Two HTTP regressions exposed the user-only input materializer and missing resumable child identity; both were fixed and the complete HTTP fixture passed.
+- Source-aware materialization checks delegation and completion records. Real regressions now pass for retiring unadmitted intents after parent cancellation and refusing two staged resumptions of the same child session. Task unit/integration, personal child-host, PostgreSQL/HTTPS and workspace Clippy checks passed.
+- Standalone executable target catalog, workspace snapshot/fork, model-option binding, full cancellation/merge and Workflow/Council assembly remain pending; the executable does not yet advertise remote task.

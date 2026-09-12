@@ -1718,6 +1718,7 @@ async fn a_fresh_delegation_creates_a_child_session_owned_by_its_parent() {
         .host
         .dispatch(fixture.request("ses_owner"), no_interrupt())
         .await
+        .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
         .expect("a fresh delegation creates a child")
         .session_id;
 
@@ -1781,6 +1782,7 @@ async fn foreground_and_background_children_inherit_revised_parent_memory_policy
             .host
             .dispatch(request, no_interrupt())
             .await
+            .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
             .expect("revised policies must not block child scheduling");
         let child = policies
             .get(&response.session_id)
@@ -2034,6 +2036,7 @@ async fn foreground_resume_refuses_a_child_with_an_unreconciled_background_job()
         .host
         .dispatch(request, no_interrupt())
         .await
+        .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
         .expect_err("the same child cannot run before reconciliation");
 
     assert!(format!("{error}").contains("job_live"), "{error}");
@@ -2050,6 +2053,7 @@ async fn foreground_dispatch_returns_the_same_host_generated_report_shape_as_bac
         .host
         .dispatch(fixture.request("ses_owner"), no_interrupt())
         .await
+        .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
         .expect("foreground delegation completes");
     let report = turn
         .report_metadata
@@ -2107,6 +2111,7 @@ async fn child_admission_links_the_job_and_report_to_the_active_plan_step() {
         .host
         .dispatch(fixture.request("ses_owner"), no_interrupt())
         .await
+        .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
         .expect("foreground delegation completes");
     let report = turn
         .report_metadata
@@ -2143,8 +2148,12 @@ async fn identical_foreground_delegations_run_once_and_create_one_child_session(
 
     let first_host = fixture.host.clone();
     let first_request = fixture.request("ses_owner");
-    let first =
-        tokio::spawn(async move { first_host.dispatch(first_request, no_interrupt()).await });
+    let first = tokio::spawn(async move {
+        first_host
+            .dispatch(first_request, no_interrupt())
+            .await
+            .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
+    });
     fixture.runner.wait_for_starts(1).await;
 
     let duplicate = tokio::time::timeout(
@@ -2190,6 +2199,7 @@ async fn sequential_foreground_duplicates_in_one_provider_attempt_run_once() {
         .host
         .dispatch(request.clone(), no_interrupt())
         .await
+        .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
         .expect("the first foreground delegation completes");
 
     fixture.runner.complete_with(Ok("must not run twice"));
@@ -2197,6 +2207,7 @@ async fn sequential_foreground_duplicates_in_one_provider_attempt_run_once() {
         .host
         .dispatch(request, no_interrupt())
         .await
+        .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
         .expect_err("the same provider attempt cannot repeat a completed logical task");
     assert!(
         duplicate
@@ -2221,8 +2232,11 @@ async fn foreground_dispatch_propagates_parent_interrupt_and_waits_for_runner_ex
     let fire = Arc::clone(&interrupt);
     let host = fixture.host.clone();
     let request = fixture.request("ses_owner");
-    let task =
-        tokio::spawn(async move { ChildTurnHost::dispatch(&host, request, interrupt).await });
+    let task = tokio::spawn(async move {
+        ChildTurnHost::dispatch(&host, request, interrupt)
+            .await
+            .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
+    });
 
     fixture.runner.wait_for_starts(1).await;
     fire.fire();
@@ -2261,8 +2275,11 @@ async fn foreground_cancellation_cannot_be_reclassified_as_successful_completion
     let fire = Arc::clone(&interrupt);
     let task_host = host.clone();
     let request = fixture.request("ses_owner");
-    let task =
-        tokio::spawn(async move { ChildTurnHost::dispatch(&task_host, request, interrupt).await });
+    let task = tokio::spawn(async move {
+        ChildTurnHost::dispatch(&task_host, request, interrupt)
+            .await
+            .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
+    });
 
     runner.started.notified().await;
     fire.fire();
@@ -2287,8 +2304,11 @@ async fn foreground_child_failure_remains_a_tool_failure_after_job_settlement() 
     fixture.session("ses_owner", None);
     let host = fixture.host.clone();
     let request = fixture.request("ses_owner");
-    let task =
-        tokio::spawn(async move { ChildTurnHost::dispatch(&host, request, no_interrupt()).await });
+    let task = tokio::spawn(async move {
+        ChildTurnHost::dispatch(&host, request, no_interrupt())
+            .await
+            .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
+    });
 
     fixture.runner.wait_for_starts(1).await;
     fixture.runner.complete_with(Err("provider failed"));
@@ -2313,8 +2333,11 @@ async fn dropping_the_outer_task_future_still_settles_the_foreground_child_job()
     fixture.session("ses_owner", None);
     let host = fixture.host.clone();
     let request = fixture.request("ses_owner");
-    let task =
-        tokio::spawn(async move { ChildTurnHost::dispatch(&host, request, no_interrupt()).await });
+    let task = tokio::spawn(async move {
+        ChildTurnHost::dispatch(&host, request, no_interrupt())
+            .await
+            .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
+    });
 
     fixture.runner.wait_for_starts(1).await;
     let jobs = fixture
@@ -2359,10 +2382,11 @@ async fn an_unresponsive_foreground_child_becomes_uncertain_after_the_cancel_dea
     .expect("build stubborn child host");
     let task_host = host.clone();
     let request = fixture.request("ses_owner");
-    let task =
-        tokio::spawn(
-            async move { ChildTurnHost::dispatch(&task_host, request, no_interrupt()).await },
-        );
+    let task = tokio::spawn(async move {
+        ChildTurnHost::dispatch(&task_host, request, no_interrupt())
+            .await
+            .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
+    });
 
     runner.started.notified().await;
     let jobs = host
@@ -2461,6 +2485,7 @@ async fn background_dispatch_returns_a_durable_active_job_before_the_child_finis
         .host
         .dispatch(request, no_interrupt())
         .await
+        .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
         .expect("background delegation is admitted");
     let job_id = turn.job_id.expect("background job id");
     assert_ne!(job_id, turn.session_id);
@@ -2544,6 +2569,7 @@ async fn an_admitted_background_child_outlives_a_parent_turn_interrupt() {
         .host
         .dispatch(request, interrupt.clone())
         .await
+        .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
         .expect("admit background child");
     let job_id = turn.job_id.expect("background job id");
     fixture.runner.wait_for_starts(1).await;
@@ -2602,6 +2628,7 @@ async fn rejected_background_logical_duplicate_leaves_no_orphan_child_session() 
         .host
         .dispatch(request, no_interrupt())
         .await
+        .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
         .expect_err("the active logical task blocks a fresh background child");
     assert!(
         duplicate
@@ -2635,11 +2662,13 @@ async fn background_children_share_the_workspace_delegation_bound() {
         .host
         .dispatch(first, no_interrupt())
         .await
+        .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
         .expect("first dispatch");
     let second = fixture
         .host
         .dispatch(second, no_interrupt())
         .await
+        .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
         .expect("second dispatch");
     fixture.runner.wait_for_starts(1).await;
     assert_eq!(
@@ -2697,11 +2726,13 @@ async fn a_queued_background_child_can_be_cancelled_without_starting() {
         .host
         .dispatch(first, no_interrupt())
         .await
+        .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
         .expect("first dispatch");
     let queued = fixture
         .host
         .dispatch(queued, no_interrupt())
         .await
+        .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
         .expect("queued dispatch");
     fixture.runner.wait_for_starts(1).await;
     let queued_job_id = queued.job_id.expect("queued job id");
@@ -2756,6 +2787,7 @@ async fn quiet_background_dispatch_persists_the_result_without_waking_the_parent
         .host
         .dispatch(request, no_interrupt())
         .await
+        .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
         .expect("dispatch");
     fixture.runner.complete_with(Ok("quiet answer"));
     fixture.jobs.wait_all().await;
@@ -2796,6 +2828,7 @@ async fn cancelling_a_native_background_job_keeps_the_host_alive_and_settles_can
         .host
         .dispatch(request, no_interrupt())
         .await
+        .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
         .expect("dispatch");
     let job_id = turn.job_id.expect("job id");
     assert!(fixture.jobs.cancel("ses_owner", &job_id));
@@ -2820,6 +2853,7 @@ async fn a_failed_background_child_is_persisted_and_reported() {
         .host
         .dispatch(request, no_interrupt())
         .await
+        .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
         .expect("dispatch");
     fixture.runner.complete_with(Err("provider failed"));
     fixture.jobs.wait_all().await;
@@ -2848,6 +2882,7 @@ async fn a_transient_parent_wake_failure_is_retried_in_the_same_process() {
         .host
         .dispatch(request, no_interrupt())
         .await
+        .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
         .expect("dispatch");
     fixture.runner.complete_with(Ok("child answer"));
     fixture.jobs.wait_all().await;
@@ -2870,6 +2905,7 @@ async fn parent_wake_is_bounded_and_the_same_report_can_be_recovered_later() {
         .host
         .dispatch(request, no_interrupt())
         .await
+        .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
         .expect("dispatch");
     fixture.runner.complete_with(Ok("child answer"));
     fixture.jobs.wait_all().await;
@@ -2913,6 +2949,7 @@ async fn a_report_left_pending_by_process_loss_is_recovered_when_the_parent_reop
         .host
         .dispatch(request, no_interrupt())
         .await
+        .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
         .expect("dispatch");
     fixture.runner.complete_with(Ok("survives restart"));
     fixture.wake.wait_for_attempts(1).await;
@@ -2974,6 +3011,7 @@ async fn recovery_keeps_a_process_owned_background_child_running() {
 
     let turn = ChildTurnHost::dispatch(&fixture.host, request, no_interrupt())
         .await
+        .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
         .expect("dispatch background child");
     let job_id = turn.job_id.expect("background child job");
     fixture.runner.wait_for_starts(1).await;
@@ -3008,6 +3046,7 @@ async fn peer_recovery_respects_a_live_owner_and_recovers_after_owner_loss() {
 
     let turn = ChildTurnHost::dispatch(&fixture.host, request, no_interrupt())
         .await
+        .and_then(zuno_tools::task::ChildTurnDispatch::into_ready)
         .expect("dispatch background child");
     let job_id = turn.job_id.expect("background child job");
     fixture.runner.wait_for_starts(1).await;

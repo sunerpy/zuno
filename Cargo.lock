@@ -8688,6 +8688,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "url",
+ "zuno-agent",
  "zuno-application",
  "zuno-auth",
  "zuno-db",

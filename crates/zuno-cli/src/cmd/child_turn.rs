@@ -41,7 +41,7 @@ use zuno_orchestration::{
 use zuno_tool::question::QuestionPort;
 use zuno_tool::{InterruptHandle, PermissionAsker};
 use zuno_tools::task::{
-    ChildTurn, ChildTurnError, ChildTurnHost, ChildTurnRequest, ChildTurnState,
+    ChildTurn, ChildTurnDispatch, ChildTurnError, ChildTurnHost, ChildTurnRequest, ChildTurnState,
     ReportDelivery as ToolReportDelivery,
 };
 use zuno_types::execution::{InputTriggerKind, WakeAdmission};
@@ -2847,19 +2847,20 @@ impl ChildTurnHost for ChildSessionHost {
         &self,
         request: ChildTurnRequest,
         interrupt: Arc<dyn InterruptHandle>,
-    ) -> Result<ChildTurn, ChildTurnError> {
+    ) -> Result<ChildTurnDispatch, ChildTurnError> {
         if !request.background {
             let cancellation = CancellationToken::new();
             let dispatch = self.dispatch_foreground(request, cancellation.clone());
             tokio::pin!(dispatch);
-            return tokio::select! {
+            return (tokio::select! {
                 biased;
                 () = interrupt.notified() => {
                     cancellation.cancel();
                     dispatch.await
                 }
                 result = &mut dispatch => result,
-            };
+            })
+            .map(ChildTurnDispatch::Ready);
         }
         if interrupt.is_set() {
             return Err(ChildTurnError::Host(
@@ -3061,7 +3062,7 @@ impl ChildTurnHost for ChildSessionHost {
             },
         );
 
-        Ok(ChildTurn {
+        Ok(ChildTurnDispatch::Ready(ChildTurn {
             session_id,
             job_id: Some(job_id),
             state: ChildTurnState::Running,
@@ -3069,7 +3070,7 @@ impl ChildTurnHost for ChildSessionHost {
                      to `reportDelivery`."
                 .to_owned(),
             report_metadata: None,
-        })
+        }))
     }
 }
 

@@ -665,6 +665,15 @@ a throwaway file.
 
 ### Delegated session projection and approval routing
 
+The host boundary now separates `ChildTurnDispatch::Ready` from a durable
+`Pending(WaitRef)`. `TaskTool::dispatch` preserves pending state for remote
+composition; foreground running text cannot settle the invocation. Local typed
+tool callers continue to receive completed output. The enterprise dispatcher
+stages the child and admits it atomically with the parent's waiting checkpoint;
+the shared driver consumes its eventual result with the next checkpoint.
+See [enterprise child dispatch](../enterprise/CHILDREN.md) for its current
+assembly and remaining workspace/Workflow work.
+
 A native delegation runs in its own child `TurnHost`; the parent tool waits for the
 foreground result but does not own the child's event channel. Interactive composition
 installs a `ChildTurnObserver` that first receives the child's durable replay and resolved

@@ -288,12 +288,12 @@ pub use crate::skill::{
 };
 
 pub use crate::task::{
-    ChildTurn, ChildTurnError, ChildTurnHost, ChildTurnRequest, DEFAULT_SUBAGENT_DEPTH,
-    DESCRIPTION as TASK_DESCRIPTION, DelegationConstraints, DelegationContract, DelegationLimits,
-    DelegationPlan, DelegationScope, FixedFacts, GENERIC_EXECUTOR, GUIDANCE_KEY, ModelFacts,
-    NoProviders, PERMISSION_KEY as TASK_PERMISSION_KEY, ProviderFacts,
-    RecordingHost as RecordingChildTurnHost, ReportDelivery, TaskParams, TaskRejection, TaskTool,
-    WIRE_ID as TASK_WIRE_ID, denial_guidance, valid_targets,
+    ChildTurn, ChildTurnDispatch, ChildTurnError, ChildTurnHost, ChildTurnRequest,
+    DEFAULT_SUBAGENT_DEPTH, DESCRIPTION as TASK_DESCRIPTION, DelegationConstraints,
+    DelegationContract, DelegationLimits, DelegationPlan, DelegationScope, FixedFacts,
+    GENERIC_EXECUTOR, GUIDANCE_KEY, ModelFacts, NoProviders, PERMISSION_KEY as TASK_PERMISSION_KEY,
+    ProviderFacts, RecordingHost as RecordingChildTurnHost, ReportDelivery, TaskDispatch,
+    TaskParams, TaskRejection, TaskTool, WIRE_ID as TASK_WIRE_ID, denial_guidance, valid_targets,
 };
 
 pub use crate::memory::{
