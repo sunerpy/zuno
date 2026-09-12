@@ -2,14 +2,23 @@ name: Enterprise client contracts
 
 on:
   workflow_call:
+    inputs:
+      include-experimental-web:
+        type: boolean
+        default: false
   workflow_dispatch:
+    inputs:
+      include-experimental-web:
+        description: Build and test the deferred experimental Web workbench
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   client:
-    name: Rust schema, SDK and Web workbench
+    name: Rust schema and SDK
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
@@ -40,14 +49,17 @@ jobs:
           npm run check:generated
           npm test
       - name: Install Web dependencies and Chromium
+        if: inputs.include-experimental-web
         working-directory: enterprise/web
         run: |
           npm ci --ignore-scripts --no-audit --no-fund
           npx playwright install --with-deps chromium
       - name: Build and verify browser recovery and accessibility
+        if: inputs.include-experimental-web
         working-directory: enterprise/web
         run: npm test
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: inputs.include-experimental-web
         with:
           name: enterprise-web-assets
           path: enterprise/web/dist/

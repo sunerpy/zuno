@@ -69,7 +69,10 @@ Entra 使用对应的 `config`。Introspection 使用 `config`、`clientId` 和
 可选 browser 配置包含 `authority`、`clientId`、`clientSecretFile`、`redirectUri`、
 `scopes`、可选 `rootCertificate` 及 `encryptionKeys`，通过 OIDC code／PKCE 和同一
 用户 verifier 登录。详见 [BFF](BROWSER.zh.md)。
-可选 [Web 工作台](WEB.zh.md) 位于 `/app/`，预览压缩包的 `web/` 目录包含已验证资源。
+实验性 [Web 工作台](WEB.zh.md) 在另行提供资源包后可挂载到 `/app/`。App 设计和 UI
+交付等待后续 Penpot 设计阶段，当前预览压缩包仅包含后端。客户端工作流继续检查 Rust
+Schema 和 SDK；客户端与 Docker 工作流中的实验浏览器检查需要显式设置
+`include-experimental-web: true`。默认 Docker 检查覆盖 Linux 两种架构的后端。
 部署静态资源不会启用其他能力，也不会放宽认证。
 
 ## 初始化与身份检查

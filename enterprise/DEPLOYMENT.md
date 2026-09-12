@@ -94,9 +94,13 @@ universal OAuth2 claims.
 An optional browser block supplies `authority`, `clientId`, `clientSecretFile`,
 `redirectUri`, `scopes`, optional `rootCertificate` and `encryptionKeys`. It uses
 OIDC code/PKCE and the same verified user policy. See [BFF contracts](BROWSER.md).
-The optional [Web workbench](WEB.md) is served at `/app/`; preview archives include
-its tested bytes under `web/`. Static resource deployment does not enable other
-enterprise routes or weaken authentication.
+The experimental [Web workbench](WEB.md) can be served at `/app/` when a separate
+bundle is supplied. App design and UI delivery are deferred until the Penpot
+design phase; current preview archives contain the backend only. The client
+contract workflow still checks Rust schemas and the SDK. Experimental browser
+checks in the client and Docker workflows require `include-experimental-web:
+true`; backend Docker checks run by default on both Linux architectures. Static
+resource deployment does not enable other routes or weaken authentication.
 
 ## Setup and identity
 
