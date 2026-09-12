@@ -103,8 +103,9 @@ authorization and budgets. Approval cannot revive a superseded lease.
 Completion payload schema 2 stores the tagged outcome. Earlier preview result
 facts remain readable and deduplicate against the same logical completion without
 rewriting the stored event. An old fact that confused approval with a tool result
-is refused. The driver checkpoint remains schema 3 and the Worker protocol remains
-version 3; completion publication is a separate state-owner port.
+is refused. The driver checkpoint remains schema 3. Worker protocol 4 carries
+compatible claims and grant lifetime; completion publication is a separate
+state-owner port.
 
 ## Storage and verification
 
@@ -121,7 +122,7 @@ budget refusal before remaining tools. The real PostgreSQL contract covers
 competing claims, independent sessions, early completion, timers, paused parents,
 cross-owner denial, failed consumption followed by checkpoint takeover, and
 failed/successful migration. The authenticated HTTPS contract carries the same
-wait and consumption through the separately versioned Worker protocol (version 3).
+wait and consumption through the separately versioned Worker protocol (version 4).
 
 These tests do not certify independently launched Workers, gateway-to-tool
 assembly, distributed child/Council orchestration or a complete enterprise UI.

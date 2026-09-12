@@ -18,14 +18,21 @@ futures = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 zuno-application = { workspace = true }
 zuno-auth = { workspace = true }
 zuno-engine = { workspace = true }
+zuno-db = { workspace = true }
+zuno-llm = { workspace = true }
+zuno-runtime = { workspace = true }
 zuno-identity = { workspace = true }
 zuno-network = { workspace = true }
 zuno-types = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

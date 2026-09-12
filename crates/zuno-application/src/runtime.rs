@@ -140,6 +140,8 @@ pub struct ClaimedJob {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct JobInput {
     pub id: InputId,
+    /// Stable database admission time, retained across Worker replacements.
+    pub created_at_ms: i64,
     pub text: String,
     pub agent: Option<String>,
     pub model: Option<JobInputModel>,

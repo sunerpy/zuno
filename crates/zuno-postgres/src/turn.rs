@@ -97,10 +97,15 @@ impl PostgresTurnPersistence {
             session_id: self.lease.session_id.to_string(),
         };
         let (mut tx, job) = self.transaction(&scope).await?;
-        let prompt:Value=query_scalar(
-            "SELECT prompt FROM zuno_enterprise_preview.input WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3 AND id=$4",
+        let input=query(
+            "SELECT prompt,time_created FROM zuno_enterprise_preview.input WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3 AND id=$4",
         ).bind(scope.owner.tenant_id.as_str()).bind(scope.owner.principal_id.as_str()).bind(&scope.session_id).bind(job.input_id.as_str())
             .fetch_one(&mut *tx).await.map_err(sql_error)?;
+        let prompt: Value = input.try_get("prompt").map_err(sql_error)?;
+        let created_at_ms: i64 = input.try_get("time_created").map_err(sql_error)?;
+        if created_at_ms < 0 {
+            return Err(TurnStateError::InvalidData.into());
+        }
         if prompt.get("kind").and_then(Value::as_str) != Some("user") {
             return Err(TurnStateError::InvalidData.into());
         }
@@ -136,6 +141,7 @@ impl PostgresTurnPersistence {
         self.commit_transaction(tx).await?;
         Ok(zuno_application::runtime::JobInput {
             id: job.input_id,
+            created_at_ms,
             text,
             agent,
             model,

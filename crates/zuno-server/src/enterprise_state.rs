@@ -21,7 +21,8 @@ use zuno_identity::worker::{
 use zuno_postgres::PostgresBackend;
 use zuno_types::identity::TenantId;
 use zuno_worker::{
-    CLAIM_PATH, ClaimRequest, GRANT_HEADER, GrantedJob, RENEW_PATH, RenewedLease, STATE_PATH,
+    CLAIM_PATH, ClaimRequest, FINISH_PATH, GRANT_HEADER, GrantedJob, RENEW_PATH, RenewedLease,
+    STATE_PATH,
 };
 
 #[derive(Clone)]
@@ -54,6 +55,7 @@ impl WorkerStateService {
             .route(&format!("/{CLAIM_PATH}"), post(claim))
             .route(&format!("/{RENEW_PATH}"), post(renew))
             .route(&format!("/{STATE_PATH}"), post(state_call))
+            .route(&format!("/{FINISH_PATH}"), post(finish))
             .layer(DefaultBodyLimit::max(MAX_WORKER_FRAME_BYTES))
             .route_layer(middleware::from_fn_with_state(self.clone(), authenticate))
             .with_state(self)
@@ -151,10 +153,17 @@ async fn claim(
     Extension(worker): Extension<AuthenticatedWorker>,
     Json(request): Json<ClaimRequest>,
 ) -> Result<Json<Option<GrantedJob>>, ApiFailure> {
+    if request.version != zuno_engine::state::wire::WORKER_PROTOCOL_VERSION {
+        return Err(ApiFailure(StatusCode::BAD_REQUEST));
+    }
     if worker.expires_at_ms().saturating_sub(now_ms()?) < 1000 {
         return Err(ApiFailure(StatusCode::UNAUTHORIZED));
     }
-    let runtime = service.backend.runtime(service.tenant.clone());
+    let runtime = service
+        .backend
+        .runtime(service.tenant.clone())
+        .with_configurations(&request.configurations)
+        .map_err(|_| ApiFailure(StatusCode::BAD_REQUEST))?;
     let Some(claimed) = runtime
         .claim(&request.worker, service.lease_duration)
         .await
@@ -187,15 +196,20 @@ async fn claim(
         return Err(state_error(error));
     }
     let input = view.primary_input().await.map_err(state_error)?;
+    let issued_at = now_ms()?;
     let grant = service
         .grants
-        .issue(&worker, &claimed.lease, now_ms()?)
+        .issue(&worker, &claimed.lease, issued_at)
         .map_err(auth_error)?;
+    let valid_for_ms =
+        u32::try_from(claimed.lease.expires_at_ms.min(worker.expires_at_ms()) - issued_at)
+            .map_err(|_| ApiFailure(StatusCode::SERVICE_UNAVAILABLE))?;
     Ok(Json(Some(GrantedJob {
         job: claimed.job,
         input,
         lease: claimed.lease,
         grant,
+        valid_for_ms,
     })))
 }
 
@@ -210,11 +224,18 @@ async fn renew(
         .renew_authorized(service.lease_duration)
         .await
         .map_err(state_error)?;
+    let issued_at = now_ms()?;
     let grant = service
         .grants
-        .issue(&worker, &lease, now_ms()?)
+        .issue(&worker, &lease, issued_at)
         .map_err(auth_error)?;
-    Ok(Json(RenewedLease { lease, grant }))
+    let valid_for_ms = u32::try_from(lease.expires_at_ms.min(worker.expires_at_ms()) - issued_at)
+        .map_err(|_| ApiFailure(StatusCode::SERVICE_UNAVAILABLE))?;
+    Ok(Json(RenewedLease {
+        lease,
+        grant,
+        valid_for_ms,
+    }))
 }
 
 async fn state_call(
@@ -238,4 +259,32 @@ async fn state_call(
         response,
     )
         .into_response())
+}
+
+async fn finish(
+    State(service): State<WorkerStateService>,
+    Extension(worker): Extension<AuthenticatedWorker>,
+    headers: HeaderMap,
+    Json(outcome): Json<JobFinish>,
+) -> Result<StatusCode, ApiFailure> {
+    let grant = service.grant(&worker, &headers)?;
+    // Successful kernel settlement already has a stronger atomic checkpoint
+    // path. This endpoint must not manufacture success without that evidence.
+    if matches!(outcome, JobFinish::Completed { .. }) {
+        return Err(ApiFailure(StatusCode::BAD_REQUEST));
+    }
+    service
+        .backend
+        .runtime(service.tenant)
+        .finish(grant.lease(), outcome)
+        .await
+        .map_err(|error| {
+            ApiFailure(match error {
+                zuno_application::ApplicationError::LeaseLost => StatusCode::CONFLICT,
+                zuno_application::ApplicationError::Forbidden => StatusCode::FORBIDDEN,
+                zuno_application::ApplicationError::Invalid(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            })
+        })?;
+    Ok(StatusCode::NO_CONTENT)
 }

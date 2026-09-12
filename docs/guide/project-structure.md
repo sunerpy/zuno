@@ -44,7 +44,7 @@ Every crate opts into the workspace lint policy. First-party code forbids
 | Crate | Responsibility |
 | --- | --- |
 | `zuno-application` | Scoped client application services and replaceable persistence ports |
-| `zuno-worker` | Authenticated Worker state transport without PostgreSQL credentials |
+| `zuno-worker` | Authenticated state/gateway transport and bounded Worker execution without PostgreSQL credentials |
 | `zuno-environment` | Rootless Docker workspace volumes, operation receipts, snapshots and output cursors |
 | `zuno-runtime` | Scoped component runtime, typed service publication, transactional profile replacement, and disposer tracking |
 | `zuno-harness` | `HarnessProfile` and `ProfileBundle` composition for the shipped runtime |

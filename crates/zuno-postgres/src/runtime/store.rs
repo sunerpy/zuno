@@ -149,13 +149,14 @@ impl RuntimeStore for PostgresRuntimeStore {
                  JOIN zuno_enterprise_preview.input i
                    ON i.tenant_id=r.tenant_id AND i.principal_id=r.principal_id AND i.id=r.input_id
                  WHERE r.tenant_id=$1 AND r.principal_id=$2 AND r.phase='ready' AND r.ready_at<=$3
+                   AND ($4::jsonb IS NULL OR r.configuration IN (SELECT value FROM jsonb_array_elements($4::jsonb)))
                    AND s.lease_job_id IS NULL AND (s.current_job_id IS NULL OR s.current_job_id=r.job_id)
                    AND ((r.checkpoint_version=0 AND i.state='queued') OR (r.checkpoint_version>0 AND i.state='consumed'))
                    AND NOT EXISTS(SELECT 1 FROM zuno_enterprise_preview.input earlier
                      WHERE earlier.tenant_id=r.tenant_id AND earlier.principal_id=r.principal_id AND earlier.session_id=r.session_id
                      AND earlier.admitted_sequence<i.admitted_sequence AND earlier.state IN('queued','steering'))
                  ORDER BY r.ready_at,i.admitted_sequence,r.job_id LIMIT 1 FOR UPDATE OF session SKIP LOCKED",
-            ).bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(time)
+            ).bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(time).bind(&self.configurations)
                 .fetch_optional(&mut *tx).await.map_err(database_error)?;
             // Empty owners advance as well, so the bounded catalog scan cannot
             // repeatedly stop before a later owner that has eligible work.

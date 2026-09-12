@@ -27,11 +27,40 @@ use crate::{database_error, database_time, owner_transaction, scoped_transaction
 pub struct PostgresRuntimeStore {
     pool: PgPool,
     tenant: TenantId,
+    configurations: Option<Value>,
 }
 
 impl PostgresRuntimeStore {
     pub(crate) fn new(pool: PgPool, tenant: TenantId) -> Self {
-        Self { pool, tenant }
+        Self {
+            pool,
+            tenant,
+            configurations: None,
+        }
+    }
+
+    /// Restrict claims before acquiring a Job. Incompatible Workers must not
+    /// settle or hold a task belonging to another installed configuration.
+    pub fn with_configurations(
+        mut self,
+        configurations: &[ConfigurationRef],
+    ) -> Result<Self, ApplicationError> {
+        if configurations.is_empty() || configurations.len() > 64 {
+            return Err(ApplicationError::Invalid(
+                "invalid Worker configuration set".to_owned(),
+            ));
+        }
+        for (index, configuration) in configurations.iter().enumerate() {
+            configuration.validate()?;
+            if configurations[..index].contains(configuration) {
+                return Err(ApplicationError::Invalid(
+                    "duplicate Worker configuration".to_owned(),
+                ));
+            }
+        }
+        self.configurations =
+            Some(serde_json::to_value(configurations).map_err(ApplicationError::storage)?);
+        Ok(self)
     }
 
     fn check_owner(&self, owner: &PrincipalKey) -> Result<(), ApplicationError> {

@@ -1,6 +1,7 @@
 //! Worker-side transport. No PostgreSQL dependency or database credentials.
 
 pub mod gateway;
+pub mod runtime;
 
 use async_trait::async_trait;
 use futures::StreamExt as _;
@@ -11,7 +12,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::io::AsyncReadExt as _;
 use url::Url;
-use zuno_application::runtime::{ExecutionLease, RuntimeJob};
+use zuno_application::runtime::{ConfigurationRef, ExecutionLease, RuntimeJob};
 use zuno_auth::Secret;
 use zuno_engine::state::remote::{RemoteTurnPersistence, StateTransport};
 use zuno_engine::state::wire::{MAX_WORKER_FRAME_BYTES, StateRequest, StateResponse};
@@ -22,6 +23,7 @@ use zuno_types::identity::WorkerInstanceId;
 pub const CLAIM_PATH: &str = "internal/worker/v1/claim";
 pub const RENEW_PATH: &str = "internal/worker/v1/renew";
 pub const STATE_PATH: &str = "internal/worker/v1/state";
+pub const FINISH_PATH: &str = "internal/worker/v1/finish";
 pub const GRANT_HEADER: &str = "x-zuno-job-grant";
 pub const GATEWAY_TICKET_PATH: &str = "internal/worker/v1/gateway-ticket";
 pub const GATEWAY_RESOLVE_PATH: &str = "internal/gateway/v1/resolve";
@@ -41,7 +43,9 @@ pub struct IssuedGatewayRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClaimRequest {
+    pub version: u32,
     pub worker: WorkerInstanceId,
+    pub configurations: Vec<ConfigurationRef>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -50,12 +54,37 @@ pub struct GrantedJob {
     pub input: zuno_application::runtime::JobInput,
     pub lease: ExecutionLease,
     pub grant: JobGrantToken,
+    /// Conservative remaining lifetime at the server's response boundary.
+    pub valid_for_ms: u32,
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RenewedLease {
     pub lease: ExecutionLease,
     pub grant: JobGrantToken,
+    pub valid_for_ms: u32,
+}
+
+struct WorkerCredential {
+    lease: ExecutionLease,
+    grant: JobGrantToken,
+    deadline: tokio::time::Instant,
+}
+
+fn grant_deadline(
+    started: tokio::time::Instant,
+    valid_for_ms: u32,
+) -> Result<tokio::time::Instant, TurnStateError> {
+    if !(1..=300_000).contains(&valid_for_ms) {
+        return Err(TurnStateError::InvalidData);
+    }
+    // Starting before the request subtracts network and server processing time.
+    // Database time still fences every mutation; this is only a local stop bound.
+    let deadline = started + Duration::from_millis(u64::from(valid_for_ms));
+    if deadline <= tokio::time::Instant::now() {
+        return Err(TurnStateError::LeaseLost);
+    }
+    Ok(deadline)
 }
 
 #[async_trait]
@@ -109,6 +138,31 @@ pub struct WorkerClient {
     tokens: Arc<dyn AccessTokenSource>,
 }
 impl WorkerClient {
+    /// Settle a failure before the kernel could record its own outcome. Unknown
+    /// effect outcomes must use Uncertain, never an optimistic success.
+    pub async fn finish(
+        &self,
+        execution: &WorkerExecution,
+        outcome: zuno_application::runtime::JobFinish,
+    ) -> Result<(), TurnStateError> {
+        outcome
+            .validate()
+            .map_err(|_| TurnStateError::InvalidData)?;
+        let grant = execution
+            .credential
+            .read()
+            .map_err(|_| TurnStateError::InvalidData)?
+            .grant
+            .clone();
+        self.post(
+            FINISH_PATH,
+            Some(&grant),
+            serde_json::to_vec(&outcome).map_err(|_| TurnStateError::InvalidData)?,
+        )
+        .await?;
+        Ok(())
+    }
+
     pub fn new(
         base: Url,
         tokens: Arc<dyn AccessTokenSource>,
@@ -207,11 +261,16 @@ impl WorkerClient {
     pub async fn claim(
         &self,
         worker: WorkerInstanceId,
+        configurations: &[ConfigurationRef],
     ) -> Result<Option<WorkerExecution>, TurnStateError> {
+        validate_configurations(configurations)?;
         let body = serde_json::to_vec(&ClaimRequest {
+            version: zuno_engine::state::wire::WORKER_PROTOCOL_VERSION,
             worker: worker.clone(),
+            configurations: configurations.to_vec(),
         })
         .map_err(|_| TurnStateError::InvalidData)?;
+        let started = tokio::time::Instant::now();
         let bytes = self.post(CLAIM_PATH, None, body).await?;
         let granted: Option<GrantedJob> =
             serde_json::from_slice(&bytes).map_err(|_| TurnStateError::InvalidData)?;
@@ -222,15 +281,17 @@ impl WorkerClient {
                     || value.lease.job_id != value.job.id
                     || value.lease.session_id != value.job.session_id
                     || value.input.id != value.job.input_id
+                    || !configurations.contains(&value.job.configuration)
                 {
                     return Err(TurnStateError::InvalidData);
                 }
                 Ok(WorkerExecution {
                     job: value.job,
                     input: value.input,
-                    credential: Arc::new(RwLock::new(RenewedLease {
+                    credential: Arc::new(RwLock::new(WorkerCredential {
                         lease: value.lease,
                         grant: value.grant,
+                        deadline: grant_deadline(started, value.valid_for_ms)?,
                     })),
                 })
             })
@@ -248,6 +309,7 @@ impl WorkerClient {
                 .map_err(|_| TurnStateError::InvalidData)?;
             (current.lease.clone(), current.grant.clone())
         };
+        let started = tokio::time::Instant::now();
         let bytes = self.post(RENEW_PATH, Some(&grant), b"{}".to_vec()).await?;
         let next: RenewedLease =
             serde_json::from_slice(&bytes).map_err(|_| TurnStateError::InvalidData)?;
@@ -262,12 +324,17 @@ impl WorkerClient {
         {
             return Err(TurnStateError::InvalidData);
         }
+        let deadline = grant_deadline(started, next.valid_for_ms)?;
         let mut current = execution
             .credential
             .write()
             .map_err(|_| TurnStateError::InvalidData)?;
         if next.lease.expires_at_ms >= current.lease.expires_at_ms {
-            *current = next;
+            *current = WorkerCredential {
+                lease: next.lease,
+                grant: next.grant,
+                deadline,
+            };
         }
         Ok(current.lease.clone())
     }
@@ -291,12 +358,33 @@ impl WorkerClient {
     }
 }
 
+pub fn validate_configurations(configurations: &[ConfigurationRef]) -> Result<(), TurnStateError> {
+    if configurations.is_empty() || configurations.len() > 64 {
+        return Err(TurnStateError::InvalidData);
+    }
+    for (index, configuration) in configurations.iter().enumerate() {
+        configuration
+            .validate()
+            .map_err(|_| TurnStateError::InvalidData)?;
+        if configurations[..index].contains(configuration) {
+            return Err(TurnStateError::InvalidData);
+        }
+    }
+    Ok(())
+}
+
 pub struct WorkerExecution {
     pub job: RuntimeJob,
     pub input: zuno_application::runtime::JobInput,
-    credential: Arc<RwLock<RenewedLease>>,
+    credential: Arc<RwLock<WorkerCredential>>,
 }
 impl WorkerExecution {
+    pub fn deadline(&self) -> Result<tokio::time::Instant, TurnStateError> {
+        self.credential
+            .read()
+            .map(|value| value.deadline)
+            .map_err(|_| TurnStateError::InvalidData)
+    }
     pub fn lease(&self) -> Result<ExecutionLease, TurnStateError> {
         self.credential
             .read()
@@ -306,7 +394,7 @@ impl WorkerExecution {
 }
 struct HttpStateTransport {
     client: WorkerClient,
-    credential: Arc<RwLock<RenewedLease>>,
+    credential: Arc<RwLock<WorkerCredential>>,
 }
 #[async_trait]
 impl StateTransport for HttpStateTransport {
@@ -322,5 +410,32 @@ impl StateTransport for HttpStateTransport {
             .post(STATE_PATH, Some(&grant), request.encode()?)
             .await?;
         StateResponse::decode(&bytes)
+    }
+}
+
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn response_time_is_subtracted_and_expired_responses_cannot_start_work() {
+        let started = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_millis(70)).await;
+        let deadline = grant_deadline(started, 100).unwrap();
+        assert_eq!(
+            deadline.duration_since(tokio::time::Instant::now()),
+            Duration::from_millis(30)
+        );
+        tokio::time::advance(Duration::from_millis(30)).await;
+        assert!(matches!(
+            grant_deadline(started, 100),
+            Err(TurnStateError::LeaseLost)
+        ));
+        for invalid in [0, 300_001, u32::MAX] {
+            assert!(matches!(
+                grant_deadline(started, invalid),
+                Err(TurnStateError::InvalidData)
+            ));
+        }
     }
 }

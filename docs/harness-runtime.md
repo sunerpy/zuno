@@ -119,8 +119,12 @@ driver checkpoints with native Job handoff/settlement in one transaction.
 In-process records are not a public Web wire protocol. The separately versioned
 Worker codec and HTTPS client now connect this port to authenticated state routes;
 service identity and signed Job scope are checked independently from current
-database authority. The Worker client has no PostgreSQL dependency. Environment
-receipts and enterprise launch/profile assembly are still required for a runnable
+database authority. The Worker client has no PostgreSQL dependency.
+`WorkerRuntime` now owns compatible claims, bounded slots and grant renewal
+around the complete advance, including initialization. Its monotonic stop bound
+subtracts request latency; database time remains authoritative. Input timestamps
+and checkpoint budgets survive Worker changes. See [Worker host](../enterprise/WORKERS.md).
+Enterprise launch/profile and tool assembly are still required for a runnable
 distributed deployment. A lost state-service acknowledgement pauses recovery;
 it never authorizes mechanical effect replay.
 
