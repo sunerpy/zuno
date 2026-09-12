@@ -47,7 +47,7 @@ A child requiring a workspace remains unclaimable until preparation is durably
 confirmed. Background dispatch also waits for this preparation before returning
 an executable Job handle.
 
-Worker protocol 8 requests `PrepareChildWorkspace` through gateway protocol 2.
+Worker protocol 9 requests `PrepareChildWorkspace` through gateway protocol 3.
 The request carries only a staged child Job ID. The control plane verifies the
 parent lease and child relation, resolves both environment specifications and
 records the workspace admission. The Worker cannot choose another volume, image,

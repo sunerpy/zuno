@@ -33,6 +33,9 @@
     "submit_turn": {
       "$ref": "#/$defs/SubmitTurn"
     },
+    "workflow": {
+      "$ref": "#/$defs/WorkflowRunView"
+    },
     "workspace": {
       "$ref": "#/$defs/WorkspaceView"
     }
@@ -48,7 +51,8 @@
     "approval",
     "answer",
     "cancel",
-    "cancellation"
+    "cancellation",
+    "workflow"
   ],
   "$defs": {
     "ApprovalAnswer": {
@@ -290,6 +294,19 @@
       "minLength": 1,
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
     },
+    "InvocationState": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "waiting",
+        "running",
+        "succeeded",
+        "failed",
+        "denied",
+        "cancelled",
+        "uncertain"
+      ]
+    },
     "JobId": {
       "type": "string",
       "maxLength": 128,
@@ -375,6 +392,50 @@
       "required": [
         "invocationId",
         "target"
+      ]
+    },
+    "NodeRunId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "NodeRunView": {
+      "type": "object",
+      "properties": {
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "id": {
+          "$ref": "#/$defs/NodeRunId"
+        },
+        "jobId": {
+          "$ref": "#/$defs/JobId"
+        },
+        "nodeId": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/InvocationState"
+        },
+        "waits": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobWaitView"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "nodeId",
+        "jobId",
+        "state",
+        "dependsOn",
+        "waits"
       ]
     },
     "OperationId": {
@@ -619,6 +680,55 @@
             "deadline_ms"
           ]
         }
+      ]
+    },
+    "WorkflowRunId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "WorkflowRunView": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/WorkflowRunId"
+        },
+        "jobId": {
+          "$ref": "#/$defs/JobId"
+        },
+        "name": {
+          "type": "string"
+        },
+        "nodes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/NodeRunView"
+          }
+        },
+        "state": {
+          "$ref": "#/$defs/WorkflowState"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "jobId",
+        "state",
+        "name",
+        "nodes"
+      ]
+    },
+    "WorkflowState": {
+      "type": "string",
+      "enum": [
+        "preparing",
+        "prepared",
+        "active",
+        "completed",
+        "failed",
+        "cancelled",
+        "uncertain"
       ]
     },
     "WorkspaceId": {

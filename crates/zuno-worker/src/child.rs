@@ -230,12 +230,12 @@ impl PermissionAsker for DelegationPermission {
 #[derive(Clone)]
 pub struct ChildToolDispatcher {
     inner: Arc<dyn ToolDispatcher>,
-    client: WorkerClient,
-    execution: WorkerExecution,
+    pub(crate) client: WorkerClient,
+    pub(crate) execution: WorkerExecution,
     targets: BTreeMap<String, ChildToolTarget>,
     maximum_depth: u32,
     definition: ToolDefinition,
-    gateway: Option<Arc<crate::gateway::GatewayClient>>,
+    pub(crate) gateway: Option<Arc<crate::gateway::GatewayClient>>,
 }
 #[derive(Clone)]
 pub struct ChildToolTarget {
@@ -282,6 +282,36 @@ impl ChildToolDispatcher {
             definition,
             gateway: None,
         })
+    }
+    pub(crate) fn planner(
+        &self,
+        invocation: InvocationId,
+        digest: String,
+        args: Value,
+    ) -> TaskTool {
+        let host = Arc::new(RemoteChildHost {
+            client: self.client.clone(),
+            execution: self.execution.clone(),
+            invocation_id: invocation,
+            arguments_sha256: digest,
+            presentation: args,
+            gateway: self.gateway.clone(),
+        });
+        let mut facts = FixedFacts::new();
+        for target in self.targets.values() {
+            facts = facts.with(&target.model, target.facts.clone());
+        }
+        let mut tool = TaskTool::new(host, Arc::new(facts))
+            .with_targets(
+                DelegationTargets::new(self.targets.keys().cloned()).expect("validated targets"),
+            )
+            .with_limits(DelegationLimits {
+                subagent_depth: self.maximum_depth,
+            });
+        for (agent, target) in &self.targets {
+            tool = tool.with_agent_override(agent, ModelChoice::new(&target.model));
+        }
+        tool
     }
     pub fn with_workspace_gateway(mut self, gateway: Arc<crate::gateway::GatewayClient>) -> Self {
         self.gateway = Some(gateway);
@@ -343,28 +373,7 @@ impl ToolDispatcher for ChildToolDispatcher {
                 );
             }
         };
-        let host = Arc::new(RemoteChildHost {
-            client: self.client.clone(),
-            execution: self.execution.clone(),
-            invocation_id: id,
-            arguments_sha256: digest,
-            presentation: args,
-            gateway: self.gateway.clone(),
-        });
-        let mut facts = FixedFacts::new();
-        for target in self.targets.values() {
-            facts = facts.with(&target.model, target.facts.clone());
-        }
-        let mut tool = TaskTool::new(host, Arc::new(facts))
-            .with_targets(
-                DelegationTargets::new(self.targets.keys().cloned()).expect("validated targets"),
-            )
-            .with_limits(DelegationLimits {
-                subagent_depth: self.maximum_depth,
-            });
-        for (agent, target) in &self.targets {
-            tool = tool.with_agent_override(agent, ModelChoice::new(&target.model));
-        }
+        let tool = self.planner(id, digest, args);
         let mut context = ToolContext::new_scoped(
             request.session_id,
             request.message_id,

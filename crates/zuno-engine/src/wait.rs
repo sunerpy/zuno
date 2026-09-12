@@ -104,11 +104,21 @@ impl WaitCompletion {
             self.reference.target,
             zuno_types::wait::WaitTarget::Approval { .. }
         );
+        let external = matches!(
+            self.reference.target,
+            zuno_types::wait::WaitTarget::Child { .. }
+                | zuno_types::wait::WaitTarget::Operation { .. }
+        );
         match &self.outcome {
             WaitOutcome::RecheckInvocation if !approval => return Err(TurnStateError::InvalidData),
             WaitOutcome::ToolResult { result }
                 if approval
-                    || result.uncertain.is_some()
+                    || (result.uncertain.is_some()
+                        && (!external
+                            || !result.is_error
+                            || result.recovery.is_some()
+                            || result.blocked.is_some()
+                            || result.interruption.is_some()))
                     || result.output.continuation
                         == zuno_tool::ToolContinuation::WaitingForHuman
                     || (result.blocked.is_some()

@@ -13,22 +13,22 @@ use zuno_application::child::{
 use zuno_types::identity::WaitId;
 use zuno_types::wait::{WaitContinuation, WaitRef, WaitTarget};
 
-struct ChildRecord {
-    invocation: ChildInvocation,
-    ticket: ChildDispatch,
-    parent_job_id: JobId,
-    parent_session_id: SessionId,
-    configuration: ConfigurationRef,
-    selection: zuno_application::runtime::JobInputSelection,
-    state: String,
-    depth_limit: u32,
+pub(super) struct ChildRecord {
+    pub(super) invocation: ChildInvocation,
+    pub(super) ticket: ChildDispatch,
+    pub(super) parent_job_id: JobId,
+    pub(super) parent_session_id: SessionId,
+    pub(super) configuration: ConfigurationRef,
+    pub(super) selection: zuno_application::runtime::JobInputSelection,
+    pub(super) state: String,
+    pub(super) depth_limit: u32,
 }
 
 fn invalid(message: &str) -> ApplicationError {
     ApplicationError::Invalid(message.to_owned())
 }
 
-async fn read(
+pub(super) async fn read(
     tx: &mut Transaction<'_, Postgres>,
     owner: &PrincipalKey,
     id: &JobId,
@@ -138,117 +138,137 @@ impl ChildDispatchStore for PostgresRuntimeStore {
         {
             return Err(ApplicationError::Forbidden);
         }
-        let mut intent = json!([&invocation, grant.parent, grant.child, grant.selection]);
-        if grant.workspace != ChildWorkspacePolicy::ModelOnly {
-            intent = json!([intent, grant.workspace]);
-        }
-        let digest = zuno_orchestration::sha256_json(&intent);
-        let existing = query(
-            "SELECT job_id,request_digest FROM zuno_enterprise_preview.runtime_child
-            WHERE tenant_id=$1 AND principal_id=$2 AND parent_job_id=$3 AND invocation_id=$4",
-        )
-        .bind(lease.owner.tenant_id.as_str())
-        .bind(lease.owner.principal_id.as_str())
-        .bind(parent.id.as_str())
-        .bind(invocation.invocation_id.as_str())
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(database_error)?;
-        if let Some(existing) = existing {
-            if existing
-                .try_get::<String, _>("request_digest")
-                .map_err(database_error)?
-                != digest
-            {
-                return Err(ApplicationError::Conflict);
-            }
-            let id = JobId::new(
-                existing
-                    .try_get::<String, _>("job_id")
-                    .map_err(database_error)?,
-            )
-            .map_err(ApplicationError::storage)?;
-            let record = read(&mut tx, &lease.owner, &id).await?;
-            if record.state == "cancelled" {
-                return Err(ApplicationError::Conflict);
-            }
-            if record.state == "staged"
-                && invocation.delivery != ChildDelivery::Foreground
-                && record.ticket.workspace != ChildWorkspaceState::Pending
-            {
-                activate(&mut tx, &parent, &record).await?;
-            }
-            let ticket = record.ticket;
-            tx.commit().await.map_err(database_error)?;
-            return Ok(ticket);
-        }
-        let depth = depth_in(&mut tx, &lease.owner, &parent.session_id).await?;
-        let inherited:i32=query_scalar("SELECT delegation_depth_limit FROM zuno_enterprise_preview.session WHERE tenant_id=$1 AND principal_id=$2 AND id=$3")
-            .bind(lease.owner.tenant_id.as_str()).bind(lease.owner.principal_id.as_str()).bind(parent.session_id.as_str())
-            .fetch_one(&mut *tx).await.map_err(database_error)?;
-        let depth_limit = grant
-            .maximum_depth
-            .min(u32::try_from(inherited).map_err(ApplicationError::storage)?);
-        if depth >= depth_limit {
-            return Err(ApplicationError::Forbidden);
-        }
-        let count:i64 = query_scalar("SELECT count(*) FROM zuno_enterprise_preview.runtime_child WHERE tenant_id=$1 AND principal_id=$2 AND parent_job_id=$3")
-            .bind(lease.owner.tenant_id.as_str()).bind(lease.owner.principal_id.as_str()).bind(parent.id.as_str())
-            .fetch_one(&mut *tx).await.map_err(database_error)?;
-        if count >= i64::from(grant.maximum_children) {
-            return Err(ApplicationError::Forbidden);
-        }
-        if let Some(session) = &invocation.resume_session_id {
-            resume_allowed(&mut tx, &parent, session).await?;
-        }
-        let key = zuno_orchestration::sha256_json(&json!([
-            "child-job",
-            lease.owner,
-            parent.id,
-            invocation.invocation_id
-        ]));
-        let id = JobId::new(format!("job_{key}")).map_err(ApplicationError::storage)?;
-        let session_id = match &invocation.resume_session_id {
-            Some(id) => id.clone(),
-            None => SessionId::new(format!("ses_{key}")).map_err(ApplicationError::storage)?,
-        };
-        let wait = WaitRef {
-            id: WaitId::new(format!("wait_{key}")).map_err(ApplicationError::storage)?,
-            turn_id: parent.turn_id.clone(),
-            invocation_id: invocation.invocation_id.clone(),
-            arguments_sha256: invocation.arguments_sha256.clone(),
-            target: WaitTarget::Child { job_id: id.clone() },
-            continuation: WaitContinuation::CurrentTurn,
-        };
-        let delivery = match invocation.delivery {
-            ChildDelivery::Foreground => "foreground",
-            ChildDelivery::NextStep => "next_step",
-            ChildDelivery::Quiet => "quiet",
-        };
-        let now = database_time(&mut tx).await?;
-        query("INSERT INTO zuno_enterprise_preview.runtime_child(tenant_id,principal_id,job_id,parent_job_id,parent_session_id,child_session_id,
-            invocation_id,logical_key,request_digest,invocation,definition,selection,reference,delivery,state,time_created,time_updated,workspace_policy,workspace_state,delegation_depth_limit)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'staged',$15,$15,$16,$17,$18)")
-            .bind(lease.owner.tenant_id.as_str()).bind(lease.owner.principal_id.as_str()).bind(id.as_str())
-            .bind(parent.id.as_str()).bind(parent.session_id.as_str()).bind(session_id.as_str())
-            .bind(invocation.invocation_id.as_str()).bind(&invocation.logical_key).bind(&digest)
-            .bind(json!(invocation)).bind(json!(grant.child)).bind(json!(grant.selection)).bind(json!(wait)).bind(delivery).bind(now)
-            .bind(match grant.workspace {ChildWorkspacePolicy::ModelOnly=>"model_only",ChildWorkspacePolicy::ForkParent=>"fork_parent"})
-            .bind(match grant.workspace {ChildWorkspacePolicy::ModelOnly=>"model_only",ChildWorkspacePolicy::ForkParent=>"pending"})
-            .bind(i32::try_from(depth_limit).map_err(ApplicationError::storage)?)
-            .execute(&mut *tx).await.map_err(database_error)?;
-        let record = read(&mut tx, &lease.owner, &id).await?;
-        if invocation.delivery != ChildDelivery::Foreground
-            && record.ticket.workspace != ChildWorkspaceState::Pending
-        {
-            activate(&mut tx, &parent, &record).await?;
-        }
+        let ticket = stage_in(&mut tx, &parent, invocation.clone(), grant, true).await?;
         verify_lease(&mut tx, lease).await?;
         emit(&mut tx, &parent.principal, parent.session_id.as_str(), "runtime.child.dispatched",
-            json!({"jobID":id,"invocationID":invocation.invocation_id,"sessionID":session_id,"delivery":delivery,"configuration":grant.child})).await?;
+            json!({"jobID":ticket.job_id,"invocationID":invocation.invocation_id,"sessionID":ticket.session_id,"delivery":invocation.delivery,"configuration":grant.child})).await?;
         tx.commit().await.map_err(database_error)?;
-        Ok(record.ticket)
+        Ok(ticket)
     }
+}
+
+/// Shared atomic child admission for a validated Agent lease or its workflow coordinator.
+/// The caller holds the parent session lock and current organization authority.
+pub(super) async fn stage_in(
+    tx: &mut Transaction<'_, Postgres>,
+    parent: &RuntimeJob,
+    invocation: ChildInvocation,
+    grant: &ChildDefinitionGrant,
+    activate_background: bool,
+) -> Result<ChildDispatch, ApplicationError> {
+    let owner = parent.principal.owner();
+    invocation.validate()?;
+    grant.validate()?;
+    if parent.configuration != grant.parent {
+        return Err(ApplicationError::Forbidden);
+    }
+    let mut intent = json!([&invocation, grant.parent, grant.child, grant.selection]);
+    if grant.workspace != ChildWorkspacePolicy::ModelOnly {
+        intent = json!([intent, grant.workspace]);
+    }
+    let digest = zuno_orchestration::sha256_json(&intent);
+    let existing = query(
+        "SELECT job_id,request_digest FROM zuno_enterprise_preview.runtime_child
+        WHERE tenant_id=$1 AND principal_id=$2 AND parent_job_id=$3 AND invocation_id=$4",
+    )
+    .bind(owner.tenant_id.as_str())
+    .bind(owner.principal_id.as_str())
+    .bind(parent.id.as_str())
+    .bind(invocation.invocation_id.as_str())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(database_error)?;
+    if let Some(existing) = existing {
+        if existing
+            .try_get::<String, _>("request_digest")
+            .map_err(database_error)?
+            != digest
+        {
+            return Err(ApplicationError::Conflict);
+        }
+        let id = JobId::new(
+            existing
+                .try_get::<String, _>("job_id")
+                .map_err(database_error)?,
+        )
+        .map_err(ApplicationError::storage)?;
+        let record = read(tx, &owner, &id).await?;
+        if record.state == "cancelled" {
+            return Err(ApplicationError::Conflict);
+        }
+        if activate_background
+            && record.state == "staged"
+            && invocation.delivery != ChildDelivery::Foreground
+            && record.ticket.workspace != ChildWorkspaceState::Pending
+        {
+            activate(tx, parent, &record).await?;
+        }
+        let ticket = record.ticket;
+        return Ok(ticket);
+    }
+    let depth = depth_in(tx, &owner, &parent.session_id).await?;
+    let inherited:i32=query_scalar("SELECT delegation_depth_limit FROM zuno_enterprise_preview.session WHERE tenant_id=$1 AND principal_id=$2 AND id=$3")
+        .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(parent.session_id.as_str())
+        .fetch_one(&mut **tx).await.map_err(database_error)?;
+    let depth_limit = grant
+        .maximum_depth
+        .min(u32::try_from(inherited).map_err(ApplicationError::storage)?);
+    if depth >= depth_limit {
+        return Err(ApplicationError::Forbidden);
+    }
+    let count:i64 = query_scalar("SELECT count(*) FROM zuno_enterprise_preview.runtime_child WHERE tenant_id=$1 AND principal_id=$2 AND parent_job_id=$3")
+        .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(parent.id.as_str())
+        .fetch_one(&mut **tx).await.map_err(database_error)?;
+    if count >= i64::from(grant.maximum_children) {
+        return Err(ApplicationError::Forbidden);
+    }
+    if let Some(session) = &invocation.resume_session_id {
+        resume_allowed(tx, parent, session).await?;
+    }
+    let key = zuno_orchestration::sha256_json(&json!([
+        "child-job",
+        owner,
+        parent.id,
+        invocation.invocation_id
+    ]));
+    let id = JobId::new(format!("job_{key}")).map_err(ApplicationError::storage)?;
+    let session_id = match &invocation.resume_session_id {
+        Some(id) => id.clone(),
+        None => SessionId::new(format!("ses_{key}")).map_err(ApplicationError::storage)?,
+    };
+    let wait = WaitRef {
+        id: WaitId::new(format!("wait_{key}")).map_err(ApplicationError::storage)?,
+        turn_id: parent.turn_id.clone(),
+        invocation_id: invocation.invocation_id.clone(),
+        arguments_sha256: invocation.arguments_sha256.clone(),
+        target: WaitTarget::Child { job_id: id.clone() },
+        continuation: WaitContinuation::CurrentTurn,
+    };
+    let delivery = match invocation.delivery {
+        ChildDelivery::Foreground => "foreground",
+        ChildDelivery::NextStep => "next_step",
+        ChildDelivery::Quiet => "quiet",
+    };
+    let now = database_time(tx).await?;
+    query("INSERT INTO zuno_enterprise_preview.runtime_child(tenant_id,principal_id,job_id,parent_job_id,parent_session_id,child_session_id,
+        invocation_id,logical_key,request_digest,invocation,definition,selection,reference,delivery,state,time_created,time_updated,workspace_policy,workspace_state,delegation_depth_limit)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'staged',$15,$15,$16,$17,$18)")
+        .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(id.as_str())
+        .bind(parent.id.as_str()).bind(parent.session_id.as_str()).bind(session_id.as_str())
+        .bind(invocation.invocation_id.as_str()).bind(&invocation.logical_key).bind(&digest)
+        .bind(json!(invocation)).bind(json!(grant.child)).bind(json!(grant.selection)).bind(json!(wait)).bind(delivery).bind(now)
+        .bind(match grant.workspace {ChildWorkspacePolicy::ModelOnly=>"model_only",ChildWorkspacePolicy::ForkParent=>"fork_parent"})
+        .bind(match grant.workspace {ChildWorkspacePolicy::ModelOnly=>"model_only",ChildWorkspacePolicy::ForkParent=>"pending"})
+        .bind(i32::try_from(depth_limit).map_err(ApplicationError::storage)?)
+        .execute(&mut **tx).await.map_err(database_error)?;
+    let record = read(tx, &owner, &id).await?;
+    if activate_background
+        && invocation.delivery != ChildDelivery::Foreground
+        && record.ticket.workspace != ChildWorkspaceState::Pending
+    {
+        activate(tx, parent, &record).await?;
+    }
+    Ok(record.ticket)
 }
 
 async fn depth_in(
@@ -276,6 +296,9 @@ async fn resume_allowed(
     let allowed:bool=query_scalar("SELECT EXISTS(SELECT 1 FROM zuno_enterprise_preview.session s
         JOIN zuno_enterprise_preview.runtime_session r ON r.tenant_id=s.tenant_id AND r.principal_id=s.principal_id AND r.session_id=s.id
         WHERE s.tenant_id=$1 AND s.principal_id=$2 AND s.id=$3 AND s.parent_id=$4 AND r.current_job_id IS NULL
+        AND NOT EXISTS(SELECT 1 FROM zuno_enterprise_preview.runtime_workflow w
+          JOIN zuno_enterprise_preview.runtime_child c ON c.tenant_id=w.tenant_id AND c.principal_id=w.principal_id AND c.job_id=w.job_id
+          WHERE c.tenant_id=s.tenant_id AND c.principal_id=s.principal_id AND c.child_session_id=s.id)
         AND NOT EXISTS(SELECT 1 FROM zuno_enterprise_preview.runtime_job j WHERE j.tenant_id=s.tenant_id AND j.principal_id=s.principal_id
           AND j.session_id=s.id AND j.phase NOT IN('completed','failed','cancelled')))")
         .bind(parent.principal.tenant_id().as_str()).bind(parent.principal.principal_id().as_str()).bind(session.as_str()).bind(parent.session_id.as_str())
@@ -292,12 +315,14 @@ pub(crate) async fn validate_delegation_input(
     prompt: &Value,
 ) -> Result<(), ApplicationError> {
     let record = read(tx, &job.principal.owner(), &job.id).await?;
+    let prompt_text = super::workflow::resolved_input(tx, &job.principal.owner(), &job.id)
+        .await?
+        .unwrap_or_else(|| record.invocation.prompt.clone());
     if record.ticket.session_id != job.session_id
         || record.state != "active"
         || prompt.get("parentSessionID") != Some(&json!(record.parent_session_id))
         || prompt.get("parentJobID") != Some(&json!(record.parent_job_id))
-        || prompt.pointer("/prompt/text").and_then(Value::as_str)
-            != Some(record.invocation.prompt.as_str())
+        || prompt.pointer("/prompt/text").and_then(Value::as_str) != Some(prompt_text.as_str())
     {
         return Err(ApplicationError::Conflict);
     }
@@ -323,10 +348,11 @@ pub(crate) async fn activate_wait(
     if record.state == "staged" {
         activate(tx, parent, &record).await?;
     }
+    super::workflow::activate_wait(tx, parent, job_id).await?;
     Ok(())
 }
 
-async fn activate(
+pub(super) async fn activate(
     tx: &mut Transaction<'_, Postgres>,
     parent: &RuntimeJob,
     record: &ChildRecord,
@@ -363,7 +389,10 @@ async fn activate(
         .ok_or_else(|| invalid("invalid child Job identity"))?;
     let turn = format!("turn_{suffix}");
     let input = format!("msg_{suffix}");
-    let prompt = json!({"kind":"delegation","prompt":{"text":record.invocation.prompt,"files":[],"agents":[]},"agent":record.selection.agent,"model":model,
+    let prompt_text = super::workflow::resolved_input(tx, &owner, id)
+        .await?
+        .unwrap_or_else(|| record.invocation.prompt.clone());
+    let prompt = json!({"kind":"delegation","prompt":{"text":prompt_text,"files":[],"agents":[]},"agent":record.selection.agent,"model":model,
         "parentSessionID":parent.session_id,"parentJobID":parent.id});
     let input_sequence=emit(tx,&parent.principal,child.as_str(),"session.input.admitted",
         json!({"inputID":input,"prompt":prompt,"delivery":"queue","state":"queued","triggerKind":"automatic","timeCreated":now})).await?;
@@ -371,7 +400,11 @@ async fn activate(
         VALUES($1,$2,$3,$4,$5,$6,'queued',$7,$8)")
         .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(child.as_str()).bind(&input).bind(format!("child:{suffix}"))
         .bind(prompt).bind(input_sequence).bind(now).execute(&mut **tx).await.map_err(database_error)?;
-    let subject = zuno_db::job::JobSubject::child_session(child.to_string());
+    let workflow = super::workflow::identity(tx, &owner, id).await?;
+    let subject = match &workflow {
+        Some((run, name)) => zuno_db::job::JobSubject::workflow(run.to_string(), name.clone()),
+        None => zuno_db::job::JobSubject::child_session(child.to_string()),
+    };
     let delivery = if record.invocation.delivery == ChildDelivery::NextStep {
         "next-step"
     } else {
@@ -386,15 +419,24 @@ async fn activate(
     )
     .await?;
     query("INSERT INTO zuno_enterprise_preview.agent_job(tenant_id,principal_id,id,parent_session_id,subject_kind,subject_payload,status,report_delivery,created_seq,time_created,time_updated)
-        VALUES($1,$2,$3,$4,'child-session',$5,'queued',$6,$7,$8,$8)")
+        VALUES($1,$2,$3,$4,$9,$5,'queued',$6,$7,$8,$8)")
         .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(id.as_str()).bind(parent.session_id.as_str()).bind(subject.as_json())
-        .bind(delivery).bind(created).bind(now).execute(&mut **tx).await.map_err(database_error)?;
+        .bind(delivery).bind(created).bind(now).bind(if workflow.is_some() { "workflow" } else { "child-session" })
+        .execute(&mut **tx).await.map_err(database_error)?;
     let version = input_version(tx, &owner, child.as_str()).await?;
     query("INSERT INTO zuno_enterprise_preview.runtime_job(tenant_id,principal_id,job_id,session_id,turn_id,input_id,request_digest,principal,configuration,phase,input_version,ready_at,time_created,time_updated)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'ready',$10,$11,$11,$11)")
-        .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(id.as_str()).bind(child.as_str()).bind(turn).bind(input)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$12,$10,$11,$11,$11)")
+        .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(id.as_str()).bind(child.as_str()).bind(turn).bind(&input)
         .bind(zuno_orchestration::sha256_json(&json!(record.invocation))).bind(json!(parent.principal)).bind(json!(record.configuration))
-        .bind(version).bind(now).execute(&mut **tx).await.map_err(database_error)?;
+        .bind(version).bind(now).bind(if workflow.is_some() { "waiting" } else { "ready" })
+        .execute(&mut **tx).await.map_err(database_error)?;
+    if workflow.is_some() {
+        query("UPDATE zuno_enterprise_preview.runtime_session SET current_job_id=$4 WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3")
+            .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(child.as_str()).bind(id.as_str())
+            .execute(&mut **tx).await.map_err(database_error)?;
+        query("UPDATE zuno_enterprise_preview.input SET state='consumed' WHERE tenant_id=$1 AND principal_id=$2 AND id=$3")
+            .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(&input).execute(&mut **tx).await.map_err(database_error)?;
+    }
     let changed=query("UPDATE zuno_enterprise_preview.runtime_child SET state='active',activated_job_id=job_id,time_updated=$4
         WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND state='staged'")
         .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(id.as_str()).bind(now)

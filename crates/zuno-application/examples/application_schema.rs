@@ -3,6 +3,7 @@ use zuno_application::{
     CreateSession, SessionPage, SessionSummary,
     api::{ApprovalDecision, ApprovalView, InputVersionView, JobView, SubmitTurn, WorkspaceView},
     control::{CancelJob, CancellationReceipt},
+    workflow::WorkflowRunView,
 };
 
 #[derive(JsonSchema)]
@@ -22,6 +23,7 @@ struct ApplicationProtocol {
     answer: ApprovalDecision,
     cancel: CancelJob,
     cancellation: CancellationReceipt,
+    workflow: WorkflowRunView,
 }
 fn main() {
     println!(

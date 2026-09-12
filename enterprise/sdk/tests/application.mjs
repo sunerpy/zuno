@@ -44,3 +44,15 @@ test("creation and cancellation responses retain workspace and turn identity", a
   await assert.rejects(client.createSession({ requestId: "create", workspaceId: "workspace", title: "Task" }), /another workspace/);
   await assert.rejects(client.cancel("job", { requestId: "cancel", expectedTurnId: "turn", reason: "Stop" }), /identity mismatch/);
 });
+
+test("workflow views preserve typed node dependencies and refuse a different run owner", async () => {
+  const value = { id: "run", jobId: "job", state: "active", name: "inspection", nodes: [
+    { id: "node", nodeId: "review", jobId: "node-job", state: "waiting", dependsOn: ["scan"],
+      waits: [{ invocationId: "call", target: { kind: "approval", approval_id: "approval" } }] },
+  ] };
+  const client = new EnterpriseClient({ baseUrl: "https://enterprise.example/app/api/v1/", fetch: async () => response(value) });
+  assert.deepEqual((await client.workflow("job")).nodes[0].dependsOn, ["scan"]);
+  await assert.rejects(client.workflow("other-job"), /identity mismatch/);
+  value.nodes[0].lease = "private-worker-state";
+  await assert.rejects(client.workflow("job"), /Invalid enterprise application/);
+});

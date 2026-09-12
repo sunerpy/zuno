@@ -321,6 +321,8 @@ pub struct Definition {
     pub environment: EnvironmentDefinition,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation: Option<DelegationDefinition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workflows: Vec<zuno_orchestration::WorkflowTemplateDescriptor>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

@@ -104,3 +104,5 @@ SDK 的 `ActivityClient.live` 和 `LiveActivity` 与持久状态分开，先补�
 固定格式 13 迁移夹具在 DDL 失败时保留消息、Memory 和持久 frame。
 HTTPS 用例实际观察模型完成前的草稿，并验证完成后消失；SDK 验证 generation 替换、
 重试清理和静默之后的新快照。
+
+`UiAction::ViewWorkflow` 指向持久编排 Job，数据所有者从原消息执行 Job 与调用关系生成，完成后的调用仍可查看。模型提供的工具名或结果文本不能创建该关联。

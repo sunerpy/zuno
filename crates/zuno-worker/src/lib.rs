@@ -8,6 +8,7 @@ pub mod memory;
 mod presentation_tests;
 pub mod runtime;
 pub mod tools;
+pub mod workflow;
 
 use async_trait::async_trait;
 use futures::StreamExt as _;
@@ -33,6 +34,7 @@ pub const STATE_PATH: &str = "internal/worker/v1/state";
 pub const LIVE_PATH: &str = "internal/worker/v1/live";
 pub const MEMORY_PATH: &str = "internal/worker/v1/memory";
 pub const CHILD_PATH: &str = "internal/worker/v1/children";
+pub const WORKFLOW_PATH: &str = "internal/worker/v1/workflows";
 pub const FINISH_PATH: &str = "internal/worker/v1/finish";
 pub const GRANT_HEADER: &str = "x-zuno-job-grant";
 pub const GATEWAY_TICKET_PATH: &str = "internal/worker/v1/gateway-ticket";

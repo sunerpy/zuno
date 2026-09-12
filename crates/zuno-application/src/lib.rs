@@ -12,6 +12,7 @@ pub mod control;
 pub mod environment;
 pub mod live;
 pub mod runtime;
+pub mod workflow;
 
 use std::sync::Arc;
 

@@ -149,6 +149,8 @@ pub struct ChildWorkspaceCompletion {
 
 /// Data-owner lookup before the child execution session exists.
 pub struct ChildWorkspaceInfo {
+    pub parent_session_id: SessionId,
+    pub parent_configuration: ConfigurationRef,
     pub child_session_id: SessionId,
     pub configuration: ConfigurationRef,
     pub resume: bool,

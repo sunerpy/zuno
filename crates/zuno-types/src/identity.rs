@@ -136,6 +136,14 @@ identity_id!(
 );
 identity_id!(TurnId, "The model/tool turn advanced by a job.");
 identity_id!(
+    WorkflowRunId,
+    "One immutable workflow invocation and its durable coordination state."
+);
+identity_id!(
+    NodeRunId,
+    "One workflow node instance, independent of its Worker attempt."
+);
+identity_id!(
     WorkerInstanceId,
     "One worker incarnation, regenerated on process startup."
 );

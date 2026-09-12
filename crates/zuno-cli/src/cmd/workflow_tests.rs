@@ -568,7 +568,9 @@ async fn independent_nodes_overlap_and_dependents_wait_with_stable_results() {
     );
     let turn = WorkflowHost::dispatch(&fixture.host, request, CancellationToken::new())
         .await
-        .expect("workflow completes");
+        .expect("workflow completes")
+        .into_ready("workflow")
+        .expect("local host returns ready");
 
     assert_eq!(fixture.runner.max_active.load(Ordering::SeqCst), 2);
     let events = fixture
@@ -668,7 +670,9 @@ async fn workflow_refills_a_free_slot_without_waiting_for_the_slowest_running_no
     let turn = task
         .await
         .expect("workflow task remains attached")
-        .expect("workflow completes");
+        .expect("workflow completes")
+        .into_ready("workflow")
+        .expect("local host returns ready");
     assert_eq!(fixture.runner.max_active.load(Ordering::SeqCst), 2);
     assert!(
         turn.output.find("### scan").expect("scan output")
@@ -696,7 +700,10 @@ async fn parent_cancellation_wins_when_the_final_node_completes_in_the_same_tick
         )
         .await;
         let error = result.expect_err("a cancelled workflow must never report completion");
-        assert!(error.contains("cancelled"), "unexpected outcome: {error}");
+        assert!(
+            zuno_error::source::describe(&error).contains("cancelled"),
+            "unexpected outcome: {error}"
+        );
     }
 }
 
@@ -709,7 +716,9 @@ async fn background_cancellation_propagates_and_settles_the_parent_job() {
         CancellationToken::new(),
     )
     .await
-    .expect("background workflow admitted");
+    .expect("background workflow admitted")
+    .into_ready("workflow")
+    .expect("local host returns ready");
     let job_id = turn.job_id.expect("durable workflow job");
     fixture.runner.entered.notified().await;
     assert!(fixture.supervisor.cancel("ses_parent", &job_id));
@@ -783,7 +792,9 @@ async fn council_seats_overlap_keep_stable_order_and_preserve_dissent() {
     );
     let turn = CouncilHost::dispatch(&fixture.host, request, CancellationToken::new())
         .await
-        .expect("Council reaches quorum");
+        .expect("Council reaches quorum")
+        .into_ready("council_run")
+        .expect("local host returns ready");
 
     assert_eq!(fixture.runner.max_active.load(Ordering::SeqCst), 3);
     assert!(
@@ -875,7 +886,7 @@ async fn failed_synthesis_imports_no_ready_eligible_seat_receipts() {
     let error = CouncilHost::dispatch(&fixture.host, request, CancellationToken::new())
         .await
         .expect_err("failed synthesis must fail the Council");
-    assert!(error.contains("synthesis failed"));
+    assert!(zuno_error::source::describe(&error).contains("synthesis failed"));
 
     let review = fixture
         .host
@@ -913,7 +924,9 @@ async fn generic_native_council_runs_without_a_review_binding() {
     request.review = None;
     let turn = CouncilHost::dispatch(&fixture.host, request, CancellationToken::new())
         .await
-        .expect("generic Council");
+        .expect("generic Council")
+        .into_ready("council_run")
+        .expect("local host returns ready");
     assert!(turn.output.contains("### Synthesis"));
     let review = fixture
         .host
@@ -1003,7 +1016,7 @@ async fn council_below_quorum_keeps_typed_partial_results_on_failed_job() {
     let error = CouncilHost::dispatch(&fixture.host, request, CancellationToken::new())
         .await
         .expect_err("one valid seat cannot reach quorum two");
-    assert!(error.contains("quorum was not reached"));
+    assert!(zuno_error::source::describe(&error).contains("quorum was not reached"));
     assert!(fixture.synth.payloads.lock().expect("payloads").is_empty());
 
     let jobs = fixture
@@ -1035,7 +1048,7 @@ async fn council_deadline_marks_the_seat_timed_out_without_synthesis() {
     let error = CouncilHost::dispatch(&fixture.host, request, CancellationToken::new())
         .await
         .expect_err("deadline prevents quorum");
-    assert!(error.contains("quorum was not reached"));
+    assert!(zuno_error::source::describe(&error).contains("quorum was not reached"));
     assert!(fixture.synth.payloads.lock().expect("payloads").is_empty());
     let jobs = fixture
         .jobs
@@ -1065,7 +1078,7 @@ async fn council_rejects_a_synthesis_budget_that_consumes_the_total_deadline() {
     let error = CouncilHost::dispatch(&fixture.host, request, CancellationToken::new())
         .await
         .expect_err("an empty seat-phase budget must be rejected");
-    assert!(error.contains("invalid seats, quorum, or bounds"));
+    assert!(zuno_error::source::describe(&error).contains("invalid seats, quorum, or bounds"));
     assert!(
         fixture
             .jobs
@@ -1087,7 +1100,9 @@ async fn background_council_cancellation_settles_job_and_work_items() {
     );
     let turn = CouncilHost::dispatch(&fixture.host, request, CancellationToken::new())
         .await
-        .expect("background Council admitted");
+        .expect("background Council admitted")
+        .into_ready("council_run")
+        .expect("local host returns ready");
     let job_id = turn.job_id.expect("durable Council job");
     fixture.runner.entered.notified().await;
     assert!(fixture.supervisor.cancel("ses_parent", &job_id));

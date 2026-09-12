@@ -10,8 +10,8 @@ use zuno_application::{
     environment::{
         CommandOperation, Environment, OperationAuthority,
         wire::{
-            GatewayExecutionContext, GatewayOperationRequest, GatewayReply, GatewayRequest,
-            MAX_GATEWAY_FRAME_BYTES,
+            GatewayCommand, GatewayExecutionContext, GatewayOperationRequest, GatewayReply,
+            GatewayRequest, MAX_GATEWAY_FRAME_BYTES,
         },
     },
     runtime::ExecutionLease,
@@ -48,7 +48,12 @@ impl WorkerClient {
             .environment
             .validate()
             .map_err(|_| TurnStateError::InvalidData)?;
-        if issued.assignment.environment.session_id != execution.job.session_id {
+        if issued.assignment.environment.session_id != execution.job.session_id
+            && !matches!(
+                request.command,
+                GatewayCommand::PrepareChildWorkspace { .. }
+            )
+        {
             return Err(TurnStateError::InvalidData);
         }
         validate_endpoint(&issued.assignment.endpoint)?;
@@ -118,7 +123,23 @@ impl GatewayStateClient {
             serde_json::from_slice(&bytes).map_err(ApplicationError::storage)?;
         context.assignment.environment.validate()?;
         if context.assignment.environment.session_id != context.lease.session_id {
-            return Err(ApplicationError::Forbidden);
+            // Only the control-plane-resolved preparation of this exact child
+            // may copy from its immutable Workflow group workspace. This does
+            // not authorize commands in another session.
+            let GatewayCommand::PrepareChildWorkspace { child_job_id } = &request.command else {
+                return Err(ApplicationError::Forbidden);
+            };
+            let assignment = context
+                .child_workspace
+                .as_ref()
+                .ok_or(ApplicationError::Forbidden)?;
+            if assignment.child_job_id != *child_job_id
+                || assignment.parent != context.assignment.environment
+                || assignment.gateway_id != context.assignment.gateway_id
+                || !context.existing_workspace
+            {
+                return Err(ApplicationError::Forbidden);
+            }
         }
         Ok(context)
     }

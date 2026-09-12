@@ -66,6 +66,73 @@ fn completion(reference: WaitRef) -> WaitCompletion {
     )
 }
 
+#[tokio::test]
+async fn an_uncertain_external_result_is_consumed_once_and_blocks_further_execution() {
+    let mut connection = seeded();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let dispatcher = deferred(&order);
+    let provider = Arc::new(ScriptedProvider::new(provider_events(&[
+        ("wait", "remote"),
+        ("after", "after"),
+    ])));
+    let (outcome, _) = advance(
+        &mut connection,
+        provider.clone(),
+        &dispatcher,
+        request(),
+        Arc::new(NoopBudgetPolicy),
+    )
+    .await;
+    let AdvanceOutcome::Waiting { checkpoint, waits } = outcome.unwrap() else {
+        panic!("durable wait")
+    };
+    let result = zuno_engine::r#loop::ToolDispatchResult::error(ToolOutput::text(
+        "Uncertain operation",
+        "Inspect the external operation",
+    ))
+    .with_uncertain_outcome(zuno_engine::r#loop::UncertainOutcome {
+        tool: "sequential".to_owned(),
+        applied_paths: Vec::new(),
+        cause: zuno_error::UncertainCause::LostOutcome,
+    });
+    let uncertain = WaitCompletion::tool_result(
+        CompletionId::new("uncertain-once").unwrap(),
+        waits[0].clone(),
+        result,
+    );
+    publish_sqlite_completion(&mut connection, &scope(), &uncertain).unwrap();
+    let (consumed, _) = advance(
+        &mut connection,
+        provider.clone(),
+        &dispatcher,
+        request().resume(checkpoint),
+        Arc::new(NoopBudgetPolicy),
+    )
+    .await;
+    let AdvanceOutcome::Progressed { checkpoint } = consumed.unwrap() else {
+        panic!("consumed uncertain result")
+    };
+    let (stopped, _) = advance(
+        &mut connection,
+        provider.clone(),
+        &dispatcher,
+        request().resume(checkpoint),
+        Arc::new(NoopBudgetPolicy),
+    )
+    .await;
+    assert!(matches!(stopped, Err(AdvanceError::NeedsInspection)));
+    assert!(order.lock().unwrap().is_empty());
+    assert_eq!(provider.requests().len(), 1);
+    let consumed: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM event WHERE type='runtime.wait.consumed.1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(consumed, 1);
+}
+
 struct SubmittedDispatcher {
     inner: DeferredDispatcher,
     submissions: Arc<AtomicUsize>,

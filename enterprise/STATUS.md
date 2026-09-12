@@ -8,7 +8,7 @@ Original baseline: `v0.10.29`, `d1212860dba6a6b420ce81d444ace58feaf0adb5`.
 | P1 | In progress | Principal propagation implemented; ownership migration validated; local bounded driver and scoped session application validated; local runtime Job/lease port validated; Memory persistence/authority ports validated; backend assembly remains |
 | P2 | In progress | PostgreSQL, generic OAuth2/OIDC, BFF, scoped private Memory, organization policy and HITL integrated; shared/automatic Memory and full fault acceptance remain |
 | P3 | In progress | Independent control/gateway/two-Worker executable loop validated; full fault/operational acceptance remains |
-| P4 | In progress | Child dispatch, persistent waits, workspace forks and Job cancellation implemented; approved merge and Workflow/Council remain |
+| P4 | In progress | Child dispatch, persistent waits, workspace forks, Job cancellation and durable Workflow implemented; approved merge and distributed Council remain |
 | P5 | In progress | Public enums, transactional history/frames, live progress, generated SDK and session Web workbench implemented; remaining Web features and full ACP/TUI adapters remain |
 | P6 | Pending | Fault injection, native artifacts, preview publication |
 
@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p5-web`.
+- Current phase branch: `codex/enterprise-p4-workflow`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -410,3 +410,13 @@ CI run 34676688599 subsequently passed all gates at `9d558b7b360289dc9d6a428bc4f
 - Seven Chromium fixture scenarios and seventeen SDK tests pass. Real TLS/PostgreSQL/Docker/four-process verification also passes with Chromium login, private history, explicit command approval and continued model output. The identity/model issuer is a fixture. Workspace check/Clippy, formatting, 100 documentation/release contracts and preview workflow checks pass. Remote preview CI remains required before integration.
 - The linked Figma workbench uses existing design-system controls and was compared with the rendered browser. Temporary capture content was removed. EN/ZH Web/deployment/auth/API guides and preview entry links are updated; generated client contracts are committed together. Stable docs publication does not apply to this preview-only delivery.
 - Remaining Web management/run-graph/Memory features, full ACP/TUI, approved child merge, Workflow/Council, remaining Memory producers and P6 remain active. No preview release is enabled by this batch.
+
+## Durable Workflow backend
+
+- Web PR #216 merged only into preview at `b1c9e9af70076e8490284b2cd42eb101270aef8b` after CI 34695923551. The user subsequently paused UI delivery and requires Penpot App design first. Experimental UI changes remain separate from this backend batch.
+- Shared DAG decisions preserve logical waiting capacity and refill independent branches. Node dependency outputs are sealed with their source digests into actual input; local and enterprise hosts share the renderer. Workflow/Council host ports preserve typed Pending and uncertain results.
+- PostgreSQL format 15 coordinates native child Jobs without allocating a Worker attempt to the group. Foreground activation, original wait and checkpoint commit atomically; callbacks and completion consumption remain deduplicated. Cancellation/revocation use existing tree fencing and gateway stop delivery.
+- Worker protocol 9 and gateway protocol 3 support validated group workspace preparation. Ordinary commands remain bound to their execution session. Node workspace preparation rejects another parent, changed source and expired lease. The exact format-14 migration fixture retains session/message/Memory/activity/live values and verifies rollback.
+- Public Workflow/node DTOs and the stable ViewWorkflow action expose no private plans, leases or credentials. SDK validation and response identity checks pass. App UI implementation is deferred under the updated plan.
+- Final local validation passed: native rootless Docker/PostgreSQL/five HTTPS/independent control+gateway+two-Worker tests, 37 shared dispatch tests, local Workflow/Council tests, enterprise catalog tests, workspace check/Clippy, 100 documentation/release tests, 12 preview publisher tests, SDK 18 tests, generated-contract drift, formatting and diff checks. Native DAG validation withheld a slow approval until a dependent branch refilled, completed four explicitly approved commands and retained ordered outputs. Fixture providers are used.
+- Remote exact-head CI remains required before integration. Distributed Council, approved merge, remaining Memory/ACP/operational work and the full P0–P6 objective remain unfinished. Preview publication stays disabled.

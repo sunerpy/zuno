@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{ApplicationError, authorization::ApprovalRecord, runtime::ExecutionLease};
 
-pub const GATEWAY_PROTOCOL_VERSION: u32 = 2;
+pub const GATEWAY_PROTOCOL_VERSION: u32 = 3;
 pub const MAX_GATEWAY_FRAME_BYTES: usize = 1024 * 1024;
 
 /// A data-owner response, never a caller-selected deployment.

@@ -122,6 +122,7 @@ impl EnterpriseApplication {
             .route("/sessions/{session}/frames", get(frames))
             .route("/sessions/{session}/live", get(live_progress))
             .route("/jobs/{job}", get(job))
+            .route("/jobs/{job}/workflow", get(workflow))
             .route("/jobs/{job}/cancel", post(cancel_job))
             .route("/approvals/{approval}", get(approval))
             .route("/approvals/{approval}/answer", post(answer));
@@ -522,6 +523,16 @@ async fn submission(
             .client_submission(&principal, &session, &request)
             .await?,
     )))
+}
+async fn workflow(
+    State(service): State<EnterpriseApplication>,
+    Extension(identity): Extension<VerifiedIdentity>,
+    Path(job): Path<JobId>,
+) -> Result<Json<zuno_application::workflow::WorkflowRunView>, Failure> {
+    let principal = service.principal(&identity).await?;
+    Ok(Json(
+        service.backend.client_workflow(&principal, &job).await?,
+    ))
 }
 async fn approval(
     State(service): State<EnterpriseApplication>,

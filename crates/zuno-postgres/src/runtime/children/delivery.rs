@@ -31,7 +31,10 @@ pub(crate) async fn completed(
     if record.ticket.session_id != job.session_id || record.state != "active" {
         return Err(ApplicationError::Conflict);
     }
-    let (text, assistant_id) = if phase == "completed" {
+    let workflow = super::super::workflow::result(tx, job, phase).await?;
+    let (text, assistant_id) = if let Some(text) = &workflow {
+        (text.clone(), None)
+    } else if phase == "completed" {
         let state: zuno_engine::advance::AdvanceState = serde_json::from_value(
             result
                 .cloned()
@@ -81,16 +84,25 @@ pub(crate) async fn completed(
         "reportDelivery":match record.ticket.delivery { ChildDelivery::Foreground=>"foreground",ChildDelivery::NextStep=>"nextStep",ChildDelivery::Quiet=>"quiet"},
         "request":record.invocation.presentation,"assistantMessageId":assistant_id,"truncated":truncated,
     });
-    let rendered = format!(
-        "<task id=\"{}\" job=\"{}\" state=\"{phase}\">\n<task_result>\n{text}\n</task_result>\n</task>",
-        job.session_id, job.id,
-    );
+    let rendered = if workflow.is_some() {
+        text.clone()
+    } else {
+        format!(
+            "<task id=\"{}\" job=\"{}\" state=\"{phase}\">\n<task_result>\n{text}\n</task_result>\n</task>",
+            job.session_id, job.id,
+        )
+    };
     let output = ToolOutput::text(&record.invocation.description, rendered)
         .with_metadata("subagent", metadata);
     let tool_result = match phase {
         "completed" => ToolDispatchResult::success(output),
         "uncertain" => ToolDispatchResult::error(output).with_uncertain_outcome(UncertainOutcome {
-            tool: "task".to_owned(),
+            tool: if workflow.is_some() {
+                "workflow"
+            } else {
+                "task"
+            }
+            .to_owned(),
             applied_paths: Vec::new(),
             cause: zuno_error::UncertainCause::LostOutcome,
         }),

@@ -17,6 +17,10 @@ export type UiAction =
       resourceId: string;
     }
   | {
+      jobId: JobId;
+      kind: "view_workflow";
+    }
+  | {
       approvalId: ApprovalId;
       kind: "approve";
     }
@@ -37,8 +41,8 @@ export type UiAction =
       jobId: JobId;
       kind: "request_resume";
     };
-export type ApprovalId = string;
 export type JobId = string;
+export type ApprovalId = string;
 export type TurnId = string;
 export type SessionItem =
   | {

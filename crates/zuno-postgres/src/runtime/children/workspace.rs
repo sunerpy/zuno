@@ -79,8 +79,14 @@ impl PostgresRuntimeStore {
     ) -> Result<ChildWorkspaceInfo, ApplicationError> {
         self.check_owner(&lease.owner)?;
         let mut tx = owner_transaction(&self.pool, &lease.owner).await?;
-        let parent = authorized_parent(&mut tx, lease).await?;
+        let mut parent = authorized_parent(&mut tx, lease).await?;
         let record = read(&mut tx, &lease.owner, child).await?;
+        if record.parent_job_id != parent.id {
+            parent =
+                super::super::workflow::preparation_parent(&mut tx, &parent, &record.parent_job_id)
+                    .await?
+                    .ok_or(ApplicationError::Forbidden)?;
+        }
         if record.parent_job_id != parent.id
             || record.parent_session_id != parent.session_id
             || record.ticket.workspace == ChildWorkspaceState::ModelOnly
@@ -92,6 +98,8 @@ impl PostgresRuntimeStore {
             .await?
             .and_then(|(_, receipt)| receipt);
         let info = ChildWorkspaceInfo {
+            parent_session_id: parent.session_id,
+            parent_configuration: parent.configuration,
             child_session_id: record.ticket.session_id,
             configuration: record.configuration,
             resume: record.invocation.resume_session_id.is_some(),
@@ -112,8 +120,14 @@ impl PostgresRuntimeStore {
         assignment.target.validate()?;
         self.check_owner(&lease.owner)?;
         let mut tx = owner_transaction(&self.pool, &lease.owner).await?;
-        let parent = authorized_parent(&mut tx, lease).await?;
+        let mut parent = authorized_parent(&mut tx, lease).await?;
         let record = read(&mut tx, &lease.owner, &assignment.child_job_id).await?;
+        if record.parent_job_id != parent.id {
+            parent =
+                super::super::workflow::preparation_parent(&mut tx, &parent, &record.parent_job_id)
+                    .await?
+                    .ok_or(ApplicationError::Forbidden)?;
+        }
         if record.parent_job_id != parent.id
             || record.parent_session_id != parent.session_id
             || record.ticket.workspace == ChildWorkspaceState::ModelOnly

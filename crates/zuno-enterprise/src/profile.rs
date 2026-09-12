@@ -112,6 +112,7 @@ pub struct ConfiguredWorkerFactory {
     gateway: Arc<GatewayClient>,
     driver: Arc<dyn AgentDriver>,
     children: crate::children::ConfiguredChildren,
+    workflows: crate::workflows::ConfiguredWorkflows,
     live_interval: Option<Duration>,
 }
 impl ConfiguredWorkerFactory {
@@ -123,6 +124,7 @@ impl ConfiguredWorkerFactory {
         driver: Arc<dyn AgentDriver>,
     ) -> Result<Self, Error> {
         let children = crate::children::ConfiguredChildren::new(&definitions)?;
+        let workflows = crate::workflows::ConfiguredWorkflows::new(&definitions, &children)?;
         let mut installed = Vec::new();
         for definition in definitions {
             definition.validate()?;
@@ -165,6 +167,7 @@ impl ConfiguredWorkerFactory {
             gateway,
             driver,
             children,
+            workflows,
             live_interval: None,
         })
     }
@@ -215,17 +218,24 @@ impl WorkerServiceFactory for ConfiguredWorkerFactory {
             ));
         if let Some((maximum_depth, targets)) = self.children.targets(&entry.definition.reference())
         {
-            dispatcher = Arc::new(
-                zuno_worker::child::ChildToolDispatcher::new(
-                    dispatcher,
-                    self.state.clone(),
-                    execution.clone(),
-                    targets,
-                    maximum_depth,
+            let child = zuno_worker::child::ChildToolDispatcher::new(
+                dispatcher,
+                self.state.clone(),
+                execution.clone(),
+                targets,
+                maximum_depth,
+            )
+            .map_err(|_| WorkerError::Configuration)?
+            .with_workspace_gateway(self.gateway.clone());
+            let templates = self.workflows.templates(&entry.definition.reference());
+            dispatcher = if templates.is_empty() {
+                Arc::new(child)
+            } else {
+                Arc::new(
+                    zuno_worker::workflow::WorkflowToolDispatcher::new(child, templates)
+                        .map_err(|_| WorkerError::Configuration)?,
                 )
-                .map_err(|_| WorkerError::Configuration)?
-                .with_workspace_gateway(self.gateway.clone()),
-            );
+            };
         }
         Ok(WorkerTurnServices {
             configuration: entry.definition.reference(),

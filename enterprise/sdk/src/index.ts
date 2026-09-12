@@ -7,4 +7,5 @@ export type {
   WorkspaceView, SessionPage, SessionSummary, SessionCursor, CreateSession, JobView,
   SubmitTurn, InputVersionView, ApprovalView, ApprovalDecision, CancelJob, CancellationReceipt,
   ApprovalState, JobPhase,
+  WorkflowRunView, NodeRunView, WorkflowState,
 } from "./generated/application.js";

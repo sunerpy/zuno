@@ -54,6 +54,11 @@ export type WaitTarget =
       deadline_ms: number;
       kind: "timer";
     };
+export type WorkflowRunId = string;
+export type NodeRunId = string;
+export type InvocationState =
+  "queued" | "waiting" | "running" | "succeeded" | "failed" | "denied" | "cancelled" | "uncertain";
+export type WorkflowState = "preparing" | "prepared" | "active" | "completed" | "failed" | "cancelled" | "uncertain";
 
 export interface ApplicationProtocol {
   answer: ApprovalDecision;
@@ -66,6 +71,7 @@ export interface ApplicationProtocol {
   session: SessionSummary;
   sessions: SessionPage;
   submit_turn: SubmitTurn;
+  workflow: WorkflowRunView;
   workspace: WorkspaceView;
 }
 export interface ApprovalDecision {
@@ -175,6 +181,21 @@ export interface SubmitTurn {
   expectedInputVersion: string;
   requestId: RequestId;
   text: string;
+}
+export interface WorkflowRunView {
+  id: WorkflowRunId;
+  jobId: JobId;
+  name: string;
+  nodes: NodeRunView[];
+  state: WorkflowState;
+}
+export interface NodeRunView {
+  dependsOn: string[];
+  id: NodeRunId;
+  jobId: JobId;
+  nodeId: string;
+  state: InvocationState;
+  waits: JobWaitView[];
 }
 export interface WorkspaceView {
   id: WorkspaceId;

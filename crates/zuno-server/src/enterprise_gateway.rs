@@ -158,17 +158,27 @@ impl GatewayControlService {
             .configuration
             .resolve(&self.tenant, &info.configuration, &info.child_session_id)
             .map_err(application)?;
+        let parent = self
+            .configuration
+            .resolve(
+                &self.tenant,
+                &info.parent_configuration,
+                &info.parent_session_id,
+            )
+            .map_err(application)?;
         // This Docker gateway owns both volumes. Transfer to another gateway
         // requires a separate authenticated snapshot transport.
         if target.gateway_id != context.assignment.gateway_id
             || target.endpoint != context.assignment.endpoint
+            || parent.gateway_id != target.gateway_id
+            || parent.endpoint != target.endpoint
         {
             return Err(Failure(StatusCode::FORBIDDEN));
         }
         let assignment = zuno_application::child::ChildWorkspaceAssignment {
             child_job_id: child_job_id.clone(),
             gateway_id: target.gateway_id,
-            parent: context.assignment.environment.clone(),
+            parent: parent.environment.clone(),
             target: target.environment,
             resume: info.resume,
         };
@@ -176,6 +186,12 @@ impl GatewayControlService {
             .admit_child_workspace(&context.lease, &assignment)
             .await
             .map_err(application)?;
+        if info.parent_session_id != context.lease.session_id {
+            // The data owner proved this is a node of the caller's staged
+            // workflow. Its immutable group workspace must already exist.
+            context.existing_workspace = true;
+        }
+        context.assignment = parent;
         context.child_workspace = Some(assignment);
         context.prepared_workspace = info.receipt;
         Ok(())

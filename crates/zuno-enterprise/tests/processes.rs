@@ -34,6 +34,8 @@ use zuno_types::identity::*;
 
 #[path = "processes/browser.rs"]
 mod browser;
+#[path = "processes/workflow.rs"]
+mod workflow;
 
 #[derive(Deserialize)]
 struct Fixture {
@@ -145,6 +147,9 @@ async fn model(
             .iter()
             .any(|message| message["role"] == "tool" && message["tool_call_id"] == id)
     };
+    if user.contains("WORKFLOW-PROBE") {
+        return workflow::model(&body);
+    }
     if user.contains("BROWSER-PROBE") {
         let completed = has_tool("browser-command");
         let delta = if completed {
@@ -491,6 +496,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
         maximum_depth: 2,
         maximum_children: 4,
     });
+    definition.workflows = vec![workflow::template()];
     let definition_file = root.join("definition.json");
     write(&definition_file, serde_json::to_vec(&definition).unwrap());
     let job_key = root.join("job.key");
@@ -847,7 +853,8 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
         operations, 4,
         "one admitted execution per logical parent or child command"
     );
-    if std::env::var_os("ZUNO_ENTERPRISE_WEB_DIST").is_some() {
+    let browser_enabled = std::env::var_os("ZUNO_ENTERPRISE_WEB_DIST").is_some();
+    if browser_enabled {
         browser::verify(root, &control_url).await;
         assert_eq!(issuer.model_requests.load(Ordering::SeqCst), 16);
         let browser_operations:i64=query_scalar("SELECT count(*) FROM zuno_enterprise_preview.gateway_operation WHERE tenant_id=$1 AND completion IS NOT NULL")
@@ -857,6 +864,14 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
             "one explicitly approved browser command"
         );
     }
+    workflow::verify(&http, &control_url, &tokens["alice"], &tokens["bob"]).await;
+    assert_eq!(
+        issuer.model_requests.load(Ordering::SeqCst),
+        if browser_enabled { 25 } else { 23 }
+    );
+    let final_operations:i64=query_scalar("SELECT count(*) FROM zuno_enterprise_preview.gateway_operation WHERE tenant_id=$1 AND completion IS NOT NULL")
+        .bind(tenant.as_str()).fetch_one(&admin).await.unwrap();
+    assert_eq!(final_operations, if browser_enabled { 9 } else { 8 });
     for child in &mut children {
         assert!(
             tokio::process::Command::new("kill")

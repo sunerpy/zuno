@@ -24,3 +24,4 @@ pub mod stream;
 pub mod terminal_lease;
 pub mod wait;
 pub mod wake;
+pub mod workflow;

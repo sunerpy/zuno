@@ -39,7 +39,7 @@ provider／model 和凭据引用，普通 task 调用不能注入任意模型／
 首次子请求只记录意图并返回稳定 Job／会话 ID。需要工作区的子任务在准备得到持久确认前
 不可领取；后台模式也先完成准备，再返回可执行 Job 句柄。
 
-Worker 协议 8 通过网关协议 2 请求 `PrepareChildWorkspace`，请求只携带已暂存子 Job ID。
+Worker 协议 9 通过网关协议 3 请求 `PrepareChildWorkspace`，请求只携带已暂存子 Job ID。
 控制面核验父租约、子归属，解析父子环境规格并记录准入；Worker 不能自行选择其他卷、
 镜像、网关或宿主路径。
 
