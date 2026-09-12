@@ -135,3 +135,8 @@ Agent 的 `mode` 默认 `agent`，保留现有定义的规范化摘要。`mode: 
 启动隔离 PostgreSQL／rootless Docker，并让已有原生角色 fixture 运行解包后的二进制。
 fixture 默认采用 `release` profile，本地驱动检查可用 `--profile dev`。这不会发布
 或安装二进制；库与 HTTP 契约仍由其他必需 gate 检查。
+
+工作区 gateway client 同时代理初始归档上传，使用 `gatewayRootCertificate` 信任配置。
+公开客户端不能指定存储路径或 Docker endpoint；初始化及导入后会话接纳固定所选部署。
+客户端在首轮输入前通过类型化导入 API 提供带 `workspace/` 根目录的未压缩 tar。
+每个 PAX／GNU 扩展头最多 64 KiB，拒绝 sparse 条目。

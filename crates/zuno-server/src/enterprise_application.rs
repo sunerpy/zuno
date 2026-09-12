@@ -51,7 +51,7 @@ pub struct EnterpriseApplication {
     tenant: TenantId,
     workspaces: Arc<BTreeMap<WorkspaceId, ApplicationWorkspace>>,
     memory: Option<PostgresMemoryBackend>,
-    merge_reader: Option<Arc<crate::merge_review::MergeReviewReader>>,
+    workspace_gateway: Option<Arc<crate::workspace_gateway::GatewayWorkspaceClient>>,
 }
 
 impl EnterpriseApplication {
@@ -85,7 +85,7 @@ impl EnterpriseApplication {
             tenant,
             workspaces: Arc::new(installed),
             memory: None,
-            merge_reader: None,
+            workspace_gateway: None,
         })
     }
 
@@ -93,11 +93,11 @@ impl EnterpriseApplication {
         self.memory = Some(memory);
         self
     }
-    pub fn with_merge_reader(
+    pub fn with_workspace_gateway(
         mut self,
-        reader: Arc<crate::merge_review::MergeReviewReader>,
+        reader: Arc<crate::workspace_gateway::GatewayWorkspaceClient>,
     ) -> Self {
-        self.merge_reader = Some(reader);
+        self.workspace_gateway = Some(reader);
         self
     }
 
@@ -136,8 +136,21 @@ impl EnterpriseApplication {
             .route("/approvals/{approval}", get(approval))
             .route("/approvals/{approval}/merge", get(merge_review))
             .route("/approvals/{approval}/answer", post(answer));
-        if self.merge_reader.is_some() {
+        if self.workspace_gateway.is_some() {
             router = router.route("/approvals/{approval}/merge/content", get(merge_content));
+            router = router
+                .route(
+                    "/sessions/{session}/workspace/imports",
+                    post(begin_workspace_import),
+                )
+                .route(
+                    "/sessions/{session}/workspace/imports/{import}",
+                    get(workspace_import).delete(cancel_workspace_import),
+                )
+                .route(
+                    "/sessions/{session}/workspace/imports/{import}/archive",
+                    axum::routing::put(upload_workspace),
+                );
         }
         if self.memory.is_some() {
             router = router.route("/workspaces/{workspace}/memory", post(memory_request));
@@ -182,6 +195,107 @@ impl EnterpriseApplication {
     }
 }
 
+async fn begin_workspace_import(
+    State(service): State<EnterpriseApplication>,
+    Extension(identity): Extension<VerifiedIdentity>,
+    Path(session): Path<SessionId>,
+    Json(request): Json<zuno_application::workspace_import::BeginWorkspaceImport>,
+) -> Result<Json<zuno_application::workspace_import::WorkspaceImportView>, Failure> {
+    let principal = service.principal(&identity).await?;
+    let summary = service
+        .sessions(principal.clone())
+        .session(&session)
+        .await?;
+    let workspace = summary
+        .workspace_id
+        .as_ref()
+        .and_then(|id| service.workspaces.get(id))
+        .ok_or(Failure(StatusCode::NOT_FOUND))?;
+    let transfer = service
+        .workspace_gateway
+        .as_ref()
+        .ok_or(Failure(StatusCode::NOT_FOUND))?;
+    Ok(Json(
+        transfer
+            .begin_import(
+                &principal,
+                &session,
+                workspace.configuration.clone(),
+                request,
+            )
+            .await?,
+    ))
+}
+async fn workspace_import(
+    State(service): State<EnterpriseApplication>,
+    Extension(identity): Extension<VerifiedIdentity>,
+    Path((session, id)): Path<(SessionId, zuno_types::identity::WorkspaceImportId)>,
+) -> Result<Json<zuno_application::workspace_import::WorkspaceImportView>, Failure> {
+    use zuno_application::workspace_import::WorkspaceImportStore;
+    let principal = service.principal(&identity).await?;
+    Ok(Json(
+        service
+            .backend
+            .import_view(&principal, &session, &id)
+            .await?,
+    ))
+}
+async fn cancel_workspace_import(
+    State(service): State<EnterpriseApplication>,
+    Extension(identity): Extension<VerifiedIdentity>,
+    Path((session, id)): Path<(SessionId, zuno_types::identity::WorkspaceImportId)>,
+) -> Result<Json<zuno_application::workspace_import::WorkspaceImportView>, Failure> {
+    use zuno_application::workspace_import::WorkspaceImportStore;
+    let principal = service.principal(&identity).await?;
+    Ok(Json(
+        service
+            .backend
+            .cancel_import(&principal, &session, &id)
+            .await?,
+    ))
+}
+async fn upload_workspace(
+    State(service): State<EnterpriseApplication>,
+    Extension(identity): Extension<VerifiedIdentity>,
+    Path((session, id)): Path<(SessionId, zuno_types::identity::WorkspaceImportId)>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
+) -> Result<Json<zuno_application::workspace_import::WorkspaceImportView>, Failure> {
+    let principal = service.principal(&identity).await?;
+    if headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        != Some("application/x-tar")
+    {
+        return Err(Failure(StatusCode::BAD_REQUEST));
+    }
+    let length = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|length| {
+            *length > 0 && *length <= zuno_application::workspace_import::MAX_IMPORT_BYTES
+        })
+        .ok_or(Failure(StatusCode::BAD_REQUEST))?;
+    let transfer = service
+        .workspace_gateway
+        .as_ref()
+        .ok_or(Failure(StatusCode::NOT_FOUND))?;
+    Ok(Json(
+        transfer
+            .upload(
+                &principal,
+                zuno_application::workspace_import::WorkspaceUploadRequest {
+                    session_id: session,
+                    import_id: id,
+                },
+                length,
+                body,
+            )
+            .await?,
+    ))
+}
+
 async fn merge_review(
     State(service): State<EnterpriseApplication>,
     Extension(identity): Extension<VerifiedIdentity>,
@@ -216,7 +330,7 @@ async fn merge_content(
 ) -> Result<Response, Failure> {
     let principal = service.principal(&identity).await?;
     let reader = service
-        .merge_reader
+        .workspace_gateway
         .as_ref()
         .ok_or(Failure(StatusCode::NOT_FOUND))?;
     Ok(reader

@@ -40,6 +40,8 @@ mod completion;
 mod council;
 #[path = "processes/executable.rs"]
 mod executable;
+#[path = "processes/import.rs"]
+mod import;
 #[path = "processes/merge.rs"]
 mod merge;
 #[path = "processes/workflow.rs"]
@@ -174,6 +176,9 @@ async fn model(
     }
     if user.contains("MERGE-PROBE") {
         return merge::model(&body);
+    }
+    if user.contains("IMPORT-PROBE") {
+        return import::model(&body);
     }
     if user.contains("BROWSER-PROBE") {
         let completed = has_tool("browser-command");
@@ -976,6 +981,11 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
     assert_eq!(
         merged, 1,
         "one durable merge receipt per logical invocation"
+    );
+    import::verify(&http, &control_url, &tokens["alice"], &tokens["bob"]).await;
+    assert_eq!(
+        issuer.model_requests.load(Ordering::SeqCst),
+        if browser_enabled { 44 } else { 42 }
     );
     for child in &mut children {
         assert!(

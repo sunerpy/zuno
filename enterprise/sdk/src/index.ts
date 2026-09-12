@@ -10,4 +10,5 @@ export type {
   WorkflowRunView, NodeRunView, WorkflowState, WorkflowKind,
   CouncilView, CouncilPhase, CouncilSeatView, CouncilSeatState,
   WorkspaceMergeView, WorkspaceMergePlan, WorkspaceChange, WorkspaceEntry, WorkspacePath, MergeChoice, MergeContentSide, MergeContentRequest,
+  BeginWorkspaceImport, WorkspaceImportView, WorkspaceImportState, WorkspaceImportId,
 } from "./generated/application.js";

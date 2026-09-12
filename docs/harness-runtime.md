@@ -3008,3 +3008,10 @@ lets authorized approval viewers stream the immutable before/after content
 without a Worker lease. Late receipts remain durable facts and are consumed once.
 See `enterprise/WORKSPACES.md` in the preview archive; UI design remains deferred
 to Penpot.
+
+Initial enterprise workspace import is a user-mediated empty-session operation.
+Its durable reservation serializes with first-input admission; no Worker starts
+until the assigned gateway's validated initialization receipt is committed.
+The stream is size/digest checked, host ownership is normalized, and restoration
+uses the existing isolated fork mechanism. Import tickets cannot execute Agent
+tools. See `enterprise/WORKSPACES.md` for the API and recovery limits.

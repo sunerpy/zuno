@@ -330,6 +330,47 @@ pub(crate) async fn event(
     ) {
         refresh_parts(connection, owner, session).await?;
     }
+    if kind == "session.workspace.import.ready"
+        && let Some(id) = data.get("importId").and_then(Value::as_str)
+    {
+        let row = query(
+            "SELECT assignment,time_created FROM zuno_enterprise_preview.workspace_import
+            WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3 AND id=$4 AND state='ready'",
+        )
+        .bind(owner.tenant_id.as_str())
+        .bind(owner.principal_id.as_str())
+        .bind(session)
+        .bind(id)
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(database_error)?;
+        let assigned: zuno_application::workspace_import::WorkspaceImportAssignment =
+            serde_json::from_value(row.try_get("assignment").map_err(database_error)?)
+                .map_err(ApplicationError::storage)?;
+        publish(
+            connection,
+            owner,
+            session,
+            ItemRecord {
+                id: format!("workspace-import:{id}"),
+                parent_id: None,
+                created_at: counter(row.try_get("time_created").map_err(database_error)?)?,
+                item: SessionItem::Artifact {
+                    resource: ResourceRef {
+                        id: id.to_owned(),
+                        name: "Initial workspace archive".to_owned(),
+                        media_type: Some("application/x-tar".to_owned()),
+                        bytes: Some(Counter(assigned.bytes)),
+                    },
+                },
+                actions: vec![UiAction::ViewWorkspaceImport {
+                    session_id: assigned.session_id,
+                    import_id: assigned.id,
+                }],
+            },
+        )
+        .await?;
+    }
     Ok(())
 }
 

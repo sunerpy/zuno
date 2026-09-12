@@ -285,14 +285,35 @@ pub enum TerminalChannel {
     deny_unknown_fields
 )]
 pub enum UiAction {
-    View { resource_id: String },
-    ViewWorkflow { job_id: JobId },
-    ViewWorkspaceMerge { approval_id: ApprovalId },
-    Approve { approval_id: ApprovalId },
-    Reject { approval_id: ApprovalId },
-    Answer { question_id: String },
-    Interrupt { job_id: JobId, turn_id: TurnId },
-    RequestResume { job_id: JobId },
+    View {
+        resource_id: String,
+    },
+    ViewWorkflow {
+        job_id: JobId,
+    },
+    ViewWorkspaceMerge {
+        approval_id: ApprovalId,
+    },
+    ViewWorkspaceImport {
+        session_id: crate::identity::SessionId,
+        import_id: crate::identity::WorkspaceImportId,
+    },
+    Approve {
+        approval_id: ApprovalId,
+    },
+    Reject {
+        approval_id: ApprovalId,
+    },
+    Answer {
+        question_id: String,
+    },
+    Interrupt {
+        job_id: JobId,
+        turn_id: TurnId,
+    },
+    RequestResume {
+        job_id: JobId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

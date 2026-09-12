@@ -87,3 +87,12 @@ approval viewer policy. Only changed entries are readable. The content route is
 installed with the configured gateway reader; it streams immutable bytes with
 size/SHA validation and never returns a Worker credential. See
 [workspace merge](WORKSPACES.md#approved-workspace-merge).
+
+Initial workspace import is available through `POST /sessions/{session}/workspace/imports`,
+`GET`/`DELETE /sessions/{session}/workspace/imports/{import}`, and
+`PUT /sessions/{session}/workspace/imports/{import}/archive`. Begin declares the
+exact SHA/size and input version zero; upload uses raw `application/x-tar` bytes.
+Only an authenticated user in a current approval application may initialize.
+Pending import and first input cannot both win. Cancellation is available before
+restore admission; after initialization starts, retry the same archive or inspect
+status. See [initial project setup](WORKSPACES.md#initialize-a-project).

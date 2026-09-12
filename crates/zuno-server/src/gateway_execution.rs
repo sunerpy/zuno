@@ -104,6 +104,10 @@ impl GatewayExecutionService {
 
     pub fn router(self) -> Router {
         Router::new()
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_IMPORT_PATH),
+                post(import_workspace),
+            )
             .route(&format!("/{GATEWAY_EXECUTE_PATH}"), post(execute))
             .route(
                 &format!("/{}", zuno_worker::GATEWAY_MERGE_READ_PATH),
@@ -275,6 +279,56 @@ impl GatewayExecutionService {
         };
         Ok(reply)
     }
+}
+
+async fn import_workspace(
+    State(service): State<GatewayExecutionService>,
+    headers: HeaderMap,
+    axum::extract::Query(request): axum::extract::Query<
+        zuno_application::workspace_import::WorkspaceUploadRequest,
+    >,
+    body: axum::body::Body,
+) -> Result<Json<zuno_application::workspace_import::WorkspaceImportReceipt>, Failure> {
+    use futures::TryStreamExt;
+    let values = headers.get_all(zuno_worker::GATEWAY_IMPORT_TICKET_HEADER);
+    if values.iter().count() != 1 {
+        return Err(Failure(ApplicationError::Forbidden));
+    }
+    let ticket = zuno_identity::gateway::GatewayImportTicket::try_from(
+        values
+            .iter()
+            .next()
+            .and_then(|value| value.to_str().ok())
+            .ok_or(Failure(ApplicationError::Forbidden))?
+            .to_owned(),
+    )
+    .map_err(|_| Failure(ApplicationError::Forbidden))?;
+    let assigned = service.state.import_context(&ticket, &request).await?;
+    if assigned.gateway_id != service.id {
+        return Err(Failure(ApplicationError::Forbidden));
+    }
+    if headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        != Some("application/x-tar")
+        || headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            != Some(assigned.bytes)
+    {
+        return Err(Failure(ApplicationError::Invalid(
+            "workspace archive type or size mismatch".to_owned(),
+        )));
+    }
+    let stream = body.into_data_stream().map_err(std::io::Error::other);
+    let input = tokio_util::io::StreamReader::new(stream);
+    Ok(Json(
+        service
+            .gateway
+            .initialize_workspace(&assigned, input, &service.state)
+            .await?,
+    ))
 }
 
 async fn read_merge_content(

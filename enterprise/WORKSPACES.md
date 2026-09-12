@@ -6,6 +6,45 @@ machines. The first Docker fork adapter requires parent and child environments t
 belong to the same configured gateway; cross-gateway snapshot transfer is not
 advertised by this adapter.
 
+## Initialize a project
+
+An authenticated user in a configured approval application can initialize a new
+root session before its first input. Create the session, then call
+`POST /sessions/{session}/workspace/imports` with `requestId`,
+`expectedInputVersion: "0"`, the archive `sha256`, and decimal-string `bytes`.
+Upload the same uncompressed tar bytes to
+`PUT /sessions/{session}/workspace/imports/{import}/archive` using
+`Content-Type: application/x-tar`. API and BFF prefixes share this contract.
+`GET /sessions/{session}/workspace/imports/{import}` returns the typed state.
+
+The archive must place its entries under `workspace/`, contain at most 512 MiB
+and use supported UTF-8 file, directory, symlink or hardlink entries. Special files,
+set-id modes, escaping links, duplicates and structurally inconsistent trees are
+rejected. Initial import normalizes UID/GID to the runtime user (`0:0`) while
+preserving content, ordinary permissions and safe links. It uses private streaming
+files and never extracts into the gateway host.
+
+Import admission serializes with first-input admission. While upload or restore
+is pending, no Job is accepted for that session. The control plane fixes owner,
+profile and environment; a separate short-lived upload ticket cannot execute
+commands or read other resources. After byte validation, the gateway rechecks
+current initialization authority, publishes through the existing durable fork
+mechanism and commits a matching receipt. A ready workspace is always opened as
+existing; a missing volume cannot silently become empty.
+
+Identical requests/uploads reuse the same result, including concurrent retries;
+different bytes or metadata conflict. `DELETE` on the import resource cancels an
+upload before initialization begins. Once restoring, retry the same archive or
+inspect the import state. Ready data cannot be replaced through initialization.
+A cancelled upload can be replaced before any input is admitted. This initial
+adapter pins the selected configuration; profile/environment changes need an
+explicit migration. Later Agent commands still require their own approval.
+
+The SDK provides `beginWorkspaceImport`, `workspaceImport`,
+`uploadWorkspaceArchive` and `cancelWorkspaceImport`. A ready import projects as
+an artifact with `ViewWorkspaceImport`, without private assignment or credentials.
+PostgreSQL format 18 preserves import state across control-plane restarts.
+
 ## Configure a target
 
 Install the child definition on the control plane and compatible Workers. Obtain

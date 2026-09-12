@@ -27,6 +27,7 @@ export type ApprovalId = string;
 export type PrincipalId = string;
 export type TenantId = string;
 export type ApprovalState = "pending" | "automatic" | "approved" | "rejected" | "expired" | "invalidated";
+export type Counter = string;
 export type WorkspaceId = string;
 export type InputId = string;
 export type JobPhase = "ready" | "running" | "waiting" | "paused" | "completed" | "failed" | "cancelled" | "uncertain";
@@ -56,7 +57,6 @@ export type WaitTarget =
     };
 export type WorkspacePath = string;
 export type MergeContentSide = "base" | "parent" | "child";
-export type Counter = string;
 export type CouncilPhase = "seats" | "stopping" | "synthesis" | "completed" | "failed" | "cancelled" | "uncertain";
 export type CouncilSeatState =
   | "pending"
@@ -75,6 +75,8 @@ export type NodeRunId = string;
 export type InvocationState =
   "queued" | "waiting" | "running" | "succeeded" | "failed" | "denied" | "cancelled" | "uncertain";
 export type WorkflowState = "preparing" | "prepared" | "active" | "completed" | "failed" | "cancelled" | "uncertain";
+export type WorkspaceImportId = string;
+export type WorkspaceImportState = "uploading" | "initializing" | "ready" | "cancelled";
 export type WorkspaceEntry =
   | {
       gid: number;
@@ -105,6 +107,7 @@ export type MergeChoice = "parent" | "child" | "conflict";
 export interface ApplicationProtocol {
   answer: ApprovalDecision;
   approval: ApprovalView;
+  begin_workspace_import: BeginWorkspaceImport;
   cancel: CancelJob;
   cancellation: CancellationReceipt;
   create_session: CreateSession;
@@ -116,6 +119,7 @@ export interface ApplicationProtocol {
   submit_turn: SubmitTurn;
   workflow: WorkflowRunView;
   workspace: WorkspaceView;
+  workspace_import: WorkspaceImportView;
   workspace_merge: WorkspaceMergeView;
 }
 export interface ApprovalDecision {
@@ -154,6 +158,12 @@ export interface ApprovalBinding {
 export interface PrincipalKey {
   principalId: PrincipalId;
   tenantId: TenantId;
+}
+export interface BeginWorkspaceImport {
+  bytes: Counter;
+  expectedInputVersion: Counter;
+  requestId: RequestId;
+  sha256: string;
 }
 export interface CancelJob {
   expectedTurnId: TurnId;
@@ -266,6 +276,14 @@ export interface NodeRunView {
 export interface WorkspaceView {
   id: WorkspaceId;
   title: string;
+}
+export interface WorkspaceImportView {
+  bytes: Counter;
+  createdAt: Counter;
+  id: WorkspaceImportId;
+  sessionId: SessionId;
+  sha256: string;
+  state: WorkspaceImportState;
 }
 export interface WorkspaceMergeView {
   admitted: boolean;

@@ -93,7 +93,7 @@ export class ActivityClient {
     url.searchParams.set("limit", limit.toString());
     return url;
   }
-  protected async response(url: URL, signal?: AbortSignal, method = "GET", body?: unknown, accept = "application/json", timeout = 15000): Promise<Response> {
+  protected async response(url: URL, signal?: AbortSignal, method = "GET", body?: unknown, accept = "application/json", timeout = 15000, archive?: Blob): Promise<Response> {
     if (url.origin !== this.base.origin || !url.pathname.startsWith(this.base.pathname) || url.username || url.password || url.hash) {
       throw new Error("Enterprise request escaped its configured API");
     }
@@ -102,9 +102,10 @@ export class ActivityClient {
     if (context !== undefined) headers.set("x-zuno-browser-context", context);
     if (this.options.accessToken) headers.set("authorization", `Bearer ${await this.options.accessToken()}`);
     if (body !== undefined) headers.set("content-type", "application/json");
+    if (archive !== undefined) headers.set("content-type", "application/x-tar");
     if (method !== "GET" && !this.options.accessToken) headers.set("x-zuno-csrf", "1");
     const response = await this.request(url, {
-      method, body: body === undefined ? undefined : JSON.stringify(body),
+      method, body: archive ?? (body === undefined ? undefined : JSON.stringify(body)),
       headers, credentials: this.options.accessToken ? "omit" : "same-origin",
       cache: "no-store", redirect: "error", signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeout)]) : AbortSignal.timeout(timeout),
     });
@@ -116,6 +117,9 @@ export class ActivityClient {
   }
   protected async get(url: URL, signal?: AbortSignal, method = "GET", body?: unknown): Promise<unknown> {
     const response = await this.response(url, signal, method, body);
+    return this.json(response);
+  }
+  protected async json(response: Response): Promise<unknown> {
     if (response.status === 204) return null;
     if (!response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
       await response.body?.cancel();

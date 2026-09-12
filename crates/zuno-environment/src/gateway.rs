@@ -1,3 +1,4 @@
+mod import;
 mod merge;
 mod metadata;
 mod workspace;

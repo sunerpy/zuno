@@ -283,6 +283,35 @@ pub fn write_merged_archive(
             snapshot.archive_bytes,
         )?;
     }
+    write_tree_archive(&resolved, &[parent, child], destination)
+}
+
+pub fn normalize_import_archive(
+    source: &Path,
+    sha256: &str,
+    bytes: u64,
+    destination: &Path,
+) -> Result<(String, u64), ApplicationError> {
+    let mut tree = SnapshotTree::read(source, sha256, bytes)?;
+    for entry in tree.entries.values_mut() {
+        match entry {
+            WorkspaceEntry::Directory { uid, gid, .. }
+            | WorkspaceEntry::File { uid, gid, .. }
+            | WorkspaceEntry::Symlink { uid, gid, .. } => {
+                *uid = 0;
+                *gid = 0;
+            }
+            WorkspaceEntry::Hardlink { .. } => {}
+        }
+    }
+    write_tree_archive(&tree.entries, &[&tree], destination)
+}
+
+fn write_tree_archive(
+    resolved: &WorkspaceTree,
+    sources: &[&SnapshotTree],
+    destination: &Path,
+) -> Result<(String, u64), ApplicationError> {
     let file = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -305,7 +334,7 @@ pub fn write_merged_archive(
     output.append(&header, std::io::empty()).map_err(storage)?;
     // Hardlink targets must be emitted before aliases, regardless of path order.
     for links in [false, true] {
-        for (path, entry) in &resolved {
+        for (path, entry) in resolved {
             if path == &WorkspacePath::root() {
                 continue;
             }
@@ -336,8 +365,9 @@ pub fn write_merged_archive(
                     sha256,
                     bytes,
                 } => {
-                    let source = [parent, child]
-                        .into_iter()
+                    let source = sources
+                        .iter()
+                        .copied()
                         .find(|snapshot| snapshot.entries.get(path) == Some(entry))
                         .ok_or_else(|| invalid("merged member has no immutable blob source"))?;
                     let blob = source.blobs.get(path).ok_or(ApplicationError::Conflict)?;
@@ -598,5 +628,46 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn initial_import_normalizes_host_ownership_and_keeps_content_modes_and_links() {
+        let root = tempfile::tempdir().unwrap();
+        let input = archive(
+            &root.path().join("source.tar"),
+            &[
+                Member::File("file", b"\0\xffdata"),
+                Member::Link("alias", "file", true),
+                Member::Link("link", "file", false),
+            ],
+        );
+        let output = root.path().join("normalized.tar");
+        let (hash, bytes) = normalize_import_archive(
+            &input.source,
+            &input.archive_sha256,
+            input.archive_bytes,
+            &output,
+        )
+        .unwrap();
+        let normalized = SnapshotTree::read(&output, &hash, bytes).unwrap();
+        for (path, entry) in normalized.entries() {
+            match entry {
+                WorkspaceEntry::Directory { uid, gid, .. }
+                | WorkspaceEntry::File { uid, gid, .. }
+                | WorkspaceEntry::Symlink { uid, gid, .. } => {
+                    assert_eq!((*uid, *gid), (0, 0), "{path:?}")
+                }
+                WorkspaceEntry::Hardlink { target } => assert_eq!(target.as_str(), "file"),
+            }
+        }
+        assert!(matches!(
+            normalized
+                .entries()
+                .get(&WorkspacePath::new("file").unwrap()),
+            Some(WorkspaceEntry::File { mode: 0o640, .. })
+        ));
+        assert!(matches!(
+            normalized.entries().get(&WorkspacePath::root()),
+            Some(WorkspaceEntry::Directory { mode: 0o750, .. })
+        ));
     }
 }

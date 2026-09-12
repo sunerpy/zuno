@@ -308,3 +308,14 @@ The exact format-16 fixture uses source digest
 and verifies preserved sessions, messages, Memory, activity, Jobs and Council
 deadlines through successful migration and failed-DDL rollback. All new tables
 use owner RLS; the cancellation helper returns bounded coordinates only.
+
+## Format 18: initial workspace import
+
+`workspace_import` binds an empty root session to one active archive request,
+fixed deployment and durable initialization receipt. The session lock arbitrates
+with first input; pending or mismatched initialization rejects admission without
+consuming input. A partial unique index permits a new upload only after a previous
+upload was cancelled. Exact format-17 migration uses source digest
+`0283f316583aeff2c9da642747f54430c9fd1035a5183355d9a2b86deb3aeebc`
+and tests preservation of sessions, messages, Memory, Jobs and merge offers,
+including rollback before the marker.
