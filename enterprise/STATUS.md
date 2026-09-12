@@ -324,3 +324,11 @@ reproduced `Forbidden`. The client now accepts only a non-shortening expiry with
 the same complete execution identity. The executable fixture renews every 100ms
 to exercise this boundary directly; persistent diagnostics retain ledger, Docker
 and driver facts if a future failure occurs.
+
+CI run 34675496698 passed both Linux Docker lanes, including the independent
+process fixture. The personal Windows test job timed out in `goal_uncertain`
+after its first CLI launch; the suite's captured log had no child diagnostics.
+The fixture now captures finite CLI output into files, bounds process waiting
+independently of pipe EOF and reports child diagnostics before a timeout panic.
+The Linux Goal test, workspace check and Clippy passed. Windows verification of
+this follow-up remains pending; the earlier timeout is not counted as a pass.
