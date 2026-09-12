@@ -155,9 +155,9 @@ impl zuno_acp::Agent for ProductionAcpAgent {
             return Err(zuno_acp::RpcError::method_not_found(method));
         }
         let session_id = required_string(&params, "sessionId")?;
+        let expected_turn_id = cancel_expected_turn_id(&params)?;
         let session = self.session(&session_id).await?;
-        session.cancel(HardInterruptReason::UserCancel);
-        Ok(())
+        session.cancel(expected_turn_id, HardInterruptReason::UserCancel)
     }
 
     async fn request_cancelled(&self, method: &str, request: &zuno_acp::RequestId, params: &Value) {
@@ -172,6 +172,35 @@ impl zuno_acp::Agent for ProductionAcpAgent {
             session.cancel_request(request);
         }
     }
+}
+
+/// ACP reserves `_meta` for negotiated extensions. Invalid exact metadata must
+/// not silently degrade to a session-only cancellation.
+fn cancel_expected_turn_id(params: &Value) -> Result<Option<&str>, zuno_acp::RpcError> {
+    let Some(meta) = params.get("_meta").filter(|meta| !meta.is_null()) else {
+        return Ok(None);
+    };
+    let meta = meta
+        .as_object()
+        .ok_or_else(|| zuno_acp::RpcError::invalid_params("_meta must be an object"))?;
+    let Some(zuno) = meta.get("zuno").filter(|zuno| !zuno.is_null()) else {
+        return Ok(None);
+    };
+    let zuno = zuno
+        .as_object()
+        .ok_or_else(|| zuno_acp::RpcError::invalid_params("_meta.zuno must be an object"))?;
+    zuno.get("expectedTurnId")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|id| !id.trim().is_empty() && id.len() <= 256)
+                .ok_or_else(|| {
+                    zuno_acp::RpcError::invalid_params(
+                        "_meta.zuno.expectedTurnId must be a non-empty string of at most 256 bytes",
+                    )
+                })
+        })
+        .transpose()
 }
 
 fn initialize(params: &Value) -> Result<Value, zuno_acp::RpcError> {
@@ -219,6 +248,14 @@ fn initialize(params: &Value) -> Result<Value, zuno_acp::RpcError> {
                     "method": "session/steer",
                     "requiresExpectedTurnId": true,
                     "turnIdSource": "session/update._meta.zuno.turnId",
+                },
+                "cancellation": {
+                    "version": 1,
+                    "method": "session/cancel",
+                    "expectedTurnIdPath": "_meta.zuno.expectedTurnId",
+                    "turnIdSource": "session/update._meta.zuno.turnId",
+                    "legacySessionIdOnly": "currentTargetAtDispatch",
+                    "armsNextTurn": false,
                 },
             },
         },
@@ -727,7 +764,6 @@ impl ProductionAcpAgent {
                 &self.state.question_pool,
             )),
             turn_owner: std::sync::Mutex::new(None),
-            active_prompt_input: std::sync::Mutex::new(None),
             prompt_driver: std::sync::Mutex::new(None),
             prompt_requests: std::sync::Mutex::new(HashMap::new()),
             prompts_in_flight: AtomicUsize::new(0),
@@ -834,7 +870,6 @@ impl ProductionAcpAgent {
                 &self.state.question_pool,
             )),
             turn_owner: std::sync::Mutex::new(None),
-            active_prompt_input: std::sync::Mutex::new(None),
             prompt_driver: std::sync::Mutex::new(None),
             prompt_requests: std::sync::Mutex::new(HashMap::new()),
             prompts_in_flight: AtomicUsize::new(0),
@@ -926,11 +961,6 @@ pub(super) struct AcpSession {
     receipts: zuno_db::input_receipt::InputReceiptStore,
     /// One native command request or session-owned durable driver serves the queue.
     turn_owner: std::sync::Mutex<Option<input_receipts::TurnOwner>>,
-    /// Input selected by the native FIFO driver while its turn lease is held.
-    ///
-    /// A request serving the queue may be driving an older input. Withdrawing its
-    /// own pending row must not interrupt that older input's turn.
-    active_prompt_input: std::sync::Mutex<Option<String>>,
     prompt_driver: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Withdrawal state of every `session/prompt` request still being served.
     ///
@@ -2838,6 +2868,7 @@ impl AcpSession {
                 SlashInvocation::Session { command, arguments } => match command {
                     SessionCommand::Compact
                     | SessionCommand::Goal
+                    | SessionCommand::InspectOutcome
                     | SessionCommand::Learn
                     | SessionCommand::Reflect
                     | SessionCommand::Questions => resources
@@ -3058,7 +3089,7 @@ impl AcpSession {
         guard: &SessionRunGuard,
         scope: DurableInputScope,
     ) -> Result<Option<(Result<(), zuno_acp::RpcError>, ProjectedTurn)>, zuno_acp::RpcError> {
-        let (input_id, drivable, context_size) = {
+        let (input_id, drivable, context_size, _active_input) = {
             let resources = self.resources.lock().await;
             let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
             let inbox = resources.host.session_inbox();
@@ -3067,15 +3098,24 @@ impl AcpSession {
             else {
                 return Ok(None);
             };
+            // Bind before promotion. A concurrent withdrawal either wins the
+            // durable pending-row cancellation or finds this exact native input.
+            let active_input = guard.mark_input_started(&input.id).ok_or_else(|| {
+                zuno_acp::RpcError::internal("durable input driver lost its live lease")
+            })?;
             let Some(promoted) = inbox
                 .promote_id(resources.host.session_id(), &input.id)
                 .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?
             else {
                 return Ok(None);
             };
-            (promoted.id, drivable, resources.configuration.context_size)
+            (
+                promoted.id,
+                drivable,
+                resources.configuration.context_size,
+                active_input,
+            )
         };
-        let _active_input = input_receipts::ActiveInput::enter(self, &input_id);
         let publication = self.publications.begin(Some(&input_id));
         let (events, receiver) = event_channel();
         let drive = async {
@@ -3350,6 +3390,7 @@ impl AcpSession {
             }
             SessionCommand::Compact
             | SessionCommand::Goal
+            | SessionCommand::InspectOutcome
             | SessionCommand::Learn
             | SessionCommand::Reflect
             | SessionCommand::Questions
@@ -3686,17 +3727,33 @@ impl AcpSession {
         Ok(())
     }
 
-    /// Interrupt the session's live turn on behalf of a session-scoped cancel.
-    ///
-    /// The armed-next disposition is deliberate: a cancel that arrives between a
-    /// prompt being accepted and its lease being taken still stops that turn.
-    fn cancel(&self, reason: HardInterruptReason) {
-        if !self.has_work_in_flight() {
-            return;
+    /// Exact metadata names a turn all the way to the signal boundary.
+    /// Legacy session-only cancellation captures a live target once at dispatch;
+    /// it cannot infer a network-stale intent and never arms the next input.
+    fn cancel(
+        &self,
+        expected_turn_id: Option<&str>,
+        reason: HardInterruptReason,
+    ) -> Result<(), zuno_acp::RpcError> {
+        let request = HardInterruptRequest::new(HardInterruptSource::Acp, reason);
+        if let Some(expected) = expected_turn_id {
+            return self.control.abort_turn(expected, request).map_err(|error| {
+                zuno_acp::RpcError::invalid_request(error.to_string()).with_data(json!({
+                    "sessionId": self.id,
+                    "expectedTurnId": expected,
+                    "reason": match error {
+                        ExpectedTurnError::NoActiveTurn { .. } => "noActiveTurn",
+                        ExpectedTurnError::ActiveTurnNotIdentified { .. } => "activeTurnNotIdentified",
+                        ExpectedTurnError::Mismatch { .. } => "expectedTurnMismatch",
+                        ExpectedTurnError::Closing { .. } => "turnClosing",
+                    },
+                }))
+            });
         }
-        let _disposition = self
-            .control
-            .abort(HardInterruptRequest::new(HardInterruptSource::Acp, reason));
+        if let Some(target) = self.control.cancel_target() {
+            let _aborted = self.control.abort_target(&target, request);
+        }
+        Ok(())
     }
 
     /// Retire exactly what one withdrawn `session/prompt` request started.
@@ -3712,35 +3769,34 @@ impl AcpSession {
     /// sees the other: this one retires an already published row, and the admitting
     /// side retires the row it publishes after the withdrawal was recorded.
     fn cancel_request(&self, request: &zuno_acp::RequestId) {
-        if self.owns_turn(request) {
-            self.cancel(HardInterruptReason::RequestCancelled);
+        // Capture native command ownership while holding its claim lock, then
+        // carry that exact identity to cancellation. Never re-read "current".
+        let target = {
+            let owner = self
+                .turn_owner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match owner.as_ref() {
+                Some(input_receipts::TurnOwner::Request(owner)) if owner == request => {
+                    self.control.cancel_target()
+                }
+                _ => None,
+            }
+        };
+        let interrupt = HardInterruptRequest::new(
+            HardInterruptSource::Acp,
+            HardInterruptReason::RequestCancelled,
+        );
+        if let Some(target) = target {
+            let _aborted = self.control.abort_target(&target, interrupt);
         }
         if let Some(input_id) = self.withdraw_prompt_request(request) {
-            let driving_this_input = self
-                .active_prompt_input
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_deref()
-                == Some(input_id.as_str());
-            if driving_this_input {
-                let _aborted = self.control.abort_active(HardInterruptRequest::new(
-                    HardInterruptSource::Acp,
-                    HardInterruptReason::RequestCancelled,
-                ));
-            }
+            // Pending cancellation first: if promotion won, the driver installed
+            // its input binding before the transaction and this exact abort sees
+            // it. Observers own no input, so cannot reach either operation.
             self.retire_pending_input(&input_id);
+            let _aborted = self.control.abort_input(&input_id, interrupt);
         }
-    }
-
-    /// Whether `request` holds this session's prompt-turn claim.
-    fn owns_turn(&self, request: &zuno_acp::RequestId) -> bool {
-        matches!(
-            self.turn_owner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref(),
-            Some(input_receipts::TurnOwner::Request(owner)) if owner == request
-        )
     }
 
     /// Record that `request` was withdrawn, returning any row it already admitted.
@@ -5906,6 +5962,7 @@ mod tests {
             vec![
                 "compact",
                 "goal",
+                "inspect-outcome",
                 "learn",
                 "plan",
                 "questions",
@@ -5923,12 +5980,13 @@ mod tests {
         );
         assert!(advertised[0].get("input").is_none());
         assert_eq!(advertised[1]["input"]["hint"], "objective | action [value]");
+        assert_eq!(advertised[2]["input"]["hint"], "[part-id ...]");
         assert_eq!(
-            advertised[2]["input"]["hint"],
+            advertised[3]["input"]["hint"],
             "remember|issue|solved|forget|promote|feedback ..."
         );
-        assert_eq!(advertised[5]["input"]["hint"], "turn | session");
-        assert_eq!(advertised[9]["input"]["hint"], "question");
+        assert_eq!(advertised[6]["input"]["hint"], "turn | session");
+        assert_eq!(advertised[10]["input"]["hint"], "question");
     }
 
     #[test]

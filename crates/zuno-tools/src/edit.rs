@@ -2,9 +2,10 @@ use crate::read::{
     FileToolRuntime, PathKind, check_interrupt, decode_text, encode_text, failed, invalid,
     publish_error, report_diff, report_formatting, report_post_write_warnings, uncertain,
 };
+use crate::uncertain::{NativeFileIntentRecorder, NativeFileKind};
 use async_trait::async_trait;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use zuno_error::ToolError;
@@ -13,7 +14,7 @@ use zuno_tool::{ToolContext, ToolOutput, TypedTool};
 /// The description the model reads.
 pub const DESCRIPTION: &str = include_str!("description/edit.txt");
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EditOperation {
     /// The text to replace.
@@ -25,7 +26,7 @@ pub struct EditOperation {
     pub replace_all: bool,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EditParams {
     /// The absolute path to the file to modify.
@@ -36,11 +37,20 @@ pub struct EditParams {
 
 pub struct EditTool {
     runtime: Arc<FileToolRuntime>,
+    intent_recorder: Option<Arc<NativeFileIntentRecorder>>,
 }
 
 impl EditTool {
     pub(crate) fn new(runtime: Arc<FileToolRuntime>) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            intent_recorder: None,
+        }
+    }
+
+    pub(crate) fn with_intent_recorder(mut self, recorder: Arc<NativeFileIntentRecorder>) -> Self {
+        self.intent_recorder = Some(recorder);
+        self
     }
 }
 
@@ -68,6 +78,14 @@ impl TypedTool for EditTool {
             .await?;
         let _guard = self.runtime.mutation.lock().await;
         check_interrupt("edit", &ctx)?;
+        if let Some(recorder) = &self.intent_recorder {
+            recorder.record(
+                NativeFileKind::Edit,
+                &params,
+                vec![target.canonical.clone()],
+                &ctx,
+            )?;
+        }
 
         // `edit` never creates a directory tree: the file it edits must already exist.
         let anchored = self.runtime.anchor_file("edit", &target, false)?;

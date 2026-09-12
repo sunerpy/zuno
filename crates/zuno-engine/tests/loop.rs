@@ -49,6 +49,8 @@ const SESSION_ID: &str = "ses_loop_test";
 
 #[path = "loop/context_usage.rs"]
 mod context_usage_tests;
+#[path = "loop/live_input_gates.rs"]
+mod live_input_gate_tests;
 
 #[derive(Debug)]
 struct ScriptedResponse {

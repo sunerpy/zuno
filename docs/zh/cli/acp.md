@@ -53,12 +53,14 @@ runtime，避免重复网络或子进程握手。结构性 MCP 配置发生变�
 `reason` 为 `noActiveTurn`、`expectedTurnMismatch`、
 `activeTurnNotSteerable` 或 `emptyInput`。目标回合会在 inbox 事务提交前再次校验；
 如果等待 SQLite 期间原回合结束或已被替换，输入行与准入事件一起回滚，被拒绝的 steer
-不会进入后续回合。`session/cancel` 仍是显式停止整个会话当前执行的控制。
+不会进入后续回合。Stop 使用 `session/cancel`；后续输入使用 prompt 准入或
+`session/steer`，不能通过取消后重发来模拟 steer。
 
 斜杠命令无法被转向，会以 `reason: "commandRequiresIdleSession"` 被拒绝，且不写入任何
 持久内容；只有能解析到真实命令、Skill 或原生控制项的文本才算斜杠命令，因此仅以 `/`
-开头的提示词会作为普通内容被接纳。`$/cancel_request` 只在尚未进入模型时撤回该请求
-贡献的输入，不能抹掉已处理内容，也不能由重复 ID 的观察者撤回原输入。
+开头的提示词会作为普通内容被接纳。`$/cancel_request` 只撤回该请求贡献的输入；
+如果它选中的原生输入已经运行，实际发出取消时仍会核对输入身份。取消不能抹掉已处理
+历史，也不能由重复 ID 的观察者撤回原输入。
 断线不等于撤回：已接收输入与处理回执继续持久保留。完整形态见
 [Zed ACP 集成](/zh/guide/editors)。
 
@@ -104,6 +106,39 @@ ACP `usage_update` 使用原生 `ContextUsageSnapshot`：最近供应商确认�
 
 运行中的 ACP 会话会订阅统一 Skill catalog generation。新增、修改、删除或重命名
 Skill 后，会发送新的 `available_commands_update`，无需重启会话。
+
+## 精确取消与旧客户端
+
+初始化响应通过 `_meta.zuno.cancellation` 宣告 `version: 1`、
+`method: "session/cancel"`、`expectedTurnIdPath: "_meta.zuno.expectedTurnId"`、
+`legacySessionIdOnly: "currentTargetAtDispatch"` 与 `armsNextTurn: false`。
+客户端从实时 `session/update` 的 `params.update._meta.zuno.turnId` 读取回合 ID：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "session/cancel",
+  "params": {
+    "sessionId": "ses_example",
+    "_meta": { "zuno": { "expectedTurnId": "turn_example" } }
+  }
+}
+```
+
+目标 ID 必须是非空字符串，最多 256 字节。Zuno 在同一把原生锁内校验目标并发出取消，
+因此迟到的 T1 取消不会中断 T2。目标不存在或已结束、ID 不匹配、exact metadata 格式
+非法时，都不会降级为取消当前回合。这是 notification，不产生 JSON-RPC 响应；
+拒绝信息写到 stderr。实际执行结果以原 prompt 的持久回执和更新为准。
+
+旧客户端只发送 `sessionId` 时，Zuno 在处理通知时绑定一次当前执行目标。空闲时取消
+没有效果，也不会给未来回合预置取消。协议没有提供识别网络迟到意图的信息：原本想取消
+T1 的 session-only 通知如果在 T2 运行时到达，可能取消 T2。需要精确目标的客户端必须
+使用上述扩展。
+
+`$/cancel_request` 通过 `requestId` 标识原客户端 RPC，字符串与数字 ID 分开处理。
+响应后复用 wire ID 会获得新的内部请求身份；使用 `_meta.zuno.messageId` 幂等重试时，
+仍只观察原持久输入。撤回不能取消无关的 Agent 到客户端 RPC。`-32800` 表示请求撤回，
+不表示工具副作用已回滚；应通过持久回执观察执行结果。
 
 ## Goal 续跑
 

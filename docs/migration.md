@@ -1,9 +1,9 @@
 # Zuno database lifecycle
 
-Zuno owns its configuration and data roots. The current database format is 14.
+Zuno owns its configuration and data roots. The current database format is 15.
 Empty databases are created at the current format, and supported older formats advance
 through guarded forward migrations. Format 5 is the first supported historical format
-and formats 5 through 13 upgrade in place to format 14 without rebuilding the database.
+and formats 5 through 14 upgrade in place to format 15 without rebuilding the database.
 
 ## The channel database
 
@@ -52,16 +52,17 @@ it opened. See
 
 Database opening recognizes these states:
 
-1. **Empty database.** The complete format-14 schema and the single `zuno_schema`
+1. **Empty database.** The complete format-15 schema and the single `zuno_schema`
    marker are created atomically.
-2. **Format 14.** The marker, tables, constraints, indexes and triggers are validated
+2. **Format 15.** The marker, tables, constraints, indexes and triggers are validated
    before application queries run.
-3. **Formats 5–13.** Every remaining supported migration runs in a single
+3. **Formats 5–14.** Every remaining supported migration runs in a single
    transaction: learning (6), Plan stack (7), verification receipts (8), session
    memory policy (9), execution/inbox state (10), versioned memory and search (11),
    automatic-memory provenance and watermarks (12), then durable questions and
    session scheduling (13), then input processing receipts, canonical Context
-   snapshots and revision-bound Goal resume choices (14).
+   snapshots and revision-bound Goal resume choices (14), then work-cycle ownership
+   and keyed Goal-turn observations/settlement (15).
 4. **Any other state.** An older unsupported format, a future format, a missing marker,
    or a marker whose required tables are absent fails closed without modification.
 
@@ -73,12 +74,12 @@ reported as a schema mismatch; a database whose format keeps changing under the 
 fails closed with a conflict on the `zuno_schema` marker. Neither path writes to the
 database.
 
-### Formats 5–13 to format 14
+### Formats 5–14 to format 15
 
 The supported migration uses one SQLite `BEGIN IMMEDIATE` transaction:
 
 1. Re-read the table inventory and require the marker to be exactly format 5, 6, 7,
-   8, 9, 10, 11, 12, or 13.
+   8, 9, 10, 11, 12, 13, or 14.
 2. Require the historical `session` and `work_plan` tables before changing anything.
 3. From format 5, create all format-6 learning tables and indexes.
 4. From format 5 or 6, add nullable `parent_plan_id`, defaulted `stack_depth`, and
@@ -104,18 +105,21 @@ The supported migration uses one SQLite `BEGIN IMMEDIATE` transaction:
     constraint to include native `goal_resume`. Create `session_input_receipt` and
     `session_context_usage` and their indexes. Old consumed inputs become
     `recorded`, never `applied` or `completed` without provider evidence.
-13. Conditionally update the singleton marker from the exact observed old format to
-    14, last. Commit only after every operation succeeds.
+13. Create `session_work_cycle` and its index, plus `goal_turn_observation`,
+    `goal_cycle_failure` and `goal_turn_audit`. These start empty. Unbound historical
+    blocker observations remain preserved, not counted against a new cycle.
+14. Conditionally update the singleton marker from the exact observed old format to
+    15, last. Commit only after every operation succeeds.
 
 Any failure rolls the transaction back. The migration does not rewrite existing
 `session`, `message`, `memory_candidate`, `learning_job`, `verification_receipt`, or
 `work_plan` values except the documented source-validation/lease backfills.
-Tests use exact format-5 through format-13 release fixtures, compare representative
+Tests use exact format-5 through format-14 release fixtures, compare representative
 session/message/memory values and preserved rows, then verify new objects and marker.
 Format-11 tests include previously published resident revisions and rollback of the
 entire additive change if the final index creation fails.
 
-The format-14 migration never runs a model, extracts Memory, invents Context
+The format-15 migration never runs a model, extracts Memory, invents Context
 counts, or resumes a paused Goal. Legacy source verification and optional
 reprocessing are resumable learning jobs, not migration side effects.
 Use `/learn repair-history --dry-run` to inspect repair eligibility before
@@ -128,6 +132,12 @@ Agent, the saved Work identity, exact authorized and handoff-ready Plan revision
 continuation cycle and context epoch, and any explicit Draft-review risk acceptance.
 `/start-work` reads the Plan and review gate, updates Goal state, writes Work authority,
 and admits its `UserControl` input in one `BEGIN IMMEDIATE` transaction.
+
+`session_work_cycle` separates the current request's work ownership from stopped
+cycles. New ordinary input does not resume the old Goal or adopt an unchanged Plan.
+Only an explicit revision-bound Goal resume can transfer its original report cycles
+to current execution; original completion receipts remain unchanged. Database opening
+does not classify unknown legacy pauses as user cancellation or automatically resume them.
 
 `completion_delivery` is the exactly-once ownership ledger for background commands,
 subagents, workflows, and product Agents. Terminal `bg output`, synchronous `bg wait` and an asynchronous
@@ -191,7 +201,7 @@ copy before any operator-led recovery.
 For important data, use the exact older binary to export it or implement and validate an
 explicit forward migration. Do not guess the schema, silently drop rows, or require a
 rebuild for a format that the current binary supports. A valid format-5, format-6,
-format-7, format-8, format-9, format-10, format-11, format-12, or format-13 database should open and migrate automatically.
+format-7, format-8, format-9, format-10, format-11, format-12, format-13, or format-14 database should open and migrate automatically.
 
 ## Rules for future schema changes
 

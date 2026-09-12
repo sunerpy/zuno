@@ -140,6 +140,21 @@ impl AuthorizationPolicy {
 }
 
 impl ToolRegistryDispatcher {
+    /// Native read/inspection controls use the same explicit rules, permission
+    /// hooks and attached-user decision point as tools. Each control starts with
+    /// a fresh approval cache; this never grants model tool exposure.
+    #[must_use]
+    pub fn native_permission_asker(&self) -> Arc<dyn PermissionAsker> {
+        Arc::new(NativeControlPermissionAsker {
+            permission: RulePermissionAsker::new(
+                Arc::clone(&self.rules),
+                Arc::clone(&self.approval),
+                self.authorization,
+            ),
+            hooks: Arc::clone(&self.hooks),
+        })
+    }
+
     /// Builds a dispatcher over an already assembled registry.
     ///
     /// Registry assembly and model-conditional exposure belong to `zuno-tools`; this
@@ -570,6 +585,39 @@ struct RulePermissionAsker {
     authorization: AuthorizationPolicy,
     approved_once: Mutex<BTreeSet<(String, String)>>,
     approved_permissions: Mutex<BTreeSet<String>>,
+}
+
+struct NativeControlPermissionAsker {
+    permission: RulePermissionAsker,
+    hooks: Arc<dyn ToolHooks>,
+}
+
+#[async_trait]
+impl PermissionAsker for NativeControlPermissionAsker {
+    async fn ask(
+        &self,
+        origin: PermissionOrigin<'_>,
+        tool: &str,
+        ask: PermissionAsk,
+    ) -> Result<(), zuno_error::ToolError> {
+        let request = origin.into_request(
+            format!("native_{}", uuid::Uuid::new_v4().simple()),
+            ask.clone(),
+        );
+        let decision = self.hooks.permission(&request).await.map_err(|error| {
+            zuno_error::ToolError::Failed {
+                tool: tool.to_owned(),
+                source: Box::new(std::io::Error::other(error)),
+            }
+        })?;
+        if decision == PermissionHookDecision::Deny {
+            return Err(zuno_error::ToolError::Denied {
+                tool: tool.to_owned(),
+                denial: None,
+            });
+        }
+        self.permission.gate(origin, tool, ask, decision).await
+    }
 }
 
 /// What the configured rules decided about one ask, before anyone is prompted.

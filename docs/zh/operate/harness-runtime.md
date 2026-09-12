@@ -55,12 +55,22 @@ TUI 用 Ctrl+S 选择稍后，`/questions` 重开待答项。高亮、空输入�
 普通会话和 Goal 共用 `session_execution_state.scheduling`：可执行、等待指定人工请求、
 等待指定外部来源/周期、暂停、完成。未完成不等于可执行；blocked Todo 或 Plan 末步未完成
 不会自动产生下一轮模型请求。暂停期间 callback 仍能入库，但不能重置无进展计数或解除暂停。
-状态查询不恢复 Work；`/resume` 是显式恢复控制，不能绕过待答条件或 Plan 授权。
+真实用户输入在提升、消费的同一事务中绑定 `session_work_cycle`，忙时仅排队不会改写当前回合。
+普通停止记录旧输入／回合并关闭其周期，下一条消息无需 `/resume`。新请求不继承旧 Plan
+或无进展计数；原生 Work 授权及类型化 Plan／Todo 修改才建立工作归属，读取或旧步骤仍为
+`in_progress` 都不是承接。受保护的等待、审批、认证、预算和未知副作用门禁保留。
+`/resume` 不能绕过待答条件、Plan 授权，也不能把未知副作用登记为已核验。
 
 终态 `bg output`、`bg wait`、callback 使用同一消费回执，并保留来源工作周期。
-格式 14 在一个原子前向迁移中升级受支持的 5–13 格式，保留用户原数据，最后更新格式标记。
-新增输入处理回执、按来源隔离的 Context 快照，以及绑定 Goal revision 的原生恢复选择；
+格式 15 在一个原子前向迁移中升级受支持的 5–14 格式，保留用户原数据，最后更新格式标记。
+在既有输入回执、Context 快照和 Goal 恢复选择之上，新增 `session_work_cycle`、
+`goal_turn_observation`、`goal_cycle_failure`、`goal_turn_audit`；
 迁移不调用模型、不批量晋升历史证据，也不恢复暂停 Goal。
+
+边界参考本地 Codex `9ba1d9eb5bbbd87ba2fc528d91ad239eea975ee9` 的
+`core/src/session/turn_input.rs`、`core/src/tasks/mod.rs` 与 TUI Goal 菜单；Goal 工具和提示词
+同时对照 `eaa8b6d91701d6cabe464141facc677e5915fbfc`。持久周期、报告转交回执及宿主阻塞
+计数是 Zuno 原生适配，不声称 Codex 提供相同数据库或协议接口。
 
 `runtime.execution` 还会按最终工具快照为内置与自定义 Agent 生成简短降级规则：首选工具
 限速、不可用或暂时失败时，不原样重复调用。`tool_search` 可见时可以发现另一个已经授权的
@@ -436,6 +446,10 @@ session 级联删除，并进入 session export/import、sanitize 与 prune。TU
 Plan、审批、预算、认证及未知副作用仍由各自控制处理；记录 callback 也不代表已进入模型。
 提示词显示真实 Goal 状态、暂停原因和恢复条件。
 
+独立查询不会恢复旧 Goal。显式恢复通过 Goal ID／revision 校验后，才登记原 Goal 报告周期
+向当前执行周期的转交；原始完成凭据和一次消费约束不变，已处理输入不重投。普通 callback
+或新消息不能自行登记这项授权。
+
 Goal continuation 是一等的回合来源。准备阶段会捕获确切 Goal id 与 revision；provider
 工作开始前若 revision 已变化，这份 continuation 会失效。回合执行身份独立地从当前 host
 捕获 Agent、目录 provider 与目录模型。保留的 user 历史只提供因果 transcript anchor，
@@ -448,6 +462,11 @@ Goal 完成审计与 Plan 写入方共用同一个 step status 类型。`complet
 都是终态；缺失、未知或旧的 `cancelled` 值会明确按持久 Plan 损坏失败关闭。模型在一次
 `goal_update` 中结算 criteria 并完成 Goal 时，两者位于同一事务；审计拒绝会同时回滚
 checklist 与 Goal revision。
+
+用户创建且声明、台账均为空的 Goal，修改文件后仍可完成；非空声明与台账不一致则失败关闭。
+已声明检查项的证据、新鲜度、所有权和未知副作用审计保持不变，模型不能从独立输入关闭
+paused Goal。阻塞工具返回暂存状态、真实 Goal 状态和已完成回合计数；宿主按可信
+Goal／cycle／turn 身份计数，观察、状态、历史及幂等结算回执原子提交。
 
 Engine 在解析当前身份之后、发送 provider 请求之前写入一条
 `session.turn.started.1`。事件记录 `turnTrigger`、`anchorMessageID`、Agent、provider 与
@@ -481,6 +500,15 @@ call id、该调用报告已改动的路径、类型化 `cause` 取 `lost_outcom
 continuation 会查询当前目标下仍待处理的记录并再次暂停。`state.uncertain.reconciledAtMs`
 缺失的时长，恰好等于这次检查被拖欠的时长；查询范围由 Goal 自己的 `created_at_ms` 界定，
 所以新目标不会继承上一个目标的义务。
+
+通用 session／Goal 恢复不会写入这个标记。`/inspect-outcome` 是不经过模型的原生文件检查
+命令。具体文件实现授权后、执行前写入 `native.filesystem.intent`，绑定实际实现、
+canonical workspace、完整解析后的目标、schema／参数摘要及原 part／call／turn／cycle。
+只有工具名、上报路径或普通成功命令回执不够。检查器在 Unix／Windows 上执行有界的
+句柄锚定读取，再原子保存观察事件及确切 part 标记。真实 native session lease 持有至
+结算完成，前端断线也不能提前释放；模型调用仍须匹配活跃 turn。原生检查可以读取已停周期，
+但不会重新打开它。report-delivery alias 不授予工具调用权限。缺少原生记录的旧调用、
+Shell 和远程操作失败关闭。检查保留原 uncertain outcome，不授权重放或自动恢复。
 
 读取或记账 Goal 预算时遇到 SQLite 争用（`SQLITE_BUSY`）会持久化一次 `database_busy` 指数退避重试，Goal 保持活跃，而不是以 `turn_budget` 暂停；其他数据库失败仍以 `usage_unknown` 停止回合并暂停 Goal；本构建无法读取的持久状态仍然阻塞。CLI 回合中的 Plan 对账驱动、human request 创建与重试上下文压缩标记路径也经同一 `GoalTerminalFailure::from_db_error` 规则分类：争用现在以 `database_busy` 重试，过去则以 `host_permanent` 阻塞。
 

@@ -6,10 +6,11 @@ use crate::read::{
     ResolvedPath, check_interrupt, decode_text, digest_bytes, encode_text, failed, interrupted,
     invalid, publish_error, report_formatting, slash, uncertain,
 };
+use crate::uncertain::{NativeFileIntentRecorder, NativeFileKind};
 use async_trait::async_trait;
 use parser::{ChunkLine, PatchOperation, PatchParseError, UpdateChunk, parse_patch};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -25,7 +26,7 @@ pub const DESCRIPTION: &str = include_str!("description/apply-patch.txt");
 const CONTEXT_RECOVERY: &str = "read the current file and retry with a smaller patch using fresh, \
                                 unique context; do not resend the same patch";
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApplyPatchParams {
     /// The full patch text that describes all changes to be made.
@@ -34,11 +35,20 @@ pub struct ApplyPatchParams {
 
 pub struct ApplyPatchTool {
     runtime: Arc<FileToolRuntime>,
+    intent_recorder: Option<Arc<NativeFileIntentRecorder>>,
 }
 
 impl ApplyPatchTool {
     pub(crate) fn new(runtime: Arc<FileToolRuntime>) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            intent_recorder: None,
+        }
+    }
+
+    pub(crate) fn with_intent_recorder(mut self, recorder: Arc<NativeFileIntentRecorder>) -> Self {
+        self.intent_recorder = Some(recorder);
+        self
     }
 }
 
@@ -202,6 +212,20 @@ impl TypedTool for ApplyPatchTool {
 
         let _guard = self.runtime.mutation.lock().await;
         let changes = self.prepare_changes(&plan, &operation_digest, &ctx)?;
+        if let Some(recorder) = &self.intent_recorder {
+            let targets = plan
+                .iter()
+                .flat_map(|operation| {
+                    std::iter::once(operation.source.canonical.clone()).chain(
+                        operation
+                            .destination
+                            .as_ref()
+                            .map(|target| target.canonical.clone()),
+                    )
+                })
+                .collect();
+            recorder.record(NativeFileKind::ApplyPatch, &params, targets, &ctx)?;
+        }
         self.runtime
             .state
             .clear_patch_conflict(&ctx.session_id, &operation_digest);

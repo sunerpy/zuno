@@ -8169,6 +8169,8 @@ version = "0.10.31"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
+ "cap-fs-ext",
+ "cap-std",
  "hex",
  "reqwest",
  "rusqlite",

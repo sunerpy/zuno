@@ -39,7 +39,7 @@
 //!   concurrent `create_goal` calls both observe `complete` and both replace.
 //!   The refusal is the statement returning no row.
 //!
-//! # Why "done" needs a receipt
+//! # Declared acceptance contracts and completion authority
 //!
 //! A model can always *say* the work is verified. Before the criterion tables
 //! existed, [`GoalStore::complete_checked`] audited durable work — plan steps,
@@ -54,24 +54,25 @@
 //! failed run and an inferred exit status count for nothing. A receipt older than
 //! the last [`GoalStore::mark_mutation`] is refused, and a criterion already
 //! satisfied by one is reopened, so editing files after a green test run undoes the
-//! evidence rather than the other way round. And a goal that recorded success
-//! criteria, or that [`GoalStore::escalate_to_change`] marked as changing the
-//! workspace, cannot complete while any criterion is still open — including the case
-//! of a change goal having no criteria at all, which is assertion with extra steps.
+//! evidence rather than the other way round. A goal that recorded success criteria
+//! cannot complete while any criterion is still open.
 //!
-//! A [`GoalKind::Question`] goal that recorded no criteria is untouched by all
-//! three. Answering a question leaves nothing behind to verify, and demanding a
-//! receipt for it would only teach the model to manufacture one. A criteria-bearing
-//! goal is held to its checklist whatever its kind, because the kind is derived from
+//! A user-created Goal whose declaration and criterion ledger are both empty may
+//! complete after a change. A write does not invent a new acceptance contract.
+//! A criteria-bearing goal is held to its checklist whatever its kind, because the
+//! kind is derived from
 //! tool-reported write paths and a run that edits through a tool reporting none
 //! never escalates.
 //!
-//! Two consequences of that split are decisions, not gaps. A goal proposed with no
-//! criteria at all is accepted, because a question needs none, and it stays a
-//! question until the first write escalates it; from then on it can never complete,
-//! and the refusal says to propose criteria with `goal_propose` rather than
-//! inventing them from the objective — a checklist the store guessed would be a
-//! checklist nobody committed to. And the plan a session can see must belong to the
+//! Model proposals still require nonempty criteria. The stored declaration and ledger
+//! must agree exactly; missing, extra or altered rows fail closed. This is a Zuno
+//! adaptation of the ordinary Goal boundary seen in local Codex 9ba/eaa, whose create
+//! request has an objective and budget but no criterion ledger.
+//!
+//! Model completion cannot close a paused Goal through independent input. Native
+//! user completion can close a legitimate paused Goal while preserving its identity,
+//! budget and history, subject to the same work and declared-evidence audits.
+//! The plan a session can see must belong to the
 //! goal being completed: `work_plan` is keyed by session, so a plan bound to an
 //! earlier goal survives replacement with every step already `completed`, and
 //! without an ownership check a new goal would complete against the previous
@@ -96,13 +97,20 @@ use crate::error::GoalError;
 use crate::pause::{GoalPauseReason, GoalPauseState};
 use crate::retry::{GoalBlockReason, GoalRetryPolicy, GoalRetryReason, GoalRetryState};
 use crate::spill;
-use crate::status::{GoalStatus, ModelStatus, SystemStatus};
+use crate::status::{GoalStatus, ModelStatus, StatusOwner, SystemStatus};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zuno_db::Pool;
+
+#[path = "goal_turn.rs"]
+mod goal_turn;
+pub use goal_turn::{
+    GOAL_TURN_SCHEMA, GoalTurnAudit, GoalTurnDisposition, GoalTurnIdentity,
+    GoalTurnObservationReceipt, GoalTurnObservationUpdate, GoalTurnSettlement,
+};
 use zuno_db::human_request::{
     HumanRequest, HumanRequestKind, HumanRequestState, NewHumanRequest,
     create_in as create_request_in,
@@ -487,6 +495,16 @@ pub struct FailureStreak {
     pub consecutive_turns: u32,
 }
 
+/// A staged observation and the durable state read in its accepting transaction.
+///
+/// The count includes only completed turns, not the observation just staged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureObservation {
+    pub goal: Goal,
+    pub criteria: Vec<GoalCriterion>,
+    pub completed_turn_streak: u32,
+}
+
 /// Whether a criterion is still open, proven, or explicitly excused.
 ///
 /// Three states and not a boolean: a waiver is not a satisfaction, and collapsing
@@ -590,10 +608,10 @@ impl GoalKind {
         }
     }
 
-    /// Whether this kind alone requires recorded evidence to complete.
+    /// Whether this kind retains the capability audit on native user completion.
     ///
-    /// Not the whole gate: a recorded checklist is audited whatever the kind, so this
-    /// answers only whether a goal with *no* criteria is held to evidence.
+    /// A recorded checklist is audited whatever the kind. A change does not create
+    /// an implicit checklist for a user-created ordinary Goal.
     #[must_use]
     pub const fn requires_evidence(self) -> bool {
         matches!(self, Self::Change)
@@ -669,6 +687,14 @@ pub struct UsageRecorded {
     pub accounted: bool,
     /// The goal after the write, or `None` when the session has no goal.
     pub goal: Option<Goal>,
+}
+
+/// Frozen before a provider request. Independent means no Goal owned that request,
+/// even if native controls later attach a Goal to the same cycle or actual turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GoalRequestOwner {
+    Independent,
+    Goal(String),
 }
 
 impl Goal {
@@ -749,6 +775,8 @@ impl GoalStore {
         pool.transaction(|tx| {
             tx.execute_batch(SCHEMA).map_err(zuno_db::map_error)?;
             tx.execute_batch(AUXILIARY_SCHEMA)
+                .map_err(zuno_db::map_error)?;
+            tx.execute_batch(GOAL_TURN_SCHEMA)
                 .map_err(zuno_db::map_error)?;
             guard_history_trigger(tx)?;
             widen_pause_reasons(tx)?;
@@ -1369,45 +1397,7 @@ impl GoalStore {
         success_criteria: &[String],
         token_budget: Option<i64>,
     ) -> Result<GoalCreation, GoalError> {
-        // The refused positions are the caller's, not the filtered list's. Dropping
-        // blank entries first and then counting made every reported ordinal a position
-        // in a list the model never sent, which sent it to edit the wrong criterion.
-        let submitted = success_criteria.len();
-        let mut recorded: Vec<String> = Vec::with_capacity(submitted);
-        // Characters, not bytes: the cap is about what a human reads and what the
-        // column contracts for, and `MAX_OBJECTIVE_CHARS` next door counts the same way.
-        let mut too_long: Option<(usize, usize)> = None;
-        for (index, criterion) in success_criteria.iter().enumerate() {
-            let criterion = criterion.trim();
-            if !has_visible_character(criterion) {
-                continue;
-            }
-            let actual = criterion.chars().count();
-            if too_long.is_none() && actual > MAX_CRITERION_STATEMENT_CHARS {
-                too_long = Some((index.saturating_add(1), actual));
-            }
-            recorded.push(criterion.to_owned());
-        }
-        if recorded.is_empty() {
-            return Err(GoalError::MissingSuccessCriteria);
-        }
-        // Count first, then length, so a flood of entries is refused for being a flood
-        // rather than for whichever one of them happened also to be too long.
-        if recorded.len() > MAX_SUCCESS_CRITERIA {
-            return Err(GoalError::TooManySuccessCriteria {
-                submitted,
-                recorded: recorded.len(),
-                max: MAX_SUCCESS_CRITERIA,
-            });
-        }
-        if let Some((ordinal, actual)) = too_long {
-            return Err(GoalError::SuccessCriterionTooLong {
-                ordinal,
-                submitted,
-                actual,
-                max: MAX_CRITERION_STATEMENT_CHARS,
-            });
-        }
+        let recorded = normalize_model_success_criteria(success_criteria)?;
         self.create_goal_with_criteria(session_id, objective, &recorded, token_budget)
     }
 
@@ -1441,37 +1431,16 @@ impl GoalStore {
         let objective = spill::store_objective(&self.spill_dir, objective)?;
         let goal_id = new_goal_id();
         let now_ms = now_ms()?;
-        let outcome = self.pool.transaction(|tx| {
-            let inserted = upsert(
+        self.pool.try_transaction(|tx| {
+            create_goal_in(
                 tx,
-                GoalUpsert {
-                    tail: UPSERT_IF_COMPLETE,
-                    session_id,
-                    goal_id: &goal_id,
-                    objective: &objective,
-                    success_criteria,
-                    token_budget,
-                    now_ms,
-                },
-            )?;
-            if inserted.is_some() {
-                clear_auxiliary_state(tx, session_id)?;
-            }
-            match inserted {
-                Some(goal) => {
-                    let criteria = insert_criteria(tx, session_id, success_criteria, now_ms)?;
-                    Ok(Ok(GoalCreation { goal, criteria }))
-                }
-                // Read only to *name* the blocker. The refusal itself already
-                // happened, atomically, in the statement's `WHERE`; this read
-                // shares that statement's transaction, so the status it reports
-                // is the one that blocked and not a later one.
-                None => Ok(Err(blocking_status(tx, session_id)?)),
-            }
-        })?;
-        outcome.map_err(|status| GoalError::GoalNotReplaceable {
-            session_id: session_id.to_owned(),
-            status,
+                session_id,
+                &goal_id,
+                &objective,
+                success_criteria,
+                token_budget,
+                now_ms,
+            )
         })
     }
 
@@ -1560,13 +1529,7 @@ impl GoalStore {
         if matches!(status, ModelStatus::Complete) {
             return self.complete_with_revision(session_id, None, CompletionAuthority::Model);
         }
-        self.write_status(
-            SET_STATUS_AS_MODEL,
-            session_id,
-            status.as_str(),
-            false,
-            None,
-        )
+        self.write_status(StatusOwner::Model, session_id, status.as_str(), false, None)
     }
 
     /// Update model-owned status only if `expected_revision` is still current.
@@ -1587,7 +1550,7 @@ impl GoalStore {
             );
         }
         self.write_status(
-            SET_STATUS_AS_MODEL,
+            StatusOwner::Model,
             session_id,
             status.as_str(),
             false,
@@ -1627,12 +1590,62 @@ impl GoalStore {
         })?)
     }
 
+    /// Explicit native `/goal block <reason>` authority. This method is not a
+    /// model tool and does not broaden `SystemStatus` or model-owned transitions.
+    ///
+    /// A user may block an already-paused Goal. Identity, budget and accounting
+    /// remain intact; status, reason, revision/history, pause/retry cleanup and
+    /// invalidation of the captured Goal turn commit together. Cancelled and
+    /// budget-limited Goals retain their status and return unchanged.
+    pub fn block_as_user_checked(
+        &self,
+        session_id: &str,
+        expected_revision: i64,
+        reason: &str,
+    ) -> Result<Option<Goal>, GoalError> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err(GoalError::EmptyBlockReason);
+        }
+        let stamp_ms = now_ms()?;
+        self.pool.try_transaction(|tx| {
+            let Some(current) = Self::goal_in(tx, session_id)? else {
+                return Ok(None);
+            };
+            if current.revision != expected_revision {
+                return Err(GoalError::RevisionConflict {
+                    session_id: session_id.to_owned(),
+                    expected: expected_revision,
+                    actual: current.revision,
+                });
+            }
+            if matches!(current.status, GoalStatus::Cancelled | GoalStatus::BudgetLimited) {
+                return Ok(Some(current));
+            }
+            let mut statement = tx.prepare(&format!(
+                "UPDATE goal SET status='blocked',blocked_reason=?2,revision=revision+1,updated_at_ms=?3 \
+                 WHERE session_id=?1 AND goal_id=?4 AND revision=?5 RETURNING {COLUMNS}"
+            )).map_err(zuno_db::map_error)?;
+            let goal = read_optional(&mut statement, params![
+                session_id, reason, stamp_ms, current.goal_id, expected_revision,
+            ])?;
+            if goal.is_some() {
+                // Retain the existing revival contract for historical finished Goals:
+                // a dormant declared checklist becomes open, never implicitly waived.
+                backfill_criteria(tx, Some(session_id))?;
+                clear_failure_and_retry_state(tx, session_id)?;
+                tx.execute("DELETE FROM goal_pause WHERE session_id=?1", params![session_id])
+                    .map_err(zuno_db::map_error)?;
+            }
+            Ok(goal)
+        })
+    }
+
     /// Complete a goal only when all durable work and recorded evidence agree.
     ///
     /// The *human's* entry point — `/goal complete` — and the only one that is. The
-    /// run's is [`Self::complete_as_model_checked`], which differs in exactly one check;
-    /// see [`CompletionAuthority`] for why that difference is the capability ledger on a
-    /// criteria-free goal and nothing else.
+    /// run's is [`Self::complete_as_model_checked`], which also rejects paused Goals
+    /// and audits capability claims on criteria-free question Goals.
     ///
     /// The completion audit and status update share one `IMMEDIATE` transaction, so a
     /// concurrent writer cannot add unfinished work, record a receipt, or change the
@@ -1646,11 +1659,10 @@ impl GoalStore {
     /// `work_plan` row whose `goal_id` names another goal is refused as stale
     /// whatever its steps say — see [`audit_plan_ownership`] for why a plan with no
     /// `goal_id`, and an archived plan, are deliberately let through. On top of all
-    /// that, a goal with recorded success criteria — or one that
-    /// [`Self::escalate_to_change`] marked as changing the workspace — must have
+    /// that, a goal with recorded success criteria must have
     /// every criterion settled and must cite evidence no older than the last
-    /// [`Self::mark_mutation`]. Only a [`GoalKind::Question`] goal that recorded no
-    /// criteria is unaffected by the evidence rules.
+    /// [`Self::mark_mutation`]. A Goal with a genuinely empty declaration and ledger
+    /// has no implicit checklist, even after [`Self::escalate_to_change`].
     ///
     /// # Errors
     ///
@@ -1658,8 +1670,8 @@ impl GoalStore {
     /// it, [`GoalError::PlanBelongsToAnotherGoal`] when the visible plan is bound to
     /// a different goal, [`GoalError::CompletionBlocked`] when durable work is
     /// unfinished, [`GoalError::EvidenceMissing`] when the goal has criteria that are
-    /// neither satisfied nor waived — or is a change goal with no criteria at all,
-    /// which is completion by assertion — [`GoalError::EvidenceUnproven`] when a
+    /// neither satisfied nor waived, [`GoalError::CriterionContractCorrupt`] when
+    /// declaration and ledger disagree, [`GoalError::EvidenceUnproven`] when a
     /// cited receipt has since been rewritten or pruned so that it no longer proves
     /// success, [`GoalError::EvidencePredatesGoal`] when a cited receipt was recorded
     /// before this goal instance existed, [`GoalError::EvidenceStale`] when a cited
@@ -1681,12 +1693,15 @@ impl GoalStore {
 
     /// Complete a goal on the *run's* authority, with the audit the run answers for.
     ///
-    /// The same call as [`Self::complete_checked`] in every respect but one: a goal that
-    /// recorded no success criteria and was never escalated is still audited against the
+    /// A paused Goal requires native user completion or an explicit resume; a new
+    /// independent request does not grant model authority to close it.
+    /// A goal that recorded no success criteria and was never escalated is still
+    /// audited against the
     /// capability ledger, so a run that guessed at a capability, wrote the configuration
     /// through `shell` and therefore never escalated cannot carry the guess out with the
-    /// goal. [`Self::complete_checked`] is the human's `/goal complete` and skips exactly
-    /// that one check, because the only way to settle a claim is a `capability_claim` call
+    /// goal. [`Self::complete_checked`] is the human's `/goal complete` and skips
+    /// that capability check for a criteria-free question, because the only way to
+    /// settle a claim is a `capability_claim` call
     /// the model makes and no CLI verb clears the row — see [`CompletionAuthority`].
     ///
     /// Every model-facing entry point must come through here or through
@@ -1696,6 +1711,7 @@ impl GoalStore {
     /// # Errors
     ///
     /// Every refusal [`Self::complete_checked`] reports, plus
+    /// [`GoalError::CompletionRequiresUser`] for a paused Goal and
     /// [`GoalError::CapabilityUnverified`] for a criteria-free goal that relies on a claim
     /// nobody verified.
     pub fn complete_as_model_checked(
@@ -1712,9 +1728,9 @@ impl GoalStore {
 
     /// Apply criterion evidence and complete the Goal in one transaction.
     ///
-    /// This is the model-facing `goal_update(status=complete)` path. A failed
-    /// completion audit rolls every criterion change in the same request back, so
-    /// retrying the request never encounters a half-applied checklist.
+    /// Low-level model-authority completion. Production `goal_update` additionally
+    /// validates immutable turn/cycle authority through [`Self::complete_goal_from_tool`].
+    /// A failed audit rolls every criterion change back.
     pub fn complete_as_model_with_criteria_checked(
         &self,
         session_id: &str,
@@ -1724,33 +1740,12 @@ impl GoalStore {
     ) -> Result<Option<Goal>, GoalError> {
         let stamp_ms = now_ms()?;
         self.pool.try_transaction(|tx| {
-            if !satisfy.is_empty() || !waive.is_empty() {
-                let goal = goal_for_write(tx, session_id, expected_revision)?;
-                for update in satisfy {
-                    satisfy_criterion_in(
-                        tx,
-                        &goal,
-                        session_id,
-                        update.criterion_id.trim(),
-                        update.receipt_id.trim(),
-                        stamp_ms,
-                    )?;
-                }
-                for update in waive {
-                    waive_criterion_in(
-                        tx,
-                        session_id,
-                        update.criterion_id.trim(),
-                        &update.reason,
-                        stamp_ms,
-                    )?;
-                }
-            }
-            complete_in_transaction(
+            complete_as_model_with_criteria_in(
                 tx,
                 session_id,
-                Some(expected_revision),
-                CompletionAuthority::Model,
+                expected_revision,
+                satisfy,
+                waive,
                 stamp_ms,
             )
         })
@@ -2019,25 +2014,91 @@ impl GoalStore {
     ) -> Result<UsageRecorded, GoalError> {
         let tokens = tokens.max(0);
         self.pool.try_transaction(|tx| {
-            let inserted = tx
-                .execute(
-                    "INSERT INTO goal_request_usage \
-                     (session_id, request_id, tokens, recorded_at_ms) \
-                     SELECT session_id, ?2, ?3, ?4 FROM goal WHERE session_id = ?1 \
-                     ON CONFLICT(session_id, request_id) DO NOTHING",
-                    params![session_id, request_id, tokens, at_ms],
-                )
-                .map_err(zuno_db::map_error)?
-                > 0;
-            let goal = if inserted {
-                record_usage_in(tx, session_id, tokens, 0, true, at_ms)?
-            } else {
-                goal_from_transaction(tx, session_id)?
+            record_request_usage_in(tx, session_id, request_id, tokens, at_ms, None)
+        })
+    }
+
+    /// Read a consistent budget owner before provider dispatch. Modern work must
+    /// own the current Goal and actual host turn. Legacy callers with no cycle
+    /// retain the original session-Goal lookup.
+    pub(crate) fn budget_goal_for_turn(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        captured: Option<&GoalRequestOwner>,
+    ) -> Result<Option<Goal>, GoalError> {
+        if captured == Some(&GoalRequestOwner::Independent) {
+            return Ok(None);
+        }
+        let connection = self.pool.get()?;
+        if let Some(GoalRequestOwner::Goal(goal_id)) = captured {
+            // Retrying before_request for the same request keeps its original
+            // budget as well as its attribution, despite a later scope change.
+            return goal_by_id_in(&connection, session_id, goal_id);
+        }
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(zuno_db::map_error)?;
+        let goal = match budget_scope_in(&transaction, session_id, turn_id)? {
+            BudgetScope::Legacy => Self::goal_in(&transaction, session_id)?,
+            BudgetScope::Independent => None,
+            BudgetScope::Goal(goal_id) => goal_by_id_in(&transaction, session_id, &goal_id)?
+                .filter(|goal| {
+                    matches!(goal.status, GoalStatus::Active | GoalStatus::BudgetLimited)
+                }),
+        };
+        transaction.commit().map_err(zuno_db::map_error)?;
+        Ok(goal)
+    }
+
+    /// Bill only the request's captured Goal ID, even after pause/completion or a
+    /// cycle switch. Never resolve a new owner from the response-time scope.
+    /// The ID guard, idempotency ledger and counters commit in one transaction.
+    pub(crate) fn record_budget_response(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        request_id: &str,
+        tokens: i64,
+        at_ms: i64,
+        owner: Option<&GoalRequestOwner>,
+    ) -> Result<UsageRecorded, GoalError> {
+        if owner == Some(&GoalRequestOwner::Independent) {
+            return Ok(UsageRecorded {
+                accounted: false,
+                goal: None,
+            });
+        }
+        self.pool.try_transaction(|tx| {
+            let expected_goal_id = match owner {
+                Some(GoalRequestOwner::Goal(goal_id)) => Some(goal_id.as_str()),
+                Some(GoalRequestOwner::Independent) => unreachable!("handled before transaction"),
+                None => match budget_scope_in(tx, session_id, turn_id)? {
+                    BudgetScope::Legacy => None,
+                    BudgetScope::Independent => {
+                        return Ok(UsageRecorded {
+                            accounted: false,
+                            goal: None,
+                        });
+                    }
+                    BudgetScope::Goal(_) => {
+                        // Production always calls before_request. Only the no-cycle
+                        // library API may account without that admission checkpoint.
+                        return Err(GoalError::BudgetRequestNotAdmitted {
+                            session_id: session_id.to_owned(),
+                            request_id: request_id.to_owned(),
+                        });
+                    }
+                },
             };
-            Ok(UsageRecorded {
-                accounted: inserted,
-                goal,
-            })
+            record_request_usage_in(
+                tx,
+                session_id,
+                request_id,
+                tokens.max(0),
+                at_ms,
+                expected_goal_id,
+            )
         })
     }
 
@@ -2071,7 +2132,7 @@ impl GoalStore {
             );
         }
         self.write_status(
-            SET_STATUS_AS_SYSTEM,
+            StatusOwner::System,
             session_id,
             status.as_str(),
             matches!(status, SystemStatus::Active),
@@ -2095,7 +2156,7 @@ impl GoalStore {
             );
         }
         self.write_status(
-            SET_STATUS_AS_SYSTEM,
+            StatusOwner::System,
             session_id,
             status.as_str(),
             matches!(status, SystemStatus::Active),
@@ -2277,9 +2338,9 @@ impl GoalStore {
 
     /// Stage the blocking condition reported during the current real turn.
     ///
-    /// Repeated tool calls in one turn overwrite this row instead of incrementing
-    /// the persisted streak. The turn boundary consumes the row exactly once, so
-    /// three tool retries cannot impersonate three consecutive turns.
+    /// Repeated tool calls overwrite this row instead of incrementing the persisted
+    /// streak. The host counts it at the completed-turn boundary.
+    /// Stable turn/cycle replay protection belongs to the host's keyed transaction.
     pub fn stage_failure_signal(&self, session_id: &str, signal: &str) -> Result<bool, GoalError> {
         self.stage_failure_signal_with_revision(session_id, signal, None)
     }
@@ -2300,11 +2361,32 @@ impl GoalStore {
         signal: &str,
         expected_revision: Option<i64>,
     ) -> Result<bool, GoalError> {
+        self.stage_failure_observation(session_id, signal, expected_revision)
+            .map(|observation| observation.is_some())
+    }
+
+    /// Stage a model observation and return its actual Goal state and completed-turn
+    /// count from the same transaction. Staging never applies `blocked`.
+    pub fn stage_failure_observation_checked(
+        &self,
+        session_id: &str,
+        signal: &str,
+        expected_revision: i64,
+    ) -> Result<Option<FailureObservation>, GoalError> {
+        self.stage_failure_observation(session_id, signal, Some(expected_revision))
+    }
+
+    fn stage_failure_observation(
+        &self,
+        session_id: &str,
+        signal: &str,
+        expected_revision: Option<i64>,
+    ) -> Result<Option<FailureObservation>, GoalError> {
         let signal = signal.trim();
         if signal.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
-        self.pool.transaction(|tx| {
+        self.pool.try_transaction(|tx| {
             let changed = tx
                 .execute(
                     "INSERT INTO goal_pending_failure_signal (session_id, signal) \
@@ -2318,10 +2400,23 @@ impl GoalStore {
             if changed == 0
                 && let Some(error) = revision_conflict(tx, session_id, expected_revision)?
             {
-                return Ok(Err(error));
+                return Err(error);
             }
-            Ok(Ok(changed > 0))
-        })?
+            if changed == 0 {
+                return Ok(None);
+            }
+            let goal = Self::goal_in(tx, session_id)?.ok_or_else(|| GoalError::NoGoal {
+                session_id: session_id.to_owned(),
+            })?;
+            let completed_turn_streak = failure_streak_in(tx, session_id)?
+                .filter(|streak| streak.signal == signal)
+                .map_or(0, |streak| streak.consecutive_turns);
+            Ok(Some(FailureObservation {
+                goal,
+                criteria: criteria_from(tx, session_id)?,
+                completed_turn_streak,
+            }))
+        })
     }
 
     /// Consume the blocking condition staged by this turn, if any.
@@ -2354,51 +2449,89 @@ impl GoalStore {
         session_id: &str,
         signal: Option<&str>,
     ) -> Result<Option<FailureStreak>, GoalError> {
-        let signal = signal.map(str::trim).filter(|signal| !signal.is_empty());
-        let streak = self.pool.transaction(|tx| {
-            clear_retry_state(tx, session_id)?;
-            let Some(signal) = signal else {
-                tx.execute(
-                    "DELETE FROM goal_failure_streak WHERE session_id = ?1",
-                    params![session_id],
-                )
-                .map_err(zuno_db::map_error)?;
-                return Ok(None);
-            };
+        Ok(self
+            .pool
+            .transaction(|tx| record_failure_signal_in(tx, session_id, signal))?)
+    }
 
-            tx.query_row(
-                "INSERT INTO goal_failure_streak (session_id, signal, consecutive_turns) \
-                 SELECT session_id, ?2, 1 FROM goal \
-                 WHERE session_id = ?1 AND status = 'active' \
-                 ON CONFLICT(session_id) DO UPDATE SET \
-                     signal = excluded.signal, \
-                     consecutive_turns = CASE \
-                         WHEN goal_failure_streak.signal = excluded.signal \
-                             THEN min(goal_failure_streak.consecutive_turns + 1, 3) \
-                         ELSE 1 \
-                     END \
-                 RETURNING signal, consecutive_turns",
-                params![session_id, signal],
-                failure_streak_from_row,
+    /// Consume this turn's observation, count it, and apply the terminal status in
+    /// one transaction, including the Goal history trigger.
+    ///
+    /// The host must invoke this once per completed Goal turn. This unkeyed API
+    /// cannot distinguish a replayed boundary or a late boundary from a new cycle.
+    pub fn record_turn_outcome(
+        &self,
+        session_id: &str,
+        outcome: crate::GoalTurnOutcome<'_>,
+    ) -> Result<crate::BlockedAudit, GoalError> {
+        let stamp_ms = now_ms()?;
+        self.pool
+            .try_transaction(|tx| Self::record_turn_outcome_in(tx, session_id, outcome, stamp_ms))
+    }
+
+    /// Transaction-level domain operation for the host to combine with its
+    /// Goal/cycle/turn ownership check and durable once-only boundary receipt.
+    ///
+    /// This is a Zuno adaptation. Codex 9ba's tool writes status directly; its
+    /// description owns the three-turn rule. Zuno keeps the host audit.
+    pub fn record_turn_outcome_in(
+        tx: &Transaction<'_>,
+        session_id: &str,
+        outcome: crate::GoalTurnOutcome<'_>,
+        stamp_ms: i64,
+    ) -> Result<crate::BlockedAudit, GoalError> {
+        use crate::{BLOCKED_TURN_THRESHOLD, BlockedAudit, GoalTurnOutcome};
+        let Some(goal) =
+            Self::goal_in(tx, session_id)?.filter(|goal| goal.status == GoalStatus::Active)
+        else {
+            return Ok(BlockedAudit::NoActiveGoal);
+        };
+        let staged: Option<String> = tx
+            .query_row(
+                "DELETE FROM goal_pending_failure_signal WHERE session_id = ?1 RETURNING signal",
+                params![session_id],
+                |row| row.get(0),
             )
             .optional()
-            .map_err(zuno_db::map_error)
-        })?;
-        Ok(streak)
+            .map_err(zuno_db::map_error)?;
+        let signal = match outcome {
+            GoalTurnOutcome::Progress => staged.as_deref(),
+            GoalTurnOutcome::Blocking(signal) => Some(signal),
+        };
+        let Some(streak) = record_failure_signal_in(tx, session_id, signal)? else {
+            return Ok(BlockedAudit::Reset);
+        };
+        if streak.consecutive_turns < BLOCKED_TURN_THRESHOLD {
+            return Ok(BlockedAudit::Pending(streak));
+        }
+        let mut statement = tx
+            .prepare(SET_STATUS_AS_MODEL)
+            .map_err(zuno_db::map_error)?;
+        let updated = read_optional(
+            &mut statement,
+            params![
+                ModelStatus::Blocked.as_str(),
+                stamp_ms,
+                session_id,
+                goal.revision
+            ],
+        )?;
+        if updated.is_some_and(|goal| goal.status == GoalStatus::Blocked) {
+            tx.execute(
+                "DELETE FROM goal_pause WHERE session_id = ?1",
+                params![session_id],
+            )
+            .map_err(zuno_db::map_error)?;
+            Ok(BlockedAudit::Blocked(streak))
+        } else {
+            Ok(BlockedAudit::NoActiveGoal)
+        }
     }
 
     /// Read the current consecutive blocking signal for a session.
     pub fn failure_streak(&self, session_id: &str) -> Result<Option<FailureStreak>, GoalError> {
         let connection = self.pool.get()?;
-        connection
-            .query_row(
-                "SELECT signal, consecutive_turns FROM goal_failure_streak WHERE session_id = ?1",
-                params![session_id],
-                failure_streak_from_row,
-            )
-            .optional()
-            .map_err(zuno_db::map_error)
-            .map_err(GoalError::from)
+        Ok(failure_streak_in(&connection, session_id)?)
     }
 
     /// Change the token budget, flipping the status if the new one is already
@@ -2564,14 +2697,37 @@ impl GoalStore {
 
     fn write_status(
         &self,
-        sql: &str,
+        owner: StatusOwner,
         session_id: &str,
         status: &str,
         clear_failure_streak: bool,
         expected_revision: Option<i64>,
     ) -> Result<Option<Goal>, GoalError> {
         let now_ms = now_ms()?;
+        let sql = match owner {
+            StatusOwner::Model => SET_STATUS_AS_MODEL,
+            StatusOwner::System => SET_STATUS_AS_SYSTEM,
+        };
         self.pool.transaction(|tx| {
+            if owner.is_model() {
+                if let Some(error) = revision_conflict(tx, session_id, expected_revision)? {
+                    return Ok(Err(error));
+                }
+                let current: Option<String> = tx
+                    .query_row(
+                        "SELECT status FROM goal WHERE session_id = ?1",
+                        params![session_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(zuno_db::map_error)?;
+                if current.as_deref() == Some(GoalStatus::Paused.as_str()) {
+                    return Ok(Err(GoalError::GoalNotActive {
+                        session_id: session_id.to_owned(),
+                        status: GoalStatus::Paused,
+                    }));
+                }
+            }
             let goal = {
                 let mut statement = tx.prepare(sql).map_err(zuno_db::map_error)?;
                 read_optional(
@@ -2586,6 +2742,7 @@ impl GoalStore {
                 return Ok(Err(error));
             }
             if clear_failure_streak && goal.is_some() {
+                goal_turn::clear_cursor_in(tx, session_id)?;
                 tx.execute(
                     "DELETE FROM goal_failure_streak WHERE session_id = ?1",
                     params![session_id],
@@ -2859,6 +3016,119 @@ fn upsert(tx: &Transaction<'_>, input: GoalUpsert<'_>) -> Result<Option<Goal>, D
     .map_err(into_db_error)
 }
 
+/// Share the model creation bounds without changing a stored historical checklist.
+fn normalize_model_success_criteria(success_criteria: &[String]) -> Result<Vec<String>, GoalError> {
+    let submitted = success_criteria.len();
+    let mut recorded = Vec::with_capacity(submitted);
+    let mut too_long = None;
+    for (index, criterion) in success_criteria.iter().enumerate() {
+        let criterion = criterion.trim();
+        if !has_visible_character(criterion) {
+            continue;
+        }
+        let actual = criterion.chars().count();
+        if too_long.is_none() && actual > MAX_CRITERION_STATEMENT_CHARS {
+            too_long = Some((index.saturating_add(1), actual));
+        }
+        recorded.push(criterion.to_owned());
+    }
+    if recorded.is_empty() {
+        return Err(GoalError::MissingSuccessCriteria);
+    }
+    // Count before length, retaining positions from the submitted list.
+    if recorded.len() > MAX_SUCCESS_CRITERIA {
+        return Err(GoalError::TooManySuccessCriteria {
+            submitted,
+            recorded: recorded.len(),
+            max: MAX_SUCCESS_CRITERIA,
+        });
+    }
+    if let Some((ordinal, actual)) = too_long {
+        return Err(GoalError::SuccessCriterionTooLong {
+            ordinal,
+            submitted,
+            actual,
+            max: MAX_CRITERION_STATEMENT_CHARS,
+        });
+    }
+    Ok(recorded)
+}
+
+/// The guarded creation SQL, shared by native creation and scoped model creation.
+/// `objective` has already passed spill/visibility validation.
+fn create_goal_in(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    goal_id: &str,
+    objective: &str,
+    success_criteria: &[String],
+    token_budget: Option<i64>,
+    stamp_ms: i64,
+) -> Result<GoalCreation, GoalError> {
+    let goal = upsert(
+        tx,
+        GoalUpsert {
+            tail: UPSERT_IF_COMPLETE,
+            session_id,
+            goal_id,
+            objective,
+            success_criteria,
+            token_budget,
+            now_ms: stamp_ms,
+        },
+    )?;
+    let Some(goal) = goal else {
+        return Err(GoalError::GoalNotReplaceable {
+            session_id: session_id.to_owned(),
+            status: blocking_status(tx, session_id)?,
+        });
+    };
+    clear_auxiliary_state(tx, session_id)?;
+    let criteria = insert_criteria(tx, session_id, success_criteria, stamp_ms)?;
+    Ok(GoalCreation { goal, criteria })
+}
+
+/// Shared model-authority completion SQL; scoped callers first validate their
+/// native context in this same transaction. Native/user completion stays separate.
+fn complete_as_model_with_criteria_in(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    expected_revision: i64,
+    satisfy: &[CriterionSatisfaction],
+    waive: &[CriterionWaiver],
+    stamp_ms: i64,
+) -> Result<Option<Goal>, GoalError> {
+    if !satisfy.is_empty() || !waive.is_empty() {
+        let goal = goal_for_write(tx, session_id, expected_revision)?;
+        for update in satisfy {
+            satisfy_criterion_in(
+                tx,
+                &goal,
+                session_id,
+                update.criterion_id.trim(),
+                update.receipt_id.trim(),
+                stamp_ms,
+            )?;
+        }
+        for update in waive {
+            waive_criterion_in(
+                tx,
+                session_id,
+                update.criterion_id.trim(),
+                &update.reason,
+                stamp_ms,
+            )?;
+        }
+    }
+    complete_in_transaction(
+        tx,
+        session_id,
+        Some(expected_revision),
+        CompletionAuthority::Model,
+        stamp_ms,
+    )
+}
+
 fn complete_in_transaction(
     tx: &Transaction<'_>,
     session_id: &str,
@@ -2870,37 +3140,28 @@ fn complete_in_transaction(
     // revision the caller is guarded on: the audit's lower bound on evidence has
     // to be this goal instance's creation and not a value a concurrent
     // replacement could have moved underneath it.
-    let current = tx
-        .query_row(
-            "SELECT goal_id, revision, created_at_ms FROM goal WHERE session_id = ?1",
-            params![session_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(zuno_db::map_error)?;
-    let Some((goal_id, actual, created_at_ms)) = current else {
+    let Some(current) = GoalStore::goal_in(tx, session_id)? else {
         return Ok(None);
     };
     if let Some(expected) = expected_revision
-        && actual != expected
+        && current.revision != expected
     {
         return Err(GoalError::RevisionConflict {
             session_id: session_id.to_owned(),
             expected,
-            actual,
+            actual: current.revision,
+        });
+    }
+    if authority == CompletionAuthority::Model && current.status == GoalStatus::Paused {
+        return Err(GoalError::CompletionRequiresUser {
+            goal_id: current.goal_id,
         });
     }
 
     // Ownership before arithmetic: a plan written for another goal is refused
     // as stale whatever its step count says, because counting its unfinished
     // steps would describe the previous goal's work as this one's.
-    audit_plan_ownership(tx, session_id, &goal_id)?;
+    audit_plan_ownership(tx, session_id, &current.goal_id)?;
     let blockers = completion_blockers(tx, session_id)?;
     if !blockers.is_empty() {
         return Err(GoalError::CompletionBlocked {
@@ -2911,7 +3172,16 @@ fn complete_in_transaction(
             details: blockers.rendered_details(),
         });
     }
-    audit_evidence(tx, session_id, created_at_ms, authority)?;
+    if table_exists(tx, "part")? {
+        let pending =
+            zuno_db::message::MessageStore::new(tx).pending_uncertain_tool_calls(session_id, 0)?;
+        if !pending.is_empty() {
+            return Err(GoalError::CompletionUncertain {
+                call_ids: pending.into_iter().map(|call| call.call_id).collect(),
+            });
+        }
+    }
+    audit_evidence(tx, &current, authority)?;
 
     let goal = {
         let mut statement = tx
@@ -3338,13 +3608,13 @@ fn insert_criterion_rows(
     Ok(criteria)
 }
 
-/// Who asked for `complete`, for the one gate whose remedy only one of them has.
+/// Who asked for completion.
 ///
 /// Not a permission level: every completion runs plan ownership, the durable-work
 /// blockers and the whole criterion-evidence audit whoever asks. It exists for the
 /// capability ledger on the criteria-free branch, where the only way to settle a claim is
 /// a `capability_claim` call the model makes, so refusing there would strand the human
-/// rather than correct the run. [`audit_evidence`] is the only reader.
+/// rather than correct the run. Model authority also cannot close a paused Goal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompletionAuthority {
     /// The human's own `/goal complete`, through [`GoalStore::complete_checked`].
@@ -3357,10 +3627,9 @@ enum CompletionAuthority {
 /// Refuse completion when a goal's criteria are not settled by evidence that still
 /// describes the current workspace.
 ///
-/// Two distinct failures, both invisible in prose. A criterion still `open` means
-/// nothing ever verified it, and a change goal with no criteria at all means
-/// nothing was ever verifiable — the same refusal, because an empty checklist is
-/// not a completed one. Separately, a mutation mark newer than a cited receipt
+/// A declared criterion still `open` means nothing verified or waived it. A plain
+/// user Goal has no checklist only when both its declaration and ledger are empty;
+/// any disagreement fails closed. Separately, a mutation mark newer than a cited receipt
 /// means the workspace moved after that check ran, so the receipt describes code
 /// that no longer exists.
 ///
@@ -3383,9 +3652,8 @@ enum CompletionAuthority {
 /// the configuration through `shell` never escalates, and gating the claim audit on
 /// the kind would let the guess out with the goal.
 ///
-/// A goal with neither a checklist nor a reported change is not held to *evidence*:
-/// nothing was verifiable and nothing was verified, and requiring a receipt there
-/// would leave a run that was only ever asked a question with no way to finish. Only
+/// A goal with no declared checklist has no criterion receipts to audit, including
+/// after a reported change. The unchanged work and capability gates still apply. Only
 /// [`GoalStore::create_goal`] — the user's own `/goal create` — can produce such a
 /// goal, because [`GoalStore::create_goal_as_model`] refuses a proposal with no
 /// criterion.
@@ -3408,7 +3676,7 @@ enum CompletionAuthority {
 /// because the editing call earns a passing receipt of its own and is indistinguishable
 /// here from the check it invalidated.
 ///
-/// One deliberate consequence of reading the criteria before the kind: a criterion row
+/// A criterion row
 /// whose `status` is not one this crate writes now fails a question goal's completion
 /// with [`GoalError::UnknownCriterionStatus`] instead of being skipped unread. Only an
 /// external writer can get past the column's `CHECK` constraint, the error is not a
@@ -3416,34 +3684,22 @@ enum CompletionAuthority {
 /// retryability regression.
 fn audit_evidence(
     tx: &Transaction<'_>,
-    session_id: &str,
-    goal_created_at_ms: i64,
+    goal: &Goal,
     authority: CompletionAuthority,
 ) -> Result<(), GoalError> {
+    let session_id = goal.session_id.as_str();
+    let goal_created_at_ms = goal.created_at_ms;
     let criteria = criteria_from(tx, session_id)?;
-    if criteria.is_empty() && !kind_from(tx, session_id)?.requires_evidence() {
-        // Nothing was verifiable, but something may still have been *relied on*. The
-        // claims are recorded by the session itself, so auditing them needs no tool to
-        // report what it wrote — which is the whole reason this branch exists — and a
-        // run that guessed at a capability, wrote the configuration through `shell` and
-        // therefore never escalated is exactly the case the kind cannot see. A goal
-        // that recorded no claims passes this in one query, so the branch stays free
-        // for the run that really only answered a question.
-        //
-        // Only against the model, though. This branch is reachable only for a goal the
-        // *user* or the system created — `create_goal_as_model` refuses a proposal with
-        // no checklist — and the only way to settle a claim is a `capability_claim` tool
-        // call the model makes. Refusing the human's own `/goal complete` over a row the
-        // model wrote would leave them a goal they can cancel and cannot finish, which is
-        // a hard failure keyed on input the untrusted actor supplies. The model reporting
-        // `complete` on that same goal is still audited, so the reliance cannot be
-        // carried out with the goal by the actor that recorded it.
-        return match authority {
-            CompletionAuthority::Model => {
-                crate::capability::audit_capability_claims(tx, session_id)
-            }
-            CompletionAuthority::User => Ok(()),
-        };
+    audit_criterion_contract(goal, &criteria)?;
+    let kind = kind_from(tx, session_id)?;
+    if criteria.is_empty() {
+        // Preserve the existing capability authority boundary: every model completion
+        // and every changed Goal audits claims. Only native user completion of a
+        // criteria-free question retains the existing exception.
+        if authority == CompletionAuthority::Model || kind.requires_evidence() {
+            return crate::capability::audit_capability_claims(tx, session_id);
+        }
+        return Ok(());
     }
     // A `satisfied` row with no citation is unproven by construction — the store
     // never writes one — but a row is data, and the audit trusts it no further than
@@ -3457,7 +3713,7 @@ fn audit_evidence(
         })
         .map(|criterion| criterion.criterion_id.clone())
         .collect();
-    if criteria.is_empty() || !unsatisfied.is_empty() {
+    if !unsatisfied.is_empty() {
         return Err(GoalError::EvidenceMissing { unsatisfied });
     }
     let marked_at_ms = mutation_mark(tx, session_id)?;
@@ -3514,6 +3770,43 @@ fn audit_evidence(
         }
     }
     crate::capability::audit_capability_claims(tx, session_id)
+}
+
+/// Match the immutable declaration exactly, including positional criterion identity.
+/// Both sides must be empty for plain completion; a missing or altered ledger never
+/// silently weakens a declared contract.
+fn audit_criterion_contract(goal: &Goal, criteria: &[GoalCriterion]) -> Result<(), GoalError> {
+    let mismatch = if goal.success_criteria.len() != criteria.len() {
+        Some(format!(
+            "{} declared criteria but {} ledger rows",
+            goal.success_criteria.len(),
+            criteria.len()
+        ))
+    } else {
+        goal.success_criteria
+            .iter()
+            .zip(criteria)
+            .enumerate()
+            .find_map(|(index, (declared, criterion))| {
+                let ordinal = i64::try_from(index).unwrap_or(i64::MAX);
+                (criterion.statement != *declared
+                    || criterion.ordinal != ordinal
+                    || criterion.criterion_id != format!("c{}", ordinal.saturating_add(1)))
+                .then(|| {
+                    format!(
+                        "criterion at position {} differs from its declaration",
+                        index + 1
+                    )
+                })
+            })
+    };
+    if let Some(reason) = mismatch {
+        return Err(GoalError::CriterionContractCorrupt {
+            session_id: goal.session_id.clone(),
+            reason,
+        });
+    }
+    Ok(())
 }
 
 /// Every criterion for a session in list order, from any connection or
@@ -3858,6 +4151,85 @@ pub(crate) fn unproven_reason(receipt: &VerificationReceipt) -> String {
 /// Shared by turn-boundary accounting and per-request accounting so both take the
 /// same path through [`RECORD_USAGE`], where the budget flip happens in the
 /// increment statement itself.
+/// A native cycle with no Goal is distinct from a library with no cycle at all.
+enum BudgetScope {
+    Legacy,
+    Independent,
+    Goal(String),
+}
+
+fn budget_scope_in(
+    connection: &Transaction<'_>,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<BudgetScope, GoalError> {
+    if !table_exists(connection, "session_execution_state")? {
+        return Ok(BudgetScope::Legacy);
+    }
+    let Some(cycle_id) = zuno_db::session_execution::read_in(connection, session_id)?
+        .and_then(|state| state.cycle_id)
+    else {
+        return Ok(BudgetScope::Legacy);
+    };
+    let scope = zuno_db::session_work_cycle::read_in(connection, session_id, &cycle_id)?
+        .ok_or_else(|| GoalError::GoalTurnConflict {
+            session_id: session_id.to_owned(),
+            reason: crate::GoalTurnConflictReason::CycleUnavailable,
+        })?;
+    if scope.stopped.is_some() || scope.active_turn_id.as_deref() != Some(turn_id) {
+        return Ok(BudgetScope::Independent);
+    }
+    Ok(scope
+        .goal_id
+        .map_or(BudgetScope::Independent, BudgetScope::Goal))
+}
+
+fn goal_by_id_in(
+    connection: &Connection,
+    session_id: &str,
+    goal_id: &str,
+) -> Result<Option<Goal>, GoalError> {
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT {COLUMNS} FROM goal WHERE session_id=?1 AND goal_id=?2"
+        ))
+        .map_err(zuno_db::map_error)?;
+    read_optional(&mut statement, params![session_id, goal_id])
+}
+
+/// Shared accounting SQL. A captured Goal ID narrows both the write and readback;
+/// replacement must never make an old response debit the new Goal.
+fn record_request_usage_in(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    request_id: &str,
+    tokens: i64,
+    at_ms: i64,
+    expected_goal_id: Option<&str>,
+) -> Result<UsageRecorded, GoalError> {
+    let inserted = tx
+        .execute(
+            "INSERT INTO goal_request_usage (session_id,request_id,tokens,recorded_at_ms) \
+         SELECT session_id,?2,?3,?4 FROM goal \
+         WHERE session_id=?1 AND (?5 IS NULL OR goal_id=?5) \
+         ON CONFLICT(session_id,request_id) DO NOTHING",
+            params![session_id, request_id, tokens, at_ms, expected_goal_id],
+        )
+        .map_err(zuno_db::map_error)?
+        > 0;
+    let goal = if inserted {
+        record_usage_in(tx, session_id, tokens, 0, true, at_ms)?
+    } else if let Some(goal_id) = expected_goal_id {
+        goal_by_id_in(tx, session_id, goal_id)?
+    } else {
+        goal_from_transaction(tx, session_id)?
+    };
+    Ok(UsageRecorded {
+        accounted: inserted,
+        goal,
+    })
+}
+
 fn record_usage_in(
     tx: &Transaction<'_>,
     session_id: &str,
@@ -4006,6 +4378,7 @@ fn blocking_status(tx: &Transaction<'_>, session_id: &str) -> Result<GoalStatus,
 }
 
 fn clear_auxiliary_state(tx: &Transaction<'_>, session_id: &str) -> Result<(), DbError> {
+    goal_turn::clear_cursor_in(tx, session_id)?;
     tx.execute(
         "DELETE FROM goal_continuation_deferral WHERE session_id = ?1",
         params![session_id],
@@ -4076,6 +4449,10 @@ fn clear_auxiliary_state(tx: &Transaction<'_>, session_id: &str) -> Result<(), D
 }
 
 fn clear_failure_and_retry_state(tx: &Transaction<'_>, session_id: &str) -> Result<(), DbError> {
+    // Native pause/resume/failure invalidates captured work. Model completion
+    // deliberately uses only clear_retry_state, keeping its cursor for Inactive
+    // settlement of that actual completed engine turn.
+    goal_turn::clear_cursor_in(tx, session_id)?;
     tx.execute(
         "DELETE FROM goal_pending_failure_signal WHERE session_id = ?1",
         params![session_id],
@@ -4104,6 +4481,48 @@ fn failure_streak_from_row(row: &Row<'_>) -> rusqlite::Result<FailureStreak> {
         signal: row.get("signal")?,
         consecutive_turns: u32::try_from(count).unwrap_or(3),
     })
+}
+
+fn failure_streak_in(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Option<FailureStreak>, DbError> {
+    connection
+        .query_row(
+            "SELECT signal, consecutive_turns FROM goal_failure_streak WHERE session_id = ?1",
+            params![session_id],
+            failure_streak_from_row,
+        )
+        .optional()
+        .map_err(zuno_db::map_error)
+}
+
+fn record_failure_signal_in(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    signal: Option<&str>,
+) -> Result<Option<FailureStreak>, DbError> {
+    clear_retry_state(tx, session_id)?;
+    let Some(signal) = signal.map(str::trim).filter(|signal| !signal.is_empty()) else {
+        tx.execute(
+            "DELETE FROM goal_failure_streak WHERE session_id = ?1",
+            params![session_id],
+        )
+        .map_err(zuno_db::map_error)?;
+        return Ok(None);
+    };
+    tx.query_row(
+        "INSERT INTO goal_failure_streak (session_id, signal, consecutive_turns) \
+         SELECT session_id, ?2, 1 FROM goal WHERE session_id = ?1 AND status = 'active' \
+         ON CONFLICT(session_id) DO UPDATE SET signal = excluded.signal, \
+             consecutive_turns = CASE WHEN goal_failure_streak.signal = excluded.signal \
+                 THEN min(goal_failure_streak.consecutive_turns + 1, 3) ELSE 1 END \
+         RETURNING signal, consecutive_turns",
+        params![session_id, signal],
+        failure_streak_from_row,
+    )
+    .optional()
+    .map_err(zuno_db::map_error)
 }
 
 struct RetryRow {
@@ -4311,12 +4730,9 @@ fn widen_pause_reasons(tx: &Transaction<'_>) -> Result<(), DbError> {
 /// [`GoalStore::create_goal`] replaces, and the only two nothing resumes. A `0.6.x`
 /// release finished such a goal without ever tracking a criterion, and reconstructing
 /// `open` rows for it would change how a finished goal reads: the goal document would
-/// show an unverified checklist under a status that says done, and a repeated `complete`
-/// — accepted today as the idempotent no-op it is — would be refused for evidence the
-/// release that finished the goal never asked for. Measured on the exact `0.6.6` shape
-/// before deciding: [`crate::projection::render`] emits `_This goal has no success
-/// criteria._` and `complete_as_model_checked` returns `Ok(Some(Complete))`, and both
-/// stay that way. `budget_limited` is terminal for the continuation board but a raised
+/// show an unverified checklist under a status that says done. The historical result
+/// stays unchanged; a new completion audit of an inconsistent declaration and ledger
+/// fails closed. `budget_limited` is terminal for the continuation board but a raised
 /// budget revives it, and `blocked` is the status the model writes when it is stuck and
 /// the system resumes from, so both get their rows at open like every live goal.
 ///

@@ -206,10 +206,15 @@ impl PlanReconciliationDriver {
             let previous = projection_in(transaction, session_id)?;
             let gated = scheduling_outcome(&state).is_some();
             let cycle_id = match wake {
-                SessionWakeSignal::UserQuery | SessionWakeSignal::UserAnswer { .. }
-                    if !gated || state.phase == SessionExecutionPhase::Completed =>
-                {
-                    proposed_cycle_id
+                // Promotion has already bound a real user input, including its
+                // source and scope, in the same transaction as inbox consumption.
+                SessionWakeSignal::UserMessage => {
+                    execution_cycle(&state).unwrap_or(proposed_cycle_id)
+                }
+                // Native query/answer controls act on existing work. New user
+                // messages acquired their own scope at promotion above.
+                SessionWakeSignal::UserQuery | SessionWakeSignal::UserAnswer { .. } => {
+                    execution_cycle(&state).unwrap_or(proposed_cycle_id)
                 }
                 // StartWork/resume services commit this authority before the
                 // host drives the control. Never replace it with a Plan event.
@@ -220,6 +225,9 @@ impl PlanReconciliationDriver {
             };
             validate_cycle(cycle_id)?;
             let cycle_id = cycle_id.to_owned();
+            if zuno_db::session_work_cycle::is_stopped_in(transaction, session_id, &cycle_id)? {
+                return Ok(None);
+            }
             if gated && admission == WakeAdmission::Admit {
                 return Ok(Some(cycle_id));
             }
@@ -814,6 +822,7 @@ fn pause_reason_name(reason: PlanPauseReason) -> &'static str {
         PlanPauseReason::User => "user",
         PlanPauseReason::Authentication => "authentication",
         PlanPauseReason::TurnBudget => "turn_budget",
+        PlanPauseReason::UncertainSideEffect => "uncertain_side_effect",
         PlanPauseReason::Blocked => "blocked",
     }
 }

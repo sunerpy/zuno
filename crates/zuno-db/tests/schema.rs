@@ -113,6 +113,9 @@ fn schema_session_delete_cascades_through_every_declared_dependent_table() {
                (session_id, use_memories, generation, reason, source, revision, time_created, \
                 time_updated) \
              VALUES ('session-1', 0, 'disabled', 'fixture policy', 'schema-test', 1, 1, 1);
+             INSERT INTO session_work_cycle \
+               (session_id,cycle_id,anchor_message_id,data,time_created,time_updated) \
+             VALUES ('session-1','cycle-1','message-1','{\"stopped\":true}',1,1);
              INSERT INTO agent_job \
                (id, parent_session_id, logical_key, subject_kind, subject_payload, status, \
                 report_delivery, evidence_start_rowid, created_seq, time_created, time_updated) \
@@ -133,6 +136,7 @@ fn schema_session_delete_cascades_through_every_declared_dependent_table() {
         "session_context_epoch",
         "session_share",
         "session_memory_policy",
+        "session_work_cycle",
         "agent_job",
     ];
     let before: Vec<_> = dependent_tables
@@ -158,4 +162,155 @@ fn schema_session_delete_cascades_through_every_declared_dependent_table() {
         "after: {after:?}"
     );
     assert_eq!(row_count(&connection, "project"), 1);
+}
+
+#[test]
+fn current_goal_turn_ddl_agrees_with_goal_store_creation() {
+    let mut current = open::open(&zuno_paths::DbLocation::Memory).expect("current database");
+    migration::apply(&mut current).expect("current schema");
+    let goal_store = Connection::open_in_memory().expect("GoalStore schema reference");
+    goal_store
+        .execute_batch(include_str!("../../zuno-goal/src/goal_turn_schema.sql"))
+        .expect("GoalStore independently creates its turn ledgers");
+    for table in [
+        "goal_turn_observation",
+        "goal_turn_audit",
+        "goal_cycle_failure",
+    ] {
+        let ddl = |connection: &Connection| {
+            connection
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE name=?1",
+                    [table],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("table DDL")
+        };
+        assert_eq!(
+            ddl(&current),
+            ddl(&goal_store),
+            "{table}: migration and GoalStore drifted"
+        );
+    }
+}
+
+#[test]
+fn work_cycle_identity_json_and_session_cascade_are_enforced() {
+    let mut connection = open::open(&zuno_paths::DbLocation::Memory).expect("database");
+    migration::apply(&mut connection).expect("current schema");
+    connection
+        .execute_batch(
+            "INSERT INTO project(id,worktree,time_created,time_updated,sandboxes)
+         VALUES('project','/workspace',1,1,'[]');
+         INSERT INTO session(id,project_id,slug,directory,title,version,time_created,time_updated)
+         VALUES('session','project','slug','/workspace','title','1',1,1);",
+        )
+        .expect("session");
+    for (session, cycle, data, valid) in [
+        ("session", "cycle-1", "{ \"stopped\" : true }", true),
+        ("session", "cycle-2", "{\"goalId\":null}", true),
+        ("session", "cycle-1", "{}", false),
+        ("missing", "cycle-1", "{}", false),
+        ("session", "cycle-3", "{", false),
+    ] {
+        let result = connection.execute(
+            "INSERT INTO session_work_cycle(session_id,cycle_id,data,time_created,time_updated)
+             VALUES (?1,?2,?3,1,1)",
+            (session, cycle, data),
+        );
+        assert_eq!(
+            result.is_ok(),
+            valid,
+            "{session}/{cycle}/{data}: {result:?}"
+        );
+    }
+    let anchor: Option<String> = connection
+        .query_row(
+            "SELECT anchor_message_id FROM session_work_cycle WHERE cycle_id='cycle-1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("nullable anchor");
+    assert_eq!(anchor, None);
+    let stored: String = connection
+        .query_row(
+            "SELECT data FROM session_work_cycle WHERE cycle_id='cycle-1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("unaltered JSON");
+    assert_eq!(stored, "{ \"stopped\" : true }");
+    connection
+        .execute("DELETE FROM session WHERE id='session'", [])
+        .expect("delete session");
+    assert_eq!(row_count(&connection, "session_work_cycle"), 0);
+}
+
+#[test]
+fn goal_turn_ledger_constraints_do_not_require_optional_legacy_goal_tables() {
+    let mut connection = open::open(&zuno_paths::DbLocation::Memory).expect("database");
+    migration::apply(&mut connection).expect("current schema without GoalStore");
+    for table in ["goal", "goal_pending_failure_signal", "goal_failure_streak"] {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name=?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .expect("optional table inventory");
+        assert!(!present, "migration must not create legacy {table}");
+    }
+    for (signal, streak, valid) in [
+        (None, 0, true),
+        (Some("io:unavailable"), 1, true),
+        (Some("io:unavailable"), 3, true),
+        (None, 1, false),
+        (Some("io:unavailable"), 0, false),
+        (Some("   "), 1, false),
+        (Some("io:unavailable"), 4, false),
+    ] {
+        let result = connection.execute(
+            "INSERT OR REPLACE INTO goal_cycle_failure
+             (session_id,goal_id,cycle_id,active_turn_id,signal,consecutive_turns)
+             VALUES ('session','goal','cycle','turn',?1,?2)",
+            (signal, streak),
+        );
+        assert_eq!(result.is_ok(), valid, "{signal:?}/{streak}: {result:?}");
+    }
+    for signal in ["", "   "] {
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO goal_turn_observation
+             (session_id,goal_id,cycle_id,turn_id,signal,time_created)
+             VALUES ('session','goal','cycle','turn',?1,1)",
+                    [signal],
+                )
+                .is_err()
+        );
+    }
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO goal_turn_audit
+         (session_id,goal_id,cycle_id,turn_id,audit,time_recorded)
+         VALUES ('session','goal','cycle','turn','{',1)",
+                [],
+            )
+            .is_err()
+    );
+    connection.execute_batch(
+        "INSERT INTO goal_turn_observation VALUES ('session','goal','cycle','turn','offline',1);
+         INSERT INTO goal_turn_observation VALUES ('session','goal','cycle','next-turn','offline',2);
+         INSERT INTO goal_turn_audit VALUES ('session','goal','cycle','turn','{}',1);",
+    ).expect("distinct turns without a legacy Goal row");
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO goal_turn_audit VALUES ('session','goal','cycle','turn','{}',2)",
+                [],
+            )
+            .is_err(),
+        "one audit per exact turn identity"
+    );
 }

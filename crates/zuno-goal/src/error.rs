@@ -36,9 +36,80 @@ use crate::status::GoalStatus;
 use std::path::PathBuf;
 use zuno_error::DbError;
 
+/// Typed Goal-turn conflicts. Expected invalidation applies only when settling a
+/// previously bound turn; it never licenses a rebind or retry of effects.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalTurnConflictReason {
+    #[error("the native turn binding changed")]
+    NativeBindingChanged,
+    #[error("Attempt belongs to another session")]
+    AttemptSessionMismatch,
+    #[error("Attempt no longer owns this Goal turn")]
+    AttemptTurnMismatch,
+    #[error("a blocking observation requires a signal")]
+    EmptySignal,
+    #[error("the host has no current work cycle")]
+    CycleUnavailable,
+    #[error("the current work cycle changed")]
+    CycleChanged,
+    #[error("the current work cycle is stopped")]
+    CycleStopped,
+    #[error("the current work cycle does not own this Goal")]
+    GoalUnowned,
+    #[error("the Goal was removed or replaced")]
+    GoalReplaced,
+    #[error("native lifecycle control invalidated the Goal turn binding")]
+    BindingInvalidated,
+    #[error("a newer Goal/cycle/turn superseded this binding")]
+    TurnSuperseded,
+    #[error("Goal state changed inside settlement")]
+    GoalStateConflict,
+}
+
+impl GoalTurnConflictReason {
+    #[must_use]
+    pub const fn is_expected_invalidation(self) -> bool {
+        matches!(
+            self,
+            Self::CycleChanged
+                | Self::CycleStopped
+                | Self::GoalUnowned
+                | Self::GoalReplaced
+                | Self::BindingInvalidated
+                | Self::TurnSuperseded
+        )
+    }
+}
+
 /// A goal store failure.
 #[derive(Debug, thiserror::Error)]
 pub enum GoalError {
+    #[error(
+        "provider request {request_id} in session {session_id} has no captured Goal owner; \
+             before_request must admit each modern provider request before its response is accounted"
+    )]
+    BudgetRequestNotAdmitted {
+        session_id: String,
+        request_id: String,
+    },
+    #[error("invalid native Goal turn identity field `{field}`")]
+    InvalidGoalTurnIdentity { field: &'static str },
+    #[error("trusted Goal turn context is unavailable; the host must bind the actual engine turn")]
+    GoalTurnContextMissing,
+    #[error("Goal turn conflict for session {session_id}: {reason}")]
+    GoalTurnConflict {
+        session_id: String,
+        reason: GoalTurnConflictReason,
+    },
+    #[error("Goal turn {turn_id} is already settled; no observation or execution may be added")]
+    GoalTurnAlreadySettled { turn_id: String },
+    #[error("durable Goal turn receipt or cursor for session {session_id} is corrupt")]
+    GoalTurnAuditCorrupt { session_id: String },
+    #[error("native `/goal block <reason>` requires a non-empty reason")]
+    EmptyBlockReason,
     /// The underlying SQLite operation failed. Retryability is
     /// [`DbError::is_retryable`]'s call, unchanged.
     #[error(transparent)]
@@ -128,6 +199,39 @@ pub enum GoalError {
         session_id: String,
         /// Current durable status.
         status: GoalStatus,
+    },
+
+    /// Independent model work cannot close an older paused Goal.
+    #[error(
+        "goal {goal_id} is paused; model completion cannot close it through an independent \
+         request; the user may explicitly complete it with `/goal complete` or resume it"
+    )]
+    CompletionRequiresUser {
+        /// The paused Goal whose authority must be preserved.
+        goal_id: String,
+    },
+
+    /// Completion cannot stand in for authoritative inspection of uncertain calls.
+    #[error(
+        "goal completion requires authoritative reconciliation of uncertain tool calls: {}; \
+         completion does not reconcile or authorize replay of these calls",
+        listed_ids(call_ids)
+    )]
+    CompletionUncertain {
+        /// Provider call IDs from the durable uncertain outcomes.
+        call_ids: Vec<String>,
+    },
+
+    /// The immutable declaration and its acceptance ledger disagree.
+    #[error(
+        "goal criterion contract for session {session_id} is inconsistent: {reason}; \
+         completion was refused and the stored declaration and ledger were left unchanged"
+    )]
+    CriterionContractCorrupt {
+        /// Session whose durable acceptance contract cannot be audited.
+        session_id: String,
+        /// Bounded explanation, without copying arbitrary stored statements.
+        reason: String,
     },
 
     /// A writer used a stale optimistic-concurrency revision.
@@ -339,16 +443,7 @@ pub enum GoalError {
         receipt_at_ms: i64,
     },
 
-    /// Completion was requested for a change goal whose criteria are unproven.
-    ///
-    /// An empty `unsatisfied` means the goal has no criteria at all, which no longer
-    /// happens to a goal the model proposed: [`GoalStore::create_goal_as_model`]
-    /// refuses a proposal that names no check, so this shape is a goal the *user*
-    /// created with `/goal create` that a tool-reported write then escalated. The
-    /// message therefore names the remedy — criteria are proposed with `goal_propose`
-    /// at creation, not asserted at completion, and an unfinished goal cannot be
-    /// re-proposed — so the model does not spend a turn discovering that no citation
-    /// can help.
+    /// Completion was requested while declared criteria remain unproven.
     ///
     /// The named-id form carries the remedy too, because both audiences reach it. A
     /// human running `/goal complete` on a goal the model proposed is refused by the
@@ -676,15 +771,10 @@ const MAX_LISTED_CLAIM_CHARS: usize = 400;
 
 /// How [`GoalError::EvidenceMissing`] describes what is still unproven.
 ///
-/// Two sentences rather than one because the two cases have different remedies:
-/// named ids mean "verify these and cite the receipts", while an empty list means
-/// "this goal has no criteria to verify at all".
+/// Ordinary Goals with empty declarations never reach this refusal.
 fn unsatisfied_detail(unsatisfied: &[String]) -> String {
     if unsatisfied.is_empty() {
-        "a goal that changes the workspace cannot complete without success criteria; propose \
-         success criteria with `goal_propose` before completing (an unfinished goal cannot be \
-         re-proposed, so this one has to be cancelled by the user first)"
-            .to_owned()
+        "criterion evidence is incomplete; inspect the stored acceptance contract".to_owned()
     } else {
         format!(
             "these criteria are neither satisfied nor waived: {}; close each one with \
@@ -752,6 +842,18 @@ fn unverified_detail(claims: &[UnverifiedCapability]) -> String {
 }
 
 impl GoalError {
+    /// A captured native turn legitimately lost its authority before settlement.
+    /// The host may skip that late settlement, without blocking/retrying the Goal.
+    /// Database, corrupt receipt, missing context and invalid identity errors are
+    /// deliberately not classified here; retain their normal typed handling.
+    #[must_use]
+    pub const fn is_expected_turn_invalidation(&self) -> bool {
+        match self {
+            Self::GoalTurnConflict { reason, .. } => reason.is_expected_invalidation(),
+            _ => false,
+        }
+    }
+
     /// Whether this failure is the model's to fix by asking again differently.
     ///
     /// The goal tool uses this to decide between returning a refusal the model
@@ -764,6 +866,11 @@ impl GoalError {
             | Self::GoalNotReplaceable { .. }
             | Self::NoGoal { .. }
             | Self::GoalNotActive { .. }
+            | Self::CompletionRequiresUser { .. }
+            | Self::CompletionUncertain { .. }
+            | Self::GoalTurnConflict { .. }
+            | Self::GoalTurnAlreadySettled { .. }
+            | Self::EmptyBlockReason
             | Self::RevisionConflict { .. }
             | Self::CompletionBlocked { .. }
             | Self::PlanBelongsToAnotherGoal { .. }
@@ -787,11 +894,16 @@ impl GoalError {
             | Self::SuccessCriterionTooLong { .. }
             | Self::EmptyObjective => true,
             Self::Db(_)
+            | Self::BudgetRequestNotAdmitted { .. }
+            | Self::InvalidGoalTurnIdentity { .. }
+            | Self::GoalTurnContextMissing
+            | Self::GoalTurnAuditCorrupt { .. }
             | Self::UnknownRetryReason { .. }
             | Self::UnknownPauseReason { .. }
             | Self::UnknownCriterionStatus { .. }
             | Self::UnknownGoalKind { .. }
             | Self::PlanStateCorrupt { .. }
+            | Self::CriterionContractCorrupt { .. }
             | Self::UnknownCapabilityClaimState { .. }
             | Self::Spill { .. }
             | Self::PointerTooLong { .. }
@@ -910,15 +1022,16 @@ mod tests {
     }
 
     #[test]
-    fn a_change_goal_with_no_criteria_is_told_to_propose_them_rather_than_which_id_is_open() {
+    fn an_empty_evidence_refusal_does_not_require_cancelling_the_goal() {
         let error = GoalError::EvidenceMissing {
             unsatisfied: Vec::new(),
         };
         let message = error.to_string();
         assert!(
-            message.contains("propose success criteria with `goal_propose` before completing"),
+            message.contains("inspect the stored acceptance contract"),
             "{message}"
         );
+        assert!(!message.contains("cancel"));
         assert!(
             !message.contains("neither satisfied nor waived"),
             "an empty checklist has no ids to list: {message}"

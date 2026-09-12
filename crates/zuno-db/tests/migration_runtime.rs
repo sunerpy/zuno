@@ -94,7 +94,7 @@ fn published_format_thirteen_preserves_rows_and_adds_runtime_receipts() {
     let version: u32 = connection
         .query_row("SELECT format FROM zuno_schema", [], |r| r.get(0))
         .expect("format");
-    assert_eq!(version, 14);
+    assert_eq!(version, migration::CURRENT_FORMAT);
     let receipt = rows(&connection, "session_input_receipt");
     assert_eq!(
         receipt,
@@ -112,7 +112,7 @@ fn published_format_thirteen_preserves_rows_and_adds_runtime_receipts() {
         "legacy consumption cannot invent a turn, model application, or completion"
     );
     assert!(rows(&connection, "session_context_usage").is_empty());
-    migration::apply(&mut connection).expect("reopening format 14 is validation only");
+    migration::apply(&mut connection).expect("reopening the current format is validation only");
     assert_eq!(rows(&connection, "session_input_receipt"), receipt);
     for (table, before) in tables.iter().zip(&before) {
         assert_eq!(

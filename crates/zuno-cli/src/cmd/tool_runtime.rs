@@ -349,7 +349,9 @@ pub(crate) fn assemble(
     let native_review =
         selected_agent.name == "review" && matches!(&selected_agent.source, AgentSource::Native);
 
-    let file_tools = FileTools::new(directory).map_err(to_string)?;
+    let (file_tools, _inspector) =
+        FileTools::with_inspector(Arc::clone(&selection.todo_store), directory)
+            .map_err(to_string)?;
     let registry = ToolRegistryBuilder::new(directory, file_tools, flags);
     let registry = match generated_root {
         Some(root) => registry.with_generated_root(root),

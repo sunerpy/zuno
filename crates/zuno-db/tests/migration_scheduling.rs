@@ -1,4 +1,4 @@
-//! Scheduling preservation through format 14, using published formats 5-13.
+//! Scheduling preservation through format 15, using published formats 5-14.
 //! The pre-13 step alone repairs documented stale-running/no-progress rows;
 //! upgrading published format 13 must not replay that repair or resume a Goal.
 
@@ -14,7 +14,7 @@ use zuno_types::execution::{
 const SESSION: &str = "ses_fixture_0001";
 
 fn legacy(format: u32) -> Connection {
-    assert!((5..=13).contains(&format), "supported fixture format");
+    assert!((5..=14).contains(&format), "supported fixture format");
     let connection = open::open(&DbLocation::Memory).expect("database");
     connection
         .execute_batch(match format {
@@ -30,6 +30,7 @@ fn legacy(format: u32) -> Connection {
         (11, include_str!("fixtures/format-11.sql")),
         (12, include_str!("fixtures/format-12.sql")),
         (13, include_str!("fixtures/format-13.sql")),
+        (14, include_str!("fixtures/format-14.sql")),
     ] {
         if format >= next {
             connection
@@ -39,7 +40,7 @@ fn legacy(format: u32) -> Connection {
     }
     assert_eq!(marker(&connection), format);
     // Opening a legacy fixture must not mutate it before migration::apply.
-    assert_eq!(has_scheduling(&connection), format == 13);
+    assert_eq!(has_scheduling(&connection), format >= 13);
     connection
 }
 
@@ -159,11 +160,11 @@ fn stale_running(connection: &Connection) {
 }
 
 #[test]
-fn every_released_format_five_through_thirteen_reaches_fourteen_and_preserves_scheduling() {
-    for format in 5..=13 {
+fn every_released_format_five_through_fourteen_reaches_current_and_preserves_scheduling() {
+    for format in 5..=14 {
         let mut connection = legacy(format);
         let before = preserved_rows(&connection);
-        let execution_query = if format == 13 {
+        let execution_query = if format >= 13 {
             "SELECT * FROM session_execution_state ORDER BY session_id"
         } else {
             "SELECT session_id,revision,mode,work_identity,authorized_plan_id,
@@ -179,7 +180,7 @@ fn every_released_format_five_through_thirteen_reaches_fourteen_and_preserves_sc
         migration::apply(&mut connection).unwrap_or_else(|error| {
             panic!("format {format}: {}", zuno_error::source::describe(&error))
         });
-        assert_eq!(marker(&connection), 14);
+        assert_eq!(marker(&connection), migration::CURRENT_FORMAT);
         assert!(has_scheduling(&connection));
         assert_preserved(&connection, &before);
         assert_eq!(
@@ -190,7 +191,7 @@ fn every_released_format_five_through_thirteen_reaches_fourteen_and_preserves_sc
                     |row| row.get::<_, i64>(0),
                 )
                 .expect("legacy metadata"),
-            0,
+            i64::from(format == 14),
             "format {format}"
         );
         if let Some(execution) = execution {
@@ -314,7 +315,7 @@ fn published_thirteen_preserves_scheduling_bytes_and_does_not_repeat_the_legacy_
         let before = preserved_rows(&connection);
         let execution = rows(&connection, "SELECT * FROM session_execution_state");
         migration::apply(&mut connection).expect("upgrade published format 13");
-        assert_eq!(marker(&connection), 14);
+        assert_eq!(marker(&connection), migration::CURRENT_FORMAT);
         assert_preserved(&connection, &before);
         assert_eq!(
             rows(&connection, "SELECT * FROM session_execution_state"),
@@ -442,14 +443,14 @@ fn legacy_repair_uses_only_the_latest_supported_structured_driver_phase() {
 }
 
 #[test]
-fn final_fourteen_marker_failure_rolls_back_scheduling_repair_and_runtime_schema() {
+fn final_fifteen_marker_failure_rolls_back_scheduling_repair_and_runtime_schema() {
     let mut connection = legacy(12);
     stale_running(&connection);
     phase_event(&mut connection, paused_event());
     connection
         .execute_batch(
             "CREATE TRIGGER scheduling_marker_failure BEFORE UPDATE OF format ON zuno_schema
-         WHEN NEW.format=14 BEGIN
+         WHEN NEW.format=15 BEGIN
            SELECT CASE WHEN (SELECT phase FROM session_execution_state LIMIT 1) <> 'paused'
              THEN RAISE(ABORT,'repair must precede marker') END;
            SELECT CASE WHEN NOT EXISTS(
@@ -457,7 +458,9 @@ fn final_fourteen_marker_failure_rolls_back_scheduling_repair_and_runtime_schema
              THEN RAISE(ABORT,'column must precede marker') END;
            SELECT CASE WHEN (SELECT count(*) FROM sqlite_schema WHERE name IN
              ('session_input_receipt','session_context_usage',
-              'session_input_receipt_turn_state_idx','session_context_usage_updated_idx')) <> 4
+              'session_input_receipt_turn_state_idx','session_context_usage_updated_idx',
+              'session_work_cycle','session_work_cycle_updated_idx',
+              'goal_turn_observation','goal_turn_audit','goal_cycle_failure')) <> 9
              THEN RAISE(ABORT,'runtime schema must precede marker') END;
            SELECT RAISE(ABORT,'final marker refused');
          END;",
@@ -503,7 +506,7 @@ fn current_marker_with_missing_scheduling_column_fails_without_mutation() {
     );
     let before = preserved_rows(&connection);
     assert!(migration::apply(&mut connection).is_err());
-    assert_eq!(marker(&connection), 14);
+    assert_eq!(marker(&connection), migration::CURRENT_FORMAT);
     assert_eq!(
         rows(
             &connection,
@@ -515,7 +518,7 @@ fn current_marker_with_missing_scheduling_column_fails_without_mutation() {
 }
 
 #[test]
-fn current_fourteen_rejects_weakened_scheduling_constraints_without_rewriting_rows() {
+fn current_rejects_weakened_scheduling_constraints_without_rewriting_rows() {
     for column in [
         "scheduling text",
         "scheduling integer CHECK(scheduling IS NULL OR (json_valid(scheduling) AND json_type(scheduling)='object'))",
@@ -543,7 +546,7 @@ fn current_fourteen_rejects_weakened_scheduling_constraints_without_rewriting_ro
             matches!(error, zuno_error::DbError::Schema { .. }),
             "{column}: {error:?}"
         );
-        assert_eq!(marker(&connection), 14);
+        assert_eq!(marker(&connection), migration::CURRENT_FORMAT);
         assert_eq!(
             rows(&connection, "SELECT * FROM session_execution_state"),
             execution,

@@ -1,9 +1,6 @@
 use super::*;
 use std::sync::atomic::AtomicBool;
-use zuno_types::execution::{
-    CollaborationMode, ContinuationToken, SessionExecutionPhase, SessionPauseReason,
-    SessionReadiness, SessionScheduling, TurnExecutionIdentity,
-};
+use zuno_types::execution::{CollaborationMode, ContinuationToken, TurnExecutionIdentity};
 
 fn paused_goal(
     client: &PromptClient,
@@ -24,6 +21,42 @@ fn paused_goal(
             None,
         )
         .expect("create fixture Goal");
+    // Represent a stopped autonomous Goal turn through the native boundaries.
+    // Merely assigning Paused(User) is an unproven session pause, not evidence
+    // that a Goal turn was interrupted. No synthetic user history is needed.
+    let control = zuno_session_control::SessionControlService::new(Arc::clone(&pool));
+    let cycle_id = "goal-resume-fixture-cycle";
+    let turn_id = "goal-resume-fixture-turn";
+    let at_ms = zuno_db::message::now_millis();
+    control
+        .record_continuation(
+            &client.session_id,
+            cycle_id,
+            TurnExecutionIdentity::new("orchestrator", "test", "test-model"),
+            CollaborationMode::Work,
+            None,
+            None,
+            None,
+            at_ms,
+        )
+        .expect("bind native Goal cycle");
+    control
+        .begin_engine_turn(&client.session_id, cycle_id, turn_id)
+        .expect("bind fixture turn")
+        .expect("active Goal owns the turn");
+    control
+        .stop_turn(&client.session_id, cycle_id, turn_id, true, at_ms + 1)
+        .expect("record native user interruption");
+    let stopped = zuno_db::session_work_cycle::current_in(
+        &pool.get().expect("fixture connection"),
+        &client.session_id,
+    )
+    .expect("read native cycle")
+    .expect("cycle")
+    .stopped
+    .expect("native stop proof");
+    assert!(stopped.user_cancelled);
+    assert_eq!(stopped.turn_id.as_deref(), Some(turn_id));
     let goal = goals
         .pause_with_reason(
             &client.session_id,
@@ -31,30 +64,6 @@ fn paused_goal(
         )
         .expect("pause fixture Goal")
         .expect("paused Goal");
-    let executions = zuno_db::session_execution::SessionExecutionStore::new(Arc::clone(&pool));
-    let mut state = executions
-        .seed(
-            &client.session_id,
-            CollaborationMode::Work,
-            Some(TurnExecutionIdentity::new(
-                "orchestrator",
-                "test",
-                "test-model",
-            )),
-            zuno_db::message::now_millis(),
-        )
-        .expect("seed execution state");
-    state.phase = SessionExecutionPhase::Paused;
-    state.cycle_id = Some("goal-resume-fixture-cycle".to_owned());
-    state.scheduling = Some(SessionScheduling {
-        readiness: SessionReadiness::Paused {
-            reason: SessionPauseReason::User,
-        },
-        ..SessionScheduling::default()
-    });
-    executions
-        .update(state.revision, state)
-        .expect("pause execution state");
     (pool, goals, goal)
 }
 

@@ -11,6 +11,12 @@
 //! Format 13 also adds nullable execution scheduling. The sole execution-row
 //! repair is a latest structured driver `paused/no_progress` event paired with
 //! stale `running` execution: preserve authority and cycle, persist the pause.
+//!
+//! Format 15 adds empty host-cycle and Goal-turn companion ledgers. Published
+//! format-14 receipts and all optional Goal tables stay byte-for-byte intact:
+//! no stopped cycle or Goal is resumed, and no legacy identity is guessed.
+
+mod turn_boundaries;
 
 use crate::{open, schema};
 use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehavior, params};
@@ -19,7 +25,7 @@ use zuno_error::DbError;
 /// Current database format.
 ///
 /// Bump this whenever [`crate::schema`] changes incompatibly.
-pub const CURRENT_FORMAT: u32 = 14;
+pub const CURRENT_FORMAT: u32 = 15;
 const LEARNING_UPGRADE_FROM: u32 = 5;
 const PLAN_STACK_UPGRADE_FROM: u32 = 6;
 const VERIFICATION_UPGRADE_FROM: u32 = 7;
@@ -29,6 +35,7 @@ const MEMORY_RUNTIME_UPGRADE_FROM: u32 = 10;
 const AUTOMATIC_MEMORY_UPGRADE_FROM: u32 = 11;
 const QUESTIONS_UPGRADE_FROM: u32 = 12;
 const RUNTIME_CONSISTENCY_UPGRADE_FROM: u32 = 13;
+const TURN_BOUNDARIES_UPGRADE_FROM: u32 = 14;
 
 const FORMAT_TABLE: &str = "zuno_schema";
 const FORMAT_SQL: &str = "
@@ -121,6 +128,7 @@ fn dispatch_once(connection: &mut Connection) -> Result<Dispatch, DbError> {
         Some(AUTOMATIC_MEMORY_UPGRADE_FROM) => migrate_automatic_memory(connection),
         Some(QUESTIONS_UPGRADE_FROM) => migrate_questions(connection),
         Some(RUNTIME_CONSISTENCY_UPGRADE_FROM) => migrate_runtime_consistency(connection),
+        Some(TURN_BOUNDARIES_UPGRADE_FROM) => migrate_turn_boundaries(connection),
         observed => Err(DbError::SchemaMismatch {
             expected: CURRENT_FORMAT,
             observed,
@@ -129,6 +137,11 @@ fn dispatch_once(connection: &mut Connection) -> Result<Dispatch, DbError> {
 }
 
 fn validate_current(connection: &Connection, tables: &[String]) -> Result<(), DbError> {
+    validate_format_fourteen(connection, tables)?;
+    turn_boundaries::validate_shape(connection)
+}
+
+fn validate_format_fourteen(connection: &Connection, tables: &[String]) -> Result<(), DbError> {
     validate_format_twelve(connection, tables)?;
     validate_questions_shape(connection)?;
     validate_scheduling_shape(connection)?;
@@ -546,6 +559,7 @@ fn add_questions(transaction: &Transaction<'_>) -> Result<(), DbError> {
     validate_questions_shape_version(transaction, true)?;
     validate_scheduling_shape(transaction)?;
     schema::up_runtime_consistency(transaction)?;
+    schema::up_turn_boundaries(transaction)?;
     validate_current(transaction, &transaction_table_names(transaction)?)
 }
 
@@ -560,6 +574,7 @@ fn migrate_runtime_consistency(connection: &mut Connection) -> Result<Dispatch, 
     }
     validate_format_thirteen(&transaction, &tables)?;
     schema::up_runtime_consistency(&transaction)?;
+    schema::up_turn_boundaries(&transaction)?;
     validate_current(&transaction, &transaction_table_names(&transaction)?)?;
     let changed = transaction
         .execute(
@@ -570,6 +585,34 @@ fn migrate_runtime_consistency(connection: &mut Connection) -> Result<Dispatch, 
     if changed != 1 {
         return Err(failure(std::io::Error::other(
             "format-13 marker changed during runtime migration",
+        )));
+    }
+    transaction.commit().map_err(map_error)?;
+    Ok(Dispatch::Settled)
+}
+
+/// Add format-15 companions to the exact published format-14 structure.
+fn migrate_turn_boundaries(connection: &mut Connection) -> Result<Dispatch, DbError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_error)?;
+    let tables = transaction_table_names(&transaction)?;
+    let observed = observed_format(&transaction, &tables)?;
+    if observed != Some(TURN_BOUNDARIES_UPGRADE_FROM) {
+        return Ok(Dispatch::Moved { observed });
+    }
+    validate_format_fourteen(&transaction, &tables)?;
+    schema::up_turn_boundaries(&transaction)?;
+    validate_current(&transaction, &transaction_table_names(&transaction)?)?;
+    let changed = transaction
+        .execute(
+            "UPDATE zuno_schema SET format=?1 WHERE singleton=1 AND format=?2",
+            params![CURRENT_FORMAT, TURN_BOUNDARIES_UPGRADE_FROM],
+        )
+        .map_err(map_error)?;
+    if changed != 1 {
+        return Err(failure(std::io::Error::other(
+            "format-14 marker changed during turn-boundary migration",
         )));
     }
     transaction.commit().map_err(map_error)?;

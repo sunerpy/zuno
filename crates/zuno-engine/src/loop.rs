@@ -4014,7 +4014,7 @@ async fn inject_live_inputs(
     let delivery = live.guard.take_soft_interrupts_at_safe_point();
     let mut injected = InjectedLiveInputs::default();
     for message in delivery.messages {
-        if let Some(input_id) = message.input_id.as_deref() {
+        let claimed = if let Some(input_id) = message.input_id.as_deref() {
             let promoted = match message.revision {
                 Some(revision) => {
                     live.inbox
@@ -4022,17 +4022,26 @@ async fn inject_live_inputs(
                 }
                 None => live.inbox.promote_id(&request.session_id, input_id)?,
             };
-            if promoted.is_none() {
+            let Some(promoted) = promoted else {
                 continue;
-            }
-        }
-        persist_live_input(
+            };
+            Some(promoted)
+        } else {
+            None
+        };
+        if !persist_live_input(
             context.connection,
             request,
             requested,
             &message,
+            claimed.as_ref(),
             context.attachments.as_deref(),
-        )?;
+        )? {
+            // The signal has been drained, but its durable input is still pending.
+            // Do not requeue a soft wake into the same blocked turn: native future
+            // activation owns delivery after the appropriate gate is resolved.
+            continue;
+        }
         if let Some(input_id) = message.input_id.as_ref() {
             events
                 .send(TurnEvent::InputConsumed {
@@ -4054,9 +4063,21 @@ fn persist_live_input(
     request: &RunTurnRequest,
     requested: &RequestedTurn,
     input: &SoftInterruptMessage,
+    claimed: Option<&zuno_db::inbox::SessionInput>,
     attachments: Option<&zuno_attachment::AttachmentStore>,
-) -> Result<(), TurnError> {
+) -> Result<bool, TurnError> {
     let transaction = open::immediate_transaction(connection)?;
+    let admission = zuno_db::session_wake::model_application_admission_in(
+        &transaction,
+        &request.session_id,
+        claimed,
+    )?;
+    if admission == zuno_types::execution::WakeAdmission::Reject && input.input_id.is_some() {
+        // Commits only the release of this exact refused promotion. No history,
+        // receipt binding, application or consumption has happened.
+        transaction.commit().map_err(open::map_error)?;
+        return Ok(false);
+    }
     let latest = MessageStore::new(&transaction).latest_time_created(&request.session_id)?;
     let created = created_after(now_millis(), latest);
     let message_id = input
@@ -4139,6 +4160,34 @@ fn persist_live_input(
             ),
         )?);
     }
+    if admission == zuno_types::execution::WakeAdmission::Reject {
+        // Legacy in-process senders may have no inbox identity. Preserve their
+        // full message/parts as a native HostMessage before dropping the signal,
+        // so a protected boundary cannot silently discard an untracked steer.
+        let trigger = match input.source {
+            crate::interrupt::SoftInterruptSource::User => {
+                zuno_types::execution::InputTriggerKind::User
+            }
+            _ => zuno_types::execution::InputTriggerKind::Recovery,
+        };
+        zuno_db::inbox::admit_in(
+            &transaction,
+            zuno_db::inbox::NewSessionInput::new(
+                &message.id,
+                &request.session_id,
+                json!({
+                    "message": message.to_json(),
+                    "parts": parts.iter().map(PartRecord::to_json).collect::<Vec<_>>(),
+                    "liveInputSource": format!("{:?}", input.source),
+                }),
+                zuno_db::inbox::InputDelivery::Queue,
+                created,
+            )
+            .with_trigger_kind(trigger),
+        )?;
+        transaction.commit().map_err(open::map_error)?;
+        return Ok(false);
+    }
     {
         let store = MessageStore::new(&transaction);
         store.put_message_at(&message, created)?;
@@ -4167,7 +4216,7 @@ fn persist_live_input(
         )?;
     }
     transaction.commit().map_err(open::map_error)?;
-    Ok(())
+    Ok(true)
 }
 
 fn touch_session(connection: &mut Connection, session_id: &str) -> Result<(), TurnError> {

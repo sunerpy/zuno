@@ -69,31 +69,6 @@ impl Drop for DriverClaim {
     }
 }
 
-/// Bind cancellation to the input selected by an existing native turn driver.
-pub(super) struct ActiveInput<'a> {
-    session: &'a AcpSession,
-}
-
-impl<'a> ActiveInput<'a> {
-    pub(super) fn enter(session: &'a AcpSession, input_id: &str) -> Self {
-        *session
-            .active_prompt_input
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(input_id.to_owned());
-        Self { session }
-    }
-}
-
-impl Drop for ActiveInput<'_> {
-    fn drop(&mut self) {
-        self.session
-            .active_prompt_input
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-    }
-}
-
 impl AcpSession {
     pub(super) async fn admit_and_drive_content(
         self: &Arc<Self>,
@@ -362,12 +337,7 @@ impl AcpSession {
             .turn_id
             .as_deref()
             .is_some_and(|turn_id| self.control.active_turn_id().as_deref() == Some(turn_id))
-            || self
-                .active_prompt_input
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_deref()
-                == Some(receipt.input_id.as_str())
+            || self.control.active_input_id().as_deref() == Some(receipt.input_id.as_str())
         {
             return true;
         }

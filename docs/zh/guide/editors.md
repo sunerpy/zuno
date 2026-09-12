@@ -297,10 +297,50 @@ Shell 工具调用的标题是提交时的确切命令，而不是加了解释�
 
 斜杠命令不同。它要对宿主命令目录解析，并作为自己的回合运行，因此无法被转向进已经在飞的工作里。Zuno 用同一个错误码拒绝它，`admission` 为 `"rejected"`，`reason` 为 `"commandRequiresIdleSession"`，并且不写入任何持久内容；等会话空闲后重新发送即可。只有真正指名了某个命令、某个无歧义 Skill 或某个原生会话控制项的提示词才算命令调用。仅仅以 `/` 开头的提示词 —— 一个 POSIX 绝对路径、一个正则表达式 —— 是普通内容，因此会像其他提示词一样被持久接纳并转向，而不是被当成无法解析的命令拒绝。
 
-取消按 RPC 请求 ID 键控，不按相同文本键控。`$/cancel_request` 只撤回该请求贡献且
-尚未处理的输入，以 `-32800` 和持久 receipt 回答；不能抹掉已进入模型的内容，
-重复 ID 的观察者也不能撤回原贡献者的输入。`session/cancel` 才是会话级中断。
+取消按 RPC 请求身份键控，不按相同文本键控。`$/cancel_request` 只撤回该请求贡献且
+尚未处理的输入，或在原子核对后取消它拥有且正在执行的原生输入。`-32800` 表示请求撤回，
+不表示工具副作用已回滚；执行结果以持久 receipt 为准。它不能抹掉已进入模型的内容，
+使用同一 `messageId` 的幂等观察者也不能撤回原贡献者的输入。响应后复用 JSON-RPC wire ID
+会获得新的内部请求身份，旧取消状态不能继承到新请求，也不能取消无关的 Agent 到客户端 RPC。
 观察者断开、显式撤回与 Zuno 进程退出是不同生命周期事件。
+
+### 精确取消扩展
+
+初始化响应通过 `_meta.zuno.cancellation` 宣告能力：
+
+```json
+{
+  "version": 1,
+  "method": "session/cancel",
+  "expectedTurnIdPath": "_meta.zuno.expectedTurnId",
+  "turnIdSource": "session/update._meta.zuno.turnId",
+  "legacySessionIdOnly": "currentTargetAtDispatch",
+  "armsNextTurn": false
+}
+```
+
+客户端把实时 `session/update` 中的 `params.update._meta.zuno.turnId` 放到取消通知：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "session/cancel",
+  "params": {
+    "sessionId": "ses_example",
+    "_meta": { "zuno": { "expectedTurnId": "turn_example" } }
+  }
+}
+```
+
+`expectedTurnId` 必须是非空字符串，最多 256 字节。原生注册表在同一把锁内核对身份并
+发出取消。迟到的 T1 取消不会中断 T2；目标已结束、ID 不匹配或 exact metadata 非法时，
+不会降级为取消当前回合。notification 没有响应 ID，拒绝信息写到 stderr；原 prompt 的
+持久回执和更新报告真实结果。取消也不能证明远端副作用已撤销。
+
+旧 `sessionId`-only 通知只在处理时绑定一次当前目标，空闲时没有效果，不会给下一回合
+预置取消。它无法识别网络迟到意图：想取消 T1 的通知若在 T2 运行时到达，可能取消 T2。
+只有携带精确身份的客户端才有更强的目标保证。后续输入仍走 prompt 准入或 `session/steer`，
+不能通过取消后重发来模拟 steer。
 
 ### 被委派的子会话
 

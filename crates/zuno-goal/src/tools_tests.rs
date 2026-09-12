@@ -13,6 +13,8 @@ impl Fixture {
     fn new() -> Self {
         let spill = tempfile::tempdir().expect("create spill directory");
         let store = GoalStore::open_memory(spill.path().to_owned()).expect("open goal store");
+        crate::goal_turn_test_support::select_cycle(&store, "ses_tools", "fixture-cycle", None);
+        crate::goal_turn_test_support::fence(&store, "ses_tools", "fixture-turn");
         Self {
             store: Arc::new(store),
             _spill: spill,
@@ -20,6 +22,48 @@ impl Fixture {
     }
 
     fn context(&self, call_id: &str) -> ToolContext {
+        // Direct store creation in these legacy tool fixtures stands in for a
+        // native Goal command before engine admission. Model creation itself starts
+        // without a Goal and must do its own atomic binding.
+        if let Some(goal) = self
+            .store
+            .goal("ses_tools")
+            .unwrap()
+            .filter(|goal| goal.status == GoalStatus::Active)
+            && self.store.current_goal_turn("ses_tools").unwrap().is_none()
+        {
+            let scope = zuno_db::session_work_cycle::current_in(
+                &self.store.pool().get().unwrap(),
+                "ses_tools",
+            )
+            .unwrap()
+            .unwrap();
+            if scope.cycle_id == "fixture-cycle" && scope.goal_id.is_none() {
+                self.store
+                    .pool()
+                    .try_transaction(|tx| -> Result<(), GoalError> {
+                        let mut scope =
+                            zuno_db::session_work_cycle::current_in(tx, "ses_tools")?.unwrap();
+                        scope.goal_id = Some(goal.goal_id.clone());
+                        zuno_db::session_work_cycle::save_in(tx, &scope, 1)?;
+                        let identity = crate::GoalTurnIdentity::new(
+                            goal.goal_id,
+                            "fixture-cycle",
+                            "fixture-turn",
+                        )?;
+                        GoalStore::bind_goal_turn_in(tx, "ses_tools", &identity, None)?;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+        }
+        crate::goal_turn_test_support::with_snapshot(
+            self.bare_context(call_id),
+            &crate::GoalTurnIdentity::new("fixture", "fixture-cycle", "fixture-turn").unwrap(),
+        )
+    }
+
+    fn bare_context(&self, call_id: &str) -> ToolContext {
         ToolContext::new(
             "ses_tools",
             "msg_tools",
@@ -284,11 +328,13 @@ async fn blocked_update_requires_three_persisted_matching_failure_signals() {
         .expect("create goal");
     let tool = erase(UpdateGoalTool::new(Arc::clone(&fixture.store)));
 
-    let continuation = crate::GoalContinuation::new(
-        Arc::clone(&fixture.store),
-        zuno_engine::status::SessionRunRegistry::new(),
-    );
     for turn in 1..=3 {
+        let id = crate::goal_turn_test_support::bind(
+            &fixture.store,
+            "ses_tools",
+            "cycle",
+            &format!("real-{turn}"),
+        );
         let pending = tool
             .execute(
                 json!({
@@ -296,7 +342,10 @@ async fn blocked_update_requires_three_persisted_matching_failure_signals() {
                     "status": "blocked",
                     "blocking_condition": "credential unavailable"
                 }),
-                fixture.context(&format!("call_blocked_{turn}")),
+                crate::goal_turn_test_support::with_snapshot(
+                    fixture.context(&format!("call_blocked_{turn}")),
+                    &id,
+                ),
             )
             .await
             .expect("stage blocker for this turn");
@@ -307,8 +356,19 @@ async fn blocked_update_requires_three_persisted_matching_failure_signals() {
                 .status,
             GoalStatus::Active
         );
-        continuation
-            .record_turn_outcome("ses_tools", crate::GoalTurnOutcome::Progress)
+        assert_eq!(
+            pending.metadata["blockedObservation"]["disposition"],
+            "staged"
+        );
+        assert_eq!(
+            pending.metadata["blockedObservation"]["completedTurnStreak"],
+            turn - 1
+        );
+        assert_eq!(pending.title, "Goal blocker staged");
+        assert!(pending.output.contains("not yet applied"));
+        fixture
+            .store
+            .settle_goal_turn("ses_tools", &id, crate::GoalTurnOutcome::Progress)
             .expect("settle one real turn");
     }
     let blocked = fixture
@@ -331,28 +391,158 @@ async fn repeated_blocked_calls_in_one_turn_count_once() {
         .create_goal("ses_tools", "do not forge turns", None)
         .expect("create goal");
     let tool = erase(UpdateGoalTool::new(Arc::clone(&fixture.store)));
+    let id = crate::goal_turn_test_support::bind(&fixture.store, "ses_tools", "cycle", "real-one");
     for call in 1..=3 {
         tool.execute(
             json!({"expected_revision": 1, "status": "blocked", "blocking_condition": "same blocker"}),
-            fixture.context(&format!("call_retry_{call}")),
+            crate::goal_turn_test_support::with_snapshot(
+                fixture.context(&format!("call_retry_{call}")), &id,
+            ),
         )
         .await
         .expect("restage blocker within one turn");
     }
-    let continuation = crate::GoalContinuation::new(
-        Arc::clone(&fixture.store),
-        zuno_engine::status::SessionRunRegistry::new(),
-    );
-    let audit = continuation
-        .record_turn_outcome("ses_tools", crate::GoalTurnOutcome::Progress)
+    let audit = fixture
+        .store
+        .settle_goal_turn("ses_tools", &id, crate::GoalTurnOutcome::Progress)
         .expect("settle one real turn");
-    assert!(matches!(
-        audit,
-        crate::BlockedAudit::Pending(crate::FailureStreak {
-            consecutive_turns: 1,
-            ..
-        })
-    ));
+    assert_eq!(audit.audit.disposition, crate::GoalTurnDisposition::Pending);
+    assert_eq!(audit.audit.completed_turn_streak, 1);
+}
+
+#[tokio::test]
+async fn scoped_tool_without_trusted_turn_context_cannot_stage_a_blocker() {
+    let fixture = Fixture::new();
+    fixture
+        .store
+        .create_goal("ses_tools", "native scope only", None)
+        .unwrap();
+    let tool = erase(UpdateGoalTool::new(Arc::clone(&fixture.store)));
+    assert!(tool.execute(
+        json!({"expected_revision":1,"status":"blocked","blocking_condition":"missing approval"}),
+        fixture.bare_context("call-unbound"),
+    ).await.is_err(), "a model call without a native turn must not stage unbound work");
+    assert!(
+        fixture
+            .store
+            .consume_staged_failure_signal("ses_tools")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn scoped_tool_from_an_old_turn_cannot_apply_criteria_to_the_new_turn() {
+    let fixture = Fixture::new();
+    let created = fixture
+        .store
+        .create_goal_as_model(
+            "ses_tools",
+            "scoped criterion update",
+            &["verify".to_owned()],
+            None,
+        )
+        .unwrap();
+    let old = crate::goal_turn_test_support::bind(&fixture.store, "ses_tools", "cycle", "old");
+    let context = crate::goal_turn_test_support::with_snapshot(fixture.context("late-call"), &old);
+    crate::goal_turn_test_support::bind(&fixture.store, "ses_tools", "cycle", "new");
+    let tool = erase(UpdateGoalTool::new(Arc::clone(&fixture.store)));
+    assert!(tool.execute(json!({
+        "expected_revision":created.goal.revision,"status":"blocked","blocking_condition":"late",
+        "waive_criteria":[{"criterionId":"c1","reason":"must not be applied"}]
+    }), context).await.is_err(), "stale turn must be rejected before criterion mutation");
+    assert_eq!(fixture.store.goal("ses_tools").unwrap(), Some(created.goal));
+    assert_eq!(
+        fixture.store.criteria("ses_tools").unwrap(),
+        created.criteria
+    );
+}
+
+#[tokio::test]
+async fn scoped_tool_criteria_and_observation_commit_or_rollback_together() {
+    let fixture = Fixture::new();
+    let created = fixture
+        .store
+        .create_goal_as_model(
+            "ses_tools",
+            "stage atomically",
+            &["verify".to_owned()],
+            None,
+        )
+        .unwrap();
+    let id = crate::goal_turn_test_support::bind(&fixture.store, "ses_tools", "cycle", "actual");
+    let tool = erase(UpdateGoalTool::new(Arc::clone(&fixture.store)));
+    let params = json!({
+        "expected_revision":created.goal.revision,"status":"blocked","blocking_condition":"external",
+        "waive_criteria":[{"criterionId":"c1","reason":"outside agreed scope"}]
+    });
+    fixture
+        .store
+        .pool()
+        .get()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_observation BEFORE INSERT ON goal_turn_observation
+         BEGIN SELECT RAISE(ABORT, 'injected staging failure'); END;",
+        )
+        .unwrap();
+    assert!(
+        tool.execute(
+            params.clone(),
+            crate::goal_turn_test_support::with_snapshot(fixture.context("first"), &id,)
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        fixture.store.goal("ses_tools").unwrap(),
+        Some(created.goal.clone())
+    );
+    assert_eq!(
+        fixture.store.criteria("ses_tools").unwrap(),
+        created.criteria
+    );
+    fixture
+        .store
+        .pool()
+        .get()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_observation")
+        .unwrap();
+    let output = tool
+        .execute(
+            params,
+            crate::goal_turn_test_support::with_snapshot(
+                fixture.context("retry-after-authoritative-rollback"),
+                &id,
+            ),
+        )
+        .await
+        .unwrap();
+    let goal = goal_from_metadata(&output).unwrap().unwrap();
+    assert_eq!(goal.status, GoalStatus::Active);
+    assert_eq!(goal.revision, created.goal.revision + 1);
+    assert_eq!(
+        output.metadata["blockedObservation"]["identity"]["turnId"],
+        id.turn_id
+    );
+    assert_eq!(
+        output.metadata["blockedObservation"]["completedTurnStreak"],
+        0
+    );
+    assert_eq!(
+        fixture.store.criteria("ses_tools").unwrap()[0].status,
+        GoalCriterionStatus::Waived
+    );
+    assert_eq!(
+        fixture
+            .store
+            .settle_goal_turn("ses_tools", &id, crate::GoalTurnOutcome::Progress)
+            .unwrap()
+            .audit
+            .completed_turn_streak,
+        1
+    );
 }
 
 #[test]
@@ -565,11 +755,9 @@ async fn a_criteria_bearing_goal_cannot_be_completed_after_an_unreported_shell_e
     );
 }
 
-/// A change goal with no criteria is still refused, and still told where criteria come
-/// from. Only [`GoalStore::create_goal`] — the user's own `/goal create` — can produce
-/// such a goal now, so the remedy sentence is aimed at the run that inherited one.
+/// A user-created ordinary Goal can finish after a reported write.
 #[tokio::test]
-async fn a_user_created_goal_that_reported_a_write_cannot_complete_by_assertion() {
+async fn a_user_created_goal_that_reported_a_write_can_complete_without_implicit_criteria() {
     let fixture = Fixture::new();
     fixture
         .store
@@ -583,18 +771,16 @@ async fn a_user_created_goal_that_reported_a_write_cannot_complete_by_assertion(
         .escalate_to_change("ses_tools", "`write` wrote zuno.toml", 1_000)
         .expect("escalate to a change goal");
 
-    let refusal = erase(UpdateGoalTool::new(Arc::clone(&fixture.store)))
+    let output = erase(UpdateGoalTool::new(Arc::clone(&fixture.store)))
         .execute(
             json!({"expected_revision": 1, "status": "complete"}),
             fixture.context("call_complete"),
         )
         .await
-        .expect_err("a change goal with no criteria cannot complete by assertion");
-    assert!(matches!(refusal, ToolError::InvalidArgs { .. }));
-    let message = refusal_detail(&refusal);
-    assert!(
-        message.contains("propose success criteria with `goal_propose` before completing"),
-        "the model is told what would have worked: {message}"
+        .expect("ordinary completion after work and capability audits");
+    assert_eq!(
+        goal_from_metadata(&output).unwrap().unwrap().status,
+        GoalStatus::Complete
     );
     assert_eq!(
         fixture
@@ -603,7 +789,7 @@ async fn a_user_created_goal_that_reported_a_write_cannot_complete_by_assertion(
             .expect("read goal")
             .expect("goal exists")
             .status,
-        GoalStatus::Active
+        GoalStatus::Complete
     );
 }
 

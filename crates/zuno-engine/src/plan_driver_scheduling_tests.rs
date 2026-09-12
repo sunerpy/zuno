@@ -39,6 +39,17 @@ fn assert_authority(before: &SessionExecutionState, after: &SessionExecutionStat
     assert_eq!(&expected, after);
 }
 
+/// Native admission owns this write; a proposed driver string is not authority.
+fn bind_native_cycle(pool: &Arc<Pool>, cycle_id: &str) {
+    let mut current = state(pool);
+    current.cycle_id = Some(cycle_id.to_owned());
+    if let Some(token) = &mut current.continuation {
+        token.cycle_id = cycle_id.to_owned();
+    }
+    pool.transaction(|tx| session_execution::update_in(tx, current.revision, current))
+        .expect("native cycle binding");
+}
+
 fn reconcile(
     driver: &PlanReconciliationDriver,
     input: &PlanReconciliationInput,
@@ -272,7 +283,7 @@ fn callback_and_even_new_user_cycle_ids_alone_never_reset_session_progress() {
     assert_eq!(phase(&driver).cycle_id, "origin-cycle");
     assert_eq!(
         driver.begin("ses", "user-cycle").expect("explicit query"),
-        "user-cycle"
+        "origin-cycle"
     );
     assert_eq!(phase(&driver).unchanged_progress_count, 2);
     assert_eq!(
@@ -644,6 +655,7 @@ fn completed_new_human_input_starts_a_bound_background_cycle_but_paused_status_d
                     WakeAdmission::Resume
                 );
             }
+            bind_native_cycle(&pool, "new-human-cycle");
             assert_eq!(
                 driver
                     .begin_with_wake("ses", "new-human-cycle", &signal, 22)
@@ -1060,6 +1072,7 @@ fn authoritative_cycle_survives_plan_handoff_and_new_work_control_admission() {
         let pool = pool();
         authorized(&pool);
         plan_mode(&pool);
+        bind_native_cycle(&pool, "old-plan-cycle");
         let driver = PlanReconciliationDriver::new(Arc::clone(&pool));
         driver.begin("ses", "old-plan-cycle").expect("Plan begin");
         let mut handoff = unfinished();
@@ -1152,9 +1165,10 @@ fn authoritative_cycle_is_bound_with_existing_continuation_before_begin_event() 
          END;",
         )
         .expect("require atomic cycle binding");
+    bind_native_cycle(&pool, "new-user-cycle");
     assert_eq!(
         driver
-            .begin_with_wake("ses", "new-user-cycle", &SessionWakeSignal::UserQuery, 20)
+            .begin_with_wake("ses", "new-user-cycle", &SessionWakeSignal::UserMessage, 20)
             .expect("begin user cycle"),
         Some("new-user-cycle".to_owned())
     );

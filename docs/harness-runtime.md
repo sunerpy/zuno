@@ -253,16 +253,36 @@ Unreconciled work means durably recorded work. A Work-mode `Optional` decision
 is not recorded work, so a request that creates no Plan, Todo, or Job settles
 rather than being driven again.
 
-A process restart preserves the session-level fingerprint and unchanged-progress
-count, even across callback cycles. `session_execution_state.scheduling` owns the
+A process restart preserves the execution fingerprint and unchanged-progress
+count; a callback cannot reset them. `session_execution_state.scheduling` owns the
 ready, exact human/external wait, paused and completed gates for ordinary sessions
 and Goals alike. A pause is committed to that row, not only a Goal store or an
 event projection. Callbacks may be recorded while paused but cannot reopen it.
-A status query can run without resuming work; explicit `/resume` queues a Work
-control but cannot waive a pending wait or approve a Plan. Assistant prose is
+A real new user input is bound to `session_work_cycle` in the transaction that
+promotes and consumes it, never while it is merely queued behind another turn.
+Stopping records the exact old input/turn and closes that cycle; it does not make
+`/resume` necessary for the next ordinary request. A fresh request does not inherit
+the old Plan or no-progress streak. Native Work authorization and typed Plan/Todo
+mutations establish ownership; a read or unchanged `in_progress` step does not.
+Protected waits, approvals, authentication, budgets, and uncertain effects remain
+gates. Explicit `/resume` queues a Work control but cannot waive a pending wait,
+approve a Plan, or mark unknown effects inspected. Assistant prose is
 never parsed as evidence that work completed or as a substitute for a typed wait. Hiding
 `plan_update` prevents the model from creating or mutating a new strategic Plan;
 existing Plans remain durable, projected, and recoverable.
+
+The boundary follows local Codex `9ba1d9eb5bbbd87ba2fc528d91ad239eea975ee9`:
+`core/src/session/turn_input.rs` separates User/Automatic/Recovery and starts or
+steers user input; `core/src/tasks/mod.rs` cancels active task work, while the TUI
+Goal menu handles explicit Goal resume separately. The Goal tool/spec were also
+checked at `eaa8b6d91701d6cabe464141facc677e5915fbfc`. Zuno's durable cycle ledger,
+report-transfer receipts and host-counted blocker audits are native adaptations,
+not claims that Codex exposes these database or protocol APIs.
+
+Format 15 atomically upgrades supported formats 5–14, preserving published state
+and updating the marker last. It adds `session_work_cycle`, `goal_turn_observation`,
+`goal_cycle_failure` and `goal_turn_audit`; old unbound observations remain
+historical, and migration does not infer user consent or resume a Goal.
 
 ACP mirrors this state through a session-owned projection pump subscribed to
 `TurnHost::work_state_changes()`. A wake causes an authoritative Plan read and a
@@ -1464,7 +1484,7 @@ custom drafts survive navigation. Merely highlighting a choice does not select
 it. Ctrl+S defers a question, preserving partial answers; `/questions` reopens the
 pending set. Deferral, cancellation and an empty submission never fabricate an answer.
 
-`runtime.work_state` version 3 includes the session scheduling gate and bounded
+`runtime.work_state` version 4 includes current work ownership, the session scheduling gate and bounded
 pending-question summaries, including early approvals awaiting handoff. They are
 restored after compaction/restart even when no Goal exists. These state summaries
 do not manufacture answers or repeat answer content already delivered by inbox.
@@ -1915,6 +1935,19 @@ Recovery is selected from typed errors, never rendered messages:
   `state.uncertain.reconciledAtMs` is absent for exactly as long as the inspection is
   owed, and the Goal's `created_at_ms` scopes the query, so a new objective does not
   inherit the previous objective's obligations.
+  Generic session/Goal resume never writes that marker. `/inspect-outcome` is a
+  native, non-model command over the file inspection service. Concrete file
+  implementations record `native.filesystem.intent` after authorization and before
+  effects, binding the actual implementation, canonical workspace, resolved targets,
+  schema/input digests and original part/call/turn/cycle identities. A name, reported
+  path or successful command receipt alone is insufficient. The inspector performs
+  bounded handle-anchored reads on Unix/Windows and commits the observation event and
+  exact part markers atomically. It retains the actual native session lease, including
+  across frontend disconnect; model-originated callers retain strict active-turn
+  ownership. Native inspection can observe a stopped cycle without reopening it.
+  Report-delivery aliases do not authorize tool calls. Legacy calls without a native
+  witness, shell and remote actions fail closed. Inspection preserves the original
+  uncertain outcome and never authorizes replay or automatic Goal/session resume.
 - A turn stopped by its own budget policy pauses with `turn_budget`. The allowance
   belongs to one turn, so the Goal keeps whatever token budget remains, but execution
   does not resume automatically: the next turn would spend the same allowance the same

@@ -345,15 +345,16 @@ Todo、Plan step、pending report 与 Job，并记录 omitted count；稳定 ide
 状态、revision 和 reconciliation 字段优先保留。若权威 identity 本身仍无法放入
 预算，组装会失败关闭。typed tools 仍是进一步查询和修改这些 Store 的唯一入口。
 
-数据库当前格式为 14。format 5 会在一个 `BEGIN IMMEDIATE` 事务中
+数据库当前格式为 15。format 5 会在一个 `BEGIN IMMEDIATE` 事务中
 增加 learning 表、Plan 栈字段、archive 表、`verification_receipt` 账本与
 `session_memory_policy`；format 6 增加 Plan 栈、账本与 policy；format 7 增加账本与
 policy；format 8 增加 policy；format 9 增加 `session_execution_state`、
 `completion_delivery` 与 typed inbox trigger 字段；format 10 增加记忆版本、来源验证、
 租约和检索索引；format 11 增加自动记忆来源、候选 revision 与完成水位；format 12
 增加持久问题、幂等响应回执及普通会话/Goal 共用的调度门控；format 13 增加输入处理回执、
-统一 Context 快照和绑定 revision 的 Goal 恢复选择，不运行模型或恢复暂停。
-全部路径都在最后以条件更新将 marker 改为 14，并保留已有的
+统一 Context 快照和绑定 revision 的 Goal 恢复选择；format 14 增加工作周期归属及精确
+Goal／cycle／turn 的观察与幂等结算，不运行模型或恢复暂停。
+全部路径都在最后以条件更新将 marker 改为 15，并保留已有的
 `session`、`message`、`memory_candidate` 与 `work_plan` 值。未来格式、缺少 marker 或结构损坏会在不修改
 数据库的情况下失败关闭；当前二进制支持的旧格式不要求重建数据库。
 

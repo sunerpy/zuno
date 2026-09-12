@@ -160,16 +160,35 @@ A pause is only actionable if it names what to look at. `/goal show` reports
 the call reported having applied, the typed cause, and when it was observed.
 `/goal resume` and the optional Resume goal choice do not attest an inspection:
 they preserve the inspection obligation and reject generic recovery while it is
-unresolved. Inspect the authoritative state and settle the relevant domain's
-reconciliation before resuming. `/goal pause` and `/goal cancel` retire nothing,
-because neither claims an inspection happened.
+unresolved. `/resume` likewise never writes an inspection marker or clears the
+authentication or turn-budget gates.
+
+`/inspect-outcome` lists pending part IDs. `/inspect-outcome <part-id> [part-id ...]`
+reads the actual current file state for 1–16 native `write`, `edit`, or `apply_patch`
+calls with a durable `native.filesystem.intent` witness. It works without a model,
+including on a stopped cycle, and keeps the native session lease until settlement.
+The receipt records file presence, content hashes, metadata, exact original calls and
+observation time. Paths are workspace-bound and handle-anchored; links, unsupported
+operations, missing native provenance and stale call records fail closed.
+
+Limits are 64 targets, 8 MiB per file, 32 MiB total, and a 30-second read deadline.
+The original outcome remains `uncertain`; inspection neither claims success nor
+resumes work or authorizes replay. After a successful inspection, explicitly use
+`/resume` or `/goal resume`; their other gates still apply. Legacy calls without
+a native witness, shell operations and remote actions require their own
+target-aware inspection integration. A successful command or a claim of manual
+checking is not such evidence. The existing `job_reconcile`
+tool handles background Job records, not these pending tool-call obligations.
+`/goal pause` and `/goal cancel` retire nothing, because neither claims an inspection
+happened.
 
 ### Success criteria and evidence
 
-A goal that changes the workspace cannot be completed on assertion alone. "The tests pass"
-in prose is a claim about the workspace, and the whole reason a goal exists is that claims
-made mid-run are the ones most likely to be wrong. So a change goal carries success
-criteria, and each one closes only against a recorded exit status.
+Declared success criteria remain evidence-gated. Prose such as "the tests pass" does
+not satisfy a declared check. A user-created Goal may intentionally have no checklist:
+when both its declaration and criterion ledger are empty, changing files does not
+retroactively invent a checklist or make completion impossible. Pending work, ownership,
+uncertain outcomes and the existing capability audit still apply.
 
 `goal_propose` requires `success_criteria`, a list of concrete checks: a proposal that names
 none is refused, and criteria cannot be added afterwards. Each becomes a row with a short id
@@ -228,10 +247,10 @@ predates the last write each produce a different sentence, and the stale case pr
 timestamps so the mismatch is visible. Completing with criteria still open reports which
 ids are unproven.
 
-A goal that only answers a question is not gated on a checklist: it has nothing to verify.
-The first tool call that writes a file turns a question goal into a change goal, so the gate
-applies to the run that turned out to modify the workspace even though it did not start out
-planning to. One thing is audited on every completion the run itself reports, checklist or
+A file write changes the Goal's kind, not its original acceptance contract. A nonempty
+declaration with missing or inconsistent ledger rows fails closed; it is not a
+criteria-less Goal. Existing checklist evidence and freshness checks remain intact.
+One thing is audited on every completion the run itself reports, checklist or
 not: a capability claim it recorded and never verified (see below). Your own
 `/goal complete` on a goal with no checklist is not refused over such a claim — the claim
 is the model's record, and there is no command that clears one — but the run cannot carry
@@ -241,6 +260,22 @@ CLI, so a goal whose checklist is still open is finished by the run or cancelled
 
 The rendered goal document lists the criteria with their state, so a human reads the same
 gate the model is held to.
+
+The model cannot complete a paused Goal from an independent request or relabel the
+pause as blocked to bypass it. The native `/goal complete` command can close a
+legitimate legacy Goal after its remaining audits pass, preserving its identity,
+history, budget and usage; cancelling and recreating it is unnecessary just because
+the original checklist was empty.
+
+### Blocking observations
+
+Report a concrete blocking condition when discovered. `goal_update` returns `staged`,
+the actual Goal status and the count of matching **completed engine turns**; staging
+does not mean the Goal is already blocked. The host applies the three-turn threshold.
+The model does not first wait three turns and then ask the host to count three more.
+Observation, count, status, history and settlement receipt commit atomically. Replaying
+the same Goal/cycle/turn receipt does not count again or consume a newer observation.
+An explicit resume starts a fresh streak; unbound legacy observations do not count.
 
 ### Capability claims
 
@@ -496,12 +531,14 @@ charge it against, and a default enforced from an in-memory turn total would res
 and never bind.
 
 Nor is a session whose goal has finished. A budget bounds work towards an objective, so a goal
-that is complete, paused, blocked, cancelled or out of provider usage does not stop a turn. Its
-counter keeps rising through the conversation that follows, the default is large enough that a
-long session would cross it, and the stop would end turns no goal governs and pause a goal the
-model had completed. The response is still charged to the goal, because the tokens were spent
-against it. `budget_limited` is the exception: that status is a spent ceiling, and a turn must
-not resume through it.
+that does not own the current native work scope does not stop a turn or receive its usage.
+Independent input is still counted in session totals; it does not charge or pause a goal the
+model had completed. Ownership is frozen for each provider request and checked at turn-end
+accounting, so a Goal replacement or mid-request resume cannot retroactively claim that spend.
+A final Goal-owned response is still charged to the goal that owned the request.
+`budget_limited` is the exception for continuing that Goal: its own work cannot cross its
+spent ceiling. An independent request neither resumes that Goal nor changes its budget or status.
+Host turn and session limits still apply to the independent request.
 
 ### Human requests and autonomy
 
@@ -542,7 +579,10 @@ result model-visible, so the record exists before anything about the Goal is dec
 ordering is what makes recovery survive a crash: a process that died between the tool write
 and the pause row leaves the pause missing and the obligation intact, and the next
 continuation reads the obligation and pauses again. `state.uncertain.reconciledAtMs` stays
-absent until an explicit recovery action retires the call.
+absent on pending calls; generic resume never writes it. `/inspect-outcome` retains
+fresh authoritative observations bound to the exact original native file calls
+before marking them inspected. Inspection does not establish that the original
+operation succeeded or authorize its automatic replay.
 
 Not every unanswered tool row earns that obligation, and the difference is durable rather
 than inferred. A checkpointed call carries `state.dispatchTracked` from the moment it is
