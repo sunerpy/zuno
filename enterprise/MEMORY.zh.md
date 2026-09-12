@@ -86,7 +86,7 @@ API 应用可以读取和提交候选，但不能自行授权或绕过审核。�
 须携带 `candidateId` 和用户实际审阅版本的 `expectedState`。事务拒绝审核后被修改的
 候选；客户端应重新展示变更，不能自动读取新摘要后重试审批。
 
-内部 Worker 协议 7 增加 `/internal/worker/v1/memory`，同时验证工作负载身份和当前
+内部 Worker 协议 8 增加 `/internal/worker/v1/memory`，同时验证工作负载身份和当前
 Job grant，仅开放作用域内读取和前台提案。`memory_read`、`memory_update` 复用个人
 工具参数 schema。无法确认修改结果时保留不确定状态，不机械重放。
 

@@ -2452,6 +2452,12 @@ async fn validate_expected_git_head(
 
 #[async_trait]
 impl Tool for ShellTool {
+    fn presentation(&self) -> zuno_types::activity::InvocationPresentation {
+        zuno_types::activity::InvocationPresentation::builtin(
+            zuno_types::activity::InvocationAction::Process,
+        )
+    }
+
     fn id(&self) -> &str {
         TOOL_ID
     }

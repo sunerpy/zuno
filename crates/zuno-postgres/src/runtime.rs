@@ -300,6 +300,7 @@ async fn expire_inflight(
              WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3",
         ).bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(&session)
             .execute(&mut **tx).await.map_err(database_error)?;
+        crate::activity::execution_changed(tx, owner, &session, &id).await?;
     }
     Ok(())
 }

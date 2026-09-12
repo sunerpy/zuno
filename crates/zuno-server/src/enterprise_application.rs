@@ -16,6 +16,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use zuno_application::{
     AgentApplication, ApplicationError, CreateSession, PageSize, SessionCursor, SessionPage,
     SessionPageRequest, SessionSummary,
+    activity::{ActivityPersistence, FrameQuery, HistoryQuery},
     authorization::{
         AnswerApproval, ApprovalAnswer, ApprovalBinding, ApprovalRecord, ApprovalState,
         OrganizationStore,
@@ -119,6 +120,8 @@ impl EnterpriseApplication {
             .route("/sessions/{session}", get(session))
             .route("/sessions/{session}/input-version", get(input_version))
             .route("/sessions/{session}/turns", post(submit_turn))
+            .route("/sessions/{session}/history", get(history))
+            .route("/sessions/{session}/frames", get(frames))
             .route("/jobs/{job}", get(job))
             .route("/jobs/{job}/cancel", post(cancel_job))
             .route("/approvals/{approval}", get(approval))
@@ -206,6 +209,69 @@ async fn cancel_job(
             .backend
             .runtime(service.tenant.clone())
             .cancel(&principal, &job, request)
+            .await?,
+    ))
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HistoryParameters {
+    #[serde(default)]
+    limit: PageSize,
+    before: Option<zuno_types::activity::Counter>,
+    through: Option<zuno_types::activity::Counter>,
+}
+
+async fn history(
+    State(service): State<EnterpriseApplication>,
+    Extension(identity): Extension<VerifiedIdentity>,
+    Path(session): Path<SessionId>,
+    Query(request): Query<HistoryParameters>,
+) -> Result<Json<zuno_types::activity::HistoryPage>, Failure> {
+    let principal = service.principal(&identity).await?;
+    Ok(Json(
+        service
+            .backend
+            .activity(principal)
+            .history(
+                &session,
+                HistoryQuery {
+                    limit: request.limit,
+                    before: request.before,
+                    through: request.through,
+                },
+            )
+            .await?,
+    ))
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FrameParameters {
+    #[serde(default)]
+    limit: PageSize,
+    #[serde(default)]
+    after: zuno_types::activity::Counter,
+}
+
+async fn frames(
+    State(service): State<EnterpriseApplication>,
+    Extension(identity): Extension<VerifiedIdentity>,
+    Path(session): Path<SessionId>,
+    Query(request): Query<FrameParameters>,
+) -> Result<Json<zuno_types::activity::FramePage>, Failure> {
+    let principal = service.principal(&identity).await?;
+    Ok(Json(
+        service
+            .backend
+            .activity(principal)
+            .frames(
+                &session,
+                FrameQuery {
+                    limit: request.limit,
+                    after: request.after,
+                },
+            )
             .await?,
     ))
 }

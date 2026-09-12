@@ -263,6 +263,9 @@ impl ChildToolDispatcher {
             return Err(TurnStateError::InvalidData);
         }
         let definition = ToolDefinition {
+            presentation: zuno_types::activity::InvocationPresentation::builtin(
+                zuno_types::activity::InvocationAction::Agent,
+            ),
             id: "task".to_owned(),
             display_name: "Delegate task".to_owned(),
             description: zuno_tools::TASK_DESCRIPTION.to_owned(),
@@ -314,7 +317,7 @@ impl ToolDispatcher for ChildToolDispatcher {
             || !request
                 .available_tools
                 .iter()
-                .any(|tool| tool == &self.definition)
+                .any(|tool| crate::definition_matches(tool, &self.definition))
             || request.interrupt.is_set()
         {
             return blocked(

@@ -1,0 +1,22 @@
+{
+  "name": "@zuno/enterprise-sdk",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "exports": {
+    ".": { "types": "./dist/src/index.d.ts", "import": "./dist/src/index.js" }
+  },
+  "scripts": {
+    "generate": "node scripts/generate.mjs",
+    "build": "tsc",
+    "test": "npm run build && node --test tests/*.mjs",
+    "check:generated": "node scripts/generate.mjs --check"
+  },
+  "devDependencies": {
+    "ajv": "8.20.0",
+    "esbuild": "0.28.2",
+    "json-schema-to-typescript": "16.0.0",
+    "typescript": "7.0.2"
+  }
+}

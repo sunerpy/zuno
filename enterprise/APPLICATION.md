@@ -24,6 +24,8 @@ bootstrap remains an explicit schema-owner operation.
 | `POST /sessions` | Idempotent owned session creation |
 | `GET /sessions` | Bounded owned-session pagination |
 | `GET /sessions/{session}` | Owned session summary |
+| `GET /sessions/{session}/history` | Bounded public history at a fixed snapshot |
+| `GET /sessions/{session}/frames` | Contiguous committed activity after a cursor |
 | `GET /sessions/{session}/input-version` | Exact CAS version |
 | `POST /sessions/{session}/turns` | Atomic input and Job admission |
 | `GET /jobs/{job}` | Public Job identity, phase and input version |
@@ -53,9 +55,9 @@ is neither tool completion nor a Worker credential.
 
 Public Job DTOs expose typed waiting targets so a client can discover its approval
 ID. They contain no checkpoints, leases, grants, configuration, private
-replay blocks or arbitrary stored results. Rich history/live activity uses the
-separate activity protocol; no placeholder history or stream route
-is mounted.
+replay blocks or arbitrary stored results. Public history and frame reads use the
+separate [activity protocol](ACTIVITY.md). Live stream endpoints are not mounted
+before their producer and authorization adapter exist.
 
 Cancellation accepts `requestId`, `expectedTurnId` and a bounded `reason`.
 Receipts distinguish logical stopped Jobs from pending external operations.

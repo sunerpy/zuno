@@ -60,6 +60,7 @@ impl GatewayToolDispatcher {
 
     pub fn definition() -> ToolDefinition {
         ToolDefinition {
+            presentation: zuno_types::activity::InvocationPresentation::builtin(zuno_types::activity::InvocationAction::Process),
             id:ENVIRONMENT_COMMAND.to_owned(),display_name:"Environment command".to_owned(),
             description:"Run an argv command in the assigned isolated workspace. Requires current human approval. Returns only an authoritative command result; an operation may wait for completion. Shell expansion requires an explicit shell executable.".to_owned(),
             parameters:zuno_tool::schema::params_schema::<CommandArguments>(),
@@ -108,7 +109,7 @@ impl GatewayToolDispatcher {
             || !request
                 .available_tools
                 .iter()
-                .any(|definition| definition == &self.definition)
+                .any(|definition| crate::definition_matches(definition, &self.definition))
             || request
                 .orchestration_snapshot
                 .as_ref()

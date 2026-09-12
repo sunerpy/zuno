@@ -53,6 +53,12 @@ impl ReportWriteTool {
 
 #[async_trait]
 impl TypedTool for ReportWriteTool {
+    fn presentation(&self) -> zuno_types::activity::InvocationPresentation {
+        zuno_types::activity::InvocationPresentation::builtin(
+            zuno_types::activity::InvocationAction::FileEdit,
+        )
+    }
+
     type Params = ReportWriteParams;
 
     fn id(&self) -> &str {

@@ -4,6 +4,7 @@
 //! persistence provider. Client DTOs contain neither owner overrides nor host
 //! paths. Drivers and clients do not acquire database connections through this API.
 
+pub mod activity;
 pub mod authorization;
 pub mod child;
 pub mod control;

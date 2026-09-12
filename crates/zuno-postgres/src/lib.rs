@@ -1,5 +1,6 @@
 //! PostgreSQL data-owner adapter. Worker credentials never include this pool.
 
+mod activity;
 mod authorization;
 #[cfg(test)]
 mod authorization_tests;
@@ -20,6 +21,7 @@ mod turn;
 #[cfg(test)]
 mod turn_tests;
 
+pub use activity::PostgresActivityPersistence;
 pub use authorization::{PostgresOrganizationStore, bootstrap_organization};
 pub use browser::{BrowserStoreLimits, PostgresBrowserStore};
 pub use client::ClientJobState;

@@ -384,6 +384,41 @@ async fn public_application_keeps_users_isolated_and_requires_current_policy_for
             .is_success()
     );
     let job_path = format!("jobs/{}", job["id"].as_str().unwrap());
+    let history_path = format!("sessions/{}/history", session["id"].as_str().unwrap());
+    let queued_history = http
+        .get(api(&history_path))
+        .bearer_auth("alice")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(queued_history.status(), StatusCode::OK);
+    let queued_history: Value = queued_history.json().await.unwrap();
+    assert!(
+        queued_history["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["record"]["item"]["kind"] == "message"
+                && row["record"]["item"]["state"] == "pending")
+    );
+    assert_eq!(
+        http.get(api(&history_path))
+            .bearer_auth("bob")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        http.get(api(&format!("{history_path}?through=00")))
+            .bearer_auth("alice")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
     assert_eq!(
         http.get(api(&job_path))
             .bearer_auth("bob")
@@ -582,6 +617,7 @@ async fn public_application_keeps_users_isolated_and_requires_current_policy_for
         job_path,
         format!("{session_path}/input-version"),
         format!("approvals/{}", approval.id),
+        history_path,
     ] {
         assert_eq!(
             http.get(api(&path))

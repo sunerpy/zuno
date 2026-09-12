@@ -122,6 +122,9 @@ pub struct ToolDefinition {
     pub parameters: Value,
     /// Stable client presentation intent, independent from the wire name.
     pub ui_intent: ToolUiIntent,
+    /// Typed display semantics supplied by assembly, never inferred from names.
+    #[serde(default)]
+    pub presentation: zuno_types::activity::InvocationPresentation,
     /// How declaration drift is represented when this tool appears in history.
     pub history_policy: HistoryPolicy,
 }
@@ -307,6 +310,10 @@ pub trait Tool: Send + Sync {
         ToolUiIntent::Generic
     }
 
+    fn presentation(&self) -> zuno_types::activity::InvocationPresentation {
+        zuno_types::activity::InvocationPresentation::default()
+    }
+
     /// The effect of this invocation after argument validation.
     ///
     /// The raw value is supplied so a mixed tool such as `bg` can classify
@@ -381,6 +388,7 @@ pub trait Tool: Send + Sync {
             description: self.description().to_owned(),
             parameters: schema::augment(self.raw_parameters_schema()),
             ui_intent: self.ui_intent(),
+            presentation: self.presentation(),
             history_policy: self.history_policy(),
         }
     }
@@ -492,6 +500,10 @@ pub trait TypedTool: Send + Sync + 'static {
         ToolUiIntent::Generic
     }
 
+    fn presentation(&self) -> zuno_types::activity::InvocationPresentation {
+        zuno_types::activity::InvocationPresentation::default()
+    }
+
     /// The effect of this invocation after argument validation.
     fn effect(&self, _args: &Value) -> ToolEffect {
         ToolEffect::SideEffecting
@@ -546,6 +558,10 @@ impl<T: TypedTool> Tool for Typed<T> {
 
     fn ui_intent(&self) -> ToolUiIntent {
         self.0.ui_intent()
+    }
+
+    fn presentation(&self) -> zuno_types::activity::InvocationPresentation {
+        self.0.presentation()
     }
 
     fn effect(&self, args: &Value) -> ToolEffect {
@@ -695,6 +711,7 @@ mod tests {
     #[test]
     fn tool_definition_schema_identity_captures_the_exact_provider_surface() {
         let definition = ToolDefinition {
+            presentation: Default::default(),
             id: "subagent_research".to_owned(),
             display_name: "subagent_research".to_owned(),
             description: "Delegate a bounded research task.".to_owned(),

@@ -228,6 +228,12 @@ impl ReadTool {
 
 #[async_trait]
 impl TypedTool for ReadTool {
+    fn presentation(&self) -> zuno_types::activity::InvocationPresentation {
+        zuno_types::activity::InvocationPresentation::builtin(
+            zuno_types::activity::InvocationAction::FileRead,
+        )
+    }
+
     type Params = ReadParams;
 
     fn id(&self) -> &str {

@@ -118,7 +118,7 @@ SIGTERM stops admission and drains bounded work. TLS connections and receipt
 delivery have bounded shutdown. Gateway shutdown does not declare its external
 commands complete; their ledger and containers remain independently recoverable.
 
-Worker protocol 7 carries checkpoint schema 4. The driver reads schema 3 only
+Worker protocol 8 carries checkpoint schema 4. The driver reads schema 3 only
 where it proves an unsubmitted wait; it never reinterprets an old record as
 submitted execution. Drain incompatible Workers before changing the control
 protocol and retain their definitions and durable data. Full rolling-upgrade and

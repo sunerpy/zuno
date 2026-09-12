@@ -1011,6 +1011,26 @@ impl McpToolProxy {
 
 #[async_trait]
 impl Tool for McpToolProxy {
+    fn presentation(&self) -> zuno_types::activity::InvocationPresentation {
+        use zuno_types::activity::{
+            ActivityName, InvocationAction, InvocationPresentation, InvocationSource, McpExposure,
+        };
+        InvocationPresentation {
+            action: InvocationAction::Tool,
+            source: match (
+                ActivityName::new(&self.source_name),
+                ActivityName::new(&self.tool),
+            ) {
+                (Ok(server), Ok(tool)) => InvocationSource::Mcp {
+                    server,
+                    tool,
+                    exposure: McpExposure::Exposed,
+                },
+                _ => InvocationSource::Unknown,
+            },
+        }
+    }
+
     fn id(&self) -> &str {
         &self.id
     }

@@ -259,6 +259,12 @@ impl Default for WebSearchTool {
 
 #[async_trait]
 impl TypedTool for WebSearchTool {
+    fn presentation(&self) -> zuno_types::activity::InvocationPresentation {
+        zuno_types::activity::InvocationPresentation::builtin(
+            zuno_types::activity::InvocationAction::WebSearch,
+        )
+    }
+
     type Params = WebSearchParams;
 
     fn id(&self) -> &str {

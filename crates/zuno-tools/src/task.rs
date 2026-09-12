@@ -1291,6 +1291,12 @@ impl TaskTool {
 
 #[async_trait]
 impl TypedTool for TaskTool {
+    fn presentation(&self) -> zuno_types::activity::InvocationPresentation {
+        zuno_types::activity::InvocationPresentation::builtin(
+            zuno_types::activity::InvocationAction::Agent,
+        )
+    }
+
     type Params = TaskParams;
 
     fn id(&self) -> &str {
@@ -1322,6 +1328,12 @@ pub struct SelectableTaskTool(TaskTool);
 
 #[async_trait]
 impl TypedTool for SelectableTaskTool {
+    fn presentation(&self) -> zuno_types::activity::InvocationPresentation {
+        zuno_types::activity::InvocationPresentation::builtin(
+            zuno_types::activity::InvocationAction::Agent,
+        )
+    }
+
     type Params = SelectableTaskParams;
 
     fn id(&self) -> &str {

@@ -1,0 +1,39 @@
+name: Enterprise client contracts
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  client:
+    name: Rust schema and TypeScript SDK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.98.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: enterprise-preview-client
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: enterprise/sdk/package-lock.json
+      - name: Install pinned build dependencies
+        working-directory: enterprise/sdk
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Verify generated contracts and client recovery
+        working-directory: enterprise/sdk
+        run: |
+          npm run check:generated
+          npm test

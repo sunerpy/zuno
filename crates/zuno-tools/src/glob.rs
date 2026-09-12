@@ -68,6 +68,12 @@ impl GlobTool {
 
 #[async_trait]
 impl TypedTool for GlobTool {
+    fn presentation(&self) -> zuno_types::activity::InvocationPresentation {
+        zuno_types::activity::InvocationPresentation::builtin(
+            zuno_types::activity::InvocationAction::FileList,
+        )
+    }
+
     type Params = GlobParams;
 
     fn id(&self) -> &str {

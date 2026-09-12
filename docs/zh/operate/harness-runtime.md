@@ -862,3 +862,5 @@ WebSearch 的带密钥 wire URL 不进入诊断。错误只保留 provider、sch
 - [Goal、Plan 与 Todo](/zh/guide/durable-state) —— 持久状态如何控制续跑
 
 企业 Job 取消通过经过认证的 `RuntimeControl` 和持久网关队列执行。Worker 执行权撤销与逻辑子结果一起提交，外部进程结束另行确认；详见预览源码归档中的 `enterprise/CONTROL.zh.md`。
+
+客户端活动使用独立的类型化公共协议。内核将适配器声明的动作／来源记录到工具调用；PostgreSQL 在源状态事务中提交安全投影。公共历史及 frame 分页使用逻辑游标，提供商私有续接数据、Worker 租约和配置快照不进入客户端 DTO。详见预览归档中的 `enterprise/ACTIVITY.zh.md`。

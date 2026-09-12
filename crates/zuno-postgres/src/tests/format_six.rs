@@ -25,7 +25,7 @@ pub(super) async fn upgrade(fixture: &Fixture, admin: &PgPool) {
         query_scalar(
             "SELECT jsonb_build_object(
               'session',(SELECT to_jsonb(s)-'delegation_depth_limit' FROM zuno_enterprise_preview.session s WHERE id='legacy-session'),
-              'message',(SELECT to_jsonb(m) FROM zuno_enterprise_preview.message m WHERE id='legacy-assistant'),
+              'message',(SELECT (to_jsonb(m)-'execution_job_id') FROM zuno_enterprise_preview.message m WHERE id='legacy-assistant'),
               'part',(SELECT to_jsonb(p) FROM zuno_enterprise_preview.part p WHERE id='legacy-tool'),
               'wait',(SELECT to_jsonb(w) FROM zuno_enterprise_preview.runtime_wait w WHERE id='legacy-wait'),
               'job',(SELECT to_jsonb(j) FROM zuno_enterprise_preview.runtime_job j WHERE job_id='legacy-job'),

@@ -87,7 +87,7 @@ Entra 使用对应的 `config`。Introspection 使用 `config`、`clientId` 和
 SIGTERM 停止新接纳并排空有界工作，TLS 连接与回执投递的退出也有期限。停止网关不表示
 外部命令已经完成，ledger 与容器仍按独立生命周期恢复。
 
-Worker 协议 7 承载检查点 schema 4。旧 schema 3 只按未提交等待读取，不能被解释成已经
+Worker 协议 8 承载检查点 schema 4。旧 schema 3 只按未提交等待读取，不能被解释成已经
 交给执行器。切换控制协议前排空不兼容 Worker，并保留定义和持久数据；完整滚动升级、
 备份恢复验收仍属 P6。
 

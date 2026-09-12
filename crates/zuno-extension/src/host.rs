@@ -655,6 +655,21 @@ impl PluginTool {
 
 #[async_trait]
 impl Tool for PluginTool {
+    fn presentation(&self) -> zuno_types::activity::InvocationPresentation {
+        use zuno_types::activity::{
+            ActivityName, InvocationAction, InvocationPresentation, InvocationSource,
+        };
+        InvocationPresentation {
+            action: match self.definition.ui_intent {
+                PluginToolUiIntent::Subagent => InvocationAction::Agent,
+                PluginToolUiIntent::Generic => InvocationAction::Tool,
+            },
+            source: ActivityName::new(&self.package)
+                .map(|extension| InvocationSource::Extension { extension })
+                .unwrap_or(InvocationSource::Unknown),
+        }
+    }
+
     fn id(&self) -> &str {
         &self.name
     }
