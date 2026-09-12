@@ -911,13 +911,42 @@ fn deduplicate(patterns: Vec<String>) -> Vec<String> {
 fn validate_arguments(schema: &Value, args: &Value) -> Result<(), String> {
     let validator = jsonschema::validator_for(schema)
         .map_err(|error| format!("tool schema is invalid: {error}"))?;
-    let errors = validator
-        .iter_errors(args)
-        .map(|error| error.to_string())
-        .collect::<Vec<_>>();
+    let mut errors = Vec::new();
+    let mut hints = Vec::new();
+    for error in validator.iter_errors(args) {
+        // Use the live schema's own field documentation, never tool-name
+        // special cases, argument contents, aliases, or guessed missing values.
+        // Nested requirements must not be attributed to a same-named root field.
+        if hints.len() < 4
+            && error.instance_path().to_string().is_empty()
+            && let jsonschema::error::ValidationErrorKind::Required {
+                property: Value::String(name),
+            } = error.kind()
+            // Retain the original validator's exact key, but do not duplicate
+            // an arbitrarily large schema property name in the added guidance.
+            && name.len() <= 128
+            && let Some(description) = schema
+                .get("properties")
+                .and_then(|properties| properties.get(name))
+                .and_then(|property| property.get("description"))
+                .and_then(Value::as_str)
+            && !description.trim().is_empty()
+        {
+            let description: String = description.trim().chars().take(256).collect();
+            hints.push(format!("Required top-level field `{name}`: {description}"));
+        }
+        errors.push(error.to_string());
+    }
     if errors.is_empty() {
         Ok(())
     } else {
+        if !hints.is_empty() {
+            errors.extend(hints);
+            errors.push(
+                "Use the current tool schema to correct the arguments before submitting a new call."
+                    .to_owned(),
+            );
+        }
         Err(errors.join("; "))
     }
 }
@@ -1751,6 +1780,70 @@ mod tests {
                 validate_arguments(&schema, &accepted),
                 Ok(()),
                 "every operation's own payload validates, including the patch item shape"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_missing_fields_do_not_receive_unrelated_root_guidance() {
+        let schema = json!({
+            "type":"object",
+            "properties":{
+                "objective":{"type":"string","description":"ROOT_GUIDANCE_MUST_NOT_APPEAR"},
+                "scope":{
+                    "type":"object",
+                    "properties":{"objective":{"type":"string"}},
+                    "required":["objective"]
+                }
+            },
+            "required":["scope"]
+        });
+        let error =
+            validate_arguments(&schema, &json!({"scope":{}})).expect_err("nested requirement");
+        assert!(error.contains("objective"));
+        assert!(!error.contains("ROOT_GUIDANCE_MUST_NOT_APPEAR"));
+        assert!(!error.contains("Required top-level field"));
+    }
+
+    #[test]
+    fn missing_field_guidance_is_bounded_and_utf8_safe() {
+        let names = ["one", "two", "three", "four", "five", "six"];
+        let properties: Map<String, Value> = names
+            .iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    json!({"type":"string","description":"界".repeat(10_000)}),
+                )
+            })
+            .collect();
+        let schema = json!({"type":"object","properties":properties,"required":names});
+        let error = validate_arguments(&schema, &json!({})).expect_err("required fields");
+        assert_eq!(error.matches("Required top-level field").count(), 4);
+        assert_eq!(error.matches('界').count(), 4 * 256);
+        assert!(error.len() < 6000);
+        assert!(
+            error.contains("six"),
+            "original validation failures remain visible"
+        );
+    }
+
+    #[test]
+    fn oversized_field_names_do_not_expand_additional_guidance() {
+        for name in ["a".repeat(129), "界".repeat(43)] {
+            let properties = Map::from_iter([(
+                name.clone(),
+                json!({"type":"string","description":"DO_NOT_REPEAT_OVERSIZED_FIELD"}),
+            )]);
+            let schema = json!({"type":"object","properties":properties,"required":[name.clone()]});
+            let error = validate_arguments(&schema, &json!({})).expect_err("still required");
+            assert!(error.contains("is a required property"));
+            assert!(!error.contains("Required top-level field"));
+            assert!(!error.contains("DO_NOT_REPEAT_OVERSIZED_FIELD"));
+            assert_eq!(
+                validate_arguments(&schema, &json!({name: "present"})),
+                Ok(()),
+                "the hint bound must not reject a valid schema property"
             );
         }
     }

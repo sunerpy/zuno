@@ -745,6 +745,22 @@ Codex configuration, role, MCP, Skill, wire, or runtime semantics.
 
 ### Typed delegation contract
 
+The contract is flat: `agent`, `objective`, `deliverable`, `instructions`, and
+`success_evidence` are required top-level strings, including on `task_id`
+continuations. The cross-cutting `intent` is an optional UI label removed before
+typed parsing; it cannot replace `objective`. Neither the schema nor the host
+fills missing fields or unwraps a `contract` object.
+
+The tool description carries a complete JSON example, tested through the erased
+tool invocation. Native direct-task callers (`orchestrator` and `deep`) receive a
+shared compact reminder without changing permissions or configured prompt
+overrides. Schema validation retains its original errors and, for missing root
+properties, adds at most four current field descriptions capped at 256 Unicode
+characters each. Nested errors do not borrow unrelated root descriptions;
+names over 128 bytes receive no additional hint, without changing validation;
+argument values are not copied into these hints. A corrected call still passes
+normal validation and authorization before dispatch.
+
 The model-facing `task` tool no longer accepts loose `description`, `prompt`, or
 `load_skills` arguments. Its required work agreement is:
 
@@ -772,9 +788,9 @@ The model-facing `task` tool no longer accepts loose `description`, `prompt`, or
 `scope`, `constraints`, and `dependencies` are optional. `agent` selects one
 member of the effective delegate roster. `task_id` resumes an existing child
 session owned by the same parent. Unknown fields and removed loose arguments,
-including `description`, `prompt`, `subagent_type`, `category`, `model`,
-`effort`, and `load_skills`, fail validation; there is no compatibility
-translation.
+including `description`, `prompt`, `subagent_type`, `category`, and `load_skills`,
+fail validation; there is no compatibility translation. `model` and `effort` are
+advertised only when the session's durable model-selection policy enables them.
 
 ## Prompt provenance
 
@@ -1964,6 +1980,31 @@ Background reports may be recorded while paused, but apply only on a legitimatel
 eligible request. The rendered Goal context names its actual status and pause
 reason, rather than describing every existing Goal as active.
 
+Report persistence and provider continuation are separate boundaries. A completed
+observer can have a callback-owned completion receipt and a `consumed` history
+input without having reached a provider request. The native idle report path
+rechecks cycle and wake authority after committing all reports, in the same writer
+transaction that satisfies an exact external wait. Live application uses the same
+scope rules. Only the current work cycle's bound Goal must be active: an explicit
+ordinary scope with `goal_id=None` is not blocked or charged by a retained paused,
+completed, or budget-limited Goal. No Goal is created or resumed for it.
+
+The absence of a persisted scope is not proof of Goal independence. Unknown legacy
+ownership keeps its conservative inactive-Goal fence. Stopped cycles, human
+approval, budgets, authentication and uncertain-side-effect gates remain intact;
+an old completion cannot start a newer cycle without an explicit native transfer.
+In a mixed report batch, planning text/source and completion identity come from the
+same eligible report. Rejected reports remain historical facts, not planning seeds.
+Ineligible reports use `report_deferred_by_execution_state` and state that the
+current work cycle does not authorize automatic continuation, rather than telling
+every ordinary session to resume a Goal.
+
+This adapts Codex `9ba1d9eb5b`'s separate inter-agent notification and automatic
+turn-admission boundaries (`core/src/agent/control.rs`,
+`core/src/session/turn_input.rs`) and Goal-owned continuation
+(`ext/goal/src/runtime.rs`). Zuno retains its authorized `nextStep` wake behavior;
+it does not copy Codex's notification trigger policy or Plan-mode semantics.
+
 Goal completion reads Plan step statuses through the same shared type as the Plan
 writer. `completed` and `superseded` are terminal; missing, unknown, or legacy
 `cancelled` values fail closed as durable Plan corruption. A model update that settles
@@ -2527,6 +2568,20 @@ than of running the CLI. See
 [One invocation, one process](cli/index.md#one-invocation-one-process).
 
 ## Background command execution
+
+Choose foreground when waiting is the only useful next action, including one
+serial command, child result, CI run, release or deployment dependency. Duration
+and task count alone are not reasons to detach. The purpose
+`backgroundPurpose: "remoteObserver"` works in either mode; it does not enable
+`background: true`. Detach only for independent parallel work or an explicit user
+request. This is model guidance, not a new task-count heuristic or tool gate.
+
+The design reference is Codex `9ba1d9eb5b`'s unified execution handle and
+`write_stdin` continuation (`core/src/tools/handlers/unified_exec.rs`,
+`core/src/unified_exec/process_manager.rs`): yielding an observation window does
+not imply completion or require creating a separate observer agent. Zuno keeps
+its existing foreground handle, event-driven wait and cancellation contracts;
+it does not copy Codex's timing constants or tool wire shape.
 
 `shell` registers a command with the process-owned
 `BackgroundExecutionService` before spawning it. Explicit background mode and a

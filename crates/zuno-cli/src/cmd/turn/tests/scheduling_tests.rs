@@ -1,6 +1,9 @@
 //! Real TurnHost/default-driver regressions with deterministic provider streams.
 //! Every database and workspace belongs to the fixture; no network provider runs.
 
+#[path = "background_report_tests.rs"]
+mod background_report_tests;
+
 use super::*;
 use std::collections::VecDeque;
 use std::sync::Mutex;

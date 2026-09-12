@@ -36,7 +36,11 @@ macro_rules! specialist_prompt {
 }
 
 /// Default multi-agent coordinator.
-pub const PROMPT_ORCHESTRATOR: &str = working_prompt!(include_str!("prompt/orchestrator.txt"));
+pub const PROMPT_ORCHESTRATOR: &str = working_prompt!(concat!(
+    include_str!("prompt/orchestrator.txt"),
+    "\n\n",
+    include_str!("prompt/task-contract.txt")
+));
 /// Direct end-to-end implementation agent.
 pub const PROMPT_BUILD: &str = working_prompt!(include_str!("prompt/build.txt"));
 /// Read-only planning agent.
@@ -44,7 +48,11 @@ pub const PROMPT_PLAN: &str = working_prompt!(include_str!("prompt/plan.txt"));
 /// Read-only high-assurance review agent.
 pub const PROMPT_REVIEW: &str = working_prompt!(include_str!("prompt/review.txt"));
 /// Thorough cross-cutting implementation agent.
-pub const PROMPT_DEEP: &str = working_prompt!(include_str!("prompt/deep.txt"));
+pub const PROMPT_DEEP: &str = working_prompt!(concat!(
+    include_str!("prompt/deep.txt"),
+    "\n\n",
+    include_str!("prompt/task-contract.txt")
+));
 /// Focused local implementation specialist.
 pub const PROMPT_FIXER: &str = specialist_prompt!("prompt/fixer.txt");
 /// Bounded miscellaneous implementation specialist.
@@ -1052,6 +1060,41 @@ mod tests {
     }
 
     const VERIFICATION_SECTION: &str = "\n\n## Verification\n";
+
+    #[test]
+    fn task_callers_receive_the_flat_contract_and_intent_distinction() {
+        for prompt in [PROMPT_ORCHESTRATOR, PROMPT_DEEP] {
+            for field in [
+                "`agent`",
+                "`objective`",
+                "`deliverable`",
+                "`instructions`",
+                "`success_evidence`",
+            ] {
+                assert!(prompt.contains(field), "missing {field}");
+            }
+            assert!(prompt.contains("top level"));
+            assert!(prompt.contains("`intent` never substitutes"));
+        }
+        assert!(
+            !PROMPT_BUILD.contains("`success_evidence`"),
+            "do not teach delegation to direct build"
+        );
+        assert!(
+            !PROMPT_REVIEW.contains("`success_evidence`"),
+            "review uses Council instead of task"
+        );
+    }
+
+    #[test]
+    fn serial_wait_guidance_does_not_detach_to_end_the_turn() {
+        let rubric = verification_rubric(PROMPT_ORCHESTRATOR);
+        assert!(rubric.contains("waiting is the only useful next action"));
+        assert!(rubric.contains("do not detach merely to end the turn"));
+        assert!(rubric.contains("same handle"));
+        assert!(rubric.contains("steering/interruption"));
+        assert!(rubric.contains("independent parallel work or an explicit user request"));
+    }
 
     fn verification_rubric(prompt: &str) -> &str {
         prompt

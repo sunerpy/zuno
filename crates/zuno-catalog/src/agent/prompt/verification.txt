@@ -8,6 +8,6 @@ Record exact commands, working directory, tested source/input identity, expected
 
 Use proportional checks for documentation, trivial changes, and command/script deliverables; do not manufacture tests for every command. Source-string assertions alone do not establish runtime behavior; prompt-output contract tests establish only the rendered prompt contract.
 
-Keep serial CI waits in the same foreground workflow. Background work is for independent parallel work or an explicit user request. A polling timeout is not remote failure; inspect the authoritative run status before concluding.
+Keep serial CI waits in the same foreground workflow. If waiting is the only useful next action, stay foreground; do not detach merely to end the turn. Background work is for independent parallel work or an explicit user request. A running handle is not a final result: wait on that same handle and preserve steering/interruption. A polling timeout is not remote failure; inspect the authoritative run status before concluding.
 
 This guidance adds no tool authority, runtime gate, or approval requirement.

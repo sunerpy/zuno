@@ -1305,16 +1305,16 @@ fn a_batched_report_turn_persists_every_report_before_its_single_provider_call()
     let persisted = body
         .find("self.persist_promoted_user_input(&message, &parts)?;")
         .expect("promoted report persistence call");
-    let goal_gate = body
-        .find("report_deferred_by_goal_state")
-        .expect("paused and terminal Goals defer automatic report continuation");
+    let cycle_gate = body
+        .find("report_deferred_by_execution_state")
+        .expect("the current cycle's native authority gates automatic report continuation");
     let provider = body
         .find("self.drive_prepared_with_start(")
         .expect("accounted turn call");
 
     assert!(
-        each_report < persisted && persisted < goal_gate && goal_gate < provider,
-        "a batch must persist every durable report, then honour Goal lifecycle state, before \
+        each_report < persisted && persisted < cycle_gate && cycle_gate < provider,
+        "a batch must persist every durable report, then honour current cycle authority, before \
          entering the provider"
     );
 }

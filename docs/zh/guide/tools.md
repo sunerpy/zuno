@@ -32,6 +32,15 @@
 
 ## Task、workflow 与 Council 的结果
 
+`task` 必须在顶层提供 `agent`、`objective`、`deliverable`、`instructions` 和
+`success_evidence`，使用 `task_id` 续跑时也一样。`intent` 只作为 UI 标签，不能
+替代 `objective`。请使用工具说明中的 JSON 示例，不要嵌套到 `contract` 中。
+漏参反馈会依据当前 schema 给出修正说明，但不会自动补值或创建子会话。
+
+当唯一有用的下一步是等待时，命令或子任务默认保留在前台。`bg` 句柄或
+`backgroundPurpose: "remoteObserver"` 不代表已分离后台：应续等同一句柄并保持
+steer／中断响应。显式后台只用于独立并行工作或用户要求，不应仅为结束主回合而开启。
+
 `task` 用于一次有界委派，`workflow` 执行配置化依赖图，`council_run` 收集独立报告后
 合成。失败时先查看持久 job 与子会话证据：超时前可以已有成功模型请求和已完成工具。
 Provider 请求及重试时间与任务总耗时是两项度量；失败任务不会自动重放。

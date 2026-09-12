@@ -36,6 +36,19 @@ updates apply automatically unless a review policy is explicitly configured, and
 
 ## Task, workflow, and Council outcomes
 
+`task` requires top-level `agent`, `objective`, `deliverable`, `instructions`,
+and `success_evidence`, including when resuming with `task_id`. `intent` only
+labels the call in the UI and cannot replace `objective`. Follow the JSON
+example in the tool description; do not nest the fields under `contract`.
+Missing-field feedback uses the current schema to explain how to correct the
+call without automatically filling fields or starting a child.
+
+When waiting is the only useful next action, keep the command or child in the
+foreground. A `bg` handle or `backgroundPurpose: "remoteObserver"` does not mean
+the operation was detached: continue the same foreground handle and preserve
+steering/interruption. Use explicit background mode only for independent parallel
+work or a user request, not merely to end the main turn.
+
 Use `task` for one bounded delegation, `workflow` for a configured dependency
 graph, and `council_run` for independent reports followed by synthesis.
 Inspect the durable job and child-session evidence when one fails: successful

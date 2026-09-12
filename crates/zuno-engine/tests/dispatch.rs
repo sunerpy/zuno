@@ -139,7 +139,10 @@ impl Tool for RecordingTool {
         json!({
             "type": "object",
             "properties": {
-                "command": { "type": "string" }
+                "command": {
+                    "type": "string",
+                    "description": "The required command to execute; intent is only a UI label."
+                }
             },
             "required": ["command"],
             "additionalProperties": false
@@ -517,6 +520,59 @@ fn dispatcher(
         zuno_engine::dispatch::AuthorizationPolicy::Standard,
         McpToolStatus::Ready,
     )
+}
+
+#[tokio::test]
+async fn missing_required_argument_explains_current_field_before_any_execution() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let approver = Arc::new(RecordingApprover::default());
+    let dispatcher = dispatcher(
+        vec![Arc::new(RecordingTool::new("shell", calls.clone()))],
+        vec![allow_all_rule()],
+        approver.clone(),
+    );
+    let rejected = dispatcher
+        .dispatch(request(
+            &dispatcher,
+            "invalid",
+            "shell",
+            json!({"intent":"PRIVATE_INPUT_NOT_A_COMMAND"}),
+        ))
+        .await;
+    assert_eq!(
+        rejected.blocked,
+        Some(zuno_engine::r#loop::ToolBlockKind::InvalidArguments)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(approver.asks().is_empty());
+    assert!(
+        rejected
+            .output
+            .output
+            .contains("Required top-level field `command`")
+    );
+    assert!(rejected.output.output.contains("intent is only a UI label"));
+    assert!(
+        !rejected
+            .output
+            .output
+            .contains("PRIVATE_INPUT_NOT_A_COMMAND")
+    );
+
+    let accepted = dispatcher
+        .dispatch(request(
+            &dispatcher,
+            "corrected",
+            "shell",
+            json!({"command":"printf ok","intent":"run a check"}),
+        ))
+        .await;
+    assert!(!accepted.is_error, "{}", accepted.output.output);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "only the corrected call executes"
+    );
 }
 
 #[derive(Default)]

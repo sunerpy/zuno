@@ -45,6 +45,87 @@ fn refuses_all(relative: &str, retired: &[&str]) {
 }
 
 #[test]
+fn task_contract_guidance_distinguishes_intent_and_objective_in_both_languages() {
+    for page in [
+        "docs/orchestration.md",
+        "docs/zh/guide/orchestration.md",
+        "docs/guide/tools.md",
+        "docs/zh/guide/tools.md",
+        "docs/harness-runtime.md",
+        "docs/zh/operate/harness-runtime.md",
+    ] {
+        contains_all(
+            page,
+            &[
+                "`intent`",
+                "`objective`",
+                "`deliverable`",
+                "`instructions`",
+                "`success_evidence`",
+                "`task_id`",
+            ],
+        );
+    }
+    contains_all(
+        "docs/harness-runtime.md",
+        &[
+            "required top-level strings",
+            "at most four",
+            "256 Unicode",
+            "argument values are not copied",
+        ],
+    );
+    contains_all(
+        "docs/zh/operate/harness-runtime.md",
+        &[
+            "顶层必填字符串",
+            "最多补充四条",
+            "256",
+            "新增提示不复制调用参数值",
+        ],
+    );
+}
+
+#[test]
+fn report_scope_and_serial_foreground_guidance_are_documented() {
+    for page in [
+        "docs/harness-runtime.md",
+        "docs/zh/operate/harness-runtime.md",
+    ] {
+        contains_all(
+            page,
+            &[
+                "goal_id=None",
+                "consumed",
+                "report_deferred_by_execution_state",
+                "9ba1d9eb5b",
+                "remoteObserver",
+            ],
+        );
+    }
+    contains_all(
+        "docs/harness-runtime.md",
+        &[
+            "current work cycle's bound Goal",
+            "same eligible report",
+            "Unknown legacy",
+            "waiting is the only useful next action",
+            "not a new task-count heuristic",
+        ],
+    );
+    contains_all(
+        "docs/zh/operate/harness-runtime.md",
+        &[
+            "只有当前工作周期绑定的 Goal",
+            "不等于模型已处理",
+            "同一条合法报告",
+            "主线默认保持前台",
+            "不按任务数量新增硬性工具拦截",
+        ],
+    );
+}
+
+#[test]
 fn council_budget_and_native_failure_evidence_are_documented_in_both_languages() {
     for page in ["docs/orchestration.md", "docs/zh/guide/orchestration.md"] {
         contains_all(
