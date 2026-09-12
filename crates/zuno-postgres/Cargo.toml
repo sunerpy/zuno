@@ -29,6 +29,7 @@ zuno-engine = { workspace = true }
 zuno-error = { workspace = true }
 zuno-permission = { workspace = true }
 zuno-identity = { workspace = true }
+zuno-memory = { workspace = true }
 
 [dev-dependencies]
 zuno-environment = { workspace = true }

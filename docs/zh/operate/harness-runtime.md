@@ -273,13 +273,27 @@ CLI 启动。无法抓取的远程规则来源使用同一类非致命 notice，
 企业提交仍须在后端事务中重新校验组织授权；预检查不能取代会话 generation policy、来源有效性
 和学习任务租约检查。
 
-候选读取和编辑与 apply／undo 一样检查文档路径归属；越界返回拒绝，不泄露另一项目的路径。
+候选读取和编辑与 apply／undo 一样检查文档归属；越界返回拒绝，不泄露另一项目的路径。
 模型 Memory 工具使用不可变调用来源记录 session/message，不能通过修改公开 context 字段更换来源。
 授权拒绝属于权限失败，不作为可由模型修改参数修复的提议错误。
 
 同步持久化事务属于 Memory 数据所有者；远程状态服务须通过有界执行调用它，不能阻塞 Worker
-的异步 reactor。本阶段仍使用明确的本地文件投影，托管文档命名空间、企业授权和 PostgreSQL
-后端仍需后续接入。
+的异步 reactor。`MemoryService::storage_only` 接受经过验证的逻辑 `MemoryDocumentKey`，
+不提供文件投影，逻辑键严格比较，不按宿主路径规范化。候选校验、版本 CAS、证据过滤、
+维护和撤销继续复用同一服务；此模式拒绝文件导入，无法解释的旧在途状态需要核查。
+`paths()` 返回可选文件投影，个人模式继续保留原有文件行为。
+
+持久化接口返回领域错误，不要求外部后端构造 SQLite 错误。`Unavailable` 与 `Conflict`
+保留类型化学习恢复，本地数据库错误维持原有分类；`InvalidData` 将损坏／不兼容状态
+与可修正提案区分。PostgreSQL 数据所有者现已注入当前组织、私有生成授权及逻辑存储；
+候选、文档、证据、请求回执和审计共用有界事务，召回重新验证来源。Worker 协议 6 通过
+工作负载身份与 Job grant 调用异步 `MemoryDataService`，不接收数据库 pool。
+
+企业 Worker profile 安装 `memory_read`、`memory_update` 与 `DynamicContextRefresher`。
+每次模型请求前（包括接管检查点后）都用当前 Memory 替换旧动态快照；空结果或撤销使用不会
+回退到旧内容。刷新保留类型化状态错误，授权服务不可用时不携带旧快照请求模型。
+私有生成必须由用户明确授权，组织共享 Memory 和自动提取生产者仍待后续实现。
+详见[企业 Memory](../../../enterprise/MEMORY.zh.md)。
 
 常驻记忆与用户学习默认启用。自动学习优先使用显式
 `learning.extractor_model`，否则依次使用当前 provider 下可达的

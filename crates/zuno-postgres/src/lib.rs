@@ -7,6 +7,7 @@ mod browser;
 #[cfg(test)]
 mod browser_tests;
 mod client;
+mod memory;
 mod migration;
 mod operation;
 mod runtime;
@@ -22,6 +23,7 @@ mod turn_tests;
 pub use authorization::{PostgresOrganizationStore, bootstrap_organization};
 pub use browser::{BrowserStoreLimits, PostgresBrowserStore};
 pub use client::ClientJobState;
+pub use memory::{MemoryStoreLimits, PostgresMemoryBackend, PostgresMemoryService};
 pub use migration::{PREVIEW_SCHEMA, migrate};
 pub use operation::PostgresOperationStore;
 pub use runtime::PostgresRuntimeStore;

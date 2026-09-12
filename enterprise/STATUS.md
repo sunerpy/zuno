@@ -332,3 +332,25 @@ The fixture now captures finite CLI output into files, bounds process waiting
 independently of pipe EOF and reports child diagnostics before a timeout panic.
 The Linux Goal test, workspace check and Clippy passed. Windows verification of
 this follow-up remains pending; the earlier timeout is not counted as a pass.
+
+CI run 34676688599 subsequently passed all gates at `9d558b7b360289dc9d6a428bc4f3ee855d573ac7`, including personal Windows and both Linux Docker lanes. PR #204 merged only into `codex/enterprise-preview` as `21ddba66790c00868ab0ac0d3beb1bf05576a727`; no release was created.
+
+## Logical Memory storage boundary
+
+- `MemoryService` now supports validated logical document keys independently of optional local file projection. Shared candidate/revision/evidence/undo behavior is preserved; logical mode refuses file imports and never treats a document key as a host path.
+- The persistence contract uses Memory domain errors. External backends can report denial, conflict and temporary unavailability directly while the SQLite provider preserves its existing database errors. Learning retry classification remains typed.
+- A focused regression first failed because logical storage required local paths. It now passes proposal/apply/snapshot/undo and foreign-document refusal with no projection; local Memory and automatic-learning regressions also pass.
+- PostgreSQL persistence, organization authorization, scope-wide caches and enterprise maintenance producers still require implementation. This foundation is not an enabled enterprise Memory feature.
+
+## PostgreSQL private Memory and Worker integration
+
+- Preview PostgreSQL format 9 installs scoped Memory policy/documents/candidates/revisions/evidence/provenance/retirement, learning Jobs, maintenance watermarks, request receipts and audit with forced RLS. The exact format-8 fixture first failed at the missing upgrade boundary, then passed rollback/preservation with the real migration.
+- The shared `MemoryService` now runs against a private PostgreSQL provider inside one bounded data-owner transaction. Public API/BFF and authenticated Worker calls share its capacity and state; commands cannot select another owner or document path.
+- Private generation defaults off. Explicit user consent controls foreground model updates and learning commits; session overrides narrow it. Scope, CAS, request replay, audit rollback, source validity, independent support, retraction, learning lease expiry and unscoped RLS reads have real PostgreSQL coverage.
+- A timed SQL write reproduced early capacity release while a cancelled transaction still ran. The data owner now awaits bounded explicit rollback before releasing its slot; the same real PostgreSQL regression passes without a candidate or receipt being committed.
+- A separate authorization regression reproduced a normal allowed API app granting Memory consent. Consent and manual review now require the current organization approval-app allowlist; ordinary API apps may read and stage candidates without granting execution or Memory authority.
+- Manual candidate review carries a state digest covering the exact record and owner. A regression reproduced applying an edited proposal through a stale review; apply/edit/reject/undo now compare the reviewed digest before mutation, while identical committed request retries retain their original receipt.
+- Worker protocol 6 installs real async Memory read/update transport and a context refresher. Typed refresh failures preserve recovery classes and prevent model requests with stale state. The personal tool schema is reused; a missing confirmation around an update retains uncertainty.
+- The full rootless-Docker fixture passed with four real executable processes, two users, eight provider requests, private Memory read/update, refresh before the next request, revocation during command-approval waits and checkpoint continuation. Both Workers participated; each approved command ran once. This is local Linux evidence; native arm64 CI and release acceptance remain required.
+- Preview documentation packaging now includes tracked guides, example configurations and licenses from the certified Git commit. A regression reproduced the old four-file-only archive; the corrected archive excludes untracked files and local edits.
+- Background extraction producers, organization-shared Memory/approval, distributed children/Workflow/Council, richer workspaces, public transcript/live projection, React/ACP clients and remaining P6 acceptance are not complete. Publication remains disabled.

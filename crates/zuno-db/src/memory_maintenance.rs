@@ -15,7 +15,8 @@ use zuno_types::{MemoryAction, MemoryCandidateStatus, MemoryScope, MemorySource}
 
 pub const MEMORY_MAINTENANCE_PURPOSE: &str = "memory";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MemoryMaintenanceState {
     pub input_digest: String,
     pub global_revision: i64,

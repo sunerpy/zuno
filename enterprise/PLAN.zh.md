@@ -256,3 +256,11 @@ ACP、本地 HTTP 和共享内核保留现有平台承诺；企业 Web 仍可由
 `crates.expected` 与中英文工作区枚举。此 crate 负责 Linux 企业控制面、Worker、网关、
 迁移和身份检查的装配入口；共享业务状态机仍归属原有组件。构建该二进制不代表 P0–P6
 全部完成或启用预览发布，具体能力与未完成项以 [STATUS.md](STATUS.md) 为准。
+
+## 实施补充：私有 Memory 与检查点提示刷新
+
+PostgreSQL 预览格式 9 与内部 Worker 协议 6 实现私有 Memory 的存储、授权、HTTP 及
+Worker 消费闭环。共享 Memory 服务保留候选、版本、证据和维护结算的原子语义，
+Worker 在每次模型请求前刷新来源和授权，不恢复已撤回的检查点 Memory。
+这不缩减后台提取、组织共享 Memory、分布式编排及 P5–P6 的既定范围，也不启用发版。
+接口、配置、故障验证与尚未注册的生产者详见 [Memory](MEMORY.zh.md)。

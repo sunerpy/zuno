@@ -35,6 +35,7 @@ zuno-engine = { workspace = true }
 zuno-error = { workspace = true }
 zuno-identity = { workspace = true }
 zuno-llm = { workspace = true }
+zuno-memory = { workspace = true }
 zuno-network = { workspace = true }
 zuno-observability = { workspace = true }
 zuno-orchestration = { workspace = true }

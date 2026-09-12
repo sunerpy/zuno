@@ -25,6 +25,7 @@ use zuno_llm::{
 use zuno_worker::{
     WorkerClient, WorkerExecution,
     gateway::GatewayClient,
+    memory::{MemoryContextRefresher, MemoryToolDispatcher},
     runtime::{WorkerError, WorkerServiceFactory, WorkerTurnServices},
     tools::GatewayToolDispatcher,
 };
@@ -186,21 +187,32 @@ impl WorkerServiceFactory for ConfiguredWorkerFactory {
         {
             return Err(WorkerError::Configuration);
         }
-        Ok(WorkerTurnServices {
-            configuration: entry.definition.reference(),
-            providers: entry.providers.clone(),
-            resolver: entry.resolver.clone(),
-            dispatcher: Arc::new(GatewayToolDispatcher::new(
+        let memory = Arc::new(self.state.memory(execution));
+        let dispatcher = Arc::new(MemoryToolDispatcher::new(
+            Arc::new(GatewayToolDispatcher::new(
                 self.state.clone(),
                 execution.clone(),
                 self.gateway.clone(),
             )),
+            memory.clone(),
+            execution.clone(),
+        ));
+        Ok(WorkerTurnServices {
+            configuration: entry.definition.reference(),
+            providers: entry.providers.clone(),
+            resolver: entry.resolver.clone(),
+            dispatcher,
             driver: self.driver.clone(),
             budget: Arc::new(Budget {
                 limits: entry.definition.budget.clone(),
                 output_tokens: entry.definition.model.max_output_tokens.get(),
             }),
             dynamic_context: DynamicContext::default(),
+            dynamic_context_refresher: Some(Arc::new(MemoryContextRefresher {
+                service: memory,
+                session_id: execution.job.session_id.to_string(),
+                base: DynamicContext::default(),
+            })),
             executor_directory: "/workspace".to_owned(),
             steps_per_advance: NonZeroU32::MIN,
             context_limit: Some(entry.definition.model.context_tokens.get()),

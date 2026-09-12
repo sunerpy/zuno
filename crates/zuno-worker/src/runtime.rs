@@ -11,7 +11,8 @@ use zuno_engine::{
     driver::AgentDriver,
     interrupt::InterruptSignal,
     r#loop::{
-        AgentModelResolver, RunTurnRequest, ToolDispatcher, TurnContext, TurnEvent, event_channel,
+        AgentModelResolver, DynamicContextRefresher, RunTurnRequest, ToolDispatcher, TurnContext,
+        TurnEvent, event_channel,
     },
     state::{InputMaterialization, TurnPersistence, TurnStateError, TurnStateScope},
 };
@@ -30,6 +31,7 @@ pub struct WorkerTurnServices {
     pub driver: Arc<dyn AgentDriver>,
     pub budget: Arc<dyn TurnBudgetPolicy>,
     pub dynamic_context: DynamicContext,
+    pub dynamic_context_refresher: Option<Arc<dyn DynamicContextRefresher>>,
     pub executor_directory: String,
     pub steps_per_advance: NonZeroU32,
     pub context_limit: Option<u64>,
@@ -350,19 +352,19 @@ async fn advance_with_services(
         );
     }
     let (sender, mut receiver) = event_channel();
-    let advance = services.driver.advance(
-        request,
-        TurnContext::from_persistence(
-            state,
-            &services.providers,
-            services.resolver.as_ref(),
-            services.dispatcher.as_ref(),
-            interrupt,
-        )
-        .with_principal_scope(execution.job.principal.clone())
-        .with_budget_policy(services.budget),
-        sender,
-    );
+    let mut context = TurnContext::from_persistence(
+        state,
+        &services.providers,
+        services.resolver.as_ref(),
+        services.dispatcher.as_ref(),
+        interrupt,
+    )
+    .with_principal_scope(execution.job.principal.clone())
+    .with_budget_policy(services.budget);
+    if let Some(refresher) = &services.dynamic_context_refresher {
+        context = context.with_dynamic_context_refresher(refresher.as_ref());
+    }
+    let advance = services.driver.advance(request, context, sender);
     tokio::pin!(advance);
     loop {
         tokio::select! {

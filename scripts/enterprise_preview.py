@@ -120,6 +120,35 @@ def archive_name(data: dict, triple: str) -> str:
     return f"{data['binary']}-{data['version']}-{triple}.tar.gz"
 
 
+def documentation_blobs(root: Path, sha: str):
+    """Package reviewed documents from the certified commit, not local state."""
+    entries = subprocess.check_output(
+        ["git", "-C", str(root), "ls-tree", "-r", "-z", sha, "--", "enterprise"]
+    )
+    for entry in entries.split(b"\0"):
+        if not entry:
+            continue
+        metadata, encoded_path = entry.split(b"\t", 1)
+        mode, kind, object_id = metadata.decode("ascii").split()
+        name = encoded_path.decode("utf-8")
+        path = Path(name)
+        included = (
+            (path.parent == Path("enterprise") and path.suffix == ".md")
+            or name == "enterprise/preview.json"
+            or (path.parent == Path("enterprise/examples")
+                and path.suffix in {".json", ".toml", ".yaml", ".yml"})
+            or (path.parent == Path("enterprise/licenses") and path.suffix == ".txt")
+        )
+        if not included:
+            continue
+        require(kind == "blob" and mode in {"100644", "100755"},
+                "preview documentation must be a regular tracked file")
+        content = subprocess.check_output(
+            ["git", "-C", str(root), "cat-file", "blob", object_id]
+        )
+        yield name, content
+
+
 def seal(root: Path, dist: Path, ref: str, sha: str) -> dict:
     data = validate_release(root, ref, sha)
     require(data["enabled"], "publication is disabled")
@@ -128,10 +157,10 @@ def seal(root: Path, dist: Path, ref: str, sha: str) -> dict:
     require(found == expected, "candidate archives are missing or unexpected")
     docs = dist / "enterprise-docs.zip"
     with zipfile.ZipFile(docs, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for name in ["PLAN.zh.md", "README.md", "STATUS.md", "preview.json"]:
-            info = zipfile.ZipInfo("enterprise/" + name, date_time=(1980, 1, 1, 0, 0, 0))
+        for name, content in documentation_blobs(root, sha):
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
-            archive.writestr(info, (root / "enterprise" / name).read_bytes())
+            archive.writestr(info, content)
     expected.add(docs.name)
     assets = []
     for name in sorted(expected):

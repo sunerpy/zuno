@@ -406,7 +406,7 @@ impl DynamicContextRefresher for RecordingContextRefresher {
         &self,
         session_id: &str,
         refresh: ToolDynamicContextRefresh,
-    ) -> Result<DynamicContext, String> {
+    ) -> Result<DynamicContext, TurnError> {
         assert_eq!(session_id, SESSION_ID);
         assert_eq!(refresh, ToolDynamicContextRefresh::WorkPlan);
         self.calls.fetch_add(1, Ordering::SeqCst);

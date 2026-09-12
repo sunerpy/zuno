@@ -113,14 +113,66 @@ async fn model(
     issuer.model_requests.fetch_add(1, Ordering::SeqCst);
     // Ensure two one-slot Workers can claim distinct ready sessions.
     tokio::time::sleep(Duration::from_millis(250)).await;
-    let completed = body["messages"]
-        .as_array()
-        .unwrap()
+    let messages = body["messages"].as_array().unwrap();
+    let user = messages
         .iter()
-        .any(|message| message["role"] == "tool");
+        .find(|message| message["role"] == "user")
+        .unwrap()["content"]
+        .to_string();
+    let name = if user.contains("alice") {
+        "alice"
+    } else {
+        assert!(user.contains("bob"));
+        "bob"
+    };
+    let other = if name == "alice" { "bob" } else { "alice" };
+    assert!(!body.to_string().contains(&format!("MEMORY-PROBE-{other}")));
+    let has_tool = |id: &str| {
+        messages
+            .iter()
+            .any(|message| message["role"] == "tool" && message["tool_call_id"] == id)
+    };
+    let completed = has_tool("native-command");
+    let live_context = messages
+        .iter()
+        .filter(|message| message["role"] == "system" || message["role"] == "developer")
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if completed {
+        assert!(
+            !live_context.contains("MEMORY-PROBE-"),
+            "revoked Memory must not return from the checkpoint"
+        );
+        assert!(!live_context.contains("MEMORY-LEARNED-"));
+    } else {
+        assert!(
+            live_context.contains(&format!("MEMORY-PROBE-{name}")),
+            "{live_context}"
+        );
+    }
     let delta = if completed {
         json!({"role":"assistant","content":"Completed the approved operation."})
+    } else if !has_tool("native-memory-read") {
+        json!({"role":"assistant","tool_calls":[{
+            "index":0,"id":"native-memory-read","type":"function","function":{
+                "name":"memory_read","arguments":json!({"target":"project","limit":4}).to_string()
+            }
+        }]})
+    } else if !has_tool("native-memory-update") {
+        json!({"role":"assistant","tool_calls":[{
+            "index":0,"id":"native-memory-update","type":"function","function":{
+                "name":"memory_update","arguments":json!({
+                    "target":"project","action":"add","content":format!("MEMORY-LEARNED-{name}"),
+                    "reason":"Explicit private Memory consent","expected_revision":2,"confidence":1.0
+                }).to_string()
+            }
+        }]})
     } else {
+        assert!(
+            live_context.contains(&format!("MEMORY-LEARNED-{name}")),
+            "a committed Memory update must refresh the next request"
+        );
         json!({"role":"assistant","tool_calls":[{
             "index":0,"id":"native-command","type":"function","function":{
                 "name":"environment_command",
@@ -369,6 +421,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
             root,
             "control",
             ServiceRole::ControlPlane(Box::new(ControlConfig {
+                memory: Default::default(),
                 tenant_id: tenant.clone(),
                 tls: fixture.tls(control_address),
                 database: DatabaseConfig {
@@ -504,13 +557,46 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
             .json()
             .await
             .unwrap();
+        let memory_url = format!("{control_url}api/v1/workspaces/workspace/memory");
+        let proposal:Value = http.post(&memory_url).bearer_auth(&tokens[name])
+            .json(&json!({"requestId":"seed-memory","command":{"kind":"propose","change":{
+                "scope":"project","action":"add","content":format!("MEMORY-PROBE-{name}"),
+                "oldText":null,"reason":"User-owned private convention","expectedRevision":null,"confidence":1.0
+            }}})).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        let candidate = proposal["result"]["Ok"]["candidate"]["id"]
+            .as_str()
+            .unwrap();
+        for (id, command) in [
+            (
+                "apply-memory",
+                json!({"kind":"apply","candidateId":candidate,"expectedState":proposal["result"]["Ok"]["stateDigest"]}),
+            ),
+            (
+                "memory-consent",
+                json!({"kind":"set_policy","sessionId":null,"expectedRevision":0,"useMemories":true,"generatePrivate":true}),
+            ),
+        ] {
+            let response: Value = http
+                .post(&memory_url)
+                .bearer_auth(&tokens[name])
+                .json(&json!({"requestId":id,"command":command}))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert!(response["result"]["Ok"].is_object(), "{response}");
+        }
         let job: Value = http
             .post(format!(
                 "{control_url}api/v1/sessions/{}/turns",
                 session["id"].as_str().unwrap()
             ))
             .bearer_auth(&tokens[name])
-            .json(&json!({"requestId":"turn","expectedInputVersion":"0","text":"Run once"}))
+            .json(&json!({"requestId":"turn","expectedInputVersion":"0","text":format!("Run once for {name}")}))
             .send()
             .await
             .unwrap()
@@ -602,6 +688,12 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
                 if wait["target"]["kind"] == "approval" {
                     let id = wait["target"]["approval_id"].as_str().unwrap();
                     if approved.insert(id.to_owned()) {
+                        let disabled:Value = http.post(format!("{control_url}api/v1/workspaces/workspace/memory"))
+                            .bearer_auth(&tokens[name]).json(&json!({
+                                "requestId":"disable-memory","command":{"kind":"set_policy","sessionId":null,
+                                    "expectedRevision":1,"useMemories":false,"generatePrivate":false}
+                            })).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+                        assert!(disabled["result"]["Ok"].is_object(), "{disabled}");
                         http.post(format!("{control_url}api/v1/approvals/{id}/answer"))
                             .bearer_auth(&tokens[name])
                             .json(&json!({"requestId":format!("approve-{id}"),"answer":"approve"}))
@@ -624,7 +716,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(approved.len(), 2);
-    assert_eq!(issuer.model_requests.load(Ordering::SeqCst), 4);
+    assert_eq!(issuer.model_requests.load(Ordering::SeqCst), 8);
     let attempts:i64=query_scalar("SELECT count(DISTINCT worker_id) FROM zuno_enterprise_preview.runtime_attempt WHERE tenant_id=$1")
         .bind(tenant.as_str()).fetch_one(&admin).await.unwrap();
     assert_eq!(attempts, 2, "both independent Workers must participate");

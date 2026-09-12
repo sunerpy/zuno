@@ -201,14 +201,16 @@ struct HostDynamicContextRefresher {
 
 #[async_trait::async_trait]
 impl DynamicContextRefresher for HostDynamicContextRefresher {
-    async fn before_request(&self, session_id: &str) -> Result<Option<DynamicContext>, String> {
+    async fn before_request(&self, session_id: &str) -> Result<Option<DynamicContext>, TurnError> {
         let refresh = {
-            let connection = self.database.get().map_err(to_string)?;
+            let connection = self.database.get()?;
             if matches!(
                 self.instruction,
                 DynamicContextRefreshInstruction::Planning(PlanningDecision::Required(_))
             ) && zuno_tools::WorkStateStore::plan_in(&connection, session_id)
-                .map_err(to_string)?
+                .map_err(|error| TurnError::DynamicContextRefresh {
+                    detail: error.to_string(),
+                })?
                 .is_some()
             {
                 ToolDynamicContextRefresh::WorkPlan
@@ -223,16 +225,18 @@ impl DynamicContextRefresher for HostDynamicContextRefresher {
         &self,
         session_id: &str,
         refresh: ToolDynamicContextRefresh,
-    ) -> Result<DynamicContext, String> {
-        let connection = self.database.get().map_err(to_string)?;
-        let context = goal_dynamic_context_from(&connection, &self.goal_continuation, session_id)?;
+    ) -> Result<DynamicContext, TurnError> {
+        let connection = self.database.get()?;
+        let context = goal_dynamic_context_from(&connection, &self.goal_continuation, session_id)
+            .map_err(|detail| TurnError::DynamicContextRefresh { detail })?;
         let memory = current_resident_memory(
             self.memory.as_deref(),
             &self.memory_policy_store,
             session_id,
             self.memory_default_use,
             self.memory_allowed,
-        )?;
+        )
+        .map_err(|detail| TurnError::DynamicContextRefresh { detail })?;
         let mut context = self.instruction.apply(context, refresh).with_memory(memory);
         if let Some(instruction) = self
             .foreground_instruction

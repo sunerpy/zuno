@@ -187,7 +187,7 @@ limit. No incomplete history is treated as an exact old context window.
 
 The captured format-5 fixture preserves pending waits, Job budgets, lease state,
 messages and usage across failed/successful format-6 migration. The internal Worker
-protocol is version 5; it is separate from public UI DTOs. Its compatible claims,
+protocol is version 6; it is separate from public UI DTOs. Its compatible claims,
 stable input timestamps and bounded grant renewal are described in [Workers](WORKERS.md).
 
 ## Browser authentication state
@@ -223,3 +223,17 @@ The exact format-7 fixture preserves sessions, message parts, Jobs, waits and a
 valid browser session across injected DDL failure and successful migration.
 See [operation result delivery](OPERATION_RESULTS.md) for gateway acknowledgement,
 output bounds and the separate parent-consumption boundary.
+
+## Private Memory
+
+Current format 9 adds owner-scoped Memory policy, session overrides, documents,
+candidates, revisions, evidence, provenance, retirement, learning Jobs, maintenance
+watermarks, request receipts and audit. Every new table forces owner RLS. The
+captured format-8 fixture verifies rollback and preservation of existing runtime,
+browser and operation data before the marker advances.
+
+The data owner runs the shared Memory service in bounded blocking capacity with
+one transaction per request. Actor/workspace checks, candidate CAS, source
+revalidation, consent, learning lease checks and result/audit commit stay together.
+Workers use internal protocol 6 and never receive this provider or pool.
+See [Memory](MEMORY.md) for implemented behavior and remaining producers.

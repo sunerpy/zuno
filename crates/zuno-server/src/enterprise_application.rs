@@ -25,8 +25,10 @@ use zuno_application::{
     },
 };
 use zuno_identity::{AccessTokenVerifier, IdentityError, VerifiedIdentity, VerifiedIdentityKind};
+use zuno_memory::remote::{MemoryDataService, MemoryRequest, MemoryResponse};
 use zuno_permission::enterprise::{ApprovalAudience, actor_denial};
 use zuno_postgres::PostgresBackend;
+use zuno_postgres::PostgresMemoryBackend;
 use zuno_types::identity::{
     ApprovalId, InputId, JobId, PrincipalKey, PrincipalScope, RequestId, SessionId, TenantId,
     TurnId, WorkspaceId,
@@ -49,6 +51,7 @@ pub struct EnterpriseApplication {
     backend: PostgresBackend,
     tenant: TenantId,
     workspaces: Arc<BTreeMap<WorkspaceId, ApplicationWorkspace>>,
+    memory: Option<PostgresMemoryBackend>,
 }
 
 impl EnterpriseApplication {
@@ -81,7 +84,13 @@ impl EnterpriseApplication {
             backend,
             tenant,
             workspaces: Arc::new(installed),
+            memory: None,
         })
+    }
+
+    pub fn with_memory(mut self, memory: PostgresMemoryBackend) -> Self {
+        self.memory = Some(memory);
+        self
     }
 
     /// External clients supply an API access token. Cookies are not credentials
@@ -103,7 +112,7 @@ impl EnterpriseApplication {
     }
 
     fn routes(self) -> Router {
-        Router::new()
+        let mut router = Router::new()
             .route("/workspaces", get(workspaces))
             .route("/sessions", post(create_session).get(list_sessions))
             .route("/sessions/{session}", get(session))
@@ -111,7 +120,11 @@ impl EnterpriseApplication {
             .route("/sessions/{session}/turns", post(submit_turn))
             .route("/jobs/{job}", get(job))
             .route("/approvals/{approval}", get(approval))
-            .route("/approvals/{approval}/answer", post(answer))
+            .route("/approvals/{approval}/answer", post(answer));
+        if self.memory.is_some() {
+            router = router.route("/workspaces/{workspace}/memory", post(memory_request));
+        }
+        router
             .layer(DefaultBodyLimit::max(
                 zuno_application::MAX_INPUT_BYTES + 16384,
             ))
@@ -149,6 +162,34 @@ impl EnterpriseApplication {
     fn sessions(&self, principal: PrincipalScope) -> AgentApplication {
         AgentApplication::new(Arc::new(self.backend.sessions(principal)))
     }
+}
+
+async fn memory_request(
+    State(service): State<EnterpriseApplication>,
+    Extension(identity): Extension<VerifiedIdentity>,
+    Path(workspace): Path<WorkspaceId>,
+    Json(request): Json<MemoryRequest>,
+) -> Result<Json<MemoryResponse>, Failure> {
+    let principal = service.principal(&identity).await?;
+    let definition = service
+        .workspaces
+        .get(&workspace)
+        .ok_or(Failure(StatusCode::NOT_FOUND))?;
+    service
+        .backend
+        .register_workspace(&principal, &workspace, &definition.title)
+        .await?;
+    let memory = service
+        .memory
+        .as_ref()
+        .ok_or(Failure(StatusCode::NOT_FOUND))?;
+    Ok(Json(MemoryResponse {
+        result: memory
+            .for_user(principal, workspace)
+            .request(request)
+            .await
+            .map_err(Into::into),
+    }))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

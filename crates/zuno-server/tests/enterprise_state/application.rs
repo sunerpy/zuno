@@ -132,7 +132,13 @@ async fn public_application_keeps_users_isolated_and_requires_current_policy_for
         }],
     )
     .unwrap();
-    let (endpoint, server) = tls_server(application.api_router(verifier), &fixture).await;
+    let memory =
+        zuno_postgres::PostgresMemoryBackend::new(backend.clone(), Default::default()).unwrap();
+    let (endpoint, server) = tls_server(
+        application.with_memory(memory).api_router(verifier),
+        &fixture,
+    )
+    .await;
     let api = |path: &str| endpoint.join(&format!("api/v1/{path}")).unwrap();
     let certificate =
         reqwest::Certificate::from_pem(&std::fs::read(&fixture.root_certificate).unwrap()).unwrap();
@@ -195,6 +201,60 @@ async fn public_application_keeps_users_isolated_and_requires_current_policy_for
         .await
         .unwrap();
     assert_ne!(session["id"], other["id"]);
+    let proposal = http
+        .post(api("workspaces/workspace/memory"))
+        .bearer_auth("alice")
+        .json(
+            &json!({"requestId":"memory-note","command":{"kind":"propose","change":{
+                "scope":"project","action":"add","content":"Use cargo test","oldText":null,
+                "reason":"repository convention","expectedRevision":null,"confidence":1.0
+            }}}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(proposal["result"]["Ok"]["kind"], "candidate", "{proposal}");
+    let memory_id = proposal["result"]["Ok"]["candidate"]["id"]
+        .as_str()
+        .unwrap();
+    let foreign_memory = http.post(api("workspaces/workspace/memory")).bearer_auth("bob")
+        .json(&json!({"requestId":"foreign-memory","command":{"kind":"apply","candidateId":memory_id,"expectedState":proposal["result"]["Ok"]["stateDigest"]}}))
+        .send().await.unwrap().json::<Value>().await.unwrap();
+    assert_eq!(foreign_memory["result"]["Err"]["kind"], "denied");
+    let apply = json!({"requestId":"memory-apply","command":{"kind":"apply","candidateId":memory_id,"expectedState":proposal["result"]["Ok"]["stateDigest"]}});
+    let applied = http
+        .post(api("workspaces/workspace/memory"))
+        .bearer_auth("alice")
+        .json(&apply)
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(applied["result"]["Ok"]["candidate"]["status"], "applied");
+    let repeated_memory = http
+        .post(api("workspaces/workspace/memory"))
+        .bearer_auth("alice")
+        .json(&apply)
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(repeated_memory, applied);
+    let injected_owner = http
+        .post(api("workspaces/workspace/memory"))
+        .bearer_auth("bob")
+        .json(&json!({"requestId":"forged","principalId":"alice","command":{"kind":"read"}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(!injected_owner.status().is_success());
     let session_id = session["id"].as_str().unwrap();
     let session_path = format!("sessions/{session_id}");
     assert_eq!(

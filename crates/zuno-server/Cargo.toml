@@ -43,6 +43,7 @@ zuno-environment = { workspace = true, optional = true }
 zuno-error = { workspace = true }
 zuno-goal = { workspace = true }
 zuno-llm = { workspace = true }
+zuno-memory = { workspace = true }
 zuno-learning = { workspace = true }
 zuno-identity = { workspace = true, optional = true }
 zuno-observability = { workspace = true }
