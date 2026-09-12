@@ -270,6 +270,12 @@ CI tests and personal dependency verification pass. Native CI is being rerun.
 - A retained driver event sender reproduced a false lease-loss report after a committed checkpoint. The host now uses nonblocking observations and a bounded final event drain, independent of sender/profile lifetime.
 - Documentation impact: both Worker guides, PostgreSQL/wait guides and preview navigation are updated. Preview documents remain isolated tag artifacts, and no stable site publication or release is enabled.
 
+PR #202's amd64 Docker gate exposed renewal racing the final checkpoint response.
+A controlled 500ms delay after checkpoint commit reproduced the false lease-loss
+report locally. Claim-local serialization now protects the boundary POST and
+retires renewal only after its validated acknowledgement. The controlled
+PostgreSQL/HTTPS regression passes; the native CI rerun remains required.
+
 ## Public enterprise application
 
 - `EnterpriseApplication` connects verified delegated-user API tokens and BFF cookies to shared session creation/listing, atomic Job admission, public Job/input-version reads and policy-checked approval decisions. Public DTOs exclude Worker credentials, leases, configuration and private replay checkpoints.

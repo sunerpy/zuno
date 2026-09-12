@@ -218,9 +218,13 @@ pub async fn advance_claimed(
                     result = &mut work => return result,
                     result = client.renew(execution) => result,
                 };
-                if renewed.is_err() {
-                    interrupt.fire();
-                    return Err(WorkerError::LeaseLost);
+                match renewed {
+                    Ok(crate::LeaseRenewal::Renewed(_)) => {}
+                    Ok(crate::LeaseRenewal::Released) => return work.await,
+                    Err(_) => {
+                        interrupt.fire();
+                        return Err(WorkerError::LeaseLost);
+                    }
                 }
             }
         }
