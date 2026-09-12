@@ -20,7 +20,16 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      personal_checks:
+        type: boolean
+        default: true
+        description: Include personal-mode Windows regression
   workflow_call:
+    inputs:
+      personal_checks:
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -45,6 +54,7 @@ jobs:
     outputs:
       release_pr: ${{ steps.route.outputs.release_pr }}
       ci_tooling: ${{ steps.tooling.outputs.needed || 'false' }}
+      personal: ${{ steps.platform.outputs.personal || 'true' }}
     steps:
       - name: Route only the trusted release-please PR shape
         id: route
@@ -81,6 +91,8 @@ jobs:
         if: steps.route.outputs.release_pr != 'true'
         id: tooling
         shell: bash
+        env:
+          PERSONAL_CHECKS_JSON: ${{ toJSON(inputs.personal_checks) }}
         run: |
           set -euo pipefail
           needed=true
@@ -89,13 +101,37 @@ jobs:
             needed=false
             while IFS= read -r -d '' path; do
               case "$path" in
+                .github/workflows/enterprise-*|scripts/check_enterprise_*|scripts/enterprise_preview.py|scripts/test_enterprise_preview.py)
+                  ;;
                 .github/*|.cargo/*|scripts/*|Makefile|Cargo.toml|Cargo.lock|rust-toolchain.toml|crates/zuno-cli/tests/release_surface.rs)
                   needed=true
                   ;;
               esac
             done < "$RUNNER_TEMP/ci-changed-paths"
           fi
+          if [ "$PERSONAL_CHECKS_JSON" = false ] && [ "$GITHUB_EVENT_NAME" != pull_request ] \
+            && [ "$GITHUB_REF" = refs/heads/codex/enterprise-preview ]; then needed=false; fi
           echo "needed=$needed" >> "$GITHUB_OUTPUT"
+
+      - name: Select personal platform coverage
+        if: steps.route.outputs.release_pr != 'true'
+        id: platform
+        shell: bash
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          PERSONAL_CHECKS_JSON: ${{ toJSON(inputs.personal_checks) }}
+        run: |
+          set -euo pipefail
+          personal=true
+          if [ "$PERSONAL_CHECKS_JSON" = false ] && [ "$GITHUB_EVENT_NAME" != pull_request ] \
+            && [ "$GITHUB_REF" = refs/heads/codex/enterprise-preview ]; then
+            personal=false
+          elif [ "$GITHUB_EVENT_NAME" = pull_request ] && [ "$BASE_REF" = codex/enterprise-preview ] \
+            && git rev-parse HEAD^1 >/dev/null 2>&1; then
+            personal="$(python3 scripts/ci_platform_scope.py --base HEAD^1)"
+          fi
+          test "$personal" = true || test "$personal" = false
+          echo "personal=$personal" >> "$GITHUB_OUTPUT"
 
   ci-cache-seed:
     name: Optional cache transport seed
@@ -341,7 +377,7 @@ jobs:
   windows-clippy:
     name: Windows Clippy
     needs: classify
-    if: needs.classify.outputs.release_pr != 'true'
+    if: needs.classify.outputs.release_pr != 'true' && needs.classify.outputs.personal == 'true'
     runs-on: windows-2022
     timeout-minutes: 30
     steps:
@@ -369,7 +405,10 @@ jobs:
         run: cargo fetch --locked
 
       - name: Clippy
-        run: cargo clippy --locked --workspace --all-targets --timings -- -D warnings
+        run: python scripts/cargo_surface.py run clippy --locked --all-targets --timings -- -D warnings
+
+      - name: Require a personal dependency graph
+        run: python scripts/cargo_surface.py verify
 
       - name: Preserve build diagnostics
         if: always()
@@ -380,7 +419,7 @@ jobs:
   windows-test:
     name: Windows test binaries
     needs: classify
-    if: needs.classify.outputs.release_pr != 'true'
+    if: needs.classify.outputs.release_pr != 'true' && needs.classify.outputs.personal == 'true'
     runs-on: windows-2022
     timeout-minutes: 30
     env:
@@ -436,6 +475,7 @@ jobs:
           RUN_DOCTESTS: "0"
           THREADS: "1"
           SUITE_TIMEOUT: "300"
+          CARGO_SURFACE: personal
         run: ./scripts/test-parallel.sh
 
       - name: Upload Windows test diagnostics
@@ -475,10 +515,11 @@ jobs:
           NEEDS_JSON: ${{ toJSON(needs) }}
           RELEASE_PR: ${{ needs.classify.outputs.release_pr }}
           CI_TOOLING: ${{ needs.classify.outputs.ci_tooling }}
+          PERSONAL: ${{ needs.classify.outputs.personal }}
         run: |
           set -euo pipefail
           mapfile -t failures < <(
-            jq -r --arg release_pr "$RELEASE_PR" --arg ci_tooling "$CI_TOOLING" '
+            jq -r --arg release_pr "$RELEASE_PR" --arg ci_tooling "$CI_TOOLING" --arg personal "$PERSONAL" '
               to_entries
               | sort_by(.key)
               | .[]
@@ -488,6 +529,8 @@ jobs:
                   elif $release_pr == "true" then
                     .value.result != "skipped"
                   elif .key == "ci-tools" and $ci_tooling != "true" then
+                    .value.result != "skipped"
+                  elif (.key == "windows-clippy" or .key == "windows-test") and $personal != "true" then
                     .value.result != "skipped"
                   else
                     .value.result != "success"

@@ -230,3 +230,24 @@ preservation of a later-window update. A deterministic 1,000-path test separatel
 requires exactly one event per path within a window. Production watcher timing
 and delivery behavior are unchanged. Documentation impact is limited to this
 test-contract explanation; no user configuration or behavior changed.
+
+## Platform boundary amendment
+
+The user clarified that enterprise services require only Linux amd64/arm64;
+personal TUI/ACP and their shared runtime retain Windows support. Enterprise
+server modules and dependencies now require an explicit feature. Personal
+Windows CI selects the non-enterprise workspace surface and enterprise-only PR
+paths may skip Windows; shared or unknown changes remain conservative. The
+two-Linux-target preview artifact matrix remains unchanged. Remote CI is pending.
+Local verification passed: personal dependency graph (including build/dev edges),
+personal workspace check/Clippy, default and enterprise server builds, explicit
+enterprise PostgreSQL/HTTPS tests, 100 documentation/release tests, Python CI
+contracts, preview publisher tests, actionlint, formatting and diff checks.
+Native Windows validation will run on this shared-manifest change; enterprise-only
+changes can then skip that personal regression according to the path classifier.
+
+PR #200's first Windows scheduler run exposed CRLF translation in the Python-to-Bash
+argument stream (`--workspace` carried a trailing carriage return). A simulated
+Windows stdout regression reproduced the exact bytes before the fix. The selector
+now emits the argument protocol through binary stdout with LF delimiters; Python
+CI tests and personal dependency verification pass. Native CI is being rerun.
