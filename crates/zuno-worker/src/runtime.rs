@@ -56,6 +56,10 @@ pub enum WorkerError {
     Configuration,
     #[error("the Worker lost its execution authority")]
     LeaseLost,
+    #[error("the Worker's local grant lifetime expired")]
+    LeaseExpired,
+    #[error("the Worker could not confirm its final checkpoint")]
+    BoundaryUnconfirmed,
     #[error("the Worker state service is unavailable")]
     Unavailable,
     #[error("the shared kernel could not advance")]
@@ -194,26 +198,37 @@ pub async fn advance_claimed(
     let work = advance_with_services(client, execution, factory, observer, &interrupt);
     tokio::pin!(work);
     loop {
+        if execution.boundary_started() {
+            return tokio::time::timeout(Duration::from_secs(30), &mut work)
+                .await
+                .map_err(|_| WorkerError::BoundaryUnconfirmed)?;
+        }
         let deadline = execution.deadline().map_err(state_error)?;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             interrupt.fire();
-            return Err(WorkerError::LeaseLost);
+            return Err(WorkerError::LeaseExpired);
         }
         let delay = renew_interval.min(remaining / 3);
         tokio::select! {
             biased;
             _ = tokio::time::sleep_until(deadline) => {
+                if execution.boundary_started() {
+                    continue;
+                }
                 interrupt.fire();
-                return Err(WorkerError::LeaseLost);
+                return Err(WorkerError::LeaseExpired);
             }
             result = &mut work => return result,
             _ = tokio::time::sleep(delay) => {
                 let renewed = tokio::select! {
                     biased;
                     _ = tokio::time::sleep_until(deadline) => {
+                        if execution.boundary_started() {
+                            continue;
+                        }
                         interrupt.fire();
-                        return Err(WorkerError::LeaseLost);
+                        return Err(WorkerError::LeaseExpired);
                     }
                     result = &mut work => return result,
                     result = client.renew(execution) => result,

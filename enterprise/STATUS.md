@@ -276,6 +276,12 @@ report locally. Claim-local serialization now protects the boundary POST and
 retires renewal only after its validated acknowledgement. The controlled
 PostgreSQL/HTTPS regression passes; the native CI rerun remains required.
 
+The rerun also exercised a checkpoint response crossing the old grant deadline.
+A 1.5s post-commit delay under a 1s lease reproduced `LeaseExpired` while the Job
+was already `Completed`. Final submission now closes new state/gateway admission
+and permits only a bounded acknowledgement wait. The target regression passes
+without extending database execution authority or replaying the final POST.
+
 ## Public enterprise application
 
 - `EnterpriseApplication` connects verified delegated-user API tokens and BFF cookies to shared session creation/listing, atomic Job admission, public Job/input-version reads and policy-checked approval decisions. Public DTOs exclude Worker credentials, leases, configuration and private replay checkpoints.
