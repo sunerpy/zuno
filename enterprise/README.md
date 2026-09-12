@@ -68,3 +68,5 @@ Durable operation results and acknowledgement: [English](OPERATION_RESULTS.md), 
 Enterprise Linux and personal cross-platform boundaries: [English](PLATFORMS.md), [中文](PLATFORMS.zh.md).
 
 Bounded Worker execution and renewal: [English](WORKERS.md), [中文](WORKERS.zh.md).
+
+Enterprise session, Job and approval API: [English](APPLICATION.md), [中文](APPLICATION.zh.md).

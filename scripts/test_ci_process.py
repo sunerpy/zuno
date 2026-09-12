@@ -182,6 +182,32 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(result.code, 0)
         self.assertEqual(self.log.stat().st_size, 4_000_000)
 
+    def test_transient_output_sharing_violation_is_resolved_before_returning(self):
+        unlink = os.unlink
+        failures = []
+
+        def delayed_release(path, *args, **kwargs):
+            if Path(os.fsdecode(path)).name == "stderr" and len(failures) < 3:
+                failures.append(path)
+                error = PermissionError("the output handle is still closing")
+                error.winerror = 32
+                raise error
+            return unlink(path, *args, **kwargs)
+
+        with patch("ci_process.os.unlink", side_effect=delayed_release):
+            result = self.run_code("print('finished')")
+        self.assertEqual(result.code, 0)
+        self.assertEqual(self.log.read_text(encoding="utf-8").strip(), "finished")
+        self.assertEqual(list(self.root.glob("suite-*")), [],
+                         "cleanup must finish before the caller removes its parent directory")
+
+    def test_persistent_output_cleanup_failure_is_not_a_successful_suite(self):
+        with patch("ci_process._cleanup_capture", side_effect=TimeoutError("still held")):
+            result = self.run_code("print('finished')")
+        self.assertEqual(result.code, ci_process.SUPERVISION_FAILURE)
+        self.assertIn("output cleanup failed", result.reason)
+        self.assertIn("finished", self.log.read_text(encoding="utf-8"))
+
     def test_log_limit_is_a_failure_instead_of_silent_truncation(self):
         with patch.object(ci_process, "MAX_LOG_BYTES", 1024):
             result = self.run_code("print('x'*8192)")

@@ -206,6 +206,7 @@ async fn worker_runtimes_renew_and_resume_shared_kernel_without_replaying_input_
         .submit(
             &actor,
             JobSubmission {
+                selection: None,
                 session_id: session.id,
                 request_id: RequestId::new("job").unwrap(),
                 expected_input_version: 0,
@@ -486,6 +487,7 @@ async fn worker_runtimes_renew_and_resume_shared_kernel_without_replaying_input_
         .submit(
             &actor,
             JobSubmission {
+                selection: None,
                 session_id: job.session_id,
                 request_id: RequestId::new("lost-renewal").unwrap(),
                 expected_input_version: 1,

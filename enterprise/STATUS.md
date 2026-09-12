@@ -281,3 +281,19 @@ A 1.5s post-commit delay under a 1s lease reproduced `LeaseExpired` while the Jo
 was already `Completed`. Final submission now closes new state/gateway admission
 and permits only a bounded acknowledgement wait. The target regression passes
 without extending database execution authority or replaying the final POST.
+
+## Public enterprise application
+
+- `EnterpriseApplication` connects verified delegated-user API tokens and BFF cookies to shared session creation/listing, atomic Job admission, public Job/input-version reads and policy-checked approval decisions. Public DTOs exclude Worker credentials, leases, configuration and private replay checkpoints.
+- PostgreSQL user-facing transactions now hold current organization policy/member checks through commit. A targeted old-revision/revoked-member regression failed before this change; refused session/input/Job actions now leave no new session facts.
+- Optional Agent/model selection is admitted atomically and included in request deduplication by both SQLite and PostgreSQL. Omission preserves existing session selection and old request digests. A focused SQLite regression reproduced ignored explicit selection before the implementation.
+- Real PostgreSQL/HTTPS fixtures cover two users, CAS/idempotency, configured input, cross-owner refusal, approval application restrictions, revocation and BFF application access. Standalone enterprise processes, production Worker/tool assembly, activity projection and remaining P3–P6 acceptance are still outstanding.
+- Documentation impact: both application guides, identity/state/wait/runtime references and preview navigation are updated. Publication remains disabled and personal platform commitments remain unchanged.
+
+PR #203's shared Windows arm64 CI-tool test found a transient stderr sharing
+violation after cancellation. Ignored temporary-directory cleanup hid the leftover
+capture until its parent's cleanup failed. An injected sharing violation reproduced
+the leftover directory. Cleanup now retries only sharing violations within the
+existing cleanup budget and reports a persistent failure instead of success.
+All 41 local CI-tool tests pass (three platform-specific tests skipped); native
+Windows rerun remains required. Both pipeline guides document the behavior.

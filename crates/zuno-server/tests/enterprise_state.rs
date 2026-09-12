@@ -46,6 +46,8 @@ use zuno_tool::{AllowAll, Tool, ToolContext, ToolOutput};
 use zuno_types::identity::*;
 use zuno_worker::{AccessTokenSource, WorkerClient};
 
+#[path = "enterprise_state/application.rs"]
+mod application;
 #[path = "enterprise_state/browser.rs"]
 mod browser;
 #[path = "enterprise_state/gateway.rs"]
@@ -351,6 +353,7 @@ async fn authenticated_workers_resume_the_kernel_over_https_without_database_cre
         .submit(
             &actor,
             JobSubmission {
+                selection: None,
                 session_id: session.id.clone(),
                 request_id: RequestId::new("input").unwrap(),
                 expected_input_version: 0,

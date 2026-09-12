@@ -125,6 +125,7 @@ pub(super) async fn seed_job(
         .submit(
             actor,
             JobSubmission {
+                selection: None,
                 session_id: session.id,
                 request_id: RequestId::new(format!("input-{name}")).unwrap(),
                 expected_input_version: 0,

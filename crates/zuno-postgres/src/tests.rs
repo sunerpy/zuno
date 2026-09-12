@@ -66,6 +66,26 @@ fn create(id: &str) -> CreateSession {
     }
 }
 
+/// Fixture setup only. Production bootstrap uses the schema-owner setup API.
+pub(crate) async fn install_access(admin: &PgPool, principal: &PrincipalScope) {
+    let apps = json!([principal.client_id().unwrap()]);
+    query(
+        "INSERT INTO zuno_enterprise_preview.organization_policy(
+             tenant_id,revision,allowed_apps,approval_apps,auto_read_apps,approval_lifetime_seconds)
+           VALUES($1,$2,$3,$3,$3,300) ON CONFLICT DO NOTHING",
+    )
+    .bind(principal.tenant_id().as_str())
+    .bind(i64::try_from(principal.policy_revision().get()).unwrap())
+    .bind(apps)
+    .execute(admin)
+    .await
+    .unwrap();
+    query("INSERT INTO zuno_enterprise_preview.organization_member(tenant_id,principal_id,role,active)
+           VALUES($1,$2,'member',true) ON CONFLICT DO NOTHING")
+        .bind(principal.tenant_id().as_str()).bind(principal.principal_id().as_str())
+        .execute(admin).await.unwrap();
+}
+
 #[tokio::test]
 #[ignore = "run scripts/check_enterprise_postgres.py to provide an isolated TLS PostgreSQL cluster"]
 async fn real_postgres_enforces_scopes_transactions_role_boundaries_and_schema_integrity() {
@@ -138,6 +158,7 @@ async fn real_postgres_enforces_scopes_transactions_role_boundaries_and_schema_i
     let other_alice = principal("organization-b", "alice");
     let workspace = WorkspaceId::new("workspace").unwrap();
     for principal in [&alice, &bob, &other_alice] {
+        install_access(&admin, principal).await;
         backend
             .register_workspace(principal, &workspace, "Workspace")
             .await

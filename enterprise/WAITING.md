@@ -81,8 +81,9 @@ obligations without spending another provider attempt.
 clients. Its provider must share the turn store's transaction domain. The producer
 must verify the actual operation, child or answer before publishing its result.
 Human approval readiness is integrated with the PostgreSQL state owner and shared
-driver. Public approval endpoints, production gateway dispatch, user-input
-adapters and cancellation/resume APIs still require their own consumers.
+driver. The [application API](APPLICATION.md) now supplies authenticated human
+approval endpoints. Production gateway dispatch, user-input adapters and
+cancellation/resume APIs still require their own consumers.
 
 ## Approval readiness
 

@@ -9,6 +9,9 @@ impl RuntimeStore for PostgresRuntimeStore {
     ) -> Result<RuntimeJob, ApplicationError> {
         self.check_owner(&principal.owner())?;
         request.configuration.validate()?;
+        if let Some(selection) = &request.selection {
+            selection.validate()?;
+        }
         if request.text.trim().is_empty()
             || request.text.len() > zuno_application::MAX_INPUT_BYTES
             || request.text.contains('\0')
@@ -49,8 +52,22 @@ impl RuntimeStore for PostgresRuntimeStore {
         let time = database_time(&mut tx).await?;
         let turn = format!("turn_{key}");
         let input = format!("msg_{key}");
-        let agent: Option<String> = session.try_get("agent").map_err(database_error)?;
-        let model: Option<Value> = session.try_get("model").map_err(database_error)?;
+        let (agent, model) = match &request.selection {
+            Some(selection) => (
+                Some(selection.agent.clone()),
+                Some(
+                    json!({"providerID":selection.model.provider_id,"modelID":selection.model.model_id}),
+                ),
+            ),
+            None => (
+                session
+                    .try_get::<Option<String>, _>("agent")
+                    .map_err(database_error)?,
+                session
+                    .try_get::<Option<Value>, _>("model")
+                    .map_err(database_error)?,
+            ),
+        };
         let prompt = json!({"kind":"user","prompt":{"text":request.text,"files":[],"agents":[]},"agent":agent,"model":model});
         let admitted = emit(&mut tx,principal,request.session_id.as_str(),"session.input.admitted",json!({
             "inputID":input,"prompt":prompt,"delivery":"queue","state":"queued","triggerKind":"user","timeCreated":time,

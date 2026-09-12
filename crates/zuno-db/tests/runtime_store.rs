@@ -82,6 +82,7 @@ fn fixture() -> Fixture {
 
 fn submission(session: &str, request: &str, version: u64) -> JobSubmission {
     JobSubmission {
+        selection: None,
         session_id: SessionId::new(session).unwrap(),
         request_id: RequestId::new(request).unwrap(),
         expected_input_version: version,
@@ -122,6 +123,61 @@ fn checkpoint(job: &RuntimeJob) -> RuntimeCheckpoint {
         schema_version: 2,
         reference: json!({"eventId":"fixture-boundary","sequence":1}),
     }
+}
+
+#[tokio::test]
+async fn explicit_selection_is_admitted_atomically_and_changed_replays_are_refused() {
+    use zuno_application::runtime::{JobInputModel, JobInputSelection};
+    let fixture = fixture();
+    let mut request = submission("ses_a", "selected-input", 0);
+    assert!(
+        serde_json::to_value(&request)
+            .unwrap()
+            .get("selection")
+            .is_none()
+    );
+    request.selection = Some(JobInputSelection {
+        agent: "research".to_owned(),
+        model: JobInputModel {
+            provider_id: "configured".to_owned(),
+            model_id: "model-v2".to_owned(),
+        },
+    });
+    let job = fixture
+        .store
+        .submit(&fixture.alice, request.clone())
+        .await
+        .unwrap();
+    let input = SessionInbox::new(fixture.pool.clone())
+        .get(job.session_id.as_str(), job.input_id.as_str())
+        .unwrap()
+        .unwrap();
+    assert_eq!(input.prompt["agent"], "research");
+    assert_eq!(
+        input.prompt["model"],
+        json!({"providerId":"configured","modelId":"model-v2"})
+    );
+    assert_eq!(
+        fixture
+            .store
+            .submit(&fixture.alice, request.clone())
+            .await
+            .unwrap(),
+        job
+    );
+    request.selection.as_mut().unwrap().model.model_id = "different".to_owned();
+    assert!(matches!(
+        fixture.store.submit(&fixture.alice, request).await,
+        Err(ApplicationError::Conflict)
+    ));
+    assert_eq!(
+        fixture
+            .store
+            .input_version(&fixture.alice.owner(), &job.session_id)
+            .await
+            .unwrap(),
+        1
+    );
 }
 
 #[tokio::test]

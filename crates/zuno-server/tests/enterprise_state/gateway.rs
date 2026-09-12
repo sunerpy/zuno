@@ -137,6 +137,7 @@ async fn gateway_requests_are_scoped_authenticated_and_still_require_current_hum
         .submit(
             &actor,
             JobSubmission {
+                selection: None,
                 session_id: session.id.clone(),
                 request_id: RequestId::new("job").unwrap(),
                 expected_input_version: 0,

@@ -94,6 +94,10 @@ pub struct JobSubmission {
     pub expected_input_version: u64,
     pub text: String,
     pub configuration: ConfigurationRef,
+    /// Host-validated Agent/model selection from the pinned configuration.
+    /// Absence retains the existing session selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<JobInputSelection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -147,11 +151,35 @@ pub struct JobInput {
     pub model: Option<JobInputModel>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct JobInputModel {
     pub provider_id: String,
     pub model_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobInputSelection {
+    pub agent: String,
+    pub model: JobInputModel,
+}
+
+impl JobInputSelection {
+    pub fn validate(&self) -> Result<(), ApplicationError> {
+        for value in [&self.agent, &self.model.provider_id, &self.model.model_id] {
+            if value.trim() != value
+                || value.is_empty()
+                || value.len() > 256
+                || value.chars().any(char::is_control)
+            {
+                return Err(ApplicationError::Invalid(
+                    "invalid Agent/model selection".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Configured positive lease lifetime. The database chooses the actual deadline.

@@ -6,6 +6,7 @@ mod authorization_tests;
 mod browser;
 #[cfg(test)]
 mod browser_tests;
+mod client;
 mod migration;
 mod operation;
 mod runtime;
@@ -172,7 +173,21 @@ async fn scoped_transaction(
     pool: &PgPool,
     principal: &PrincipalScope,
 ) -> Result<Transaction<'static, Postgres>, ApplicationError> {
-    owner_transaction(pool, &principal.owner()).await
+    let mut tx = owner_transaction(pool, &principal.owner()).await?;
+    let access = authorization::access_in(&mut tx, &principal.owner())
+        .await
+        .map_err(|error| match error {
+            ApplicationError::NotFound => ApplicationError::Forbidden,
+            other => other,
+        })?;
+    if zuno_permission::enterprise::actor_denial(&access.policy, &access.member, principal)
+        .is_some()
+    {
+        return Err(ApplicationError::Forbidden);
+    }
+    // access_in holds policy/member read locks through the data transaction.
+    // Revocation and resource mutation therefore cannot pass each other.
+    Ok(tx)
 }
 
 async fn owner_transaction(

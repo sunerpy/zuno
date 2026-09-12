@@ -56,7 +56,8 @@ PostgreSQL 只有在最新驱动事件恰好等于 Job 已提交的检查点、�
 
 `WaitCompletionStore` 是宿主服务，不向模型或任意客户端开放；其 provider 必须与回合
 存储属于同一事务域。Producer 必须先验证实际操作、子任务或回答。仅增加目标 enum
-并不表示人工审批／输入适配器以及取消／恢复 API 已经完成。
+人工审批端点现已接入[应用 API](APPLICATION.zh.md)；输入适配器以及取消／恢复 API
+仍需完成各自的调用方。
 
 ## 存储与验证
 

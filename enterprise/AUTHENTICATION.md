@@ -161,7 +161,10 @@ See [中文](AUTHENTICATION.zh.md) and [status](STATUS.md).
 
 Identity HTTP clients use `zuno-network` and honor the control-plane process proxy policy, including `NO_PROXY`. HTTPS, redirect refusal and request limits remain enforced by the identity adapter.
 
-Organization policy and durable approval storage are implemented separately; see [authorization](AUTHORIZATION.md). Resource/driver integration remains pending.
+Organization policy and durable approval storage are implemented separately; see
+[authorization](AUTHORIZATION.md). The [application adapter](APPLICATION.md) connects
+delegated-user API access and BFF cookies to the same session/Job/approval handlers,
+with current policy checks in the data transaction.
 
 ## Worker service and Job grants
 

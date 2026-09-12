@@ -38,7 +38,10 @@ Each application transaction sets its tenant and principal with transaction-loca
 settings. All data tables enable and force row security; application queries also
 filter ownership explicitly. Closing or rolling back a transaction clears its
 identity before the connection is reused. A scope value is attribution, not an
-authentication credential: the host must authenticate and authorize first.
+authentication credential: the host authenticates first. User-facing transactions
+also check organization membership, actor/application and policy revision under
+locks held through commit. Organization bootstrap must precede resource use.
+See the [application API](APPLICATION.md) for the connected public handlers.
 
 Creation receipts prevent changed-content reuse of an idempotency key. Input,
 admission event and caller attribution commit together. Event cursors are logical

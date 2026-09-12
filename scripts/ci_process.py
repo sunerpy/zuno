@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -116,6 +117,23 @@ def _copy_output(path, output, budget):
     return budget - copied, size > copied
 
 
+def _cleanup_capture(path, deadline):
+    """Wait only for transient Windows handle release within cleanup's budget."""
+    while True:
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            if getattr(error, "winerror", None) not in (32, 33):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("test output files are still held open") from error
+            time.sleep(min(0.01, remaining))
+
+
 def run(command, cwd, env, timeout, log_path, cancelled=None):
     """Run once, reap descendants, and preserve output without waiting for pipe EOF.
 
@@ -176,5 +194,15 @@ def run(command, cwd, env, timeout, log_path, cancelled=None):
                         code = SUPERVISION_FAILURE
                     reason = f"{reason or 'test ended'}; output exceeded {MAX_LOG_BYTES} bytes"
             if reason:
+                output.write(f"\nCI PROCESS: {reason}\n".encode("utf-8"))
+        try:
+            # Termination/accounting can precede release of inherited file
+            # handles. Do not report success while silently leaving captures
+            # that prevent a caller from removing its parent directory.
+            _cleanup_capture(temp, deadline)
+        except Exception as error:
+            code = SUPERVISION_FAILURE
+            reason = f"{reason or 'test ended'}; output cleanup failed: {error}"
+            with log_path.open("ab") as output:
                 output.write(f"\nCI PROCESS: {reason}\n".encode("utf-8"))
     return Result(code, time.monotonic() - began, reason)

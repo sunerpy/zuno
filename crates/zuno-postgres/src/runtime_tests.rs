@@ -36,6 +36,7 @@ fn duration() -> LeaseDuration {
 }
 fn submission(session: &SessionId, id: &str, version: u64) -> JobSubmission {
     JobSubmission {
+        selection: None,
         session_id: session.clone(),
         request_id: RequestId::new(id).unwrap(),
         expected_input_version: version,
@@ -79,6 +80,15 @@ async fn consume(admin: &PgPool, job: &RuntimeJob) {
         .execute(admin).await.unwrap();
 }
 pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool) {
+    for (tenant, subject) in [
+        ("runtime-concurrency", "alice"),
+        ("runtime-concurrency", "bob"),
+        ("runtime-recovery", "alice"),
+        ("runtime-recovery", "bob"),
+        ("runtime-fairness", "zz-active"),
+    ] {
+        crate::tests::install_access(admin, &principal(tenant, subject)).await;
+    }
     concurrency::exercise(backend, admin).await;
     recovery::exercise(backend, admin).await;
 }
