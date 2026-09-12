@@ -38,6 +38,8 @@ mod browser;
 mod completion;
 #[path = "processes/council.rs"]
 mod council;
+#[path = "processes/executable.rs"]
+mod executable;
 #[path = "processes/merge.rs"]
 mod merge;
 #[path = "processes/workflow.rs"]
@@ -317,7 +319,7 @@ async fn command(root: &Path, name: &str, service: ServiceRole) -> tokio::proces
         })
         .unwrap(),
     );
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_zuno-enterprise"));
+    let mut command = tokio::process::Command::new(executable::binary());
     command
         .arg("--config")
         .arg(file)
@@ -347,11 +349,13 @@ async fn run_once(root: &Path, name: &str, service: ServiceRole) -> Value {
     }
 }
 async fn spawn(root: &Path, name: &str, service: ServiceRole) -> tokio::process::Child {
-    command(root, name, service)
+    let mut child = command(root, name, service)
         .await
         .stdout(Stdio::null())
         .spawn()
-        .unwrap()
+        .unwrap();
+    executable::started(name, &mut child).await;
+    child
 }
 
 #[tokio::test]
@@ -511,7 +515,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
         &child_definition_file,
         serde_json::to_vec(&child_definition).unwrap(),
     );
-    let reference = tokio::process::Command::new(env!("CARGO_BIN_EXE_zuno-enterprise"))
+    let reference = tokio::process::Command::new(executable::binary())
         .arg("--definition-ref")
         .arg(&child_definition_file)
         .kill_on_drop(true)
@@ -996,4 +1000,5 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
     }
     issuer_stopped.fire();
     issuer_task.await.unwrap();
+    executable::finish(issuer.model_requests.load(Ordering::SeqCst));
 }

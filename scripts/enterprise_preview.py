@@ -11,10 +11,12 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import tomllib
 import urllib.error
 import urllib.request
 import zipfile
+import enterprise_artifact_smoke as artifact_smoke
 
 CHANNEL = "enterprise-preview"
 BRANCH = "codex/enterprise-preview"
@@ -120,6 +122,41 @@ def archive_name(data: dict, triple: str) -> str:
     return f"{data['binary']}-{data['version']}-{triple}.tar.gz"
 
 
+def smoke_name(data: dict, triple: str) -> str:
+    return archive_name(data, triple).removesuffix(".tar.gz") + ".smoke.json"
+
+
+def validate_smoke(dist: Path, data: dict, target: str, source: str) -> None:
+    path = dist / smoke_name(data, target)
+    require(path.is_file() and not path.is_symlink() and path.stat().st_size <= 16384,
+            "native smoke evidence is missing or invalid")
+    proof = json.loads(path.read_text(encoding="utf-8"))
+    archive = dist / archive_name(data, target)
+    require(proof.get("archive") == archive.name and proof.get("target") == target
+            and proof.get("sourceSha") == source
+            and proof.get("archiveSha256") == artifact_smoke.sha256(archive),
+            "native smoke evidence does not match this archive and source")
+    binary_sha = proof.get("binarySha256", "")
+    require(isinstance(binary_sha, str) and bool(re.fullmatch(r"[0-9a-f]{64}", binary_sha)),
+            "native smoke evidence lacks a binary digest")
+    with tempfile.TemporaryDirectory(prefix="zuno-preview-seal-") as temporary:
+        try:
+            _, extracted_sha = artifact_smoke.extract(archive, Path(temporary), target)
+        except ValueError as error:
+            raise InvalidPreview(str(error)) from error
+    require(binary_sha == extracted_sha, "native fixture proof names a different packaged binary")
+    try:
+        artifact_smoke.validate_proof(proof, binary_sha, data["version"])
+    except ValueError as error:
+        raise InvalidPreview(str(error)) from error
+    if os.environ.get("GITHUB_RUN_ID"):
+        require(proof.get("runId") == os.environ["GITHUB_RUN_ID"],
+                "native smoke evidence came from a different workflow")
+        require(0 < int(proof.get("runAttempt", "0"))
+                <= int(os.environ["GITHUB_RUN_ATTEMPT"]),
+                "native smoke evidence came from an invalid attempt")
+
+
 def documentation_blobs(root: Path, sha: str):
     """Package reviewed documents from the certified commit, not local state."""
     entries = subprocess.check_output(
@@ -155,6 +192,9 @@ def seal(root: Path, dist: Path, ref: str, sha: str) -> dict:
     expected = {archive_name(data, triple) for triple in TARGETS}
     found = {path.name for path in dist.iterdir() if path.name.endswith(".tar.gz")}
     require(found == expected, "candidate archives are missing or unexpected")
+    for target in TARGETS:
+        validate_smoke(dist, data, target, sha)
+        expected.add(smoke_name(data, target))
     docs = dist / "enterprise-docs.zip"
     with zipfile.ZipFile(docs, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, content in documentation_blobs(root, sha):
@@ -171,7 +211,7 @@ def seal(root: Path, dist: Path, ref: str, sha: str) -> dict:
         assets.append({
             "name": name,
             "bytes": size,
-            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "sha256": artifact_smoke.sha256(path),
         })
     manifest = {
         "schemaVersion": 1,
@@ -222,7 +262,10 @@ def verify(root: Path, dist: Path, ref: str, sha: str) -> dict:
         require(0 < int(manifest.get("runAttempt", "0"))
                 <= int(os.environ["GITHUB_RUN_ATTEMPT"]),
                 "candidate workflow attempt mismatch")
-    expected = {archive_name(data, target) for target in TARGETS} | {"enterprise-docs.zip"}
+    expected = {archive_name(data, target) for target in TARGETS} | {
+        smoke_name(data, target) for target in TARGETS} | {"enterprise-docs.zip"}
+    for target in TARGETS:
+        validate_smoke(dist, data, target, sha)
     assets = manifest.get("assets", [])
     require(len(assets) == len(expected)
             and {item.get("name") for item in assets} == expected,
@@ -232,7 +275,7 @@ def verify(root: Path, dist: Path, ref: str, sha: str) -> dict:
         path = dist / item["name"]
         require(path.is_file() and not path.is_symlink(), "archive must be a regular file")
         require(path.stat().st_size == item["bytes"], "candidate archive size mismatch")
-        require(hashlib.sha256(path.read_bytes()).hexdigest() == item["sha256"],
+        require(artifact_smoke.sha256(path) == item["sha256"],
                 "candidate archive digest mismatch")
         canonical += f"{item['sha256']}  {item['name']}\n"
     require((dist / "SHA256SUMS").read_text(encoding="utf-8") == canonical,

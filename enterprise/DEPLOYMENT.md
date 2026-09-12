@@ -161,3 +161,11 @@ internal completions; it does not enable distributed Council coordination.
 Optional `councils` installs native `council_run` with durable seats and completion-only repair/synthesis profiles. Model bindings, quorum, capacity and deadlines belong to the immutable definition. See [Council configuration](WORKFLOW.md#durable-council).
 
 Gateway `mergeParallelism` defaults to 2 and accepts 1–16 background merge tasks. The gateway drains these tasks on shutdown; their journal and receipts survive interruption. Control-plane `gatewayRootCertificate` configures an optional private CA for authenticated review downloads from the configured gateway. Omit it for system trust. Review downloads require no active Worker lease and expose no Worker credential to clients.
+
+Release artifact validation uses `scripts/enterprise_artifact_smoke.py --archive
+<archive> --target <native-linux-triple> --version <version> --source-sha <sha>
+--output <proof.json>`. It starts isolated PostgreSQL/rootless Docker and the
+existing native role fixture using the extracted binary. The default fixture
+profile is `release`; `--profile dev` is available for local driver checks. This
+does not publish or install the binary. Library/HTTP contract gates remain
+separate required checks.

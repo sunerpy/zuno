@@ -57,35 +57,25 @@ jobs:
           npx playwright install --with-deps chromium
           echo "ZUNO_ENTERPRISE_WEB_DIST=$GITHUB_WORKSPACE/enterprise/web/dist" >> "$GITHUB_ENV"
       - name: Ensure rootless prerequisites
-        run: |
-          set -euo pipefail
-          if [ ! -x "$ZUNO_POSTGRES_BINDIR/postgres" ]; then
-            sudo apt-get update
-            sudo env NEEDRESTART_MODE=l apt-get install -y --no-install-recommends postgresql-16 postgresql-client-16
-          fi
-          if ! command -v newuidmap || ! command -v newgidmap; then
-            sudo apt-get update
-            sudo env NEEDRESTART_MODE=l apt-get install -y --no-install-recommends uidmap
-          fi
-          if ! command -v dockerd-rootless.sh; then
-            sudo install -m 0755 -d /etc/apt/keyrings
-            curl --fail --silent --show-error --location https://download.docker.com/linux/ubuntu/gpg -o "$RUNNER_TEMP/docker.asc"
-            fingerprint="$(gpg --show-keys --with-colons "$RUNNER_TEMP/docker.asc" | awk -F: '$1 == "fpr" { print $10; exit }')"
-            test "$fingerprint" = 9DC858229FC7DD38854AE2D88D81803C0EBFCD88
-            sudo install -m 0644 "$RUNNER_TEMP/docker.asc" /etc/apt/keyrings/zuno-docker.asc
-            arch="$(dpkg --print-architecture)"
-            printf 'deb [arch=%s signed-by=/etc/apt/keyrings/zuno-docker.asc] https://download.docker.com/linux/ubuntu noble stable\n' "$arch" \
-              | sudo tee /etc/apt/sources.list.d/zuno-docker.list > /dev/null
-            sudo apt-get update
-            sudo env NEEDRESTART_MODE=l apt-get install -y --no-install-recommends docker-ce-rootless-extras
-          fi
-          runtime="/run/user/$(id -u)"
-          if [ ! -S "$runtime/bus" ]; then
-            sudo loginctl enable-linger "$(id -un)"
-            sudo systemctl start "user@$(id -u).service"
-          fi
-          test -S "$runtime/bus"
-          echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
-          docker --version
+        uses: ./.github/actions/enterprise-rootless
       - name: Verify isolated gateway and native recovery
         run: python3 scripts/check_enterprise_docker.py
+      - name: Verify the packaged native binary
+        run: |
+          set -euo pipefail
+          target="$(rustc -vV | sed -n 's/^host: //p')"
+          version="$(target/debug/zuno-enterprise --version)"
+          version="${version#zuno-enterprise }"
+          mkdir -p target/enterprise-artifact
+          archive="target/enterprise-artifact/zuno-enterprise-${version}-${target}.tar.gz"
+          tar --format=gnu -czf "$archive" -C target/debug zuno-enterprise
+          python3 scripts/enterprise_artifact_smoke.py \
+            --archive "$archive" --target "$target" --version "$version" \
+            --source-sha "$GITHUB_SHA" --profile dev \
+            --output "target/enterprise-artifact/${target}.smoke.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: enterprise-native-smoke-${{ runner.arch }}
+          path: target/enterprise-artifact/*.smoke.json
+          if-no-files-found: error
+          retention-days: 14

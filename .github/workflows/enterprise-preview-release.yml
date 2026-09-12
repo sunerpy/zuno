@@ -55,6 +55,11 @@ jobs:
     needs: [identify, client]
     if: needs.identify.outputs.publish == 'true'
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      ZUNO_POSTGRES_BINDIR: /usr/lib/postgresql/16/bin
+      CARGO_BUILD_TARGET: ${{ matrix.triple }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.identify.outputs.matrix) }}
@@ -75,6 +80,8 @@ jobs:
         with:
           prefix-key: enterprise-preview
           key: ${{ matrix.triple }}
+      - name: Ensure native smoke prerequisites
+        uses: ./.github/actions/enterprise-rootless
       - name: Build, package and execute the archive's binary
         env:
           TARGET: ${{ matrix.triple }}
@@ -82,20 +89,25 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --locked --release -p zuno-enterprise --bin zuno-enterprise --target "$TARGET"
-          mkdir -p dist unpacked package
+          mkdir -p dist package
           cp "target/$TARGET/release/zuno-enterprise" package/
           archive="zuno-enterprise-${VERSION}-${TARGET}.tar.gz"
-          tar -czf "dist/$archive" -C package zuno-enterprise
-          tar -xzf "dist/$archive" -C unpacked
-          test "$(unpacked/zuno-enterprise --version)" = "zuno-enterprise $VERSION"
-          unpacked/zuno-enterprise smoke
+          tar --format=gnu -czf "dist/$archive" -C package zuno-enterprise
+          python3 scripts/enterprise_artifact_smoke.py \
+            --archive "dist/$archive" --target "$TARGET" --version "$VERSION" \
+            --source-sha "$GITHUB_SHA" --profile release \
+            --output "dist/${archive%.tar.gz}.smoke.json"
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: dist/*.tar.gz
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.smoke.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: enterprise-preview-${{ matrix.triple }}
-          path: dist/*.tar.gz
+          path: |
+            dist/*.tar.gz
+            dist/*.smoke.json
           if-no-files-found: error
           retention-days: 30
   seal:
@@ -166,7 +178,7 @@ jobs:
         run: |
           set -euo pipefail
           python scripts/enterprise_preview.py verify
-          for artifact in dist/enterprise-preview/*.tar.gz dist/enterprise-preview/enterprise-docs.zip dist/enterprise-preview/candidate-manifest.json; do
+          for artifact in dist/enterprise-preview/*.tar.gz dist/enterprise-preview/*.smoke.json dist/enterprise-preview/enterprise-docs.zip dist/enterprise-preview/candidate-manifest.json; do
             gh attestation verify "$artifact" --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/enterprise-preview-release.yml"
           done

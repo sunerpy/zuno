@@ -129,3 +129,9 @@ Agent 的 `mode` 默认 `agent`，保留现有定义的规范化摘要。`mode: 
 可选 `councils` 安装原生 `council_run`，提供持久席位以及模型专用修正／综合。模型绑定、quorum、容量和期限由不可变定义控制，见 [Council 配置](WORKFLOW.zh.md#持久-council)。
 
 网关 `mergeParallelism` 默认 2，允许 1–16 个后台合并任务；退出时有界排空，日志和回执可在重启后恢复。控制面的 `gatewayRootCertificate` 可为配置网关的审批内容下载设置私有 CA，省略时使用系统信任库。查看变更不需要活跃 Worker 租约，客户端也不会收到 Worker 凭证。
+
+归档验证使用 `scripts/enterprise_artifact_smoke.py --archive <归档> --target
+<本机Linux目标> --version <版本> --source-sha <SHA> --output <proof.json>`，
+启动隔离 PostgreSQL／rootless Docker，并让已有原生角色 fixture 运行解包后的二进制。
+fixture 默认采用 `release` profile，本地驱动检查可用 `--profile dev`。这不会发布
+或安装二进制；库与 HTTP 契约仍由其他必需 gate 检查。
