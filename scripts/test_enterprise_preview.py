@@ -2,10 +2,13 @@
 
 from copy import deepcopy
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import subprocess
+import struct
+import tarfile
 import tempfile
 import unittest
 import zipfile
@@ -68,9 +71,27 @@ class PreviewTests(unittest.TestCase):
         dist = self.root / "dist"
         dist.mkdir()
         for target in preview.TARGETS:
-            (dist / preview.archive_name(self.manifest, target)).write_bytes(
-                ("packaged fixture " + target).encode()
-            )
+            binary = bytearray(64)
+            binary[:6] = b"\x7fELF\x02\x01"
+            struct.pack_into("<H", binary, 18, preview.artifact_smoke.TARGETS[target][1])
+            binary.extend(("fixture " + target).encode())
+            archive = dist / preview.archive_name(self.manifest, target)
+            with tarfile.open(archive, "w:gz") as package:
+                member = tarfile.TarInfo("zuno-enterprise")
+                member.size = len(binary)
+                member.mode = 0o755
+                package.addfile(member, io.BytesIO(binary))
+            evidence = {
+                "schemaVersion": 1, "kind": "enterprise-native-processes",
+                "binarySha256": hashlib.sha256(binary).hexdigest(),
+                "version": self.manifest["version"], "sourceSha": sha, "target": target,
+                "archive": archive.name, "archiveSha256": preview.artifact_smoke.sha256(archive),
+                "roles": ["control", "gateway", "worker-a", "worker-b"], "modelRequests": 40,
+                "runId": "42", "runAttempt": "1",
+                **{name: True for name in ["userIsolation", "humanApproval", "workflow",
+                                          "council", "workspaceMerge", "contentReview", "shutdown"]},
+            }
+            (dist / preview.smoke_name(self.manifest, target)).write_text(json.dumps(evidence))
         return dist, "refs/heads/" + preview.BRANCH, sha
 
     def test_disabled_channel_is_valid_but_cannot_publish(self):
@@ -168,7 +189,11 @@ class PreviewTests(unittest.TestCase):
         self.assertNotIn("--latest\n", workflow)
         self.assertNotIn("pull_request_target:", workflow)
         self.assertIn("needs.build.result == 'success'", workflow)
-        self.assertIn("unpacked/zuno-enterprise smoke", workflow)
+        self.assertNotIn("unpacked/zuno-enterprise smoke", workflow)
+        self.assertIn("scripts/enterprise_artifact_smoke.py", workflow)
+        self.assertIn('--archive "dist/$archive"', workflow)
+        self.assertIn("--source-sha \"$GITHUB_SHA\"", workflow)
+        self.assertIn("dist/*.smoke.json", workflow)
         self.assertIn("--signer-workflow", workflow)
         for name in ["release.yml", "release-candidate.yml", "publish-docs.yml"]:
             stable = (root / ".github/workflows" / name).read_text()
@@ -188,6 +213,25 @@ class PreviewTests(unittest.TestCase):
             self.assertIn(method, ["POST", "PATCH"])
             self.assertTrue(payload["prerelease"])
             self.assertEqual(payload["make_latest"], "false")
+
+    def test_native_evidence_is_required_and_binds_packaged_binary_and_role_execution(self):
+        dist, ref, sha = self.candidate()
+        target = next(iter(preview.TARGETS))
+        report = dist / preview.smoke_name(self.manifest, target)
+        original = report.read_text()
+        with patch.dict(os.environ, {}, clear=True):
+            report.unlink()
+            with self.assertRaisesRegex(preview.InvalidPreview, "smoke evidence"):
+                preview.seal(self.root, dist, ref, sha)
+            for change in [{"binarySha256": "f" * 64}, {"sourceSha": "f" * 40},
+                           {"workspaceMerge": False}, {"roles": ["control"]}]:
+                value = json.loads(original)
+                value.update(change)
+                report.write_text(json.dumps(value))
+                with self.assertRaises(preview.InvalidPreview):
+                    preview.seal(self.root, dist, ref, sha)
+            report.write_text(original)
+            preview.seal(self.root, dist, ref, sha)
 
     def test_public_release_and_mismatched_uploaded_assets_are_immutable(self):
         dist, ref, sha = self.candidate()

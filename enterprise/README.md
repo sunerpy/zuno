@@ -36,6 +36,21 @@ not validation. Enabling it requires a runnable capability set, matching Cargo
 versions, the complete target matrix, packaged-binary execution, checksums, and
 attestations. A branch name or successful unit test alone is not release proof.
 
+The release job packages a single executable in a GNU-format archive and invokes
+`scripts/enterprise_artifact_smoke.py`. The driver verifies the native ELF target,
+archive/binary SHA and version, then runs the unpacked binary for the isolated
+control plane, gateway and both Workers. The fixture checks Linux process
+executable identities and records successful runtime behavior before emitting
+evidence. A per-target `.smoke.json` binds that evidence to source SHA, archive
+bytes and workflow run. Sealing and promotion require matching evidence and
+checksums; release publishes the same attested artifacts without rebuilding.
+Preview PR CI also runs this archive driver against each native Linux test binary,
+so the amd64/arm64 execution path is exercised before publication is enabled.
+
+预览发布会直接运行归档中解包的二进制，检查 ELF 架构、版本、SHA 和四个独立服务的
+实际进程路径。每平台 `.smoke.json` 将运行证据绑定到源码、归档字节和工作流 run；
+seal 与 promotion 检查一致性，发布阶段不重新构建，也不依赖 tag 隐式触发其他流程。
+
 ## Architecture ownership
 
 The control plane owns authentication, authorization, approvals, durable state,

@@ -113,17 +113,26 @@ def main():
             # accidentally make the negative certificate-verification case pass.
             for variable in ["PGSSLROOTCERT", "PGSSLMODE", "PGPASSFILE"]:
                 environment.pop(variable, None)
-            subprocess.run(
-                ["cargo", "test", "-p", "zuno-postgres", "--lib", "--", "--include-ignored"],
-                cwd=repository, env=environment, check=True,
-            )
-            subprocess.run(
-                ["cargo", "test", "-p", "zuno-server", "--features", "enterprise", "--test", "enterprise_state", "--", "--include-ignored"],
-                cwd=repository, env=environment, check=True,
-            )
+            artifact = environment.get("ZUNO_ENTERPRISE_ARTIFACT_SMOKE") == "1"
+            if artifact and environment.get("ZUNO_GATEWAY_TEST_REQUIRED") != "1":
+                raise SystemExit("artifact smoke requires the native gateway fixture")
+            cargo = ["cargo", "test"]
+            if artifact:
+                cargo.append("--locked")
+            if artifact and environment.get("ZUNO_ENTERPRISE_SMOKE_PROFILE") == "release":
+                cargo.append("--release")
+            if not artifact:
+                subprocess.run(
+                    cargo + ["-p", "zuno-postgres", "--lib", "--", "--include-ignored"],
+                    cwd=repository, env=environment, check=True,
+                )
+                subprocess.run(
+                    cargo + ["-p", "zuno-server", "--features", "enterprise", "--test", "enterprise_state", "--", "--include-ignored"],
+                    cwd=repository, env=environment, check=True,
+                )
             if environment.get("ZUNO_GATEWAY_TEST_REQUIRED") == "1":
                 subprocess.run(
-                    ["cargo", "test", "-p", "zuno-enterprise", "--test", "processes", "--", "--include-ignored"],
+                    cargo + ["-p", "zuno-enterprise", "--test", "processes", "--", "--include-ignored"],
                     cwd=repository, env=environment, check=True,
                 )
         except subprocess.CalledProcessError as error:

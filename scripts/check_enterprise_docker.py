@@ -60,10 +60,11 @@ def main():
             raise SystemExit("refusing a non-rootless or unconfined Docker test backend")
         subprocess.run(docker + ["pull", IMAGE], check=True)
         environment["ZUNO_ROOTLESS_DOCKER_SOCKET"] = str(socket)
-        subprocess.run(
-            ["cargo", "test", "-p", "zuno-environment", "--", "--include-ignored"],
-            cwd=repository, env=environment, check=True,
-        )
+        if environment.get("ZUNO_ENTERPRISE_ARTIFACT_SMOKE") != "1":
+            subprocess.run(
+                ["cargo", "test", "-p", "zuno-environment", "--", "--include-ignored"],
+                cwd=repository, env=environment, check=True,
+            )
         # Require the complete authenticated gateway path in this native gate.
         # The PostgreSQL-only gate separately exercises the control API without
         # starting Docker; it cannot stand in for this execution evidence.
