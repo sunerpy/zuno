@@ -10,30 +10,27 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::Deserialize;
 use std::{collections::BTreeMap, sync::Arc};
+use zuno_application::api::{
+    ApprovalDecision, ApprovalView, InputVersionView, JobView, JobWaitView, SubmitTurn,
+    WorkspaceView,
+};
 use zuno_application::{
     AgentApplication, ApplicationError, CreateSession, PageSize, SessionCursor, SessionPage,
     SessionPageRequest, SessionSummary,
     activity::{ActivityPersistence, FrameQuery, HistoryQuery},
-    authorization::{
-        AnswerApproval, ApprovalAnswer, ApprovalBinding, ApprovalRecord, ApprovalState,
-        OrganizationStore,
-    },
+    authorization::{AnswerApproval, OrganizationStore},
     control::{CancelJob, CancellationReceipt, RuntimeControl},
-    runtime::{
-        ConfigurationRef, JobDispatcher, JobInputSelection, JobPhase, JobSubmission, RuntimeJob,
-    },
+    runtime::{ConfigurationRef, JobDispatcher, JobInputSelection, JobSubmission},
 };
 use zuno_identity::{AccessTokenVerifier, IdentityError, VerifiedIdentity, VerifiedIdentityKind};
 use zuno_memory::remote::{MemoryDataService, MemoryRequest, MemoryResponse};
-use zuno_permission::enterprise::{ApprovalAudience, actor_denial};
+use zuno_permission::enterprise::actor_denial;
 use zuno_postgres::PostgresBackend;
 use zuno_postgres::PostgresMemoryBackend;
 use zuno_types::identity::{
-    ApprovalId, InputId, JobId, PrincipalKey, PrincipalScope, RequestId, SessionId, TenantId,
-    TurnId, WorkspaceId,
+    ApprovalId, JobId, PrincipalKey, PrincipalScope, SessionId, TenantId, WorkspaceId,
 };
 
 pub const API_PREFIX: &str = "/api/v1";
@@ -120,6 +117,7 @@ impl EnterpriseApplication {
             .route("/sessions/{session}", get(session))
             .route("/sessions/{session}/input-version", get(input_version))
             .route("/sessions/{session}/turns", post(submit_turn))
+            .route("/sessions/{session}/requests/{request}", get(submission))
             .route("/sessions/{session}/history", get(history))
             .route("/sessions/{session}/frames", get(frames))
             .route("/sessions/{session}/live", get(live_progress))
@@ -288,81 +286,6 @@ async fn live_progress(
     ))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkspaceView {
-    pub id: WorkspaceId,
-    pub title: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct JobView {
-    pub id: JobId,
-    pub session_id: SessionId,
-    pub turn_id: TurnId,
-    pub input_id: InputId,
-    pub phase: JobPhase,
-    /// Decimal strings preserve exact counters in JavaScript clients.
-    pub input_version: String,
-    /// Public waiting coordinates, without arguments, checkpoints or grants.
-    pub waits: Vec<JobWaitView>,
-    pub stop_requested: bool,
-    pub pending_operations: Vec<zuno_types::identity::OperationId>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct JobWaitView {
-    pub invocation_id: zuno_types::identity::InvocationId,
-    pub target: zuno_types::wait::WaitTarget,
-}
-impl From<RuntimeJob> for JobView {
-    fn from(job: RuntimeJob) -> Self {
-        Self {
-            id: job.id,
-            session_id: job.session_id,
-            turn_id: job.turn_id,
-            input_id: job.input_id,
-            phase: job.phase,
-            input_version: job.input_version.to_string(),
-            waits: Vec::new(),
-            stop_requested: false,
-            pending_operations: Vec::new(),
-        }
-    }
-}
-impl From<zuno_postgres::ClientJobState> for JobView {
-    fn from(state: zuno_postgres::ClientJobState) -> Self {
-        let mut view = Self::from(state.job);
-        view.stop_requested = state.stop_requested;
-        view.pending_operations = state.pending_operations;
-        view.waits = state
-            .waits
-            .into_iter()
-            .map(|wait| JobWaitView {
-                invocation_id: wait.invocation_id,
-                target: wait.target,
-            })
-            .collect();
-        view
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct InputVersionView {
-    pub version: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SubmitTurn {
-    pub request_id: RequestId,
-    pub expected_input_version: String,
-    pub text: String,
-}
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ListSessions {
@@ -388,36 +311,19 @@ impl ListSessions {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ApprovalView {
-    pub id: ApprovalId,
-    pub binding: ApprovalBinding,
-    pub requester: PrincipalKey,
-    pub audience: ApprovalAudience,
-    pub state: ApprovalState,
-    pub presentation: Value,
-    pub expires_at_ms: i64,
-}
-impl From<ApprovalRecord> for ApprovalView {
-    fn from(value: ApprovalRecord) -> Self {
-        Self {
-            id: value.id,
-            binding: value.binding,
-            requester: value.requester.owner(),
-            audience: value.audience,
-            state: value.state,
-            presentation: value.presentation,
-            expires_at_ms: value.expires_at_ms,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ApprovalDecision {
-    pub request_id: RequestId,
-    pub answer: ApprovalAnswer,
+pub fn job_view(state: zuno_postgres::ClientJobState) -> JobView {
+    let mut view = JobView::from(state.job);
+    view.stop_requested = state.stop_requested;
+    view.pending_operations = state.pending_operations;
+    view.waits = state
+        .waits
+        .into_iter()
+        .map(|wait| JobWaitView {
+            invocation_id: wait.invocation_id,
+            target: wait.target,
+        })
+        .collect();
+    view
 }
 
 struct Failure(StatusCode);
@@ -600,9 +506,22 @@ async fn job(
     Path(job): Path<JobId>,
 ) -> Result<Json<JobView>, Failure> {
     let principal = service.principal(&identity).await?;
-    Ok(Json(
-        service.backend.client_job(&principal, &job).await?.into(),
-    ))
+    Ok(Json(job_view(
+        service.backend.client_job(&principal, &job).await?,
+    )))
+}
+async fn submission(
+    State(service): State<EnterpriseApplication>,
+    Extension(identity): Extension<VerifiedIdentity>,
+    Path((session, request)): Path<(SessionId, zuno_types::identity::RequestId)>,
+) -> Result<Json<JobView>, Failure> {
+    let principal = service.principal(&identity).await?;
+    Ok(Json(job_view(
+        service
+            .backend
+            .client_submission(&principal, &session, &request)
+            .await?,
+    )))
 }
 async fn approval(
     State(service): State<EnterpriseApplication>,

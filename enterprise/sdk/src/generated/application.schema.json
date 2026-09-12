@@ -1,0 +1,648 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ApplicationProtocol",
+  "type": "object",
+  "properties": {
+    "answer": {
+      "$ref": "#/$defs/ApprovalDecision"
+    },
+    "approval": {
+      "$ref": "#/$defs/ApprovalView"
+    },
+    "cancel": {
+      "$ref": "#/$defs/CancelJob"
+    },
+    "cancellation": {
+      "$ref": "#/$defs/CancellationReceipt"
+    },
+    "create_session": {
+      "$ref": "#/$defs/CreateSession"
+    },
+    "input_version": {
+      "$ref": "#/$defs/InputVersionView"
+    },
+    "job": {
+      "$ref": "#/$defs/JobView"
+    },
+    "session": {
+      "$ref": "#/$defs/SessionSummary"
+    },
+    "sessions": {
+      "$ref": "#/$defs/SessionPage"
+    },
+    "submit_turn": {
+      "$ref": "#/$defs/SubmitTurn"
+    },
+    "workspace": {
+      "$ref": "#/$defs/WorkspaceView"
+    }
+  },
+  "required": [
+    "workspace",
+    "session",
+    "sessions",
+    "create_session",
+    "job",
+    "submit_turn",
+    "input_version",
+    "approval",
+    "answer",
+    "cancel",
+    "cancellation"
+  ],
+  "$defs": {
+    "ApprovalAnswer": {
+      "type": "string",
+      "enum": [
+        "approve",
+        "reject"
+      ]
+    },
+    "ApprovalAudience": {
+      "type": "string",
+      "enum": [
+        "requester",
+        "designatedApprover"
+      ]
+    },
+    "ApprovalBinding": {
+      "description": "Stable authorization target. Attempt/worker/epoch are intentionally absent.\nThe execution permission check binds the current lease separately.",
+      "type": "object",
+      "properties": {
+        "argumentsSha256": {
+          "type": "string"
+        },
+        "effect": {
+          "$ref": "#/$defs/EffectKind"
+        },
+        "invocationId": {
+          "$ref": "#/$defs/InvocationId"
+        },
+        "jobId": {
+          "$ref": "#/$defs/JobId"
+        },
+        "operationId": {
+          "$ref": "#/$defs/OperationId"
+        },
+        "resourcesSha256": {
+          "description": "Digest of the gateway's resolved resource identities and versions.",
+          "type": "string"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "turnId": {
+          "$ref": "#/$defs/TurnId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "jobId",
+        "sessionId",
+        "turnId",
+        "invocationId",
+        "operationId",
+        "argumentsSha256",
+        "resourcesSha256",
+        "effect"
+      ]
+    },
+    "ApprovalDecision": {
+      "type": "object",
+      "properties": {
+        "answer": {
+          "$ref": "#/$defs/ApprovalAnswer"
+        },
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "requestId",
+        "answer"
+      ]
+    },
+    "ApprovalId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "ApprovalState": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "automatic",
+        "approved",
+        "rejected",
+        "expired",
+        "invalidated"
+      ]
+    },
+    "ApprovalView": {
+      "type": "object",
+      "properties": {
+        "audience": {
+          "$ref": "#/$defs/ApprovalAudience"
+        },
+        "binding": {
+          "$ref": "#/$defs/ApprovalBinding"
+        },
+        "expiresAtMs": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "id": {
+          "$ref": "#/$defs/ApprovalId"
+        },
+        "presentation": true,
+        "requester": {
+          "$ref": "#/$defs/PrincipalKey"
+        },
+        "state": {
+          "$ref": "#/$defs/ApprovalState"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "binding",
+        "requester",
+        "audience",
+        "state",
+        "presentation",
+        "expiresAtMs"
+      ]
+    },
+    "CancelJob": {
+      "type": "object",
+      "properties": {
+        "expectedTurnId": {
+          "$ref": "#/$defs/TurnId"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "requestId",
+        "expectedTurnId",
+        "reason"
+      ]
+    },
+    "CancellationReceipt": {
+      "description": "The logical tree is fenced when this receipt commits. External operations\nhave their own observed receipts; this does not claim their processes stopped.",
+      "type": "object",
+      "properties": {
+        "jobId": {
+          "$ref": "#/$defs/JobId"
+        },
+        "pendingOperations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/OperationId"
+          }
+        },
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "stoppedJobs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobId"
+          }
+        },
+        "turnId": {
+          "$ref": "#/$defs/TurnId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "requestId",
+        "jobId",
+        "turnId",
+        "stoppedJobs",
+        "pendingOperations"
+      ]
+    },
+    "CreateSession": {
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "title": {
+          "type": "string"
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "requestId",
+        "workspaceId",
+        "title"
+      ]
+    },
+    "EffectKind": {
+      "description": "Execution semantics supplied by a registered handler, never a UI hint or\nthe `readOnlyHint` annotation of an arbitrary remote MCP tool.",
+      "type": "string",
+      "enum": [
+        "fileRead",
+        "fileList",
+        "fileSearch",
+        "fileWrite",
+        "process",
+        "network",
+        "externalTool",
+        "memoryRead",
+        "memoryWrite",
+        "unknown"
+      ]
+    },
+    "InputId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "InputVersionView": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version"
+      ]
+    },
+    "InvocationId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "JobId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "JobPhase": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "running",
+        "waiting",
+        "paused",
+        "completed",
+        "failed",
+        "cancelled",
+        "uncertain"
+      ]
+    },
+    "JobView": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/JobId"
+        },
+        "inputId": {
+          "$ref": "#/$defs/InputId"
+        },
+        "inputVersion": {
+          "description": "Decimal strings preserve exact counters in JavaScript clients.",
+          "type": "string"
+        },
+        "pendingOperations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/OperationId"
+          }
+        },
+        "phase": {
+          "$ref": "#/$defs/JobPhase"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "stopRequested": {
+          "type": "boolean"
+        },
+        "turnId": {
+          "$ref": "#/$defs/TurnId"
+        },
+        "waits": {
+          "description": "Public waiting coordinates, without arguments, checkpoints or grants.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JobWaitView"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "sessionId",
+        "turnId",
+        "inputId",
+        "phase",
+        "inputVersion",
+        "waits",
+        "stopRequested",
+        "pendingOperations"
+      ]
+    },
+    "JobWaitView": {
+      "type": "object",
+      "properties": {
+        "invocationId": {
+          "$ref": "#/$defs/InvocationId"
+        },
+        "target": {
+          "$ref": "#/$defs/WaitTarget"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "invocationId",
+        "target"
+      ]
+    },
+    "OperationId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "PrincipalKey": {
+      "description": "A private resource's stable owner. This value is not a permission grant.",
+      "type": "object",
+      "properties": {
+        "principalId": {
+          "$ref": "#/$defs/PrincipalId"
+        },
+        "tenantId": {
+          "$ref": "#/$defs/TenantId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "tenantId",
+        "principalId"
+      ]
+    },
+    "RequestId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "SessionCursor": {
+      "description": "Both ordering keys are needed when sessions have equal timestamps.",
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "updatedAt": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "updatedAt",
+        "sessionId"
+      ]
+    },
+    "SessionId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "SessionPage": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SessionSummary"
+          }
+        },
+        "next": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionCursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "items"
+      ]
+    },
+    "SessionSummary": {
+      "description": "A session's public summary. Filesystem locations remain backend-owned.",
+      "type": "object",
+      "properties": {
+        "createdAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "id": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "title": {
+          "type": "string"
+        },
+        "updatedAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "workspaceId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkspaceId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "SubmitTurn": {
+      "type": "object",
+      "properties": {
+        "expectedInputVersion": {
+          "type": "string"
+        },
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "requestId",
+        "expectedInputVersion",
+        "text"
+      ]
+    },
+    "TenantId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "TurnId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "WaitTarget": {
+      "description": "Scheduling and UI can distinguish causes without inspecting tool names.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "approval_id": {
+              "$ref": "#/$defs/ApprovalId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "approval"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "approval_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "user_input"
+            },
+            "request_id": {
+              "$ref": "#/$defs/RequestId"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "request_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "job_id": {
+              "$ref": "#/$defs/JobId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "child"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "job_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "operation"
+            },
+            "operation_id": {
+              "$ref": "#/$defs/OperationId"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "operation_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "deadline_ms": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "kind": {
+              "type": "string",
+              "const": "timer"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "deadline_ms"
+          ]
+        }
+      ]
+    },
+    "WorkspaceId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "WorkspaceView": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/WorkspaceId"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title"
+      ]
+    }
+  },
+  "$id": "zuno-application-v1"
+}

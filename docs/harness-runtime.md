@@ -2981,3 +2981,6 @@ Enterprise Job cancellation uses the authenticated `RuntimeControl` port and a d
 Client activity now uses a separate typed public protocol. The kernel records adapter-owned action/source metadata on tool calls; PostgreSQL commits safe public projections with source state. Public history and committed-frame paging use logical counters, while private provider replay, Worker leases and configuration snapshots stay outside client DTOs. See `enterprise/ACTIVITY.md` in the preview archive.
 
 Enterprise Workers may publish bounded live snapshots independently of committed events. The data owner checks the originating message and active lease; execution changes retire drafts. Publication is optional through validated `liveMillis` and cannot block model work.
+
+
+The enterprise React workbench consumes public `AgentApplication` and activity DTOs generated from Rust. The optional control-plane Web adapter serves an immutable bundle alongside the same-origin OIDC BFF; UI actions still pass current data-owner authorization. Browser identity binding and abortable per-session subscriptions prevent stale account/session responses from steering current work. See `enterprise/WEB.md` in the preview archive.

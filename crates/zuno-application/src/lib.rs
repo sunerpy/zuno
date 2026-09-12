@@ -5,6 +5,7 @@
 //! paths. Drivers and clients do not acquire database connections through this API.
 
 pub mod activity;
+pub mod api;
 pub mod authorization;
 pub mod child;
 pub mod control;

@@ -32,6 +32,9 @@ use zuno_enterprise::config::*;
 use zuno_postgres::PostgresOptions;
 use zuno_types::identity::*;
 
+#[path = "processes/browser.rs"]
+mod browser;
+
 #[derive(Deserialize)]
 struct Fixture {
     admin_url: String,
@@ -63,6 +66,7 @@ struct Issuer {
     origin: String,
     key: KeyPair,
     model_requests: AtomicUsize,
+    codes: std::sync::Mutex<BTreeMap<String, browser::Code>>,
 }
 impl Issuer {
     fn token(&self, subject: &str, client: &str, user: bool) -> String {
@@ -76,9 +80,14 @@ impl Issuer {
             "scope":if user {"agent"} else {"service"},"iat":now,"exp":now+3600,
             "jti":uuid::Uuid::new_v4().to_string(),
         });
+        self.sign("at+jwt", claims)
+    }
+    fn sign(&self, typ: &str, claims: Value) -> String {
         let signed = format!(
             "{}.{}",
-            URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"at+jwt","kid":"native"}"#),
+            URL_SAFE_NO_PAD.encode(
+                serde_json::to_vec(&json!({"alg":"RS256","typ":typ,"kid":"native"})).unwrap()
+            ),
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
         );
         let mut signature = vec![0; self.key.public_modulus_len()];
@@ -94,7 +103,11 @@ impl Issuer {
     }
 }
 async fn metadata(State(issuer): State<Arc<Issuer>>) -> Json<Value> {
-    Json(json!({"issuer":issuer.origin,"jwks_uri":format!("{}/jwks",issuer.origin)}))
+    Json(
+        json!({"issuer":issuer.origin,"jwks_uri":format!("{}/jwks",issuer.origin),
+        "authorization_endpoint":format!("{}/authorize",issuer.origin),
+        "token_endpoint":format!("{}/token",issuer.origin),"response_types_supported":["code"]}),
+    )
 }
 async fn keys(State(issuer): State<Arc<Issuer>>) -> Json<Value> {
     let key =
@@ -132,6 +145,21 @@ async fn model(
             .iter()
             .any(|message| message["role"] == "tool" && message["tool_call_id"] == id)
     };
+    if user.contains("BROWSER-PROBE") {
+        let completed = has_tool("browser-command");
+        let delta = if completed {
+            assert!(body.to_string().contains("browser-operation-ok"));
+            json!({"role":"assistant","content":"BROWSER-COMPLETE: 已完成批准的命令。"})
+        } else {
+            json!({"role":"assistant","tool_calls":[{
+                "index":0,"id":"browser-command","type":"function","function":{
+                    "name":"environment_command",
+                    "arguments":json!({"argv":["sh","-c","printf 'browser-operation-ok\\n'"]}).to_string()
+                }
+            }]})
+        };
+        return model_response(delta, completed);
+    }
     let live_context = messages
         .iter()
         .filter(|message| message["role"] == "system" || message["role"] == "developer")
@@ -208,6 +236,9 @@ async fn model(
             }
         }]})
     };
+    model_response(delta, completed)
+}
+fn model_response(delta: Value, completed: bool) -> Response {
     let frames = [
         json!({"id":"native-response","object":"chat.completion.chunk","model":"model","choices":[{"index":0,"delta":delta,"finish_reason":null}]}),
         json!({"id":"native-response","object":"chat.completion.chunk","model":"model","choices":[{"index":0,"delta":{},"finish_reason":if completed {"stop"} else {"tool_calls"}}],
@@ -312,10 +343,13 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
         origin: format!("https://{issuer_address}"),
         key: KeyPair::generate(KeySize::Rsa2048).unwrap(),
         model_requests: AtomicUsize::new(0),
+        codes: Default::default(),
     });
     let routes = Router::new()
         .route("/.well-known/openid-configuration", get(metadata))
         .route("/jwks", get(keys))
+        .route("/authorize", get(browser::authorize))
+        .route("/token", post(browser::exchange))
         .route("/v1/chat/completions", post(model))
         .with_state(issuer.clone());
     let issuer_stopped = InterruptSignal::new();
@@ -420,6 +454,10 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
     let control_address = address();
     let gateway_address = address();
     let control_url = format!("https://{control_address}/");
+    let browser_assets = std::env::var_os("ZUNO_ENTERPRISE_WEB_DIST").map(PathBuf::from);
+    let browser_config = browser_assets
+        .as_ref()
+        .map(|_| browser::config(root, &fixture, &issuer, &control_url));
     let mut definition:Definition=serde_json::from_value(json!({
         "id":"native","version":1,"workspace":{"id":"workspace","title":"Workspace"},
         "agent":{"name":"build","systemPrompt":"Complete the user's task through approved tools.","maxSteps":8},
@@ -470,6 +508,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
             root,
             "control",
             ServiceRole::ControlPlane(Box::new(ControlConfig {
+                web_assets_directory: browser_assets,
                 memory: Default::default(),
                 tenant_id: tenant.clone(),
                 tls: fixture.tls(control_address),
@@ -504,7 +543,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
                     id: definition.id.clone(),
                     version: 1,
                 }],
-                browser: None,
+                browser: browser_config,
                 lease_millis: 30000,
             })),
         )
@@ -808,6 +847,16 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
         operations, 4,
         "one admitted execution per logical parent or child command"
     );
+    if std::env::var_os("ZUNO_ENTERPRISE_WEB_DIST").is_some() {
+        browser::verify(root, &control_url).await;
+        assert_eq!(issuer.model_requests.load(Ordering::SeqCst), 16);
+        let browser_operations:i64=query_scalar("SELECT count(*) FROM zuno_enterprise_preview.gateway_operation WHERE tenant_id=$1 AND completion IS NOT NULL")
+            .bind(tenant.as_str()).fetch_one(&admin).await.unwrap();
+        assert_eq!(
+            browser_operations, 5,
+            "one explicitly approved browser command"
+        );
+    }
     for child in &mut children {
         assert!(
             tokio::process::Command::new("kill")

@@ -146,7 +146,7 @@ pub(super) async fn exercise(context: Context<'_>) {
     let WaitTarget::Approval { approval_id } = &waits[0].target else {
         panic!("approval target")
     };
-    let visible = zuno_server::enterprise_application::JobView::from(
+    let visible = zuno_server::enterprise_application::job_view(
         context
             .backend
             .client_job(context.actor, &job.id)

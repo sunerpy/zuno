@@ -10,15 +10,19 @@ import { build } from "esbuild";
 const root = fileURLToPath(new URL("../../..", import.meta.url));
 const directory = fileURLToPath(new URL("../src/generated", import.meta.url));
 const checking = process.argv.includes("--check");
+for (const [name,crate,example,title,sourceName,validatorName,roots] of [
+  ["activity","zuno-types","activity_schema","ActivityProtocol","zuno-types/activity.rs","validators.mjs",["HistoryPage","FramePage","CommittedFrame","LiveFrame"]],
+  ["application","zuno-application","application_schema","ApplicationProtocol","zuno-application/api.rs","application-validators.mjs",["WorkspaceView","SessionSummary","SessionPage","JobView","ApprovalView","InputVersionView","CancellationReceipt"]],
+]) {
 const source = execFileSync(
-  "cargo", ["run", "--quiet", "-p", "zuno-types", "--example", "activity_schema"],
+  "cargo", ["run", "--quiet", "-p", crate, "--example", example],
   { cwd: root, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
 );
 const schema = JSON.parse(source);
-const id = "zuno-activity-v1";
+const id = `zuno-${name}-v1`;
 schema.$id = id;
-const types = await compile(schema, "ActivityProtocol", {
-  bannerComment: "/* Generated from zuno-types/activity.rs. Do not edit. */",
+const types = await compile(schema, title, {
+  bannerComment: `/* Generated from ${sourceName}. Do not edit. */`,
   unknownAny: true,
   additionalProperties: false,
 });
@@ -34,11 +38,15 @@ function portableFormats(value) {
     value.maximum = Math.min(value.maximum ?? 4294967295, 4294967295);
     delete value.format;
   }
+  if (value.format === "int64" || value.format === "uint64") {
+    value.minimum = Math.max(value.minimum ?? Number.MIN_SAFE_INTEGER, value.format === "uint64" ? 0 : Number.MIN_SAFE_INTEGER);
+    value.maximum = Math.min(value.maximum ?? Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);
+    delete value.format;
+  }
   for (const child of Object.values(value)) portableFormats(child);
 }
 portableFormats(validationSchema);
 ajv.addSchema(validationSchema, id);
-const roots = ["HistoryPage", "FramePage", "CommittedFrame", "LiveFrame"];
 const exports = Object.fromEntries(roots.map((name) => [`validate${name}`, `${id}#/$defs/${name}`]));
 const validators = standalone(ajv, exports);
 // Bundle generated helpers at build time. Browsers need no eval, runtime schema
@@ -49,15 +57,17 @@ const bundle = await build({
   minify: true, write: false, legalComments: "inline",
 });
 await mkdir(directory, { recursive: true });
-for (const [name, content] of [
-  ["activity.schema.json", `${JSON.stringify(schema, null, 2)}\n`],
-  ["activity.ts", types],
-  ["validators.mjs", `// Generated from the Rust client schema. Do not edit.\n${bundle.outputFiles[0].text}`],
+for (const [fileName, content] of [
+  [`${name}.schema.json`, `${JSON.stringify(schema, null, 2)}\n`],
+  [`${name}.ts`, types],
+  [validatorName, `// Generated from the Rust client schema. Do not edit.\n${bundle.outputFiles[0].text}`],
 ]) {
-  const path = resolve(directory, name);
+  const path = resolve(directory, fileName);
   if (checking) {
-    if (await readFile(path, "utf8") !== content) throw new Error(`${name} is out of date`);
+    if (await readFile(path, "utf8") !== content) throw new Error(`${fileName} is out of date`);
   } else {
     await writeFile(path, content);
   }
+}
+
 }

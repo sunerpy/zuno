@@ -11,6 +11,8 @@ export interface ActivityClientOptions {
   /** Omit for the same-origin BFF. Never persist bearer tokens in browser storage. */
   accessToken?: () => Promise<string>;
   fetch?: typeof globalThis.fetch;
+  /** Optional BFF identity compare-and-set; it restricts a request and grants no authority. */
+  browserContext?: () => string | undefined;
 }
 export interface PageOptions {
   limit?: number;
@@ -20,10 +22,11 @@ export interface PageOptions {
 /** Public activity client. It never accepts a database credential, lease,
  * Worker URL, host path, or a fallback endpoint. */
 export class ActivityClient {
-  private readonly base: URL;
+  protected readonly base: URL;
   private readonly request: typeof globalThis.fetch;
   constructor(private readonly options: ActivityClientOptions) {
     this.base = new URL(options.baseUrl);
+    if (options.accessToken && options.browserContext) throw new Error("Browser context belongs to the BFF");
     if (this.base.protocol !== "https:" || this.base.username || this.base.password || this.base.search || this.base.hash) {
       throw new Error("Enterprise activity requires a credential-free HTTPS API URL");
     }
@@ -90,10 +93,15 @@ export class ActivityClient {
     url.searchParams.set("limit", limit.toString());
     return url;
   }
-  private async get(url: URL, signal?: AbortSignal): Promise<unknown> {
+  protected async get(url: URL, signal?: AbortSignal, method = "GET", body?: unknown): Promise<unknown> {
     const headers = new Headers({ accept: "application/json" });
+    const context = this.options.browserContext?.();
+    if (context !== undefined) headers.set("x-zuno-browser-context", context);
     if (this.options.accessToken) headers.set("authorization", `Bearer ${await this.options.accessToken()}`);
+    if (body !== undefined) headers.set("content-type", "application/json");
+    if (method !== "GET" && !this.options.accessToken) headers.set("x-zuno-csrf", "1");
     const response = await this.request(url, {
+      method, body: body === undefined ? undefined : JSON.stringify(body),
       headers, credentials: this.options.accessToken ? "omit" : "same-origin",
       cache: "no-store", redirect: "error", signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
     });
@@ -101,6 +109,7 @@ export class ActivityClient {
       await response.body?.cancel();
       throw new EnterpriseHttpError(response.status);
     }
+    if (response.status === 204) return null;
     if (!response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
       await response.body?.cancel();
       throw new Error("Enterprise activity did not return JSON");

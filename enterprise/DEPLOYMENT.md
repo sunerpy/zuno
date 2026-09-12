@@ -76,6 +76,7 @@ Docker socket. See [environment requirements](ENVIRONMENTS.md).
 | `activeDefinitions` | Explicit `{id,version}` selections for new sessions |
 | `leaseMillis` | Database lease lifetime, 1000–300000; default 30000 |
 | `browser` | Optional OIDC BFF configuration |
+| `webAssetsDirectory` | Optional absolute Web bundle directory; requires `browser` |
 | `memory` | Optional transaction concurrency/deadline and character budgets; defaults documented in [Memory](MEMORY.md) |
 
 Key files contain raw key bytes. The HMAC authorities validate key sizes and
@@ -93,6 +94,9 @@ universal OAuth2 claims.
 An optional browser block supplies `authority`, `clientId`, `clientSecretFile`,
 `redirectUri`, `scopes`, optional `rootCertificate` and `encryptionKeys`. It uses
 OIDC code/PKCE and the same verified user policy. See [BFF contracts](BROWSER.md).
+The optional [Web workbench](WEB.md) is served at `/app/`; preview archives include
+its tested bytes under `web/`. Static resource deployment does not enable other
+enterprise routes or weaken authentication.
 
 ## Setup and identity
 
@@ -134,9 +138,8 @@ command and SIGTERM cleanup. This is fixture provider evidence,
 not a live Entra tenant.
 
 Remaining work includes richer workspace provisioning, background/shared Memory,
-distributed children/Workflow/Council, public transcript/live projection,
-React/ACP clients and the full failure matrix. No preview release is enabled by
-building this binary.
+approved child merges, distributed Workflow/Council, remaining Web/ACP features
+and the full failure matrix. No preview release is enabled by building this binary.
 
 See [中文](DEPLOYMENT.zh.md), [platforms](PLATFORMS.md) and [status](STATUS.md).
 

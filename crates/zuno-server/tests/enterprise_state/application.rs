@@ -309,6 +309,31 @@ async fn public_application_keeps_users_isolated_and_requires_current_policy_for
     let job: Value = response.json().await.unwrap();
     assert_eq!(job["inputVersion"], "1");
     assert_eq!(job["phase"], "ready");
+    let receipt_path = format!(
+        "sessions/{}/requests/{}",
+        session["id"].as_str().unwrap(),
+        input["requestId"].as_str().unwrap()
+    );
+    assert_eq!(
+        http.get(api(&receipt_path))
+            .bearer_auth("alice")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap(),
+        job
+    );
+    assert_eq!(
+        http.get(api(&receipt_path))
+            .bearer_auth("bob")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
     for private in [
         "lease",
         "grant",

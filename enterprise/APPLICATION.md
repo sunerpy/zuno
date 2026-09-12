@@ -29,6 +29,7 @@ bootstrap remains an explicit schema-owner operation.
 | `GET /sessions/{session}/live` | Current authorized transient snapshot |
 | `GET /sessions/{session}/input-version` | Exact CAS version |
 | `POST /sessions/{session}/turns` | Atomic input and Job admission |
+| `GET /sessions/{session}/requests/{request}` | Original authorized admission receipt after an uncertain response |
 | `GET /jobs/{job}` | Public Job identity, phase and input version |
 | `POST /jobs/{job}/cancel` | Durable tree cancellation, old-lease fencing and operation stop intent |
 | `GET /approvals/{approval}` | Authorized approval presentation |
