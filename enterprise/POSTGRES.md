@@ -237,3 +237,17 @@ one transaction per request. Actor/workspace checks, candidate CAS, source
 revalidation, consent, learning lease checks and result/audit commit stay together.
 Workers use internal protocol 6 and never receive this provider or pool.
 See [Memory](MEMORY.md) for implemented behavior and remaining producers.
+
+## Child execution-session binding
+
+Format 10 separates a native Job's parent session from the session its Worker
+executes. `runtime_job` keeps the logical `agent_job` foreign key independently
+of its input/session binding; `runtime_session` references the exact executing
+Job/session pair. Existing root rows keep the same identifiers and values.
+
+The format-9 fixture includes real private Memory and policy values along with
+the previous runtime history. Migration failure restores the old constraints
+and marker; success preserves all rows. A storage regression verifies that a
+child execution takes the child's slot while retaining its delegating parent.
+This schema boundary does not register a remote child-dispatch endpoint: atomic
+dispatch, persistent foreground waiting and completion delivery remain P4 work.

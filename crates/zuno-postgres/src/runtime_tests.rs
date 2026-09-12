@@ -1,5 +1,6 @@
 //! Real PostgreSQL storage contracts. Consumption simulates the kernel's
 //! materialization boundary; it does not certify a remote Agent Worker.
+mod children;
 mod concurrency;
 mod recovery;
 
@@ -91,4 +92,5 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool) {
     }
     concurrency::exercise(backend, admin).await;
     recovery::exercise(backend, admin).await;
+    children::execution_binding(backend, admin).await;
 }

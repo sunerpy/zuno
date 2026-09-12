@@ -354,3 +354,9 @@ CI run 34676688599 subsequently passed all gates at `9d558b7b360289dc9d6a428bc4f
 - The full rootless-Docker fixture passed with four real executable processes, two users, eight provider requests, private Memory read/update, refresh before the next request, revocation during command-approval waits and checkpoint continuation. Both Workers participated; each approved command ran once. This is local Linux evidence; native arm64 CI and release acceptance remain required.
 - Preview documentation packaging now includes tracked guides, example configurations and licenses from the certified Git commit. A regression reproduced the old four-file-only archive; the corrected archive excludes untracked files and local edits.
 - Background extraction producers, organization-shared Memory/approval, distributed children/Workflow/Council, richer workspaces, public transcript/live projection, React/ACP clients and remaining P6 acceptance are not complete. Publication remains disabled.
+
+## P4 child storage boundary in progress
+
+- A real PostgreSQL regression confirmed that the original root-only foreign key could not retain a parent session while executing in a separate child session.
+- The format-10 migration separates these bindings and keeps the native Job identity. The real PostgreSQL suite passed the child execution-slot regression and frozen format-9 rollback/preservation test, including private Memory; all five authenticated HTTP suites also passed.
+- Child dispatch/host integration, completion production and consumption, background delivery, Workflow/Council and environment merge remain unregistered pending their complete implementations and tests.
