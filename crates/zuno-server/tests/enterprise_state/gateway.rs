@@ -1,7 +1,10 @@
 use super::*;
 use zuno_application::{
     authorization::{AnswerApproval, ApprovalAnswer, ApprovalState, OrganizationStore},
-    environment::{CommandOperation, Environment, OperationAuthority, OperationPhase, wire::*},
+    environment::{
+        CommandOperation, Environment, OperationAuthority, OperationCompletionSink, OperationPhase,
+        wire::*,
+    },
 };
 use zuno_identity::gateway::{GatewayServiceAuthority, GatewayTicketAuthority};
 use zuno_server::{
@@ -12,6 +15,20 @@ use zuno_server::{
 use zuno_worker::gateway::{GatewayClient, GatewayStateClient};
 
 const IMAGE: &str = "public.ecr.aws/docker/library/alpine@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce";
+
+async fn lose_first_completion_response(
+    axum::extract::State(lost): axum::extract::State<Arc<std::sync::atomic::AtomicBool>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let completion = request.uri().path().ends_with("/gateway/v1/completion");
+    let response = next.run(request).await;
+    if completion && response.status().is_success() && !lost.swap(true, Ordering::SeqCst) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    response
+}
 
 struct Services;
 #[async_trait]
@@ -213,8 +230,16 @@ async fn gateway_requests_are_scoped_authenticated_and_still_require_current_hum
         tenant.clone(),
         LeaseDuration::new(300000).unwrap(),
     );
-    let (endpoint, control_server) =
-        tls_server(worker_state.router().merge(control.router()), &fixture).await;
+    let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let routes =
+        worker_state
+            .router()
+            .merge(control.router())
+            .layer(axum::middleware::from_fn_with_state(
+                lost.clone(),
+                lose_first_completion_response,
+            ));
+    let (endpoint, control_server) = tls_server(routes, &fixture).await;
     let certificate =
         reqwest::Certificate::from_pem(&std::fs::read(&fixture.root_certificate).unwrap()).unwrap();
     let worker = WorkerClient::new(
@@ -327,6 +352,7 @@ async fn gateway_requests_are_scoped_authenticated_and_still_require_current_hum
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     let mut host = None;
+    let mut delivery = None;
     let mut execution_server = None;
     let client = GatewayClient::new(Some(certificate)).unwrap();
     if let Some(socket) = socket {
@@ -339,6 +365,7 @@ async fn gateway_requests_are_scoped_authenticated_and_still_require_current_hum
         .await
         .unwrap();
         host = Some(service.environments());
+        delivery = Some(service.clone());
         execution_server = Some(
             tls_server_at(service.router(), &fixture, execution_listener)
                 .await
@@ -543,6 +570,47 @@ async fn gateway_requests_are_scoped_authenticated_and_still_require_current_hum
         .bind(tenant.as_str()).bind(actor.principal_id().as_str()).bind(job.session_id.as_str()).execute(&admin).await.unwrap();
     assert!(worker.gateway_ticket(&execution, &request).await.is_err());
     assert!(state.resolve(&issued.ticket, &request).await.is_err());
+    if let Some(delivery) = delivery {
+        assert!(
+            delivery.deliver_completions(128).await.is_err(),
+            "a lost post-commit response must remain unacknowledged at the gateway"
+        );
+        assert!(lost.load(Ordering::SeqCst));
+        assert_eq!(delivery.deliver_completions(128).await.unwrap(), 2);
+        assert_eq!(delivery.deliver_completions(128).await.unwrap(), 0);
+        let saved = backend
+            .gateway_operations(GatewayId::new("gateway").unwrap())
+            .completion(&actor.owner(), &command.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.receipt.exit_code, Some(0));
+        assert_eq!(saved.operation, command);
+        assert!(
+            backend
+                .gateway_operations(GatewayId::new("other-gateway").unwrap())
+                .complete(&saved)
+                .await
+                .is_err()
+        );
+        let mut forged = saved.clone();
+        forged.lease.attempt_id = ExecutionAttemptId::new("unadmitted-attempt").unwrap();
+        assert!(state.publish(&forged).await.is_err());
+        let mut changed = saved.clone();
+        changed.output = vec![zuno_application::environment::OperationOutput {
+            channel: zuno_application::environment::OutputChannel::Stdout,
+            bytes: b"changed".to_vec(),
+        }];
+        assert!(state.publish(&changed).await.is_err());
+        state.publish(&saved).await.unwrap();
+        let count:i64=sqlx_core::query_scalar::query_scalar(
+            "SELECT count(*) FROM zuno_enterprise_preview.event WHERE tenant_id=$1 AND principal_id=$2 AND type='runtime.operation.completed'",
+        ).bind(tenant.as_str()).bind(actor.principal_id().as_str()).fetch_one(&admin).await.unwrap();
+        assert_eq!(
+            count, 2,
+            "lost acknowledgements must not duplicate completion facts"
+        );
+    }
     if let Some(host) = host {
         let environment = host
             .get(&actor.owner(), &context.assignment.environment.id)

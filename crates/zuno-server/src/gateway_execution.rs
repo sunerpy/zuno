@@ -32,6 +32,12 @@ pub struct GatewayExecutionService {
     state: GatewayStateClient,
 }
 impl GatewayExecutionService {
+    /// Host lifecycle calls this bounded scan repeatedly with interruptible
+    /// backoff. Work is reconstructed from the ledger, not an in-memory list.
+    pub async fn deliver_completions(&self, limit: u32) -> Result<u32, ApplicationError> {
+        self.gateway.deliver_completions(&self.state, limit).await
+    }
+
     /// Host administration owns environment lifecycle; this is not an HTTP
     /// capability and is never installed in the Worker's tool registry.
     pub fn environments(&self) -> Arc<dyn EnvironmentProvider> {

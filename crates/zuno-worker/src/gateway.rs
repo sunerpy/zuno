@@ -145,6 +145,25 @@ impl OperationAuthority for GatewayStateClient {
     }
 }
 
+#[async_trait]
+impl zuno_application::environment::OperationCompletionSink for GatewayStateClient {
+    async fn publish(
+        &self,
+        completion: &zuno_application::environment::OperationCompletion,
+    ) -> Result<(), ApplicationError> {
+        completion.validate()?;
+        self.control
+            .post(
+                GATEWAY_COMPLETION_PATH,
+                None,
+                serde_json::to_vec(completion).map_err(ApplicationError::storage)?,
+            )
+            .await
+            .map_err(state_error)?;
+        Ok(())
+    }
+}
+
 /// Worker-facing execution client. Each request needs a separately minted
 /// ticket bound to its full payload; no OAuth access token is sent to the gateway.
 pub struct GatewayClient {

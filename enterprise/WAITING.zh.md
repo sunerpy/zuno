@@ -62,7 +62,7 @@ PostgreSQL 只有在最新驱动事件恰好等于 Job 已提交的检查点、�
 
 SQLite 复用有索引的不可变会话事件，稳定核心格式 14 与预览运行时扩展格式 1 分开管理。
 PostgreSQL 预览格式 5
-增加 `runtime_wait`、强制所有者 RLS、定时器／Job 索引及等待状态；当前 PostgreSQL 格式 7 还保存浏览器认证、规范化上下文和输入执行回执，格式 1–6 原子前向迁移。
+增加 `runtime_wait`、强制所有者 RLS、定时器／Job 索引及等待状态；当前 PostgreSQL 格式 8 还保存操作准入／结果、浏览器认证、规范化上下文和输入执行回执，格式 1–7 原子前向迁移。
 格式 4 fixture 固定原始回合 DDL 和 source digest，保留消息、签名 metadata、用量、
 Job 预算及租约状态。
 

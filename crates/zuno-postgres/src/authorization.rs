@@ -32,6 +32,17 @@ pub struct PostgresOrganizationStore {
     tenant: TenantId,
 }
 impl PostgresOrganizationStore {
+    /// Gateway authentication and assignment are checked by the host before
+    /// entering this atomic approval/admission transaction.
+    pub async fn check_gateway_execution(
+        &self,
+        proposal: ApprovalProposal,
+        admission: &zuno_application::environment::OperationAdmission,
+    ) -> Result<CheckedApproval, ApplicationError> {
+        approvals::check_execution_with_admission(self, &admission.lease, proposal, Some(admission))
+            .await
+    }
+
     pub(crate) fn new(pool: PgPool, tenant: TenantId) -> Self {
         Self { pool, tenant }
     }

@@ -121,6 +121,15 @@ pub(super) async fn check_execution(
     lease: &ExecutionLease,
     proposal: ApprovalProposal,
 ) -> Result<CheckedApproval, ApplicationError> {
+    check_execution_with_admission(store, lease, proposal, None).await
+}
+
+pub(super) async fn check_execution_with_admission(
+    store: &PostgresOrganizationStore,
+    lease: &ExecutionLease,
+    proposal: ApprovalProposal,
+    admission: Option<&zuno_application::environment::OperationAdmission>,
+) -> Result<CheckedApproval, ApplicationError> {
     proposal.validate()?;
     store.check_tenant(&lease.owner.tenant_id)?;
     let mut tx = owner_transaction(&store.pool, &lease.owner).await?;
@@ -202,8 +211,7 @@ pub(super) async fn check_execution(
     if valid_until_ms <= database_time(&mut tx).await? {
         return Err(ApplicationError::LeaseLost);
     }
-    tx.commit().await.map_err(database_error)?;
-    Ok(CheckedApproval {
+    let checked = CheckedApproval {
         approval_id: record.id,
         binding: record.binding,
         lease: ExecutionLease {
@@ -211,5 +219,13 @@ pub(super) async fn check_execution(
             ..lease.clone()
         },
         valid_until_ms,
-    })
+    };
+    if let Some(admission) = admission {
+        crate::operation::admit_in(&mut tx, &checked, admission).await?;
+    }
+    if valid_until_ms <= database_time(&mut tx).await? {
+        return Err(ApplicationError::LeaseLost);
+    }
+    tx.commit().await.map_err(database_error)?;
+    Ok(checked)
 }

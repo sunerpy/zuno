@@ -13,6 +13,8 @@ use zuno_types::identity::{
 
 use super::*;
 
+#[path = "tests/format_seven.rs"]
+mod format_seven;
 #[path = "tests/format_six.rs"]
 mod format_six;
 
@@ -298,6 +300,7 @@ async fn real_postgres_enforces_scopes_transactions_role_boundaries_and_schema_i
     format_four_upgrade(&fixture, &admin).await;
     format_five_upgrade(&fixture, &admin).await;
     format_six::upgrade(&fixture, &admin).await;
+    format_seven::upgrade(&fixture, &admin).await;
     let expected_count: i64 = query_scalar("SELECT count(*) FROM zuno_enterprise_preview.session")
         .fetch_one(&admin)
         .await

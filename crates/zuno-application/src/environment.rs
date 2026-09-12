@@ -147,6 +147,64 @@ pub struct OutputPage {
     pub end_of_available: bool,
 }
 
+/// Immutable facts captured by the execution owner. The original lease records
+/// attribution; a late receipt does not require that lease to remain active.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OperationCompletion {
+    pub lease: ExecutionLease,
+    pub operation: CommandOperation,
+    pub receipt: OperationReceipt,
+    pub output: Vec<OperationOutput>,
+    pub output_truncated: bool,
+}
+
+pub const MAX_COMPLETION_OUTPUT_BYTES: usize = 64 * 1024;
+pub const MAX_COMPLETION_OUTPUT_CHUNKS: usize = 8192;
+
+/// Frozen execution coordinates recorded by the authoritative approval writer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OperationAdmission {
+    pub gateway_id: zuno_types::identity::GatewayId,
+    pub lease: ExecutionLease,
+    pub environment: Environment,
+    pub operation: CommandOperation,
+}
+
+impl OperationCompletion {
+    pub fn validate(&self) -> Result<(), ApplicationError> {
+        self.operation.validate()?;
+        if self.receipt.id != self.operation.id
+            || self.receipt.environment_id != self.operation.environment_id
+            || !matches!(
+                self.receipt.phase,
+                OperationPhase::Completed | OperationPhase::Cancelled
+            )
+            || (self.receipt.phase == OperationPhase::Completed && self.receipt.exit_code.is_none())
+            || self.output.len() > MAX_COMPLETION_OUTPUT_CHUNKS
+            || self
+                .output
+                .iter()
+                .map(|chunk| chunk.bytes.len())
+                .sum::<usize>()
+                > MAX_COMPLETION_OUTPUT_BYTES
+        {
+            return Err(ApplicationError::Invalid(
+                "invalid bounded operation completion".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Only an authenticated execution owner can publish. A successful response
+/// means durable storage, not that a paused parent has already consumed it.
+#[async_trait]
+pub trait OperationCompletionSink: Send + Sync {
+    async fn publish(&self, completion: &OperationCompletion) -> Result<(), ApplicationError>;
+}
+
 /// The gateway provides facts; the control plane owns current authorization.
 /// Implementations must check the exact operation, resources and current lease.
 #[async_trait]

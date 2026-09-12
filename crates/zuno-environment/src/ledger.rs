@@ -1,5 +1,15 @@
 use crate::storage;
 const SCHEMA: &str = include_str!("schema.sql");
+const DELIVERY_SCHEMA: &str = include_str!("schema_delivery.sql");
+const FORMAT: i64 = 2;
+
+fn source_digest(version: i64) -> String {
+    if version == 1 {
+        zuno_orchestration::sha256_text(SCHEMA)
+    } else {
+        zuno_orchestration::sha256_text(&format!("{SCHEMA}\n{DELIVERY_SCHEMA}"))
+    }
+}
 
 fn manifest(connection: &Connection) -> Result<String, ApplicationError> {
     let mut query=connection.prepare(
@@ -26,7 +36,8 @@ use std::sync::Mutex;
 use zuno_application::ApplicationError;
 use zuno_application::environment::EnvironmentSnapshot;
 use zuno_application::environment::{
-    CommandOperation, Environment, EnvironmentSpec, OperationPhase, OperationReceipt,
+    CommandOperation, Environment, EnvironmentSpec, OperationCompletion, OperationPhase,
+    OperationReceipt,
 };
 use zuno_application::runtime::ExecutionLease;
 use zuno_types::identity::EnvironmentSnapshotId;
@@ -77,14 +88,21 @@ impl Ledger {
                     |row| Ok((row.get(0)?, row.get(1)?,row.get(2)?,row.get(3)?)),
                 )
                 .map_err(storage)?;
-            if version != 1
+            if !(1..=FORMAT).contains(&version)
                 || channel != "enterprise-preview"
-                || source != zuno_orchestration::sha256_text(SCHEMA)
+                || source != source_digest(version)
                 || expected != manifest(&tx)?
             {
                 return Err(ApplicationError::Invalid(
                     "unsupported execution ledger; preserve it for inspection".to_owned(),
                 ));
+            }
+            if version < FORMAT {
+                tx.execute_batch(DELIVERY_SCHEMA).map_err(storage)?;
+                tx.execute(
+                    "UPDATE gateway_format SET version=?1,source_digest=?2,manifest=?3 WHERE singleton=1 AND version=1",
+                    params![FORMAT,source_digest(FORMAT),manifest(&tx)?],
+                ).map_err(storage)?;
             }
         } else {
             let count: i64 = tx
@@ -100,9 +118,10 @@ impl Ledger {
                 ));
             }
             tx.execute_batch(SCHEMA).map_err(storage)?;
+            tx.execute_batch(DELIVERY_SCHEMA).map_err(storage)?;
             tx.execute(
-                "INSERT INTO gateway_format VALUES(1,1,'enterprise-preview',?1,?2)",
-                params![zuno_orchestration::sha256_text(SCHEMA), manifest(&tx)?],
+                "INSERT INTO gateway_format VALUES(1,?1,'enterprise-preview',?2,?3)",
+                params![FORMAT, source_digest(FORMAT), manifest(&tx)?],
             )
             .map_err(storage)?;
         }
@@ -270,6 +289,22 @@ impl Ledger {
         if active.is_some() || u64::try_from(stored).map_err(storage)? != revision {
             return Err(ApplicationError::Conflict);
         }
+        let pending: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM operation_delivery d JOIN operation o
+             ON o.tenant=d.tenant AND o.principal=d.principal AND o.id=d.operation_id
+             WHERE o.tenant=?1 AND o.principal=?2 AND o.environment_id=?3 AND d.acknowledged=0)",
+                params![
+                    owner.tenant_id.as_str(),
+                    owner.principal_id.as_str(),
+                    id.as_str()
+                ],
+                |row| row.get(0),
+            )
+            .map_err(storage)?;
+        if pending {
+            return Err(ApplicationError::Conflict);
+        }
         if state == "released" {
             return Ok(None);
         }
@@ -315,6 +350,145 @@ impl Ledger {
             .lock()
             .map_err(|_| ApplicationError::Unavailable)?;
         operation(&connection, owner, id)
+    }
+
+    pub(crate) fn scan_deliveries(&self, limit: u32) -> Result<Vec<Operation>, ApplicationError> {
+        if !(1..=128).contains(&limit) {
+            return Err(ApplicationError::Invalid(
+                "invalid delivery scan bound".to_owned(),
+            ));
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| ApplicationError::Unavailable)?;
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let keys = {
+            let mut query=tx.prepare(
+                "SELECT tenant,principal,operation_id FROM operation_delivery WHERE acknowledged=0
+                 ORDER BY scan_order,tenant,principal,operation_id LIMIT ?1",
+            ).map_err(storage)?;
+            query
+                .query_map([limit], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(storage)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(storage)?
+        };
+        let mut next: i64 = tx
+            .query_row(
+                "SELECT coalesce(max(scan_order),0) FROM operation_delivery",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(storage)?;
+        let mut result = Vec::with_capacity(keys.len());
+        for (tenant, principal, id) in keys {
+            let owner = PrincipalKey {
+                tenant_id: zuno_types::identity::TenantId::new(tenant).map_err(storage)?,
+                principal_id: zuno_types::identity::PrincipalId::new(principal).map_err(storage)?,
+            };
+            let id = OperationId::new(id).map_err(storage)?;
+            result.push(operation(&tx, &owner, &id)?);
+            next = next.checked_add(1).ok_or(ApplicationError::Conflict)?;
+            tx.execute("UPDATE operation_delivery SET scan_order=?4 WHERE tenant=?1 AND principal=?2 AND operation_id=?3",
+                params![owner.tenant_id.as_str(),owner.principal_id.as_str(),id.as_str(),next]).map_err(storage)?;
+        }
+        tx.commit().map_err(storage)?;
+        Ok(result)
+    }
+
+    pub(crate) fn completion(
+        &self,
+        owner: &PrincipalKey,
+        id: &OperationId,
+    ) -> Result<Option<OperationCompletion>, ApplicationError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| ApplicationError::Unavailable)?;
+        let (raw,digest):(Option<String>,Option<String>)=connection.query_row(
+            "SELECT completion,completion_digest FROM operation_delivery WHERE tenant=?1 AND principal=?2 AND operation_id=?3",
+            params![owner.tenant_id.as_str(),owner.principal_id.as_str(),id.as_str()],|row|Ok((row.get(0)?,row.get(1)?)),
+        ).map_err(storage)?;
+        let result = raw
+            .map(|raw| serde_json::from_str::<OperationCompletion>(&raw).map_err(storage))
+            .transpose()?;
+        if let Some(result) = &result {
+            result.validate()?;
+            if result.lease.owner != *owner
+                || result.operation.id != *id
+                || digest.as_deref()
+                    != Some(zuno_orchestration::sha256_json(&serde_json::json!(result)).as_str())
+            {
+                return Err(ApplicationError::Conflict);
+            }
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn capture(&self, completion: &OperationCompletion) -> Result<(), ApplicationError> {
+        completion.validate()?;
+        let owner = &completion.lease.owner;
+        let id = &completion.operation.id;
+        let digest = zuno_orchestration::sha256_json(&serde_json::json!(completion));
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| ApplicationError::Unavailable)?;
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let original = operation(&tx, owner, id)?;
+        if original.lease != completion.lease
+            || original.request != completion.operation
+            || original.receipt != completion.receipt
+        {
+            return Err(ApplicationError::Conflict);
+        }
+        let old:Option<String>=tx.query_row(
+            "SELECT completion_digest FROM operation_delivery WHERE tenant=?1 AND principal=?2 AND operation_id=?3",
+            params![owner.tenant_id.as_str(),owner.principal_id.as_str(),id.as_str()],|row|row.get(0),
+        ).map_err(storage)?;
+        if let Some(old) = old {
+            if old != digest {
+                return Err(ApplicationError::Conflict);
+            }
+        } else {
+            tx.execute(
+                "UPDATE operation_delivery SET completion=?4,completion_digest=?5 WHERE tenant=?1 AND principal=?2 AND operation_id=?3",
+                params![owner.tenant_id.as_str(),owner.principal_id.as_str(),id.as_str(),serde_json::to_string(completion).map_err(storage)?,digest],
+            ).map_err(storage)?;
+        }
+        tx.commit().map_err(storage)
+    }
+
+    pub(crate) fn acknowledge(
+        &self,
+        completion: &OperationCompletion,
+    ) -> Result<(), ApplicationError> {
+        completion.validate()?;
+        let owner = &completion.lease.owner;
+        let digest = zuno_orchestration::sha256_json(&serde_json::json!(completion));
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| ApplicationError::Unavailable)?;
+        let changed=connection.execute(
+            "UPDATE operation_delivery SET acknowledged=1 WHERE tenant=?1 AND principal=?2 AND operation_id=?3 AND completion_digest=?4",
+            params![owner.tenant_id.as_str(),owner.principal_id.as_str(),completion.operation.id.as_str(),digest],
+        ).map_err(storage)?;
+        if changed != 1 {
+            return Err(ApplicationError::Conflict);
+        }
+        Ok(())
     }
 
     pub(crate) fn admit(
@@ -387,6 +561,15 @@ impl Ledger {
             params![owner.tenant_id.as_str(),owner.principal_id.as_str(),request.id.as_str(),request.environment_id.as_str(),
                 digest,serde_json::to_string(&value).map_err(storage)?],
         ).map_err(storage)?;
+        tx.execute(
+            "INSERT INTO operation_delivery(tenant,principal,operation_id) VALUES(?1,?2,?3)",
+            params![
+                owner.tenant_id.as_str(),
+                owner.principal_id.as_str(),
+                request.id.as_str()
+            ],
+        )
+        .map_err(storage)?;
         tx.commit().map_err(storage)?;
         Ok(value)
     }
@@ -732,5 +915,212 @@ mod tests {
         ));
         drop(ledger);
         Ledger::open(&path).unwrap();
+    }
+
+    #[test]
+    fn release_cannot_discard_output_before_completion_is_durably_acknowledged() {
+        let (_directory, ledger, lease, request) = fixture();
+        ledger
+            .admit(&lease, &request, "container".to_owned())
+            .unwrap();
+        ledger.begin_start(&lease.owner, &request.id).unwrap();
+        ledger
+            .observed(
+                &lease.owner,
+                &request.id,
+                OperationPhase::Completed,
+                Some(0),
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                ledger.release(&lease.owner, &request.environment_id, 2, false),
+                Err(ApplicationError::Conflict),
+            ),
+            "the result owner must acknowledge completion before output containers can be removed"
+        );
+        let completion = OperationCompletion {
+            lease: lease.clone(),
+            operation: request.clone(),
+            receipt: ledger.operation(&lease.owner, &request.id).unwrap().receipt,
+            output: Vec::new(),
+            output_truncated: false,
+        };
+        ledger.capture(&completion).unwrap();
+        assert!(
+            ledger
+                .release(&lease.owner, &request.environment_id, 2, false)
+                .is_err()
+        );
+        ledger.acknowledge(&completion).unwrap();
+        ledger
+            .release(&lease.owner, &request.environment_id, 2, false)
+            .unwrap();
+    }
+
+    #[test]
+    fn captured_completion_survives_restart_and_only_matching_acknowledgement_releases_it() {
+        let (directory, ledger, lease, request) = fixture();
+        ledger
+            .admit(&lease, &request, "container".to_owned())
+            .unwrap();
+        ledger.begin_start(&lease.owner, &request.id).unwrap();
+        let receipt = ledger
+            .observed(
+                &lease.owner,
+                &request.id,
+                OperationPhase::Completed,
+                Some(0),
+            )
+            .unwrap();
+        let completion = OperationCompletion {
+            lease: lease.clone(),
+            operation: request.clone(),
+            receipt,
+            output: vec![zuno_application::environment::OperationOutput {
+                channel: zuno_application::environment::OutputChannel::Stdout,
+                bytes: b"saved output".to_vec(),
+            }],
+            output_truncated: false,
+        };
+        ledger.capture(&completion).unwrap();
+        drop(ledger);
+        let ledger = Ledger::open(&directory.path().join("gateway.sqlite")).unwrap();
+        assert_eq!(
+            ledger.completion(&lease.owner, &request.id).unwrap(),
+            Some(completion.clone())
+        );
+        assert_eq!(ledger.scan_deliveries(1).unwrap().len(), 1);
+        let mut changed = completion.clone();
+        changed.output[0].bytes = b"changed".to_vec();
+        assert!(ledger.capture(&changed).is_err());
+        assert!(ledger.acknowledge(&changed).is_err());
+        ledger.acknowledge(&completion).unwrap();
+        ledger.acknowledge(&completion).unwrap();
+        assert!(ledger.scan_deliveries(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn format_one_delivery_upgrade_preserves_rows_and_rolls_back_before_its_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        let (_fixture, ledger, lease, request) = fixture();
+        ledger
+            .admit(&lease, &request, "container".to_owned())
+            .unwrap();
+        ledger.begin_start(&lease.owner, &request.id).unwrap();
+        ledger
+            .observed(
+                &lease.owner,
+                &request.id,
+                OperationPhase::Completed,
+                Some(0),
+            )
+            .unwrap();
+        let operation = ledger.operation(&lease.owner, &request.id).unwrap();
+        let environment = ledger
+            .environment(&lease.owner, &request.environment_id)
+            .unwrap();
+        connection.execute(
+            "INSERT INTO environment(tenant,principal,id,spec,revision,state) VALUES(?1,?2,?3,?4,?5,'active')",
+            params![lease.owner.tenant_id.as_str(),lease.owner.principal_id.as_str(),request.environment_id.as_str(),
+                serde_json::to_string(&environment.spec).unwrap(),i64::try_from(environment.revision).unwrap()],
+        ).unwrap();
+        let raw = serde_json::to_string(&operation).unwrap();
+        connection.execute(
+            "INSERT INTO operation(tenant,principal,id,environment_id,request_digest,data) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![lease.owner.tenant_id.as_str(),lease.owner.principal_id.as_str(),request.id.as_str(),request.environment_id.as_str(),
+                zuno_orchestration::sha256_json(&serde_json::json!([lease.job_id,lease.session_id,request])),raw],
+        ).unwrap();
+        connection
+            .execute(
+                "INSERT INTO gateway_format VALUES(1,1,'enterprise-preview',?1,?2)",
+                params![
+                    "4ef57090d4688535586706bb476f6dddd394a795838d726b03f770901feccb4c",
+                    manifest(&connection).unwrap()
+                ],
+            )
+            .unwrap();
+        // Keep the injected trigger in the expected old manifest so validation
+        // succeeds and the actual marker write is what fails.
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_delivery_marker BEFORE UPDATE OF version ON gateway_format
+             BEGIN SELECT RAISE(ABORT,'injected marker failure'); END;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE gateway_format SET manifest=?1",
+                [manifest(&connection).unwrap()],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(Ledger::open(&path).is_err());
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT version FROM gateway_format", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(
+            !connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='operation_delivery')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT data FROM operation", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            raw
+        );
+        connection
+            .execute_batch("DROP TRIGGER reject_delivery_marker")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE gateway_format SET manifest=?1",
+                [manifest(&connection).unwrap()],
+            )
+            .unwrap();
+        drop(connection);
+        let migrated = Ledger::open(&path).unwrap();
+        assert_eq!(
+            migrated
+                .operation(&lease.owner, &request.id)
+                .unwrap()
+                .receipt,
+            operation.receipt
+        );
+        assert_eq!(migrated.scan_deliveries(1).unwrap().len(), 1);
+        assert!(
+            migrated
+                .release(&lease.owner, &request.environment_id, 2, false)
+                .is_err()
+        );
+        let connection = migrated.connection.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT version FROM gateway_format", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            FORMAT
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT data FROM operation", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            raw
+        );
     }
 }

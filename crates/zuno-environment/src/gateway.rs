@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, Weak};
 use zuno_application::ApplicationError;
 use zuno_application::environment::{
     CommandOperation, Environment, EnvironmentProvider, EnvironmentSnapshot, EnvironmentSpec,
-    OperationAuthority, OperationGateway, OperationPhase, OperationReceipt, OutputCursor,
-    OutputPage,
+    OperationAuthority, OperationCompletion, OperationCompletionSink, OperationGateway,
+    OperationPhase, OperationReceipt, OutputCursor, OutputPage,
 };
 use zuno_application::runtime::ExecutionLease;
 use zuno_types::identity::{EnvironmentId, EnvironmentSnapshotId, OperationId, PrincipalKey};
@@ -23,6 +23,68 @@ pub struct DockerGateway {
     snapshots: PathBuf,
 }
 impl DockerGateway {
+    /// Reconstruct delivery work from the ledger after a gateway restart. A
+    /// successful sink acknowledgement is persisted before output may be removed.
+    pub async fn deliver_completions(
+        &self,
+        sink: &dyn OperationCompletionSink,
+        limit: u32,
+    ) -> Result<u32, ApplicationError> {
+        let operations = self.ledger.scan_deliveries(limit)?;
+        let mut delivered = 0;
+        for operation in operations {
+            let completion = if let Some(completion) = self
+                .ledger
+                .completion(&operation.owner, &operation.request.id)?
+            {
+                completion
+            } else {
+                let receipt = self.observe(&operation).await?;
+                if !matches!(
+                    receipt.phase,
+                    OperationPhase::Completed | OperationPhase::Cancelled
+                ) {
+                    continue;
+                }
+                let mut page = if receipt.phase == OperationPhase::Cancelled
+                    && receipt.exit_code.is_none()
+                {
+                    OutputPage {
+                        chunks: Vec::new(),
+                        next: OutputCursor::default(),
+                        end_of_available: true,
+                    }
+                } else {
+                    self.output(
+                        &operation.owner,
+                        &operation.request.id,
+                        OutputCursor::default(),
+                        u32::try_from(zuno_application::environment::MAX_COMPLETION_OUTPUT_BYTES)
+                            .expect("bounded constant"),
+                    )
+                    .await?
+                };
+                let omitted_chunks =
+                    page.chunks.len() > zuno_application::environment::MAX_COMPLETION_OUTPUT_CHUNKS;
+                page.chunks
+                    .truncate(zuno_application::environment::MAX_COMPLETION_OUTPUT_CHUNKS);
+                let completion = OperationCompletion {
+                    lease: operation.lease,
+                    operation: operation.request,
+                    receipt,
+                    output: page.chunks,
+                    output_truncated: !page.end_of_available || omitted_chunks,
+                };
+                self.ledger.capture(&completion)?;
+                completion
+            };
+            sink.publish(&completion).await?;
+            self.ledger.acknowledge(&completion)?;
+            delivered += 1;
+        }
+        Ok(delivered)
+    }
+
     pub async fn connect(
         socket: &Path,
         ledger: &Path,

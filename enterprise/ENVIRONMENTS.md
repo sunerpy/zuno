@@ -98,3 +98,8 @@ in [gateway transport](GATEWAY.md). A request ticket does not bypass operation
 approval. The combined Docker gate also verifies the real HTTP path against a
 temporary PostgreSQL/TLS control plane. Role startup, Agent tool assembly and
 administrative cancellation remain separate delivery items.
+
+Ledger format 2 adds durable completion capture and acknowledgement. Environment
+release retains output until the result owner has acknowledged it. A bounded
+delivery scan survives restarts, and an unavailable response does not discard its
+pending item. See [operation results](OPERATION_RESULTS.md).

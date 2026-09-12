@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p3-gateway-transport`.
+- Current phase branch: `codex/enterprise-p3-operation-completion`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -230,6 +230,15 @@ preservation of a later-window update. A deterministic 1,000-path test separatel
 requires exactly one event per path within a window. Production watcher timing
 and delivery behavior are unchanged. Documentation impact is limited to this
 test-contract explanation; no user configuration or behavior changed.
+
+## Durable external operation results
+
+- Gateway PR #199 repaired CI `34661231045` passed all gates and merged at `5fe39c9d`. The user's Linux-enterprise/personal-Windows boundary is implemented separately in platform PR #200.
+- Gateway ledger format 2 persists pending/captured/acknowledged results and refuses environment cleanup before acknowledgement. PostgreSQL format 8 atomically records execution admission with approval checks, preserves admitted attempts and accepts matching late terminal facts after a Worker lease expires.
+- Verified results publish matching operation-wait facts through the existing runtime. Receipt, event and wakeup share one transaction; parent consumption remains separate. Changed output, wrong gateways and unadmitted attempts are rejected.
+- The full rootless Docker/PostgreSQL/HTTPS runner passed, including simulated response loss after control-plane commit, retry without duplicate events, old-lease receipts and both old-format migration/rollback fixtures. Workspace check and Clippy passed. Captured output is bounded and explicitly truncated.
+- Documentation/release checks, preview contracts, formatting and diff checks passed. Additional PostgreSQL tests verify early completion, receipt/readiness rollback and exactly one wait-completion fact.
+- Full Worker/command-dispatch consumption and a production delivery supervisor remain pending. This does not enable an enterprise runtime command or release.
 
 ## Platform boundary amendment
 
