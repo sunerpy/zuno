@@ -136,7 +136,14 @@ impl OperationAuthority for GatewayStateClient {
             .map_err(state_error)?;
         let checked: CheckedApproval =
             serde_json::from_slice(&bytes).map_err(ApplicationError::storage)?;
-        if checked.lease != *lease
+        if checked.lease.owner != lease.owner
+            || checked.lease.job_id != lease.job_id
+            || checked.lease.session_id != lease.session_id
+            || checked.lease.attempt_id != lease.attempt_id
+            || checked.lease.worker != lease.worker
+            || checked.lease.epoch != lease.epoch
+            || checked.lease.checkpoint_version != lease.checkpoint_version
+            || checked.lease.expires_at_ms < lease.expires_at_ms
             || checked.binding.operation_id != operation.id
             || checked.binding.invocation_id != operation.invocation_id
             || checked.binding.job_id != lease.job_id

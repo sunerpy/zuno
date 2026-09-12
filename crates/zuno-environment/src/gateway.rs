@@ -15,6 +15,10 @@ use zuno_application::environment::{
 use zuno_application::runtime::ExecutionLease;
 use zuno_types::identity::{EnvironmentId, EnvironmentSnapshotId, OperationId, PrincipalKey};
 
+#[cfg(test)]
+#[path = "gateway_tests.rs"]
+mod tests;
+
 pub struct DockerGateway {
     docker: Docker,
     ledger: Ledger,
@@ -33,6 +37,15 @@ impl DockerGateway {
         let operations = self.ledger.scan_deliveries(limit)?;
         let mut delivered = 0;
         for operation in operations {
+            let control = self.control(&operation.owner, &operation.request.environment_id)?;
+            let Ok(guard) = control.try_lock() else {
+                // The live submitter owns the created -> started boundary.
+                // Other environments must remain eligible for this scan.
+                continue;
+            };
+            let operation = self
+                .ledger
+                .operation(&operation.owner, &operation.request.id)?;
             let completion = if let Some(completion) = self
                 .ledger
                 .completion(&operation.owner, &operation.request.id)?
@@ -78,6 +91,7 @@ impl DockerGateway {
                 self.ledger.capture(&completion)?;
                 completion
             };
+            drop(guard);
             sink.publish(&completion).await?;
             self.ledger.acknowledge(&completion)?;
             delivered += 1;
@@ -627,7 +641,9 @@ impl OperationGateway for DockerGateway {
             .authorize(lease, &environment, &request)
             .await?;
         if !self.ledger.begin_start(&lease.owner, &request.id)? {
-            return self.inspect(&lease.owner, &request.id).await;
+            return self
+                .observe(&self.ledger.operation(&lease.owner, &request.id)?)
+                .await;
         }
         let result = self
             .docker
@@ -643,7 +659,8 @@ impl OperationGateway for DockerGateway {
             let current = self.ledger.operation(&lease.owner, &request.id)?;
             return self.observe(&current).await;
         }
-        self.inspect(&lease.owner, &request.id).await
+        self.observe(&self.ledger.operation(&lease.owner, &request.id)?)
+            .await
     }
 
     async fn inspect(
@@ -651,6 +668,9 @@ impl OperationGateway for DockerGateway {
         owner: &PrincipalKey,
         id: &OperationId,
     ) -> Result<OperationReceipt, ApplicationError> {
+        let operation = self.ledger.operation(owner, id)?;
+        let control = self.control(owner, &operation.request.environment_id)?;
+        let _guard = control.lock().await;
         self.observe(&self.ledger.operation(owner, id)?).await
     }
 
@@ -714,7 +734,10 @@ impl OperationGateway for DockerGateway {
             )
             .await
         {
-            Ok(_) => self.inspect(&lease.owner, id).await,
+            Ok(_) => {
+                self.observe(&self.ledger.operation(&lease.owner, id)?)
+                    .await
+            }
             Err(_) => self
                 .ledger
                 .observed(&lease.owner, id, OperationPhase::Uncertain, None),

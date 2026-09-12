@@ -309,3 +309,18 @@ Windows rerun remains required. Both pipeline guides document the behavior.
 - Public Job views now expose safe typed wait targets so clients can discover approval IDs. They still omit grants, checkpoints and private replay material. Full final-message/activity projection, workspace provisioning, enterprise Memory, distributed children/Workflow/Council, React/ACP and P6 acceptance remain outstanding.
 - Documentation impact: both deployment guides and typed templates, Worker/wait/state/application/runtime references and workspace inventories are updated. No release is enabled; documentation remains an isolated preview artifact.
 - Validation passed: enterprise configuration/budget tests, shared dispatch tests, real Docker/PostgreSQL/HTTPS/independent-process contracts, workspace check and Clippy, 100 documentation/release contracts, CI-tool and preview publisher tests, personal dependency isolation, formatting and diff checks. The explicit crate roster and both inventories now contain 55 crates. Remote CI remains required before integration.
+
+PR #204's independent-process CI reported uncertain Jobs on both Linux
+architectures. A controlled real-Docker regression reproduced receipt observation
+changing an active `Starting` operation to `Uncertain` before Docker start
+completed. Direct inspection now waits for the environment's submit boundary;
+background delivery skips it and continues other work. Observation refreshes the
+ledger under that boundary, preserving conservative recovery after a restart.
+
+Repeated native validation exposed a second cause: the authority returned an
+extended lease after renewal, while the gateway compared the entire lease for
+equality and rejected it. A deterministic renewal-between-authorization test
+reproduced `Forbidden`. The client now accepts only a non-shortening expiry with
+the same complete execution identity. The executable fixture renews every 100ms
+to exercise this boundary directly; persistent diagnostics retain ledger, Docker
+and driver facts if a future failure occurs.
