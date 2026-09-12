@@ -50,6 +50,8 @@ use zuno_worker::{AccessTokenSource, WorkerClient};
 mod application;
 #[path = "enterprise_state/browser.rs"]
 mod browser;
+#[path = "enterprise_state/children.rs"]
+mod children;
 #[path = "enterprise_state/gateway.rs"]
 mod gateway;
 #[path = "enterprise_state/worker_runtime.rs"]
@@ -375,6 +377,7 @@ async fn authenticated_workers_resume_the_kernel_over_https_without_database_cre
         LeaseDuration::new(30_000).unwrap(),
     )
     .with_memory(memory_backend)
+    .with_children(Arc::new(children::Catalog::new(configuration.clone())))
     .router()
     .route(
         "/failure/internal/worker/v1/claim",
@@ -695,6 +698,7 @@ async fn authenticated_workers_resume_the_kernel_over_https_without_database_cre
         runtime.get(&actor.owner(), &job.id).await.unwrap().phase,
         JobPhase::Completed
     );
+    children::exercise(&backend, &admin, &client, &actor, &configuration).await;
     server.abort();
     let _ = server.await;
 }

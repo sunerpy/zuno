@@ -549,6 +549,44 @@ pub struct ChildTurn {
     pub report_metadata: Option<Value>,
 }
 
+/// A foreground remote child has no tool result until the data owner consumes
+/// its completion. A background dispatch may return a ready Job handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChildTurnDispatch {
+    Ready(ChildTurn),
+    Pending(zuno_types::wait::WaitRef),
+}
+impl From<ChildTurn> for ChildTurnDispatch {
+    fn from(value: ChildTurn) -> Self {
+        Self::Ready(value)
+    }
+}
+impl ChildTurnDispatch {
+    pub fn into_ready(self) -> Result<ChildTurn, ChildTurnError> {
+        match self {
+            Self::Ready(turn) => Ok(turn),
+            Self::Pending(_) => Err(ChildTurnError::Host(
+                "this child requires a durable waiting dispatcher".to_owned(),
+            )),
+        }
+    }
+}
+
+pub enum TaskDispatch {
+    Ready(ToolOutput),
+    Pending(zuno_types::wait::WaitRef),
+}
+impl TaskDispatch {
+    fn into_output(self) -> Result<ToolOutput, ToolError> {
+        match self {
+            Self::Ready(output) => Ok(output),
+            Self::Pending(_) => Err(host_failure(ChildTurnError::Host(
+                "this task requires a durable waiting dispatcher".to_owned(),
+            ))),
+        }
+    }
+}
+
 /// The durable state reached by one delegated child.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildTurnState {
@@ -575,6 +613,14 @@ impl ChildTurnState {
 /// Why a dispatch could not produce a child turn.
 #[derive(Debug, thiserror::Error)]
 pub enum ChildTurnError {
+    #[error("child dispatch is not authorized")]
+    Denied,
+    #[error("child dispatch conflicts with current durable state")]
+    Conflict,
+    #[error("child state service is unavailable")]
+    Unavailable,
+    #[error("child admission has an unconfirmed outcome")]
+    Uncertain,
     /// The session layer refused or failed.
     #[error("{0}")]
     Host(String),
@@ -608,7 +654,7 @@ pub trait ChildTurnHost: Send + Sync + 'static {
         &self,
         request: ChildTurnRequest,
         interrupt: Arc<dyn InterruptHandle>,
-    ) -> Result<ChildTurn, ChildTurnError>;
+    ) -> Result<ChildTurnDispatch, ChildTurnError>;
 }
 
 /// A refusal, phrased so the caller can act on it without a recovery hook.
@@ -1113,12 +1159,21 @@ impl TaskTool {
         })
     }
 
+    pub async fn dispatch(
+        &self,
+        params: TaskParams,
+        ctx: ToolContext,
+    ) -> Result<TaskDispatch, ToolError> {
+        self.run_with_request(params, DelegationModelRequest::default(), ctx)
+            .await
+    }
+
     async fn run_with_request(
         &self,
         params: TaskParams,
         request: DelegationModelRequest,
         ctx: ToolContext,
-    ) -> Result<ToolOutput, ToolError> {
+    ) -> Result<TaskDispatch, ToolError> {
         params.contract.validate().map_err(reject)?;
         let background = params.background.unwrap_or(false);
         if !background && params.report_delivery.is_some() {
@@ -1187,6 +1242,31 @@ impl TaskTool {
             .await
             .map_err(host_failure)?;
 
+        let turn = match turn {
+            ChildTurnDispatch::Ready(turn) => turn,
+            ChildTurnDispatch::Pending(reference) => {
+                reference
+                    .validate()
+                    .map_err(|detail| host_failure(ChildTurnError::Host(detail.to_owned())))?;
+                if background
+                    || reference.invocation_id.as_str() != ctx.permission_origin().call_id()
+                    || !matches!(reference.target, zuno_types::wait::WaitTarget::Child { .. })
+                    || ctx
+                        .orchestration_snapshot()
+                        .is_some_and(|snapshot| snapshot.turn_id != reference.turn_id.as_str())
+                {
+                    return Err(host_failure(ChildTurnError::Host(
+                        "child wait does not belong to this foreground invocation".to_owned(),
+                    )));
+                }
+                return Ok(TaskDispatch::Pending(reference));
+            }
+        };
+        if !background && turn.state == ChildTurnState::Running {
+            return Err(host_failure(ChildTurnError::Host(
+                "foreground child is still running; return a durable Pending wait".to_owned(),
+            )));
+        }
         if background {
             let job = turn.job_id.as_deref().ok_or_else(|| {
                 host_failure(ChildTurnError::Host(
@@ -1203,7 +1283,9 @@ impl TaskTool {
             }
         }
 
-        Ok(render(&params, &plan, &turn, background))
+        Ok(TaskDispatch::Ready(render(
+            &params, &plan, &turn, background,
+        )))
     }
 }
 
@@ -1229,7 +1311,8 @@ impl TypedTool for TaskTool {
 
     async fn run(&self, params: TaskParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
         self.run_with_request(params, DelegationModelRequest::default(), ctx)
-            .await
+            .await?
+            .into_output()
     }
 }
 
@@ -1263,7 +1346,10 @@ impl TypedTool for SelectableTaskTool {
         ctx: ToolContext,
     ) -> Result<ToolOutput, ToolError> {
         let (params, request) = params.into_parts();
-        self.0.run_with_request(params, request, ctx).await
+        self.0
+            .run_with_request(params, request, ctx)
+            .await?
+            .into_output()
     }
 }
 
@@ -1289,6 +1375,29 @@ fn unrecoverable(rejection: TaskRejection) -> ToolError {
 }
 
 fn host_failure(error: ChildTurnError) -> ToolError {
+    match error {
+        ChildTurnError::Denied => {
+            return ToolError::Denied {
+                tool: WIRE_ID.to_owned(),
+                denial: None,
+            };
+        }
+        ChildTurnError::Unavailable => {
+            return ToolError::Transient {
+                tool: WIRE_ID.to_owned(),
+                retry_after: None,
+                source: Box::new(error),
+            };
+        }
+        ChildTurnError::Uncertain => {
+            return ToolError::Uncertain {
+                tool: WIRE_ID.to_owned(),
+                applied_paths: Vec::new(),
+                source: Box::new(error),
+            };
+        }
+        _ => {}
+    }
     ToolError::Failed {
         tool: WIRE_ID.to_owned(),
         source: Box::new(error),
@@ -1518,7 +1627,7 @@ impl ChildTurnHost for RecordingHost {
         &self,
         request: ChildTurnRequest,
         _interrupt: Arc<dyn InterruptHandle>,
-    ) -> Result<ChildTurn, ChildTurnError> {
+    ) -> Result<ChildTurnDispatch, ChildTurnError> {
         let background = request.background;
         let session_id = request
             .resume_session_id
@@ -1536,7 +1645,7 @@ impl ChildTurnHost for RecordingHost {
                 self.next_job.fetch_add(1, Ordering::Relaxed) + 1
             )
         };
-        Ok(ChildTurn {
+        Ok(ChildTurnDispatch::Ready(ChildTurn {
             job_id: background.then_some(job),
             state: if background {
                 ChildTurnState::Running
@@ -1548,7 +1657,7 @@ impl ChildTurnHost for RecordingHost {
                 .then(|| self.report_metadata.clone())
                 .flatten(),
             session_id,
-        })
+        }))
     }
 }
 

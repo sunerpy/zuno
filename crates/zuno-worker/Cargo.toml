@@ -23,6 +23,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 zuno-application = { workspace = true }
+zuno-agent = { workspace = true }
 zuno-auth = { workspace = true }
 zuno-engine = { workspace = true }
 zuno-error = { workspace = true }

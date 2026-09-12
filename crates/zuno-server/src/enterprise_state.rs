@@ -11,6 +11,9 @@ use axum::{
 };
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use zuno_application::child::{
+    ChildCommand, ChildDefinitionCatalog, ChildDispatchStore, ChildReply,
+};
 use zuno_application::runtime::{JobFinish, LeaseDuration, RuntimeStore};
 use zuno_engine::state::wire::{MAX_WORKER_FRAME_BYTES, StateRequest, StateResponse, execute};
 use zuno_engine::state::{TurnPersistence, TurnStateError, TurnStateScope};
@@ -35,6 +38,7 @@ pub struct WorkerStateService {
     tenant: TenantId,
     lease_duration: LeaseDuration,
     memory: Option<PostgresMemoryBackend>,
+    children: Option<Arc<dyn ChildDefinitionCatalog>>,
 }
 impl WorkerStateService {
     pub fn new(
@@ -51,11 +55,17 @@ impl WorkerStateService {
             tenant,
             lease_duration,
             memory: None,
+            children: None,
         }
     }
 
     pub fn with_memory(mut self, memory: PostgresMemoryBackend) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    pub fn with_children(mut self, children: Arc<dyn ChildDefinitionCatalog>) -> Self {
+        self.children = Some(children);
         self
     }
 
@@ -67,6 +77,9 @@ impl WorkerStateService {
             .route(&format!("/{FINISH_PATH}"), post(finish));
         if self.memory.is_some() {
             router = router.route(&format!("/{}", zuno_worker::MEMORY_PATH), post(memory_call));
+        }
+        if self.children.is_some() {
+            router = router.route(&format!("/{}", zuno_worker::CHILD_PATH), post(child_call));
         }
         router
             .layer(DefaultBodyLimit::max(MAX_WORKER_FRAME_BYTES))
@@ -93,6 +106,57 @@ impl WorkerStateService {
             .verify(worker, &token, now_ms()?)
             .map_err(auth_error)
     }
+}
+
+async fn child_call(
+    State(service): State<WorkerStateService>,
+    Extension(worker): Extension<AuthenticatedWorker>,
+    headers: HeaderMap,
+    Json(command): Json<ChildCommand>,
+) -> Result<Json<ChildReply>, ApiFailure> {
+    let grant = service.grant(&worker, &headers)?;
+    let runtime = service.backend.runtime(service.tenant.clone());
+    let reply = match command {
+        ChildCommand::Depth => ChildReply::Depth {
+            depth: runtime
+                .delegation_depth(grant.lease())
+                .await
+                .map_err(child_error)?,
+        },
+        ChildCommand::Dispatch {
+            agent,
+            model,
+            invocation,
+        } => {
+            let parent = runtime
+                .get(&grant.lease().owner, &grant.lease().job_id)
+                .await
+                .map_err(child_error)?;
+            let definition = service
+                .children
+                .as_ref()
+                .and_then(|catalog| {
+                    catalog.resolve(&parent.configuration, &agent, model.as_deref())
+                })
+                .ok_or(ApiFailure(StatusCode::FORBIDDEN))?;
+            ChildReply::Dispatch {
+                dispatch: runtime
+                    .dispatch_child(grant.lease(), *invocation, &definition)
+                    .await
+                    .map_err(child_error)?,
+            }
+        }
+    };
+    Ok(Json(reply))
+}
+fn child_error(error: zuno_application::ApplicationError) -> ApiFailure {
+    use zuno_application::ApplicationError as E;
+    ApiFailure(match error {
+        E::Forbidden | E::NotFound => StatusCode::FORBIDDEN,
+        E::Conflict | E::LeaseLost => StatusCode::CONFLICT,
+        E::Invalid(_) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    })
 }
 
 async fn memory_call(

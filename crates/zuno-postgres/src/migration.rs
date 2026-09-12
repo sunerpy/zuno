@@ -29,6 +29,7 @@ const BROWSER_TABLES: &[&str] = &["browser_login", "browser_session", "authentic
 const OPERATION_DDL: &str = include_str!("schema_operation.sql");
 const MEMORY_DDL: &str = include_str!("schema_memory.sql");
 const CHILD_DDL: &str = include_str!("schema_child.sql");
+const CHILD_TABLES: &[&str] = &["runtime_child"];
 const MEMORY_TABLES: &[&str] = &[
     "memory_policy",
     "session_memory_policy",
@@ -447,6 +448,7 @@ async fn grant_runtime(connection: &mut PgConnection, role: &str) -> Result<(), 
         .chain(CONTEXT_TABLES)
         .chain(BROWSER_TABLES)
         .chain(MEMORY_TABLES)
+        .chain(CHILD_TABLES)
         .chain(["gateway_operation", "gateway_operation_attempt"].iter())
         .chain(["organization_policy", "organization_audit"].iter())
     {
@@ -492,9 +494,17 @@ async fn install_turn(connection: &mut PgConnection) -> Result<(), ApplicationEr
 
 async fn install_children(connection: &mut PgConnection) -> Result<(), ApplicationError> {
     sqlx_core::raw_sql::raw_sql(CHILD_DDL)
-        .execute(connection)
+        .execute(&mut *connection)
         .await
         .map_err(database_error)?;
+    for table in CHILD_TABLES {
+        sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
+            "ALTER TABLE {PREVIEW_SCHEMA}.{table} ENABLE ROW LEVEL SECURITY;
+             ALTER TABLE {PREVIEW_SCHEMA}.{table} FORCE ROW LEVEL SECURITY;
+             CREATE POLICY owner_scope ON {PREVIEW_SCHEMA}.{table} USING ({POLICY}) WITH CHECK ({POLICY});
+             REVOKE ALL ON {PREVIEW_SCHEMA}.{table} FROM PUBLIC;"
+        ))).execute(&mut *connection).await.map_err(database_error)?;
+    }
     Ok(())
 }
 

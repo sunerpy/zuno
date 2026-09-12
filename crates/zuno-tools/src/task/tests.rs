@@ -1200,7 +1200,7 @@ async fn a_host_failure_is_reported_as_a_tool_failure() {
             &self,
             _request: ChildTurnRequest,
             _interrupt: Arc<dyn zuno_tool::InterruptHandle>,
-        ) -> Result<ChildTurn, ChildTurnError> {
+        ) -> Result<ChildTurnDispatch, ChildTurnError> {
             Err(ChildTurnError::UnknownSession("ses_gone".to_owned()))
         }
     }
@@ -1212,6 +1212,37 @@ async fn a_host_failure_is_reported_as_a_tool_failure() {
 
     assert!(matches!(error, ToolError::Failed { .. }));
     assert!(message(&error).contains("drop `task_id`"));
+}
+
+#[tokio::test]
+async fn foreground_running_text_is_not_a_completed_tool_result() {
+    struct EarlyHost;
+    #[async_trait]
+    impl ChildTurnHost for EarlyHost {
+        async fn delegation_depth(&self, _session: &str) -> Result<u32, ChildTurnError> {
+            Ok(0)
+        }
+        async fn dispatch(
+            &self,
+            _request: ChildTurnRequest,
+            _interrupt: Arc<dyn zuno_tool::InterruptHandle>,
+        ) -> Result<ChildTurnDispatch, ChildTurnError> {
+            Ok(ChildTurnDispatch::Ready(ChildTurn {
+                session_id: "child".to_owned(),
+                job_id: None,
+                state: ChildTurnState::Running,
+                output: "running".to_owned(),
+                report_metadata: None,
+            }))
+        }
+    }
+    let result = TaskTool::new(Arc::new(EarlyHost), facts())
+        .run(to_explorer(), allowed())
+        .await;
+    assert!(
+        result.is_err(),
+        "foreground dispatch must wait for a terminal result or return a typed pending wait"
+    );
 }
 
 // -- identity ------------------------------------------------------------

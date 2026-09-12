@@ -796,6 +796,12 @@ writer 拒绝符号链接越界。该能力不会授予 Shell 或源码写权限
 
 ## 后台子 Agent 与产品 Agent
 
+宿主边界区分 `ChildTurnDispatch::Ready` 与持久 `Pending(WaitRef)`。
+`TaskTool::dispatch` 为远程装配保留等待状态，前台 running 文本不能提前结算调用；
+本地 TypedTool 调用继续获得已完成输出。企业派发将子任务接纳与父等待检查点放在同一
+事务中，再由共享驱动把最终结果与后续检查点一起消费。已装配范围和工作区／Workflow
+后续工作见[企业子任务](../../../enterprise/CHILDREN.zh.md)。
+
 工具执行默认是至多一次。`ToolReplayPolicy::Never` 是默认值；只有显式声明为只读或幂等的工具才可以声明 `Safe`。
 
 副作用附近的超时或响应丢失属于结果不确定。这种情况会被持久化，要求检查权威状态，绝不机械重放调用。

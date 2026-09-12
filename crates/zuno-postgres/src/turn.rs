@@ -106,7 +106,10 @@ impl PostgresTurnPersistence {
         if created_at_ms < 0 {
             return Err(TurnStateError::InvalidData.into());
         }
-        if prompt.get("kind").and_then(Value::as_str) != Some("user") {
+        if !matches!(
+            prompt.get("kind").and_then(Value::as_str),
+            Some("user" | "delegation" | "completion")
+        ) {
             return Err(TurnStateError::InvalidData.into());
         }
         let text = prompt

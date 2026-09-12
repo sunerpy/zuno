@@ -455,13 +455,30 @@ impl TurnPersistence for PostgresTurnPersistence {
         let prompt: Value = row.try_get("prompt").map_err(sql_error)?;
         let phase: String = row.try_get("state").map_err(sql_error)?;
         if !matches!(phase.as_str(), "queued" | "promoted")
-            || prompt.get("kind").and_then(Value::as_str) != Some("user")
             || input.parts.len() != 1
             || input.parts[0].kind != PartKind::Text
             || input.parts[0].data.get("text") != prompt.pointer("/prompt/text")
         {
             return Err(TurnStateError::Conflict.into());
         }
+        match prompt.get("kind").and_then(Value::as_str) {
+            Some("user") => {}
+            Some("delegation") => {
+                crate::runtime::children::validate_delegation_input(&mut tx, &job, &prompt)
+                    .await
+                    .map_err(state_error)?
+            }
+            Some("completion") => {
+                crate::runtime::children::validate_completion_input(&mut tx, &job, &prompt)
+                    .await
+                    .map_err(state_error)?
+            }
+            _ => return Err(TurnStateError::InvalidData.into()),
+        }
+        input.message.data.insert("inputSource".to_owned(),json!({
+            "kind":prompt["kind"],"completion":prompt.get("completion"),
+            "parentSessionID":prompt.get("parentSessionID"),"parentJobID":prompt.get("parentJobID"),
+        }));
         for (field, key) in [("agent", "agent"), ("model", "model")] {
             if let Some(expected) = prompt.get(field).filter(|value| !value.is_null())
                 && input.message.data.get(key) != Some(expected)

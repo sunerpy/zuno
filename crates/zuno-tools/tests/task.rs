@@ -25,7 +25,7 @@ use zuno_tools::registry::{
     BUILTIN_ORDER, BuiltinSlot, DEFAULT_BUILTINS, RegistryFlags, ToolRegistryBuilder,
 };
 use zuno_tools::task::{
-    COORDINATOR, ChildTurn, ChildTurnError, ChildTurnHost, ChildTurnRequest, FixedFacts,
+    COORDINATOR, ChildTurnDispatch, ChildTurnError, ChildTurnHost, ChildTurnRequest, FixedFacts,
     GENERIC_EXECUTOR, RecordingHost, TaskTool, WIRE_ID, valid_targets,
 };
 
@@ -331,7 +331,7 @@ async fn a_child_session_cannot_delegate_again_at_the_default_bound() {
             &self,
             _request: ChildTurnRequest,
             _interrupt: Arc<dyn zuno_tool::InterruptHandle>,
-        ) -> Result<ChildTurn, ChildTurnError> {
+        ) -> Result<ChildTurnDispatch, ChildTurnError> {
             panic!("a delegation past the bound must never reach the host");
         }
     }

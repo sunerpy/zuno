@@ -1,5 +1,7 @@
 //! Tenant-bound scheduling in the data owner, never in an Agent Worker.
 
+mod admission;
+pub(crate) mod children;
 mod store;
 mod transactions;
 pub(crate) mod waiting;
