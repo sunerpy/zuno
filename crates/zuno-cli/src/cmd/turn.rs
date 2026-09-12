@@ -2434,6 +2434,13 @@ struct PromptRouting {
     content: String,
 }
 
+/// Returned by the same transaction that consumes the input. Capturing its
+/// cycle must not require a fallible read after the commit.
+struct UserInputCommit {
+    materialized: bool,
+    cycle_id: Option<String>,
+}
+
 struct DriveInputOptions<'a> {
     message_id: Option<&'a str>,
     content: Option<&'a [RequestContentBlock]>,
@@ -7601,22 +7608,23 @@ impl TurnHost {
         events: TurnEventSender,
     ) -> Result<(), String> {
         let mut driven_input_id = options.message_id.map(str::to_owned);
+        let mut driven_cycle_id = None;
         let result = async {
             self.require_active_extension_composition()?;
             self.preload_turn_skills(&[prompt], &events).await?;
             let (message, parts) =
                 self.prepare_turn_user_message(prompt, options.message_id, options.content)?;
             driven_input_id = Some(message.id.clone());
-            let materialized = match options.persistence {
+            let committed = match options.persistence {
                 UserInputPersistence::AdmitAndPromote => {
                     self.persist_user_input(&message, &parts)?
                 }
                 UserInputPersistence::AlreadyPromoted => {
-                    self.persist_promoted_user_input(&message, &parts)?;
-                    false
+                    self.persist_promoted_user_input(&message, &parts)?
                 }
             };
-            if materialized {
+            driven_cycle_id = committed.cycle_id;
+            if committed.materialized {
                 events
                     .publish(TurnEvent::SessionMaterialized {
                         session_id: self.session_id.clone(),
@@ -7640,22 +7648,50 @@ impl TurnHost {
             let receipts =
                 zuno_db::input_receipt::InputReceiptStore::new(Arc::clone(&self.database));
             if let Err(error) = &result {
-                receipts
-                    .fail_input(
-                        &self.session_id,
-                        &input_id,
-                        &redact_learning_text(error, self.credential.as_deref()),
-                        guard.interrupt_signal().is_set(),
-                        zuno_db::message::now_millis(),
-                    )
-                    .map_err(to_string)?;
+                let detail = redact_learning_text(error, self.credential.as_deref());
+                if let Some(cycle_id) = driven_cycle_id.as_deref() {
+                    // ReceiptCycle owns real engine failures. This outer owner
+                    // only settles pre-engine failures and may already have been
+                    // superseded by an explicit native recovery.
+                    receipts
+                        .fail_unapplied_input(
+                            &self.session_id,
+                            &input_id,
+                            cycle_id,
+                            &detail,
+                            guard.interrupt_signal().is_set(),
+                            zuno_db::message::now_millis(),
+                        )
+                        .map_err(to_string)?;
+                } else {
+                    receipts
+                        .fail_unrecorded_input(
+                            &self.session_id,
+                            &input_id,
+                            &detail,
+                            guard.interrupt_signal().is_set(),
+                            zuno_db::message::now_millis(),
+                        )
+                        .map_err(to_string)?;
+                }
             } else if receipts
                 .get(&self.session_id, &input_id)
                 .map_err(to_string)?
-                .is_some_and(|receipt| !receipt.state.is_terminal())
+                .is_some_and(|receipt| {
+                    !receipt.state.is_terminal() && receipt.execution_gate.is_none()
+                })
+                && !self
+                    .session_control
+                    .defer_input_at_execution_gate(
+                        &self.session_id,
+                        &input_id,
+                        zuno_db::message::now_millis(),
+                    )
+                    .map_err(to_string)?
+                && let Some(cycle_id) = driven_cycle_id
             {
-                receipts.fail_input(
-                    &self.session_id, &input_id,
+                receipts.fail_unapplied_input(
+                    &self.session_id, &input_id, &cycle_id,
                     "native processing stopped before this input was applied; its durable record was retained",
                     guard.interrupt_signal().is_set(), zuno_db::message::now_millis(),
                 ).map_err(to_string)?;
@@ -8047,7 +8083,7 @@ impl TurnHost {
         &mut self,
         message: &zuno_db::message::MessageRecord,
         parts: &[zuno_db::message::PartRecord],
-    ) -> Result<bool, String> {
+    ) -> Result<UserInputCommit, String> {
         let durable_input = zuno_db::inbox::NewSessionInput::new(
             format!("inp_{}", message.id),
             self.session_id.clone(),
@@ -8066,10 +8102,14 @@ impl TurnHost {
                 zuno_db::inbox::admit_and_promote_in(&transaction, durable_input)
                     .map_err(to_string)?;
                 persist_prepared_user_message(&transaction, message, parts).map_err(to_string)?;
-                self.activate_user_message_in(&transaction, &durable_input_id, message)?;
+                let cycle_id =
+                    self.activate_user_message_in(&transaction, &durable_input_id, message)?;
                 consume_promoted_input(&transaction, &self.session_id, &durable_input_id)?;
                 transaction.commit().map_err(to_string)?;
-                Ok(false)
+                Ok(UserInputCommit {
+                    materialized: false,
+                    cycle_id: Some(cycle_id),
+                })
             }
             SessionMaterializer::Pending(input) => {
                 let mut input = input.clone();
@@ -8095,13 +8135,17 @@ impl TurnHost {
                 zuno_db::inbox::admit_and_promote_in(&transaction, durable_input)
                     .map_err(to_string)?;
                 persist_prepared_user_message(&transaction, message, parts).map_err(to_string)?;
-                self.activate_user_message_in(&transaction, &durable_input_id, message)?;
+                let cycle_id =
+                    self.activate_user_message_in(&transaction, &durable_input_id, message)?;
                 consume_promoted_input(&transaction, &self.session_id, &durable_input_id)?;
                 transaction.commit().map_err(to_string)?;
                 self.memory_policy = memory_policy;
                 self.session_materializer = SessionMaterializer::Existing;
                 self.session_identity.mark_materialized();
-                Ok(true)
+                Ok(UserInputCommit {
+                    materialized: true,
+                    cycle_id: Some(cycle_id),
+                })
             }
         }
     }
@@ -8110,7 +8154,7 @@ impl TurnHost {
         &self,
         message: &zuno_db::message::MessageRecord,
         parts: &[zuno_db::message::PartRecord],
-    ) -> Result<(), String> {
+    ) -> Result<UserInputCommit, String> {
         if !self.session_identity.is_materialized() {
             return Err(format!(
                 "promoted input `{}` belongs to an unmaterialized session",
@@ -8122,7 +8166,7 @@ impl TurnHost {
         let mut message = message.clone();
         attach_promoted_task_report_metadata(&transaction, &mut message).map_err(to_string)?;
         persist_prepared_user_message(&transaction, &message, parts).map_err(to_string)?;
-        if zuno_db::inbox::read_in(&transaction, &self.session_id, &message.id)
+        let cycle_id = if zuno_db::inbox::read_in(&transaction, &self.session_id, &message.id)
             .map_err(to_string)?
             .is_some_and(|input| {
                 matches!(
@@ -8134,12 +8178,17 @@ impl TurnHost {
                             | zuno_db::inbox::DurableInputKind::HostMessage
                     )
                 )
-            })
-        {
-            self.activate_user_message_in(&transaction, &message.id, &message)?;
-        }
+            }) {
+            Some(self.activate_user_message_in(&transaction, &message.id, &message)?)
+        } else {
+            None
+        };
         consume_promoted_input(&transaction, &self.session_id, &message.id)?;
-        transaction.commit().map_err(to_string)
+        transaction.commit().map_err(to_string)?;
+        Ok(UserInputCommit {
+            materialized: false,
+            cycle_id,
+        })
     }
 
     fn activate_user_message_in(
@@ -8147,7 +8196,7 @@ impl TurnHost {
         transaction: &zuno_db::Transaction<'_>,
         input_id: &str,
         message: &zuno_db::message::MessageRecord,
-    ) -> Result<(), String> {
+    ) -> Result<String, String> {
         zuno_session_control::SessionControlService::activate_user_input_in(
             transaction,
             &self.session_id,
@@ -8161,7 +8210,7 @@ impl TurnHost {
             self.current_turn_identity(),
             message.time_created,
         )
-        .map(|_| ())
+        .map(|cycle| cycle.cycle_id)
         .map_err(to_string)
     }
 

@@ -41,9 +41,9 @@ logs include phase timings but omit selected values and credentials.
 
 A `session/prompt` that arrives while the session is already running is committed
 to the durable inbox, then steered at a safe point or left queued. Its RPC waits
-for that input's associated processing outcome and returns a legal `stopReason`;
-accepted content is no longer reported as a `-32001` busy error. Session-owned
-execution outlives an individual RPC observer. Responses include
+for that input's associated processing outcome; a normal completion returns a
+legal `stopReason`. Accepted content is no longer reported as a `-32001` busy error.
+Session-owned execution outlives an individual RPC observer. Responses include
 `_meta.zuno.receipt`, separating admitted, recorded, applied and terminal state.
 
 Normal prompts may set `_meta.zuno.messageId` (1–256 bytes). Retrying the same ID
@@ -164,6 +164,50 @@ internal request identity; an idempotent `_meta.zuno.messageId` retry still only
 observes the original durable input. Withdrawal cannot cancel an unrelated
 Agent-to-client RPC. `-32800` reports request withdrawal, not rollback of tool
 effects; use the durable receipt to observe execution.
+
+## Saved input and execution gates
+
+An input can be consumed into history while native execution is still gated.
+Its `InputAdmissionReceipt` remains `recorded`, with an optional `executionGate`;
+`appliedAt`, `completedAt`, and `turnId` are absent. The gate does not turn that
+saved, unapplied input into a `failed` receipt or prove that sampling started.
+
+For this case, `session/prompt` returns JSON-RPC error `-32005`. Its `error.data`
+contains `admission: "accepted"`, `reason: "executionGated"`,
+`recoveryRequired: true`, and the authoritative `receipt`. The message is
+already saved: do not resend it as a new input. Reconnecting and retrying the
+same `_meta.zuno.messageId` observes the original receipt.
+
+`executionGate` contains:
+
+| Field | Meaning |
+| --- | --- |
+| `reason` | `user`, `authentication`, `turn_budget`, `uncertain_side_effect`, `blocked`, `waiting_human`, `waiting_external`, `no_progress`, `no_executable_work`, or `execution_unavailable` |
+| `recovery` | `resume_work`, `resume_goal`, `start_work`, `resolve_human_request`, `wait_for_event`, `reauthenticate`, `inspect_outcome`, `review_budget`, or `inspect_session` |
+| `executionRevision`, `cycleId` | The native execution revision and cycle at the gate decision |
+| `requestId`, `sourceId` | Optional identity of the human request or external source being awaited |
+
+Recovery values are hints, not permission or a promise that one command clears
+the gate. `start_work` points to Plan authorization through Start Work, which
+`/resume` cannot grant. Ordinary `/resume` must pass the existing Work, Plan,
+Goal, wait, authentication, budget, blocked-state, and uncertain-outcome checks. Only then
+does it bind the matching gated, unapplied anchor to a new cycle without
+inserting the original text again. Until a real turn binds that input, duplicate
+observers can still receive the same gate; application and completion then
+advance through the normal receipt lifecycle. Existing `failed`, `cancelled`,
+`applied`, and `completed` receipts are not reset.
+
+This recovery does not change ordinary Stop: the next new message can run
+normally. An interrupted Goal still requires its explicit Goal recovery control,
+and old-cycle callbacks cannot revive stopped work.
+
+Automatic recognition of an old ordinary stop requires no failed bridge and
+sufficient evidence from the original cycle, native events, and timing.
+Existing v0.10.32 failed bridges lack complete preceding pause provenance;
+they and unknown pauses stay gated. Ordinary Work recovery requires explicit
+`/resume`, subject to all the checks above. It does not reopen old `failed`
+receipts. The reconnect and recovery behavior above applies to new gated inputs
+whose receipts remain `recorded`.
 
 ## Goal continuation
 

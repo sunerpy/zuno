@@ -18,6 +18,8 @@ const SESSION: &str = "ses_control";
 
 #[path = "control/goal_resume.rs"]
 mod goal_resume;
+#[path = "control/input_gate.rs"]
+mod input_gate;
 #[path = "control/questions.rs"]
 mod questions;
 #[path = "control/turn_boundaries.rs"]

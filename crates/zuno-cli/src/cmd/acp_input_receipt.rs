@@ -22,6 +22,7 @@ use super::{
 
 const RECEIPT_RECONCILE_INTERVAL: Duration = Duration::from_millis(100);
 const EXECUTION_OBSERVATION_UNAVAILABLE_CODE: i64 = -32004;
+const EXECUTION_GATED_CODE: i64 = -32005;
 
 pub(super) fn message_id(params: &Value) -> Result<Option<String>, RpcError> {
     let Some(meta) = params.get("_meta").filter(|meta| !meta.is_null()) else {
@@ -408,6 +409,21 @@ fn withdrawn(receipt: &InputAdmissionReceipt) -> RpcError {
 }
 
 fn terminal_response(receipt: &InputAdmissionReceipt) -> Option<Result<Value, RpcError>> {
+    if let Some(gate) = &receipt.execution_gate {
+        let mut error = accepted_error(
+            receipt,
+            RpcError {
+                code: EXECUTION_GATED_CODE,
+                message: gate.message().to_owned(),
+                data: None,
+            },
+        );
+        if let Some(data) = error.data.as_mut() {
+            data["reason"] = json!("executionGated");
+            data["recoveryRequired"] = json!(true);
+        }
+        return Some(Err(error));
+    }
     if !receipt.state.is_terminal() {
         return None;
     }

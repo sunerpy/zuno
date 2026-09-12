@@ -61,6 +61,15 @@ TUI 用 Ctrl+S 选择稍后，`/questions` 重开待答项。高亮、空输入�
 `in_progress` 都不是承接。受保护的等待、审批、认证、预算和未知副作用门禁保留。
 `/resume` 不能绕过待答条件、Plan 授权，也不能把未知副作用登记为已核验。
 
+旧普通暂停仅在真实用户输入提升时，且没有失败桥接、原始周期及原生事件／时间证据充分的
+情况下自动识别。后续正常回复本身不能证明暂停来源。既有 v0.10.32 failed 桥接未保留
+完整前序暂停来源：后来一个 scheduling 值相同的未知暂停，可能在桥接覆盖 `timeUpdated`
+后无法区分。因此匹配这些值不能证明来源连续，这些桥接和未知暂停仍保留门禁；
+普通 Work 恢复需要显式 `/resume`，且既有授权和安全审计全部保留。
+证据缺失、已裁剪、版本未知、改变或超出窗口时也保持暂停。审计不会扫描任意历史取消，
+不会重置或重放旧 failed 回执，不绕过 Goal 或人工请求授权，也不授权
+Automatic／Recovery 唤醒或旧 callback。
+
 终态 `bg output`、`bg wait`、callback 使用同一消费回执，并保留来源工作周期。
 格式 15 在一个原子前向迁移中升级受支持的 5–14 格式，保留用户原数据，最后更新格式标记。
 在既有输入回执、Context 快照和 Goal 恢复选择之上，新增 `session_work_cycle`、
@@ -68,9 +77,12 @@ TUI 用 Ctrl+S 选择稍后，`/questions` 重开待答项。高亮、空输入�
 迁移不调用模型、不批量晋升历史证据，也不恢复暂停 Goal。
 
 边界参考本地 Codex `9ba1d9eb5bbbd87ba2fc528d91ad239eea975ee9` 的
-`core/src/session/turn_input.rs`、`core/src/tasks/mod.rs` 与 TUI Goal 菜单；Goal 工具和提示词
-同时对照 `eaa8b6d91701d6cabe464141facc677e5915fbfc`。持久周期、报告转交回执及宿主阻塞
-计数是 Zuno 原生适配，不声称 Codex 提供相同数据库或协议接口。
+`protocol/src/turn_input.rs:178`：`TurnInputSubmission::Started` 与 `Steered`
+仅确认 Core 接收输入用于回合处理，不等待 hook、模型上下文更新、rollout 落盘或采样。
+`core/src/session/turn_input.rs` 另行区分 User/Automatic/Recovery；
+`core/src/tasks/mod.rs` 取消活跃工作，TUI Goal 菜单单独控制显式 Goal 恢复。
+Goal 工具和提示词同时对照 `eaa8b6d91701d6cabe464141facc677e5915fbfc`。持久周期、
+报告转交回执及宿主阻塞计数是 Zuno 原生适配，不声称 Codex 提供相同数据库或协议接口。
 
 `runtime.execution` 还会按最终工具快照为内置与自定义 Agent 生成简短降级规则：首选工具
 限速、不可用或暂时失败时，不原样重复调用。`tool_search` 可见时可以发现另一个已经授权的
@@ -217,9 +229,35 @@ TUI 保存请求前基线及当前请求的可替换用量快照。分批事件�
 
 `InputAdmissionReceipt` 分开记录 admitted、recorded、applied 与 completed/failed/cancelled。
 写入历史不代表模型已处理；实际 post-hook 请求建立应用事实，逻辑执行结束才结算完成。
-同周期恢复显式交接 owner，其他 turn 不能完成这条输入。标准 ACP prompt 等待真实结果，
-`session/steer` 即时返回接收；可选客户端消息 ID 按会话幂等，不按文本去重。
-观察者断线不等于撤回，也不能证明旧执行已结束。
+同周期恢复显式交接 owner，其他 turn 不能完成这条输入。可选客户端消息 ID 按会话幂等，
+不按文本去重。
+
+对已消费并写入历史、但从未应用的输入，原生 session-control 事务可以保存
+`session.input.execution_gate`（存储类型为 `session.input.execution_gate.1`），
+记录 input ID、gate 和时间；同一写事务快照读取执行资格并发布回执。
+可选 `InputAdmissionReceipt.executionGate` 从该持久事件投影，不改变 format 15
+或其 schema。回执保持 `recorded`，`appliedAt`、`completedAt`、`turnId` 缺省，
+不会仅因驱动遇到执行门禁、未发起采样而改为 `failed`。
+
+输入持久化事务把捕获的 cycle ID 随提交结果直接返回给驱动 owner，不依赖提交后可能
+失败的再次读取。迟到的失败兜底会在更新回执的事务内重新校验回执状态、gate、turn 绑定、
+输入的预期周期及当前会话周期；本地未捕获 cycle 时，也只允许仍未消费且未绑定的情况。
+已被替换的 owner 不能把原生恢复已接管的输入改为失败。
+
+`executionGate` 固定 `reason`、`recovery`、`executionRevision`、`cycleId`
+及可选 `requestId`／`sourceId`。类型化恢复值是诊断提示，不是授权。
+普通 `/resume` 先校验既有 Work revision、Plan 和 Goal 授权、精确人工／外部等待、
+认证、预算、blocked 状态及原生未知副作用核验证据；通过后才在同一事务中把匹配的 gated
+且未应用 anchor 迁入新周期，并记录 `session.input.execution_recovered`，
+不会重新准入或重复插入原文。真实 turn 绑定前 gate 仍可观察；绑定后由正常应用、
+完成路径推进。此路径不会重置 `failed`、`cancelled`、`applied`、`completed` 回执，
+也不会授权旧周期 callback。
+
+标准 ACP prompt 等待关联结果，其中包括已保存的执行门禁：门禁返回 `-32005`，
+error data 携带 `admission: "accepted"`、`reason: "executionGated"`、
+`recoveryRequired: true` 和 `receipt`，客户端不得重发已保存输入。
+同一消息 ID 的重复观察者在恢复交接空隙仍可收到相同 gate。
+`session/steer` 即时返回接收，不证明已经采样。观察者断线不等于撤回，也不能证明旧执行已结束。
 
 队列立即发送在同一准入事务中比较选中行的 revision 与界面显示的 turn id；失败则回滚行和事件，
 不改投新回合。空闲时先持有 run guard 再提升选中行，其他条目保持原准入顺序。消费时校验信号
