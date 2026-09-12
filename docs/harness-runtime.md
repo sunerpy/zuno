@@ -1353,6 +1353,27 @@ Duplicate message IDs observe the same gate even in the recovery handoff gap.
 Disconnect drops an observer; it is not implicit withdrawal or evidence that
 an old owner has stopped.
 
+ACP binds a `session/prompt` carrying ordinary `/resume` to the native resume
+control input (`ctl_…`) and its `InputAdmissionReceipt`. The session owns the FIFO
+driver, which uses a session-scoped client connection independently of the RPC
+observer. Losing that observer does not drop the drive future or implicitly
+cancel its client requests; this independence does not extend execution beyond
+closure of the ACP connection, runtime, or process. `ClientConnection::session_scoped`
+still shares disconnect state. Connection EOF allows up to 25 ms to drain ready
+requests before runtime shutdown cancels a running resume control. Its data and
+`cancelled` receipt remain durable; `session/load` does not replay that control.
+A `Queued` control is admission evidence, not
+completion: the prompt waits for its associated native execution to complete,
+wait for human input, be cancelled, or fail. Receipt and publication tracking
+keep the response behind the associated outcome and its pending updates, so an
+early `end_turn` cannot clear the client's busy state and Stop control.
+
+Explicit `$/cancel_request` remains bound to the control input contributed by
+that request. If execution has started, withdrawal checks the selected input at
+the cancellation boundary. `session/cancel` retains its exact-turn validation
+and legacy current-target capture; neither path arms cancellation for a later
+turn. An unrelated turn's completion cannot settle the resume control's receipt.
+
 Every multi-statement write transaction reserves SQLite's writer with `BEGIN IMMEDIATE`,
 including transactions opened through a caller-owned turn connection. This lets the configured
 busy timeout serialize concurrent parent and child writers before any read snapshot is taken;

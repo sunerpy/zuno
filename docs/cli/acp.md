@@ -197,6 +197,19 @@ observers can still receive the same gate; application and completion then
 advance through the normal receipt lifecycle. Existing `failed`, `cancelled`,
 `applied`, and `completed` receipts are not reset.
 
+When ordinary `/resume` is submitted through `session/prompt` and passes these
+checks, the RPC observes the native resume control's durable receipt. Queuing
+the control does not return `stopReason: "end_turn"`: the request stays pending
+until its associated native execution completes, waits for human input, is
+cancelled, or fails. Clients can keep the panel busy and retain Stop while the
+resumed work runs. Losing the RPC observer does not cancel session-owned
+execution; this applies to an individual observer, not closure of the ACP
+connection, runtime, or process. Connection EOF allows up to 25 ms to drain ready
+requests before runtime shutdown cancels a running resume control. Its data and
+`cancelled` receipt remain durable; `session/load` does not replay that control.
+Explicit `$/cancel_request` withdraws only that request's control;
+`session/cancel` still follows the exact-turn or legacy target rules above.
+
 This recovery does not change ordinary Stop: the next new message can run
 normally. An interrupted Goal still requires its explicit Goal recovery control,
 and old-cycle callbacks cannot revive stopped work.

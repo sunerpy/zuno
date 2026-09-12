@@ -2403,6 +2403,11 @@ fn runtime_consistency_guides_publish_the_native_contracts_and_source_mapping() 
             ],
         );
     }
+    contains_all(
+        "docs/cli/acp.md",
+        &["request stays pending", "individual observer"],
+    );
+    contains_all("docs/zh/cli/acp.md", &["请求会保持待决", "整个 ACP 连接"]);
 }
 
 /// The two configuration index pages enumerate every top-level key by hand, and the count

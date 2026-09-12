@@ -259,6 +259,21 @@ error data 携带 `admission: "accepted"`、`reason: "executionGated"`、
 同一消息 ID 的重复观察者在恢复交接空隙仍可收到相同 gate。
 `session/steer` 即时返回接收，不证明已经采样。观察者断线不等于撤回，也不能证明旧执行已结束。
 
+ACP 把携带普通 `/resume` 的 `session/prompt` 绑定到原生恢复控制输入（`ctl_…`）
+及其 `InputAdmissionReceipt`。FIFO driver 由会话持有，使用独立于 RPC 观察者的
+session-scoped client connection；观察者丢失不会丢弃 drive future，也不会隐式取消
+驱动发起的客户端请求；这种独立性不意味着整个 ACP 连接、运行时或进程关闭后仍继续执行。
+`ClientConnection::session_scoped` 仍共享断线状态。连接 EOF 最多等待 25 ms 以排空
+已就绪的请求，随后运行时关闭会取消正在运行的恢复控制；其数据和 `cancelled` 回执
+继续持久保留，`session/load` 不会重放该控制。
+控制处于 `Queued` 只证明已准入，不代表完成：prompt 会等待关联
+原生执行完成、等待人工输入、被取消或失败。回执与发布跟踪确保响应晚于关联结果及其
+待发布更新，避免提前 `end_turn` 清除客户端 busy 状态和 Stop 控件。
+
+显式 `$/cancel_request` 仍绑定该请求贡献的控制输入；如果执行已经开始，撤回会在
+实际取消边界核对选中的输入。`session/cancel` 保留精确回合校验及旧客户端的当前目标
+捕获，两条路径都不会给后续回合预置取消。无关回合的完成不能结算恢复控制的回执。
+
 队列立即发送在同一准入事务中比较选中行的 revision 与界面显示的 turn id；失败则回滚行和事件，
 不改投新回合。空闲时先持有 run guard 再提升选中行，其他条目保持原准入顺序。消费时校验信号
 revision，用户消息和 consumed 状态提交后才发出 `InputConsumed`。完成边界会原子关闭准入；

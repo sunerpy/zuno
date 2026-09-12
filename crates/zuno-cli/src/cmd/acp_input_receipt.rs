@@ -16,8 +16,9 @@ use zuno_engine::status::{SessionRunGuard, SessionStatus};
 use zuno_types::admission::{InputAdmissionReceipt, InputReceiptState, InputStopReason};
 
 use super::{
-    AcpPrompt, AcpSession, DurableInputScope, SessionDurableHandles, WithdrawablePrompt,
-    acp_prompt_payload, durable_questions, steering_content,
+    AcpPrompt, AcpSession, AcpState, DurableInputScope, SessionDurableHandles,
+    SessionReconfiguration, WithdrawablePrompt, acp_prompt_payload, durable_questions,
+    publish_configuration_updates, steering_content,
 };
 
 const RECEIPT_RECONCILE_INTERVAL: Duration = Duration::from_millis(100);
@@ -54,6 +55,23 @@ pub(super) fn message_id(params: &Value) -> Result<Option<String>, RpcError> {
 pub(super) enum TurnOwner {
     Request(RequestId),
     Durable,
+}
+
+/// The same session-owned FIFO driver serves content and explicitly authorized
+/// Work controls. RPC observers never own or drop the underlying drive future.
+#[derive(Clone)]
+enum ReceiptDrive {
+    Prompt,
+    WorkControl(Arc<AcpState>),
+}
+
+impl ReceiptDrive {
+    fn scope(&self) -> DurableInputScope {
+        match self {
+            Self::Prompt => DurableInputScope::Prompts,
+            Self::WorkControl(_) => DurableInputScope::Controls,
+        }
+    }
 }
 
 struct DriverClaim {
@@ -147,17 +165,47 @@ impl AcpSession {
             );
             if let InputAdmission::Drive { guard, .. } = admitted {
                 self.start_prompt_driver(
-                    &input.id,
+                    &input,
                     guard,
                     claim.expect("a drive admission requires the caller's driver claim"),
                     client,
+                    ReceiptDrive::Prompt,
                 );
             }
             // A steer into an autonomous turn owns no driver claim. Releasing
             // it here lets the native owner and queued-input recovery cooperate.
         }
-        self.wait_for_prompt_receipt(&input, handles, withdrawable, client)
+        self.wait_for_prompt_receipt(&input, handles, withdrawable, client, &ReceiptDrive::Prompt)
             .await
+    }
+
+    pub(super) async fn observe_work_control(
+        self: &Arc<Self>,
+        input: &SessionInput,
+        state: Arc<AcpState>,
+        withdrawable: &WithdrawablePrompt<'_>,
+        client: &ClientConnection,
+    ) -> Result<Value, RpcError> {
+        if withdrawable.publish(&input.id, true) {
+            self.retire_pending_input(&input.id);
+            let _aborted = self.control.abort_input(
+                &input.id,
+                super::HardInterruptRequest::new(
+                    super::HardInterruptSource::Acp,
+                    super::HardInterruptReason::RequestCancelled,
+                ),
+            );
+            return Err(withdrawn(&self.receipt_for_input(input)?));
+        }
+        let handles = self.durable_handles()?;
+        self.wait_for_prompt_receipt(
+            input,
+            &handles,
+            withdrawable,
+            client,
+            &ReceiptDrive::WorkControl(state),
+        )
+        .await
     }
 
     pub(super) fn receipt_for_input(
@@ -192,23 +240,44 @@ impl AcpSession {
     /// Retain one existing native FIFO drive independently of RPC observers.
     fn start_prompt_driver(
         self: &Arc<Self>,
-        admitted_input_id: &str,
+        input: &SessionInput,
         guard: SessionRunGuard,
         claim: DriverClaim,
         client: &ClientConnection,
+        drive: ReceiptDrive,
     ) {
         let session = Arc::clone(self);
         let client = client.session_scoped();
-        let admitted_input_id = admitted_input_id.to_owned();
+        let input = input.clone();
         let task = tokio::spawn(async move {
             let _claim = claim;
+            let interrupt = guard.interrupt_signal().clone();
+            let _preparing_control = match &drive {
+                ReceiptDrive::WorkControl(_) => guard.mark_input_started(&input.id),
+                ReceiptDrive::Prompt => None,
+            };
             let outcome = async {
                 if session.closed.load(Ordering::Acquire) {
                     return Ok(());
                 }
+                if let ReceiptDrive::WorkControl(state) = &drive {
+                    let configuration = session
+                        .reconfigure_from_prompt(
+                            SessionReconfiguration::Mode("build".to_owned()),
+                            state,
+                            client.clone(),
+                        )
+                        .await?;
+                    publish_configuration_updates(&client, &session.id, &configuration).await?;
+                    if interrupt.is_set() {
+                        return Err(RpcError::cancelled(
+                            "Work control was interrupted before execution",
+                        ));
+                    }
+                }
                 session.recover_pending_permissions(&client, &guard).await?;
                 let next = session
-                    .drive_next_durable_input(&client, &guard, DurableInputScope::Prompts)
+                    .drive_durable_input(&client, &guard, drive.scope(), Some(&input.id))
                     .await?;
                 drop(guard);
                 if let Some((driven, projected)) = next {
@@ -220,9 +289,12 @@ impl AcpSession {
             }
             .await;
             if let Err(error) = outcome {
+                if matches!(drive, ReceiptDrive::WorkControl(_)) {
+                    session.settle_control_start_failure(&input, &error, interrupt.is_set());
+                }
                 tracing::warn!(
                     session_id = %session.id,
-                    %admitted_input_id,
+                    admitted_input_id = %input.id,
                     %error,
                     "ACP native input drive stopped; observers retain their durable receipts"
                 );
@@ -234,6 +306,62 @@ impl AcpSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
     }
 
+    /// Failure before the host creates an engine turn must also settle the
+    /// accepted control. This owner holds the driver claim; observers cannot
+    /// infer failure from an idle lease or mutate another input's receipt.
+    pub(super) fn settle_control_start_failure(
+        &self,
+        input: &SessionInput,
+        error: &RpcError,
+        cancelled: bool,
+    ) {
+        let result = (|| {
+            // Configuration failure can leave the resource host unavailable.
+            // Durable settlement must not depend on that host being mounted.
+            let inbox = zuno_db::inbox::SessionInbox::new(Arc::new(super::durable_pool()?));
+            if cancelled {
+                if let Some(current) = inbox
+                    .get(&self.id, &input.id)
+                    .map_err(|error| RpcError::internal(error.to_string()))?
+                    && matches!(
+                        current.state,
+                        SubmissionState::Queued | SubmissionState::Steering
+                    )
+                {
+                    inbox
+                        .cancel_pending(
+                            &self.id,
+                            &input.id,
+                            current.revision,
+                            zuno_db::message::now_millis(),
+                        )
+                        .map_err(|error| RpcError::internal(error.to_string()))?;
+                }
+            } else {
+                inbox
+                    .mark_failed(&self.id, &input.id, error.message.clone())
+                    .map_err(|error| RpcError::internal(error.to_string()))?;
+            }
+            if let Some(cycle_id) = &input.cycle_id {
+                self.receipts
+                    .fail_unapplied_input(
+                        &self.id,
+                        &input.id,
+                        cycle_id,
+                        &error.message,
+                        cancelled,
+                        zuno_db::message::now_millis(),
+                    )
+                    .map_err(|error| RpcError::internal(error.to_string()))?;
+            }
+            Ok::<_, RpcError>(())
+        })();
+        if let Err(error) = result {
+            tracing::warn!(session_id=%self.id, input_id=%input.id, %error,
+                "could not settle a failed native Work control");
+        }
+    }
+
     /// Recover a pending FIFO handoff through the existing native driver.
     ///
     /// Duplicate observers may wake delivery; they never re-admit or re-steer the
@@ -242,15 +370,13 @@ impl AcpSession {
         self: &Arc<Self>,
         handles: &SessionDurableHandles,
         client: &ClientConnection,
+        drive: &ReceiptDrive,
     ) -> Result<(), RpcError> {
         if self.closed.load(Ordering::Acquire) || self.control.status() == SessionStatus::Busy {
             return Ok(());
         }
-        let Some((input, _)) = durable_questions::next_input(
-            handles.admission.inbox(),
-            &self.id,
-            DurableInputScope::Prompts,
-        )?
+        let Some((input, _)) =
+            durable_questions::next_input(handles.admission.inbox(), &self.id, drive.scope())?
         else {
             return Ok(());
         };
@@ -260,7 +386,7 @@ impl AcpSession {
         let Ok(guard) = self.runs.begin_turn(self.id.clone()) else {
             return Ok(());
         };
-        self.start_prompt_driver(&input.id, guard, claim, client);
+        self.start_prompt_driver(&input, guard, claim, client, drive.clone());
         Ok(())
     }
 
@@ -270,6 +396,7 @@ impl AcpSession {
         handles: &SessionDurableHandles,
         withdrawable: &WithdrawablePrompt<'_>,
         client: &ClientConnection,
+        drive: &ReceiptDrive,
     ) -> Result<Value, RpcError> {
         // Subscribe before the first read. Reconciliation also observes commits
         // made by another connection and changes during runtime replacement.
@@ -294,7 +421,7 @@ impl AcpSession {
                     RpcError::cancelled("session closed while this accepted input was pending"),
                 ));
             }
-            if !self.can_observe_input(&receipt)
+            if !self.can_observe_input(&receipt, drive)
                 && handles
                     .admission
                     .inbox()
@@ -302,7 +429,12 @@ impl AcpSession {
                     .map_err(|error| {
                         accepted_error(&receipt, RpcError::internal(error.to_string()))
                     })?
-                    .is_some_and(|current| current.state == SubmissionState::Consumed)
+                    .is_some_and(|current| {
+                        matches!(
+                            current.state,
+                            SubmissionState::Consumed | SubmissionState::Promoted
+                        )
+                    })
             {
                 // Native completion may have committed between our first read
                 // and the ownership observation. Never replace it with a guessed
@@ -314,11 +446,11 @@ impl AcpSession {
                         .await;
                     return response;
                 }
-                if !self.can_observe_input(&latest) {
+                if !self.can_observe_input(&latest, drive) {
                     return Err(observation_unavailable(&latest));
                 }
             }
-            self.wake_prompt_driver(handles, client)
+            self.wake_prompt_driver(handles, client, drive)
                 .map_err(|error| accepted_error(&receipt, error))?;
             let busy = self.control.status() == SessionStatus::Busy;
             tokio::select! {
@@ -333,7 +465,7 @@ impl AcpSession {
     ///
     /// Absence only means observation is unavailable here. It cannot prove that
     /// another process stopped executing the durable turn.
-    fn can_observe_input(&self, receipt: &InputAdmissionReceipt) -> bool {
+    fn can_observe_input(&self, receipt: &InputAdmissionReceipt, drive: &ReceiptDrive) -> bool {
         if receipt
             .turn_id
             .as_deref()
@@ -341,6 +473,11 @@ impl AcpSession {
             || self.control.active_input_id().as_deref() == Some(receipt.input_id.as_str())
         {
             return true;
+        }
+        if matches!(drive, ReceiptDrive::WorkControl(_)) {
+            // Owning the RPC is not evidence that its native control is still
+            // running. Another native input pump may have claimed it.
+            return false;
         }
         self.prompt_requests
             .lock()

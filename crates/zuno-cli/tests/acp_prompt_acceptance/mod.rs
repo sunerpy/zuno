@@ -3,6 +3,7 @@ use super::*;
 mod exact_cancellation;
 mod execution_gate;
 mod goal_resume;
+mod resume_lifecycle;
 
 /// Every model response remains gated, including a request restarted by steering.
 struct AcceptedTurnResponder {
