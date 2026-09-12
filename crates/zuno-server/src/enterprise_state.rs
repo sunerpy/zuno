@@ -41,6 +41,7 @@ pub struct WorkerStateService {
     tenant: TenantId,
     lease_duration: LeaseDuration,
     memory: Option<PostgresMemoryBackend>,
+    memory_configurations: Option<Vec<zuno_application::runtime::ConfigurationRef>>,
     children: Option<Arc<dyn ChildDefinitionCatalog>>,
     workflows: Option<Arc<dyn WorkflowDefinitionCatalog>>,
 }
@@ -59,6 +60,7 @@ impl WorkerStateService {
             tenant,
             lease_duration,
             memory: None,
+            memory_configurations: None,
             children: None,
             workflows: None,
         }
@@ -67,6 +69,23 @@ impl WorkerStateService {
     pub fn with_memory(mut self, memory: PostgresMemoryBackend) -> Self {
         self.memory = Some(memory);
         self
+    }
+    /// Restrict this installed Memory capability to explicit immutable profiles.
+    /// Empty means no Worker profile receives Memory access.
+    pub fn with_memory_configurations(
+        mut self,
+        configurations: Vec<zuno_application::runtime::ConfigurationRef>,
+    ) -> Result<Self, zuno_application::ApplicationError> {
+        if configurations.len() > 128 {
+            return Err(zuno_application::ApplicationError::Invalid(
+                "too many Memory profiles".to_owned(),
+            ));
+        }
+        for configuration in &configurations {
+            configuration.validate()?;
+        }
+        self.memory_configurations = Some(configurations);
+        Ok(self)
     }
 
     pub fn with_children(mut self, children: Arc<dyn ChildDefinitionCatalog>) -> Self {
@@ -86,7 +105,12 @@ impl WorkerStateService {
             .route(&format!("/{STATE_PATH}"), post(state_call))
             .route(&format!("/{}", zuno_worker::LIVE_PATH), post(live_call))
             .route(&format!("/{FINISH_PATH}"), post(finish));
-        if self.memory.is_some() {
+        if self.memory.is_some()
+            && self
+                .memory_configurations
+                .as_ref()
+                .is_none_or(|allowed| !allowed.is_empty())
+        {
             router = router.route(&format!("/{}", zuno_worker::MEMORY_PATH), post(memory_call));
         }
         if self.children.is_some() {
@@ -230,6 +254,17 @@ async fn memory_call(
     bytes: Bytes,
 ) -> Result<Json<MemoryResponse>, ApiFailure> {
     let grant = service.grant(&worker, &headers)?;
+    if let Some(allowed) = &service.memory_configurations {
+        let job = service
+            .backend
+            .runtime(service.tenant.clone())
+            .get(&grant.lease().owner, &grant.lease().job_id)
+            .await
+            .map_err(child_error)?;
+        if !allowed.contains(&job.configuration) {
+            return Err(ApiFailure(StatusCode::FORBIDDEN));
+        }
+    }
     if bytes.len() > 65_536 {
         return Err(ApiFailure(StatusCode::PAYLOAD_TOO_LARGE));
     }

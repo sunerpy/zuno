@@ -39,14 +39,25 @@ impl ConfiguredChildren {
                         "child definition digest changed without updating its parent snapshot",
                     ));
                 }
-                if child.workspace.id != parent.workspace.id
-                    || child.environment.gateway_id != parent.environment.gateway_id
-                    || child.environment.endpoint != parent.environment.endpoint
+                if child.workspace.id != parent.workspace.id {
+                    return Err(invalid(
+                        "child definitions must retain the parent's logical workspace",
+                    ));
+                }
+                let workspace = if child.agent.mode == crate::config::AgentExecutionMode::Completion
                 {
+                    ChildWorkspacePolicy::ModelOnly
+                } else if let (Some(parent), Some(child)) =
+                    (&parent.environment, &child.environment)
+                    && child.gateway_id == parent.gateway_id
+                    && child.endpoint == parent.endpoint
+                {
+                    ChildWorkspacePolicy::ForkParent
+                } else {
                     return Err(invalid(
                         "child workspace forks require the parent's workspace and assigned Docker gateway",
                     ));
-                }
+                };
                 if !agents.insert(child.agent.name.clone()) {
                     return Err(invalid(
                         "child Agent names must resolve to one immutable definition",
@@ -76,7 +87,7 @@ impl ConfiguredChildren {
                         selection: child.selection(),
                         maximum_depth: policy.maximum_depth,
                         maximum_children: policy.maximum_children,
-                        workspace: ChildWorkspacePolicy::ForkParent,
+                        workspace,
                     },
                     facts: zuno_tools::ModelFacts {
                         family,
@@ -187,9 +198,26 @@ mod tests {
     }
 
     #[test]
+    fn a_completion_child_receives_no_environment_grant() {
+        let (mut parent, mut child) = definitions();
+        child.agent.mode = crate::config::AgentExecutionMode::Completion;
+        child.environment = None;
+        child.validate().unwrap();
+        parent.delegation.as_mut().unwrap().targets = vec![child.reference()];
+        let catalog = ConfiguredChildren::new(&[parent.clone(), child]).unwrap();
+        assert_eq!(
+            catalog
+                .resolve(&parent.reference(), "helper", None)
+                .unwrap()
+                .workspace,
+            ChildWorkspacePolicy::ModelOnly
+        );
+    }
+
+    #[test]
     fn inherited_workspace_must_resolve_to_the_same_docker_owner() {
         let (mut parent, mut child) = definitions();
-        child.environment.endpoint = "https://other-gateway.example/".to_owned();
+        child.environment.as_mut().unwrap().endpoint = "https://other-gateway.example/".to_owned();
         parent.delegation.as_mut().unwrap().targets = vec![child.reference()];
         assert!(ConfiguredChildren::new(&[parent, child]).is_err());
     }

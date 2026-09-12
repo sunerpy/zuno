@@ -872,3 +872,8 @@ WebSearch 的带密钥 wire URL 不进入诊断。错误只保留 provider、sch
 
 
 Workflow／Council 宿主派发区分已完成结果与持久等待，保留类型化工具错误。本地 Workflow 与企业协调器共用 DAG 就绪／逻辑容量决策和有界依赖结果输入。可信外部不确定完成结果消费一次后，后续有界推进要求核查。企业协调及节点审批见预览文档 `enterprise/WORKFLOW.zh.md`。
+
+
+企业 completion 配置复用有界驱动，不提供工具或驻留 Memory 上下文；数据所有者
+不给该不可变配置分配网关，也拒绝其 Worker Memory 访问。Council 席位结果校验
+由运行时共享，分布式协调仍属独立生产者，`agent.mode` 见预览部署文档。

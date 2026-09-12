@@ -49,3 +49,6 @@ Workflow／Council 继续按 P4 实现，配置见[工作区](WORKSPACES.zh.md)�
 
 参见 [English](CHILDREN.md)、[持久等待](WAITING.zh.md)、
 [PostgreSQL](POSTGRES.zh.md)及[进度](STATUS.md)。
+
+子定义使用 `agent.mode: "completion"` 时接收 `ModelOnly`，不分叉工作区，配置中
+没有环境或委派能力；普通子定义仍使用已有 Docker 分支与审批路径。

@@ -69,3 +69,7 @@ remain P4 work. See [workspace configuration](WORKSPACES.md).
 
 See [中文](CHILDREN.zh.md), [waiting](WAITING.md), [PostgreSQL](POSTGRES.md)
 and [implementation status](STATUS.md).
+
+A child definition with `agent.mode: "completion"` receives `ModelOnly`, not a
+workspace fork. Its configuration has no environment or delegation surface;
+normal child definitions retain the configured Docker fork and approval path.

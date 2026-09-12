@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use rusqlite::{OptionalExtension, params};
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
@@ -23,6 +23,7 @@ use zuno_db::job::{
     ReportDelivery as DbReportDelivery,
 };
 use zuno_db::pool::Pool;
+use zuno_engine::council::{CouncilSeatAnswer, parse_generic_council_answer};
 use zuno_engine::prelude::{InternalAgent, complete_internal_text};
 use zuno_llm::event::{Message, Role};
 use zuno_llm::registry::{Provider, ProviderRequestContext};
@@ -43,8 +44,6 @@ use zuno_tools::workflow::{WorkflowHost, WorkflowRequest, WorkflowTurn};
 use super::child_turn::{BackgroundJobSupervisor, ChildSessionHost, ParentReportWake};
 
 const CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_COUNCIL_LIST_ITEMS: usize = 32;
-const MAX_COUNCIL_FIELD_BYTES: usize = 4_096;
 type NodeJoin = (usize, String, String, i64, Result<ChildTurn, String>);
 type CouncilJoin = (usize, i64, CouncilSeatResult);
 
@@ -136,16 +135,6 @@ impl CouncilSeatStatus {
             }
         }
     }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CouncilSeatAnswer {
-    verdict: String,
-    confidence: f64,
-    evidence: Vec<String>,
-    risks: Vec<String>,
-    recommendation: String,
 }
 
 #[derive(Debug)]
@@ -2087,7 +2076,8 @@ fn parse_council_answer(
 ) -> Result<ParsedCouncilAnswer, String> {
     let Some(review) = review else {
         return parse_generic_council_answer(output, output_limit)
-            .map(ParsedCouncilAnswer::Generic);
+            .map(ParsedCouncilAnswer::Generic)
+            .map_err(|error| error.to_string());
     };
     let mut report = DelegationEvidenceReport::parse(output, ReportLimits::for_seat(output_limit))
         .map_err(|error| format!("seat returned invalid evidence report: {error}"))?;
@@ -2118,71 +2108,6 @@ fn parse_council_answer(
         .validate(ReportLimits::for_seat(output_limit))
         .map_err(|error| format!("seat returned invalid evidence report: {error}"))?;
     Ok(ParsedCouncilAnswer::Review(report))
-}
-
-fn parse_generic_council_answer(
-    output: &str,
-    output_limit: usize,
-) -> Result<CouncilSeatAnswer, String> {
-    if output.len() > output_limit {
-        return Err(format!(
-            "seat response exceeded the {output_limit}-byte output bound"
-        ));
-    }
-    let payload = council_json_payload(output)
-        .map_err(|error| format!("seat returned malformed structured output: {error}"))?;
-    let answer: CouncilSeatAnswer = serde_json::from_str(payload)
-        .map_err(|error| format!("seat returned malformed structured output: {error}"))?;
-    validate_council_text("verdict", &answer.verdict)?;
-    validate_council_text("recommendation", &answer.recommendation)?;
-    if !answer.confidence.is_finite() || !(0.0..=1.0).contains(&answer.confidence) {
-        return Err("seat confidence must be a finite number from 0 to 1".to_owned());
-    }
-    for (name, values) in [("evidence", &answer.evidence), ("risks", &answer.risks)] {
-        if values.len() > MAX_COUNCIL_LIST_ITEMS {
-            return Err(format!(
-                "seat {name} exceeds the {MAX_COUNCIL_LIST_ITEMS}-item bound"
-            ));
-        }
-        for value in values {
-            validate_council_text(name, value)?;
-        }
-    }
-    Ok(answer)
-}
-
-fn council_json_payload(output: &str) -> Result<&str, String> {
-    let trimmed = output.trim();
-    let Some(fenced) = trimmed.strip_prefix("```") else {
-        return Ok(trimmed);
-    };
-    let Some((language, body)) = fenced.split_once('\n') else {
-        return Err("JSON code fence has no body".to_owned());
-    };
-    let language = language.trim();
-    if !language.is_empty() && !language.eq_ignore_ascii_case("json") {
-        return Err(format!("unsupported code fence language `{language}`"));
-    }
-    let Some(body) = body.strip_suffix("```") else {
-        return Err("JSON code fence is not the complete response".to_owned());
-    };
-    let payload = body.trim();
-    if payload.is_empty() {
-        return Err("JSON code fence is empty".to_owned());
-    }
-    Ok(payload)
-}
-
-fn validate_council_text(field: &str, value: &str) -> Result<(), String> {
-    if value.trim().is_empty() {
-        return Err(format!("seat `{field}` must not be empty"));
-    }
-    if value.len() > MAX_COUNCIL_FIELD_BYTES {
-        return Err(format!(
-            "seat `{field}` exceeds the {MAX_COUNCIL_FIELD_BYTES}-byte field bound"
-        ));
-    }
-    Ok(())
 }
 
 fn complete_council_results(

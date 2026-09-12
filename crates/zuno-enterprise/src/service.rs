@@ -323,19 +323,26 @@ async fn control(options: ControlConfig, shutdown: InterruptSignal) -> Result<()
     )?);
     let deployments = definitions
         .iter()
-        .map(|definition| {
+        .filter_map(|definition| {
+            definition
+                .environment
+                .as_ref()
+                .map(|environment| (definition, environment))
+        })
+        .map(|(definition, environment)| {
             Ok(GatewayDeployment {
                 tenant: options.tenant_id.clone(),
                 configuration: definition.reference(),
-                gateway_id: definition.environment.gateway_id.clone(),
-                endpoint: config::https_endpoint(&definition.environment.endpoint)?,
-                image: definition.environment.image.clone(),
-                memory_bytes: definition.environment.memory_bytes,
-                pids_limit: definition.environment.pids_limit,
-                cpu_millis: definition.environment.cpu_millis,
+                gateway_id: environment.gateway_id.clone(),
+                endpoint: config::https_endpoint(&environment.endpoint)?,
+                image: environment.image.clone(),
+                memory_bytes: environment.memory_bytes,
+                pids_limit: environment.pids_limit,
+                cpu_millis: environment.cpu_millis,
             })
         })
         .collect::<Result<Vec<_>, Error>>()?;
+    let has_environments = !deployments.is_empty();
     let assignments = Arc::new(ConfiguredGateways::new(deployments)?);
     let mut active = Vec::new();
     for selected in &options.active_definitions {
@@ -365,7 +372,14 @@ async fn control(options: ControlConfig, shutdown: InterruptSignal) -> Result<()
         options.tenant_id.clone(),
         lease,
     )
-    .with_memory(memory);
+    .with_memory(memory)
+    .with_memory_configurations(
+        definitions
+            .iter()
+            .filter(|definition| definition.agent.mode == config::AgentExecutionMode::Agent)
+            .map(|definition| definition.reference())
+            .collect(),
+    )?;
     if !children.is_empty() {
         worker_state = worker_state.with_children(children);
     }
@@ -375,8 +389,9 @@ async fn control(options: ControlConfig, shutdown: InterruptSignal) -> Result<()
     let mut routes = application
         .clone()
         .api_router(users.clone())
-        .merge(worker_state.router())
-        .merge(
+        .merge(worker_state.router());
+    if has_environments {
+        routes = routes.merge(
             GatewayControlService::new(
                 backend.clone(),
                 options.tenant_id.clone(),
@@ -388,6 +403,7 @@ async fn control(options: ControlConfig, shutdown: InterruptSignal) -> Result<()
             )
             .router(),
         );
+    }
     if let Some(browser) = &options.browser {
         let browser = crate::identity::browser(browser, &backend, options.tenant_id, users).await?;
         routes = routes

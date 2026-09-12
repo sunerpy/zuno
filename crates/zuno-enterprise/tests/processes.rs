@@ -34,6 +34,8 @@ use zuno_types::identity::*;
 
 #[path = "processes/browser.rs"]
 mod browser;
+#[path = "processes/completion.rs"]
+mod completion;
 #[path = "processes/workflow.rs"]
 mod workflow;
 
@@ -147,6 +149,17 @@ async fn model(
             .iter()
             .any(|message| message["role"] == "tool" && message["tool_call_id"] == id)
     };
+    if user.contains("COMPLETION-PROBE") {
+        assert!(
+            body.get("tools")
+                .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty))
+        );
+        assert!(!body.to_string().contains("MEMORY-NOT-FOR-COMPLETION"));
+        return model_response(
+            json!({"role":"assistant","content":"COMPLETION-VERIFIED"}),
+            true,
+        );
+    }
     if user.contains("WORKFLOW-PROBE") {
         return workflow::model(&body);
     }
@@ -473,6 +486,12 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
             "image":"public.ecr.aws/docker/library/alpine@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce",
             "memoryBytes":67108864,"pidsLimit":32,"cpuMillis":500},
     })).unwrap();
+    let completion_definition = completion::definition(&definition);
+    let completion_file = root.join("completion-definition.json");
+    write(
+        &completion_file,
+        serde_json::to_vec(&completion_definition).unwrap(),
+    );
     let mut child_definition = definition.clone();
     child_definition.id = zuno_types::identity::ConfigurationId::new("native-child").unwrap();
     child_definition.agent.name = "workspace-helper".to_owned();
@@ -544,11 +563,21 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
                         path: gateway_key,
                     }],
                 },
-                definitions: vec![definition_file.clone(), child_definition_file.clone()],
-                active_definitions: vec![DefinitionKey {
-                    id: definition.id.clone(),
-                    version: 1,
-                }],
+                definitions: vec![
+                    definition_file.clone(),
+                    child_definition_file.clone(),
+                    completion_file.clone(),
+                ],
+                active_definitions: vec![
+                    DefinitionKey {
+                        id: definition.id.clone(),
+                        version: 1,
+                    },
+                    DefinitionKey {
+                        id: completion_definition.id.clone(),
+                        version: 1,
+                    },
+                ],
                 browser: browser_config,
                 lease_millis: 30000,
             })),
@@ -584,7 +613,11 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
                     live_millis: Some(100),
                     instance_prefix: name.to_owned(),
                     state: state("worker"),
-                    definitions: vec![definition_file.clone(), child_definition_file.clone()],
+                    definitions: vec![
+                        definition_file.clone(),
+                        child_definition_file.clone(),
+                        completion_file.clone(),
+                    ],
                     credentials: [(
                         "model".to_owned(),
                         ModelCredential {
@@ -872,6 +905,22 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
     let final_operations:i64=query_scalar("SELECT count(*) FROM zuno_enterprise_preview.gateway_operation WHERE tenant_id=$1 AND completion IS NOT NULL")
         .bind(tenant.as_str()).fetch_one(&admin).await.unwrap();
     assert_eq!(final_operations, if browser_enabled { 9 } else { 8 });
+    completion::verify(&http, &control_url, &tokens["alice"]).await;
+    assert_eq!(
+        issuer.model_requests.load(Ordering::SeqCst),
+        if browser_enabled { 26 } else { 24 }
+    );
+    let after_completion: i64 = query_scalar(
+        "SELECT count(*) FROM zuno_enterprise_preview.gateway_operation WHERE tenant_id=$1",
+    )
+    .bind(tenant.as_str())
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        after_completion, final_operations,
+        "completion mode cannot introduce an external operation"
+    );
     for child in &mut children {
         assert!(
             tokio::process::Command::new("kill")

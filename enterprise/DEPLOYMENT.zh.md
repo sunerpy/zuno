@@ -116,3 +116,9 @@ Web／ACP 功能及完整故障矩阵仍需继续完成。构建此二进制不�
 Worker 的 `liveMillis` 默认 500 毫秒，允许 100–5000，设为 null 关闭。实时进度是有界、可替换的快照，不阻塞模型执行，不替代持久历史。见[活动协议](ACTIVITY.zh.md)。
 
 可选 `workflows` 在已有子任务目录上安装有界模板，使用不运行模型的协调 Job、独立节点工作区及严格命令审批。配置与限制见 [Workflow](WORKFLOW.zh.md)。
+
+Agent 的 `mode` 默认 `agent`，保留现有定义的规范化摘要。`mode: "completion"`
+复用有界模型驱动，但不提供工具或驻留 Memory 上下文；该配置省略 `environment`、
+`delegation`、`workflows`。控制面不为其分配网关，并从 Worker Memory 授权中排除
+该配置。它可作为自有根会话或显式配置的纯模型子任务运行，是内部完成请求的后端原语，
+不代表分布式 Council 编排已完成。

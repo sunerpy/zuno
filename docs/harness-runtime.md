@@ -2987,3 +2987,10 @@ The enterprise React workbench consumes public `AgentApplication` and activity D
 
 
 Workflow and Council host dispatch now distinguish a ready result from a durable pending invocation, preserving typed tool failures. The native Workflow host and enterprise coordinator share DAG readiness/logical-capacity decisions and bounded dependency-result input. A trusted uncertain external completion is consumed once; a later bounded advance requires inspection. Enterprise coordination and node approval are documented in `enterprise/WORKFLOW.md`.
+
+
+Enterprise completion profiles reuse the bounded driver while exposing no tool
+surface or resident Memory context. The data owner withholds gateway assignment
+and Worker Memory access for those immutable configurations. Council answer
+validation is shared by runtime consumers; distributed coordination remains a
+separate producer. See the preview deployment guide for `agent.mode`.

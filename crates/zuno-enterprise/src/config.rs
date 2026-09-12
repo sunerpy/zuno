@@ -318,7 +318,8 @@ pub struct Definition {
     pub agent: AgentDefinition,
     pub model: ModelDefinition,
     pub budget: BudgetDefinition,
-    pub environment: EnvironmentDefinition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<EnvironmentDefinition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation: Option<DelegationDefinition>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -343,6 +344,20 @@ pub struct AgentDefinition {
     pub name: String,
     pub system_prompt: String,
     pub max_steps: NonZeroU32,
+    #[serde(default, skip_serializing_if = "AgentExecutionMode::is_agent")]
+    pub mode: AgentExecutionMode,
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentExecutionMode {
+    #[default]
+    Agent,
+    Completion,
+}
+impl AgentExecutionMode {
+    fn is_agent(&self) -> bool {
+        *self == Self::Agent
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -424,16 +439,29 @@ impl Definition {
         if let Some(endpoint) = &self.model.base_url {
             https_endpoint(endpoint)?;
         }
-        https_endpoint(&self.environment.endpoint)?;
-        zuno_application::environment::EnvironmentSpec {
-            id: zuno_types::identity::EnvironmentId::new("validation").expect("fixed identity"),
-            session_id: zuno_types::identity::SessionId::new("validation").expect("fixed identity"),
-            image: self.environment.image.clone(),
-            memory_bytes: self.environment.memory_bytes,
-            pids_limit: self.environment.pids_limit,
-            cpu_millis: self.environment.cpu_millis,
+        match (&self.agent.mode, &self.environment) {
+            (AgentExecutionMode::Completion, None)
+                if self.delegation.is_none() && self.workflows.is_empty() => {}
+            (AgentExecutionMode::Agent, Some(environment)) => {
+                https_endpoint(&environment.endpoint)?;
+                zuno_application::environment::EnvironmentSpec {
+                    id: zuno_types::identity::EnvironmentId::new("validation")
+                        .expect("fixed identity"),
+                    session_id: zuno_types::identity::SessionId::new("validation")
+                        .expect("fixed identity"),
+                    image: environment.image.clone(),
+                    memory_bytes: environment.memory_bytes,
+                    pids_limit: environment.pids_limit,
+                    cpu_millis: environment.cpu_millis,
+                }
+                .validate()?;
+            }
+            _ => {
+                return Err(invalid(
+                    "completion mode has no environment or delegation; agent mode requires an environment",
+                ));
+            }
         }
-        .validate()?;
         Ok(())
     }
 }
@@ -452,6 +480,7 @@ pub fn https_endpoint(value: &str) -> Result<url::Url, Error> {
     }
     Ok(url)
 }
+
 pub async fn definitions(paths: &[PathBuf]) -> Result<Vec<Definition>, Error> {
     if paths.is_empty() || paths.len() > 64 {
         return Err(invalid("configure 1–64 immutable definitions"));
@@ -467,4 +496,53 @@ pub async fn definitions(paths: &[PathBuf]) -> Result<Vec<Definition>, Error> {
         definitions.push(definition);
     }
     Ok(definitions)
+}
+
+#[cfg(test)]
+mod execution_mode_tests {
+    use super::*;
+    fn definition() -> Definition {
+        serde_json::from_str(include_str!("../../../enterprise/examples/definition.json")).unwrap()
+    }
+    #[test]
+    fn legacy_agent_definitions_keep_their_exact_normalized_reference() {
+        let value = definition();
+        value.validate().unwrap();
+        let encoded = serde_json::to_value(&value).unwrap();
+        assert!(encoded["agent"].get("mode").is_none());
+        assert!(encoded["environment"].is_object());
+        let mut original: serde_json::Value =
+            serde_json::from_str(include_str!("../../../enterprise/examples/definition.json"))
+                .unwrap();
+        // These nullable model fields were already emitted by the original
+        // definition serializer, even when absent from the operator's file.
+        for field in ["region", "project", "apiVersion"] {
+            original["model"]
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_owned(), serde_json::Value::Null);
+        }
+        assert_eq!(encoded, original);
+        assert_eq!(
+            value.reference().sha256,
+            zuno_orchestration::sha256_json(&original)
+        );
+    }
+    #[test]
+    fn completion_profiles_require_no_execution_environment_or_delegation() {
+        let mut value = definition();
+        value.agent.mode = AgentExecutionMode::Completion;
+        assert!(value.validate().is_err());
+        value.environment = None;
+        value.validate().unwrap();
+        let encoded = serde_json::to_value(&value).unwrap();
+        assert!(encoded.get("environment").is_none());
+        assert_eq!(encoded["agent"]["mode"], "completion");
+        value.delegation = Some(DelegationDefinition {
+            targets: vec![value.reference()],
+            maximum_depth: 2,
+            maximum_children: 4,
+        });
+        assert!(value.validate().is_err());
+    }
 }

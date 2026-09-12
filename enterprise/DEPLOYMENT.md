@@ -146,3 +146,11 @@ See [中文](DEPLOYMENT.zh.md), [platforms](PLATFORMS.md) and [status](STATUS.md
 Worker `liveMillis` defaults to 500 milliseconds, accepts 100–5000, or null to disable transient publication. Live progress is a bounded replaceable snapshot; it never holds model execution or replaces committed history. See [activity](ACTIVITY.md).
 
 Optional `workflows` installs bounded templates over the existing child target catalog. They use a non-model coordination Job, independent node workspaces and strict command approvals. See [Workflow configuration and limits](WORKFLOW.md).
+
+Agent `mode` defaults to `agent`, preserving existing normalized definition digests.
+`mode: "completion"` uses the same bounded model driver with no tools or resident
+Memory context. Omit `environment`, `delegation` and `workflows` for that profile.
+The control plane does not assign a gateway to it and excludes its configuration
+from Worker Memory access. Completion profiles can run as owned root sessions or
+as explicitly configured model-only children. This is a backend primitive for
+internal completions; it does not enable distributed Council coordination.

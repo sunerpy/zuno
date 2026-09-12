@@ -35,9 +35,9 @@ pub struct ConfiguredGateways {
 
 impl ConfiguredGateways {
     pub fn new(deployments: Vec<GatewayDeployment>) -> Result<Self, ApplicationError> {
-        if deployments.is_empty() || deployments.len() > 128 {
+        if deployments.len() > 128 {
             return Err(ApplicationError::Invalid(
-                "configure 1–128 immutable gateway deployments".to_owned(),
+                "configure at most 128 immutable gateway deployments".to_owned(),
             ));
         }
         let mut seen = BTreeSet::new();
