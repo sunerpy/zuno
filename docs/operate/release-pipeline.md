@@ -110,6 +110,9 @@ members remain. On macOS, a bounded process-state query distinguishes dead
 zombies from live members; `killpg` permission errors alone cannot do that.
 Cancellation stops waiting workers and reaps active suites;
 cleanup or launch failures remain failures, without retrying the test.
+Capture-directory removal uses the remaining cleanup budget to wait for transient
+Windows sharing violations. A lingering output handle cannot be hidden by a
+successful suite result; persistent cleanup failure is reported explicitly.
 
 Combined output is limited to 64 MiB per suite. Exceeding the limit is reported
 as a failure instead of silently discarding output from a successful test.
