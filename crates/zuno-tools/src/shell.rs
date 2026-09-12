@@ -155,10 +155,12 @@ pub struct ShellParams {
     /// The command's working directory, relative to the workspace when not absolute.
     #[serde(default)]
     pub workdir: Option<String>,
-    /// Start the command and return immediately while its lifecycle continues asynchronously.
+    /// Defaults to false. Set true only for an explicit parallel split while doing
+    /// independent local work; serial critical-path waits keep the foreground handle.
     #[serde(default)]
     pub background: bool,
-    /// Mark a command that only observes remote work so completion triggers an authoritative refresh.
+    /// Purpose only, in either execution mode. remoteObserver marks remote-state
+    /// observation and does not require background=true. Recheck remote state on exit.
     #[serde(default)]
     pub background_purpose: BackgroundExecutionPurpose,
     /// Exact full object id expected at `HEAD` before rewriting local Git history.

@@ -95,8 +95,8 @@ pub fn model_application_admission_in(
     let scope = crate::session_work_cycle::current_in(transaction, session_id)?;
     let stopped = scope.as_ref().is_some_and(|cycle| cycle.stopped.is_some());
     let state = crate::session_execution::read_in(transaction, session_id)?;
-    let goal_active = match scope.as_ref().and_then(|cycle| cycle.goal_id.as_deref()) {
-        Some(goal_id) => transaction
+    let goal_active = match scope.as_ref().map(|cycle| cycle.goal_id.as_deref()) {
+        Some(Some(goal_id)) => transaction
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM goal \
                  WHERE session_id=?1 AND goal_id=?2 AND status='active')",
@@ -104,7 +104,10 @@ pub fn model_application_admission_in(
                 |row| row.get::<_, bool>(0),
             )
             .map_err(open::map_error)?,
-        None => true,
+        Some(None) => true,
+        None => {
+            crate::session_work_cycle::legacy_goal_allows_execution_in(transaction, session_id)?
+        }
     };
     let input_scope_matches = input.as_ref().is_none_or(|input| {
         DurableInputKind::classify(&input.prompt)

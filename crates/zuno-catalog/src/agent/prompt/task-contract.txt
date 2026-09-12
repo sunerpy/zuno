@@ -1,0 +1,1 @@
+`task` requires `agent`, `objective`, `deliverable`, `instructions`, `success_evidence` at top level; `intent` never substitutes. Use its JSON example.

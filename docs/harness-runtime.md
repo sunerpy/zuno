@@ -242,12 +242,23 @@ tool-result, and verification state:
   external source/cycle wait without consuming reconciliation attempts;
 - an active Goal owns the next durable continuation;
 - authorized ordinary Work continues from a durable `Recovery` token only when
-  the host proves executable Todo/dependency work. Unfinished Plan steps and
-  blocked Todos alone produce `no_executable_work`, not another provider call;
+  the host proves executable Todo/dependency work or the current cycle's adopted,
+  authorized `in_progress` Plan step. No duplicate Todo is required. Linked
+  unfinished Todos retain their owner/dependency gates; an unsettled child
+  result cannot be bypassed by the coarser Plan status. An unowned Plan or
+  blocked Todo alone produces `no_executable_work`, not another provider call;
 - the driver hashes authoritative Plan, Todo, Job, and Goal revisions into a
   progress fingerprint; three consecutive identical fingerprints pause with
   typed `no_progress`;
 - no reconciliation branch manufactures a generic human confirmation request.
+
+The step is selected by typed status, not array position or assistant promises
+about "next steps". A decision needed only by a later independent step does not
+block the current authorized work. Required waits must be recorded through native
+controls. Existing pauses are not cleared on upgrade. Codex `9ba1d9eb5b`'s
+`core/src/tools/handlers/plan_spec.rs` likewise represents the current step with
+`in_progress`; Zuno adapts that representation to its own durable cycle and
+reconciliation service, not a claim that Codex auto-runs every unfinished Plan.
 
 Unreconciled work means durably recorded work. A Work-mode `Optional` decision
 is not recorded work, so a request that creates no Plan, Todo, or Job settles
@@ -745,6 +756,22 @@ Codex configuration, role, MCP, Skill, wire, or runtime semantics.
 
 ### Typed delegation contract
 
+The contract is flat: `agent`, `objective`, `deliverable`, `instructions`, and
+`success_evidence` are required top-level strings, including on `task_id`
+continuations. The cross-cutting `intent` is an optional UI label removed before
+typed parsing; it cannot replace `objective`. Neither the schema nor the host
+fills missing fields or unwraps a `contract` object.
+
+The tool description carries a complete JSON example, tested through the erased
+tool invocation. Native direct-task callers (`orchestrator` and `deep`) receive a
+shared compact reminder without changing permissions or configured prompt
+overrides. Schema validation retains its original errors and, for missing root
+properties, adds at most four current field descriptions capped at 256 Unicode
+characters each. Nested errors do not borrow unrelated root descriptions;
+names over 128 bytes receive no additional hint, without changing validation;
+argument values are not copied into these hints. A corrected call still passes
+normal validation and authorization before dispatch.
+
 The model-facing `task` tool no longer accepts loose `description`, `prompt`, or
 `load_skills` arguments. Its required work agreement is:
 
@@ -772,9 +799,9 @@ The model-facing `task` tool no longer accepts loose `description`, `prompt`, or
 `scope`, `constraints`, and `dependencies` are optional. `agent` selects one
 member of the effective delegate roster. `task_id` resumes an existing child
 session owned by the same parent. Unknown fields and removed loose arguments,
-including `description`, `prompt`, `subagent_type`, `category`, `model`,
-`effort`, and `load_skills`, fail validation; there is no compatibility
-translation.
+including `description`, `prompt`, `subagent_type`, `category`, and `load_skills`,
+fail validation; there is no compatibility translation. `model` and `effort` are
+advertised only when the session's durable model-selection policy enables them.
 
 ## Prompt provenance
 
@@ -1964,6 +1991,31 @@ Background reports may be recorded while paused, but apply only on a legitimatel
 eligible request. The rendered Goal context names its actual status and pause
 reason, rather than describing every existing Goal as active.
 
+Report persistence and provider continuation are separate boundaries. A completed
+observer can have a callback-owned completion receipt and a `consumed` history
+input without having reached a provider request. The native idle report path
+rechecks cycle and wake authority after committing all reports, in the same writer
+transaction that satisfies an exact external wait. Live application uses the same
+scope rules. Only the current work cycle's bound Goal must be active: an explicit
+ordinary scope with `goal_id=None` is not blocked or charged by a retained paused,
+completed, or budget-limited Goal. No Goal is created or resumed for it.
+
+The absence of a persisted scope is not proof of Goal independence. Unknown legacy
+ownership keeps its conservative inactive-Goal fence. Stopped cycles, human
+approval, budgets, authentication and uncertain-side-effect gates remain intact;
+an old completion cannot start a newer cycle without an explicit native transfer.
+In a mixed report batch, planning text/source and completion identity come from the
+same eligible report. Rejected reports remain historical facts, not planning seeds.
+Ineligible reports use `report_deferred_by_execution_state` and state that the
+current work cycle does not authorize automatic continuation, rather than telling
+every ordinary session to resume a Goal.
+
+This adapts Codex `9ba1d9eb5b`'s separate inter-agent notification and automatic
+turn-admission boundaries (`core/src/agent/control.rs`,
+`core/src/session/turn_input.rs`) and Goal-owned continuation
+(`ext/goal/src/runtime.rs`). Zuno retains its authorized `nextStep` wake behavior;
+it does not copy Codex's notification trigger policy or Plan-mode semantics.
+
 Goal completion reads Plan step statuses through the same shared type as the Plan
 writer. `completed` and `superseded` are terminal; missing, unknown, or legacy
 `cancelled` values fail closed as durable Plan corruption. A model update that settles
@@ -2528,6 +2580,26 @@ than of running the CLI. See
 
 ## Background command execution
 
+Choose foreground when waiting is the only useful next action, including one
+serial command, child result, CI run, release or deployment dependency. Duration
+and task count alone are not reasons to detach. The purpose
+`backgroundPurpose: "remoteObserver"` works in either mode; it does not enable
+`background: true`. Detach only for an explicit parallel split: identify the
+independent work the parent will perform locally before dispatch, then perform
+it. Never detach the sole task and finalize while it runs. This is model
+guidance, not a new task-count heuristic or tool gate.
+
+The design reference is Codex `9ba1d9eb5b`'s unified execution handle and
+`write_stdin` continuation (`core/src/tools/handlers/unified_exec.rs`,
+`core/src/unified_exec/process_manager.rs`): yielding an observation window does
+not imply completion or require creating a separate observer agent. Zuno keeps
+its existing foreground handle, event-driven wait and cancellation contracts;
+it does not copy Codex's timing constants or tool wire shape.
+Codex's `core/src/tools/handlers/multi_agents_spec.rs` additionally requires
+identifying critical-path versus parallel sidecar work before delegation, keeping
+immediate blocking work local, and doing non-overlapping local work while a child
+runs. This is the source for Zuno's explicit parallel-split guidance.
+
 `shell` registers a command with the process-owned
 `BackgroundExecutionService` before spawning it. Explicit background mode and a
 foreground attention timeout therefore retain one execution identity and one
@@ -2552,8 +2624,8 @@ budgets still apply.
 Foreground terminal output, completion ownership and the original tool's
 verification receipt commit together before the handle is consumed. It does not
 also produce a detached callback. Serial CI/status dependencies therefore remain
-foreground by default; independent parallel work or an explicit user request
-can select detached execution.
+foreground by default; only explicitly planned independent work alongside
+useful mainline work selects detached execution.
 
 Durable commands keep a bounded 2 MiB live tail, persist complete output
 separately, and record status under `.zuno/background`. Each execution owns

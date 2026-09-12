@@ -227,6 +227,24 @@ async fn assert_deferred_then_usable(pool: Arc<Pool>, gate_at_promotion: bool) {
     pool.transaction(|tx| {
         let mut state = zuno_db::session_execution::read_in(tx, SESSION_ID)?.unwrap();
         state.cycle_id = Some("future-native-activation".to_owned());
+        // Native user activation creates a scope, not only a cycle string.
+        // Explicit independence must not be confused with unknown legacy ownership.
+        zuno_db::session_work_cycle::save_in(
+            tx,
+            &zuno_db::session_work_cycle::SessionWorkCycle {
+                session_id: SESSION_ID.to_owned(),
+                cycle_id: "future-native-activation".to_owned(),
+                anchor_message_id: Some("msg_original".to_owned()),
+                goal_id: None,
+                plan_id: None,
+                active_turn_id: None,
+                todo_ids: Default::default(),
+                resumed_goal_cycles: Default::default(),
+                stopped: None,
+                scheduling: None,
+            },
+            22,
+        )?;
         zuno_db::session_execution::update_in(tx, state.revision, state).map(|_| ())
     })
     .unwrap();

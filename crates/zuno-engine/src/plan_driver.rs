@@ -4,7 +4,7 @@
 //! machine-owned execution phase separately, then decides from typed durable
 //! state whether a host may finish, should recover, must wait for background
 //! completion, or should pause after durable evidence of no progress. An
-//! unfinished Plan or blocked Todo is not executable work. The host supplies
+//! merely unfinished Plan or blocked Todo is not executable work. The host supplies
 //! runnable-work evidence; session scheduling gates precede both ordinary and
 //! Goal continuation, without interpreting assistant prose.
 
@@ -82,8 +82,9 @@ pub struct PlanReconciliationInput {
     /// A Todo remains pending, in progress, or blocked.
     /// This describes unfinished work, not whether it can run.
     pub active_todo: bool,
-    /// Runnable Todo/dependency work or authorized queued work, verified by the
-    /// host. An unfinished Plan, blocked Todo or callback alone is insufficient.
+    /// Runnable Todo/dependency work, an adopted authorized Plan's current step,
+    /// or authorized queued work, verified by the host. An unowned/merely
+    /// unfinished Plan, blocked Todo or callback alone is insufficient.
     pub executable_work: bool,
     /// A Job is active, uncertain, or still owns an unconsumed report.
     pub active_job: bool,
@@ -336,8 +337,8 @@ impl PlanReconciliationDriver {
     /// persists only the bounded digest, and pauses after three consecutive
     /// identical observations. The streak belongs to the session, not a cycle.
     /// Wait/pause eligibility, progress and the driver event are handled in one
-    /// transaction. An unfinished Plan or blocked Todo can only cause a
-    /// `NoExecutableWork` pause, never ordinary recovery.
+    /// transaction. Unfinished work without host-verified runnable evidence
+    /// causes a `NoExecutableWork` pause, never ordinary recovery.
     pub fn reconcile_with_progress(
         &self,
         session_id: &str,

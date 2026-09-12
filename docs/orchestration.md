@@ -396,6 +396,20 @@ cannot change them.
 Reasoning or variant resolution uses the reasoning or variant attached to the
 winning Agent route, then the selected model/provider default.
 
+Every `task` call is one flat JSON object with five required non-empty strings:
+`agent`, `objective`, `deliverable`, `instructions`, and `success_evidence`.
+They remain required when using `task_id` to continue a child. The optional
+`intent` is only a UI label; it is removed before typed argument parsing and
+cannot replace `objective`. Do not wrap the fields in a `contract` object.
+
+The tool description includes an executable minimal JSON example. Native
+`orchestrator` and `deep` prompts repeat the short contract; direct `build` and
+Council-only `review` do not gain delegation instructions or authority.
+If a required root field is missing, validation names it and adds bounded
+guidance from that field's current schema description. Correct the arguments
+before submitting a new call. Zuno does not infer a missing objective from
+`intent`, start a child from incomplete input, or replay the rejected call.
+
 Example direct delegation:
 
 ```json
@@ -463,9 +477,30 @@ returns a job id. `reportDelivery` then controls the terminal result:
 that never began becomes cancelled; a job that was already running becomes
 uncertain and is never replayed.
 
-Use background delegation for independent research or long-running work. Keep a
-dependency on the critical path in the foreground unless the parent has other
-useful work and can reliably consume a later report.
+Finishing the foreground response does not itself forbid an authorized observer
+completion. A `nextStep` report can continue the same eligible ordinary work cycle
+without a Goal, including when the session retains an unrelated completed or
+paused Goal. The report's bound cycle, not the mere existence of a session Goal,
+controls this decision. A truly Goal-owned pause or another execution gate still
+defers it; missing legacy scope is not assumed independent.
+
+For diagnosis, distinguish process exit, callback/history consumption and provider
+application. `consumed` records history, not proof of a new model request.
+Deferred reports stay durable and are not automatically replayed after an upgrade.
+An explicit new user request can inspect existing results; do not restart the
+observer just because no model continuation appeared.
+
+Use background delegation only for explicitly planned independent work alongside
+the parent's local work. Identify what the parent will do before dispatch, then
+do that non-overlapping work. Never background the sole task and finalize while
+it runs. Keep critical-path dependencies local or in the foreground.
+
+Long-running alone does not select background mode. If waiting is the only
+useful next action, keep the main workflow foreground and await the same child
+or process handle. A background dispatch requires identified independent
+mainline work, not merely a long runtime. A `remoteObserver` purpose does
+not itself detach a command. Do not end the turn merely to replace an existing
+foreground wait with a promised background callback.
 
 Task elapsed time includes every model request, tool call, and wait in the child.
 A provider timeout describes the request that failed and its retry recovery.

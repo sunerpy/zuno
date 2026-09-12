@@ -7707,27 +7707,19 @@ impl TurnHost {
     /// request is shared. Spending one turn per report is what let a session announce
     /// intermediate states that a later report in the same batch had already replaced.
     ///
-    /// Plan reconciliation reads the report the batch marks current, so a superseded
-    /// state cannot reopen work the newest report already finished.
+    /// Plan reconciliation uses an eligible report. A late report from a stopped
+    /// or unrelated cycle remains history but cannot seed the current work.
     pub(crate) async fn drive_promoted_reports_with_guard(
         &mut self,
         reports: &[ProjectedReport],
         guard: &SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<(), String> {
-        let newest = reports
-            .iter()
-            .find(|report| report.newest)
-            .or_else(|| reports.last())
-            .ok_or_else(|| "a batched report turn needs one promoted report".to_owned())?;
-        debug_assert!(matches!(
-            newest.source,
-            PlanningInputSource::ChildReport | PlanningInputSource::BackgroundReport
-        ));
-        let planning_prompt = newest.text.clone();
-        let planning_source = newest.source;
+        if reports.is_empty() {
+            return Err("a batched report turn needs one promoted report".to_owned());
+        }
         self.require_active_extension_composition()?;
-        let mut admitted_completion = None;
+        let mut committed_completions = Vec::new();
         for report in reports {
             let Some(input) = self
                 .inbox
@@ -7739,59 +7731,51 @@ impl TurnHost {
             if input.state != zuno_db::inbox::SubmissionState::Promoted {
                 continue;
             }
-            if zuno_db::session_wake::admission_in(&self.connection, &input).map_err(to_string)?
-                != WakeAdmission::Reject
-            {
-                admitted_completion = Some(input);
-            }
             let (message, parts) =
                 self.prepare_turn_user_message(&report.text, Some(report.input_id.as_str()), None)?;
             self.persist_promoted_user_input(&message, &parts)?;
+            committed_completions.push(input);
         }
-        let Some(admitted_completion) = admitted_completion else {
-            // The facts are durable, but a callback is not permission to reopen a
-            // paused/completed cycle or invent a new legacy completion cycle.
+        if committed_completions.is_empty() {
             return Ok(());
-        };
-        if self
-            .goal_store
-            .goal(&self.session_id)
-            .map_err(to_string)?
-            .is_some_and(|goal| goal.status != GoalStatus::Active)
-        {
+        }
+        // Promotion is a delivery claim, not continuing execution authority.
+        // Recheck after every report is durable, then satisfy only its exact
+        // wake in the same writer transaction. The native cycle resolver checks
+        // the bound Goal (if any), stopped cycles and explicit resume aliases;
+        // a historical session Goal does not own an independent ordinary cycle.
+        let admitted_completion = self
+            .database
+            .transaction(|tx| {
+                admit_report_continuation_in(tx, &self.session_id, reports, &committed_completions)
+            })
+            .map_err(to_string)?;
+        let Some((admitted_completion, planning_report)) = admitted_completion else {
+            // Reports remain durable even when current execution authority has
+            // changed. Only the owning native control can resolve that gate.
             events
                 .publish(TurnEvent::Notice {
                     audience: NoticeAudience::User,
                     severity: NoticeSeverity::Info,
-                    code: "report_deferred_by_goal_state".to_owned(),
+                    code: "report_deferred_by_execution_state".to_owned(),
                     detail: "Settled background reports were committed to durable history, but \
-                             the Goal is not active; provider continuation is deferred until the \
-                             Goal is resumed."
+                             the current work cycle does not authorize automatic continuation."
                         .to_owned(),
                 })
                 .await
                 .map_err(to_string)?;
             return Ok(());
-        }
-        let wake = zuno_db::session_wake::signal_in(&self.connection, &admitted_completion)
-            .map_err(to_string)?
-            .ok_or_else(|| "completion lost its durable wake identity".to_owned())?;
-        self.database
-            .transaction(|tx| {
-                zuno_db::session_execution::admit_wake_in(
-                    tx,
-                    &self.session_id,
-                    &wake,
-                    zuno_db::message::now_millis(),
-                )
-            })
-            .map_err(to_string)?;
+        };
+        debug_assert!(matches!(
+            planning_report.source,
+            PlanningInputSource::ChildReport | PlanningInputSource::BackgroundReport
+        ));
         let prompts = reports
             .iter()
             .map(|report| report.text.as_str())
             .collect::<Vec<_>>();
         self.preload_turn_skills(&prompts, &events).await?;
-        let completion_source = self.completion_source_for_input(&newest.input_id)?;
+        let completion_source = self.completion_source_for_input(&admitted_completion.id)?;
         let execution = self
             .session_control
             .state(&self.session_id)
@@ -7833,8 +7817,8 @@ impl TurnHost {
             )
             .map_err(|error| error.to_string())?;
         self.drive_prepared_with_start(
-            &planning_prompt,
-            planning_source,
+            &planning_report.text,
+            planning_report.source,
             None,
             None,
             TurnStart::Automatic {
@@ -8911,7 +8895,7 @@ impl TurnHost {
                     let (code, detail) = if reason == PlanPauseReason::NoExecutableWork {
                         (
                             "no_executable_work",
-                            "Automatic recovery paused: unfinished Plan or blocked Todo state does not identify executable work. Resolve the recorded wait or explicitly resume.",
+                            "Automatic recovery paused: no runnable step or Todo is owned by the current work cycle. Inspect the work state and any recorded gates before continuing.",
                         )
                     } else {
                         (
@@ -9390,7 +9374,7 @@ impl TurnHost {
                 zuno_tools::WorkItemStatus::Completed | zuno_tools::WorkItemStatus::Cancelled
             )
         });
-        let executable_work = work.items.iter().any(|item| {
+        let executable_todo = work.items.iter().any(|item| {
             matches!(
                 item.status,
                 zuno_tools::WorkItemStatus::Pending | zuno_tools::WorkItemStatus::InProgress
@@ -9483,6 +9467,31 @@ impl TurnHost {
                     _ => true,
                 }
             });
+        // A Plan is sufficient to represent work: do not require a duplicate
+        // Todo for its current step. Only an explicitly adopted Work Plan may
+        // supply this evidence; old Plans and assistant prose cannot. Where a
+        // step has unfinished Todos, their ownership/dependencies decide, not
+        // the coarser Plan status. An unsettled child still owns its result.
+        let executable_plan = work_authorized
+            && !active_job
+            && scope.as_ref().is_some_and(|scope| {
+                scope.stopped.is_none()
+                    && work.plan.as_ref().is_some_and(|plan| {
+                        scope.plan_id.as_deref() == Some(plan.id.as_str())
+                            && plan.steps.iter().any(|step| {
+                                step.status == zuno_tools::PlanStepStatus::InProgress
+                                    && !work.items.iter().any(|item| {
+                                        item.plan_step_id.as_deref() == Some(step.id.as_str())
+                                            && !matches!(
+                                                item.status,
+                                                zuno_tools::WorkItemStatus::Completed
+                                                    | zuno_tools::WorkItemStatus::Cancelled
+                                            )
+                                    })
+                            })
+                    })
+            });
+        let executable_work = executable_todo || executable_plan;
         let input = PlanReconciliationInput {
             plan_exists,
             plan_terminal,
@@ -10831,6 +10840,49 @@ fn durable_work_context(
     };
     transaction.commit().map_err(to_string)?;
     render_durable_work_context(snapshot).map(Some)
+}
+
+/// Select and admit one report while holding the caller's writer transaction.
+/// The returned projection is the input to the automatic turn's planning policy.
+fn admit_report_continuation_in(
+    tx: &zuno_db::Transaction<'_>,
+    session_id: &str,
+    reports: &[ProjectedReport],
+    committed_completions: &[zuno_db::inbox::SessionInput],
+) -> Result<Option<(zuno_db::inbox::SessionInput, ProjectedReport)>, zuno_error::DbError> {
+    // Prefer the projected newest report when eligible, otherwise the latest
+    // admitted eligible report. Rejected reports remain history, never the
+    // planning seed or completion source of this continuation.
+    let candidates = reports
+        .iter()
+        .filter(|report| report.newest)
+        .chain(reports.iter().rev().filter(|report| !report.newest));
+    for report in candidates {
+        let Some(input) = committed_completions
+            .iter()
+            .find(|input| input.id == report.input_id && input.session_id == session_id)
+        else {
+            continue;
+        };
+        if zuno_db::session_wake::admission_in(tx, input)? == WakeAdmission::Reject {
+            continue;
+        }
+        let Some(wake @ SessionWakeSignal::ExternalCompletion { .. }) =
+            zuno_db::session_wake::signal_in(tx, input)?
+        else {
+            continue;
+        };
+        if zuno_db::session_execution::admit_wake_in(
+            tx,
+            session_id,
+            &wake,
+            zuno_db::message::now_millis(),
+        )? != WakeAdmission::Reject
+        {
+            return Ok(Some((input.clone(), report.clone())));
+        }
+    }
+    Ok(None)
 }
 
 struct HostPlanningRequest<'a> {

@@ -412,6 +412,61 @@ fn the_advertised_schema_is_a_typed_delegation_contract() {
     );
 }
 
+#[tokio::test]
+async fn description_example_is_a_complete_flat_contract_that_dispatches_once() {
+    let example = DESCRIPTION
+        .split_once("```json\n")
+        .expect("an executable JSON example")
+        .1
+        .split_once("\n```")
+        .expect("closed JSON example")
+        .0;
+    let value: Value = serde_json::from_str(example).expect("valid JSON example");
+    assert!(
+        value.get("contract").is_none(),
+        "contract fields must be flat"
+    );
+    let host = Arc::new(RecordingHost::new());
+    let tool = erase(tool(host.clone()));
+    let schema = tool.definition().parameters;
+    for field in schema["required"].as_array().expect("required fields") {
+        assert!(value.get(field.as_str().unwrap()).is_some(), "{field}");
+    }
+    let output = tool
+        .invoke(value, context(Arc::new(AllowAll)))
+        .await
+        .expect("example runs");
+    assert!(!output.output.is_empty());
+    assert_eq!(host.dispatched().len(), 1);
+}
+
+#[tokio::test]
+async fn optional_intent_never_substitutes_for_the_objective_even_when_resuming() {
+    for resume in [false, true] {
+        let host = Arc::new(RecordingHost::new());
+        let tool = erase(tool(host.clone()));
+        let mut value = json!({
+            "agent":"explorer",
+            "intent":"A UI label is not a delegated outcome",
+            "deliverable":"An evidence report",
+            "instructions":"Inspect the declared scope without editing",
+            "success_evidence":"Name the inspected symbols"
+        });
+        if resume {
+            value["task_id"] = json!("ses_existing");
+        }
+        let error = tool
+            .invoke(value, context(Arc::new(AllowAll)))
+            .await
+            .expect_err("objective required");
+        assert!(message(&error).contains("objective"), "{}", message(&error));
+        assert!(
+            host.dispatched().is_empty(),
+            "invalid input never starts or resumes a child"
+        );
+    }
+}
+
 #[test]
 fn an_enabled_policy_advertises_optional_model_and_effort_fields() {
     let definition = erase(selectable_tool(Arc::new(RecordingHost::new()))).definition();
@@ -430,6 +485,28 @@ fn an_enabled_policy_advertises_optional_model_and_effort_fields() {
         .expect("required fields");
     assert!(!required.contains(&Value::String("model".to_owned())));
     assert!(!required.contains(&Value::String("effort".to_owned())));
+}
+
+#[test]
+fn both_task_schemas_explain_that_intent_cannot_replace_objective() {
+    for tool in [
+        erase(tool(Arc::new(RecordingHost::new()))),
+        erase(selectable_tool(Arc::new(RecordingHost::new()))),
+    ] {
+        let definition = tool.definition();
+        let objective = definition.parameters["properties"]["objective"]["description"]
+            .as_str()
+            .expect("objective guidance");
+        assert!(objective.contains("top-level"));
+        assert!(objective.contains("task_id"));
+        assert!(objective.contains("`intent`"));
+        assert!(
+            definition.parameters["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("objective"))
+        );
+    }
 }
 
 #[test]

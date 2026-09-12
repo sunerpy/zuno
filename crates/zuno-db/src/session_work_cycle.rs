@@ -60,6 +60,9 @@ pub fn completion_cycle_in(
     origin_cycle: &str,
 ) -> Result<Option<String>, DbError> {
     let Some(current) = current_in(connection, session_id)? else {
+        if !legacy_goal_allows_execution_in(connection, session_id)? {
+            return Ok(None);
+        }
         return Ok(crate::session_execution::read_in(connection, session_id)?
             .and_then(|state| state.cycle_id)
             .filter(|cycle| cycle == origin_cycle));
@@ -87,6 +90,34 @@ pub fn completion_cycle_in(
         }
     }
     Ok(Some(current.cycle_id))
+}
+
+/// A missing scope does not prove Goal independence. Legacy execution retains
+/// its conservative session-level Goal fence; only a persisted scope with an
+/// explicit `goal_id=None` can bypass that fence.
+pub(crate) fn legacy_goal_allows_execution_in(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<bool, DbError> {
+    // Goal policy is optional in older/native database consumers. No attached
+    // Goal store is different from a present, inactive Goal of unknown ownership.
+    let attached = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='goal')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(map_error)?;
+    if !attached {
+        return Ok(true);
+    }
+    connection
+        .query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM goal WHERE session_id=?1 AND status!='active')",
+            [session_id],
+            |row| row.get(0),
+        )
+        .map_err(map_error)
 }
 
 pub fn read_in(

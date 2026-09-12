@@ -148,13 +148,14 @@ pub struct DelegationConstraints {
 #[derive(Debug, Clone, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DelegationContract {
-    /// The concrete outcome this delegation advances.
+    /// Required top-level child outcome, including on task_id continuations.
+    /// The optional UI label `intent` does not supply or replace `objective`.
     pub objective: String,
-    /// The artifact or answer the child must return.
+    /// Required top-level artifact or answer the child must return.
     pub deliverable: String,
-    /// Task-specific execution guidance.
+    /// Required top-level execution guidance for the child, not a `prompt` alias.
     pub instructions: String,
-    /// Observable evidence that proves the delegation succeeded.
+    /// Required top-level observable evidence that proves this delegation succeeded.
     pub success_evidence: String,
     /// Explicit in-scope and out-of-scope ownership.
     #[serde(default)]
@@ -248,7 +249,8 @@ fn push_list(sections: &mut Vec<String>, heading: &str, values: &[String]) {
     sections.push(format!("{heading}:\n{body}"));
 }
 
-/// Arguments for one delegation.
+/// One flat JSON object: agent, objective, deliverable, instructions and
+/// success_evidence are required on every call. Do not nest them under contract.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TaskParams {
@@ -257,7 +259,8 @@ pub struct TaskParams {
     pub contract: DelegationContract,
     /// The specific Agent to delegate to.
     pub agent: String,
-    /// Run asynchronously and report a job id immediately. Defaults to foreground.
+    /// Default foreground. Set true only for an explicit parallel split while the
+    /// parent does independent local work; never detach merely to end its turn.
     #[serde(default)]
     pub background: Option<bool>,
     /// What to do with the terminal report of a background dispatch.
@@ -268,7 +271,8 @@ pub struct TaskParams {
     pub task_id: Option<String>,
 }
 
-/// Arguments exposed only when the session's durable model-selection policy is enabled.
+/// The same flat required delegation contract, with optional model/effort fields
+/// exposed only when the session's durable model-selection policy is enabled.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SelectableTaskParams {
@@ -277,7 +281,8 @@ pub struct SelectableTaskParams {
     pub contract: DelegationContract,
     /// The specific Agent to delegate to.
     pub agent: String,
-    /// Run asynchronously and report a job id immediately. Defaults to foreground.
+    /// Default foreground. Set true only for an explicit parallel split while the
+    /// parent does independent local work; never detach merely to end its turn.
     #[serde(default)]
     pub background: Option<bool>,
     /// What to do with the terminal report of a background dispatch.
