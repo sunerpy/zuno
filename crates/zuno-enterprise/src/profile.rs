@@ -205,8 +205,11 @@ impl WorkerServiceFactory for ConfiguredWorkerFactory {
         {
             return Err(WorkerError::Configuration);
         }
+        let completion_only = entry.definition.agent.mode == config::AgentExecutionMode::Completion;
         let memory = Arc::new(self.state.memory(execution));
-        let mut dispatcher: Arc<dyn zuno_engine::r#loop::ToolDispatcher> =
+        let mut dispatcher: Arc<dyn zuno_engine::r#loop::ToolDispatcher> = if completion_only {
+            Arc::new(zuno_worker::tools::CompletionToolDispatcher)
+        } else {
             Arc::new(MemoryToolDispatcher::new(
                 Arc::new(GatewayToolDispatcher::new(
                     self.state.clone(),
@@ -215,7 +218,8 @@ impl WorkerServiceFactory for ConfiguredWorkerFactory {
                 )),
                 memory.clone(),
                 execution.clone(),
-            ));
+            ))
+        };
         if let Some((maximum_depth, targets)) = self.children.targets(&entry.definition.reference())
         {
             let child = zuno_worker::child::ChildToolDispatcher::new(
@@ -248,11 +252,13 @@ impl WorkerServiceFactory for ConfiguredWorkerFactory {
                 output_tokens: entry.definition.model.max_output_tokens.get(),
             }),
             dynamic_context: DynamicContext::default(),
-            dynamic_context_refresher: Some(Arc::new(MemoryContextRefresher {
-                service: memory,
-                session_id: execution.job.session_id.to_string(),
-                base: DynamicContext::default(),
-            })),
+            dynamic_context_refresher: (!completion_only).then(|| {
+                Arc::new(MemoryContextRefresher {
+                    service: memory,
+                    session_id: execution.job.session_id.to_string(),
+                    base: DynamicContext::default(),
+                }) as Arc<dyn zuno_engine::r#loop::DynamicContextRefresher>
+            }),
             executor_directory: "/workspace".to_owned(),
             steps_per_advance: NonZeroU32::MIN,
             context_limit: Some(entry.definition.model.context_tokens.get()),

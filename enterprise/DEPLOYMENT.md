@@ -94,9 +94,13 @@ universal OAuth2 claims.
 An optional browser block supplies `authority`, `clientId`, `clientSecretFile`,
 `redirectUri`, `scopes`, optional `rootCertificate` and `encryptionKeys`. It uses
 OIDC code/PKCE and the same verified user policy. See [BFF contracts](BROWSER.md).
-The optional [Web workbench](WEB.md) is served at `/app/`; preview archives include
-its tested bytes under `web/`. Static resource deployment does not enable other
-enterprise routes or weaken authentication.
+The experimental [Web workbench](WEB.md) can be served at `/app/` when a separate
+bundle is supplied. App design and UI delivery are deferred until the Penpot
+design phase; current preview archives contain the backend only. The client
+contract workflow still checks Rust schemas and the SDK. Experimental browser
+checks in the client and Docker workflows require `include-experimental-web:
+true`; backend Docker checks run by default on both Linux architectures. Static
+resource deployment does not enable other routes or weaken authentication.
 
 ## Setup and identity
 
@@ -146,3 +150,11 @@ See [中文](DEPLOYMENT.zh.md), [platforms](PLATFORMS.md) and [status](STATUS.md
 Worker `liveMillis` defaults to 500 milliseconds, accepts 100–5000, or null to disable transient publication. Live progress is a bounded replaceable snapshot; it never holds model execution or replaces committed history. See [activity](ACTIVITY.md).
 
 Optional `workflows` installs bounded templates over the existing child target catalog. They use a non-model coordination Job, independent node workspaces and strict command approvals. See [Workflow configuration and limits](WORKFLOW.md).
+
+Agent `mode` defaults to `agent`, preserving existing normalized definition digests.
+`mode: "completion"` uses the same bounded model driver with no tools or resident
+Memory context. Omit `environment`, `delegation` and `workflows` for that profile.
+The control plane does not assign a gateway to it and excludes its configuration
+from Worker Memory access. Completion profiles can run as owned root sessions or
+as explicitly configured model-only children. This is a backend primitive for
+internal completions; it does not enable distributed Council coordination.

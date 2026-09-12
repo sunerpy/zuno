@@ -262,7 +262,12 @@ async fn worker_runtimes_renew_and_resume_shared_kernel_without_replaying_input_
         grants,
         tenant.clone(),
         LeaseDuration::new(1000).unwrap(),
-    );
+    )
+    .with_memory(
+        zuno_postgres::PostgresMemoryBackend::new(backend.clone(), Default::default()).unwrap(),
+    )
+    .with_memory_configurations(vec![configuration.clone()])
+    .unwrap();
     let reject_renewal = Arc::new(AtomicBool::new(false));
     let rejected_renewals = Arc::new(AtomicUsize::new(0));
     let failure_switch = reject_renewal.clone();
@@ -362,6 +367,76 @@ async fn worker_runtimes_renew_and_resume_shared_kernel_without_replaying_input_
         runtime.get(&actor.owner(), &job.id).await.unwrap().phase,
         JobPhase::Ready
     );
+
+    // A valid workload + Job grant cannot turn a completion-only profile into
+    // a Memory client. The restriction is enforced by the control plane.
+    let no_memory = ConfigurationRef {
+        id: ConfigurationId::new("completion-only").unwrap(),
+        version: 1,
+        sha256: "7".repeat(64),
+    };
+    let isolated_session = AgentApplication::new(Arc::new(backend.sessions(actor.clone())))
+        .create_session(CreateSession {
+            request_id: RequestId::new("completion-session").unwrap(),
+            workspace_id: WorkspaceId::new("workspace").unwrap(),
+            title: "Completion".to_owned(),
+        })
+        .await
+        .unwrap();
+    let isolated = runtime
+        .submit(
+            &actor,
+            JobSubmission {
+                selection: None,
+                session_id: isolated_session.id,
+                request_id: RequestId::new("completion-job").unwrap(),
+                expected_input_version: 0,
+                text: "Completion request".to_owned(),
+                configuration: no_memory.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let granted: zuno_worker::GrantedJob = http
+        .post(endpoint.join(zuno_worker::CLAIM_PATH).unwrap())
+        .bearer_auth("worker-token")
+        .json(&json!({
+            "version":zuno_engine::state::wire::WORKER_PROTOCOL_VERSION,
+            "worker":"completion-worker","configurations":[no_memory],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(granted.job.id, isolated.id);
+    let denied = http
+        .post(endpoint.join(zuno_worker::MEMORY_PATH).unwrap())
+        .bearer_auth("worker-token")
+        .header(zuno_worker::GRANT_HEADER, granted.grant.expose())
+        .json(&json!({"requestId":"forbidden-memory","command":{"kind":"policy","sessionId":null}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    {
+        use zuno_application::control::{CancelJob, RuntimeControl};
+        runtime
+            .cancel(
+                &actor,
+                &isolated.id,
+                CancelJob {
+                    request_id: RequestId::new("completion-cancel").unwrap(),
+                    expected_turn_id: isolated.turn_id,
+                    reason: "fixture complete".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+    }
 
     let script = Arc::new(Script {
         responses: Mutex::new(VecDeque::from([

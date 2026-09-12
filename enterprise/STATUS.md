@@ -422,3 +422,11 @@ CI run 34676688599 subsequently passed all gates at `9d558b7b360289dc9d6a428bc4f
 - Remote exact-head CI remains required before integration. Distributed Council, approved merge, remaining Memory/ACP/operational work and the full P0–P6 objective remain unfinished. Preview publication stays disabled.
 
 Workflow PR #218 initially exposed an arm64 stack overflow in the PostgreSQL contract. The shared turn-loop and optional coordination futures now have heap boundaries, as do independent test suites. Local PostgreSQL and all five HTTPS cases pass with 1.5 MiB test-thread stacks; CI retains its default stack limit. This is an allocation/layout fix with no API, database, permission or configuration change. The native arm64 rerun remains required.
+
+## Completion profiles for internal model work
+
+- Workflow PR #218 merged only into preview at `91e51905d5581026a733cbdfb65eaa333d5f69d2`, with CI 34702801073 green on both Linux architectures after the heap-boundary fix.
+- `agent.mode: completion` uses the shared bounded driver without tools, environment assignment, delegation or resident Memory injection. Its immutable configuration is also excluded from Worker Memory RPC access. Standard Agent definitions retain their normalized identity.
+- Council generic seat-answer validation now lives in the shared engine and remains consumed by the local Council host. These primitives do not register a distributed Council producer.
+- Native Docker/PostgreSQL/five HTTPS/four-role tests pass, including one completion request with no tools, Memory leakage or external operation; a valid excluded Worker grant receives forbidden from Memory. Ten enterprise unit tests, local Workflow/Council tests, shared parser checks, workspace check/Clippy, 100 docs/release contracts, formatting and diff checks pass.
+- UI is deferred to Penpot App design and is excluded from this batch. Distributed Council quorum/deadline/retry/synthesis and the remaining implementation plan remain incomplete; preview publication remains disabled.

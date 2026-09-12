@@ -28,6 +28,25 @@ use zuno_types::{
 
 pub const ENVIRONMENT_COMMAND: &str = "environment_command";
 
+/// An explicit completion profile exposes no tools. An unsolicited provider
+/// call is rejected before any environment, Memory or delegation operation.
+pub struct CompletionToolDispatcher;
+#[async_trait]
+impl ToolDispatcher for CompletionToolDispatcher {
+    fn available_tools(&self) -> AvailableTools {
+        AvailableTools::new(Vec::new(), McpToolStatus::Ready)
+    }
+    async fn prepare(&self, _request: DispatchRequest) -> PreparedToolDispatch {
+        PreparedToolDispatch::ready(ToolDispatchResult::blocked(
+            ToolOutput::text(
+                "Tool execution unavailable",
+                "This completion profile does not authorize tool execution.",
+            ),
+            ToolBlockKind::Denied,
+        ))
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct CommandArguments {

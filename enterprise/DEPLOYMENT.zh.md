@@ -69,7 +69,10 @@ Entra 使用对应的 `config`。Introspection 使用 `config`、`clientId` 和
 可选 browser 配置包含 `authority`、`clientId`、`clientSecretFile`、`redirectUri`、
 `scopes`、可选 `rootCertificate` 及 `encryptionKeys`，通过 OIDC code／PKCE 和同一
 用户 verifier 登录。详见 [BFF](BROWSER.zh.md)。
-可选 [Web 工作台](WEB.zh.md) 位于 `/app/`，预览压缩包的 `web/` 目录包含已验证资源。
+实验性 [Web 工作台](WEB.zh.md) 在另行提供资源包后可挂载到 `/app/`。App 设计和 UI
+交付等待后续 Penpot 设计阶段，当前预览压缩包仅包含后端。客户端工作流继续检查 Rust
+Schema 和 SDK；客户端与 Docker 工作流中的实验浏览器检查需要显式设置
+`include-experimental-web: true`。默认 Docker 检查覆盖 Linux 两种架构的后端。
 部署静态资源不会启用其他能力，也不会放宽认证。
 
 ## 初始化与身份检查
@@ -116,3 +119,9 @@ Web／ACP 功能及完整故障矩阵仍需继续完成。构建此二进制不�
 Worker 的 `liveMillis` 默认 500 毫秒，允许 100–5000，设为 null 关闭。实时进度是有界、可替换的快照，不阻塞模型执行，不替代持久历史。见[活动协议](ACTIVITY.zh.md)。
 
 可选 `workflows` 在已有子任务目录上安装有界模板，使用不运行模型的协调 Job、独立节点工作区及严格命令审批。配置与限制见 [Workflow](WORKFLOW.zh.md)。
+
+Agent 的 `mode` 默认 `agent`，保留现有定义的规范化摘要。`mode: "completion"`
+复用有界模型驱动，但不提供工具或驻留 Memory 上下文；该配置省略 `environment`、
+`delegation`、`workflows`。控制面不为其分配网关，并从 Worker Memory 授权中排除
+该配置。它可作为自有根会话或显式配置的纯模型子任务运行，是内部完成请求的后端原语，
+不代表分布式 Council 编排已完成。
