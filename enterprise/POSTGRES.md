@@ -265,3 +265,7 @@ the new defaults: root sessions retain their configured maximum, while legacy
 children cannot infer additional delegation authority. Forward migration performs
 the backfill and restores forced RLS before updating the marker.
 See [workspace preparation](WORKSPACES.md).
+
+## Format 12: durable cancellation
+
+Format 12 adds `runtime_control_request`, `runtime_stop`, `runtime_continuation` and `gateway_cancellation_delivery`. Stop intent, subtree lease fencing, logical completion and the gateway outbox commit together. The restricted catalog helper only returns assigned operation coordinates; actual bodies use owner RLS. The frozen format-11 fixture preserves sessions, messages, jobs, Memory, children and operation admissions through success and injected migration rollback. See [control](CONTROL.md).

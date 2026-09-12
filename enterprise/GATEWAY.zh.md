@@ -86,3 +86,7 @@ socket 会使该 gate 失败。可以通过 `ZUNO_ROOTLESS_DOCKER_SOCKET` 指定
 `GatewayToolDispatcher` 已通过此传输实现 `environment_command`，审批等待发生在执行前，
 操作等待发生在持久交接之后。可执行网关运行回执投递 supervisor；原生 runner 还会启动
 控制面、网关和两个独立 Worker 二进制，详见[部署](DEPLOYMENT.zh.md)。
+
+## 数据所有者取消
+
+网关 supervisor 通过独立服务认证轮询 `internal/gateway/v1/cancellations`，领取已停止 Job 的不可变操作接纳记录。该入口在 Worker 撤权后仍有效，只允许停止原操作；完成事实保持原样，不确定状态继续核查。见[控制](CONTROL.zh.md)。

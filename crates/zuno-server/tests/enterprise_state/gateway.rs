@@ -626,8 +626,77 @@ async fn gateway_requests_are_scoped_authenticated_and_still_require_current_hum
         );
         assert!(workspace_lost.load(Ordering::SeqCst));
     }
-    query("UPDATE zuno_enterprise_preview.runtime_session SET lease_expires=0 WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3")
-        .bind(tenant.as_str()).bind(actor.principal_id().as_str()).bind(job.session_id.as_str()).execute(&admin).await.unwrap();
+    let mut pending_operation = None;
+    if host.is_some() {
+        let GatewayReply::Environment(current) =
+            reply(&worker, &execution, &client, GatewayCommand::Get)
+                .await
+                .unwrap()
+        else {
+            panic!("current parent workspace")
+        };
+        let pending = CommandOperation {
+            id: OperationId::new("cancel-running-process").unwrap(),
+            invocation_id: InvocationId::new("cancel-running-process").unwrap(),
+            expected_revision: current.revision,
+            argv: vec!["sleep".to_owned(), "300".to_owned()],
+            ..command.clone()
+        };
+        let GatewayReply::Approval(approval) = reply(
+            &worker,
+            &execution,
+            &client,
+            GatewayCommand::PrepareCommand {
+                operation: pending.clone(),
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("command approval")
+        };
+        backend
+            .organizations(tenant.clone())
+            .answer(
+                &actor,
+                AnswerApproval {
+                    request_id: RequestId::new("approve-pending").unwrap(),
+                    approval_id: approval.id,
+                    answer: ApprovalAnswer::Approve,
+                },
+            )
+            .await
+            .unwrap();
+        let GatewayReply::Operation(receipt) = reply(
+            &worker,
+            &execution,
+            &client,
+            GatewayCommand::SubmitCommand {
+                operation: pending.clone(),
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("running command")
+        };
+        assert_eq!(receipt.phase, OperationPhase::Running);
+        pending_operation = Some(pending.id);
+    }
+    use zuno_application::control::{CancelJob, RuntimeControl};
+    let cancelled = runtime
+        .cancel(
+            &actor,
+            &job.id,
+            CancelJob {
+                request_id: RequestId::new("cancel-root").unwrap(),
+                expected_turn_id: job.turn_id.clone(),
+                reason: "Stop the current investigation".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    if let Some(id) = &pending_operation {
+        assert!(cancelled.pending_operations.contains(id));
+    }
     assert!(worker.gateway_ticket(&execution, &request).await.is_err());
     assert!(state.resolve(&issued.ticket, &request).await.is_err());
     if let Some(delivery) = &delivery {
@@ -636,8 +705,22 @@ async fn gateway_requests_are_scoped_authenticated_and_still_require_current_hum
             "a lost post-commit response must remain unacknowledged at the gateway"
         );
         assert!(lost.load(Ordering::SeqCst));
-        assert_eq!(delivery.deliver_completions(128).await.unwrap(), 3);
+        assert_eq!(delivery.deliver_completions(128).await.unwrap(), 4);
         assert_eq!(delivery.deliver_completions(128).await.unwrap(), 0);
+        assert!(state.cancellations(64).await.unwrap().is_empty());
+        let stopped = backend
+            .gateway_operations(GatewayId::new("gateway").unwrap())
+            .completion(&actor.owner(), pending_operation.as_ref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopped.receipt.phase, OperationPhase::Cancelled);
+        assert!(stopped.receipt.cancellation_requested);
+        assert_eq!(
+            runtime.get(&actor.owner(), &job.id).await.unwrap().phase,
+            zuno_application::runtime::JobPhase::Cancelled,
+            "late gateway receipts cannot revive a cancelled parent"
+        );
         if let Some((id, revision)) = &child_workspace {
             delivery
                 .environments()
@@ -674,7 +757,7 @@ async fn gateway_requests_are_scoped_authenticated_and_still_require_current_hum
             "SELECT count(*) FROM zuno_enterprise_preview.event WHERE tenant_id=$1 AND principal_id=$2 AND type='runtime.operation.completed'",
         ).bind(tenant.as_str()).bind(actor.principal_id().as_str()).fetch_one(&admin).await.unwrap();
         assert_eq!(
-            count, 3,
+            count, 4,
             "lost acknowledgements must not duplicate completion facts"
         );
         root::exercise(root::Context {

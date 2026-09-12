@@ -6,9 +6,9 @@ Original baseline: `v0.10.29`, `d1212860dba6a6b420ce81d444ace58feaf0adb5`.
 | --- | --- | --- |
 | P0 | Complete | PR #176 merged into preview; native CI run 34553054820 succeeded |
 | P1 | In progress | Principal propagation implemented; ownership migration validated; local bounded driver and scoped session application validated; local runtime Job/lease port validated; Memory persistence/authority ports validated; backend assembly remains |
-| P2 | In progress | PostgreSQL sessions/runtime Jobs, OAuth2/Entra verification and organization/approval storage validated; Memory, login and execution integration remain |
-| P3 | In progress | Shared kernel, PostgreSQL checkpoint handoff, authenticated HTTPS transport and rootless backend validated; independent Worker processes, gateway service and launch assembly remain |
-| P4 | In progress | Durable invocation waits/consumption implemented; child/Workflow/Council producers, merges and cancellation controls remain |
+| P2 | In progress | PostgreSQL, generic OAuth2/OIDC, BFF, scoped private Memory, organization policy and HITL integrated; shared/automatic Memory and full fault acceptance remain |
+| P3 | In progress | Independent control/gateway/two-Worker executable loop validated; full fault/operational acceptance remains |
+| P4 | In progress | Child dispatch, persistent waits, workspace forks and Job cancellation implemented; approved merge and Workflow/Council remain |
 | P5 | Pending | Web, SDK, remote ACP, common projections |
 | P6 | Pending | Fault injection, native artifacts, preview publication |
 
@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p3-operation-completion`.
+- Current phase branch: `codex/enterprise-p4-cancellation`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -376,3 +376,11 @@ CI run 34676688599 subsequently passed all gates at `9d558b7b360289dc9d6a428bc4f
 - PostgreSQL format 11 gates child activation on an assigned gateway's immutable workspace receipt. Parent/child identities, current lease, source/target specs and receipt deduplication are checked. Truthful late receipts do not restore expired authority. Exact format-10 migration preserves prior rows and explicitly backfills inherited depth under RLS.
 - Worker protocol 7 and gateway protocol 2 expose only preparation of a server-resolved staged child. Executable definitions with pinned child digests now mount native task and prepare parent snapshots/child forks. `--definition-ref` produces validated references without starting services or reading credentials.
 - The real four-process test passed two users, parent/child jobs and workspaces, fourteen model requests, four human command approvals, Memory isolation/revocation and SIGTERM. Child changes leave the parent intact. Snapshot/fork currently requires one assigned Docker gateway; cross-gateway transfer, approved merge, full cancellation and Workflow/Council remain outstanding.
+
+## Durable task-tree cancellation
+
+- Workspace PR #211 (head `4ebc99c29c44edb1660c721d7e62af5be0176fd8`) is running native preview CI.
+- Authenticated API/BFF cancellation fences active descendants and old Worker leases atomically, preserves completed/uncertain evidence and suppresses late nextStep wakeups.
+- Gateway service cancellation survives lease revocation and uses immutable admissions, fair durable polling and the existing terminal receipt acknowledgement path.
+- PostgreSQL format 12 preserves exact format-11 fixtures and rolls back failed DDL atomically. Native Docker/PostgreSQL/HTTPS/independent-role tests pass. Follow-up PostgreSQL tests cover rollback, competing cancellation, previously admitted automatic continuation and bounded/fair gateway batches. Final workspace check, Clippy, docs, formatting and diff gates pass.
+- English/Chinese control, application, persistence and runtime docs are updated. Only preview docs archives are affected. Publication remains disabled.

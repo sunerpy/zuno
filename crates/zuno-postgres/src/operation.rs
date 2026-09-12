@@ -9,7 +9,7 @@ use zuno_application::{
     authorization::CheckedApproval,
     environment::{OperationAdmission, OperationCompletion},
 };
-use zuno_types::identity::{GatewayId, OperationId, PrincipalKey};
+use zuno_types::identity::{GatewayId, OperationId, PrincipalId, PrincipalKey, TenantId};
 
 #[derive(Clone)]
 pub struct PostgresOperationStore {
@@ -20,6 +20,83 @@ pub struct PostgresOperationStore {
 impl PostgresOperationStore {
     pub(crate) fn new(backend: PostgresBackend, gateway: GatewayId) -> Self {
         Self { backend, gateway }
+    }
+
+    /// Only the authenticated gateway host selects its tenant/identity. This
+    /// outbox survives Worker loss and never requires a live execution lease.
+    pub async fn cancellations(
+        &self,
+        tenant: &TenantId,
+        limit: u32,
+    ) -> Result<Vec<OperationAdmission>, ApplicationError> {
+        if !(1..=64).contains(&limit) {
+            return Err(ApplicationError::Invalid(
+                "invalid cancellation batch".to_owned(),
+            ));
+        }
+        let rows = query(
+            "SELECT principal_id,operation_id FROM zuno_enterprise_preview.gateway_cancellations($1,$2,$3)",
+        )
+        .bind(tenant.as_str()).bind(self.gateway.as_str()).bind(limit as i32)
+        .fetch_all(&self.backend.pool).await.map_err(database_error)?;
+        let mut pending = Vec::new();
+        let mut encoded_bytes = 2usize;
+        for row in rows {
+            let owner = PrincipalKey {
+                tenant_id: tenant.clone(),
+                principal_id: PrincipalId::new(
+                    row.try_get::<String, _>("principal_id")
+                        .map_err(database_error)?,
+                )
+                .map_err(ApplicationError::storage)?,
+            };
+            let id: String = row.try_get("operation_id").map_err(database_error)?;
+            let mut tx = owner_transaction(&self.backend.pool, &owner).await?;
+            let raw = query(
+                "SELECT o.admission FROM zuno_enterprise_preview.gateway_operation o
+                 JOIN zuno_enterprise_preview.runtime_stop s
+                   ON s.tenant_id=o.tenant_id AND s.principal_id=o.principal_id AND s.job_id=o.job_id
+                 WHERE o.tenant_id=$1 AND o.principal_id=$2 AND o.operation_id=$3
+                   AND o.gateway_id=$4 AND o.completion IS NULL",
+            )
+            .bind(tenant.as_str()).bind(owner.principal_id.as_str()).bind(&id).bind(self.gateway.as_str())
+            .fetch_optional(&mut *tx).await.map_err(database_error)?;
+            if let Some(raw) = raw {
+                let admission: OperationAdmission =
+                    serde_json::from_value(raw.try_get("admission").map_err(database_error)?)
+                        .map_err(ApplicationError::storage)?;
+                if admission.lease.owner != owner
+                    || admission.gateway_id != self.gateway
+                    || admission.operation.id.as_str() != id
+                {
+                    return Err(ApplicationError::Conflict);
+                }
+                let bytes = serde_json::to_vec(&admission)
+                    .map_err(ApplicationError::storage)?
+                    .len()
+                    + 1;
+                if encoded_bytes.saturating_add(bytes)
+                    > zuno_application::environment::wire::MAX_GATEWAY_FRAME_BYTES
+                {
+                    if pending.is_empty() {
+                        return Err(ApplicationError::Invalid(
+                            "stored cancellation admission exceeds the protocol bound".to_owned(),
+                        ));
+                    }
+                    tx.commit().await.map_err(database_error)?;
+                    break;
+                }
+                encoded_bytes += bytes;
+                let time = database_time(&mut tx).await?;
+                query("UPDATE zuno_enterprise_preview.gateway_cancellation_delivery SET time_polled=$4
+                    WHERE tenant_id=$1 AND principal_id=$2 AND operation_id=$3")
+                    .bind(tenant.as_str()).bind(owner.principal_id.as_str()).bind(&id).bind(time)
+                    .execute(&mut *tx).await.map_err(database_error)?;
+                pending.push(admission);
+            }
+            tx.commit().await.map_err(database_error)?;
+        }
+        Ok(pending)
     }
 
     /// The host authenticates the gateway and pins its ID before using this

@@ -294,14 +294,67 @@ async fn rootless_gateway_reopens_receipts_without_replaying_the_command() {
         argv: vec!["sleep".to_owned(), "30".to_owned()],
     };
     gateway.submit(&lease, pending.clone()).await.unwrap();
-    gateway.cancel(&lease, &pending.id).await.unwrap();
+    let cancellation = OperationAdmission {
+        gateway_id: GatewayId::new("test-gateway").unwrap(),
+        lease: lease.clone(),
+        environment: gateway.get(&owner, &spec.id).await.unwrap(),
+        operation: pending.clone(),
+    };
+    authority.0.store(false, Ordering::SeqCst);
+    assert!(gateway.cancel(&lease, &pending.id).await.is_err());
+    drop(gateway);
+    let gateway = DockerGateway::connect(std::path::Path::new(&socket), &ledger, authority.clone())
+        .await
+        .unwrap();
+    let mut forged = cancellation.clone();
+    forged.operation.argv.push("changed".to_owned());
+    assert!(gateway.cancel_admitted(&forged).await.is_err());
+    gateway.cancel_admitted(&cancellation).await.unwrap();
     assert_eq!(
         terminal(&gateway, &owner, &pending.id).await.phase,
         OperationPhase::Cancelled
     );
     gateway.deliver_completions(&sink, 128).await.unwrap();
-    gateway.release(&owner, &spec.id, 3).await.unwrap();
-    gateway.release(&owner, &spec.id, 3).await.unwrap();
+    assert_eq!(
+        gateway.cancel_admitted(&cancellation).await.unwrap().phase,
+        OperationPhase::Cancelled,
+        "durable stop intent survives Worker revocation and gateway restart"
+    );
+    let tombstone = OperationAdmission {
+        environment: gateway.get(&owner, &spec.id).await.unwrap(),
+        operation: CommandOperation {
+            id: OperationId::new("never-start").unwrap(),
+            invocation_id: InvocationId::new("never-start").unwrap(),
+            expected_revision: 3,
+            argv: vec!["touch".to_owned(), "/workspace/forbidden".to_owned()],
+            ..pending
+        },
+        ..cancellation
+    };
+    assert_eq!(
+        gateway.cancel_admitted(&tombstone).await.unwrap().phase,
+        OperationPhase::Cancelled
+    );
+    authority.0.store(true, Ordering::SeqCst);
+    assert_eq!(
+        gateway
+            .submit(&lease, tombstone.operation)
+            .await
+            .unwrap()
+            .phase,
+        OperationPhase::Cancelled,
+        "a delayed submit cannot start an operation cancelled before local admission"
+    );
+    gateway.deliver_completions(&sink, 128).await.unwrap();
+    let final_revision = gateway.get(&owner, &spec.id).await.unwrap().revision;
+    gateway
+        .release(&owner, &spec.id, final_revision)
+        .await
+        .unwrap();
+    gateway
+        .release(&owner, &spec.id, final_revision)
+        .await
+        .unwrap();
     assert!(gateway.get(&owner, &spec.id).await.is_err());
     assert!(gateway.acquire(&owner, spec).await.is_err());
 }

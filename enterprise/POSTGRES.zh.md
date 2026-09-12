@@ -194,3 +194,7 @@ message／part、等待 Job 和输入回执。BFF 与 Worker 的网络验证使�
 
 精确格式 10 fixture 比较旧列并单独验证新默认值：根会话保留配置上限，旧子会话不推断
 额外委派权。迁移在回填后恢复强制 RLS，再更新格式标记。详见[工作区](WORKSPACES.zh.md)。
+
+## 格式 12：持久取消
+
+格式 12 增加 `runtime_control_request`、`runtime_stop`、`runtime_continuation` 和 `gateway_cancellation_delivery`。停止意图、子树执行权撤销、逻辑完成及网关队列一起提交；受限目录函数只返回分配给网关的操作坐标，正文仍经过所有者 RLS。固定格式 11 夹具验证迁移成功及注入失败回滚时会话、消息、Job、Memory、子任务和操作接纳记录不丢失。见[控制](CONTROL.zh.md)。

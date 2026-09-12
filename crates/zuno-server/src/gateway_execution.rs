@@ -35,7 +35,23 @@ impl GatewayExecutionService {
     /// Host lifecycle calls this bounded scan repeatedly with interruptible
     /// backoff. Work is reconstructed from the ledger, not an in-memory list.
     pub async fn deliver_completions(&self, limit: u32) -> Result<u32, ApplicationError> {
-        self.gateway.deliver_completions(&self.state, limit).await
+        let pending = self.state.cancellations(limit.min(64)).await?;
+        let mut failure = None;
+        for admission in pending {
+            if admission.gateway_id != self.id {
+                return Err(ApplicationError::Forbidden);
+            }
+            if let Err(error) = self.gateway.cancel_admitted(&admission).await {
+                // One unavailable environment must not stop other cancellations
+                // or delivery of already captured completion facts.
+                failure.get_or_insert(error);
+            }
+        }
+        let delivered = self.gateway.deliver_completions(&self.state, limit).await?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(delivered)
     }
 
     /// Host administration owns environment lifecycle; this is not an HTTP

@@ -15,6 +15,8 @@ use super::*;
 
 #[path = "tests/format_eight.rs"]
 mod format_eight;
+#[path = "tests/format_eleven.rs"]
+mod format_eleven;
 #[path = "tests/format_nine.rs"]
 mod format_nine;
 #[path = "tests/format_seven.rs"]
@@ -332,6 +334,7 @@ async fn real_postgres_enforces_scopes_transactions_role_boundaries_and_schema_i
     format_eight::upgrade(&fixture, &admin).await;
     format_nine::upgrade(&fixture, &admin).await;
     format_ten::upgrade(&fixture, &admin).await;
+    format_eleven::upgrade(&fixture, &admin).await;
     let expected_count: i64 = query_scalar("SELECT count(*) FROM zuno_enterprise_preview.session")
         .fetch_one(&admin)
         .await

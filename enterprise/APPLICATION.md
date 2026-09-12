@@ -27,6 +27,7 @@ bootstrap remains an explicit schema-owner operation.
 | `GET /sessions/{session}/input-version` | Exact CAS version |
 | `POST /sessions/{session}/turns` | Atomic input and Job admission |
 | `GET /jobs/{job}` | Public Job identity, phase and input version |
+| `POST /jobs/{job}/cancel` | Durable tree cancellation, old-lease fencing and operation stop intent |
 | `GET /approvals/{approval}` | Authorized approval presentation |
 | `POST /approvals/{approval}/answer` | Idempotent human decision |
 | `POST /workspaces/{workspace}/memory` | Typed private Memory requests, when the backend is installed |
@@ -53,8 +54,13 @@ is neither tool completion nor a Worker credential.
 Public Job DTOs expose typed waiting targets so a client can discover its approval
 ID. They contain no checkpoints, leases, grants, configuration, private
 replay blocks or arbitrary stored results. Rich history/live activity uses the
-separate activity protocol; no placeholder history, cancellation or stream route
+separate activity protocol; no placeholder history or stream route
 is mounted.
+
+Cancellation accepts `requestId`, `expectedTurnId` and a bounded `reason`.
+Receipts distinguish logical stopped Jobs from pending external operations.
+Public Job reads include `stopRequested` and current `pendingOperations`;
+see [durable cancellation](CONTROL.md) for races, restart and completion semantics.
 
 Run `python3 scripts/check_enterprise_postgres.py` for real TLS/PostgreSQL
 verification: two users, CAS/replay conflicts, configured input, foreign-resource

@@ -44,7 +44,7 @@ RLS，并保留格式 1–9。精确格式 9 fixture 含运行时和 Memory 数�
 
 只有注入真实 catalog，`WorkerStateService::with_children` 才挂载处理器。独立可执行
 定义配置有效 `delegation.targets` 后，现已安装 catalog 与原生 task dispatcher。
-子模型、网关由引用定义固定，工作区准备控制执行准入。完整取消／合并、跨网关传输与
+子模型、网关由引用定义固定，工作区准备控制执行准入。Job／任务树取消见[控制](CONTROL.zh.md)。审批合并、跨网关传输与
 Workflow／Council 继续按 P4 实现，配置见[工作区](WORKSPACES.zh.md)。
 
 参见 [English](CHILDREN.md)、[持久等待](WAITING.zh.md)、

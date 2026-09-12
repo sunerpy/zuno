@@ -96,7 +96,7 @@ the parent unchanged.
 The executable fixture runs one control plane, one gateway and two Workers with
 two users, real parent/child Jobs, fourteen provider requests, four human command
 approvals, private Memory and clean SIGTERM shutdown. These are deterministic
-provider fixtures. Full cancellation/approved merge, cross-gateway transfer,
+provider fixtures. Approved merge, cross-gateway transfer,
 Workflow/Council and the remaining P5–P6 acceptance continue under the main plan.
 
 See [中文](WORKSPACES.zh.md), [child dispatch](CHILDREN.md),

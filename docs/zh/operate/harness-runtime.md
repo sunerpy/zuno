@@ -860,3 +860,5 @@ WebSearch 的带密钥 wire URL 不进入诊断。错误只保留 provider、sch
 - [权限与沙箱](/zh/guide/permissions) —— 沙箱与权限的两个门禁
 - [编排与委派](/zh/guide/orchestration) —— 委派边界与模型路由
 - [Goal、Plan 与 Todo](/zh/guide/durable-state) —— 持久状态如何控制续跑
+
+企业 Job 取消通过经过认证的 `RuntimeControl` 和持久网关队列执行。Worker 执行权撤销与逻辑子结果一起提交，外部进程结束另行确认；详见预览源码归档中的 `enterprise/CONTROL.zh.md`。
