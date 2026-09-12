@@ -174,7 +174,7 @@ message／part、等待 Job 和输入回执。BFF 与 Worker 的网络验证使�
 
 数据所有者在有界阻塞容量中执行共享 Memory 服务，每个请求共用一个事务。主体／工作区
 验证、候选 CAS、来源重验、授权、学习租约与结果／审计保持同一边界。Worker 使用内部
-协议 9，不接收数据库 provider 或 pool。已实现能力和待实现生产者见 [Memory](MEMORY.zh.md)。
+协议 10，不接收数据库 provider 或 pool。已实现能力和待实现生产者见 [Memory](MEMORY.zh.md)。
 
 ## 子任务执行会话关联
 
@@ -210,3 +210,14 @@ message／part、等待 Job 和输入回执。BFF 与 Worker 的网络验证使�
 ## 格式 15：持久 Workflow 协调
 
 `runtime_workflow`、`runtime_workflow_node` 保存固定 DAG、原生 Job 关联、逻辑节点容量、有序结果及精确依赖输入。Agent Worker 不领取协调 Job；节点接纳在当前授权与短事务锁下完成。格式 14 fixture 验证会话、消息、Memory、持久 frame 和临时行保留，以及 marker 前故障回滚。详见 [Workflow](WORKFLOW.zh.md)。
+
+## 格式 16：Council 协调和执行期限
+
+作用域化 `runtime_council`、`runtime_council_seat` 和 `runtime_council_attempt`
+保存固定策略执行、答案摘要、修正来源、quorum 和综合期限。普通 Job 的
+`runtime_job.deadline_at` 为空；有期限的 Council Job 在领取和续租时截断租约。
+固定格式 15 fixture 的来源摘要为
+`412f668e781e311d6ddf76fd51a1314ace1b6423f1b33c67ceaac053ce40661c`。
+迁移测试保留代表性 Job、消息、Memory、frame 和 Workflow／节点，检查 DDL
+失败回滚、新 RLS 表及 marker。比较历史 Job 行时只排除新增的可空列，旧格式来源摘要
+和结构 manifest 仍需通过校验。详见 [Council 执行](WORKFLOW.zh.md#持久-council)。

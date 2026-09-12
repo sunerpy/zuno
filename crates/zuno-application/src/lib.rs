@@ -9,6 +9,7 @@ pub mod api;
 pub mod authorization;
 pub mod child;
 pub mod control;
+pub mod council;
 pub mod environment;
 pub mod live;
 pub mod runtime;

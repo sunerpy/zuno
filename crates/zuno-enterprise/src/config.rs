@@ -324,6 +324,18 @@ pub struct Definition {
     pub delegation: Option<DelegationDefinition>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workflows: Vec<zuno_orchestration::WorkflowTemplateDescriptor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub councils: Vec<CouncilDefinition>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CouncilDefinition {
+    pub preset: zuno_orchestration::CouncilPresetDescriptor,
+    pub synthesis: ConfigurationRef,
+    /// Original seat Agent name -> an explicit completion profile using the
+    /// same model. Repairs cannot rerun a seat's external tools.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub repairs: BTreeMap<String, ConfigurationRef>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -441,7 +453,9 @@ impl Definition {
         }
         match (&self.agent.mode, &self.environment) {
             (AgentExecutionMode::Completion, None)
-                if self.delegation.is_none() && self.workflows.is_empty() => {}
+                if self.delegation.is_none()
+                    && self.workflows.is_empty()
+                    && self.councils.is_empty() => {}
             (AgentExecutionMode::Agent, Some(environment)) => {
                 https_endpoint(&environment.endpoint)?;
                 zuno_application::environment::EnvironmentSpec {

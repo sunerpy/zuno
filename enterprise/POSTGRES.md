@@ -187,7 +187,7 @@ limit. No incomplete history is treated as an exact old context window.
 
 The captured format-5 fixture preserves pending waits, Job budgets, lease state,
 messages and usage across failed/successful format-6 migration. The internal Worker
-protocol is version 9; it is separate from public UI DTOs. Its compatible claims,
+protocol is version 10; it is separate from public UI DTOs. Its compatible claims,
 stable input timestamps and bounded grant renewal are described in [Workers](WORKERS.md).
 
 ## Browser authentication state
@@ -235,7 +235,7 @@ browser and operation data before the marker advances.
 The data owner runs the shared Memory service in bounded blocking capacity with
 one transaction per request. Actor/workspace checks, candidate CAS, source
 revalidation, consent, learning lease checks and result/audit commit stay together.
-Workers use internal protocol 9 and never receive this provider or pool.
+Workers use internal protocol 10 and never receive this provider or pool.
 See [Memory](MEMORY.md) for implemented behavior and remaining producers.
 
 ## Child execution-session binding
@@ -281,3 +281,17 @@ Format 14 adds `live_progress` and an atomic cleanup trigger on execution change
 ## Format 15: durable Workflow coordination
 
 `runtime_workflow` and `runtime_workflow_node` retain the fixed DAG, native Job links, logical node capacity, ordered results and exact dependency inputs. Agent Workers never claim coordination Jobs. Current authorization and short transaction locks govern node admission. The format-14 fixture preserves sessions, messages, Memory, committed frames and live rows, including rollback before the marker. See [Workflow](WORKFLOW.md).
+
+## Format 16: Council coordination and execution deadlines
+
+Scoped `runtime_council`, `runtime_council_seat` and `runtime_council_attempt`
+retain immutable-policy execution, answer digests, repair provenance, quorum and
+synthesis deadlines. `runtime_job.deadline_at` is nullable for ordinary Jobs;
+claims and renewals clip execution leases for bounded Council Jobs.
+The frozen format-15 fixture has source digest
+`412f668e781e311d6ddf76fd51a1314ace1b6423f1b33c67ceaac053ce40661c`.
+Migration tests preserve representative Jobs, messages, Memory, frames and
+Workflow/node rows and verify DDL failure rollback, new RLS tables and the marker.
+Only the newly added nullable column is excluded when comparing historical Job
+rows. The source digest and structural manifest of every prior format remain
+validated. See [Council execution](WORKFLOW.md#durable-council).

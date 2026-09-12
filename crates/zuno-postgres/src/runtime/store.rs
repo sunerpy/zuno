@@ -59,6 +59,7 @@ impl RuntimeStore for PostgresRuntimeStore {
             };
             let mut tx = owner_transaction(&self.pool, &owner).await?;
             let time = database_time(&mut tx).await?;
+            Box::pin(workflow::expire_councils(&mut tx, &owner, time)).await?;
             expire_inflight(&mut tx, &owner, time).await?;
             children::drain(&mut tx, &owner).await?;
             // Coordination has its own bounded async state. Keeping it inline
@@ -68,7 +69,7 @@ impl RuntimeStore for PostgresRuntimeStore {
             waiting::wake_timers(&mut tx, &owner, time).await?;
             let time = database_time(&mut tx).await?;
             let candidate = query(
-                "SELECT r.job_id FROM zuno_enterprise_preview.runtime_job r
+                "SELECT r.job_id,r.deadline_at FROM zuno_enterprise_preview.runtime_job r
                  JOIN zuno_enterprise_preview.runtime_session s
                    ON s.tenant_id=r.tenant_id AND s.principal_id=r.principal_id AND s.session_id=r.session_id
                  JOIN zuno_enterprise_preview.session session
@@ -76,6 +77,7 @@ impl RuntimeStore for PostgresRuntimeStore {
                  JOIN zuno_enterprise_preview.input i
                    ON i.tenant_id=r.tenant_id AND i.principal_id=r.principal_id AND i.id=r.input_id
                  WHERE r.tenant_id=$1 AND r.principal_id=$2 AND r.phase='ready' AND r.ready_at<=$3
+                   AND (r.deadline_at IS NULL OR r.deadline_at>$3)
                    AND NOT EXISTS(SELECT 1 FROM zuno_enterprise_preview.runtime_workflow w
                      WHERE w.tenant_id=r.tenant_id AND w.principal_id=r.principal_id AND w.job_id=r.job_id)
                    AND ($4::jsonb IS NULL OR r.configuration IN (SELECT value FROM jsonb_array_elements($4::jsonb)))
@@ -110,6 +112,12 @@ impl RuntimeStore for PostgresRuntimeStore {
             let expires = time
                 .checked_add(i64::from(duration.milliseconds()))
                 .ok_or(ApplicationError::Conflict)?;
+            let deadline: Option<i64> = candidate.try_get("deadline_at").map_err(database_error)?;
+            let expires = deadline.map_or(expires, |deadline| expires.min(deadline));
+            if expires <= time {
+                tx.commit().await.map_err(database_error)?;
+                continue;
+            }
             // Recheck readiness after acquiring the session row lock.
             let epoch: Option<i64> = query_scalar(
                 "UPDATE zuno_enterprise_preview.runtime_session SET lease_epoch=lease_epoch+1,current_job_id=$3,
@@ -183,8 +191,12 @@ impl RuntimeStore for PostgresRuntimeStore {
             .checked_add(i64::from(duration.milliseconds()))
             .ok_or(ApplicationError::Conflict)?;
         let expires_at_ms: i64 = query_scalar(
-            "UPDATE zuno_enterprise_preview.runtime_session SET lease_expires=GREATEST(lease_expires,$4)
-             WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3 RETURNING lease_expires",
+            "UPDATE zuno_enterprise_preview.runtime_session s
+             SET lease_expires=LEAST(GREATEST(s.lease_expires,$4),r.deadline_at)
+             FROM zuno_enterprise_preview.runtime_job r
+             WHERE s.tenant_id=$1 AND s.principal_id=$2 AND s.session_id=$3
+               AND r.tenant_id=s.tenant_id AND r.principal_id=s.principal_id AND r.job_id=s.lease_job_id
+             RETURNING s.lease_expires",
         ).bind(lease.owner.tenant_id.as_str()).bind(lease.owner.principal_id.as_str()).bind(lease.session_id.as_str()).bind(expires)
             .fetch_one(&mut *tx).await.map_err(database_error)?;
         tx.commit().await.map_err(database_error)?;

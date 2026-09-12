@@ -68,8 +68,51 @@ Worker 更换不改变节点身份或输入。Workflow 完成、原生 Job 结�
 
 PostgreSQL 预览格式 15 增加 Workflow／节点协调和固定依赖输入。精确格式 14 fixture
 验证会话、消息、Memory、持久 frame 和临时行在迁移及回滚中保留；更旧的受支持格式
-仍在同一受保护事务内前进。Worker 协议 9 承载 Workflow 命令，检查点 schema 4 保持不变，
-网关协议 3 校验 Workflow 工作区准备。控制面与 Worker 使用匹配版本，公共 SDK 和 Web 包一起生成。
+仍在同一受保护事务内前进。Worker 协议 10 承载 Workflow 命令，检查点 schema 4 保持不变，
+网关协议 3 校验 Workflow 工作区准备。控制面与 Worker 使用匹配版本，契约更新时重新生成公共 SDK。
+
+## 持久 Council
+
+Agent 定义可以安装 `councils`。每项包含 `preset`、综合模型的 `synthesis` 配置引用，
+以及从席位 Agent 名称到配置引用的 `repairs` 映射。使用 `--definition-ref` 生成精确引用。
+preset 复用原生字段：`name`、`sourceId`、`seats`、`quorum`、`maxParallel`、
+`deadlineMs`、`seatOutputBytes`、`retryPolicy.maxRetries` 和
+`synthesisPolicy.{timeoutMs,maxInputBytes}`。原生工具 ID 保持 `council_run`；
+调用方选择 preset 并提供问题。
+
+席位、修正与综合定义均需安装、保留父逻辑工作区，并在父 `delegation.targets` 中
+明确授权。修正与综合使用 `agent.mode: "completion"`，不能带环境、委派、
+Workflow 或 Council catalog。修正定义必须保持原席位的精确模型绑定，包括凭证引用
+和提供商选项；配置阶段拒绝在格式修正时更换模型。子任务额度至少为
+`席位数 × (maxRetries + 1) + 1`，委派至少两级。每定义最多 32 个 preset，
+每次最多 12 席位、每席位 3 次格式修正、总期限最长 10 分钟。
+
+Council 复用原生 Workflow 协调、子 Job、工作区分支、持久等待及完成消费。
+原始调用方准备完工作区后释放 Worker 名额；席位等待仍占逻辑席位名额。
+每个初始席位使用独立工作区分支。只有已完成的公开答案文本进入校验，私有推理
+和工具 transcript 不进入修正或综合提示。无效答案可以建立有界的模型专用修正
+Job，不重放原 Agent 的命令。修正次数和来源完成摘要持久保存，不随进程重启丢失。
+
+工作区准备完成后，数据库在激活时确定总截止时间。席位时间包含排队、审批等待和
+格式修正，综合时间在总期限内预留。领取和续租不能延长适用期限。席位超时通过同一
+任务树取消和网关 Outbox 停止；在途操作等待真实回执，最多五秒且不超过剩余总期限。
+外部效果未确认时 Council 保持 `uncertain`，合法迟到回执仍保存，但不擅自继续
+已经不确定的父任务。
+
+所有席位结算后才综合，保留原始顺序和不同意见。quorum 只计算截止时间前完成且
+通过校验的答案；缺失、超时、无效和失败席位都会记录，但不能作为票数。综合 Job
+没有工具和常驻 Memory，输入有界并固定；超过输入限制、票数不足或综合超时直接
+失败，不伪造成功。取消撤销整棵任务树的执行权，Worker 更换继续检查当前授权。
+
+PostgreSQL 格式 16 增加作用域化 Council、席位状态、尝试来源和可选 Job 截止时间。
+精确格式 15 fixture 验证原有 Job、Workflow／节点、消息、Memory 和活动 frame
+保留，并检查 marker 前故障原子回滚。Worker 协议 10 增加内部 Council 接纳；
+网关协议 3 和检查点 schema 4 保持不变。`WorkflowRunView.kind` 区分 `workflow`
+与 `council`，可选 `council` 视图包含类型化阶段、席位状态、次数和十进制精确期限。
+公开视图不包含私有配置、提示词、租约或凭证。
+
+通用远程 Council 不暴露原生 review binding。Review 证据接纳和工作区审批合并
+继续作为独立能力实现。
 
 ## 验收范围
 
@@ -78,7 +121,11 @@ PostgreSQL 预览格式 15 增加 Workflow／节点协调和固定依赖输入�
 验证三节点 DAG、四次明确命令审批、独立工作区分支，以及慢节点仍等审批时后继补位。
 身份和模型服务为 fixture，Linux amd64／arm64 原生 CI 提供平台证据。
 
-分布式 Council 综合／quorum／期限执行、审批合并、跨网关传输及剩余 P5–P6 运维验收
+Council 数据库用例覆盖模型专用修正、quorum、有界期限、等待取消、租约撤销、
+迟到操作回执和不确定结果。原生用例增加两个独立且明确审批的席位命令、一次格式
+修正及模型专用综合，随后消费原始父调用；这些后端证据不需要浏览器。
+
+审批合并、跨网关传输及剩余 P5–P6 运维验收
 继续按[计划](PLAN.zh.md)实施，不能通过一个 Workflow 模板自动开启。独立预览发布
 仍等待验收完成。
 

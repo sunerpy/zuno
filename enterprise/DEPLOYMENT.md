@@ -126,7 +126,7 @@ SIGTERM stops admission and drains bounded work. TLS connections and receipt
 delivery have bounded shutdown. Gateway shutdown does not declare its external
 commands complete; their ledger and containers remain independently recoverable.
 
-Worker protocol 9 carries checkpoint schema 4. The driver reads schema 3 only
+Worker protocol 10 carries checkpoint schema 4. The driver reads schema 3 only
 where it proves an unsubmitted wait; it never reinterprets an old record as
 submitted execution. Drain incompatible Workers before changing the control
 protocol and retain their definitions and durable data. Full rolling-upgrade and
@@ -153,8 +153,10 @@ Optional `workflows` installs bounded templates over the existing child target c
 
 Agent `mode` defaults to `agent`, preserving existing normalized definition digests.
 `mode: "completion"` uses the same bounded model driver with no tools or resident
-Memory context. Omit `environment`, `delegation` and `workflows` for that profile.
+Memory context. Omit `environment`, `delegation`, `workflows` and `councils` for that profile.
 The control plane does not assign a gateway to it and excludes its configuration
 from Worker Memory access. Completion profiles can run as owned root sessions or
 as explicitly configured model-only children. This is a backend primitive for
 internal completions; it does not enable distributed Council coordination.
+
+Optional `councils` installs native `council_run` with durable seats and completion-only repair/synthesis profiles. Model bindings, quorum, capacity and deadlines belong to the immutable definition. See [Council configuration](WORKFLOW.md#durable-council).

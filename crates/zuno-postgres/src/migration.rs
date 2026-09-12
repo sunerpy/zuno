@@ -7,7 +7,7 @@ use zuno_application::ApplicationError;
 use crate::database_error;
 
 pub const PREVIEW_SCHEMA: &str = "zuno_enterprise_preview";
-pub(crate) const FORMAT: i32 = 15;
+pub(crate) const FORMAT: i32 = 16;
 const TABLES: &[&str] = &["workspace", "session", "request_receipt", "input", "event"];
 const RUNTIME_TABLES: &[&str] = &[
     "agent_job",
@@ -37,6 +37,12 @@ const ACTIVITY_DDL: &str = include_str!("schema_activity.sql");
 const LIVE_DDL: &str = include_str!("schema_live.sql");
 const WORKFLOW_DDL: &str = include_str!("schema_workflow.sql");
 const WORKFLOW_TABLES: &[&str] = &["runtime_workflow", "runtime_workflow_node"];
+const COUNCIL_DDL: &str = include_str!("schema_council.sql");
+const COUNCIL_TABLES: &[&str] = &[
+    "runtime_council",
+    "runtime_council_seat",
+    "runtime_council_attempt",
+];
 const LIVE_TABLES: &[&str] = &["live_progress"];
 const ACTIVITY_TABLES: &[&str] = &["activity_session", "activity_item", "activity_frame"];
 const CONTROL_TABLES: &[&str] = &[
@@ -125,9 +131,13 @@ fn source_digest(version: i32) -> String {
         zuno_orchestration::sha256_text(&format!(
             "14\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{WAIT_DDL}\n{CONTEXT_DDL}\n{BROWSER_DDL}\n{OPERATION_DDL}\n{MEMORY_DDL}\n{CHILD_DDL}\n{CHILD_WORKSPACE_DDL}\n{CONTROL_DDL}\n{ACTIVITY_DDL}\n{LIVE_DDL}\n{POLICY}\n{TENANT_POLICY}"
         ))
+    } else if version == 15 {
+        zuno_orchestration::sha256_text(&format!(
+            "15\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{WAIT_DDL}\n{CONTEXT_DDL}\n{BROWSER_DDL}\n{OPERATION_DDL}\n{MEMORY_DDL}\n{CHILD_DDL}\n{CHILD_WORKSPACE_DDL}\n{CONTROL_DDL}\n{ACTIVITY_DDL}\n{LIVE_DDL}\n{WORKFLOW_DDL}\n{POLICY}\n{TENANT_POLICY}"
+        ))
     } else {
         zuno_orchestration::sha256_text(&format!(
-            "{FORMAT}\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{WAIT_DDL}\n{CONTEXT_DDL}\n{BROWSER_DDL}\n{OPERATION_DDL}\n{MEMORY_DDL}\n{CHILD_DDL}\n{CHILD_WORKSPACE_DDL}\n{CONTROL_DDL}\n{ACTIVITY_DDL}\n{LIVE_DDL}\n{WORKFLOW_DDL}\n{POLICY}\n{TENANT_POLICY}"
+            "{FORMAT}\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{WAIT_DDL}\n{CONTEXT_DDL}\n{BROWSER_DDL}\n{OPERATION_DDL}\n{MEMORY_DDL}\n{CHILD_DDL}\n{CHILD_WORKSPACE_DDL}\n{CONTROL_DDL}\n{ACTIVITY_DDL}\n{LIVE_DDL}\n{WORKFLOW_DDL}\n{COUNCIL_DDL}\n{POLICY}\n{TENANT_POLICY}"
         ))
     }
 }
@@ -239,7 +249,10 @@ pub async fn migrate(admin: &PgPool, runtime_role: &str) -> Result<(), Applicati
                 if version < 14 {
                     install_live(&mut tx).await?;
                 }
-                install_workflow(&mut tx).await?;
+                if version < 15 {
+                    install_workflow(&mut tx).await?;
+                }
+                install_council(&mut tx).await?;
                 if version < 13 {
                     crate::activity::backfill(&mut tx).await?;
                 }
@@ -296,6 +309,7 @@ pub async fn migrate(admin: &PgPool, runtime_role: &str) -> Result<(), Applicati
     install_activity(&mut tx).await?;
     install_live(&mut tx).await?;
     install_workflow(&mut tx).await?;
+    install_council(&mut tx).await?;
     crate::activity::backfill(&mut tx).await?;
     sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
         "REVOKE ALL ON SCHEMA {PREVIEW_SCHEMA} FROM PUBLIC;
@@ -513,6 +527,7 @@ async fn grant_runtime(connection: &mut PgConnection, role: &str) -> Result<(), 
         .chain(ACTIVITY_TABLES)
         .chain(LIVE_TABLES)
         .chain(WORKFLOW_TABLES)
+        .chain(COUNCIL_TABLES)
         .chain(["gateway_operation", "gateway_operation_attempt"].iter())
         .chain(["organization_policy", "organization_audit"].iter())
     {
@@ -555,6 +570,22 @@ async fn install_turn(connection: &mut PgConnection) -> Result<(), ApplicationEr
         .execute(&mut *connection)
         .await
         .map_err(database_error)?;
+    }
+    Ok(())
+}
+
+async fn install_council(connection: &mut PgConnection) -> Result<(), ApplicationError> {
+    sqlx_core::raw_sql::raw_sql(COUNCIL_DDL)
+        .execute(&mut *connection)
+        .await
+        .map_err(database_error)?;
+    for table in COUNCIL_TABLES {
+        sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
+            "ALTER TABLE {PREVIEW_SCHEMA}.{table} ENABLE ROW LEVEL SECURITY;
+             ALTER TABLE {PREVIEW_SCHEMA}.{table} FORCE ROW LEVEL SECURITY;
+             CREATE POLICY owner_scope ON {PREVIEW_SCHEMA}.{table} USING ({POLICY}) WITH CHECK ({POLICY});
+             REVOKE ALL ON {PREVIEW_SCHEMA}.{table} FROM PUBLIC;"
+        ))).execute(&mut *connection).await.map_err(database_error)?;
     }
     Ok(())
 }
@@ -1376,5 +1407,32 @@ pub(crate) async fn install_format_fourteen_fixture(
     let manifest = schema_manifest(&mut tx).await?;
     sqlx_core::query::query("UPDATE zuno_enterprise_preview.schema_format SET version=14,source_digest=$1,manifest=$2 WHERE singleton=1")
         .bind("ef6f3cedfec964d194adebfe095906e77c33e8d4f8715fe49cd14a281d14aad6").bind(manifest).execute(&mut *tx).await.map_err(database_error)?;
+    tx.commit().await.map_err(database_error)
+}
+
+#[cfg(test)]
+pub(crate) async fn install_format_fifteen_fixture(
+    pool: &PgPool,
+    role: &str,
+) -> Result<(), ApplicationError> {
+    install_format_fourteen_fixture(pool, role).await?;
+    let mut tx = pool.begin().await.map_err(database_error)?;
+    sqlx_core::raw_sql::raw_sql(include_str!("fixtures/format15-workflow.sql"))
+        .execute(&mut *tx)
+        .await
+        .map_err(database_error)?;
+    for table in ["runtime_workflow", "runtime_workflow_node"] {
+        sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
+            "ALTER TABLE {PREVIEW_SCHEMA}.{table} ENABLE ROW LEVEL SECURITY;
+             ALTER TABLE {PREVIEW_SCHEMA}.{table} FORCE ROW LEVEL SECURITY;
+             CREATE POLICY owner_scope ON {PREVIEW_SCHEMA}.{table} USING ({POLICY}) WITH CHECK ({POLICY});
+             REVOKE ALL ON {PREVIEW_SCHEMA}.{table} FROM PUBLIC;
+             GRANT SELECT,INSERT,UPDATE,DELETE ON {PREVIEW_SCHEMA}.{table} TO \"{role}\";"
+        ))).execute(&mut *tx).await.map_err(database_error)?;
+    }
+    let manifest = schema_manifest(&mut tx).await?;
+    sqlx_core::query::query("UPDATE zuno_enterprise_preview.schema_format SET version=15,source_digest=$1,manifest=$2 WHERE singleton=1")
+        .bind("412f668e781e311d6ddf76fd51a1314ace1b6423f1b33c67ceaac053ce40661c").bind(manifest)
+        .execute(&mut *tx).await.map_err(database_error)?;
     tx.commit().await.map_err(database_error)
 }

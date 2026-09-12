@@ -220,6 +220,26 @@ async fn settle_cancelled(
     reason: &str,
     time: i64,
 ) -> Result<(), ApplicationError> {
+    query(
+        "UPDATE zuno_enterprise_preview.runtime_council c SET state='cancelled'
+        FROM zuno_enterprise_preview.runtime_workflow w
+        WHERE c.tenant_id=$1 AND c.principal_id=$2 AND w.job_id=$3
+          AND w.tenant_id=c.tenant_id AND w.principal_id=c.principal_id AND w.run_id=c.run_id
+          AND c.state IN('seats','stopping','synthesis')",
+    )
+    .bind(job.principal.tenant_id().as_str())
+    .bind(job.principal.principal_id().as_str())
+    .bind(job.id.as_str())
+    .execute(&mut **tx)
+    .await
+    .map_err(database_error)?;
+    query("UPDATE zuno_enterprise_preview.runtime_council_seat c SET status='cancelled',retry_after_at=NULL
+        FROM zuno_enterprise_preview.runtime_workflow w
+        WHERE c.tenant_id=$1 AND c.principal_id=$2 AND w.job_id=$3
+          AND w.tenant_id=c.tenant_id AND w.principal_id=c.principal_id AND w.run_id=c.run_id
+          AND (c.status IN('pending','running','waiting','retrying') OR (c.status='invalid' AND c.retry_after_at IS NOT NULL))")
+        .bind(job.principal.tenant_id().as_str()).bind(job.principal.principal_id().as_str()).bind(job.id.as_str())
+        .execute(&mut **tx).await.map_err(database_error)?;
     let owner = job.principal.owner();
     let sequence = emit(tx, &job.principal, job.session_id.as_str(), "agent.job.settled",
         json!({"jobID":job.id,"status":"cancelled","error":reason,"result":null,"reportDelivery":"quiet"})).await?;

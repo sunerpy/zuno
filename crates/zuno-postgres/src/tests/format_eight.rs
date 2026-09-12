@@ -25,7 +25,7 @@ pub(super) async fn upgrade(fixture: &Fixture, admin: &PgPool) {
             'sessions',(SELECT jsonb_agg(to_jsonb(s)-'delegation_depth_limit') FROM zuno_enterprise_preview.session s),
             'messages',(SELECT jsonb_agg((to_jsonb(m)-'execution_job_id')) FROM zuno_enterprise_preview.message m),
             'parts',(SELECT jsonb_agg(to_jsonb(p)) FROM zuno_enterprise_preview.part p),
-            'jobs',(SELECT jsonb_agg(to_jsonb(j)) FROM zuno_enterprise_preview.runtime_job j),
+            'jobs',(SELECT jsonb_agg(to_jsonb(j)-'deadline_at') FROM zuno_enterprise_preview.runtime_job j),
             'waits',(SELECT jsonb_agg(to_jsonb(w)) FROM zuno_enterprise_preview.runtime_wait w),
             'browser',(SELECT jsonb_agg(to_jsonb(b)) FROM zuno_enterprise_preview.browser_session b),
             'operations',(SELECT jsonb_agg(to_jsonb(o)) FROM zuno_enterprise_preview.gateway_operation o)

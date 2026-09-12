@@ -113,7 +113,7 @@ Completion payload schema 2 stores the tagged outcome. Earlier preview result
 facts remain readable and deduplicate against the same logical completion without
 rewriting the stored event. An old fact that confused approval with a tool result
 is refused. Driver checkpoint schema 4 reads safe schema-3 boundaries without
-resetting budget or replaying tools. Worker protocol 9 carries the submitted-wait
+resetting budget or replaying tools. Worker protocol 10 carries the submitted-wait
 state; completion publication remains a separate state-owner port.
 
 ## Storage and verification

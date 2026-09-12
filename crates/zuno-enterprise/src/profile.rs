@@ -113,6 +113,7 @@ pub struct ConfiguredWorkerFactory {
     driver: Arc<dyn AgentDriver>,
     children: crate::children::ConfiguredChildren,
     workflows: crate::workflows::ConfiguredWorkflows,
+    councils: crate::councils::ConfiguredCouncils,
     live_interval: Option<Duration>,
 }
 impl ConfiguredWorkerFactory {
@@ -125,6 +126,7 @@ impl ConfiguredWorkerFactory {
     ) -> Result<Self, Error> {
         let children = crate::children::ConfiguredChildren::new(&definitions)?;
         let workflows = crate::workflows::ConfiguredWorkflows::new(&definitions, &children)?;
+        let councils = crate::councils::ConfiguredCouncils::new(&definitions, &children)?;
         let mut installed = Vec::new();
         for definition in definitions {
             definition.validate()?;
@@ -168,6 +170,7 @@ impl ConfiguredWorkerFactory {
             driver,
             children,
             workflows,
+            councils,
             live_interval: None,
         })
     }
@@ -233,13 +236,20 @@ impl WorkerServiceFactory for ConfiguredWorkerFactory {
             .with_workspace_gateway(self.gateway.clone());
             let templates = self.workflows.templates(&entry.definition.reference());
             dispatcher = if templates.is_empty() {
-                Arc::new(child)
+                Arc::new(child.clone())
             } else {
                 Arc::new(
-                    zuno_worker::workflow::WorkflowToolDispatcher::new(child, templates)
+                    zuno_worker::workflow::WorkflowToolDispatcher::new(child.clone(), templates)
                         .map_err(|_| WorkerError::Configuration)?,
                 )
             };
+            let presets = self.councils.presets(&entry.definition.reference());
+            if !presets.is_empty() {
+                dispatcher = Arc::new(
+                    zuno_worker::council::CouncilToolDispatcher::new(dispatcher, child, presets)
+                        .map_err(|_| WorkerError::Configuration)?,
+                );
+            }
         }
         Ok(WorkerTurnServices {
             configuration: entry.definition.reference(),

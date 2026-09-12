@@ -28,7 +28,7 @@ pub(super) async fn upgrade(fixture: &Fixture, admin: &PgPool) {
               'message',(SELECT (to_jsonb(m)-'execution_job_id') FROM zuno_enterprise_preview.message m WHERE id='legacy-assistant'),
               'part',(SELECT to_jsonb(p) FROM zuno_enterprise_preview.part p WHERE id='legacy-tool'),
               'wait',(SELECT to_jsonb(w) FROM zuno_enterprise_preview.runtime_wait w WHERE id='legacy-wait'),
-              'job',(SELECT to_jsonb(j) FROM zuno_enterprise_preview.runtime_job j WHERE job_id='legacy-job'),
+              'job',(SELECT to_jsonb(j)-'deadline_at' FROM zuno_enterprise_preview.runtime_job j WHERE job_id='legacy-job'),
               'receipt',(SELECT to_jsonb(r) FROM zuno_enterprise_preview.input_execution_receipt r WHERE input_id='legacy-input')
             )",
         ).fetch_one(pool).await.unwrap()

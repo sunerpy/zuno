@@ -321,6 +321,10 @@ async fn control(options: ControlConfig, shutdown: InterruptSignal) -> Result<()
         &definitions,
         &children,
     )?);
+    let councils = Arc::new(crate::councils::ConfiguredCouncils::new(
+        &definitions,
+        &children,
+    )?);
     let deployments = definitions
         .iter()
         .filter_map(|definition| {
@@ -385,6 +389,9 @@ async fn control(options: ControlConfig, shutdown: InterruptSignal) -> Result<()
     }
     if !workflows.is_empty() {
         worker_state = worker_state.with_workflows(workflows);
+    }
+    if !councils.is_empty() {
+        worker_state = worker_state.with_councils(councils);
     }
     let mut routes = application
         .clone()

@@ -3,6 +3,7 @@
 
 mod children;
 pub mod config;
+mod councils;
 mod http;
 mod identity;
 pub use http::serve as serve_tls;

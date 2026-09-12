@@ -93,7 +93,7 @@ Schema 和 SDK；客户端与 Docker 工作流中的实验浏览器检查需要�
 SIGTERM 停止新接纳并排空有界工作，TLS 连接与回执投递的退出也有期限。停止网关不表示
 外部命令已经完成，ledger 与容器仍按独立生命周期恢复。
 
-Worker 协议 9 承载检查点 schema 4。旧 schema 3 只按未提交等待读取，不能被解释成已经
+Worker 协议 10 承载检查点 schema 4。旧 schema 3 只按未提交等待读取，不能被解释成已经
 交给执行器。切换控制协议前排空不兼容 Worker，并保留定义和持久数据；完整滚动升级、
 备份恢复验收仍属 P6。
 
@@ -122,6 +122,8 @@ Worker 的 `liveMillis` 默认 500 毫秒，允许 100–5000，设为 null 关�
 
 Agent 的 `mode` 默认 `agent`，保留现有定义的规范化摘要。`mode: "completion"`
 复用有界模型驱动，但不提供工具或驻留 Memory 上下文；该配置省略 `environment`、
-`delegation`、`workflows`。控制面不为其分配网关，并从 Worker Memory 授权中排除
+`delegation`、`workflows`、`councils`。控制面不为其分配网关，并从 Worker Memory 授权中排除
 该配置。它可作为自有根会话或显式配置的纯模型子任务运行，是内部完成请求的后端原语，
 不代表分布式 Council 编排已完成。
+
+可选 `councils` 安装原生 `council_run`，提供持久席位以及模型专用修正／综合。模型绑定、quorum、容量和期限由不可变定义控制，见 [Council 配置](WORKFLOW.zh.md#持久-council)。

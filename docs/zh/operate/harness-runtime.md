@@ -876,4 +876,7 @@ Workflow／Council 宿主派发区分已完成结果与持久等待，保留类�
 
 企业 completion 配置复用有界驱动，不提供工具或驻留 Memory 上下文；数据所有者
 不给该不可变配置分配网关，也拒绝其 Worker Memory 访问。Council 席位结果校验
-由运行时共享，分布式协调仍属独立生产者，`agent.mode` 见预览部署文档。
+由运行时共享。企业 Council 复用原生 Workflow／子 Job，持久保存 quorum、模型专用
+格式修正与综合。数据库期限截断租约，取消后的外部效果通过真实回执核查，完成消费
+保留原始工具调用。公共协议具有类型化 Council 阶段与席位状态，App 设计和 UI
+交付继续等待 Penpot 阶段。`agent.mode` 与 Council 配置见预览部署及 Workflow 文档。
