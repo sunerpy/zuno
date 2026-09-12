@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p5-activity`.
+- Current phase branch: `codex/enterprise-p5-live`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -393,3 +393,10 @@ CI run 34676688599 subsequently passed all gates at `9d558b7b360289dc9d6a428bc4f
 - Rust generates Schema, TypeScript and bundled standalone validators. Ten SDK recovery/security tests and generation-drift checks pass. Native Docker/PostgreSQL/HTTPS/independent-role tests and additional history/migration/rollback contracts pass; final workspace check, Clippy, docs, formatting, workflow and diff gates pass.
 - One broad test build stopped because the shared filesystem filled. The task-owned incremental cache was removed after verifying no compiler remained active; source, binaries and evidence were preserved. Subsequent local verification disables incremental caching.
 - LiveFrame production, React Web, full ACP/TUI integration, P4 approved merge/Workflow/Council and remaining enterprise acceptance continue. Publication remains disabled. English/Chinese guides and preview navigation are updated; stable docs deployment remains outside this preview branch.
+
+## Live progress transport
+
+- Activity PR #213 merged at `4acc059175137d109954c38fa31dded44b6307d0`; CI `34690283755` passed all required gates including generated client contracts.
+- Worker-side coalescing, private authenticated writes, active-only public snapshot reads and SDK generation handling are implemented. Original message/Job identity, lease and sequence fence publication. Checkpoints/retries/execution changes clear drafts; no encrypted fields or authoritative usage enter live frames.
+- PostgreSQL format 14 has exact format-13 migration/rollback coverage. PostgreSQL/HTTPS and 12 SDK tests pass, including observation before provider completion. Final native Docker/PostgreSQL/HTTPS/independent-process, workspace check/Clippy, docs/release-surface and formatting gates pass.
+- React Web, full ACP/TUI, approved workspace merge, Workflow/Council, remaining Memory producers and P6 work continue. Preview publication remains disabled.

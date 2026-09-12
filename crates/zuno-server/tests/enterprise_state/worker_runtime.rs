@@ -24,10 +24,12 @@ impl Provider for SlowProvider {
     fn stream(&self, request: CompletionRequest) -> ProviderStream<'_> {
         let mut response = Some(self.script.stream(request));
         Box::pin(
-            stream::once(async {
-                tokio::time::sleep(std::time::Duration::from_millis(1400)).await;
-            })
-            .flat_map(move |_| response.take().unwrap()),
+            stream::once(async { Ok(StreamEvent::TextDelta("Working… ".to_owned())) }).chain(
+                stream::once(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(1400)).await;
+                })
+                .flat_map(move |_| response.take().unwrap()),
+            ),
         )
     }
 }
@@ -75,6 +77,9 @@ impl AgentDriver for RetainedEventsDriver {
 }
 #[async_trait]
 impl WorkerServiceFactory for Factory {
+    fn live_interval(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_millis(100))
+    }
     fn configurations(&self) -> Vec<ConfigurationRef> {
         vec![self.configuration.clone()]
     }
@@ -442,7 +447,15 @@ async fn worker_runtimes_renew_and_resume_shared_kernel_without_replaying_input_
     )
     .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        let (a, b) = tokio::join!(first.run(shutdown.clone()), second.run(shutdown));
+        let observe=async {
+            loop {
+                if let Some(frame)=backend.live_progress(&actor,&job.session_id).await.unwrap()
+                    && matches!(frame.event,zuno_types::activity::LiveEvent::Snapshot {items} if items.iter().any(|item|matches!(item,zuno_types::activity::LiveItem::Text {text,..} if text.contains("Working"))))
+                {break;}
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        };
+        let (a, b, ()) = tokio::join!(first.run(shutdown.clone()), second.run(shutdown), observe);
         a.unwrap();
         b.unwrap();
     })
@@ -484,6 +497,14 @@ async fn worker_runtimes_renew_and_resume_shared_kernel_without_replaying_input_
     .await
     .unwrap();
     assert_eq!(messages, 1);
+    assert!(
+        backend
+            .live_progress(&actor, &job.session_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "completed turns cannot keep publishing or displaying volatile drafts"
+    );
     use zuno_application::activity::{ActivityPersistence, FrameQuery, HistoryQuery};
     let activity = backend.activity(actor.clone());
     let history = activity

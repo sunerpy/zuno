@@ -55,7 +55,7 @@ item 保留首次位置和最新 revision，frame 同时携带原位置。因此
 每页只推进到实际返回的最后一个 frame。慢客户端可以停止并补读，不需要服务器无限积压队列。
 
 `CommittedFrame` 是已提交的公共历史；`LiveFrame` 使用独立 generation 与序号，
-不携带权威计量或加密数据。本批只注册持久历史和 frame 读取。实时生产者、流式接口、
+不携带权威计量或加密数据。实时进度通过独立、经过认证的 `/sessions/{session}/live` 快照读取。流式传输、
 Plan／Goal／产物投影及相关操作处理器，在真实适配器完成前不宣称可用。
 
 ## TypeScript SDK
@@ -83,3 +83,24 @@ SDK 用例覆盖协议拒绝、精确计数、去重、断档、快照竞争、�
 
 参见 [English](ACTIVITY.md)、[应用 API](APPLICATION.zh.md)、
 [SDK](sdk/README.md)、[平台](PLATFORMS.zh.md)和[进度](STATUS.md)。
+
+## 可替换的实时快照
+
+Worker 通过 `/internal/worker/v1/live` 发送合并后的可见文本／思考和调用标签，
+同时验证工作负载身份与当前 Job 凭证。数据所有者在接纳、提交时验证租约，绑定尚未完成的
+原始 assistant 消息，并拒绝改变内容的重复序号及倒序更新。每个 Job 只保留最新有界快照，
+不进入模型历史或用量计费。
+
+Worker 的 `liveMillis` 默认 500，允许 100–5000，设为 null 可关闭。
+本地最多保留 16 项、32 KiB 原始文本，网络合并发送不阻塞模型执行。
+重试回滚替换草稿；消息提交后草稿立即隐藏。签名、加密提供商数据不参与实时投影。
+
+PostgreSQL 格式 14 增加作用域临时行，并在 Job 阶段或执行尝试切换时原子清除。
+公共读取重新检查当前策略、执行租约及尚未完成的来源消息，超过 30 秒未更新的快照不显示。
+SDK 的 `ActivityClient.live` 和 `LiveActivity` 与持久状态分开，先补齐所需历史，
+再接受当前 generation；过期 generation、倒序更新不会覆盖新草稿。
+前端应分别命名文本／思考草稿键和调用 ID，无当前快照时清除实时内容。
+
+固定格式 13 迁移夹具在 DDL 失败时保留消息、Memory 和持久 frame。
+HTTPS 用例实际观察模型完成前的草稿，并验证完成后消失；SDK 验证 generation 替换、
+重试清理和静默之后的新快照。

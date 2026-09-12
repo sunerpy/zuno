@@ -714,6 +714,26 @@
         {
           "type": "object",
           "properties": {
+            "items": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/LiveItem"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "const": "snapshot"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "items"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "itemId": {
               "type": "string"
             },
@@ -826,6 +846,94 @@
         "sequence",
         "afterCommitted",
         "event"
+      ]
+    },
+    "LiveItem": {
+      "description": "Replaceable drafts have independent IDs and are discarded when their\ngeneration ends. Only committed records enter durable conversation history.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "text"
+            },
+            "parentId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "text": {
+              "type": "string"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "id",
+            "text",
+            "truncated"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "thinking"
+            },
+            "parentId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "text": {
+              "type": "string"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "id",
+            "text",
+            "truncated"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/InvocationId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "invocation"
+            },
+            "label": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "id",
+            "label"
+          ]
+        }
       ]
     },
     "McpExposure": {

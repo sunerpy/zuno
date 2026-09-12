@@ -2979,3 +2979,5 @@ The design sources and explicit adopt/adapt/reject decisions are recorded in [th
 Enterprise Job cancellation uses the authenticated `RuntimeControl` port and a durable gateway outbox. Worker lease revocation and logical child completion commit together; external process termination is confirmed separately. See `enterprise/CONTROL.md` in the preview source archive.
 
 Client activity now uses a separate typed public protocol. The kernel records adapter-owned action/source metadata on tool calls; PostgreSQL commits safe public projections with source state. Public history and committed-frame paging use logical counters, while private provider replay, Worker leases and configuration snapshots stay outside client DTOs. See `enterprise/ACTIVITY.md` in the preview archive.
+
+Enterprise Workers may publish bounded live snapshots independently of committed events. The data owner checks the originating message and active lease; execution changes retire drafts. Publication is optional through validated `liveMillis` and cannot block model work.

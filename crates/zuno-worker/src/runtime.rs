@@ -39,6 +39,11 @@ pub struct WorkerTurnServices {
 
 #[async_trait]
 pub trait WorkerServiceFactory: Send + Sync {
+    /// An installed live transport enables bounded coalescing independently of
+    /// model execution. Test/library compositions may omit this capability.
+    fn live_interval(&self) -> Option<Duration> {
+        None
+    }
     /// Immutable definitions installed and validated by this Worker host.
     fn configurations(&self) -> Vec<ConfigurationRef>;
     async fn resolve(&self, execution: &WorkerExecution)
@@ -365,6 +370,12 @@ async fn advance_with_services(
         context = context.with_dynamic_context_refresher(refresher.as_ref());
     }
     let advance = services.driver.advance(request, context, sender);
+    let mut live = factory
+        .live_interval()
+        .filter(|value| (Duration::from_millis(100)..=Duration::from_secs(5)).contains(value))
+        .map(|interval| {
+            crate::live::LivePublisher::start(client.clone(), execution.clone(), interval)
+        });
     tokio::pin!(advance);
     loop {
         tokio::select! {
@@ -374,13 +385,17 @@ async fn advance_with_services(
                 // lifecycle must not hold a committed scheduling boundary.
                 for _ in 0..zuno_engine::r#loop::TURN_EVENT_CHANNEL_CAPACITY {
                     let Ok(event) = receiver.try_recv() else { break };
+                    if let Some(live)=&mut live {live.observe(&event);}
                     observer.event(&execution.job.id, event);
                 }
                 return result.map_err(WorkerError::Advance);
             }
             event = receiver.recv() => {
                 match event {
-                    Some(event) => observer.event(&execution.job.id, event),
+                    Some(event) => {
+                        if let Some(live)=&mut live {live.observe(&event);}
+                        observer.event(&execution.job.id, event);
+                    },
                     None => return advance.await.map_err(WorkerError::Advance),
                 }
             }

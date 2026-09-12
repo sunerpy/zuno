@@ -2,6 +2,7 @@
 
 pub mod child;
 pub mod gateway;
+pub mod live;
 pub mod memory;
 #[cfg(test)]
 mod presentation_tests;
@@ -29,6 +30,7 @@ use zuno_types::identity::WorkerInstanceId;
 pub const CLAIM_PATH: &str = "internal/worker/v1/claim";
 pub const RENEW_PATH: &str = "internal/worker/v1/renew";
 pub const STATE_PATH: &str = "internal/worker/v1/state";
+pub const LIVE_PATH: &str = "internal/worker/v1/live";
 pub const MEMORY_PATH: &str = "internal/worker/v1/memory";
 pub const CHILD_PATH: &str = "internal/worker/v1/children";
 pub const FINISH_PATH: &str = "internal/worker/v1/finish";

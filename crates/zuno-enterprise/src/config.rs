@@ -105,6 +105,9 @@ pub struct WorkerConfig {
     pub renew_millis: u64,
     #[serde(default = "drain")]
     pub drain_seconds: u64,
+    /// Optional live snapshot publication interval; null disables transient progress.
+    #[serde(default = "live_interval")]
+    pub live_millis: Option<u64>,
 }
 fn one() -> u32 {
     1
@@ -117,6 +120,9 @@ fn renew() -> u64 {
 }
 fn drain() -> u64 {
     30
+}
+fn live_interval() -> Option<u64> {
+    Some(500)
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

@@ -67,9 +67,9 @@ reader can stop and resume without retaining a server-side queue.
 
 `CommittedFrame` is authoritative public history. `LiveFrame` has a separate
 generation and sequence and cannot carry billing totals or encrypted data.
-This phase registers committed history and frame reads only. Live producers,
-stream endpoints, Plan/Goal/artifact projections and their action handlers are
-not advertised before their adapters exist.
+Live progress uses the separate authenticated `/sessions/{session}/live` snapshot
+read. Streaming transport, Plan/Goal/artifact projections and their action handlers
+are not advertised before their adapters exist.
 
 ## TypeScript SDK
 
@@ -103,3 +103,31 @@ deduplication, gaps, snapshot races, bounds, credential routing and cancellation
 
 See [中文](ACTIVITY.zh.md), [application API](APPLICATION.md),
 [SDK source](sdk/README.md), [platforms](PLATFORMS.md) and [status](STATUS.md).
+
+## Replaceable live snapshots
+
+Workers publish coalesced visible text/thinking and invocation labels through
+`/internal/worker/v1/live`, using workload authentication plus their current Job
+grant. The data owner verifies the lease at admission and commit, binds the
+original pending assistant message, and rejects changed/reordered snapshots.
+Only the latest bounded snapshot is retained for a Job; it never enters model
+history or usage accounting.
+
+`liveMillis` on a Worker defaults to 500, accepts 100–5000, and can be null to
+disable publication. The local buffer keeps at most 16 items/32 KiB raw text and
+coalesces network work independently of model execution. Retry rollback replaces
+the draft; checkpointed content immediately hides it. Signatures and encrypted
+provider events have no live projection.
+
+PostgreSQL format 14 adds the scoped transient row and clears it atomically when
+Job phase/attempt changes. Public reads require current owner policy, the active
+lease and a pending originating message; updates older than 30 seconds disappear.
+`ActivityClient.live` and `LiveActivity` keep snapshots separate from committed
+state, wait for required history and reject older/retired generations. A client
+should key draft text/thinking separately from invocation IDs and clear live
+content when no current snapshot exists.
+
+The frozen format-13 migration retains messages, Memory and committed frames
+through injected DDL failure. HTTPS tests observe a real pending provider draft
+and verify it disappears after completion; SDK tests cover generation replacement,
+retry clearing and fresh progress after a silent interval.
