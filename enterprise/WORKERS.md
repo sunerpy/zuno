@@ -35,6 +35,13 @@ arrives; a concurrent renewal must not mistake that normal handoff for lease los
 After a validated acknowledgement the local claim is retired and no further
 renewal is sent. An unknown/failed commit response still grants no replay.
 
+Entering the final POST also closes new state and gateway admission locally.
+If its response arrives after the old grant deadline, the Worker may wait up to
+30 seconds for that one acknowledgement. This wait grants no execution authority:
+the kernel has already finished its provider/tool segment, and PostgreSQL still
+checks the deadline inside the commit transaction. A missing response remains an
+unconfirmed boundary, never a reason to repeat the POST.
+
 The root input's database admission timestamp travels with its stable ID. The
 materializer reuses that timestamp and part identity across Worker changes.
 Consumed input and provider-applied input retain their separate durable meanings.

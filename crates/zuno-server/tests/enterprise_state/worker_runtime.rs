@@ -118,7 +118,7 @@ impl WorkerObserver for Observer {
                 self.shutdown.fire();
             }
             Err(error) => {
-                self.failures.lock().unwrap().push(error.to_string());
+                self.failures.lock().unwrap().push(format!("{error:?}"));
                 self.shutdown.fire();
             }
             _ => {}
@@ -308,7 +308,7 @@ async fn worker_runtimes_renew_and_resume_shared_kernel_without_replaying_input_
                         if delayed_boundary && response.status().is_success() {
                             // The database has released this lease, but its
                             // checkpoint acknowledgement is still in transit.
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
                         }
                         response
                     }
@@ -445,10 +445,12 @@ async fn worker_runtimes_renew_and_resume_shared_kernel_without_replaying_input_
     })
     .await
     .unwrap();
+    let persisted_phase = runtime.get(&actor.owner(), &job.id).await.unwrap().phase;
     assert!(
         observer.failures.lock().unwrap().is_empty(),
-        "{:?}",
-        observer.failures.lock().unwrap()
+        "{:?}; persisted phase: {:?}",
+        observer.failures.lock().unwrap(),
+        persisted_phase
     );
     assert_eq!(observer.completed.load(Ordering::SeqCst), 1);
     assert_eq!(calls.load(Ordering::SeqCst), 1);

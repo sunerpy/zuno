@@ -8,6 +8,7 @@ use futures::StreamExt as _;
 use reqwest::header::{CONTENT_TYPE, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::io::AsyncReadExt as _;
@@ -157,12 +158,21 @@ impl WorkerClient {
         outcome
             .validate()
             .map_err(|_| TurnStateError::InvalidData)?;
+        if matches!(
+            outcome,
+            zuno_application::runtime::JobFinish::Completed { .. }
+        ) {
+            return Err(TurnStateError::InvalidData);
+        }
         let grant = execution
             .credential
             .read()
             .map_err(|_| TurnStateError::InvalidData)?
             .grant
             .clone();
+        if execution.boundary_started.swap(true, Ordering::AcqRel) {
+            return Err(TurnStateError::LeaseLost);
+        }
         self.post(
             FINISH_PATH,
             Some(&grant),
@@ -303,6 +313,7 @@ impl WorkerClient {
                     job: value.job,
                     input: value.input,
                     lease_gate: Arc::new(tokio::sync::Mutex::new(())),
+                    boundary_started: Arc::new(AtomicBool::new(false)),
                     credential: Arc::new(RwLock::new(WorkerCredential {
                         lease: value.lease,
                         grant: value.grant,
@@ -369,6 +380,7 @@ impl WorkerClient {
                 client: self.clone(),
                 credential: Arc::clone(&execution.credential),
                 lease_gate: Arc::clone(&execution.lease_gate),
+                boundary_started: Arc::clone(&execution.boundary_started),
             }),
             TurnStateScope {
                 owner: execution.job.principal.owner(),
@@ -399,8 +411,12 @@ pub struct WorkerExecution {
     pub input: zuno_application::runtime::JobInput,
     credential: Arc<RwLock<WorkerCredential>>,
     lease_gate: Arc<tokio::sync::Mutex<()>>,
+    boundary_started: Arc<AtomicBool>,
 }
 impl WorkerExecution {
+    pub fn boundary_started(&self) -> bool {
+        self.boundary_started.load(Ordering::Acquire)
+    }
     pub fn deadline(&self) -> Result<tokio::time::Instant, TurnStateError> {
         self.credential
             .read()
@@ -418,6 +434,7 @@ struct HttpStateTransport {
     client: WorkerClient,
     credential: Arc<RwLock<WorkerCredential>>,
     lease_gate: Arc<tokio::sync::Mutex<()>>,
+    boundary_started: Arc<AtomicBool>,
 }
 #[async_trait]
 impl StateTransport for HttpStateTransport {
@@ -431,6 +448,13 @@ impl StateTransport for HttpStateTransport {
         } else {
             None
         };
+        if boundary {
+            if self.boundary_started.swap(true, Ordering::AcqRel) {
+                return Err(TurnStateError::LeaseLost);
+            }
+        } else if self.boundary_started.load(Ordering::Acquire) {
+            return Err(TurnStateError::LeaseLost);
+        }
         let grant = self
             .credential
             .read()
