@@ -18,6 +18,7 @@ jobs:
     timeout-minutes: 20
     env:
       CARGO_INCREMENTAL: "0"
+      ZUNO_POSTGRES_BINDIR: /usr/lib/postgresql/16/bin
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -32,6 +33,10 @@ jobs:
       - name: Ensure rootless prerequisites
         run: |
           set -euo pipefail
+          if [ ! -x "$ZUNO_POSTGRES_BINDIR/postgres" ]; then
+            sudo apt-get update
+            sudo env NEEDRESTART_MODE=l apt-get install -y --no-install-recommends postgresql-16 postgresql-client-16
+          fi
           if ! command -v newuidmap || ! command -v newgidmap; then
             sudo apt-get update
             sudo env NEEDRESTART_MODE=l apt-get install -y --no-install-recommends uidmap

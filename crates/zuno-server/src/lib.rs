@@ -20,9 +20,12 @@ mod browser_auth;
 mod directory;
 mod discovery;
 pub mod enterprise_browser;
+pub mod enterprise_gateway;
 pub mod enterprise_state;
 mod event;
 mod events;
+pub mod gateway_configuration;
+pub mod gateway_execution;
 mod request_broker;
 mod server;
 

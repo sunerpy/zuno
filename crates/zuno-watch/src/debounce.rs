@@ -373,6 +373,40 @@ mod tests {
     }
 
     #[test]
+    fn a_thousand_paths_coalesce_per_window_without_suppressing_the_next_window() {
+        let base = Instant::now();
+        let mut debouncer =
+            Debouncer::new(Duration::from_millis(250), Duration::from_secs(30), 4096);
+        let root = PathBuf::from("fixture");
+        for index in 0..1000 {
+            let path = root.join(format!("burst-{index:04}.txt"));
+            debouncer.accept(path.clone(), ChangeKind::Add, base);
+            debouncer.accept(path, ChangeKind::Change, at(base, 1));
+        }
+        assert_eq!(debouncer.accepted(), 2000);
+        assert_eq!(debouncer.pending_len(), 1000);
+        assert!(!debouncer.due(at(base, 250)));
+        assert!(debouncer.due(at(base, 251)));
+        let first = debouncer.flush();
+        assert_eq!(first.events.len(), 1000);
+        assert_eq!(first.dropped, 0);
+        assert!(
+            first
+                .events
+                .iter()
+                .all(|event| event.kind == ChangeKind::Add)
+        );
+        let later = root.join("burst-0033.txt");
+        debouncer.accept(later.clone(), ChangeKind::Change, at(base, 300));
+        debouncer.accept(later.clone(), ChangeKind::Change, at(base, 301));
+        assert!(debouncer.due(at(base, 551)));
+        assert_eq!(
+            debouncer.flush().events,
+            vec![FileEvent::new(later, ChangeKind::Change)]
+        );
+    }
+
+    #[test]
     fn create_then_delete_in_one_window_reports_the_deletion() {
         let base = Instant::now();
         let mut debouncer = debouncer();

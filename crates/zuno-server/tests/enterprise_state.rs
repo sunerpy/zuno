@@ -48,6 +48,8 @@ use zuno_worker::{AccessTokenSource, WorkerClient};
 
 #[path = "enterprise_state/browser.rs"]
 mod browser;
+#[path = "enterprise_state/gateway.rs"]
+mod gateway;
 
 #[derive(Deserialize)]
 struct Fixture {
