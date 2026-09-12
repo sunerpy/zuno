@@ -354,12 +354,12 @@ async fn run_once(root: &Path, name: &str, service: ServiceRole) -> Value {
     }
 }
 async fn spawn(root: &Path, name: &str, service: ServiceRole) -> tokio::process::Child {
-    let child = command(root, name, service)
+    let mut child = command(root, name, service)
         .await
         .stdout(Stdio::null())
         .spawn()
         .unwrap();
-    executable::started(name, &child);
+    executable::started(name, &mut child).await;
     child
 }
 

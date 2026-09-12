@@ -55,16 +55,30 @@ pub fn binary() -> &'static Path {
         path
     })
 }
-pub fn started(name: &str, child: &tokio::process::Child) {
+pub async fn started(name: &str, child: &mut tokio::process::Child) {
     if std::env::var_os("ZUNO_ENTERPRISE_TEST_BINARY").is_none() {
         return;
     }
     let selected = std::fs::canonicalize(binary()).unwrap();
-    let actual = std::fs::read_link(format!("/proc/{}/exe", child.id().unwrap())).unwrap();
-    assert_eq!(
-        actual, selected,
-        "{name} must execute the unpacked artifact"
-    );
+    let inherited = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+    let process = format!("/proc/{}/exe", child.id().unwrap());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "{name} exited before artifact verification"
+        );
+        let actual = std::fs::read_link(&process).unwrap();
+        if actual == selected {
+            break;
+        }
+        assert_eq!(actual, inherited, "{name} executed an unexpected binary");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{name} did not exec the unpacked artifact"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     ROLES.lock().unwrap().push(name.to_owned());
 }
 pub fn finish(model_requests: usize) {
