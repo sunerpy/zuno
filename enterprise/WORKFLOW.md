@@ -46,7 +46,8 @@ to its eligible successor, without waiting for an unrelated slow branch.
 The original parent stages the fixed plan, forks an immutable coordination
 workspace and prepares independent node workspaces. This bounded preparation
 still holds the original Worker slot; it performs no node model/tool execution.
-The current Docker adapter requires one assigned gateway. After preparation,
+Nodes may select another configured gateway; authenticated snapshot transfer
+prepares their branches before execution. After preparation,
 foreground activation and the original parent's waiting checkpoint commit
 together. Background workflows activate through preparation and retain the
 existing `nextStep`/`quiet` behavior.
@@ -89,7 +90,7 @@ PostgreSQL preview format 15 adds workflow/node coordination and frozen dependen
 inputs. The exact format-14 fixture preserves sessions, messages, Memory, committed
 frames and live rows through migration and rollback. Earlier supported formats
 advance in the same guarded transaction. Worker protocol 11 carries workflow
-commands; checkpoint schema 4 is unchanged and gateway protocol 4 validates Workflow workspace preparation. Use matching
+commands; checkpoint schema 4 is unchanged and gateway protocol 5 validates Workflow workspace preparation. Use matching
 control-plane/Worker versions and regenerate the public SDK when updating these contracts.
 
 ## Durable Council
@@ -141,7 +142,7 @@ PostgreSQL format 16 adds scoped Council state, seat outcomes, attempt provenanc
 and optional Job deadlines. Exact format-15 migration preserves existing Jobs,
 Workflow/node rows, messages, Memory and activity frames, with rollback before
 the marker. Worker protocol 11 adds internal Council admission; gateway protocol
-3 and checkpoint schema 4 remain unchanged. `WorkflowRunView.kind` distinguishes
+5 supports remote node workspaces; checkpoint schema 4 remains unchanged. `WorkflowRunView.kind` distinguishes
 `workflow` and `council`; its optional `council` view carries typed phases, seat
 states, attempt counts and exact decimal deadlines. Private configuration,
 prompts, leases and credentials remain outside this public view.
@@ -154,7 +155,7 @@ evidence acceptance and approved workspace merge remain separate capabilities.
 Database tests cover activation rollback, concurrent claims, waiting/refill,
 dependency input, replacement Workers, terminal consumption, failure, uncertainty,
 cancellation and owner boundaries. Native executable tests exercise a control
-plane, gateway and two Workers with a three-node DAG, four explicit command
+plane, two gateways and two Workers with a three-node DAG, four explicit command
 approvals, isolated workspace forks and a dependent node starting while another
 node still waits for approval. Identity and model providers in these tests are
 fixtures; native Linux amd64/arm64 CI supplies platform evidence.
@@ -165,8 +166,8 @@ The native test adds two isolated, explicitly approved seat commands, one
 format correction and a model-only synthesis before consuming the original
 parent call. No browser is required for this backend evidence.
 
-Approved workspace merges, cross-gateway transfer and the remaining P5–P6 operational acceptance
-continue under [the plan](PLAN.zh.md). They are not enabled by a workflow template.
+Approved workspace merges and cross-gateway transfer use the configured workspace
+providers. Full P5–P6 operational acceptance continues under [the plan](PLAN.zh.md).
 The independent preview release remains disabled until its acceptance is complete.
 
 See [中文](WORKFLOW.zh.md), [children](CHILDREN.md), [workspace forks](WORKSPACES.md),

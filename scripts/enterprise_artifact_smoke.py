@@ -71,12 +71,12 @@ def validate_proof(proof: dict, binary_sha: str, version: str) -> None:
             "native fixture proof is missing or unsupported")
     require(proof.get("binarySha256") == binary_sha and proof.get("version") == version,
             "fixture executed a different binary")
-    require(proof.get("roles") == ["control", "gateway", "worker-a", "worker-b"],
+    require(proof.get("roles") == ["control", "gateway", "gateway-peer", "worker-a", "worker-b"],
             "all independent roles must execute the artifact")
     require(type(proof.get("modelRequests")) is int and proof["modelRequests"] > 0,
             "artifact did not execute the model fixture")
     for capability in ["userIsolation", "humanApproval", "workflow", "council",
-                       "workspaceMerge", "contentReview", "shutdown"]:
+                       "workspaceMerge", "contentReview", "workspaceTransfer", "shutdown"]:
         require(proof.get(capability) is True, f"native proof lacks {capability}")
 
 

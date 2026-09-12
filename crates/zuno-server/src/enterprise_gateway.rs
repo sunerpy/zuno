@@ -1,6 +1,7 @@
 //! Data-owner endpoints for gateway delegation and current operation approval.
 mod import;
 mod merge;
+mod transfer;
 
 use axum::{
     Json, Router,
@@ -71,6 +72,22 @@ impl GatewayControlService {
 
     pub fn router(self) -> Router {
         Router::new()
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_SNAPSHOT_TICKET_PATH),
+                post(transfer::ticket),
+            )
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_SNAPSHOT_RESOLVE_PATH),
+                post(transfer::resolve),
+            )
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_SNAPSHOT_COMPLETE_PATH),
+                post(transfer::complete),
+            )
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_SNAPSHOT_FACT_PATH),
+                post(transfer::fact),
+            )
             .route(
                 &format!("/{}", zuno_worker::GATEWAY_IMPORT_RESOLVE_PATH),
                 post(import::resolve),
@@ -184,11 +201,28 @@ impl GatewayControlService {
             existing_workspace: workspace.is_some() || imported.is_some(),
             child_workspace: None,
             prepared_workspace: None,
+            workspace_source: None,
             merge_source: None,
         })
     }
 
     async fn child_context(
+        &self,
+        request: &GatewayRequest,
+        context: &mut GatewayExecutionContext,
+    ) -> Result<(), Failure> {
+        self.resolve_child_context(request, context).await?;
+        if let Some(assignment) = &context.child_workspace {
+            self.backend
+                .runtime(self.tenant.clone())
+                .admit_child_workspace(&context.lease, assignment)
+                .await
+                .map_err(application)?;
+        }
+        Ok(())
+    }
+
+    async fn resolve_child_context(
         &self,
         request: &GatewayRequest,
         context: &mut GatewayExecutionContext,
@@ -213,32 +247,21 @@ impl GatewayControlService {
                 &info.parent_session_id,
             )
             .map_err(application)?;
-        // This Docker gateway owns both volumes. Transfer to another gateway
-        // requires a separate authenticated snapshot transport.
-        if target.gateway_id != context.assignment.gateway_id
-            || target.endpoint != context.assignment.endpoint
-            || parent.gateway_id != target.gateway_id
-            || parent.endpoint != target.endpoint
-        {
-            return Err(Failure(StatusCode::FORBIDDEN));
-        }
         let assignment = zuno_application::child::ChildWorkspaceAssignment {
             child_job_id: child_job_id.clone(),
-            gateway_id: target.gateway_id,
+            gateway_id: target.gateway_id.clone(),
+            parent_gateway_id: Some(parent.gateway_id.clone()),
             parent: parent.environment.clone(),
-            target: target.environment,
+            target: target.environment.clone(),
             resume: info.resume,
         };
-        runtime
-            .admit_child_workspace(&context.lease, &assignment)
-            .await
-            .map_err(application)?;
         if info.parent_session_id != context.lease.session_id {
             // The data owner proved this is a node of the caller's staged
             // workflow. Its immutable group workspace must already exist.
             context.existing_workspace = true;
         }
-        context.assignment = parent;
+        context.assignment = target;
+        context.workspace_source = Some(parent);
         context.child_workspace = Some(assignment);
         context.prepared_workspace = info.receipt;
         Ok(())
@@ -419,11 +442,11 @@ async fn resolve(
         .verify(&gateway, &ticket, &request, now()?)
         .map_err(authentication)?;
     let mut context = service.context(verified.lease()).await?;
+    service.child_context(&request, &mut context).await?;
+    service.merge_context(&request, &mut context).await?;
     if *gateway.id() != context.assignment.gateway_id {
         return Err(Failure(StatusCode::FORBIDDEN));
     }
-    service.child_context(&request, &mut context).await?;
-    service.merge_context(&request, &mut context).await?;
     target(&request, &context)?;
     Ok(Json(context))
 }

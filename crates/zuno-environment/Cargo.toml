@@ -24,6 +24,7 @@ sha2 = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tar = { workspace = true }
+tempfile = { workspace = true }
 uuid = { workspace = true }
 zuno-application = { workspace = true }
 zuno-network = { workspace = true }

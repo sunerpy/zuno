@@ -408,6 +408,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
         ("bob", "web", true),
         ("worker", "worker", false),
         ("gateway", "gateway", false),
+        ("gateway-peer", "gateway", false),
     ] {
         let token = issuer.token(name, client, user);
         let path = root.join(format!("{name}.token"));
@@ -490,6 +491,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
         .bind(tenant.as_str()).bind(owner("bob").principal_id.as_str()).execute(&admin).await.unwrap();
     let control_address = address();
     let gateway_address = address();
+    let peer_address = address();
     let control_url = format!("https://{control_address}/");
     let browser_assets = std::env::var_os("ZUNO_ENTERPRISE_WEB_DIST").map(PathBuf::from);
     let browser_config = browser_assets
@@ -514,6 +516,8 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
     let mut child_definition = definition.clone();
     child_definition.id = zuno_types::identity::ConfigurationId::new("native-child").unwrap();
     child_definition.agent.name = "workspace-helper".to_owned();
+    child_definition.environment.as_mut().unwrap().gateway_id = GatewayId::new("peer").unwrap();
+    child_definition.environment.as_mut().unwrap().endpoint = format!("https://{peer_address}/");
     child_definition.agent.system_prompt="CHILD-EXECUTOR: inspect inherited files and keep edits inside the assigned child workspace.".to_owned();
     let child_definition_file = root.join("child-definition.json");
     write(
@@ -575,10 +579,16 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
                 user_identity: user_verifier,
                 service_identity: service_verifier,
                 workers: [subject("worker")].into(),
-                gateways: vec![GatewaySubject {
-                    subject: subject("gateway"),
-                    gateway_id: GatewayId::new("native").unwrap(),
-                }],
+                gateways: vec![
+                    GatewaySubject {
+                        subject: subject("gateway"),
+                        gateway_id: GatewayId::new("native").unwrap(),
+                    },
+                    GatewaySubject {
+                        subject: subject("gateway-peer"),
+                        gateway_id: GatewayId::new("peer").unwrap(),
+                    },
+                ],
                 job_keys: KeyFiles {
                     active: "current".to_owned(),
                     keys: vec![KeyFile {
@@ -626,9 +636,28 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
             "gateway",
             ServiceRole::Gateway(GatewayConfig {
                 merge_parallelism: 2,
+                snapshot_parallelism: 2,
+                snapshot_root_certificate: Some(fixture.root_certificate.clone()),
                 id: GatewayId::new("native").unwrap(),
                 tls: fixture.tls(gateway_address),
                 state: state("gateway"),
+                docker_socket: socket.clone(),
+                delivery_millis: 100,
+            }),
+        )
+        .await,
+    );
+    children.push(
+        spawn(
+            root,
+            "gateway-peer",
+            ServiceRole::Gateway(GatewayConfig {
+                merge_parallelism: 2,
+                snapshot_parallelism: 2,
+                snapshot_root_certificate: Some(fixture.root_certificate.clone()),
+                id: GatewayId::new("peer").unwrap(),
+                tls: fixture.tls(peer_address),
+                state: state("gateway-peer"),
                 docker_socket: socket,
                 delivery_millis: 100,
             }),
@@ -690,11 +719,15 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
             assert!(
                 child.try_wait().unwrap().is_none(),
                 "service {index} exited; logs: {}",
-                std::fs::read_to_string(
-                    root.join(
-                        ["control.log", "gateway.log", "worker-a.log", "worker-b.log"][index]
-                    )
-                )
+                std::fs::read_to_string(root.join(
+                    [
+                        "control.log",
+                        "gateway.log",
+                        "gateway-peer.log",
+                        "worker-a.log",
+                        "worker-b.log"
+                    ][index]
+                ))
                 .unwrap()
             );
         }
@@ -798,15 +831,21 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
                 let operations:Vec<Value>=query_scalar(
                     "SELECT to_jsonb(o) FROM zuno_enterprise_preview.gateway_operation o WHERE tenant_id=$1 AND job_id=$2",
                 ).bind(tenant.as_str()).bind(id).fetch_all(&admin).await.unwrap();
-                let logs = ["control.log", "gateway.log", "worker-a.log", "worker-b.log"]
-                    .into_iter()
-                    .map(|name| {
-                        format!(
-                            "{name}: {}",
-                            std::fs::read_to_string(root.join(name)).unwrap()
-                        )
-                    })
-                    .collect::<Vec<_>>();
+                let logs = [
+                    "control.log",
+                    "gateway.log",
+                    "gateway-peer.log",
+                    "worker-a.log",
+                    "worker-b.log",
+                ]
+                .into_iter()
+                .map(|name| {
+                    format!(
+                        "{name}: {}",
+                        std::fs::read_to_string(root.join(name)).unwrap()
+                    )
+                })
+                .collect::<Vec<_>>();
                 let ledger =
                     rusqlite::Connection::open(root.join("gateway-state/gateway.sqlite")).unwrap();
                 let states = ledger
@@ -987,6 +1026,47 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
         issuer.model_requests.load(Ordering::SeqCst),
         if browser_enabled { 44 } else { 42 }
     );
+    let transfers: Vec<Value> = query_scalar(
+        "SELECT jsonb_build_object('source',source_gateway_id,'target',target_gateway_id,
+            'principal',principal_id,'snapshot',snapshot)
+         FROM zuno_enterprise_preview.workspace_snapshot_transfer WHERE tenant_id=$1",
+    )
+    .bind(tenant.as_str())
+    .fetch_all(&admin)
+    .await
+    .unwrap();
+    assert!(
+        transfers.len() >= 4,
+        "root, Workflow and merge snapshots cross gateway processes"
+    );
+    assert!(
+        transfers
+            .iter()
+            .any(|t| t["source"] == "peer" && t["target"] == "native"),
+        "approved merge must import the child snapshot back to the parent gateway"
+    );
+    for transfer in transfers {
+        assert_ne!(transfer["source"], transfer["target"]);
+        let snapshot: zuno_application::environment::EnvironmentSnapshot =
+            serde_json::from_value(transfer["snapshot"].clone())
+                .expect("source fact was committed");
+        let directory = if transfer["target"] == "peer" {
+            "gateway-peer-state"
+        } else {
+            "gateway-state"
+        };
+        let ledger =
+            rusqlite::Connection::open(root.join(directory).join("gateway.sqlite")).unwrap();
+        let source_exists: bool = ledger.query_row(
+            "SELECT EXISTS(SELECT 1 FROM environment WHERE tenant=?1 AND principal=?2 AND id=?3)",
+            rusqlite::params![tenant.as_str(), transfer["principal"].as_str().unwrap(), snapshot.environment_id.as_str()],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(
+            !source_exists,
+            "a receiver must not acquire a peer's environment locally"
+        );
+    }
     for child in &mut children {
         assert!(
             tokio::process::Command::new("kill")

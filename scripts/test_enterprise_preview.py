@@ -86,10 +86,10 @@ class PreviewTests(unittest.TestCase):
                 "binarySha256": hashlib.sha256(binary).hexdigest(),
                 "version": self.manifest["version"], "sourceSha": sha, "target": target,
                 "archive": archive.name, "archiveSha256": preview.artifact_smoke.sha256(archive),
-                "roles": ["control", "gateway", "worker-a", "worker-b"], "modelRequests": 40,
+                "roles": ["control", "gateway", "gateway-peer", "worker-a", "worker-b"], "modelRequests": 42,
                 "runId": "42", "runAttempt": "1",
                 **{name: True for name in ["userIsolation", "humanApproval", "workflow",
-                                          "council", "workspaceMerge", "contentReview", "shutdown"]},
+                                          "council", "workspaceMerge", "contentReview", "workspaceTransfer", "shutdown"]},
             }
             (dist / preview.smoke_name(self.manifest, target)).write_text(json.dumps(evidence))
         return dist, "refs/heads/" + preview.BRANCH, sha

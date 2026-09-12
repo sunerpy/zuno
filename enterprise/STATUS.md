@@ -7,9 +7,9 @@ Original baseline: `v0.10.29`, `d1212860dba6a6b420ce81d444ace58feaf0adb5`.
 | P0 | Complete | PR #176 merged into preview; native CI run 34553054820 succeeded |
 | P1 | In progress | Principal propagation implemented; ownership migration validated; local bounded driver and scoped session application validated; local runtime Job/lease port validated; Memory persistence/authority ports validated; backend assembly remains |
 | P2 | In progress | PostgreSQL, generic OAuth2/OIDC, BFF, scoped private Memory, organization policy and HITL integrated; shared/automatic Memory and full fault acceptance remain |
-| P3 | In progress | Independent control/gateway/two-Worker executable loop validated; full fault/operational acceptance remains |
-| P4 | In progress | Child dispatch, persistent waits, workspace forks, Job cancellation and durable Workflow implemented; approved merge and distributed Council remain |
-| P5 | In progress | Public enums, transactional history/frames, live progress, generated SDK and session Web workbench implemented; remaining Web features and full ACP/TUI adapters remain |
+| P3 | In progress | Independent control/two-gateway/two-Worker executable loop validated locally; full fault/operational acceptance remains |
+| P4 | In progress | Child dispatch, persistent waits, workspace forks/import/transfer, cancellation, Workflow, Council and approved merge implemented; resumed baselines and operational acceptance remain |
+| P5 | Backend adapters in progress; UI paused | Public enums, transactional history/frames, live progress and generated SDK implemented; full ACP/TUI adapters remain. App design must use Penpot before UI implementation resumes |
 | P6 | Pending | Fault injection, native artifacts, preview publication |
 
 Publication remains disabled until the first runnable root-task preview has
@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p4-workflow`.
+- Current phase branch: `codex/enterprise-p4-workspace-transfer`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -466,3 +466,13 @@ Workflow PR #218 initially exposed an arm64 stack overflow in the PostgreSQL con
 - PostgreSQL format 18 adds owner-scoped import state with exact format-17 preservation/rollback. Ready imports project a typed artifact and `ViewWorkspaceImport`; the SDK includes begin/status/cancel/raw-upload methods. Private assignment and credentials stay out of client DTOs.
 - Final local validation passed: native Docker and four independent roles with imported mode-600 content/root mode 700, normalized ownership, early-input/user denial, concurrent duplicate upload and changed-byte checks, followed by separately approved command execution; PostgreSQL migration/admission/receipt/race tests and five HTTPS cases; workspace check/Clippy, 100 docs/release contracts, 21 SDK tests and generated drift, archive/publication tests, formatting/diff.
 - Native providers remain fixtures and current-commit amd64/arm64 CI remains required. Initialization pins its configuration; remote/cross-gateway storage, broader provisioning/recovery/retention/quotas, Memory producers, ACP/TUI and remaining P6 work stay open. UI remains deferred to Penpot and publication remains disabled.
+
+## Workspace transfer between gateways
+
+- Initial import PR #227 passed CI `34718542822`, including both Linux architectures, and merged only into preview at `78cbc512a52990ad1acccf1cdd72bc5aa93aaace`.
+- Immutable parent/child definitions can select different gateways. The target receives a separate snapshot ticket; the source registers an authenticated immutable fact before streaming. The target verifies the source fact, bounded archive and digest, then rechecks current authority before atomic fork publication.
+- Snapshot identity survives Worker renewal, retries, interrupted downloads and gateway restart. Conflicting bytes cannot replace committed content. Completed descendant snapshots travel back to the parent gateway for the existing manifest/content review and human approval. No command is implicitly approved or replayed.
+- Gateway `snapshotParallelism` bounds independent send/receive pools; `snapshotRootCertificate` optionally separates peer trust from control-plane trust. PostgreSQL format 19 adds forced-owner-RLS source facts, an exact format-18 migration and rollback fixture. Existing same-gateway admissions keep their original bytes/digests. Gateway protocol 5 requires matching roles; Worker protocol 11, checkpoint 4 and public schemas stay unchanged.
+- Local validation covers the real control plane, two gateway processes/ledgers and two Workers, 42 fixture model requests, remote child/Workflow/Council workspaces, approved return merge/content review and drain. Provider faults cover truncation, cancellation, corrupt/repeated bytes, changed source contents and restart after publication. PostgreSQL covers authenticated source facts, conflicting receipts, expired leases, legacy re-admission and atomic migration; five HTTPS cases pass.
+- Documentation impact: English/Chinese architecture, configuration, workspace, gateway, workflow, child and PostgreSQL guides are updated. The 21 SDK tests and generated-schema drift checks pass, as do 16 archive/publication contracts. Preview artifact proof now requires all five actual process images and workspace-transfer evidence.
+- Current-commit Linux amd64/arm64 CI is still required before preview integration. Unproven resumed baselines, remote artifact retention, Memory producers, ACP/TUI, quotas, backup/rolling upgrade and remaining P6 acceptance remain open. UI files stay unchanged and excluded; App design/delivery awaits Penpot. No preview version/tag or Release is enabled.

@@ -124,9 +124,27 @@ pub struct ChildDispatch {
 pub struct ChildWorkspaceAssignment {
     pub child_job_id: JobId,
     pub gateway_id: GatewayId,
+    /// Older preparations were confined to one gateway. Omission retains their
+    /// canonical durable digest; new assignments name the source explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_gateway_id: Option<GatewayId>,
     pub parent: EnvironmentSpec,
     pub target: EnvironmentSpec,
     pub resume: bool,
+}
+
+impl ChildWorkspaceAssignment {
+    pub fn parent_gateway(&self) -> &GatewayId {
+        self.parent_gateway_id.as_ref().unwrap_or(&self.gateway_id)
+    }
+
+    pub fn same_operation(&self, other: &Self) -> bool {
+        let mut left = self.clone();
+        let mut right = other.clone();
+        left.parent_gateway_id = Some(self.parent_gateway().clone());
+        right.parent_gateway_id = Some(other.parent_gateway().clone());
+        left == right
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

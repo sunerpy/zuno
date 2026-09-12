@@ -10,11 +10,11 @@ use super::{
 };
 use crate::{ApplicationError, authorization::ApprovalRecord, runtime::ExecutionLease};
 
-pub const GATEWAY_PROTOCOL_VERSION: u32 = 4;
+pub const GATEWAY_PROTOCOL_VERSION: u32 = 5;
 pub const MAX_GATEWAY_FRAME_BYTES: usize = 1024 * 1024;
 
 /// A data-owner response, never a caller-selected deployment.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GatewayAssignment {
     pub gateway_id: GatewayId,
@@ -32,6 +32,8 @@ pub struct GatewayExecutionContext {
     pub child_workspace: Option<ChildWorkspaceAssignment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prepared_workspace: Option<ChildWorkspaceReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_source: Option<GatewayAssignment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_source: Option<crate::workspace_merge::WorkspaceMergeSource>,
 }

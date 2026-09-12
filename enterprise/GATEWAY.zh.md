@@ -35,7 +35,7 @@
 
 ## 私有协议
 
-`GatewayRequest` 为版本 4，使用有界的 tagged enum：
+`GatewayRequest` 为版本 5，使用有界的 tagged enum：
 
 | 命令 | 行为 |
 | --- | --- |
@@ -100,4 +100,11 @@ socket 会使该 gate 失败。可以通过 `ZUNO_ROOTLESS_DOCKER_SOCKET` 指定
 
 网关 supervisor 通过独立服务认证轮询 `internal/gateway/v1/cancellations`，领取已停止 Job 的不可变操作接纳记录。该入口在 Worker 撤权后仍有效，只允许停止原操作；完成事实保持原样，不确定状态继续核查。见[控制](CONTROL.zh.md)。
 
-网关协议 4 允许从数据所有者验证过的 Workflow 协调工作区准备子工作区；源工作区必须已经存在，具体子 Job、源与网关绑定保持在签名请求内。普通命令仍要求执行会话一致。
+网关协议 5 将子工作区准备路由至目标网关，单独标识经过授权的来源，包括已经存在的
+Workflow 协调工作区。普通命令仍要求执行会话一致。
+
+快照交换使用 `/internal/execution/v1/snapshot` 及独立的
+`x-zuno-snapshot-ticket`。控制面的 `/internal/gateway/v1/snapshot/` 下提供
+`ticket`、`resolve`、`complete`、`fact`，分别绑定路由、当前授权及不可变来源回执。
+JSON 帧仍限制为 1 MiB，只有经过认证的归档正文使用独立的 512 MiB 上限。
+源网关服务令牌不发送给对端，详见[工作区传输](WORKSPACES.zh.md#网关间传输)。
