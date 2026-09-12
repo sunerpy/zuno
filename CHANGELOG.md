@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.35](https://github.com/sunerpy/zuno/compare/v0.10.34...v0.10.35) (2026-09-12)
+
+
+### Bug Fixes
+
+* **runtime:** 修复任务参数指引、计划续跑和后台调度边界 ([33bf6c8](https://github.com/sunerpy/zuno/commit/33bf6c895253bc04b9898e527dc4ad7217de4423))
+
 ## [0.10.34](https://github.com/sunerpy/zuno/compare/v0.10.33...v0.10.34) (2026-09-12)
 
 
