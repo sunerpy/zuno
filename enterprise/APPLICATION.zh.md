@@ -21,6 +21,7 @@ HttpOnly Cookie，写请求必须携带精确 Origin 与 `x-zuno-csrf: 1`。
 | `GET /sessions/{session}` | 归属会话摘要 |
 | `GET /sessions/{session}/history` | 固定快照中的有界公共历史 |
 | `GET /sessions/{session}/frames` | 游标之后连续的持久活动 |
+| `GET /sessions/{session}/live` | 当前经过授权的临时快照 |
 | `GET /sessions/{session}/input-version` | 精确 CAS 版本 |
 | `POST /sessions/{session}/turns` | 原子接纳输入和 Job |
 | `GET /jobs/{job}` | 公共 Job 标识、阶段及输入版本 |

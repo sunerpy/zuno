@@ -273,3 +273,7 @@ Format 12 adds `runtime_control_request`, `runtime_stop`, `runtime_continuation`
 ## Format 13: public activity
 
 Format 13 adds owner-scoped public activity counters, items and immutable frames, plus an immutable message-to-execution Job association. Projection, source writes and each logical cursor commit together. The exact format-12 fixture preserves messages, parts, Memory and cancellation delivery state through success and failed-DDL rollback. See [activity](ACTIVITY.md) for snapshot pagination and privacy boundaries.
+
+## Format 14: transient live progress
+
+Format 14 adds `live_progress` and an atomic cleanup trigger on execution changes. Original message/Job binding, lease, snapshot digest and sequence are verified. Only active, fresh pending-message snapshots can be read. Exact format-13 migration preserves durable activity and Memory rows.

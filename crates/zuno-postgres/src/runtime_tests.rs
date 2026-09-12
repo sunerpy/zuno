@@ -3,6 +3,7 @@
 mod activity;
 mod children;
 mod concurrency;
+mod live;
 mod recovery;
 
 use crate::{PostgresBackend, scoped_transaction};
@@ -95,4 +96,5 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool) {
     recovery::exercise(backend, admin).await;
     children::execution_binding(backend, admin).await;
     activity::exercise(backend, admin).await;
+    live::exercise(backend, admin).await;
 }

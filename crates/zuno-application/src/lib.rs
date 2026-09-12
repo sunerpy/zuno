@@ -9,6 +9,7 @@ pub mod authorization;
 pub mod child;
 pub mod control;
 pub mod environment;
+pub mod live;
 pub mod runtime;
 
 use std::sync::Arc;

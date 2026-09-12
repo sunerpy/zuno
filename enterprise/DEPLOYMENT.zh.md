@@ -109,3 +109,5 @@ React／ACP 及完整故障矩阵仍需继续完成。构建此二进制不会�
 `maximumChildren`。使用 `zuno-enterprise --definition-ref /absolute/child.json`
 计算引用，将父子定义都安装到控制面和 Worker。引用改变时更新父版本，合法目录会安装
 原生 `task`；工作区准备在子执行前完成。完整流程见[工作区](WORKSPACES.zh.md)。
+
+Worker 的 `liveMillis` 默认 500 毫秒，允许 100–5000，设为 null 关闭。实时进度是有界、可替换的快照，不阻塞模型执行，不替代持久历史。见[活动协议](ACTIVITY.zh.md)。

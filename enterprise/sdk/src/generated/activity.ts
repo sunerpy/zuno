@@ -226,6 +226,10 @@ export type WorkState =
 export type SessionId = string;
 export type LiveEvent =
   | {
+      items: LiveItem[];
+      kind: "snapshot";
+    }
+  | {
       itemId: string;
       kind: "text_delta";
       text: string;
@@ -242,6 +246,30 @@ export type LiveEvent =
     }
   | {
       kind: "reset";
+    };
+/**
+ * Replaceable drafts have independent IDs and are discarded when their
+ * generation ends. Only committed records enter durable conversation history.
+ */
+export type LiveItem =
+  | {
+      id: string;
+      kind: "text";
+      parentId?: string | null;
+      text: string;
+      truncated: boolean;
+    }
+  | {
+      id: string;
+      kind: "thinking";
+      parentId?: string | null;
+      text: string;
+      truncated: boolean;
+    }
+  | {
+      id: InvocationId;
+      kind: "invocation";
+      label: string;
     };
 
 export interface ActivityProtocol {

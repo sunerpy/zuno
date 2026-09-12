@@ -1,4 +1,5 @@
-import type { FramePage, HistoryPage } from "./generated/activity.js";
+import type { FramePage, HistoryPage, LiveFrame } from "./generated/activity.js";
+import { validateLiveFrame } from "./generated/validators.mjs";
 import { counter, decodeFramePage, decodeHistoryPage } from "./state.js";
 
 const MAXIMUM_BODY = 1024 * 1024;
@@ -57,6 +58,18 @@ export class ActivityClient {
       throw new Error("Enterprise activity has an invalid continuation");
     }
     return page;
+  }
+  async live(session: string, signal?: AbortSignal): Promise<LiveFrame | null> {
+    const url = this.url(session, "live"); url.search = "";
+    const value = await this.get(url, signal);
+    if (value === null) return null;
+    if (!validateLiveFrame(value)) throw new Error("Invalid live activity response");
+    const frame = value as LiveFrame;
+    if (frame.version !== 1 || frame.sessionId !== session || frame.event.kind !== "snapshot") {
+      throw new Error("Invalid live activity context");
+    }
+    counter(frame.sequence); counter(frame.afterCommitted);
+    return frame;
   }
   async *watch(session: string, after: string, options: PageOptions & { intervalMs?: number } = {}): AsyncGenerator<FramePage> {
     const interval = options.intervalMs ?? 500;

@@ -112,6 +112,7 @@ pub struct ConfiguredWorkerFactory {
     gateway: Arc<GatewayClient>,
     driver: Arc<dyn AgentDriver>,
     children: crate::children::ConfiguredChildren,
+    live_interval: Option<Duration>,
 }
 impl ConfiguredWorkerFactory {
     pub async fn new(
@@ -164,11 +165,22 @@ impl ConfiguredWorkerFactory {
             gateway,
             driver,
             children,
+            live_interval: None,
         })
+    }
+    pub fn with_live_interval(mut self, milliseconds: Option<u64>) -> Result<Self, Error> {
+        if milliseconds.is_some_and(|value| !(100..=5000).contains(&value)) {
+            return Err(invalid("liveMillis must be null or between 100 and 5000"));
+        }
+        self.live_interval = milliseconds.map(Duration::from_millis);
+        Ok(self)
     }
 }
 #[async_trait]
 impl WorkerServiceFactory for ConfiguredWorkerFactory {
+    fn live_interval(&self) -> Option<Duration> {
+        self.live_interval
+    }
     fn configurations(&self) -> Vec<ConfigurationRef> {
         self.installed
             .iter()

@@ -122,6 +122,7 @@ impl EnterpriseApplication {
             .route("/sessions/{session}/turns", post(submit_turn))
             .route("/sessions/{session}/history", get(history))
             .route("/sessions/{session}/frames", get(frames))
+            .route("/sessions/{session}/live", get(live_progress))
             .route("/jobs/{job}", get(job))
             .route("/jobs/{job}/cancel", post(cancel_job))
             .route("/approvals/{approval}", get(approval))
@@ -273,6 +274,17 @@ async fn frames(
                 },
             )
             .await?,
+    ))
+}
+
+async fn live_progress(
+    State(service): State<EnterpriseApplication>,
+    Extension(identity): Extension<VerifiedIdentity>,
+    Path(session): Path<SessionId>,
+) -> Result<Json<Option<zuno_types::activity::LiveFrame>>, Failure> {
+    let principal = service.principal(&identity).await?;
+    Ok(Json(
+        service.backend.live_progress(&principal, &session).await?,
     ))
 }
 

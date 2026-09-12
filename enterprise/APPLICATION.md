@@ -26,6 +26,7 @@ bootstrap remains an explicit schema-owner operation.
 | `GET /sessions/{session}` | Owned session summary |
 | `GET /sessions/{session}/history` | Bounded public history at a fixed snapshot |
 | `GET /sessions/{session}/frames` | Contiguous committed activity after a cursor |
+| `GET /sessions/{session}/live` | Current authorized transient snapshot |
 | `GET /sessions/{session}/input-version` | Exact CAS version |
 | `POST /sessions/{session}/turns` | Atomic input and Job admission |
 | `GET /jobs/{job}` | Public Job identity, phase and input version |

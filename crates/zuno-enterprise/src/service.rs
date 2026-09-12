@@ -185,7 +185,8 @@ async fn worker(options: WorkerConfig, shutdown: InterruptSignal) -> Result<(), 
                 gateway,
                 driver,
             )
-            .await?,
+            .await?
+            .with_live_interval(options.live_millis)?,
         );
         let worker = WorkerRuntime::new(
             state,

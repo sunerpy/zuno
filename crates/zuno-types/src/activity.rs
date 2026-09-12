@@ -460,6 +460,9 @@ pub struct CommittedFrame {
     deny_unknown_fields
 )]
 pub enum LiveEvent {
+    Snapshot {
+        items: Vec<LiveItem>,
+    },
     TextDelta {
         item_id: String,
         text: String,
@@ -473,6 +476,34 @@ pub enum LiveEvent {
         label: String,
     },
     Reset,
+}
+
+/// Replaceable drafts have independent IDs and are discarded when their
+/// generation ends. Only committed records enter durable conversation history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum LiveItem {
+    Text {
+        id: String,
+        parent_id: Option<String>,
+        text: String,
+        truncated: bool,
+    },
+    Thinking {
+        id: String,
+        parent_id: Option<String>,
+        text: String,
+        truncated: bool,
+    },
+    Invocation {
+        id: InvocationId,
+        label: String,
+    },
 }
 
 /// A replaceable, bounded stream generation. It never substitutes for committed

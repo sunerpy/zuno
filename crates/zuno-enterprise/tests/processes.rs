@@ -536,6 +536,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
                 root,
                 name,
                 ServiceRole::Worker(WorkerConfig {
+                    live_millis: Some(100),
                     instance_prefix: name.to_owned(),
                     state: state("worker"),
                     definitions: vec![definition_file.clone(), child_definition_file.clone()],

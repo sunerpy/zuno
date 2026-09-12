@@ -74,6 +74,7 @@ impl WorkerStateService {
             .route(&format!("/{CLAIM_PATH}"), post(claim))
             .route(&format!("/{RENEW_PATH}"), post(renew))
             .route(&format!("/{STATE_PATH}"), post(state_call))
+            .route(&format!("/{}", zuno_worker::LIVE_PATH), post(live_call))
             .route(&format!("/{FINISH_PATH}"), post(finish));
         if self.memory.is_some() {
             router = router.route(&format!("/{}", zuno_worker::MEMORY_PATH), post(memory_call));
@@ -106,6 +107,21 @@ impl WorkerStateService {
             .verify(worker, &token, now_ms()?)
             .map_err(auth_error)
     }
+}
+
+async fn live_call(
+    State(service): State<WorkerStateService>,
+    Extension(worker): Extension<AuthenticatedWorker>,
+    headers: HeaderMap,
+    Json(update): Json<zuno_application::live::LiveUpdate>,
+) -> Result<StatusCode, ApiFailure> {
+    let grant = service.grant(&worker, &headers)?;
+    service
+        .backend
+        .publish_live(grant.lease(), &update)
+        .await
+        .map_err(child_error)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn child_call(

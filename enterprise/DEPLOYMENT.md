@@ -139,3 +139,5 @@ React/ACP clients and the full failure matrix. No preview release is enabled by
 building this binary.
 
 See [中文](DEPLOYMENT.zh.md), [platforms](PLATFORMS.md) and [status](STATUS.md).
+
+Worker `liveMillis` defaults to 500 milliseconds, accepts 100–5000, or null to disable transient publication. Live progress is a bounded replaceable snapshot; it never holds model execution or replaces committed history. See [activity](ACTIVITY.md).
