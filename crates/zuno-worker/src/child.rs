@@ -4,7 +4,9 @@ use super::*;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use zuno_agent::model_policy::ModelChoice;
-use zuno_application::child::{ChildCommand, ChildDelivery, ChildInvocation, ChildReply};
+use zuno_application::child::{
+    ChildCommand, ChildDelivery, ChildInvocation, ChildReply, ChildWorkspaceState,
+};
 use zuno_engine::r#loop::{
     AvailableTools, DispatchRequest, PreparedToolDispatch, ToolBlockKind, ToolDispatchOutcome,
     ToolDispatchResult, ToolDispatcher, UncertainOutcome,
@@ -48,6 +50,7 @@ struct RemoteChildHost {
     invocation_id: InvocationId,
     arguments_sha256: String,
     presentation: Value,
+    gateway: Option<Arc<crate::gateway::GatewayClient>>,
 }
 
 fn host_error(error: TurnStateError, admission: bool) -> ChildTurnError {
@@ -111,19 +114,17 @@ impl ChildTurnHost for RemoteChildHost {
                 .map_err(|_| ChildTurnError::Host("invalid child session ID".to_owned()))?,
             presentation: self.presentation.clone(),
         };
+        let command = ChildCommand::Dispatch {
+            agent: request.agent,
+            model: request.model.map(|model| model.model),
+            invocation: Box::new(invocation),
+        };
         let reply = self
             .client
-            .child_command(
-                &self.execution,
-                &ChildCommand::Dispatch {
-                    agent: request.agent,
-                    model: request.model.map(|model| model.model),
-                    invocation: Box::new(invocation),
-                },
-            )
+            .child_command(&self.execution, &command)
             .await
             .map_err(|error| host_error(error, true))?;
-        let ChildReply::Dispatch { dispatch } = reply else {
+        let ChildReply::Dispatch { mut dispatch } = reply else {
             return Err(ChildTurnError::Uncertain);
         };
         if dispatch.delivery != delivery
@@ -132,6 +133,57 @@ impl ChildTurnHost for RemoteChildHost {
             || dispatch.wait.arguments_sha256 != self.arguments_sha256
         {
             return Err(ChildTurnError::Uncertain);
+        }
+        if dispatch.workspace == ChildWorkspaceState::Pending {
+            let gateway = self.gateway.as_ref().ok_or_else(|| {
+                ChildTurnError::Host("child workspace gateway is not installed".to_owned())
+            })?;
+            let request = zuno_application::environment::wire::GatewayRequest::new(
+                zuno_application::environment::wire::GatewayCommand::PrepareChildWorkspace {
+                    child_job_id: dispatch.job_id.clone(),
+                },
+            )
+            .map_err(|_| ChildTurnError::Conflict)?;
+            let issued = self
+                .client
+                .gateway_ticket(&self.execution, &request)
+                .await
+                .map_err(|error| host_error(error, false))?;
+            let result = gateway
+                .execute(&issued, &request)
+                .await
+                .map_err(|error| match error {
+                    zuno_application::ApplicationError::Forbidden => ChildTurnError::Denied,
+                    zuno_application::ApplicationError::Conflict
+                    | zuno_application::ApplicationError::LeaseLost => ChildTurnError::Conflict,
+                    _ => ChildTurnError::Uncertain,
+                })?;
+            let zuno_application::environment::wire::GatewayReply::ChildWorkspace(receipt) = result
+            else {
+                return Err(ChildTurnError::Uncertain);
+            };
+            if receipt.child_job_id != dispatch.job_id
+                || receipt.target.owner != self.execution.job.principal.owner()
+                || receipt.target.spec.session_id != dispatch.session_id
+            {
+                return Err(ChildTurnError::Uncertain);
+            }
+            let ChildReply::Dispatch { dispatch: prepared } = self
+                .client
+                .child_command(&self.execution, &command)
+                .await
+                .map_err(|error| host_error(error, true))?
+            else {
+                return Err(ChildTurnError::Uncertain);
+            };
+            if prepared.job_id != dispatch.job_id
+                || prepared.session_id != dispatch.session_id
+                || prepared.wait != dispatch.wait
+                || prepared.workspace != ChildWorkspaceState::Ready
+            {
+                return Err(ChildTurnError::Uncertain);
+            }
+            dispatch = prepared;
         }
         if delivery == ChildDelivery::Foreground {
             return Ok(ChildTurnDispatch::Pending(dispatch.wait));
@@ -183,6 +235,7 @@ pub struct ChildToolDispatcher {
     targets: BTreeMap<String, ChildToolTarget>,
     maximum_depth: u32,
     definition: ToolDefinition,
+    gateway: Option<Arc<crate::gateway::GatewayClient>>,
 }
 #[derive(Clone)]
 pub struct ChildToolTarget {
@@ -224,7 +277,12 @@ impl ChildToolDispatcher {
             targets,
             maximum_depth,
             definition,
+            gateway: None,
         })
+    }
+    pub fn with_workspace_gateway(mut self, gateway: Arc<crate::gateway::GatewayClient>) -> Self {
+        self.gateway = Some(gateway);
+        self
     }
 }
 fn blocked(kind: ToolBlockKind, text: &str) -> PreparedToolDispatch {
@@ -288,6 +346,7 @@ impl ToolDispatcher for ChildToolDispatcher {
             invocation_id: id,
             arguments_sha256: digest,
             presentation: args,
+            gateway: self.gateway.clone(),
         });
         let mut facts = FixedFacts::new();
         for target in self.targets.values() {

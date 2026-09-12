@@ -50,6 +50,7 @@ zuno-runtime = { workspace = true }
 zuno-server = { workspace = true, features = ["enterprise"] }
 zuno-types = { workspace = true }
 zuno-worker = { workspace = true }
+zuno-tools = { workspace = true }
 
 [dev-dependencies]
 rusqlite = { workspace = true }

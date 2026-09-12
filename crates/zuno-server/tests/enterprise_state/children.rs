@@ -49,6 +49,7 @@ impl ChildDefinitionCatalog for Catalog {
                 },
                 maximum_depth: 2,
                 maximum_children: 4,
+                workspace: zuno_application::child::ChildWorkspacePolicy::ModelOnly,
             },
         )
     }

@@ -22,7 +22,7 @@ pub(super) async fn upgrade(fixture: &Fixture, admin: &PgPool) {
         .unwrap();
     async fn snapshot(pool: &PgPool) -> Value {
         query_scalar("SELECT jsonb_build_object(
-            'sessions',(SELECT jsonb_agg(to_jsonb(s)) FROM zuno_enterprise_preview.session s),
+            'sessions',(SELECT jsonb_agg(to_jsonb(s)-'delegation_depth_limit') FROM zuno_enterprise_preview.session s),
             'messages',(SELECT jsonb_agg(to_jsonb(m)) FROM zuno_enterprise_preview.message m),
             'parts',(SELECT jsonb_agg(to_jsonb(p)) FROM zuno_enterprise_preview.part p),
             'jobs',(SELECT jsonb_agg(to_jsonb(j)) FROM zuno_enterprise_preview.runtime_job j),

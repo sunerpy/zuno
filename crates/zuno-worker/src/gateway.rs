@@ -110,6 +110,21 @@ impl GatewayStateClient {
             .map_err(state_error)?;
         serde_json::from_slice(&bytes).map_err(ApplicationError::storage)
     }
+
+    pub async fn child_workspace_completed(
+        &self,
+        completion: &zuno_application::child::ChildWorkspaceCompletion,
+    ) -> Result<(), ApplicationError> {
+        self.control
+            .post(
+                GATEWAY_CHILD_WORKSPACE_PATH,
+                None,
+                serde_json::to_vec(completion).map_err(ApplicationError::storage)?,
+            )
+            .await
+            .map_err(state_error)?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -263,6 +278,15 @@ impl GatewayClient {
                     && receipt.environment_id == issued.assignment.environment.id
             }
             (GatewayCommand::Output { .. }, GatewayReply::Output(_)) => true,
+            (
+                GatewayCommand::PrepareChildWorkspace { child_job_id },
+                GatewayReply::ChildWorkspace(receipt),
+            ) => {
+                receipt.child_job_id == *child_job_id
+                    && receipt.parent_environment_id == issued.assignment.environment.id
+                    && receipt.target.spec.validate().is_ok()
+                    && receipt.target.revision > 0
+            }
             _ => false,
         };
         if !matches {

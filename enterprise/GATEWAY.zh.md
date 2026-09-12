@@ -35,24 +35,26 @@
 
 ## 私有协议
 
-`GatewayRequest` 为版本 1，使用有界的 tagged enum：
+`GatewayRequest` 为版本 2，使用有界的 tagged enum：
 
 | 命令 | 行为 |
 | --- | --- |
 | `acquire` | 获取数据所有者分配的会话环境 |
 | `get` | 读取并验证该环境 |
+| `prepare_child_workspace` | 仅准备控制面解析的暂存子任务工作区 |
 | `prepare_command` | 解析环境并取得持久审批 |
 | `submit_command` | 重新检查租约与审批后提交 |
 | `inspect` | 在分配环境内查询原操作回执 |
 | `output` | 使用 offset 和前缀摘要读取有界输出 |
 
 它们属于 Worker／网关私有消息，公共 Web 活动使用独立投影。此版本的 Worker HTTP
-不开放环境销毁、分支创建或管理级取消。
+不开放任意环境销毁、分支目标选择或管理级取消。子工作区准备绑定已接纳关系和回执，
+不代替子命令审批。
 
 控制面提供 `/internal/worker/v1/gateway-ticket`、
 `/internal/gateway/v1/resolve`、`/prepare`、`/authorize`；执行网关提供
 `/internal/execution/v1/request`。宿主装配真实 provider 后才注册这些处理器。
-独立角色启动和 Agent 工具装配仍有单独交付要求，这些模块不单独启用企业 CLI。
+独立可执行文件已安装这些服务；有效子目标配置会增加受限工作区准备路径。
 
 Worker→控制面携带 Worker token 和 Job grant；网关→控制面携带网关自身的工作负载
 token；Worker→网关仅通过 `x-zuno-gateway-ticket` 携带绑定请求的短期凭证。

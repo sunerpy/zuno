@@ -1320,7 +1320,7 @@ learning recovery; local database failures retain their original variants.
 The PostgreSQL data owner now injects current organization and private-generation
 authorization with the logical provider. One bounded transaction contains
 candidate/document/evidence updates, request receipts and audit; source validity
-is rechecked on recall. Worker protocol 6 calls the async `MemoryDataService`,
+is rechecked on recall. Worker protocol 7 calls the async `MemoryDataService`,
 with workload identity and a Job grant, rather than exposing a pool.
 
 Enterprise Worker profiles install `memory_read`, `memory_update` and a

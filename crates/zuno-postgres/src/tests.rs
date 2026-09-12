@@ -21,6 +21,8 @@ mod format_nine;
 mod format_seven;
 #[path = "tests/format_six.rs"]
 mod format_six;
+#[path = "tests/format_ten.rs"]
+mod format_ten;
 
 #[derive(Deserialize)]
 struct Fixture {
@@ -329,6 +331,7 @@ async fn real_postgres_enforces_scopes_transactions_role_boundaries_and_schema_i
     format_seven::upgrade(&fixture, &admin).await;
     format_eight::upgrade(&fixture, &admin).await;
     format_nine::upgrade(&fixture, &admin).await;
+    format_ten::upgrade(&fixture, &admin).await;
     let expected_count: i64 = query_scalar("SELECT count(*) FROM zuno_enterprise_preview.session")
         .fetch_one(&admin)
         .await
@@ -568,7 +571,7 @@ async fn format_four_upgrade(fixture: &Fixture, admin: &PgPool) {
     async fn snapshot(pool: &PgPool) -> Value {
         query_scalar(
             "SELECT jsonb_build_object(
-              'session',(SELECT to_jsonb(s) FROM zuno_enterprise_preview.session s WHERE id='legacy-session'),
+              'session',(SELECT to_jsonb(s)-'delegation_depth_limit' FROM zuno_enterprise_preview.session s WHERE id='legacy-session'),
               'message',(SELECT to_jsonb(m) FROM zuno_enterprise_preview.message m WHERE id='legacy-assistant'),
               'part',(SELECT to_jsonb(p) FROM zuno_enterprise_preview.part p WHERE id='legacy-tool'),
               'job',(SELECT to_jsonb(j) FROM zuno_enterprise_preview.runtime_job j WHERE job_id='legacy-job'),
@@ -644,7 +647,7 @@ async fn format_five_upgrade(fixture: &Fixture, admin: &PgPool) {
     async fn snapshot(pool: &PgPool) -> Value {
         query_scalar(
             "SELECT jsonb_build_object(
-              'session',(SELECT to_jsonb(s) FROM zuno_enterprise_preview.session s WHERE id='legacy-session'),
+              'session',(SELECT to_jsonb(s)-'delegation_depth_limit' FROM zuno_enterprise_preview.session s WHERE id='legacy-session'),
               'message',(SELECT to_jsonb(m) FROM zuno_enterprise_preview.message m WHERE id='legacy-assistant'),
               'part',(SELECT to_jsonb(p) FROM zuno_enterprise_preview.part p WHERE id='legacy-tool'),
               'wait',(SELECT to_jsonb(w) FROM zuno_enterprise_preview.runtime_wait w WHERE id='legacy-wait'),

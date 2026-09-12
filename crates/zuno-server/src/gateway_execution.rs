@@ -86,12 +86,44 @@ impl GatewayExecutionService {
             return Err(ApplicationError::Forbidden);
         }
         let reply = match request.command {
-            GatewayCommand::Acquire => GatewayReply::Environment(
+            GatewayCommand::Acquire => GatewayReply::Environment(if context.existing_workspace {
+                self.environment(&context).await?
+            } else {
                 self.gateway
                     .acquire(&context.lease.owner, context.assignment.environment)
-                    .await?,
-            ),
+                    .await?
+            }),
             GatewayCommand::Get => GatewayReply::Environment(self.environment(&context).await?),
+            GatewayCommand::PrepareChildWorkspace { child_job_id } => {
+                let assignment = context
+                    .child_workspace
+                    .as_ref()
+                    .ok_or(ApplicationError::Forbidden)?;
+                if assignment.child_job_id != child_job_id
+                    || assignment.gateway_id != self.id
+                    || assignment.parent != context.assignment.environment
+                {
+                    return Err(ApplicationError::Forbidden);
+                }
+                let receipt = if let Some(receipt) = context.prepared_workspace {
+                    receipt
+                } else {
+                    self.gateway
+                        .prepare_child_workspace(
+                            &context.lease.owner,
+                            assignment,
+                            context.existing_workspace,
+                        )
+                        .await?
+                };
+                self.state
+                    .child_workspace_completed(&zuno_application::child::ChildWorkspaceCompletion {
+                        lease: context.lease,
+                        receipt: receipt.clone(),
+                    })
+                    .await?;
+                GatewayReply::ChildWorkspace(receipt)
+            }
             GatewayCommand::PrepareCommand { operation } => {
                 let environment = self.environment(&context).await?;
                 GatewayReply::Approval(Box::new(

@@ -1,3 +1,5 @@
+mod workspace;
+
 use crate::docker::Docker;
 use crate::ledger::{Ledger, Operation};
 use async_trait::async_trait;
@@ -210,7 +212,7 @@ impl DockerGateway {
         readonly: bool,
     ) -> Result<(), ApplicationError> {
         let config = json!({
-            "Image":environment.spec.image,"Cmd":["true"],"Labels":Self::environment_labels(&environment.owner,&environment.spec),
+            "Image":environment.spec.image,"Cmd":["true"],"Labels":self.storage_labels(&environment.owner,&environment.spec)?,
             "HostConfig":{"ReadonlyRootfs":true,"NetworkMode":"none","CapDrop":["ALL"],"SecurityOpt":["no-new-privileges"],
                 "Memory":environment.spec.memory_bytes,"PidsLimit":environment.spec.pids_limit,
                 "Mounts":[{"Type":"volume","Source":Self::volume(&environment.owner,&environment.spec.id),"Target":"/workspace","ReadOnly":readonly}]}
@@ -230,11 +232,7 @@ impl DockerGateway {
             .docker
             .json(Method::GET, &format!("/volumes/{volume}"), None)
             .await?;
-        if info.get("Labels")
-            != Some(&Self::environment_labels(
-                &environment.owner,
-                &environment.spec,
-            ))
+        if info.get("Labels") != Some(&self.storage_labels(&environment.owner, &environment.spec)?)
         {
             return Err(ApplicationError::Conflict);
         }
@@ -388,6 +386,8 @@ impl EnvironmentProvider for DockerGateway {
         if self.ledger.contains_environment(owner, &spec.id)? {
             return Err(ApplicationError::Conflict);
         }
+        self.ledger
+            .require_unreserved_environment(owner, &spec.id)?;
         let volume = Self::volume(owner, &spec.id);
         let body = json!({"Name":volume,"Labels":Self::environment_labels(owner,&spec)});
         self.docker
@@ -417,60 +417,11 @@ impl EnvironmentProvider for DockerGateway {
         id: &EnvironmentId,
         expected_revision: u64,
     ) -> Result<EnvironmentSnapshot, ApplicationError> {
-        let control = self.control(owner, id)?;
-        let _guard = control.lock().await;
-        let environment = self.ledger.require_idle(owner, id, expected_revision)?;
-        self.volume_exists(&environment).await?;
         let snapshot_id =
             EnvironmentSnapshotId::new(format!("snapshot-{}", uuid::Uuid::now_v7().simple()))
                 .map_err(crate::storage)?;
-        let name = format!(
-            "zuno-snapshot-{}",
-            zuno_orchestration::sha256_json(&json!([owner, snapshot_id]))
-        );
-        self.snapshot_container(&environment, &name, true).await?;
-        let path = self.snapshot_path(owner, &snapshot_id);
-        let temporary = path.with_extension("pending");
-        let result = self
-            .docker
-            .download_archive(
-                &format!("/containers/{name}/archive?path=/workspace"),
-                &temporary,
-                512 * 1024 * 1024,
-            )
-            .await;
-        let cleanup = self
-            .docker
-            .json(Method::DELETE, &format!("/containers/{name}"), None)
-            .await;
-        let (sha256, bytes) = match result {
-            Ok(value) => value,
-            Err(error) => {
-                let _ = tokio::fs::remove_file(&temporary).await;
-                return Err(error);
-            }
-        };
-        cleanup?;
-        let check_path = temporary.clone();
-        let check_sha = sha256.clone();
-        tokio::task::spawn_blocking(move || crate::archive::verify(&check_path, &check_sha, bytes))
+        self.snapshot_named(owner, id, expected_revision, &snapshot_id)
             .await
-            .map_err(crate::storage)??;
-        tokio::fs::rename(&temporary, &path)
-            .await
-            .map_err(crate::storage)?;
-        std::fs::File::open(&self.snapshots)
-            .and_then(|directory| directory.sync_all())
-            .map_err(crate::storage)?;
-        let snapshot = EnvironmentSnapshot {
-            id: snapshot_id,
-            environment_id: id.clone(),
-            revision: expected_revision,
-            sha256,
-            bytes,
-        };
-        self.ledger.put_snapshot(owner, &snapshot)?;
-        Ok(snapshot)
     }
 
     async fn fork(
@@ -479,60 +430,7 @@ impl EnvironmentProvider for DockerGateway {
         snapshot: &EnvironmentSnapshot,
         spec: EnvironmentSpec,
     ) -> Result<Environment, ApplicationError> {
-        spec.validate()?;
-        if self.ledger.snapshot(owner, &snapshot.id)? != *snapshot {
-            return Err(ApplicationError::Conflict);
-        }
-        let control = self.control(owner, &spec.id)?;
-        let _guard = control.lock().await;
-        if self.ledger.contains_environment(owner, &spec.id)? {
-            return Err(ApplicationError::Conflict);
-        }
-        let path = self.snapshot_path(owner, &snapshot.id);
-        let check_path = path.clone();
-        let check = snapshot.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::archive::verify(&check_path, &check.sha256, check.bytes)
-        })
-        .await
-        .map_err(crate::storage)??;
-        let environment = Environment {
-            owner: owner.clone(),
-            spec: spec.clone(),
-            revision: 1,
-        };
-        self.docker.json(Method::POST,"/volumes/create",Some(&json!({
-            "Name":Self::volume(owner,&spec.id),"Labels":Self::environment_labels(owner,&spec)
-        }))).await?;
-        self.volume_exists(&environment).await?;
-        let name = format!(
-            "zuno-fork-{}",
-            zuno_orchestration::sha256_json(&json!([owner, spec.id]))
-        );
-        self.snapshot_container(&environment, &name, false).await?;
-        let restored = path.with_extension(format!("restore-{}", uuid::Uuid::new_v4().simple()));
-        let source = path.clone();
-        let destination = restored.clone();
-        let size =
-            tokio::task::spawn_blocking(move || crate::archive::for_restore(&source, &destination))
-                .await
-                .map_err(crate::storage)??;
-        let result = self
-            .docker
-            .upload_archive(
-                &format!("/containers/{name}/archive?path=/workspace"),
-                &restored,
-                size,
-            )
-            .await;
-        let _ = tokio::fs::remove_file(&restored).await;
-        let cleanup = self
-            .docker
-            .json(Method::DELETE, &format!("/containers/{name}"), None)
-            .await;
-        result?;
-        cleanup?;
-        self.ledger.create_environment(owner, &spec)
+        self.fork_snapshot(owner, snapshot, spec).await
     }
 
     async fn release(

@@ -155,6 +155,82 @@ async fn rootless_gateway_reopens_receipts_without_replaying_the_command() {
     let revision = gateway.get(&owner, &spec.id).await.unwrap().revision;
     assert_eq!(revision, 2);
     let snapshot = gateway.snapshot(&owner, &spec.id, revision).await.unwrap();
+    let mut interrupted_target = spec.clone();
+    interrupted_target.id =
+        EnvironmentId::new(format!("interrupted-{}", std::process::id())).unwrap();
+    let injection = rusqlite::Connection::open(&ledger).unwrap();
+    injection
+        .execute_batch(&format!(
+            "CREATE TRIGGER refuse_fork_publication BEFORE INSERT ON environment WHEN NEW.id='{}'
+         BEGIN SELECT RAISE(ABORT,'injected fork publication failure'); END;",
+            interrupted_target.id.as_str(),
+        ))
+        .unwrap();
+    assert!(
+        gateway
+            .fork(&owner, &snapshot, interrupted_target.clone())
+            .await
+            .is_err()
+    );
+    assert!(
+        gateway.get(&owner, &interrupted_target.id).await.is_err(),
+        "an incomplete fork is not an executable environment"
+    );
+    assert!(
+        gateway
+            .acquire(&owner, interrupted_target.clone())
+            .await
+            .is_err(),
+        "acquire cannot publish an incomplete copied volume"
+    );
+    injection
+        .execute_batch("DROP TRIGGER refuse_fork_publication")
+        .unwrap();
+    drop(injection);
+    drop(gateway);
+    let gateway = DockerGateway::connect(std::path::Path::new(&socket), &ledger, authority.clone())
+        .await
+        .unwrap();
+    let recovered = gateway
+        .fork(&owner, &snapshot, interrupted_target.clone())
+        .await
+        .unwrap();
+    assert_eq!(recovered.revision, 1);
+    gateway
+        .release(&owner, &interrupted_target.id, 1)
+        .await
+        .unwrap();
+
+    let other_ledger = directory.path().join("other-owner-ledger.sqlite");
+    let other = DockerGateway::connect(
+        std::path::Path::new(&socket),
+        &other_ledger,
+        authority.clone(),
+    )
+    .await
+    .unwrap();
+    let mut reserved_target = spec.clone();
+    reserved_target.id =
+        EnvironmentId::new(format!("other-ledger-{}", std::process::id())).unwrap();
+    let preserved = other
+        .acquire(&owner, reserved_target.clone())
+        .await
+        .unwrap();
+    assert!(
+        gateway
+            .fork(&owner, &snapshot, reserved_target.clone())
+            .await
+            .is_err(),
+        "another ledger's volume cannot be adopted for destructive fork recovery"
+    );
+    assert_eq!(
+        other.get(&owner, &reserved_target.id).await.unwrap(),
+        preserved
+    );
+    other
+        .release(&owner, &reserved_target.id, preserved.revision)
+        .await
+        .unwrap();
     let mut branch = spec.clone();
     branch.id = EnvironmentId::new(format!("branch-{}", std::process::id())).unwrap();
     let forked = gateway
@@ -182,6 +258,22 @@ async fn rootless_gateway_reopens_receipts_without_replaying_the_command() {
             .await
             .exit_code,
         Some(0)
+    );
+    let branch_before = gateway.snapshot(&owner, &branch.id, 2).await.unwrap();
+    drop(gateway);
+    let gateway = DockerGateway::connect(std::path::Path::new(&socket), &ledger, authority.clone())
+        .await
+        .unwrap();
+    let replay = gateway.fork(&owner, &snapshot, branch.clone()).await;
+    assert!(
+        replay.is_ok(),
+        "reopening the same fork after a lost response must return its existing branch: {replay:?}"
+    );
+    assert_eq!(replay.unwrap().revision, 2);
+    let branch_after = gateway.snapshot(&owner, &branch.id, 2).await.unwrap();
+    assert_eq!(
+        branch_before.sha256, branch_after.sha256,
+        "fork retry must not overwrite subsequent child work"
     );
     let unchanged = gateway.snapshot(&owner, &spec.id, revision).await.unwrap();
     assert_eq!(unchanged.sha256, snapshot.sha256);

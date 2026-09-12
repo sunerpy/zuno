@@ -1,9 +1,10 @@
 # Rootless execution environments
 
 The preview `zuno-environment` library implements `EnvironmentProvider` and
-`OperationGateway`. It is not yet registered as an Agent tool or enterprise launch
-command. Durable approval waits, the authenticated gateway service and Worker
-profile assembly must be connected before that registration.
+`OperationGateway`. The enterprise executable assembles authenticated gateway
+services, current human approval and Worker tools. Child workspace preparation
+uses a server-resolved staged Job; arbitrary lifecycle operations are not Worker
+capabilities. See [deployment](DEPLOYMENT.md) and [workspace forks](WORKSPACES.md).
 
 ## Isolation and ownership
 

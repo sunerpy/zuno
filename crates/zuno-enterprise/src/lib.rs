@@ -1,6 +1,7 @@
 //! Enterprise composition roots. Runtime business state machines remain in the
 //! shared kernel and backend components.
 
+mod children;
 pub mod config;
 mod http;
 mod identity;

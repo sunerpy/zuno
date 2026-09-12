@@ -33,6 +33,13 @@ model, budget and environment. Changing a definition requires a new version.
 Physical credential files are separate from that digest. A restarted Worker may
 read rotated model credentials without resetting a Job's stored budget.
 
+Optional `delegation` lists exact child `{id,version,sha256}` references with
+`maximumDepth` and `maximumChildren`. Compute each reference with
+`zuno-enterprise --definition-ref /absolute/child.json`, install both definitions
+on the control plane and Workers, and increment parent versions when references
+change. Valid target catalogs mount native `task`; child workspaces are prepared
+before execution. See [workspace preparation](WORKSPACES.md).
+
 The Worker mounts a `HarnessProfile` containing the shared `AgentDriver`, resolves
 native provider factories, and calls bounded advances. Models have an explicit
 context limit and output cap. Token/time/tool allowances use resumed counters;
@@ -111,7 +118,7 @@ SIGTERM stops admission and drains bounded work. TLS connections and receipt
 delivery have bounded shutdown. Gateway shutdown does not declare its external
 commands complete; their ledger and containers remain independently recoverable.
 
-Worker protocol 6 carries checkpoint schema 4. The driver reads schema 3 only
+Worker protocol 7 carries checkpoint schema 4. The driver reads schema 3 only
 where it proves an unsubmitted wait; it never reinterprets an old record as
 submitted execution. Drain incompatible Workers before changing the control
 protocol and retain their definitions and durable data. Full rolling-upgrade and
@@ -121,8 +128,9 @@ backup/restore acceptance remain P6 work.
 plane, a gateway and two independent Worker processes. A real TLS RSA issuer,
 native compatible model transport, PostgreSQL and rootless Docker verify two
 users, private Memory reads and updates, fresh prompts after changes, Memory-use
-revocation during approval waits, two approvals, both Workers participating, one
-operation per command and SIGTERM cleanup. This is fixture provider evidence,
+revocation during approval waits, parent/child workspace forks, fourteen model
+requests, four command approvals, both Workers participating, one operation per
+command and SIGTERM cleanup. This is fixture provider evidence,
 not a live Entra tenant.
 
 Remaining work includes richer workspace provisioning, background/shared Memory,

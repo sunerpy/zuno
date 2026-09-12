@@ -111,6 +111,7 @@ pub struct ConfiguredWorkerFactory {
     state: WorkerClient,
     gateway: Arc<GatewayClient>,
     driver: Arc<dyn AgentDriver>,
+    children: crate::children::ConfiguredChildren,
 }
 impl ConfiguredWorkerFactory {
     pub async fn new(
@@ -120,6 +121,7 @@ impl ConfiguredWorkerFactory {
         gateway: Arc<GatewayClient>,
         driver: Arc<dyn AgentDriver>,
     ) -> Result<Self, Error> {
+        let children = crate::children::ConfiguredChildren::new(&definitions)?;
         let mut installed = Vec::new();
         for definition in definitions {
             definition.validate()?;
@@ -161,6 +163,7 @@ impl ConfiguredWorkerFactory {
             state,
             gateway,
             driver,
+            children,
         })
     }
 }
@@ -188,15 +191,30 @@ impl WorkerServiceFactory for ConfiguredWorkerFactory {
             return Err(WorkerError::Configuration);
         }
         let memory = Arc::new(self.state.memory(execution));
-        let dispatcher = Arc::new(MemoryToolDispatcher::new(
-            Arc::new(GatewayToolDispatcher::new(
-                self.state.clone(),
+        let mut dispatcher: Arc<dyn zuno_engine::r#loop::ToolDispatcher> =
+            Arc::new(MemoryToolDispatcher::new(
+                Arc::new(GatewayToolDispatcher::new(
+                    self.state.clone(),
+                    execution.clone(),
+                    self.gateway.clone(),
+                )),
+                memory.clone(),
                 execution.clone(),
-                self.gateway.clone(),
-            )),
-            memory.clone(),
-            execution.clone(),
-        ));
+            ));
+        if let Some((maximum_depth, targets)) = self.children.targets(&entry.definition.reference())
+        {
+            dispatcher = Arc::new(
+                zuno_worker::child::ChildToolDispatcher::new(
+                    dispatcher,
+                    self.state.clone(),
+                    execution.clone(),
+                    targets,
+                    maximum_depth,
+                )
+                .map_err(|_| WorkerError::Configuration)?
+                .with_workspace_gateway(self.gateway.clone()),
+            );
+        }
         Ok(WorkerTurnServices {
             configuration: entry.definition.reference(),
             providers: entry.providers.clone(),

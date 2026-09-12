@@ -2,11 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use zuno_application::{
-    ApplicationError,
-    environment::EnvironmentSpec,
-    runtime::{ConfigurationRef, RuntimeJob},
-};
+use zuno_application::{ApplicationError, environment::EnvironmentSpec, runtime::ConfigurationRef};
 use zuno_types::identity::{EnvironmentId, GatewayId, SessionId, TenantId};
 
 pub use zuno_application::environment::wire::GatewayAssignment;
@@ -25,7 +21,12 @@ pub struct GatewayDeployment {
 }
 
 pub trait GatewayConfigurationResolver: Send + Sync {
-    fn resolve(&self, job: &RuntimeJob) -> Result<GatewayAssignment, ApplicationError>;
+    fn resolve(
+        &self,
+        tenant: &TenantId,
+        configuration: &ConfigurationRef,
+        session: &SessionId,
+    ) -> Result<GatewayAssignment, ApplicationError>;
 }
 
 pub struct ConfiguredGateways {
@@ -90,16 +91,16 @@ impl GatewayDeployment {
 }
 
 impl GatewayConfigurationResolver for ConfiguredGateways {
-    fn resolve(&self, job: &RuntimeJob) -> Result<GatewayAssignment, ApplicationError> {
+    fn resolve(
+        &self,
+        tenant: &TenantId,
+        configuration: &ConfigurationRef,
+        session: &SessionId,
+    ) -> Result<GatewayAssignment, ApplicationError> {
         let deployment = self
             .deployments
             .iter()
-            .find(|entry| {
-                entry.tenant == *job.principal.tenant_id()
-                    && entry.configuration.id == job.configuration.id
-                    && entry.configuration.version == job.configuration.version
-                    && entry.configuration.sha256 == job.configuration.sha256
-            })
+            .find(|entry| entry.tenant == *tenant && entry.configuration == *configuration)
             .ok_or_else(|| {
                 ApplicationError::Invalid(
                     "the Job's gateway configuration is not installed".to_owned(),
@@ -108,7 +109,7 @@ impl GatewayConfigurationResolver for ConfiguredGateways {
         Ok(GatewayAssignment {
             gateway_id: deployment.gateway_id.clone(),
             endpoint: deployment.endpoint.to_string(),
-            environment: deployment.environment(&job.session_id)?,
+            environment: deployment.environment(session)?,
         })
     }
 }

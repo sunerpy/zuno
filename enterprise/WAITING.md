@@ -113,7 +113,7 @@ Completion payload schema 2 stores the tagged outcome. Earlier preview result
 facts remain readable and deduplicate against the same logical completion without
 rewriting the stored event. An old fact that confused approval with a tool result
 is refused. Driver checkpoint schema 4 reads safe schema-3 boundaries without
-resetting budget or replaying tools. Worker protocol 6 carries the submitted-wait
+resetting budget or replaying tools. Worker protocol 7 carries the submitted-wait
 state; completion publication remains a separate state-owner port.
 
 ## Storage and verification
@@ -131,7 +131,7 @@ budget refusal before remaining tools. The real PostgreSQL contract covers
 competing claims, independent sessions, early completion, timers, paused parents,
 cross-owner denial, failed consumption followed by checkpoint takeover, and
 failed/successful migration. The authenticated HTTPS contract carries the same
-wait and consumption through the separately versioned Worker protocol (version 6).
+wait and consumption through the separately versioned Worker protocol (version 7).
 
 These tests do not certify independently launched Workers, gateway-to-tool
 assembly, distributed child/Council orchestration or a complete enterprise UI.
