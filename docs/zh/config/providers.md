@@ -233,6 +233,11 @@ Provider 重试恢复与 transport 超时分别配置：
 3 次尝试、180 秒恢复窗口、2 秒初始延迟、30 秒最大延迟和 20% 抖动。该设置按
 provider 隔离，随会话模型解析结果冻结，且不会进入 SDK options 或请求 JSON。
 
+主会话、委派子会话、恢复会话和内部请求均保留完整模型解析结果中的同一策略，不能出现
+内部请求使用配置的 660 秒而主会话静默落回默认 180 秒。修改配置后重启相关 Zuno/ACP
+进程。重试耗尽时保留已捕获并脱敏的 HTTP 状态、provider code、请求 ID 与原因；
+这些只用于诊断，不授权副作用重放或切换账户。
+
 `responsesTextBlocks: "single"` 是一项兼容性声明，不是从 provider id 推断出的模型能力。它让 Zuno 的持久提示词 part 保持类型化，但会在构建 compatible Responses 请求之前，用一个空行把它们的文本投影连接起来。内联图像仍然是独立的内容块。只有当目标端点拒绝一条消息中出现多个 `input_text` 块时才使用它；符合标准的端点应当保持默认的 `multiple` 行为。不要把它用于 2026-08-28 的 `kiro-provider` 构建：那个 provider 现在会把连续的全文本块逐字节拼接、不加分隔符，而这个选项会有意插入一个空行。
 
 ## Amazon Bedrock Responses 与 Converse

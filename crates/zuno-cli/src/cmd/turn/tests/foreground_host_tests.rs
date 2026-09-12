@@ -77,9 +77,12 @@ fn plan_for(
             max_steps: None,
             requested_provider: "provider".to_owned(),
             requested_model: "model".to_owned(),
-            wire_model: "model".to_owned(),
-            spec: Spec::new(COMPATIBLE_PROVIDER).with_surface(ApiSurface::Chat),
-            reasoning_options: Map::new(),
+            model: EngineModel::new(
+                Spec::new(COMPATIBLE_PROVIDER).with_surface(ApiSurface::Chat),
+                "model",
+                ApiSurface::Chat,
+            )
+            .with_catalog_identity("provider", "model"),
             orchestration_seed: None,
         },
         catalog_models: Vec::new(),
@@ -268,7 +271,7 @@ async fn foreground_host_with_requests(
         profile,
         config,
     );
-    plan.resolver.spec = Spec::new(COMPATIBLE_PROVIDER)
+    plan.resolver.model.provider = Spec::new(COMPATIBLE_PROVIDER)
         .with_surface(ApiSurface::Chat)
         .with_base_url("http://127.0.0.1:9/v1");
     plan.credential = Some(Credential::Api {

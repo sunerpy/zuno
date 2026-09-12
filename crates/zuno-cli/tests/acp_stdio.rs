@@ -6422,7 +6422,17 @@ fn acp_load_replays_durable_content_tools_plan_and_usage() {
         .find(|update| update["sessionUpdate"] == "tool_call_update")
         .expect("completed tool replay");
     let content = completed["content"].as_array().expect("tool content");
-    assert_eq!(completed["title"], "Editing files");
+    assert_eq!(completed["title"], "Editing lib.rs");
+    assert!(
+        completed["locations"].as_array().is_some_and(|locations| {
+            locations.iter().any(|location| {
+                location["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("/src/lib.rs"))
+            })
+        }),
+        "Zed receives the filename and its standard location: {completed}"
+    );
     assert_eq!(completed["kind"], "edit");
     assert!(
         content.iter().all(|item| {

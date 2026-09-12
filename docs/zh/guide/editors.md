@@ -223,7 +223,11 @@ Zed 呈现权限与征询请求，但策略拥有者仍然是 Zuno：
 - 可复用的 ACP 询问提供 `Allow once`、`Allow for session` 和 `Reject`；会话级授予对权限与资源模式是确切匹配的，能在 Agent/模型/推理重挂载后存活，并由 `session/close` 清除；
 - strict 或 Shell 风险类的仅人工询问只提供 `Allow once` 与 `Reject`；生效的 `allow_all`，包括 `danger-full-access`，完全不会发出权限请求；
 - Zuno 的 Shell 沙箱控制文件系统与网络权限；
-- 原生文件工具为 Zed 发出类型化的创建与编辑 diff；
+- 原生文件工具为 Zed 发出类型化的创建与编辑 diff，并在标准 `title` 中展示
+  `Editing <filename>`，在 `locations` 中提供绝对路径；完整参数到达前仍显示
+  `Editing files`。多文件标题最多三个文件名、160 个 Unicode 字符，其余用
+  `(+N more)` 表示。相对 patch 路径先显示名称，不借用进程 cwd 猜测位置；
+  完成时优先使用实际修改路径，权限请求及历史回放同样保留文件名；
 - 当所选 Agent profile 允许时，Zuno 配置的 MCP server 仍然可用；
 - ACP 客户端提供的 stdio 与 Streamable HTTP MCP server 以 session 为作用域，只有完整集合全部连接并发现成功后才发布工具；
 - 取消、会话加载、恢复、关闭、plan 状态、用量和工具历史使用与 TUI 相同的持久运行时。
@@ -476,7 +480,8 @@ dev: open acp logs
 9. 发送一个只读的仓库问题，确认已提交的推理、答案和待处理工具行各出现一次；注入一次可重试的流失败，确认失败的部分尝试不存在；
 10. 委派一个前台子级，并根据客户端能力确认得到的是协商后的子会话流，或者完整的稳定 task 卡片；
 11. 委派一个后台子级，关闭根线程，确认该 job 被取消且没有前台原生子级流；
-12. 在 ask 策略下请求一次文件编辑，确认 Zed 同时显示权限请求和类型化 diff；
+12. 在 ask 策略下请求一次文件编辑，确认 Zed 在权限请求、执行中和完成后均显示文件名，
+    位置由标准 `locations` 提供，并保留类型化 diff；
 13. 取消一个正在运行的提示词，确认会话回到空闲；
 14. 关闭并重新加载该会话，确认内容、question/task 卡片、子级历史、工具、plan 和用量都被重放且仅一次；
 15. 再次加载同一个已打开的会话，确认对话记录没有被重复。

@@ -108,7 +108,13 @@ fn every_terminal_turn_error_has_an_explicit_goal_recovery_decision() {
                 attempt: 3,
                 recovery_elapsed: Duration::from_secs(180),
                 total_elapsed: Duration::from_secs(181),
-                last_provider_error_code: Some("upstream_stream_error"),
+                last_failure: Box::new(
+                    ProviderError::Stream {
+                        code: ProviderStreamFailure::UpstreamStreamError,
+                        source: None,
+                    }
+                    .diagnostic_snapshot(),
+                ),
             },
             TurnRecovery::Retry {
                 reason: TurnRetryReason::ProviderRetryDeadline,
@@ -250,9 +256,10 @@ async fn recovery_deadline_interrupts_an_active_replay() {
             attempt: 2,
             recovery_elapsed,
             total_elapsed,
-            last_provider_error_code: None,
+            ref last_failure,
         }) if recovery_elapsed == Duration::from_secs(180)
             && total_elapsed == Duration::from_secs(180)
+            && last_failure.code().is_none()
     ));
     assert_eq!(attempts.get(), 2);
     assert_eq!(started.elapsed(), Duration::from_secs(180));
@@ -287,9 +294,10 @@ async fn recovery_deadline_prevents_starting_another_replay() {
             attempt: 2,
             recovery_elapsed,
             total_elapsed,
-            last_provider_error_code: None,
+            ref last_failure,
         }) if recovery_elapsed == Duration::from_secs(180)
             && total_elapsed == Duration::from_secs(180)
+            && last_failure.code().is_none()
     ));
     assert_eq!(
         attempts.get(),
@@ -297,6 +305,84 @@ async fn recovery_deadline_prevents_starting_another_replay() {
         "the expired budget must reject attempt 3"
     );
     assert_eq!(started.elapsed(), Duration::from_secs(180));
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovery_deadline_keeps_last_http_failure_without_reflected_credentials() {
+    let result = retry_provider(
+        policy(3),
+        |attempt| async move {
+            if attempt == 1 {
+                Err(
+                    ProviderError::from_status("fixture", 503).with_http_diagnostic(
+                        503,
+                        Some("reasoning_replay_account_unavailable"),
+                        Some("request-safe"),
+                        Some("Unavailable; Authorization: Bearer secret-fixture"),
+                        &["secret-fixture"],
+                    ),
+                )
+            } else {
+                std::future::pending::<Result<(), ProviderError>>().await
+            }
+        },
+        |_| ready(Ok::<(), std::io::Error>(())),
+    )
+    .await
+    .expect_err("replacement is cut off");
+    let display = result.to_string();
+    assert!(display.contains("503"), "{display}");
+    assert!(
+        display.contains("reasoning_replay_account_unavailable"),
+        "{display}"
+    );
+    assert!(display.contains("request-safe"), "{display}");
+    assert!(!display.contains("secret-fixture"), "{display}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovery_deadline_retains_the_latest_failure_not_stale_http_metadata() {
+    let result = retry_provider(
+        policy(3),
+        |attempt| async move {
+            match attempt {
+                1 => Err(
+                    ProviderError::from_status("fixture", 503).with_http_diagnostic(
+                        503,
+                        Some("old-code"),
+                        Some("old-request"),
+                        Some("old failure"),
+                        &[],
+                    ),
+                ),
+                2 => Err(ProviderError::transient(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "connection reset during retry",
+                ))),
+                _ => std::future::pending::<Result<(), ProviderError>>().await,
+            }
+        },
+        |_| ready(Ok::<(), std::io::Error>(())),
+    )
+    .await
+    .expect_err("replacement is cut off");
+    let ProviderRetryError::DeadlineExceeded {
+        last_failure,
+        attempt,
+        ..
+    } = result
+    else {
+        panic!("expected recovery deadline")
+    };
+    assert_eq!(attempt, 3);
+    assert_eq!(last_failure.status(), None);
+    assert_eq!(last_failure.code(), None);
+    assert!(
+        last_failure
+            .to_string()
+            .contains("connection reset during retry")
+    );
+    assert!(!last_failure.to_string().contains("old-request"));
 }
 
 fn assert_budget<F>(budget: RecoveryBudget, limit: u32, mut record: F)

@@ -2,6 +2,8 @@
 
 #[path = "turn/tests/plan_execution_tests.rs"]
 mod plan_execution_tests;
+#[path = "turn/tests/provider_resolution_tests.rs"]
+mod provider_resolution_tests;
 #[path = "turn/tests/scheduling_tests.rs"]
 mod scheduling_tests;
 
@@ -213,9 +215,8 @@ fn traced_resolver(prompt: &str) -> Resolver {
         max_steps: None,
         requested_provider: "provider".to_owned(),
         requested_model: "model".to_owned(),
-        wire_model: "model".to_owned(),
-        spec: Spec::new(COMPATIBLE_PROVIDER),
-        reasoning_options: serde_json::Map::new(),
+        model: EngineModel::new(Spec::new(COMPATIBLE_PROVIDER), "model", ApiSurface::Default)
+            .with_catalog_identity("provider", "model"),
         orchestration_seed: None,
     }
 }
@@ -1985,7 +1986,7 @@ async fn scripted_reconciliation_host(
             ApiSurface::Chat,
         )
     };
-    plan.resolver.spec = model().provider;
+    plan.resolver.model.provider = model().provider;
     plan.internals.title.model = model();
     plan.internals.compaction.model = model();
     plan.internals.summary.model = model();
@@ -2751,9 +2752,12 @@ fn plan_for(
             max_steps: None,
             requested_provider: "provider".to_owned(),
             requested_model: "model".to_owned(),
-            wire_model: "model".to_owned(),
-            spec: Spec::new(COMPATIBLE_PROVIDER).with_surface(ApiSurface::Chat),
-            reasoning_options: serde_json::Map::new(),
+            model: EngineModel::new(
+                Spec::new(COMPATIBLE_PROVIDER).with_surface(ApiSurface::Chat),
+                "model",
+                ApiSurface::Chat,
+            )
+            .with_catalog_identity("provider", "model"),
             orchestration_seed: None,
         },
         catalog_models: Vec::new(),
@@ -8623,7 +8627,13 @@ fn every_turn_error() -> Vec<TurnError> {
             attempt: 2,
             recovery_elapsed: std::time::Duration::from_secs(180),
             total_elapsed: std::time::Duration::from_secs(490),
-            last_provider_error_code: Some("upstream_stream_error"),
+            last_failure: Box::new(
+                ProviderError::Stream {
+                    code: zuno_error::ProviderStreamFailure::UpstreamStreamError,
+                    source: None,
+                }
+                .diagnostic_snapshot(),
+            ),
         },
         TurnError::Cache(zuno_llm::cache::CacheViolation::StaticPrefixChanged { turn: 2 }),
         TurnError::Attachment(zuno_attachment::AttachmentError::StoreUnavailable),
@@ -8986,9 +8996,8 @@ async fn run_compatible_turn(
         max_steps: None,
         requested_provider: "provider".to_owned(),
         requested_model: "model".to_owned(),
-        wire_model: "model".to_owned(),
-        reasoning_options: serde_json::Map::new(),
-        spec,
+        model: EngineModel::new(spec, "model", ApiSurface::Chat)
+            .with_catalog_identity("provider", "model"),
         orchestration_seed: None,
     };
     let mut connection =
@@ -12353,39 +12362,37 @@ fn an_unknown_explicit_variant_is_rejected_before_the_provider_request() {
     assert!(error.contains("low"), "{error}");
 }
 
-#[test]
-fn the_generation_controls_are_wired_into_the_turns_own_resolution() {
-    let turn = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join("cmd")
-            .join("turn.rs"),
-    )
-    .expect("turn.rs is readable");
-
-    assert!(
-        turn.contains("spec: with_agent_options(")
-            && turn.contains("model_spec(&catalog, catalog_model, env)?")
-            && turn.contains("catalog_model.capabilities.temperature"),
-        "`TurnPlan::resolve` no longer overlays the agent's options onto the resolved \
-         spec under the selected model's capabilities, so `temperature`, `top_p` and \
-         `options` are parsed, listed, and dropped — the defect this pair of tests \
-         exists to catch. A behavioural test alone cannot see it, because it calls \
-         the helper the turn stopped calling."
-    );
-    assert!(
-        turn.contains("let definition = agent.definition();")
-            && turn.contains("let effort = turn_effort(")
-            && turn.contains("routed_variant,"),
-        "`TurnPlan::resolve` no longer carries the resolved profile's agent definition \
-         into `turn_effort`, so an agent configured with a `variant` can run at the \
-         provider's default"
-    );
-    assert!(
-        turn.contains("generation::MAX_TOKENS, json!(output_ceiling(model))"),
-        "`model_spec` no longer defaults the output cap from the catalog, so every \
-         request runs uncapped"
-    );
+#[tokio::test]
+async fn the_generation_controls_are_wired_into_the_turns_own_resolution() {
+    for output_override in [None, Some(4096)] {
+        let mut provider = resume_provider("zzz", true);
+        provider["models"]["zzz-model"]["temperature"] = json!(true);
+        let mut options = json!({});
+        if let Some(limit) = output_override {
+            options["maxTokens"] = json!(limit);
+        }
+        let fixture = ResumeFixture::new(resume_config(json!({
+            "default_agent": "build",
+            "model": "zzz/zzz-model",
+            "provider": {"zzz": provider},
+            "agents": {"build": {
+                "model": "zzz/zzz-model", "variant": "high",
+                "temperature": 0.42, "top_p": 0.76, "options": options
+            }}
+        })));
+        let plan = fixture.resolve(fixture.options(SessionChoice::New)).await;
+        let model = plan
+            .resolver
+            .resolve_model(&plan.provider_id, &plan.model_id)
+            .unwrap();
+        assert_eq!(model.provider.options[generation::TEMPERATURE], json!(0.42));
+        assert_eq!(model.provider.options[generation::TOP_P], json!(0.76));
+        assert_eq!(
+            model.provider.options[generation::MAX_TOKENS],
+            json!(output_override.unwrap_or(10_000))
+        );
+        assert_eq!(model.reasoning_options["reasoningEffort"], "high");
+    }
 }
 
 mod learning_runtime {

@@ -31,7 +31,7 @@ use zuno_db::message::{
     TASK_REPORT_METADATA_KEY, created_after, now_millis,
 };
 use zuno_db::{Connection, open, session};
-use zuno_error::{DbError, ProviderError, UncertainCause};
+use zuno_error::{DbError, ProviderDiagnostic, ProviderError, UncertainCause};
 use zuno_llm::cache::{CacheViolation, DynamicContext, McpToolStatus, PreparedTurn, PromptCache};
 use zuno_llm::catalog::resolved::ModelCost;
 use zuno_llm::event::{
@@ -743,13 +743,13 @@ pub enum TurnError {
     PromptAssembly(#[from] PromptAssemblyError),
     #[error(
         "provider retry deadline exceeded on attempt {attempt} after {recovery_elapsed:?} \
-         recovery ({total_elapsed:?} total; last provider code {last_provider_error_code:?})"
+         recovery ({total_elapsed:?} total; last provider failure: {last_failure})"
     )]
     ProviderRetryDeadlineExceeded {
         attempt: u32,
         recovery_elapsed: Duration,
         total_elapsed: Duration,
-        last_provider_error_code: Option<&'static str>,
+        last_failure: Box<ProviderDiagnostic>,
     },
     #[error(transparent)]
     Cache(#[from] CacheViolation),
@@ -3051,7 +3051,7 @@ async fn run_turn_in_span(
                             max,
                             recovery_elapsed,
                             total_elapsed,
-                            last_provider_error_code,
+                            last_failure,
                         } => {
                             let generated_output = accumulator
                                 .lock()
@@ -3073,7 +3073,7 @@ async fn run_turn_in_span(
                                 generated_output,
                                 recovery_elapsed,
                                 total_elapsed,
-                                last_provider_error_code,
+                                last_failure,
                             )
                         }
                         ProviderAttemptObservation::BackoffScheduled {
@@ -3120,12 +3120,12 @@ async fn run_turn_in_span(
                     attempt,
                     recovery_elapsed,
                     total_elapsed,
-                    last_provider_error_code,
+                    last_failure,
                 } => Err(TurnError::ProviderRetryDeadlineExceeded {
                     attempt,
                     recovery_elapsed,
                     total_elapsed,
-                    last_provider_error_code,
+                    last_failure,
                 }),
                 // The peer named a delay the same-request deadline cannot hold. The
                 // turn ends on the peer's own typed error so the goal controller
@@ -7267,7 +7267,7 @@ fn append_provider_attempt_deadline(
     generated_output: bool,
     recovery_elapsed: Duration,
     total_elapsed: Duration,
-    last_provider_error_code: Option<&'static str>,
+    last_failure: &ProviderDiagnostic,
 ) -> Result<(), TurnError> {
     let mut properties = provider_attempt_properties(request, attempt);
     properties.insert("status".to_owned(), Value::String("failed".to_owned()));
@@ -7289,7 +7289,8 @@ fn append_provider_attempt_deadline(
         "totalElapsedMs".to_owned(),
         Value::from(u64::try_from(total_elapsed.as_millis()).unwrap_or(u64::MAX)),
     );
-    if let Some(code) = last_provider_error_code {
+    properties.insert("lastProviderFailure".to_owned(), last_failure.fields());
+    if let Some(code) = last_failure.code() {
         properties.insert(
             "lastProviderErrorCode".to_owned(),
             Value::String(code.to_owned()),
@@ -7418,16 +7419,18 @@ fn append_turn_origin_properties(properties: &mut Map<String, Value>, start: &Tu
 
 fn insert_provider_attempt_error(properties: &mut Map<String, Value>, error: &ProviderError) {
     let (kind, status) = provider_error_metadata(error);
+    let diagnostic = error.diagnostic_snapshot();
+    properties.insert("providerDiagnostic".to_owned(), diagnostic.fields());
     properties.insert("errorKind".to_owned(), Value::String(kind.to_owned()));
     properties.insert("retryable".to_owned(), Value::Bool(error.is_retryable()));
     properties.insert(
         "partialOutputRetryPermitted".to_owned(),
         Value::Bool(error.permits_partial_output_retry()),
     );
-    if let Some(status) = status {
+    if let Some(status) = diagnostic.status().or(status) {
         properties.insert("httpStatus".to_owned(), Value::from(status));
     }
-    if let Some(code) = error.structured_code() {
+    if let Some(code) = diagnostic.code() {
         properties.insert(
             "providerErrorCode".to_owned(),
             Value::String(code.to_owned()),
@@ -7629,7 +7632,7 @@ fn append_provider_request_terminal(
         if let TurnError::ProviderRetryDeadlineExceeded {
             recovery_elapsed,
             total_elapsed,
-            last_provider_error_code,
+            last_failure,
             ..
         } = error
         {
@@ -7641,12 +7644,19 @@ fn append_provider_request_terminal(
                 "totalElapsedMs".to_owned(),
                 Value::from(u64::try_from(total_elapsed.as_millis()).unwrap_or(u64::MAX)),
             );
-            if let Some(code) = last_provider_error_code {
+            properties.insert("lastProviderFailure".to_owned(), last_failure.fields());
+            if let Some(code) = last_failure.code() {
                 properties.insert(
                     "lastProviderErrorCode".to_owned(),
-                    Value::String((*code).to_owned()),
+                    Value::String(code.to_owned()),
                 );
             }
+        }
+        if let TurnError::Provider(provider) = error {
+            properties.insert(
+                "providerDiagnostic".to_owned(),
+                provider.diagnostic_fields(),
+            );
         }
     }
     append_with_connection(

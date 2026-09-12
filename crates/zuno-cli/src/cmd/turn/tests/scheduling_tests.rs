@@ -132,7 +132,7 @@ async fn mock_provider_host(
             ApiSurface::Chat,
         )
     };
-    turn_plan.resolver.spec = model().provider;
+    turn_plan.resolver.model.provider = model().provider;
     turn_plan.internals.title.model = model();
     turn_plan.internals.compaction.model = model();
     turn_plan.internals.summary.model = model();

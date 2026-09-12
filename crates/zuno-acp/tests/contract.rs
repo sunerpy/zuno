@@ -11,6 +11,9 @@ use zuno_tool::{
     ToolResultPresentation, ToolUiIntent, UncertainMutationPresentation,
 };
 
+#[path = "contract/edit_paths.rs"]
+mod edit_paths;
+
 #[test]
 fn adapter_exposes_exactly_the_stable_v1_21_agent_methods() {
     assert_eq!(
@@ -976,7 +979,7 @@ fn completed_tools_project_native_file_diffs_locations_and_json_output() {
             { "path": deleted_path },
         ])
     );
-    assert_eq!(completed["title"], "Editing files");
+    assert_eq!(completed["title"], "Editing lib.rs, new.rs, deleted.rs");
     assert_eq!(completed["kind"], "edit");
     assert_eq!(completed["content"].as_array().map(Vec::len), Some(3));
     assert_eq!(

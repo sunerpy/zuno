@@ -274,6 +274,14 @@ are three attempts, a 180-second recovery window, 2-second initial delay,
 scoped, frozen with the resolved session model, and never enter SDK options or
 request JSON.
 
+The main conversation, delegated turns, restored sessions and internal requests
+all retain this policy from the complete resolved model. It must not silently
+fall back to 180 seconds while internal requests use a configured value such as
+660 seconds. Restart the relevant Zuno/ACP process after changing configuration.
+Retry deadline errors preserve the last captured, redacted HTTP status, provider
+code, request ID and reason when available; these are diagnostics, not permission
+to replay a side effect or an instruction to change accounts.
+
 ## Amazon Bedrock Responses and Converse
 
 Zuno keeps the three AWS transports explicit:
