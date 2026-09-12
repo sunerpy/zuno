@@ -1152,6 +1152,22 @@ attempts, a 180-second window, 2-second initial delay, 30-second maximum delay,
 and 20 percent jitter. The policy is frozen with the resolved provider and is
 never sent upstream.
 
+Main, child and restored turns retain the same complete resolved model value as
+internal requests: provider retry policy, pricing, catalog/wire identity and API
+surface are not reconstructed from defaults. Agent sampling and inherited
+reasoning only replace their respective fields. Configuration changes still
+require resolving a new host/model; this is not live config mutation.
+
+Failed provider attempts persist a bounded, redacted `providerDiagnostic` with
+`status`, `code`, `requestID` and `reason`. Recovery deadlines retain an owned
+snapshot of the last **completed failure** as `lastProviderFailure`, including an
+HTTP code carried by a transient 503; cancelling the replacement attempt does not
+erase it or falsely attribute that HTTP response to the cancelled attempt.
+The same safe context appears in terminal request events and the error text of
+ACP processing receipts. Missing facts remain unknown; raw response bodies and
+credentials are not retained, and diagnostics never determine recovery policy.
+Old receipts are not retroactively reconstructed.
+
 Request/retry elapsed time is separate from the whole child task's wall clock.
 A direct `oracle` task may complete nine successful provider rounds before its
 last request and retries consume 510 seconds. That final request diagnostic
@@ -2031,7 +2047,7 @@ before the Goal is blocked; no started or provider-attempt event is fabricated.
 
 The retry row is tied to the exact `goal_id` and stores the attempt, typed reason, selected delay, schedule time, and next eligible time. Reopening the same session reconstructs the wait from SQLite. ACP load and resume first restore the durable session cold. If the root Goal is active, the stable session registry singleflights runtime activation and schedules the Goal through the detached continuation observer; otherwise no TurnHost, MCP, plugin host, or watcher starts until user-authorized work arrives. This recovery path is process-owned and uses the same per-session execution gate as a prompt, so it cannot race a second Goal turn. Queued user input has priority over an automatic turn, and long waits are split by `poll_interval_ms` so an interactive surface can notice that input promptly.
 
-Local delays use exponential backoff with symmetric jitter and never collapse to zero. A valid provider `Retry-After` value is never shortened by jitter; it is clamped to the configured ceiling rather than replaced by an earlier local delay. The same-request recovery window starts after the first retryable provider failure. When the peer's requested delay is at least as long as what remains, the provider layer neither sleeps past its window nor substitutes a shorter local delay: the turn ends with the peer's own typed error, and the goal-level retry waits the peer's value clamped to `max_delay_ms`. A local backoff that would outlive the window ends the turn as `provider_retry_deadline`, retaining the last structured provider code plus recovery and total elapsed times for durable diagnosis.
+Local delays use exponential backoff with symmetric jitter and never collapse to zero. A valid provider `Retry-After` value is never shortened by jitter; it is clamped to the configured ceiling rather than replaced by an earlier local delay. The same-request recovery window starts after the first retryable provider failure. When the peer's requested delay is at least as long as what remains, the provider layer neither sleeps past its window nor substitutes a shorter local delay: the turn ends with the peer's own typed error, and the goal-level retry waits the peer's value clamped to `max_delay_ms`. A local backoff that would outlive the window ends the turn as `provider_retry_deadline`, retaining the last safe provider diagnostic (status, code, request ID and reason) plus recovery and total elapsed times.
 
 ```json
 {
@@ -2946,7 +2962,12 @@ privately. Cursor replay closes gaps after disconnects; live delivery is only a
 wake/latency path. See [client interface architecture](design/client-interfaces.md).
 
 Native file mutations likewise have one presentation policy for live delivery
-and replay. `edit`, `write`, and `apply_patch` use an `Editing files` card.
+and replay. `edit`, `write`, and `apply_patch` use a file-aware standard `title`
+such as `Editing main.rs`, falling back to `Editing files` until complete native
+arguments identify a target. Standard `locations` contain absolute paths, never
+paths guessed from the adapter's cwd. Intended patch paths are projected by the
+native parser; completion prefers actual mutation paths. Titles cap at three
+filenames and 160 Unicode characters with a `(+N more)` suffix when needed.
 Successful calls with typed state expose only structured add/modify/delete
 diffs as visible content while retaining the original result in `rawOutput`;
 successful calls without a diff keep a short fallback. Pre-write failures show

@@ -318,6 +318,15 @@ fn permission_payload(
         },
         "options": permission_options(reusable),
     });
+    if let Some(path) = request.metadata.get("filepath").and_then(Value::as_str) {
+        // FileToolRuntime supplies the resolved file separately from permission
+        // patterns. A glob, directory grant or shell command is not a filename.
+        crate::presentation::decorate_file_tool_paths(
+            &mut payload["toolCall"],
+            tool,
+            &[path.to_owned()],
+        );
+    }
     if let Some(child_session_id) = routed.child_session_id() {
         payload["_meta"] = json!({
             "zuno": {
@@ -572,6 +581,54 @@ mod tests {
             .into_iter()
             .map(|option| option["optionId"].clone())
             .collect()
+    }
+
+    #[test]
+    fn edit_paths_permission_cards_name_the_native_authorized_file() {
+        for tool in ["write", "edit", "apply_patch"] {
+            let request = PermissionRequest {
+                id: "permission".to_owned(),
+                session_id: "session".to_owned(),
+                permission: "edit".to_owned(),
+                patterns: vec!["**/*.rs".to_owned()],
+                metadata: serde_json::from_value(json!({
+                    "filepath": "/workspace/授权 file.rs",
+                }))
+                .expect("native permission metadata"),
+                always: vec!["*".to_owned()],
+                tool: Some(zuno_permission::ToolCall {
+                    message_id: "message".to_owned(),
+                    call_id: "file-call".to_owned(),
+                }),
+            };
+            let payload = permission_payload(
+                &crate::RoutedSession::direct("session"),
+                "Permission required",
+                tool,
+                &request,
+                true,
+            );
+            let call = &payload["toolCall"];
+            assert!(
+                call["title"]
+                    .as_str()
+                    .is_some_and(|title| title.contains("授权 file.rs")),
+                "{call}"
+            );
+            assert_eq!(
+                call["locations"],
+                json!([{"path": "/workspace/授权 file.rs"}])
+            );
+            assert_eq!(call["status"], "pending");
+            assert_eq!(call["toolCallId"], "file-call");
+            assert_eq!(call["rawInput"]["patterns"], json!(["**/*.rs"]));
+            assert_eq!(payload["options"], json!(permission_options(true)));
+            #[cfg(feature = "zed-schema-contract")]
+            {
+                let _: agent_client_protocol_schema::v1::RequestPermissionRequest =
+                    serde_json::from_value(payload).expect("Zed decodes the file permission");
+            }
+        }
     }
 
     #[test]

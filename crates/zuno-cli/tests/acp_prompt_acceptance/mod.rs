@@ -2,7 +2,9 @@ use super::*;
 
 mod exact_cancellation;
 mod execution_gate;
+mod file_titles;
 mod goal_resume;
+mod provider_retry;
 mod resume_lifecycle;
 
 /// Every model response remains gated, including a request restarted by steering.

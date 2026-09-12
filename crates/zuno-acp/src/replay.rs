@@ -433,23 +433,27 @@ fn tool_updates(part: &PartRecord, policy: &ReplayPolicy) -> Vec<Value> {
         .and_then(|state| state.get("status"))
         .and_then(Value::as_str)
         .unwrap_or("pending");
-    let raw_input = state
+    let raw = state
         .and_then(|state| state.get("raw"))
-        .and_then(Value::as_str)
-        .map(json_or_string)
-        .or_else(|| state.and_then(|state| state.get("input")).cloned());
+        .and_then(Value::as_str);
+    let raw_input = raw
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .or_else(|| state.and_then(|state| state.get("input")).cloned())
+        .or_else(|| raw.map(|raw| Value::String(raw.to_owned())));
     let initial_status = if status == "running" {
         "in_progress"
     } else {
         "pending"
     };
-    let mut updates = vec![tool_call(
+    let mut initial = tool_call(
         call_id,
         display_name,
         name,
         initial_status,
         raw_input.clone(),
-    )];
+    );
+    filter_tool_paths(&mut initial, policy, None);
+    let mut updates = vec![initial];
     if !matches!(status, "completed" | "error") {
         return updates;
     }
@@ -472,12 +476,9 @@ fn tool_updates(part: &PartRecord, policy: &ReplayPolicy) -> Vec<Value> {
     let written_paths = durable_output
         .written_paths()
         .into_iter()
-        .filter(|path| policy.actionable_path(Path::new(path)))
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let diff = ToolDiff::from_output(&durable_output)
-        .as_ref()
-        .and_then(|diff| replay_diff(diff, policy));
+    let diff = ToolDiff::from_output(&durable_output);
     let completed_input = CompletedToolUpdate {
         call_id,
         display_name,
@@ -514,6 +515,7 @@ fn tool_updates(part: &PartRecord, policy: &ReplayPolicy) -> Vec<Value> {
         }
         None => completed_tool_update(completed_input),
     };
+    filter_tool_paths(&mut completed, policy, Some(output));
     if let Some(content) = completed.get_mut("content").and_then(Value::as_array_mut) {
         content.extend(
             state
@@ -539,19 +541,35 @@ fn tool_updates(part: &PartRecord, policy: &ReplayPolicy) -> Vec<Value> {
     updates
 }
 
-fn replay_diff(diff: &ToolDiff, policy: &ReplayPolicy) -> Option<ToolDiff> {
-    let files = diff
-        .files()
-        .iter()
-        .filter(|file| policy.actionable_path(Path::new(file.path())))
-        .cloned()
-        .collect::<Vec<_>>();
-    let unified = diff
-        .files()
-        .is_empty()
-        .then(|| diff.unified().map(str::to_owned))
-        .flatten();
-    ToolDiff::new(unified, files)
+fn filter_tool_paths(update: &mut Value, policy: &ReplayPolicy, output: Option<&str>) {
+    // Filenames remain useful historical text even after a deletion or move.
+    // Apply the actionable-path policy after presentation so input-derived paths
+    // cannot bypass it, and filtering old diffs cannot erase the card's identity.
+    if let Some(locations) = update.get_mut("locations").and_then(Value::as_array_mut) {
+        locations.retain(|location| {
+            location
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| policy.actionable_path(Path::new(path)))
+        });
+    }
+    if let Some(content) = update.get_mut("content").and_then(Value::as_array_mut) {
+        content.retain(|item| {
+            item["type"] != "diff"
+                || item
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| policy.actionable_path(Path::new(path)))
+        });
+        if content.is_empty()
+            && let Some(output) = output
+        {
+            content.push(json!({
+                "type": "content",
+                "content": { "type": "text", "text": output },
+            }));
+        }
+    }
 }
 
 fn stored_file_content(data: &Map<String, Value>, policy: &ReplayPolicy) -> Option<Value> {
@@ -635,10 +653,6 @@ fn non_empty_string<'a>(data: &'a Map<String, Value>, key: &str) -> Option<&'a s
 fn data_url_payload<'a>(url: &'a str, mime: &str) -> Option<&'a str> {
     let (header, payload) = url.split_once(',')?;
     (header == format!("data:{mime};base64") && !payload.is_empty()).then_some(payload)
-}
-
-fn json_or_string(value: &str) -> Value {
-    serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_owned()))
 }
 
 #[cfg(test)]
@@ -766,7 +780,7 @@ mod tests {
         assert_eq!(updates[3]["rawInput"]["filePath"], edited);
         assert_eq!(updates[4]["sessionUpdate"], "tool_call_update");
         assert_eq!(updates[4]["status"], "completed");
-        assert_eq!(updates[4]["title"], "Editing files");
+        assert_eq!(updates[4]["title"], "Editing demo.rs");
         assert_eq!(updates[4]["content"][0]["type"], "diff");
         assert_eq!(updates[4]["content"][0]["path"], edited_wire);
         assert_eq!(updates[4]["content"][1]["content"]["type"], "image");

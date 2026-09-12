@@ -79,11 +79,24 @@ entries 清除 Zed 旧面板。load、resume、detached Goal continuation 与 ho
 `parentPlanId`，客户端无需比对 entries 就能区分推入的子 Plan 与被替换的根 Plan；每个 entry 带
 `_meta.zuno.stepId`，清空更新只携带 `_meta.zuno.cleared: true`。
 
-`edit`、`write` 与 `apply_patch` 统一投影为 `Editing files` 卡片。成功且存在结构化
+`edit`、`write` 与 `apply_patch` 的标准 `title` 显示文件名，例如
+`Editing main.rs, lib.rs`。完整原生参数到达后、执行前即更新标题；JSON 尚不完整时
+保留 `Editing files`。标题最多展示三个文件名、160 个 Unicode 字符，其余数量用
+`(+N more)` 表示。标准 `locations` 保留绝对路径；相对 patch 路径可以显示名称，但不会
+借用 ACP 进程 cwd 猜测位置。目标来自原生 patch parser，不把 hunk 内容扫描为文件名。
+完成时以实际修改路径替换输入别名。权限卡片、历史 replay 同样保留文件名，历史中不可打开
+或越界的位置仍被过滤；展示这些信息不需要客户端理解 Zuno 的 `_meta`。
+
+成功且存在结构化
 diff 时，可见内容只保留 `A/M/D <path>`，不再重复显示成功文案；完整原始输出仍在
 `rawOutput`。写入前失败展示可操作错误而不伪造 diff；部分写入或其他不确定结果使用
 failed 状态，保留已观察到的路径/diff，并设置 `_meta.zuno.outcome: "uncertain"`。
 实时更新与历史 replay 使用同一策略。
+
+输入获准后发生 provider 重试失败时，处理回执的错误文字保留最后已捕获的 HTTP 状态、
+provider code、请求 ID 与脱敏原因。`admission: accepted` 仍只说明输入已保存，不代表
+模型成功完成。ACP 主会话与内部请求均从完整模型解析结果读取 provider 重试配置。
+上游缺失的信息保持未知，不回填旧回执。
 
 运维通知——无法抓取的远程规则文件，或因装不进 prompt 预算而整份跳过的完整本地规则文件
 （其规则本轮不生效，回合继续）、被 token、工具调用次数或墙上时间额度停下的回合，以及

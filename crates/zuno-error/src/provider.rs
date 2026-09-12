@@ -102,6 +102,59 @@ impl fmt::Display for ProviderProtocolFailure {
     }
 }
 
+/// Owned, bounded and redacted provider facts. This is diagnostic data, never a
+/// retry classification. It survives cancellation of a replacement request after
+/// the original ProviderError (and its transport source) has been dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderDiagnostic {
+    status: Option<u16>,
+    code: Option<String>,
+    request_id: Option<String>,
+    reason: Option<String>,
+}
+
+impl ProviderDiagnostic {
+    #[must_use]
+    pub const fn status(&self) -> Option<u16> {
+        self.status
+    }
+
+    #[must_use]
+    pub fn code(&self) -> Option<&str> {
+        self.code.as_deref()
+    }
+
+    #[must_use]
+    pub fn fields(&self) -> serde_json::Value {
+        serde_json::json!({
+            "status": self.status,
+            "code": self.code,
+            "requestID": self.request_id,
+            "reason": self.reason,
+        })
+    }
+}
+
+impl fmt::Display for ProviderDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(status) = self.status {
+            write!(f, "HTTP {status}")?;
+        } else {
+            f.write_str("provider failure")?;
+        }
+        if let Some(code) = &self.code {
+            write!(f, " code={code}")?;
+        }
+        if let Some(request_id) = &self.request_id {
+            write!(f, " requestID={request_id}")?;
+        }
+        if let Some(reason) = &self.reason {
+            write!(f, ": {reason}")?;
+        }
+        Ok(())
+    }
+}
+
 /// A failure from a model provider, classified by what recovery it permits.
 ///
 /// Every variant is a recovery class, not a description. A caller decides what to
@@ -227,30 +280,43 @@ impl ProviderError {
     /// stays missing; rendered prose is never parsed to infer a code or request id.
     #[must_use]
     pub fn diagnostic_fields(&self) -> serde_json::Value {
+        self.diagnostic_snapshot().fields()
+    }
+
+    /// Copy the sanitized metadata captured at the provider boundary without
+    /// retaining the original response body or transport source object.
+    #[must_use]
+    pub fn diagnostic_snapshot(&self) -> ProviderDiagnostic {
+        if let Some(wire) = self.http_diagnostic() {
+            return ProviderDiagnostic {
+                status: Some(wire.status),
+                code: wire.code.clone(),
+                request_id: wire.request_id.clone(),
+                reason: wire.reason.clone(),
+            };
+        }
+        ProviderDiagnostic {
+            status: match self {
+                Self::Transient { status, .. } | Self::Fatal { status, .. } => *status,
+                _ => None,
+            },
+            code: self.structured_code().map(str::to_owned),
+            request_id: None,
+            reason: Some(self.diagnostic()),
+        }
+    }
+
+    fn http_diagnostic(&self) -> Option<&HttpDiagnostic> {
         use std::error::Error as _;
         let mut source = self.source();
         for _ in 0..8 {
             let Some(cause) = source else { break };
             if let Some(wire) = cause.downcast_ref::<HttpDiagnostic>() {
-                return serde_json::json!({
-                    "status":wire.status,"code":wire.code,
-                    "requestID":wire.request_id,"reason":wire.reason,
-                });
+                return Some(wire);
             }
             source = cause.source();
         }
-        let status = match self {
-            Self::Transient { status, .. } | Self::Fatal { status, .. } => *status,
-            _ => None,
-        };
-        let code = match self {
-            Self::Stream { code, .. } => Some(code.as_str()),
-            Self::Protocol { code, .. } => Some(code.as_str()),
-            _ => None,
-        };
-        serde_json::json!({
-            "status":status,"code":code,"requestID":null,"reason":self.diagnostic()
-        })
+        None
     }
 
     /// Attach facts read from a bounded HTTP response without changing recovery.
@@ -447,7 +513,10 @@ impl ProviderError {
 
     /// The exact structured provider code, when the wire contract supplied one.
     #[must_use]
-    pub const fn structured_code(&self) -> Option<&'static str> {
+    pub fn structured_code(&self) -> Option<&str> {
+        if let Some(code) = self.http_diagnostic().and_then(|wire| wire.code.as_deref()) {
+            return Some(code);
+        }
         match self {
             Self::Stream { code, .. } => Some(code.as_str()),
             Self::Protocol { code, .. } => Some(code.as_str()),
@@ -660,6 +729,46 @@ impl Recoverable for ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_http_diagnostic_retains_dynamic_metadata_and_recovery_class() {
+        let snapshot = {
+            let code = String::from("reasoning_replay_account_unavailable");
+            let error = ProviderError::from_status("test", 503).with_http_diagnostic(
+                503,
+                Some(&code),
+                Some("upstream-request-7"),
+                Some("Temporarily unavailable"),
+                &[],
+            );
+            assert!(error.is_retryable());
+            assert_eq!(error.structured_code(), Some(code.as_str()));
+            error.diagnostic_snapshot()
+        };
+        assert_eq!(snapshot.status(), Some(503));
+        assert_eq!(
+            snapshot.code(),
+            Some("reasoning_replay_account_unavailable")
+        );
+        assert_eq!(snapshot.fields()["requestID"], "upstream-request-7");
+        assert!(snapshot.to_string().contains("HTTP 503"));
+        assert!(snapshot.to_string().contains("Temporarily unavailable"));
+    }
+
+    #[test]
+    fn owned_diagnostic_stays_bounded_and_redacted_after_source_drop() {
+        let secret = "private-fixture-key";
+        let large = format!("{secret}\n\u{1b}[31m{}", "中".repeat(3000));
+        let snapshot = ProviderError::from_status("test", 503)
+            .with_http_diagnostic(503, Some(&large), Some(&large), Some(&large), &[secret])
+            .diagnostic_snapshot();
+        let fields = snapshot.fields();
+        assert!(fields["code"].as_str().unwrap().len() <= 192);
+        assert!(fields["requestID"].as_str().unwrap().len() <= 256);
+        assert!(fields["reason"].as_str().unwrap().len() <= 3072);
+        assert!(!fields.to_string().contains(secret));
+        assert!(!snapshot.to_string().chars().any(char::is_control));
+    }
 
     #[test]
     fn rate_limited_returns_the_duration_the_provider_sent() {

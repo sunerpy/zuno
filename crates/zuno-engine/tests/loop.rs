@@ -4144,9 +4144,10 @@ async fn loop_provider_retry_deadline_cancels_and_persists_an_active_replay() {
                 attempt: 2,
                 recovery_elapsed,
                 total_elapsed,
-                last_provider_error_code: Some("upstream_stream_error"),
+                ref last_failure,
             }) if recovery_elapsed == Duration::from_secs(180)
                 && total_elapsed == Duration::from_secs(180)
+                && last_failure.code() == Some("upstream_stream_error")
         ),
         "{outcome:?}"
     );
@@ -4212,6 +4213,92 @@ async fn loop_provider_retry_deadline_cancels_and_persists_an_active_replay() {
         request_failure["lastProviderErrorCode"],
         "upstream_stream_error"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn loop_retry_deadline_preserves_safe_http_diagnostics_in_durable_events() {
+    let mut connection = seeded();
+    put_user(
+        &connection,
+        "msg_http_failure",
+        10,
+        "inspect synthetic status",
+    );
+    let provider = Arc::new(FakeProvider::new(vec![
+        ScriptedResponse::failed(
+            Vec::new(),
+            ProviderError::from_status("test", 503).with_http_diagnostic(
+                503,
+                Some("upstream_account_unavailable"),
+                Some("wire-request-safe"),
+                Some("Synthetic unavailable. api_key=secret-fixture"),
+                &["secret-fixture"],
+            ),
+        ),
+        ScriptedResponse::hanging(Vec::new()),
+    ]));
+    let providers = registry(&provider);
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+    let (result, _) = tokio::join!(
+        run_turn(
+            request("turn-http-diagnostic"),
+            TurnContext::new(
+                &mut connection,
+                &providers,
+                &FakeResolver,
+                &dispatcher,
+                &interrupt
+            ),
+            sender
+        ),
+        collect_events(receiver)
+    );
+    let error = result.expect_err("recovery expires");
+    let display = error.to_string();
+    assert!(
+        display.contains("503") && display.contains("wire-request-safe"),
+        "{display}"
+    );
+    let events: Vec<Value> = connection
+        .prepare(
+            "SELECT data FROM event WHERE aggregate_id=?1 AND type IN
+         ('session.provider.attempt.1','session.provider.request.1') ORDER BY seq",
+        )
+        .unwrap()
+        .query_map([SESSION_ID], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+        .collect();
+    let failed = events
+        .iter()
+        .find(|event| event["status"] == "failed" && event["attempt"] == 1)
+        .unwrap();
+    assert_eq!(failed["providerErrorCode"], "upstream_account_unavailable");
+    assert_eq!(
+        failed["providerDiagnostic"]["requestID"],
+        "wire-request-safe"
+    );
+    let terminal = events
+        .iter()
+        .find(|event| event["errorKind"] == "provider_retry_deadline")
+        .unwrap();
+    assert_eq!(terminal["lastProviderFailure"]["status"], 503);
+    assert_eq!(
+        terminal["lastProviderFailure"]["code"],
+        "upstream_account_unavailable"
+    );
+    assert_eq!(
+        terminal["lastProviderFailure"]["requestID"],
+        "wire-request-safe"
+    );
+    assert!(
+        !serde_json::to_string(&events)
+            .unwrap()
+            .contains("secret-fixture")
+    );
+    assert!(dispatcher.calls().is_empty());
 }
 
 #[tokio::test]

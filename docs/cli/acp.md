@@ -89,13 +89,32 @@ final revision before prompt completion, and emits empty entries when the Plan
 is removed. Load, resume, detached Goal continuation, and host remount share the
 same projector.
 
-`edit`, `write`, and `apply_patch` use one `Editing files` card. A successful
+`edit`, `write`, and `apply_patch` use edit cards whose standard `title` names
+the files, for example `Editing main.rs, lib.rs`. Complete native arguments
+update the title before dispatch; partial JSON keeps the `Editing files` fallback.
+Titles show up to three filenames and 160 Unicode characters, with `(+N more)`
+for additional files. Standard `locations` retain absolute paths, while relative
+patch targets can name a card without guessing the session directory. Patch
+targets use the native parser; hunk text is never scanned as a filename.
+Resolved mutation results take precedence over requested path aliases.
+Permission cards and history replay also retain filenames; replay still filters
+unopenable/out-of-worktree paths. These fields do not require Zuno-specific `_meta`.
+
+A successful
 typed mutation shows only its structured add/modify/delete diff in visible
 content while preserving the complete original result in `rawOutput`.
 Pre-write failures show actionable text without a fabricated diff. Partial or
 otherwise uncertain mutations remain failed, preserve observed paths or diffs,
 and carry `_meta.zuno.outcome: "uncertain"`. Live delivery and replay use the
 same policy.
+
+If a provider retry fails after input admission, the failed processing receipt
+retains the last captured HTTP status, provider code, request ID and redacted
+reason in its error text. `admission: accepted` still means the input was saved;
+it does not mean the provider completed it. Retry configuration is taken from
+the selected provider's complete resolved model on the main ACP path as well as
+internal requests. Missing upstream facts remain unknown, and old receipts are
+not backfilled.
 
 Operational notices — a remote rule file that could not be fetched or an intact local
 rule file skipped because it did not fit the prompt budget (its rules are not in force

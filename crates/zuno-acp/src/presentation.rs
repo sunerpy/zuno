@@ -4,13 +4,18 @@
 //! helpers only add the human-facing card and typed Zuno metadata a client can
 //! render without reverse-engineering a tool's JSON envelope.
 
+use std::collections::HashSet;
+use std::path::Path;
+
 use serde_json::{Map, Value, json};
+use zuno_engine::r#loop::ToolDiff;
 use zuno_tool::{
     METADATA_MUTATION_CONFLICT_KEY, MutationConflictPresentation, QuestionResultPresentation,
     ToolResultPresentation,
 };
 
 pub(crate) fn decorate_tool_call(update: &mut Value, name: &str, raw_input: Option<&Value>) {
+    decorate_file_tool_call(update, name, raw_input);
     match name {
         "question" => {
             let Some(presentation) = question_presentation(raw_input, None, "pending") else {
@@ -32,6 +37,181 @@ pub(crate) fn decorate_tool_call(update: &mut Value, name: &str, raw_input: Opti
     }
 }
 
+/// Project intended targets only after the native argument envelope is complete.
+///
+/// This is presentation, not path resolution or evidence that an effect ran. In
+/// particular, a relative patch target can name a card but cannot become an ACP
+/// location by borrowing the adapter process's working directory.
+pub(crate) fn decorate_file_tool_call(update: &mut Value, name: &str, raw_input: Option<&Value>) {
+    decorate_file_tool_paths(update, name, &file_input_paths(name, raw_input));
+}
+
+pub(crate) fn decorate_file_tool_result(
+    update: &mut Value,
+    name: &str,
+    raw_input: Option<&Value>,
+    written_paths: &[String],
+    diff: Option<&ToolDiff>,
+    presentation: Option<&ToolResultPresentation>,
+    metadata: Option<&Map<String, Value>>,
+) {
+    if file_action(name).is_none() {
+        return;
+    }
+    // Resolved result paths take precedence over input aliases. Do not union
+    // unobserved requested targets into a partially applied mutation's locations.
+    let mut paths = normalized_paths(
+        written_paths.iter().map(String::as_str).chain(
+            diff.into_iter()
+                .flat_map(ToolDiff::files)
+                .map(zuno_tool::FileDiff::path),
+        ),
+    );
+    if paths.is_empty() {
+        let presented = uncertain_mutation_paths(presentation, metadata).or_else(|| {
+            mutation_conflict_presentation(presentation, metadata)
+                .map(|conflict| vec![conflict.resource().to_owned()])
+        });
+        if let Some(presented) = presented {
+            paths = normalized_paths(presented.iter().map(String::as_str));
+        }
+    }
+    if paths.is_empty() {
+        paths = file_input_paths(name, raw_input);
+    }
+    decorate_file_tool_paths(update, name, &paths);
+}
+
+/// Shared by the tool stream, durable replay and native file permission cards.
+pub(crate) fn decorate_file_tool_paths(update: &mut Value, name: &str, paths: &[String]) {
+    let Some(action) = file_action(name) else {
+        return;
+    };
+    let paths = normalized_paths(paths.iter().map(String::as_str));
+    if paths.is_empty() {
+        return;
+    }
+    update["title"] = Value::String(file_title(action, &paths));
+    update["locations"] = Value::Array(
+        paths
+            .iter()
+            .filter(|path| absolute_wire_path(path))
+            .map(|path| json!({ "path": path }))
+            .collect(),
+    );
+}
+
+fn file_action(name: &str) -> Option<&'static str> {
+    match name {
+        "write" | "edit" | "apply_patch" => Some("Editing"),
+        "move" => Some("Moving"),
+        "delete" => Some("Deleting"),
+        _ => None,
+    }
+}
+
+fn file_input_paths(name: &str, input: Option<&Value>) -> Vec<String> {
+    if !matches!(name, "write" | "edit" | "apply_patch") {
+        return Vec::new();
+    }
+    let Some(mut input) = input.filter(|input| input.is_object()).cloned() else {
+        return Vec::new();
+    };
+    zuno_tool::guard::strip_cross_cutting(&mut input);
+    let paths = match name {
+        "write" => serde_json::from_value::<zuno_tools::write::WriteParams>(input)
+            .ok()
+            .map(|params| vec![params.file_path]),
+        "edit" => serde_json::from_value::<zuno_tools::edit::EditParams>(input)
+            .ok()
+            .map(|params| vec![params.file_path]),
+        "apply_patch" => serde_json::from_value::<zuno_tools::apply_patch::ApplyPatchParams>(input)
+            .ok()
+            .and_then(|params| zuno_tools::apply_patch::intended_file_paths(&params.patch_text)),
+        _ => None,
+    };
+    paths.map_or_else(Vec::new, |paths| {
+        normalized_paths(paths.iter().map(String::as_str))
+    })
+}
+
+fn normalized_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            if path.trim().is_empty() || path.contains('\0') {
+                return None;
+            }
+            let path = zuno_paths::wire_path(Path::new(path));
+            // Durable inputs may come from a different platform. wire_path handles
+            // native Windows paths; also strip their verbatim prefix on replay on
+            // another host, before choosing a filename or an absolute location.
+            let path = if let Some(rest) = path.strip_prefix("//?/UNC/") {
+                format!("//{rest}")
+            } else {
+                path.strip_prefix("//?/").unwrap_or(&path).to_owned()
+            };
+            seen.insert(path.clone()).then_some(path)
+        })
+        .collect()
+}
+
+fn absolute_wire_path(path: &str) -> bool {
+    path.starts_with('/')
+        || matches!(
+            path.as_bytes(),
+            [drive, b':', b'/', ..] if drive.is_ascii_alphabetic()
+        )
+}
+
+fn file_title(action: &str, paths: &[String]) -> String {
+    const MAX_CHARS: usize = 160;
+    const MAX_NAMES: usize = 3;
+    let shown = paths.len().min(MAX_NAMES);
+    let suffix = if paths.len() > shown {
+        format!(" (+{} more)", paths.len() - shown)
+    } else {
+        String::new()
+    };
+    let separators = (shown - 1) * 2;
+    let name_budget =
+        (MAX_CHARS - action.chars().count() - 1 - suffix.chars().count() - separators) / shown;
+    let names = paths
+        .iter()
+        .take(shown)
+        .map(|path| {
+            let filename = path
+                .rsplit('/')
+                .find(|part| !part.is_empty())
+                .unwrap_or(path);
+            let filename = filename
+                .chars()
+                .map(|character| {
+                    if character.is_control() {
+                        ' '
+                    } else {
+                        character
+                    }
+                })
+                .collect::<String>();
+            let count = filename.chars().count();
+            if count > name_budget {
+                format!(
+                    "…{}",
+                    filename
+                        .chars()
+                        .skip(count - (name_budget - 1))
+                        .collect::<String>()
+                )
+            } else {
+                filename
+            }
+        })
+        .collect::<Vec<_>>();
+    format!("{action} {}{suffix}", names.join(", "))
+}
+
 pub(crate) fn decorate_completed_tool_update(
     update: &mut Value,
     name: &str,
@@ -41,22 +221,7 @@ pub(crate) fn decorate_completed_tool_update(
     output: &str,
     is_error: bool,
 ) {
-    let mutation_conflict = result_presentation
-        .and_then(|presentation| match presentation {
-            ToolResultPresentation::MutationConflict(conflict) => Some(conflict.clone()),
-            ToolResultPresentation::Question(_) | ToolResultPresentation::UncertainMutation(_) => {
-                None
-            }
-        })
-        .or_else(|| {
-            metadata
-                .and_then(|metadata| metadata.get(METADATA_MUTATION_CONFLICT_KEY))
-                .cloned()
-                .and_then(|value| {
-                    serde_json::from_value::<MutationConflictPresentation>(value).ok()
-                })
-        });
-    if let Some(conflict) = mutation_conflict {
+    if let Some(conflict) = mutation_conflict_presentation(result_presentation, metadata) {
         merge_zuno_metadata(
             update,
             "mutationConflict",
@@ -64,36 +229,7 @@ pub(crate) fn decorate_completed_tool_update(
                 .expect("mutation conflict presentation is JSON-serializable"),
         );
     }
-    let uncertain_paths = result_presentation
-        .and_then(|presentation| match presentation {
-            ToolResultPresentation::UncertainMutation(uncertain) => {
-                Some(uncertain.applied_paths().to_vec())
-            }
-            ToolResultPresentation::Question(_) | ToolResultPresentation::MutationConflict(_) => {
-                None
-            }
-        })
-        .or_else(|| {
-            metadata
-                .filter(|metadata| {
-                    metadata.get("outcome").and_then(Value::as_str) == Some("uncertain")
-                        || metadata
-                            .get("uncertain")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false)
-                })
-                .map(|metadata| {
-                    metadata
-                        .get("writtenPaths")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .map(str::to_owned)
-                        .collect::<Vec<_>>()
-                })
-        });
-    if let Some(paths) = uncertain_paths {
+    if let Some(paths) = uncertain_mutation_paths(result_presentation, metadata) {
         merge_zuno_metadata(update, "outcome", json!("uncertain"));
         merge_zuno_metadata(update, "uncertain", json!(true));
         merge_zuno_metadata(update, "appliedPaths", json!(paths));
@@ -151,6 +287,60 @@ pub(crate) fn decorate_completed_tool_update(
         }
         _ => {}
     }
+}
+
+fn mutation_conflict_presentation(
+    presentation: Option<&ToolResultPresentation>,
+    metadata: Option<&Map<String, Value>>,
+) -> Option<MutationConflictPresentation> {
+    presentation
+        .and_then(|presentation| match presentation {
+            ToolResultPresentation::MutationConflict(conflict) => Some(conflict.clone()),
+            ToolResultPresentation::Question(_) | ToolResultPresentation::UncertainMutation(_) => {
+                None
+            }
+        })
+        .or_else(|| {
+            metadata
+                .and_then(|metadata| metadata.get(METADATA_MUTATION_CONFLICT_KEY))
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+        })
+}
+
+fn uncertain_mutation_paths(
+    presentation: Option<&ToolResultPresentation>,
+    metadata: Option<&Map<String, Value>>,
+) -> Option<Vec<String>> {
+    presentation
+        .and_then(|presentation| match presentation {
+            ToolResultPresentation::UncertainMutation(uncertain) => {
+                Some(uncertain.applied_paths().to_vec())
+            }
+            ToolResultPresentation::Question(_) | ToolResultPresentation::MutationConflict(_) => {
+                None
+            }
+        })
+        .or_else(|| {
+            metadata
+                .filter(|metadata| {
+                    metadata.get("outcome").and_then(Value::as_str) == Some("uncertain")
+                        || metadata
+                            .get("uncertain")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                })
+                .map(|metadata| {
+                    metadata
+                        .get("writtenPaths")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+        })
 }
 
 fn question_result_metadata(result: &QuestionResultPresentation) -> Map<String, Value> {

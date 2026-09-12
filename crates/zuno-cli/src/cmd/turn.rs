@@ -1057,6 +1057,13 @@ impl TurnPlan {
                 )
                 .map_err(to_string)?;
         }
+        let mut resolved_model = engine_model(&catalog, catalog_model, env)?;
+        resolved_model.provider = with_agent_options(
+            resolved_model.provider,
+            definition,
+            catalog_model.capabilities.temperature,
+        );
+        resolved_model.reasoning_options = reasoning.options;
         let mut resolver = Resolver {
             requested_agent: agent.name().to_owned(),
             system_prompt: prompt_assembly.render(),
@@ -1073,13 +1080,7 @@ impl TurnPlan {
             max_steps: definition.steps,
             requested_provider: provider_id.clone(),
             requested_model: model_id.clone(),
-            wire_model: catalog_model.api.id.clone(),
-            reasoning_options: reasoning.options,
-            spec: with_agent_options(
-                model_spec(&catalog, catalog_model, env)?,
-                definition,
-                catalog_model.capabilities.temperature,
-            ),
+            model: resolved_model,
             orchestration_seed: None,
         };
         let window = TokenWindow {
@@ -1491,7 +1492,7 @@ impl TurnPlan {
         &mut self,
         parameters: serde_json::Map<String, serde_json::Value>,
     ) {
-        self.resolver.reasoning_options = parameters;
+        self.resolver.model.reasoning_options = parameters;
     }
 
     /// Explicit surface-level reasoning override, excluding configured defaults.
@@ -13042,9 +13043,10 @@ fn model_spec(
 
 /// Lift one catalog model into the engine without changing its resolved API surface.
 ///
-/// Main turns copy [`Spec::surface`] into [`EngineModel::surface`]. Internal Agents and
-/// reflection must do the same: forcing Chat here makes a Responses-only compatible
-/// endpoint fail even though its provider spec was resolved correctly.
+/// Main, delegated, internal and restored turns retain this complete value.
+/// Reconstructing it from just a Spec loses retry policy and pricing. Agent
+/// sampling and inherited reasoning may overlay their own fields, not replace
+/// provider configuration or the resolved API surface.
 fn engine_model(
     catalog: &Catalog,
     model: &zuno_llm::catalog::ResolvedModel,
@@ -13403,9 +13405,7 @@ struct Resolver {
     max_steps: Option<NonZeroU32>,
     requested_provider: String,
     requested_model: String,
-    wire_model: String,
-    reasoning_options: serde_json::Map<String, serde_json::Value>,
-    spec: Spec,
+    model: EngineModel,
     orchestration_seed: Option<Arc<AttemptSeed>>,
 }
 
@@ -13430,15 +13430,8 @@ impl AgentModelResolver for Resolver {
     }
 
     fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<EngineModel> {
-        (provider_id == self.requested_provider && model_id == self.requested_model).then(|| {
-            EngineModel::new(
-                self.spec.clone(),
-                self.wire_model.clone(),
-                self.spec.surface,
-            )
-            .with_catalog_identity(&self.requested_provider, &self.requested_model)
-            .with_reasoning_options(self.reasoning_options.clone())
-        })
+        (provider_id == self.requested_provider && model_id == self.requested_model)
+            .then(|| self.model.clone())
     }
 }
 

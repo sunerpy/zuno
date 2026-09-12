@@ -45,6 +45,33 @@ fn refuses_all(relative: &str, retired: &[&str]) {
 }
 
 #[test]
+fn provider_retry_diagnostics_and_standard_acp_file_titles_are_documented() {
+    for page in [
+        "docs/harness-runtime.md",
+        "docs/zh/operate/harness-runtime.md",
+    ] {
+        contains_all(
+            page,
+            &[
+                "providerDiagnostic",
+                "lastProviderFailure",
+                "requestID",
+                "reason",
+            ],
+        );
+    }
+    for page in [
+        "docs/cli/acp.md",
+        "docs/zh/cli/acp.md",
+        "docs/reference/zed-acp.md",
+        "docs/zh/guide/editors.md",
+        "docs/design/zed-acp-integration.md",
+    ] {
+        contains_all(page, &["title", "locations", "160", "(+N more)"]);
+    }
+}
+
+#[test]
 fn task_contract_guidance_distinguishes_intent_and_objective_in_both_languages() {
     for page in [
         "docs/orchestration.md",

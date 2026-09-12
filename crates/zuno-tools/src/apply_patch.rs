@@ -33,6 +33,26 @@ pub struct ApplyPatchParams {
     pub patch_text: String,
 }
 
+/// Read intended source/destination names with the same grammar used by execution.
+/// This does not resolve paths, access files, authorize writes or claim that a
+/// mutation succeeded. Consumers must use resolved result paths when available.
+#[must_use]
+pub fn intended_file_paths(patch_text: &str) -> Option<Vec<String>> {
+    let operations = parse_patch(patch_text, || false).ok()?;
+    let mut paths = Vec::new();
+    for operation in operations {
+        paths.push(operation.path().to_owned());
+        if let PatchOperation::Update {
+            move_to: Some(destination),
+            ..
+        } = operation
+        {
+            paths.push(destination);
+        }
+    }
+    Some(paths)
+}
+
 pub struct ApplyPatchTool {
     runtime: Arc<FileToolRuntime>,
     intent_recorder: Option<Arc<NativeFileIntentRecorder>>,
