@@ -34,7 +34,7 @@ workspace。`crates/zuno-cli` 构建最终的 `zuno` 二进制，其余 crate �
 | --- | --- |
 | `zuno-cli`（`zuno`） | 解析命令、加载配置、组装默认 harness，并提供发布的可执行文件 |
 | `zuno-tui` | 终端视图、输入、快捷键、主题与渲染；不拥有私有 Agent 循环 |
-| `zuno-server` | HTTP 路由、认证、SSE、PTY 访问与 Server projection |
+| `zuno-server` | 默认提供个人 HTTP／SSE／PTY projection；Linux 企业服务通过显式 `enterprise` feature 启用 |
 | `zuno-acp` | Zed 等编辑器使用的 Agent Client Protocol adapter |
 
 ### 运行时与编排

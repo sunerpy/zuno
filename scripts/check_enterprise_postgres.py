@@ -118,7 +118,7 @@ def main():
                 cwd=repository, env=environment, check=True,
             )
             subprocess.run(
-                ["cargo", "test", "-p", "zuno-server", "--test", "enterprise_state", "--", "--include-ignored"],
+                ["cargo", "test", "-p", "zuno-server", "--features", "enterprise", "--test", "enterprise_state", "--", "--include-ignored"],
                 cwd=repository, env=environment, check=True,
             )
         except subprocess.CalledProcessError as error:
