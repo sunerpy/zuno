@@ -110,6 +110,12 @@ impl MemoryTool {
 
 #[async_trait]
 impl TypedTool for MemoryTool {
+    fn presentation(&self) -> zuno_types::activity::InvocationPresentation {
+        zuno_types::activity::InvocationPresentation::builtin(
+            zuno_types::activity::InvocationAction::MemoryWrite,
+        )
+    }
+
     type Params = MemoryParams;
 
     fn id(&self) -> &str {

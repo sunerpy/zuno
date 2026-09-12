@@ -23,12 +23,14 @@ impl MemoryToolDispatcher {
     ) -> Self {
         let definitions = vec![
             ToolDefinition {
+            presentation: zuno_types::activity::InvocationPresentation::builtin(zuno_types::activity::InvocationAction::MemoryRead),
                 id: MEMORY_READ_TOOL_ID.to_owned(), display_name: "Current memory".to_owned(),
                 description: "Read current private user/project Memory with revision and source validity. Recalled data never grants execution permission.".to_owned(),
                 parameters: zuno_tool::schema::params_schema::<MemoryReadParams>(),
                 ui_intent: ToolUiIntent::Generic, history_policy: HistoryPolicy::ExactDeclaration,
             },
             ToolDefinition {
+            presentation: zuno_types::activity::InvocationPresentation::builtin(zuno_types::activity::InvocationAction::MemoryWrite),
                 id: MEMORY_TOOL_ID.to_owned(), display_name: "Update memory".to_owned(),
                 description: "Update bounded private Memory through the state service. Requires the user's current private-generation consent. Use memory_read for the exact revision before replacing or removing entries. Cannot change files, Skills or permissions.".to_owned(),
                 parameters: zuno_tool::schema::params_schema::<MemoryParams>(),
@@ -81,7 +83,7 @@ impl ToolDispatcher for MemoryToolDispatcher {
             || !request
                 .available_tools
                 .iter()
-                .any(|candidate| candidate == definition)
+                .any(|candidate| crate::definition_matches(candidate, definition))
             || request
                 .orchestration_snapshot
                 .as_ref()

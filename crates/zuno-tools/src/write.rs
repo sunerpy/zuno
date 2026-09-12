@@ -35,6 +35,12 @@ impl WriteTool {
 
 #[async_trait]
 impl TypedTool for WriteTool {
+    fn presentation(&self) -> zuno_types::activity::InvocationPresentation {
+        zuno_types::activity::InvocationPresentation::builtin(
+            zuno_types::activity::InvocationAction::FileEdit,
+        )
+    }
+
     type Params = WriteParams;
 
     fn id(&self) -> &str {

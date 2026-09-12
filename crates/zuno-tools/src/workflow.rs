@@ -226,6 +226,12 @@ impl WorkflowTool {
 
 #[async_trait]
 impl TypedTool for WorkflowTool {
+    fn presentation(&self) -> zuno_types::activity::InvocationPresentation {
+        zuno_types::activity::InvocationPresentation::builtin(
+            zuno_types::activity::InvocationAction::Workflow,
+        )
+    }
+
     type Params = WorkflowParams;
 
     fn id(&self) -> &str {

@@ -81,6 +81,8 @@ Child workspace forks and executable target configuration: [English](WORKSPACES.
 
 Durable job/tree cancellation and observed process stops: [English](CONTROL.md), [中文](CONTROL.zh.md).
 
+Public activity enums, history and TypeScript SDK: [English](ACTIVITY.md), [中文](ACTIVITY.zh.md).
+
 Preview documentation archives contain the tracked guides, example configurations
 and license notices from the exact release commit. Local edits and untracked files
 are excluded; these archives do not update the stable documentation site.

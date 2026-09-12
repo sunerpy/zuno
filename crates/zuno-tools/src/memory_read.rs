@@ -38,6 +38,12 @@ impl MemoryReadTool {
 
 #[async_trait]
 impl TypedTool for MemoryReadTool {
+    fn presentation(&self) -> zuno_types::activity::InvocationPresentation {
+        zuno_types::activity::InvocationPresentation::builtin(
+            zuno_types::activity::InvocationAction::MemoryRead,
+        )
+    }
+
     type Params = MemoryReadParams;
 
     fn id(&self) -> &str {

@@ -187,7 +187,7 @@ limit. No incomplete history is treated as an exact old context window.
 
 The captured format-5 fixture preserves pending waits, Job budgets, lease state,
 messages and usage across failed/successful format-6 migration. The internal Worker
-protocol is version 7; it is separate from public UI DTOs. Its compatible claims,
+protocol is version 8; it is separate from public UI DTOs. Its compatible claims,
 stable input timestamps and bounded grant renewal are described in [Workers](WORKERS.md).
 
 ## Browser authentication state
@@ -235,7 +235,7 @@ browser and operation data before the marker advances.
 The data owner runs the shared Memory service in bounded blocking capacity with
 one transaction per request. Actor/workspace checks, candidate CAS, source
 revalidation, consent, learning lease checks and result/audit commit stay together.
-Workers use internal protocol 7 and never receive this provider or pool.
+Workers use internal protocol 8 and never receive this provider or pool.
 See [Memory](MEMORY.md) for implemented behavior and remaining producers.
 
 ## Child execution-session binding
@@ -269,3 +269,7 @@ See [workspace preparation](WORKSPACES.md).
 ## Format 12: durable cancellation
 
 Format 12 adds `runtime_control_request`, `runtime_stop`, `runtime_continuation` and `gateway_cancellation_delivery`. Stop intent, subtree lease fencing, logical completion and the gateway outbox commit together. The restricted catalog helper only returns assigned operation coordinates; actual bodies use owner RLS. The frozen format-11 fixture preserves sessions, messages, jobs, Memory, children and operation admissions through success and injected migration rollback. See [control](CONTROL.md).
+
+## Format 13: public activity
+
+Format 13 adds owner-scoped public activity counters, items and immutable frames, plus an immutable message-to-execution Job association. Projection, source writes and each logical cursor commit together. The exact format-12 fixture preserves messages, parts, Memory and cancellation delivery state through success and failed-DDL rollback. See [activity](ACTIVITY.md) for snapshot pagination and privacy boundaries.

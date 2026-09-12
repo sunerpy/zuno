@@ -25,6 +25,8 @@ mod format_seven;
 mod format_six;
 #[path = "tests/format_ten.rs"]
 mod format_ten;
+#[path = "tests/format_twelve.rs"]
+mod format_twelve;
 
 #[derive(Deserialize)]
 struct Fixture {
@@ -335,6 +337,7 @@ async fn real_postgres_enforces_scopes_transactions_role_boundaries_and_schema_i
     format_nine::upgrade(&fixture, &admin).await;
     format_ten::upgrade(&fixture, &admin).await;
     format_eleven::upgrade(&fixture, &admin).await;
+    format_twelve::upgrade(&fixture, &admin).await;
     let expected_count: i64 = query_scalar("SELECT count(*) FROM zuno_enterprise_preview.session")
         .fetch_one(&admin)
         .await
@@ -575,7 +578,7 @@ async fn format_four_upgrade(fixture: &Fixture, admin: &PgPool) {
         query_scalar(
             "SELECT jsonb_build_object(
               'session',(SELECT to_jsonb(s)-'delegation_depth_limit' FROM zuno_enterprise_preview.session s WHERE id='legacy-session'),
-              'message',(SELECT to_jsonb(m) FROM zuno_enterprise_preview.message m WHERE id='legacy-assistant'),
+              'message',(SELECT (to_jsonb(m)-'execution_job_id') FROM zuno_enterprise_preview.message m WHERE id='legacy-assistant'),
               'part',(SELECT to_jsonb(p) FROM zuno_enterprise_preview.part p WHERE id='legacy-tool'),
               'job',(SELECT to_jsonb(j) FROM zuno_enterprise_preview.runtime_job j WHERE job_id='legacy-job'),
               'slot',(SELECT to_jsonb(s) FROM zuno_enterprise_preview.runtime_session s WHERE session_id='legacy-session'),
@@ -651,7 +654,7 @@ async fn format_five_upgrade(fixture: &Fixture, admin: &PgPool) {
         query_scalar(
             "SELECT jsonb_build_object(
               'session',(SELECT to_jsonb(s)-'delegation_depth_limit' FROM zuno_enterprise_preview.session s WHERE id='legacy-session'),
-              'message',(SELECT to_jsonb(m) FROM zuno_enterprise_preview.message m WHERE id='legacy-assistant'),
+              'message',(SELECT (to_jsonb(m)-'execution_job_id') FROM zuno_enterprise_preview.message m WHERE id='legacy-assistant'),
               'part',(SELECT to_jsonb(p) FROM zuno_enterprise_preview.part p WHERE id='legacy-tool'),
               'wait',(SELECT to_jsonb(w) FROM zuno_enterprise_preview.runtime_wait w WHERE id='legacy-wait'),
               'job',(SELECT to_jsonb(j) FROM zuno_enterprise_preview.runtime_job j WHERE job_id='legacy-job'),

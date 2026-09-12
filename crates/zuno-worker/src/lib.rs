@@ -3,6 +3,8 @@
 pub mod child;
 pub mod gateway;
 pub mod memory;
+#[cfg(test)]
+mod presentation_tests;
 pub mod runtime;
 pub mod tools;
 
@@ -40,6 +42,21 @@ pub const GATEWAY_CANCELLATIONS_PATH: &str = "internal/gateway/v1/cancellations"
 pub const GATEWAY_CHILD_WORKSPACE_PATH: &str = "internal/gateway/v1/child-workspace";
 pub const GATEWAY_TICKET_HEADER: &str = "x-zuno-gateway-ticket";
 pub const GATEWAY_EXECUTE_PATH: &str = "internal/execution/v1/request";
+
+/// Older checkpoints did not record display provenance. That absence may be
+/// filled by the installed adapter; every execution-relevant declaration field
+/// and any explicitly recorded presentation must still match.
+pub(crate) fn definition_matches(
+    locked: &zuno_tool::ToolDefinition,
+    current: &zuno_tool::ToolDefinition,
+) -> bool {
+    if locked.presentation != Default::default() {
+        return locked == current;
+    }
+    let mut expected = locked.clone();
+    expected.presentation = current.presentation.clone();
+    expected == *current
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

@@ -124,6 +124,18 @@ impl ProductAgentTool {
 
 #[async_trait]
 impl TypedTool for ProductAgentTool {
+    fn presentation(&self) -> zuno_types::activity::InvocationPresentation {
+        use zuno_types::activity::{
+            ActivityName, InvocationAction, InvocationPresentation, InvocationSource,
+        };
+        InvocationPresentation {
+            action: InvocationAction::Agent,
+            source: ActivityName::new(&self.instance)
+                .map(|agent| InvocationSource::ExternalAgent { agent })
+                .unwrap_or(InvocationSource::Unknown),
+        }
+    }
+
     type Params = ProductAgentParams;
 
     fn id(&self) -> &str {

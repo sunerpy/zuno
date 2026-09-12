@@ -46,6 +46,12 @@ impl EditTool {
 
 #[async_trait]
 impl TypedTool for EditTool {
+    fn presentation(&self) -> zuno_types::activity::InvocationPresentation {
+        zuno_types::activity::InvocationPresentation::builtin(
+            zuno_types::activity::InvocationAction::FileEdit,
+        )
+    }
+
     type Params = EditParams;
 
     fn id(&self) -> &str {

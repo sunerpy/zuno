@@ -414,6 +414,12 @@ impl WebFetchTool {
 
 #[async_trait]
 impl TypedTool for WebFetchTool {
+    fn presentation(&self) -> zuno_types::activity::InvocationPresentation {
+        zuno_types::activity::InvocationPresentation::builtin(
+            zuno_types::activity::InvocationAction::WebFetch,
+        )
+    }
+
     type Params = WebFetchParams;
 
     fn id(&self) -> &str {

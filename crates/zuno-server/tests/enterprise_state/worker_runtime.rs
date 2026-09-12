@@ -328,7 +328,7 @@ async fn worker_runtimes_renew_and_resume_shared_kernel_without_replaying_input_
     let rejected = http
         .post(endpoint.join(zuno_worker::CLAIM_PATH).unwrap())
         .bearer_auth("worker-token")
-        .json(&json!({"version":3,"worker":"old","configurations":[configuration.clone()]}))
+        .json(&json!({"version":zuno_engine::state::wire::WORKER_PROTOCOL_VERSION-1,"worker":"old","configurations":[configuration.clone()]}))
         .send()
         .await
         .unwrap();
@@ -484,6 +484,42 @@ async fn worker_runtimes_renew_and_resume_shared_kernel_without_replaying_input_
     .await
     .unwrap();
     assert_eq!(messages, 1);
+    use zuno_application::activity::{ActivityPersistence, FrameQuery, HistoryQuery};
+    let activity = backend.activity(actor.clone());
+    let history = activity
+        .history(&job.session_id, HistoryQuery::default())
+        .await
+        .unwrap();
+    let public = serde_json::to_string(&history).unwrap();
+    assert!(
+        public.contains("Done"),
+        "final model output must be available to clients"
+    );
+    assert!(
+        public.contains("invocation"),
+        "the original tool call remains a typed activity"
+    );
+    for private in [
+        "checkpointVersion",
+        "expiresAtMs",
+        "thoughtSignature",
+        "encryptedContent",
+        "configuration",
+        "credential",
+    ] {
+        assert!(!public.contains(private), "private field leaked: {private}");
+    }
+    let frames = activity
+        .frames(&job.session_id, FrameQuery::default())
+        .await
+        .unwrap();
+    assert!(
+        frames
+            .frames
+            .windows(2)
+            .all(|pair| pair[1].sequence.0 == pair[0].sequence.0 + 1)
+    );
+    assert!(frames.through.0 <= history.through.0);
 
     let next = runtime
         .submit(

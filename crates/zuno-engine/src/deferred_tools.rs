@@ -455,6 +455,7 @@ mod tests {
 
     fn definition(id: &str, description: &str) -> ToolDefinition {
         ToolDefinition {
+            presentation: Default::default(),
             id: id.to_owned(),
             display_name: id.to_owned(),
             description: description.to_owned(),

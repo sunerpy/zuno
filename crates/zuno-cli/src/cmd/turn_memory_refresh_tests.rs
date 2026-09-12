@@ -114,6 +114,7 @@ impl ToolDispatcher for UnmarkedProbe {
     fn available_tools(&self) -> AvailableTools {
         AvailableTools::new(
             vec![ToolDefinition {
+                presentation: Default::default(),
                 id: "probe".to_owned(),
                 display_name: "Probe".to_owned(),
                 description: "A deterministic local probe without a context refresh marker."

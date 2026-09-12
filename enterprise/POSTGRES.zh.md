@@ -174,7 +174,7 @@ message／part、等待 Job 和输入回执。BFF 与 Worker 的网络验证使�
 
 数据所有者在有界阻塞容量中执行共享 Memory 服务，每个请求共用一个事务。主体／工作区
 验证、候选 CAS、来源重验、授权、学习租约与结果／审计保持同一边界。Worker 使用内部
-协议 7，不接收数据库 provider 或 pool。已实现能力和待实现生产者见 [Memory](MEMORY.zh.md)。
+协议 8，不接收数据库 provider 或 pool。已实现能力和待实现生产者见 [Memory](MEMORY.zh.md)。
 
 ## 子任务执行会话关联
 
@@ -198,3 +198,7 @@ message／part、等待 Job 和输入回执。BFF 与 Worker 的网络验证使�
 ## 格式 12：持久取消
 
 格式 12 增加 `runtime_control_request`、`runtime_stop`、`runtime_continuation` 和 `gateway_cancellation_delivery`。停止意图、子树执行权撤销、逻辑完成及网关队列一起提交；受限目录函数只返回分配给网关的操作坐标，正文仍经过所有者 RLS。固定格式 11 夹具验证迁移成功及注入失败回滚时会话、消息、Job、Memory、子任务和操作接纳记录不丢失。见[控制](CONTROL.zh.md)。
+
+## 格式 13：公共活动
+
+格式 13 增加所有者作用域的公共计数、item、不可变 frame，以及消息到原始执行 Job 的稳定关联。投影、源写入及逻辑游标一起提交。固定格式 12 夹具验证迁移成功及 DDL 失败回滚时消息、part、Memory 与取消投递状态均被保留。快照分页与隐私边界见[活动协议](ACTIVITY.zh.md)。

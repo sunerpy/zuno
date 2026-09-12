@@ -431,6 +431,7 @@ struct ProgressiveDispatcher {
 impl ProgressiveDispatcher {
     fn definition(id: &str, description: &str) -> ToolDefinition {
         ToolDefinition {
+            presentation: Default::default(),
             id: id.to_owned(),
             display_name: id.to_owned(),
             description: description.to_owned(),
@@ -509,6 +510,7 @@ impl ToolDispatcher for FakeDispatcher {
     fn available_tools(&self) -> AvailableTools {
         AvailableTools::new(
             vec![ToolDefinition {
+                presentation: Default::default(),
                 id: "echo".to_owned(),
                 display_name: "echo-runtime".to_owned(),
                 description: "Echo text.".to_owned(),
@@ -547,6 +549,7 @@ impl ToolDispatcher for BlockingToolDispatcher {
     fn available_tools(&self) -> AvailableTools {
         AvailableTools::new(
             vec![ToolDefinition {
+                presentation: Default::default(),
                 id: "echo".to_owned(),
                 display_name: "echo-runtime".to_owned(),
                 description: "Wait until the test releases the tool.".to_owned(),
@@ -2400,6 +2403,7 @@ async fn runtime_policy_is_rendered_from_the_post_hook_tool_subset() {
     let providers = registry(&provider);
     let resolver = PolicyResolver;
     let definition = |id: &str| ToolDefinition {
+        presentation: Default::default(),
         id: id.to_owned(),
         display_name: id.to_owned(),
         description: format!("{id} test tool"),
@@ -5314,6 +5318,7 @@ impl ToolDispatcher for ObjectDeletingDispatcher {
     fn available_tools(&self) -> AvailableTools {
         AvailableTools::new(
             vec![ToolDefinition {
+                presentation: Default::default(),
                 id: "echo".to_owned(),
                 display_name: "echo-runtime".to_owned(),
                 description: "Echo text.".to_owned(),

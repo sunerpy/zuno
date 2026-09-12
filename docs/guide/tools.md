@@ -653,3 +653,7 @@ deliberate back door rather than the first thing the notice suggests.
 - [Agents](/guide/agents)
 - [MCP servers](/guide/mcp)
 - [Harness runtime](/harness-runtime)
+
+## Typed presentation
+
+Tool definitions carry action and source separately from permissions, side effects, concurrency and replay. Built-in file/process/Web/Memory/delegation adapters, MCP, extensions and external product Agents declare their actual source; a name cannot confer built-in identity. The kernel records these declarations with each invocation for public projections. Older records keep explicitly unknown provenance when no reliable source was recorded.

@@ -9,7 +9,7 @@ Original baseline: `v0.10.29`, `d1212860dba6a6b420ce81d444ace58feaf0adb5`.
 | P2 | In progress | PostgreSQL, generic OAuth2/OIDC, BFF, scoped private Memory, organization policy and HITL integrated; shared/automatic Memory and full fault acceptance remain |
 | P3 | In progress | Independent control/gateway/two-Worker executable loop validated; full fault/operational acceptance remains |
 | P4 | In progress | Child dispatch, persistent waits, workspace forks and Job cancellation implemented; approved merge and Workflow/Council remain |
-| P5 | Pending | Web, SDK, remote ACP, common projections |
+| P5 | In progress | Public enums, transactional history/frames and generated TypeScript activity SDK implemented; live producers, Web, full ACP/TUI adapters remain |
 | P6 | Pending | Fault injection, native artifacts, preview publication |
 
 Publication remains disabled until the first runnable root-task preview has
@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p4-cancellation`.
+- Current phase branch: `codex/enterprise-p5-activity`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -384,3 +384,12 @@ CI run 34676688599 subsequently passed all gates at `9d558b7b360289dc9d6a428bc4f
 - Gateway service cancellation survives lease revocation and uses immutable admissions, fair durable polling and the existing terminal receipt acknowledgement path.
 - PostgreSQL format 12 preserves exact format-11 fixtures and rolls back failed DDL atomically. Native Docker/PostgreSQL/HTTPS/independent-role tests pass. Follow-up PostgreSQL tests cover rollback, competing cancellation, previously admitted automatic continuation and bounded/fair gateway batches. Final workspace check, Clippy, docs, formatting and diff gates pass.
 - English/Chinese control, application, persistence and runtime docs are updated. Only preview docs archives are affected. Publication remains disabled.
+
+## Public activity and generated client contracts
+
+- Workspace PR #211 merged at `34c18f25` with CI `34685893939` green. Cancellation PR #212 merged at `e66465ae346f62d69d5d4cc0763cb510432e1353` with CI `34686887132` green.
+- Six public enum groups are implemented independently of Worker/gateway DTOs. Real adapters supply invocation action/source; the kernel persists it. Public protocol 1 and Worker protocol 8 are distinct; compatible legacy display omissions do not widen execution declarations.
+- PostgreSQL format 13 writes bounded public items and immutable frames atomically with original state. Fixed-snapshot history, contiguous replay, immediate queued-input display, capsule deduplication and logical positions are implemented behind authenticated API/BFF handlers. Message-to-Job association prevents cross-turn reuse of approval/wait/operation state; approval invalidation and lease loss update the public state after authoritative changes.
+- Rust generates Schema, TypeScript and bundled standalone validators. Ten SDK recovery/security tests and generation-drift checks pass. Native Docker/PostgreSQL/HTTPS/independent-role tests and additional history/migration/rollback contracts pass; final workspace check, Clippy, docs, formatting, workflow and diff gates pass.
+- One broad test build stopped because the shared filesystem filled. The task-owned incremental cache was removed after verifying no compiler remained active; source, binaries and evidence were preserved. Subsequent local verification disables incremental caching.
+- LiveFrame production, React Web, full ACP/TUI integration, P4 approved merge/Workflow/Council and remaining enterprise acceptance continue. Publication remains disabled. English/Chinese guides and preview navigation are updated; stable docs deployment remains outside this preview branch.

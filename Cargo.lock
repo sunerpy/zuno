@@ -7889,6 +7889,7 @@ dependencies = [
  "zuno-process",
  "zuno-runtime",
  "zuno-tool",
+ "zuno-types",
 ]
 
 [[package]]
@@ -8058,6 +8059,7 @@ dependencies = [
  "zuno-process",
  "zuno-tool",
  "zuno-tools",
+ "zuno-types",
 ]
 
 [[package]]

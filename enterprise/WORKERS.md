@@ -13,7 +13,7 @@ platform contract is unchanged; see [platform boundaries](PLATFORMS.md).
 
 ## Claims and lifetime
 
-Internal Worker protocol 7 requires the protocol version and a bounded, nonempty
+Internal Worker protocol 8 requires the protocol version and a bounded, nonempty
 set of configuration references on every claim. The PostgreSQL claim query
 matches the exact ID, version and SHA before acquiring the session. A Worker with
 an older definition leaves incompatible work eligible for another Worker.

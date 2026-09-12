@@ -402,7 +402,8 @@ async fn emit_new(
         "INSERT INTO zuno_enterprise_preview.event(tenant_id,principal_id,session_id,id,sequence,type,data)
          VALUES($1,$2,$3,$4,$5,$6,$7)",
     ).bind(principal.tenant_id().as_str()).bind(principal.principal_id().as_str()).bind(session)
-        .bind(id).bind(sequence).bind(kind).bind(data)
+        .bind(id).bind(sequence).bind(kind).bind(&data)
         .execute(&mut **tx).await.map_err(database_error)?;
+    crate::activity::event(tx, &principal.owner(), session, kind, &data).await?;
     Ok(sequence)
 }

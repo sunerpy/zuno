@@ -7406,6 +7406,7 @@ fn attempt_snapshot(input: AttemptSnapshotInput<'_>) -> AttemptSnapshot {
         .iter()
         .map(|tool| {
             ToolDefinition {
+                presentation: Default::default(),
                 id: tool.name.clone(),
                 display_name: locked_tools
                     .iter()
@@ -7771,6 +7772,7 @@ async fn checkpoint_assistant(
                         call,
                         display_name: &display_name,
                         ui_intent: tool_ui_intent(locked_tools, &call.name),
+                        presentation: tool_presentation(locked_tools, &call.name),
                         schema_identity: tool_schema_identity(locked_tools, &call.name),
                     },
                     tool_failure.map_or(ToolPartStage::Pending, ToolPartStage::Closed),
@@ -7962,6 +7964,7 @@ fn checkpoint_tool_part(
         call,
         display_name,
         ui_intent,
+        presentation,
         schema_identity,
     } = identity;
     let mut state = match stage {
@@ -7992,6 +7995,7 @@ fn checkpoint_tool_part(
         "tool": call.name,
         "displayName": display_name,
         "uiIntent": ui_intent,
+        "presentation": presentation,
         "state": state
     });
     if let Some(schema_identity) = schema_identity {
@@ -8018,6 +8022,7 @@ struct ToolPartIdentity<'a> {
     call: &'a ToolCall,
     display_name: &'a str,
     ui_intent: ToolUiIntent,
+    presentation: zuno_types::activity::InvocationPresentation,
     schema_identity: Option<ToolSchemaIdentity>,
 }
 
@@ -8071,6 +8076,7 @@ async fn mark_group_dispatched(
                 call,
                 display_name,
                 ui_intent,
+                presentation: tool_presentation(locked_tools, &call.name),
                 schema_identity: tool_schema_identity(locked_tools, &call.name),
             },
             ToolPartStage::Dispatched,
@@ -8151,6 +8157,7 @@ fn tool_result_part(
         "tool": identity.call.name,
         "displayName": identity.display_name,
         "uiIntent": identity.ui_intent,
+        "presentation": identity.presentation,
         "state": state
     });
     if let Some(schema_identity) = identity.schema_identity {
@@ -8168,6 +8175,17 @@ fn tool_ui_intent(definitions: &[ToolDefinition], name: &str) -> ToolUiIntent {
         .iter()
         .find(|definition| definition.id == name)
         .map_or(ToolUiIntent::Generic, |definition| definition.ui_intent)
+}
+
+fn tool_presentation(
+    definitions: &[ToolDefinition],
+    name: &str,
+) -> zuno_types::activity::InvocationPresentation {
+    definitions
+        .iter()
+        .find(|definition| definition.id == name)
+        .map(|definition| definition.presentation.clone())
+        .unwrap_or_default()
 }
 
 fn tool_schema_identity(definitions: &[ToolDefinition], name: &str) -> Option<ToolSchemaIdentity> {
@@ -8816,6 +8834,7 @@ mod historical_tool_declaration_tests {
 
     fn definition(description: &str, required: &[&str]) -> ToolDefinition {
         ToolDefinition {
+            presentation: Default::default(),
             id: "penpot_execute_code".to_owned(),
             display_name: "Penpot execute".to_owned(),
             description: description.to_owned(),

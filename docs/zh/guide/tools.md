@@ -476,3 +476,7 @@ History、Notes 读取、job 状态、LSP 检查、goal 状态、外部工具元
 - [Agent](/zh/guide/agents)
 - [MCP server](/zh/guide/mcp)
 - [Harness 运行时](/zh/operate/harness-runtime)
+
+## 类型化展示
+
+工具定义将动作和来源与权限、副作用、并发及重放策略分开。内置文件／进程／Web／Memory／委派适配器、MCP、扩展和外部产品 Agent 声明真实来源，名称本身不能获得内置身份。内核随每次调用持久记录该声明，用于公共投影；旧记录没有可靠来源时保持明确的未知状态。

@@ -1,5 +1,6 @@
 //! Wire and domain types shared across the workspace (sessions, messages, parts, tool payloads).
 
+pub mod activity;
 pub mod admission;
 pub mod context_usage;
 pub mod execution;

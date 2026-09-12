@@ -64,17 +64,25 @@ pub(super) async fn put_message(
         MessageRole::User => "user",
         MessageRole::Assistant => "assistant",
     };
-    let changed = query(
-        "INSERT INTO zuno_enterprise_preview.message(tenant_id,principal_id,session_id,id,role,data,time_created,time_updated)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8)
-         ON CONFLICT(tenant_id,principal_id,id) DO UPDATE SET data=excluded.data,time_updated=excluded.time_updated
-         WHERE message.session_id=excluded.session_id AND message.role=excluded.role AND message.time_created=excluded.time_created",
+    let job: String = query_scalar(
+        "SELECT lease_job_id FROM zuno_enterprise_preview.runtime_session WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3",
     ).bind(scope.owner.tenant_id.as_str()).bind(scope.owner.principal_id.as_str()).bind(&scope.session_id)
-        .bind(&message.id).bind(role).bind(json!(message.data)).bind(message.time_created).bind(at)
+        .fetch_one(&mut **tx).await.map_err(sql_error)?;
+    let changed = query(
+        "INSERT INTO zuno_enterprise_preview.message(tenant_id,principal_id,session_id,id,role,data,time_created,time_updated,execution_job_id)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         ON CONFLICT(tenant_id,principal_id,id) DO UPDATE SET data=excluded.data,time_updated=excluded.time_updated
+         WHERE message.session_id=excluded.session_id AND message.role=excluded.role AND message.time_created=excluded.time_created
+           AND message.execution_job_id=excluded.execution_job_id",
+    ).bind(scope.owner.tenant_id.as_str()).bind(scope.owner.principal_id.as_str()).bind(&scope.session_id)
+        .bind(&message.id).bind(role).bind(json!(message.data)).bind(message.time_created).bind(at).bind(job)
         .execute(&mut **tx).await.map_err(sql_error)?.rows_affected();
     if changed != 1 {
         return Err(TurnStateError::Conflict.into());
     }
+    crate::activity::message(tx, &scope.owner, message)
+        .await
+        .map_err(state_error)?;
     Ok(())
 }
 
@@ -104,6 +112,9 @@ pub(super) async fn put_part(
     if changed != 1 {
         return Err(TurnStateError::Conflict.into());
     }
+    crate::activity::part(tx, &scope.owner, part)
+        .await
+        .map_err(state_error)?;
     Ok(())
 }
 
