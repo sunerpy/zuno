@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.36](https://github.com/sunerpy/zuno/compare/v0.10.35...v0.10.36) (2026-09-12)
+
+
+### Bug Fixes
+
+* **runtime:** 贯通重试配置与诊断并补全 ACP 文件名 ([a023279](https://github.com/sunerpy/zuno/commit/a023279fccc0d3233e1a1297301ee1f3841d9051))
+
 ## [0.10.35](https://github.com/sunerpy/zuno/compare/v0.10.34...v0.10.35) (2026-09-12)
 
 
