@@ -3,7 +3,10 @@ use schemars::{JsonSchema, schema_for};
 use zuno_types::activity::{CommittedFrame, FramePage, HistoryPage, LiveFrame};
 
 #[derive(JsonSchema)]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "this schema-only root collects public DTO definitions and is never instantiated"
+)]
 struct ActivityProtocol {
     history: HistoryPage,
     frames: FramePage,
