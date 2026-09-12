@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.34](https://github.com/sunerpy/zuno/compare/v0.10.33...v0.10.34) (2026-09-12)
+
+
+### Bug Fixes
+
+* **acp:** 修复恢复执行生命周期与评审任务边界 ([7cd6144](https://github.com/sunerpy/zuno/commit/7cd6144f25bb903926dfd53bcc548afe7e3c1ca7))
+
 ## [0.10.33](https://github.com/sunerpy/zuno/compare/v0.10.32...v0.10.33) (2026-09-12)
 
 
