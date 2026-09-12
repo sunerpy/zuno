@@ -132,12 +132,12 @@ async fn reflection_creates_a_pending_candidate_and_approval_changes_the_next_pr
     let candidates = service.candidates().expect("candidates");
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].status, MemoryCandidateStatus::Pending);
-    assert!(!service.paths().for_scope(Scope::Project).exists());
+    assert!(!service.paths().unwrap().for_scope(Scope::Project).exists());
 
     service.apply(&candidates[0].id).expect("approve candidate");
     let prompt = SessionMemory::open(
-        service.paths().for_scope(Scope::Global),
-        service.paths().for_scope(Scope::Project),
+        service.paths().unwrap().for_scope(Scope::Global),
+        service.paths().unwrap().for_scope(Scope::Project),
     )
     .expect("session memory")
     .inject_into("SYSTEM");
@@ -211,7 +211,7 @@ fn restart_reconciliation_observes_apply_and_undo_without_replaying_either_write
     let candidate = service
         .propose(proposal("durable entry", 1.0))
         .expect("proposal");
-    let project_path = service.paths().for_scope(Scope::Project);
+    let project_path = service.paths().unwrap().for_scope(Scope::Project);
 
     store
         .begin_apply(candidate.id(), &[], &["durable entry".to_owned()], 20)
@@ -262,7 +262,11 @@ fn restart_reconciliation_marks_divergent_resident_state_uncertain() {
         .expect("record interrupted apply");
     MemoryStore::open(
         Scope::Project,
-        service.paths().for_scope(Scope::Project).to_path_buf(),
+        service
+            .paths()
+            .unwrap()
+            .for_scope(Scope::Project)
+            .to_path_buf(),
     )
     .expect("open resident store")
     .replace_exact(&[], &["different external state".to_owned()])
@@ -281,7 +285,11 @@ fn restart_reconciliation_marks_divergent_resident_state_uncertain() {
     assert!(service.entries().expect("authoritative entries").is_empty());
     let projection = MemoryStore::open(
         Scope::Project,
-        service.paths().for_scope(Scope::Project).to_path_buf(),
+        service
+            .paths()
+            .unwrap()
+            .for_scope(Scope::Project)
+            .to_path_buf(),
     )
     .expect("preserved external projection");
     assert_eq!(projection.entries(), ["different external state"]);

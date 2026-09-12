@@ -5,7 +5,8 @@ use zuno_db::{Pool, migration};
 use zuno_memory::authority::{LocalMemoryAuthority, MemoryAccess, MemoryAuthority};
 use zuno_memory::persistence::{MemoryPersistence, SqliteMemoryPersistence};
 use zuno_memory::service::{
-    MemoryProposal, MemoryService, MemoryServiceError, PromotionPolicy, ScopePaths,
+    MemoryDocumentKey, MemoryProposal, MemoryService, MemoryServiceError, PromotionPolicy,
+    ScopePaths,
 };
 use zuno_memory::{Scope, ScopeLimits};
 use zuno_paths::DbLocation;
@@ -212,7 +213,7 @@ fn an_unavailable_authoritative_backend_does_not_fall_back_to_the_projection_fil
     );
     let candidate = memory.propose(proposal()).unwrap();
     memory.apply(candidate.id()).unwrap();
-    let path = memory.paths().for_scope(Scope::Project);
+    let path = memory.paths().unwrap().for_scope(Scope::Project);
     let before = std::fs::read(path).unwrap();
     pool.get()
         .unwrap()
@@ -223,4 +224,56 @@ fn an_unavailable_authoritative_backend_does_not_fall_back_to_the_projection_fil
         Err(MemoryServiceError::Database(_))
     ));
     assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn logical_memory_preserves_versions_without_resolving_or_creating_files() {
+    let pool = pool();
+    let backend: Arc<dyn MemoryPersistence> = Arc::new(SqliteMemoryPersistence::new(pool.clone()));
+    let memory = MemoryService::storage_only(
+        backend.clone(),
+        Arc::new(LocalMemoryAuthority),
+        MemoryDocumentKey::new("private:global").unwrap(),
+        MemoryDocumentKey::new("private:workspace").unwrap(),
+        ScopeLimits::default(),
+        PromotionPolicy::Review,
+    )
+    .unwrap();
+    assert!(memory.paths().is_none());
+    assert_eq!(
+        memory.scope_identity(MemoryScope::Project).unwrap(),
+        "private:workspace"
+    );
+    let candidate = memory.propose(proposal()).unwrap();
+    memory.apply(candidate.id()).unwrap();
+    let snapshot = memory.snapshot(Scope::Project).unwrap();
+    assert!(
+        snapshot
+            .content
+            .contains("Keep reviewed deployment instructions.")
+    );
+    assert!(snapshot.source.starts_with("private:workspace"));
+    assert_eq!(candidate.target_path, "private:workspace");
+    assert!(matches!(
+        memory.import_projection(MemoryScope::Project),
+        Err(MemoryServiceError::Denied)
+    ));
+    memory.undo(candidate.id()).unwrap();
+    assert!(memory.entries().unwrap().is_empty());
+    assert!(memory.snapshot(Scope::Project).unwrap().revision > snapshot.revision);
+
+    let foreign = MemoryService::storage_only(
+        backend,
+        Arc::new(LocalMemoryAuthority),
+        MemoryDocumentKey::new("another:global").unwrap(),
+        MemoryDocumentKey::new("another:workspace").unwrap(),
+        ScopeLimits::default(),
+        PromotionPolicy::Review,
+    )
+    .unwrap();
+    assert!(matches!(
+        foreign.candidate(candidate.id()),
+        Err(MemoryServiceError::Denied)
+    ));
+    assert!(MemoryDocumentKey::new("../private").is_err());
 }

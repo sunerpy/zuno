@@ -1288,7 +1288,7 @@ authentication nor an enterprise approval service. Organization policy must also
 be rechecked by the committing backend; a preflight policy decision cannot replace
 transactional session-generation, source-validity or learning-lease checks.
 
-Candidate lookup and edit enforce the same document-path ownership as apply and
+Candidate lookup and edit enforce the same document ownership as apply and
 undo. An out-of-scope candidate returns a denied result without disclosing its
 path. Model Memory tools use the immutable call origin for session and message
 provenance; changing a tool context's public fields cannot change that origin.
@@ -1297,9 +1297,18 @@ Authority denial is a permission failure, not a model-correctable proposal.
 These synchronous persistence transactions belong to the Memory data owner.
 Remote HTTP/state-service consumers need bounded execution around that owner;
 they must not block an Agent Worker's async reactor on a remote backend call.
-Local file projection remains explicit in this implementation. Managed document
-namespaces, enterprise authorization and the PostgreSQL provider are subsequent
-integration work, not capabilities implied by an injectable trait.
+`MemoryService::storage_only` accepts validated logical `MemoryDocumentKey`
+identities and has no filesystem projection. Logical keys are compared exactly;
+they are never canonicalized as host paths. Candidate validation, revision CAS,
+evidence filtering, maintenance and undo still use the same service. File import
+is refused in this mode; unexplained legacy in-flight state requires inspection.
+`paths()` returns an optional projection, preserving explicit local file behavior.
+
+The persistence port returns domain errors rather than requiring every backend
+to manufacture a SQLite failure. `Unavailable` and `Conflict` retain typed
+learning recovery; local database failures retain their original variants.
+Enterprise authorization and the PostgreSQL provider remain subsequent
+integration work, not capabilities implied by logical document support alone.
 
 Resident Memory has one model-visible mutation boundary: `memory_update`. It
 validates add/replace/remove operations and inserts a durable `MemoryCandidate`;

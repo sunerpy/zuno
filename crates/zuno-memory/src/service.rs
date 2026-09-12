@@ -30,6 +30,49 @@ pub struct ScopePaths {
     project: PathBuf,
 }
 
+/// A storage identity, never a file path supplied by a model or client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryDocumentKey(String);
+impl MemoryDocumentKey {
+    pub fn new(value: impl Into<String>) -> Result<Self, MemoryServiceError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 512
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+        {
+            return Err(MemoryServiceError::Invalid(
+                "invalid logical Memory document key".to_owned(),
+            ));
+        }
+        Ok(Self(value))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone)]
+enum MemoryLocations {
+    Files(ScopePaths),
+    Logical {
+        global: MemoryDocumentKey,
+        project: MemoryDocumentKey,
+    },
+}
+impl MemoryLocations {
+    fn key(&self, scope: Scope) -> String {
+        match self {
+            Self::Files(paths) => paths.wire_path(scope),
+            Self::Logical { global, project } => match scope {
+                Scope::Global => global.as_str().to_owned(),
+                Scope::Project => project.as_str().to_owned(),
+            },
+        }
+    }
+}
+
 impl ScopePaths {
     #[must_use]
     pub fn discover(worktree: &Path) -> Self {
@@ -115,6 +158,10 @@ pub struct MemorySnapshot {
 pub enum MemoryServiceError {
     #[error("memory access is not authorized for this scope")]
     Denied,
+    #[error("the Memory state service is temporarily unavailable")]
+    Unavailable,
+    #[error("Memory state changed concurrently")]
+    Conflict,
     #[error(transparent)]
     Database(#[from] zuno_error::DbError),
     #[error(transparent)]
@@ -130,7 +177,7 @@ impl MemoryServiceError {
         match self {
             Self::Invalid(_) => true,
             Self::Resident(error) => error.is_proposal_correctable(),
-            Self::Database(_) | Self::Denied => false,
+            Self::Database(_) | Self::Denied | Self::Unavailable | Self::Conflict => false,
         }
     }
 }
@@ -140,7 +187,7 @@ impl MemoryServiceError {
 pub struct MemoryService {
     persistence: Arc<dyn MemoryPersistence>,
     authority: Arc<dyn MemoryAuthority>,
-    paths: ScopePaths,
+    locations: MemoryLocations,
     limits: ScopeLimits,
     promotion: PromotionPolicy,
     observer: Option<Arc<dyn MemoryObserver>>,
@@ -176,7 +223,7 @@ impl MemoryService {
         Self {
             persistence,
             authority,
-            paths,
+            locations: MemoryLocations::Files(paths),
             limits,
             promotion,
             observer: None,
@@ -190,8 +237,39 @@ impl MemoryService {
     }
 
     #[must_use]
-    pub fn paths(&self) -> &ScopePaths {
-        &self.paths
+    pub fn paths(&self) -> Option<&ScopePaths> {
+        match &self.locations {
+            MemoryLocations::Files(paths) => Some(paths),
+            MemoryLocations::Logical { .. } => None,
+        }
+    }
+
+    /// Use logical storage identities without filesystem discovery or projection.
+    pub fn storage_only(
+        persistence: Arc<dyn MemoryPersistence>,
+        authority: Arc<dyn MemoryAuthority>,
+        global: MemoryDocumentKey,
+        project: MemoryDocumentKey,
+        limits: ScopeLimits,
+        promotion: PromotionPolicy,
+    ) -> Result<Self, MemoryServiceError> {
+        if global == project {
+            return Err(MemoryServiceError::Invalid(
+                "Memory scopes need distinct keys".to_owned(),
+            ));
+        }
+        Ok(Self {
+            persistence,
+            authority,
+            locations: MemoryLocations::Logical { global, project },
+            limits,
+            promotion,
+            observer: None,
+        })
+    }
+
+    fn local_paths(&self) -> Result<&ScopePaths, MemoryServiceError> {
+        self.paths().ok_or(MemoryServiceError::Denied)
     }
 
     pub fn scope_limit(&self, scope: MemoryScope) -> usize {
@@ -576,7 +654,7 @@ impl MemoryService {
             return Ok(MemorySnapshot {
                 scope: scope.into(),
                 revision: 0,
-                source: format!("{}#unimported", self.paths.wire_path(scope)),
+                source: format!("{}#unimported", self.locations.key(scope)),
                 content: String::new(),
                 digest: hex::encode(Sha256::digest(b"")),
                 projected_revision: 0,
@@ -625,7 +703,7 @@ impl MemoryService {
                 paths.push(self.document(scope)?.path);
             }
         }
-        self.persistence.views(&paths).map_err(Into::into)
+        self.persistence.views(&paths)
     }
 
     pub fn read_for_model(
@@ -671,6 +749,20 @@ impl MemoryService {
         for scope in Scope::ALL {
             self.authority
                 .authorize(scope.into(), MemoryAccess::Maintain)?;
+        }
+        if matches!(self.locations, MemoryLocations::Logical { .. }) {
+            if self.records()?.iter().any(|candidate| {
+                matches!(
+                    candidate.projection.status,
+                    MemoryCandidateStatus::Applying
+                        | MemoryCandidateStatus::Undoing
+                        | MemoryCandidateStatus::Uncertain
+                )
+            }) {
+                return Err(MemoryServiceError::Invalid(
+                    "logical Memory contains an unresolved legacy write; inspect its authoritative state".to_owned()));
+            }
+            return Ok(());
         }
         let mut changed = false;
         for candidate in self.records()?.into_iter().filter(|candidate| {
@@ -756,8 +848,11 @@ impl MemoryService {
             zuno_db::message::now_millis(),
         ) {
             Ok(_) => Ok(()),
-            Err(DbError::Conflict { .. } | DbError::NotFound { .. }) => Ok(()),
-            Err(error) => Err(error.into()),
+            Err(
+                MemoryServiceError::Database(DbError::Conflict { .. } | DbError::NotFound { .. })
+                | MemoryServiceError::Conflict,
+            ) => Ok(()),
+            Err(error) => Err(error),
         }
     }
 
@@ -765,8 +860,8 @@ impl MemoryService {
         for scope in Scope::ALL {
             self.authority.authorize(scope.into(), MemoryAccess::Read)?;
         }
-        let global = self.paths.wire_path(Scope::Global);
-        let project = self.paths.wire_path(Scope::Project);
+        let global = self.locations.key(Scope::Global);
+        let project = self.locations.key(Scope::Project);
         let mut records = self.persistence.candidates_for_paths(&global, &project)?;
         let canonical_global = self.resolved_path(Scope::Global)?;
         let canonical_project = self.resolved_path(Scope::Project)?;
@@ -783,13 +878,15 @@ impl MemoryService {
         Ok(records)
     }
 
-    fn open(&self, scope: Scope) -> Result<MemoryStore, MemoryError> {
-        validate_managed_path(self.paths.for_scope(scope))?;
+    fn open(&self, scope: Scope) -> Result<MemoryStore, MemoryServiceError> {
+        let paths = self.local_paths()?;
+        validate_managed_path(paths.for_scope(scope))?;
         MemoryStore::open_with_limit(
             scope,
-            self.paths.for_scope(scope).to_path_buf(),
+            paths.for_scope(scope).to_path_buf(),
             self.limits.for_scope(scope),
         )
+        .map_err(Into::into)
     }
 
     fn ensure_owned_path(
@@ -797,6 +894,13 @@ impl MemoryService {
         candidate: &MemoryCandidateRecord,
     ) -> Result<(), MemoryServiceError> {
         let expected = self.resolved_path(Scope::from(candidate.projection.scope))?;
+        if matches!(self.locations, MemoryLocations::Logical { .. }) {
+            return if candidate.target_path == expected {
+                Ok(())
+            } else {
+                Err(MemoryServiceError::Denied)
+            };
+        }
         let candidate_path =
             zuno_atomic_file::canonical_destination(Path::new(&candidate.target_path))
                 .map_err(|_| MemoryServiceError::Denied)?;
@@ -807,14 +911,19 @@ impl MemoryService {
     }
 
     fn resolved_path(&self, scope: Scope) -> Result<String, MemoryServiceError> {
-        validate_managed_path(self.paths.for_scope(scope))?;
-        let path = zuno_atomic_file::canonical_destination(self.paths.for_scope(scope)).map_err(
-            |source| MemoryError::Io {
-                operation: "resolve resident memory identity",
-                path: self.paths.for_scope(scope).to_path_buf(),
-                source,
-            },
-        )?;
+        if matches!(self.locations, MemoryLocations::Logical { .. }) {
+            return Ok(self.locations.key(scope));
+        }
+        let paths = self.local_paths()?;
+        validate_managed_path(paths.for_scope(scope))?;
+        let path =
+            zuno_atomic_file::canonical_destination(paths.for_scope(scope)).map_err(|source| {
+                MemoryError::Io {
+                    operation: "resolve resident memory identity",
+                    path: paths.for_scope(scope).to_path_buf(),
+                    source,
+                }
+            })?;
         path.to_str().map(str::to_owned).ok_or_else(|| {
             MemoryServiceError::Invalid("resident memory path must be valid Unicode".to_owned())
         })
@@ -839,19 +948,26 @@ impl MemoryService {
                 "resident memory at {key} has an unresolved legacy write; inspect it and explicitly import the projection"
             )));
         }
-        let resident = self.open(scope)?;
-        Ok(self.persistence.adopt(
-            &key,
-            scope.into(),
-            resident.entries(),
-            zuno_db::message::now_millis(),
-        )?)
+        let entries = if matches!(self.locations, MemoryLocations::Logical { .. }) {
+            Vec::new()
+        } else {
+            self.open(scope)?.entries().to_vec()
+        };
+        self.persistence
+            .adopt(&key, scope.into(), &entries, zuno_db::message::now_millis())
     }
 
     fn project_document(
         &self,
         document: &ResidentMemoryDocument,
     ) -> Result<bool, MemoryServiceError> {
+        if matches!(self.locations, MemoryLocations::Logical { .. }) {
+            if document.path != self.resolved_path(Scope::from(document.scope))? {
+                return Err(MemoryServiceError::Denied);
+            }
+            return Ok(true);
+        }
+        let paths = self.local_paths()?;
         let expected = if document.projected_revision == 0 {
             Vec::new()
         } else {
@@ -860,7 +976,7 @@ impl MemoryService {
         };
         let scope = Scope::from(document.scope);
         let projection = (|| -> Result<(), MemoryError> {
-            validate_managed_path(self.paths.for_scope(scope))?;
+            validate_managed_path(paths.for_scope(scope))?;
             validate_managed_path(Path::new(&document.path))?;
             let mut file = MemoryStore::open_with_limit(
                 scope,
@@ -876,21 +992,23 @@ impl MemoryService {
             Ok(())
         })();
         let error = projection.err().map(|error| error.to_string());
-        Ok(self.persistence.record_projection(
-            &document.path,
-            document.revision,
-            error.as_deref(),
-        )?)
+        self.persistence
+            .record_projection(&document.path, document.revision, error.as_deref())
     }
 
     fn import_required(&self, scope: Scope) -> Result<bool, MemoryServiceError> {
-        let key = zuno_atomic_file::canonical_destination(self.paths.for_scope(scope)).map_err(
-            |source| MemoryError::Io {
-                operation: "resolve resident memory identity",
-                path: self.paths.for_scope(scope).to_path_buf(),
-                source,
-            },
-        )?;
+        if matches!(self.locations, MemoryLocations::Logical { .. }) {
+            return Ok(false);
+        }
+        let paths = self.local_paths()?;
+        let key =
+            zuno_atomic_file::canonical_destination(paths.for_scope(scope)).map_err(|source| {
+                MemoryError::Io {
+                    operation: "resolve resident memory identity",
+                    path: paths.for_scope(scope).to_path_buf(),
+                    source,
+                }
+            })?;
         if self.persistence.document(&key.to_string_lossy())?.is_some() {
             return Ok(false);
         }
@@ -912,13 +1030,15 @@ impl MemoryService {
     ) -> Result<MemorySnapshot, MemoryServiceError> {
         self.authority.authorize(scope, MemoryAccess::Import)?;
         let scope = Scope::from(scope);
-        let key = zuno_atomic_file::canonical_destination(self.paths.for_scope(scope)).map_err(
-            |source| MemoryError::Io {
-                operation: "resolve resident memory identity",
-                path: self.paths.for_scope(scope).to_path_buf(),
-                source,
-            },
-        )?;
+        let paths = self.local_paths()?;
+        let key =
+            zuno_atomic_file::canonical_destination(paths.for_scope(scope)).map_err(|source| {
+                MemoryError::Io {
+                    operation: "resolve resident memory identity",
+                    path: paths.for_scope(scope).to_path_buf(),
+                    source,
+                }
+            })?;
         let resident = self.open(scope)?;
         let operations: Vec<_> = resident
             .entries()

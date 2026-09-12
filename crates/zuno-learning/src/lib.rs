@@ -122,6 +122,9 @@ impl Recoverable for LearningServiceError {
             Self::Database(error) => Recoverable::recovery(error),
             Self::Learning(error) => Recoverable::recovery(error),
             Self::Memory(MemoryServiceError::Database(error)) => Recoverable::recovery(error),
+            Self::Memory(MemoryServiceError::Unavailable | MemoryServiceError::Conflict) => {
+                Recovery::Retry { after: None }
+            }
             Self::Memory(
                 MemoryServiceError::Denied
                 | MemoryServiceError::Resident(_)

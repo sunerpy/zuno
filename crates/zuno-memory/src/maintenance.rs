@@ -59,7 +59,6 @@ impl MemoryService {
         let project = self.document(Scope::Project)?;
         self.persistence
             .maintenance_state(project_id, &project.path)
-            .map_err(Into::into)
     }
 
     /// Existing direct user changes are higher-priority correction/forget signals

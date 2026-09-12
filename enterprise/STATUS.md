@@ -309,3 +309,10 @@ Windows rerun remains required. Both pipeline guides document the behavior.
 - Public Job views now expose safe typed wait targets so clients can discover approval IDs. They still omit grants, checkpoints and private replay material. Full final-message/activity projection, workspace provisioning, enterprise Memory, distributed children/Workflow/Council, React/ACP and P6 acceptance remain outstanding.
 - Documentation impact: both deployment guides and typed templates, Worker/wait/state/application/runtime references and workspace inventories are updated. No release is enabled; documentation remains an isolated preview artifact.
 - Validation passed: enterprise configuration/budget tests, shared dispatch tests, real Docker/PostgreSQL/HTTPS/independent-process contracts, workspace check and Clippy, 100 documentation/release contracts, CI-tool and preview publisher tests, personal dependency isolation, formatting and diff checks. The explicit crate roster and both inventories now contain 55 crates. Remote CI remains required before integration.
+
+## Logical Memory storage boundary
+
+- `MemoryService` now supports validated logical document keys independently of optional local file projection. Shared candidate/revision/evidence/undo behavior is preserved; logical mode refuses file imports and never treats a document key as a host path.
+- The persistence contract uses Memory domain errors. External backends can report denial, conflict and temporary unavailability directly while the SQLite provider preserves its existing database errors. Learning retry classification remains typed.
+- A focused regression first failed because logical storage required local paths. It now passes proposal/apply/snapshot/undo and foreign-document refusal with no projection; local Memory and automatic-learning regressions also pass.
+- PostgreSQL persistence, organization authorization, scope-wide caches and enterprise maintenance producers still require implementation. This foundation is not an enabled enterprise Memory feature.

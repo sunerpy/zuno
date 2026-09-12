@@ -447,6 +447,7 @@ async fn consolidation_corrects_managed_memory_and_forgetting_does_not_restore_o
             fixture
                 .memory
                 .paths()
+                .unwrap()
                 .for_scope(zuno_memory::Scope::Project)
         )
         .expect("projection")
@@ -906,7 +907,11 @@ async fn worktree_bindings_do_not_consume_or_exhaust_each_others_memory_jobs() {
     let other_memory = Arc::new(MemoryService::new(
         fixture.pool.clone(),
         ScopePaths::at(
-            fixture.memory.paths().for_scope(zuno_memory::Scope::Global),
+            fixture
+                .memory
+                .paths()
+                .unwrap()
+                .for_scope(zuno_memory::Scope::Global),
             fixture._dir.path().join("other-worktree/RULES.md"),
         ),
         ScopeLimits::default(),

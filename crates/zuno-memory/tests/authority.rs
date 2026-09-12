@@ -180,7 +180,7 @@ fn accepted_memory_survives_missing_projection_and_repairs_from_the_revision() {
     std::fs::remove_file(directory.path().join("project.md")).expect("lose derived file");
     let restarted = MemoryService::new(
         pool,
-        service.paths().clone(),
+        service.paths().unwrap().clone(),
         ScopeLimits::default(),
         PromotionPolicy::Review,
     );
