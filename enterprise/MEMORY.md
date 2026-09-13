@@ -182,6 +182,23 @@ commits candidates, evidence, revisions, Job settlement and watermark atomically
 High-confidence supported changes may apply; other candidates remain reviewable.
 User-owned entries and explicitly retired content remain protected.
 
+The data owner also reconstructs maintenance wakes from durable private Memory
+changes and evidence validity. Once an authorized source has been extracted,
+manual corrections and invalidated support can schedule maintenance without a new
+foreground turn or extraction request. Only current configured source/model
+bindings and current owner/session consent qualify. The scan rechecks those facts
+inside the owner transaction and admits at most one active maintenance batch per
+workspace.
+
+At claim, changed document revisions or evidence retire an obsolete queued
+snapshot before model admission. In-flight results still require the original
+revision/evidence checks at settlement; a later scan builds a new bounded batch
+for the changed input. Worker replacement retains an existing Job's budget.
+Unchanged successful input and a cancelled identical batch do not schedule again.
+Source invalidation suppresses recall immediately; maintenance may then remove the
+unsupported managed entry. Its own successful document changes do not create a
+self-sustaining model loop.
+
 Normal Agent work takes priority when a Worker polls. Learning uses the same
 bounded Worker slots, continues lease renewal during model I/O, and drains under
 the existing Worker shutdown deadline. The control plane handles state only.

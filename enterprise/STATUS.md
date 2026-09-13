@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p5-learning-activity`.
+- Current phase branch: `codex/enterprise-p2-memory-maintenance-wake`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -508,3 +508,11 @@ Workflow PR #218 initially exposed an arm64 stack overflow in the PostgreSQL con
 - PR #229's ancestry synchronization retained the validated source tree. Run `34729620253` passed enterprise Linux amd64/arm64 and all other independent gates, but a personal Windows fixture failed: its shared-memory SQL polling opened a connection during asynchronous journal writing (`SQLITE_LOCKED`).
 - The fixture now waits for a notification emitted after settlement, stops the owned supervisor, and verifies exactly one durable completion and model request. Runtime scheduling and timeouts remain unchanged. All 25 learning runtime tests pass locally; exact-head Windows CI remains required.
 - Documentation impact: this is test synchronization only, with no user-facing behavior or configuration change. UI work remains paused and excluded.
+
+## Independent maintenance wakes
+
+- The scheduler reconstructs missed maintenance wakes from current private Memory revisions/signals and evidence, anchored to a completed authorized extraction. It rechecks consent and the installed immutable configuration under the owner lock, permits one active maintenance batch per workspace and preserves cancelled identical-input identities.
+- Claim retires obsolete queued snapshots before model admission. In-flight settlement still rejects changed revisions; the following scan creates a new bounded batch for current state. Source loss suppresses recall before maintenance and can trigger a supported retraction. Maintenance's own successful writes do not cause repeated requests.
+- The new regression first failed because a manual correction scheduled zero Jobs. PostgreSQL/HTTPS now pass queued/in-flight races, cancellation, evidence loss, recall suppression and two independent schedulers creating exactly one wake. The real five-process fixture passes with 47 model requests: a direct manual correction starts only maintenance, without another foreground turn or extraction. The large fault-test future is heap allocated to retain the default thread stack. Workspace check/Clippy, 100 documentation/release contracts and fmt/diff pass locally.
+- Private learning PR #229 passed all 21 checks in run `34731217056`, including native Windows, and merged only into preview at `56d95a2971c4ead8b00ddc87fa6023fd86734c2d`. Public learning activity PR #230 is separate; this maintenance batch still needs its own exact-head CI.
+- Public protocols and PostgreSQL format 21 are unchanged. English/Chinese Memory and runtime guides record the new behavior. Full P0–P6 backend acceptance remains open; UI stays paused for Penpot.

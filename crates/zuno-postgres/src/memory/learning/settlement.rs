@@ -81,6 +81,36 @@ impl PostgresLearningRuntime {
 }
 
 impl TransactionMemory {
+    pub(super) async fn maintenance_current(
+        &self,
+        tx: &mut Tx,
+        job: &LearningExecution,
+    ) -> Result<bool, Error> {
+        if !matches!(job.input, LearningInput::Maintenance(_)) {
+            return Ok(true);
+        }
+        let row = self.execution_row(tx, &job.id).await?;
+        let context: MaintenanceContext =
+            serde_json::from_value(row.try_get("context").map_err(sql_error)?)
+                .map_err(decode_error)?;
+        for frozen in &context.views {
+            let current = self.view(tx, &frozen.document.path).await?;
+            if current.document.revision != frozen.document.revision
+                || current.suppressed != frozen.suppressed
+            {
+                return Ok(false);
+            }
+        }
+        if !context.references.is_empty()
+            && !self
+                .references_current(tx, &context.references, true)
+                .await?
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     async fn settle_extraction(
         &self,
         tx: &mut Tx,
@@ -201,11 +231,29 @@ impl TransactionMemory {
         Ok(())
     }
 
-    fn schedule_maintenance(
+    pub(super) fn schedule_maintenance(
         self: &Arc<Self>,
         job: &LearningExecution,
         extraction: &ExtractionContext,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
+        let pending = self.execute(async |tx| {
+            query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM zuno_enterprise_preview.learning_execution e
+                 JOIN zuno_enterprise_preview.learning_job j
+                   ON j.tenant_id=e.tenant_id AND j.principal_id=e.principal_id AND j.id=e.job_id
+                 WHERE e.tenant_id=$1 AND e.principal_id=$2 AND j.workspace_id=$3
+                   AND e.phase='maintenance' AND j.status IN('queued','running'))",
+            )
+            .bind(self.principal.tenant_id().as_str())
+            .bind(self.principal.principal_id().as_str())
+            .bind(self.workspace.as_str())
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(sql_error)
+        })?;
+        if pending {
+            return Ok(false);
+        }
         let service = self.service()?;
         let views = service.read_views()?;
         let signals = service.maintenance_signals()?;
@@ -263,8 +311,13 @@ impl TransactionMemory {
                 ));
             }
         }
-        if references.is_empty() && views.iter().all(|view| view.suppressed.is_empty()) {
-            return Ok(());
+        let suppressed = views
+            .iter()
+            .filter(|view| !view.suppressed.is_empty())
+            .map(|view| json!([view.document.scope, view.suppressed]))
+            .collect::<Vec<_>>();
+        if references.is_empty() && suppressed.is_empty() {
+            return Ok(false);
         }
         let digest = zuno_orchestration::sha256_json(&json!([
             references,
@@ -287,21 +340,33 @@ impl TransactionMemory {
             project_revision: project.document.revision,
         };
         let state = service.maintenance_state(self.workspace.as_str())?;
-        if state.is_some_and(|state| {
-            state.input_digest == digest
-                && state.global_revision == global.document.revision
-                && state.project_revision == project.document.revision
-        }) {
-            return Ok(());
+        if suppressed.is_empty()
+            && state.is_some_and(|state| {
+                state.input_digest == digest
+                    && state.global_revision == global.document.revision
+                    && state.project_revision == project.document.revision
+            })
+        {
+            return Ok(false);
+        }
+        // Preserve the original identity for ordinary batches, including prior
+        // cancelled work. Source invalidation can change recall without a document
+        // revision; bind that fact only when it is present.
+        let mut identity = json!([
+            self.principal.owner(),
+            self.workspace,
+            batch,
+            extraction.maintenance,
+        ]);
+        if !suppressed.is_empty() {
+            identity
+                .as_array_mut()
+                .ok_or(Error::InvalidData)?
+                .push(json!(suppressed));
         }
         let id = JobId::new(format!(
             "maintain_{}",
-            zuno_orchestration::sha256_json(&json!([
-                self.principal.owner(),
-                self.workspace,
-                batch,
-                extraction.maintenance,
-            ]))
+            zuno_orchestration::sha256_json(&identity)
         ))
         .map_err(decode_error)?;
         let context = MaintenanceContext {
@@ -319,7 +384,7 @@ impl TransactionMemory {
                 id:&id,source_job:&source_job,session:&job.session,configuration:&extraction.maintenance,
                 input:LearningInput::Maintenance(request),limits:&extraction.maintenance_limits,context:json!(context),
             }).await?;}
-            Ok(())
+            Ok(!exists)
         })
     }
 
