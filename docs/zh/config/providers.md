@@ -337,6 +337,24 @@ turn loop 无法表达的。
 不一致的同名声明只会招来 Zuno 一定会拒绝的调用。当一轮不带锁定集时——标题、摘要、压缩请求
 ——`options.tools` 会原样发送。
 
+历史工具输入不等于当前可调用工具。普通 Agent 请求若解析到 Responses surface，或解析后的
+选项显式设置 `reasoningReplay: "encrypted"`，会保留既有工具调用及结果的原始内容、call id、
+arguments 字符串、顺序和边界；当前工具缺失、权限收紧、hook 移除声明或 schema 结构变化，
+都不会让这些历史交互转成惰性文本，也不会删除 Goal、Plan、Todo 的旧状态调用。Responses
+上的这条规则不要求开启加密重放；`reasoningReplay: "off"` 仍不发送封装推理。
+surface 优先级为显式 `ResolvedModel.surface` > adapter 已解析的 `Capabilities.default_surface` >
+`Spec.surface`。没有显式模型 surface 时，仅在 adapter 仍为 `Default`（未知）时回退到 Spec；
+Spec 不能覆盖 adapter 已解析的结果，全部仍为 `Default` 时保持未知、不猜测。
+没有模型覆盖时，compatible fixed profile 忽略冲突的 Spec：`xai` 即使设置
+`Spec.surface = Chat` 仍走 Responses；`openrouter` 即使设置 `Spec.surface = Responses`
+仍走 Chat。OpenAI 在 model 与 Spec 都为 `Default` 时仍解析为 Responses。`Provider` trait 仍只有三个方法，
+复用能力声明，不新增用户配置。
+
+历史保留既不扩张本轮工具清单，也不恢复工具权限或重执行旧调用。engine 工具 dispatch 使用
+与 provider 收到的相同、经 `prepare_request` 收窄的快照，而非更宽的 hook 前 registry。新调用仍受该快照、
+schema 校验、权限与风险门禁约束。其他协议继续使用现有声明 fallback；无工具的内部压缩
+仍使用独立的工具无关投影，将历史交互转为有界说明且不携带封装推理。
+
 `toolChoice` 只在请求体确实带着它所指名的那个工具时才发送。Anthropic 与 Vertex Anthropic
 surface 上的 `{"type": "tool", "name": "…"}`，以及 Gemini 上限定单个函数的写法，在被指名的
 工具不在请求里时都是永久 400，因此不可满足的选择会被丢弃，而不是变成一轮失败。此时模型自行
@@ -400,9 +418,32 @@ Responses function tools；同名的配置工具会由锁定声明覆盖。
 
 重放还必须与端点的指纹一致。工具调用会用 provider 自己的 `arguments` 字节重放，而不是把解析后的值重新序列化，因为键顺序与空格也是被签名内容的一部分。如果某个步骤的封装项后面没有任何输出（例如步骤被打断，或整份输出预算都花在推理上），这一项会被扣留而不是单独发出，因为 Responses 端点会拒绝这种形状；它计入被扣留数，而不算作一次重放。项 id 不会回送：重放项只带 `type`、`summary`、`encrypted_content` 与 `status`。
 
+历史保护模块复用共享 Responses 最大 assistant 组边界，保护绑定输出、项顺序与输入边界，
+阻止 hook 通过插入或改写同组相邻未密封 assistant 内容绕过保护；受保护组外的未密封普通文本
+仍允许原先的 hook 行为。符合重放条件的密封请求组装后，guard 还锁定 hook 前后的模型与
+surface，并在 dispatch 前拒绝请求参数中的 `input`、`messages` 或 `model` 覆盖。
+当前工具清单变化不能作为改写历史绑定输出的理由；Zuno 保留历史而不重新开放工具。
+这项修复不新增用户配置或数据库迁移，不修改原始持久历史；provider/model、年龄、`off`
+与歧义组 withholding 策略保持不变。
+
+若 `text_complete` 改写刚完成的 provider-sealed 输出，Zuno 会恢复原始文本并返回 Hook 错误；
+失配文本不会持久化，该错误也不会自动重试。sealed-history guard 仅使用哈希快照保护历史，
+不会打印 capsule 内容。
+
+遇到 `400 reasoning_replay_context_mismatch`，应保留原始历史和脱敏错误诊断，核对回放内容
+与绑定关系，而不是盲目重试、全局关闭或删除 reasoning，或更换账户来绕过校验。Kiro Provider
+v3.1.1 的回放绑定校验保持不变；现有有效的 Zuno Responses 配置不需要新增设置。该错误不因
+本修复而变成可重试错误；真实会话是否已成功恢复，需要另外核验，不能由配置或版本号推断。
+
+Kiro v3.1.1 会在完整历史引用了本轮工具清单之外的工具时返回
+`missing_tool_declaration`。此场景需使用 Kiro v3.1.2 的历史工具作用域修复，将历史校验
+与当前工具授权分离，无需新增 Zuno 配置。缺少可证明原始别名绑定的旧 namespace/custom
+历史仍返回 `missing_historical_tool_binding`，不会猜测身份。不要重新公开已禁用工具或
+删除密封推理来绕过校验；必须先在实际端点上验证收窄工具后的回放，才能报告真实会话恢复成功。
+
 自动 Goal continuation 的输入边界也会被保留。Zuno 会在新 turn 的第一条 assistant 行上只保存 prompt receipt 引用，并在两个 assistant 响应于 Responses `input` 中直接相邻时，从 receipt 的 hook 后实际投影恢复动态 developer context 后缀。该后缀会成为后一个请求消息上的结构化 `ResponsesInputBoundary` sidecar，由 OpenAI、OpenAI-compatible 与 Bedrock Mantle/Runtime 共用的 Responses cursor 投影；通用 `Message`、Chat、Anthropic Messages 与 Converse 路径不读取它，空边界也不会改变普通请求 JSON。旧版本的行会从 provider request 事件找到准确 receipt，并先剥离稳定的 runtime policy 前缀。这样每个加密信封仍只对应铸造它的那一个 turn 的输出指纹，不需要伪造 user 消息或工具结果。若旧 export、压缩摘要或损坏历史没有可证明的 receipt，Zuno 会仅扣留歧义组中的 capsule，保留其余文本与工具历史；最后的 provider 校验只报告消息索引而不会输出 token。
 
-默认值 `off` 表示请求既不带 `include`，也不带任何封装项，包括同一会话在选项为 `encrypted` 时存下的信封。它并不承诺请求字节与既有版本一致：本次发布还会按模型流出的顺序发送每个 assistant 轮次的 Responses `input`，因此先写文本再调用工具的一轮，现在会先发文本项再发 function call —— 这对所有 Responses provider 生效，与 `reasoningReplay` 的取值无关。这个顺序正是封装端点会校验的内容；一次性代价是仅追加的提示词缓存前缀会失效一次。
+默认值 `off` 表示请求既不带 `include`，也不带任何封装项，包括同一会话在选项为 `encrypted` 时存下的信封。原生历史工具回放与 assistant 项顺序适用于所有 Responses provider，与 `reasoningReplay` 的取值无关：先写文本再调用工具的一轮，会先发文本项再发 function call。这个顺序正是封装端点会校验的内容。
 
 没有 `reasoningReplay: "encrypted"` 的 `reasoningReplayMaxAge` 同样会在配置期被拒绝。不要给会封装推理的端点添加 `reasoningSummary`，它会拒绝 `reasoning.summary`。
 

@@ -403,6 +403,7 @@ impl Provider for BedrockResponsesProvider {
             prompt_cache: true,
             attachments: true,
             sampling_params: false,
+            default_surface: ApiSurface::Responses,
         }
     }
 
@@ -638,6 +639,37 @@ mod tests {
             "https://bedrock-runtime.us-east-2.amazonaws.com/openai/v1/responses"
         );
         assert_eq!(runtime.signing_service(), "bedrock");
+    }
+
+    #[test]
+    fn responses_provider_declares_the_default_used_by_its_body_and_url() {
+        for (id, endpoint) in [
+            (MANTLE_PROVIDER_ID, BedrockResponsesEndpoint::Mantle),
+            (RUNTIME_PROVIDER_ID, BedrockResponsesEndpoint::Runtime),
+        ] {
+            let provider =
+                BedrockResponsesProvider::from_spec(&spec(id, None), endpoint).expect("provider");
+            assert_eq!(
+                provider.capabilities().default_surface,
+                ApiSurface::Responses
+            );
+            let request = CompletionRequest::new(
+                "openai.gpt-5.6-sol",
+                vec![Message::new(Role::User, "hello")],
+            );
+            assert_eq!(request.surface, ApiSurface::Default);
+            let body = provider.body_for(&request).expect("Responses body");
+            assert!(body["input"].is_array());
+            assert!(body.get("messages").is_none());
+            assert!(
+                provider
+                    .config()
+                    .request_url_for_region("us-east-2")
+                    .expect("request URL")
+                    .path()
+                    .ends_with("/responses")
+            );
+        }
     }
 
     #[test]

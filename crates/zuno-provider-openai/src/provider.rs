@@ -327,6 +327,7 @@ impl Provider for OpenAiProvider {
             prompt_cache: true,
             attachments: true,
             sampling_params: true,
+            default_surface: resolve_surface(self.config.surface),
         }
     }
 
@@ -577,6 +578,113 @@ fn option<'a>(options: &'a BTreeMap<String, Value>, names: &[&str]) -> Option<&'
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zuno_llm::event::{Message, Role};
+    use zuno_testkit::{MockProvider, MockResponse, Scenario};
+
+    async fn assert_surface_metadata_matches_stream(
+        configured: ApiSurface,
+        requested: ApiSurface,
+        declared_default: ApiSurface,
+        wire_surface: ApiSurface,
+    ) {
+        let expected_path = match wire_surface {
+            ApiSurface::Responses => "/v1/responses",
+            ApiSurface::Chat => "/v1/chat/completions",
+            _ => panic!("the fixture covers OpenAI's two supported wire surfaces"),
+        };
+        let server = MockProvider::start(vec![
+            Scenario::new("surface-probe")
+                .on_path(expected_path)
+                .respond(MockResponse::authored(
+                    400,
+                    "application/json",
+                    br#"{"error":{"message":"intentional local route probe","type":"invalid_request_error"}}"#.to_vec(),
+                    "Capture the real stream request route and body without claiming provider-response fidelity.",
+                )),
+        ])
+        .await
+        .expect("loopback fixture");
+        let config = OpenAiConfig::try_from_spec(
+            Spec::new("openai")
+                .with_surface(configured)
+                .with_base_url(server.base_url()),
+        )
+        .expect("fixture config");
+        let provider = OpenAiProvider {
+            client: zuno_network::direct_client_builder(
+                zuno_network::DirectPurpose::LoopbackControlPlane,
+            )
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("loopback client"),
+            auth: OpenAiAuth::Bearer(Secret::new("fixture-only")),
+            config,
+        };
+        assert_eq!(provider.capabilities().default_surface, declared_default);
+        let request = CompletionRequest::new(
+            "fixture-model",
+            vec![Message::new(Role::User, "surface probe")],
+        )
+        .on_surface(requested);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            provider.stream(request).try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("bounded loopback request")
+        .expect_err("the fixture deliberately terminates after capturing the request");
+        let captured = server.captured().await;
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].path, expected_path);
+        let body = captured[0].json().expect("captured JSON body");
+        assert_eq!(body["model"], "fixture-model");
+        assert_eq!(body["stream"], true);
+        match wire_surface {
+            ApiSurface::Responses => {
+                assert!(body["input"].is_array());
+                assert!(body.get("messages").is_none());
+            }
+            ApiSurface::Chat => {
+                assert!(body["messages"].is_array());
+                assert!(body.get("input").is_none());
+            }
+            _ => unreachable!("the fixture selected a supported wire surface"),
+        }
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn double_default_declares_responses_and_streams_a_responses_body() {
+        assert_surface_metadata_matches_stream(
+            ApiSurface::Default,
+            ApiSurface::Default,
+            ApiSurface::Responses,
+            ApiSurface::Responses,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn configured_chat_default_declares_chat_and_streams_a_chat_body() {
+        assert_surface_metadata_matches_stream(
+            ApiSurface::Chat,
+            ApiSurface::Default,
+            ApiSurface::Chat,
+            ApiSurface::Chat,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn explicit_request_surface_overrides_the_declared_default() {
+        for (configured, requested) in [
+            (ApiSurface::Chat, ApiSurface::Responses),
+            (ApiSurface::Responses, ApiSurface::Chat),
+        ] {
+            assert_surface_metadata_matches_stream(configured, requested, configured, requested)
+                .await;
+        }
+    }
 
     #[test]
     fn default_surface_targets_responses() {
