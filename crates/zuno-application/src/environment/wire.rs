@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{ApplicationError, authorization::ApprovalRecord, runtime::ExecutionLease};
 
-pub const GATEWAY_PROTOCOL_VERSION: u32 = 6;
+pub const GATEWAY_PROTOCOL_VERSION: u32 = 7;
 pub const MAX_GATEWAY_FRAME_BYTES: usize = 1024 * 1024;
 
 /// A data-owner response, never a caller-selected deployment.
@@ -54,6 +54,18 @@ pub struct GatewayOperationRequest {
 pub enum GatewayCommand {
     Acquire,
     Get,
+    PreviewEdit {
+        operation: Box<crate::workspace_edit::WorkspaceEditOperation>,
+    },
+    PrepareEdit {
+        admission: Box<crate::workspace_edit::WorkspaceEditAdmission>,
+    },
+    SubmitEdit {
+        admission: Box<crate::workspace_edit::WorkspaceEditAdmission>,
+    },
+    InspectEdit {
+        operation_id: OperationId,
+    },
     PrepareFiles {
         operation: crate::workspace_files::WorkspaceFileOperation,
     },
@@ -96,6 +108,10 @@ pub enum GatewayCommand {
 impl GatewayCommand {
     pub fn validate(&self) -> Result<(), ApplicationError> {
         match self {
+            Self::PreviewEdit { operation } => operation.validate(),
+            Self::PrepareEdit { admission } | Self::SubmitEdit { admission } => {
+                admission.validate()
+            }
             Self::PrepareFiles { operation } | Self::QueryFiles { operation } => {
                 operation.validate()
             }
@@ -187,6 +203,8 @@ impl GatewayRequest {
 )]
 pub enum GatewayReply {
     Environment(Environment),
+    EditPreview(Box<crate::workspace_edit::WorkspaceEditAdmission>),
+    EditReceipt(crate::workspace_edit::WorkspaceEditReceipt),
     Files(crate::workspace_files::WorkspaceFileReceipt),
     Approval(Box<ApprovalRecord>),
     Operation(OperationReceipt),

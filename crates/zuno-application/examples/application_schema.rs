@@ -7,6 +7,7 @@ use zuno_application::{
         CancelLearning, LearningCancellation, LearningJobView, LearningPage, LearningPageRequest,
     },
     workflow::WorkflowRunView,
+    workspace_edit::WorkspaceEditView,
     workspace_import::{BeginWorkspaceImport, WorkspaceImportView},
     workspace_merge::{MergeContentRequest, WorkspaceMergeView},
 };
@@ -30,6 +31,7 @@ struct ApplicationProtocol {
     cancellation: CancellationReceipt,
     workflow: WorkflowRunView,
     workspace_merge: WorkspaceMergeView,
+    workspace_edit: WorkspaceEditView,
     merge_content: MergeContentRequest,
     begin_workspace_import: BeginWorkspaceImport,
     workspace_import: WorkspaceImportView,

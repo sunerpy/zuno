@@ -1,5 +1,6 @@
 mod administration;
 mod boundaries;
+mod edit_results;
 mod environment;
 mod lifecycle;
 mod operation_results;
@@ -167,6 +168,7 @@ fn answer(id: &ApprovalId, key: &str) -> AnswerApproval {
     }
 }
 pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator: &PgPool) {
+    Box::pin(edit_results::exercise(backend, admin, migrator)).await;
     lifecycle::exercise(backend, admin, migrator).await;
     boundaries::exercise(backend, admin, migrator).await;
     administration::exercise(backend, admin, migrator).await;

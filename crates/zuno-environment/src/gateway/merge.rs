@@ -248,11 +248,19 @@ impl DockerGateway {
         record: &crate::ledger::MergeRecord,
     ) -> Result<Value, ApplicationError> {
         let mut labels = self.storage_labels(owner, spec)?;
+        labels
+            .as_object_mut()
+            .ok_or(ApplicationError::Conflict)?
+            .remove("zuno.edit");
+        labels
+            .as_object_mut()
+            .ok_or(ApplicationError::Conflict)?
+            .remove("zuno.edit.nonce");
         labels["zuno.merge"] = json!(record.request.id);
         labels["zuno.merge.nonce"] = json!(record.nonce);
         Ok(labels)
     }
-    async fn remove_merge_helper(
+    pub(super) async fn remove_merge_helper(
         &self,
         name: &str,
         labels: &Value,
@@ -375,100 +383,18 @@ impl DockerGateway {
             "zuno-merge-restore-{}",
             zuno_orchestration::sha256_json(&json!([owner, operation.id]))
         );
-        self.remove_merge_helper(&name, &labels).await?;
-        self.cleanup_root_metadata(&record.volume, &labels, &archive)
-            .await?;
-        match self
-            .docker
-            .json(Method::GET, &format!("/volumes/{}", record.volume), None)
-            .await
-        {
-            Ok(info) => {
-                if info.get("Labels") != Some(&labels) {
-                    return Err(ApplicationError::Conflict);
-                }
-                self.docker
-                    .json(Method::DELETE, &format!("/volumes/{}", record.volume), None)
-                    .await?;
-            }
-            Err(ApplicationError::NotFound) => {}
-            Err(error) => return Err(error),
-        }
-        self.docker
-            .json(
-                Method::POST,
-                "/volumes/create",
-                Some(&json!({"Name":record.volume,"Labels":labels})),
-            )
-            .await?;
-        let spec = &environment.spec;
-        self.docker.json(Method::POST,&format!("/containers/create?name={name}"),Some(&json!({
-            "Image":spec.image,"Cmd":["true"],"Labels":labels,
-            "HostConfig":{"ReadonlyRootfs":true,"NetworkMode":"none","CapDrop":["ALL"],"SecurityOpt":["no-new-privileges"],
-                "Memory":spec.memory_bytes,"PidsLimit":spec.pids_limit,
-                "Mounts":[{"Type":"volume","Source":record.volume,"Target":"/workspace","VolumeOptions":{"NoCopy":true}}]}
-        }))).await?;
-        let restored = archive.with_extension(format!("{}.restore", uuid::Uuid::new_v4().simple()));
-        let destination = restored.clone();
-        let source = archive.clone();
-        let expected_sha = sha.clone();
-        let size = tokio::task::spawn_blocking(move || {
-            crate::archive::verify(&source, &expected_sha, bytes)?;
-            crate::archive::for_restore(&source, &destination)
-        })
-        .await
-        .map_err(crate::storage)??;
-        let applied = self
-            .docker
-            .upload_archive(
-                &format!("/containers/{name}/archive?path=/workspace"),
-                &restored,
-                size,
-            )
-            .await;
-        let _ = tokio::fs::remove_file(&restored).await;
-        let verified = async {
-            applied?;
-            self.restore_root_metadata(&environment, &record.volume, &labels, &archive)
-                .await?;
-            let check = archive.with_extension(format!("{}.verify", uuid::Uuid::new_v4().simple()));
-            let downloaded = self
-                .docker
-                .download_archive(
-                    &format!("/containers/{name}/archive?path=/workspace"),
-                    &check,
-                    512 * 1024 * 1024,
-                )
-                .await;
-            let verify = match downloaded {
-                Ok((observed_sha, observed_bytes)) => {
-                    let observed = check.clone();
-                    let expected = archive.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let actual = crate::workspace_merge::SnapshotTree::read(
-                            &observed,
-                            &observed_sha,
-                            observed_bytes,
-                        )?;
-                        let expected =
-                            crate::workspace_merge::SnapshotTree::read(&expected, &sha, bytes)?;
-                        if actual.entries() != expected.entries() {
-                            return Err(ApplicationError::Conflict);
-                        }
-                        Ok(())
-                    })
-                    .await
-                    .map_err(crate::storage)?
-                }
-                Err(error) => Err(error),
-            };
-            let _ = tokio::fs::remove_file(&check).await;
-            verify
-        }
-        .await;
-        let cleanup = self.remove_merge_helper(&name, &labels).await;
-        verified?;
-        cleanup?;
+        self.restore_candidate(
+            &environment,
+            &record.volume,
+            &name,
+            &labels,
+            super::publication::CandidateArchive {
+                path: &archive,
+                sha256: &sha,
+                bytes,
+            },
+        )
+        .await?;
         // Publication wins or cancellation wins under the ledger transaction.
         // A partial restore remains unpublished and can be rebuilt from snapshots.
         self.ledger.publish_merge(owner, &operation.id)

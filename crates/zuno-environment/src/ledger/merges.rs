@@ -257,7 +257,8 @@ impl Ledger {
                     return Err(ApplicationError::Conflict);
                 }
             } else {
-                let command:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE tenant=?1 AND principal=?2 AND id=?3)",
+                let command:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operation WHERE tenant=?1 AND principal=?2 AND id=?3)
+                    OR EXISTS(SELECT 1 FROM workspace_edit WHERE tenant=?1 AND principal=?2 AND id=?3)",
                     params![owner.tenant_id.as_str(),owner.principal_id.as_str(),request.id.as_str()],|row|row.get(0)).map_err(storage)?;
                 if command {
                     return Err(ApplicationError::Conflict);
@@ -300,7 +301,7 @@ impl Ledger {
         let selected: Option<String> = connection
             .query_row(
                 "SELECT merge_id FROM environment_volume
-            WHERE tenant=?1 AND principal=?2 AND environment_id=?3",
+            WHERE tenant=?1 AND principal=?2 AND environment_id=?3 AND merge_id IS NOT NULL",
                 params![
                     owner.tenant_id.as_str(),
                     owner.principal_id.as_str(),
@@ -349,7 +350,8 @@ impl Ledger {
         }
         let command: bool = tx
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM operation WHERE tenant=?1 AND principal=?2 AND id=?3)",
+                "SELECT EXISTS(SELECT 1 FROM operation WHERE tenant=?1 AND principal=?2 AND id=?3)
+                 OR EXISTS(SELECT 1 FROM workspace_edit WHERE tenant=?1 AND principal=?2 AND id=?3)",
                 params![
                     owner.tenant_id.as_str(),
                     owner.principal_id.as_str(),
@@ -424,7 +426,7 @@ impl Ledger {
         tx.execute("UPDATE workspace_merge SET state='committed',receipt=?4 WHERE tenant=?1 AND principal=?2 AND id=?3 AND state='preparing'",
             params![owner.tenant_id.as_str(),owner.principal_id.as_str(),id.as_str(),serde_json::to_string(&receipt).map_err(storage)?]).map_err(storage)?;
         tx.execute("INSERT INTO environment_volume(tenant,principal,environment_id,merge_id) VALUES(?1,?2,?3,?4)
-            ON CONFLICT(tenant,principal,environment_id) DO UPDATE SET merge_id=excluded.merge_id",
+            ON CONFLICT(tenant,principal,environment_id) DO UPDATE SET merge_id=excluded.merge_id,edit_id=NULL",
             params![owner.tenant_id.as_str(),owner.principal_id.as_str(),request.environment_id.as_str(),id.as_str()]).map_err(storage)?;
         tx.commit().map_err(storage)?;
         Ok(receipt)
@@ -750,7 +752,7 @@ mod tests {
                 .query_row("SELECT version FROM gateway_format", [], |row| row
                     .get::<_, i64>(0))
                 .unwrap(),
-            4
+            FORMAT
         );
     }
 }

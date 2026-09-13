@@ -3,6 +3,7 @@ use super::*;
 pub(super) enum GatewayAdmission<'a> {
     Command(&'a zuno_application::environment::OperationAdmission),
     WorkspaceMerge(&'a zuno_application::workspace_merge::WorkspaceMergeAdmission),
+    WorkspaceEdit(&'a zuno_application::workspace_edit::WorkspaceEditAdmission),
 }
 
 fn approval_id(owner: &PrincipalKey, binding: &ApprovalBinding) -> String {
@@ -231,6 +232,9 @@ pub(super) async fn check_execution_with_admission(
         }
         Some(GatewayAdmission::WorkspaceMerge(admission)) => {
             crate::workspace_merge::admit_in(&mut tx, &checked, admission).await?
+        }
+        Some(GatewayAdmission::WorkspaceEdit(admission)) => {
+            crate::workspace_edit::admit_in(&mut tx, &checked, admission).await?
         }
         None => {}
     }

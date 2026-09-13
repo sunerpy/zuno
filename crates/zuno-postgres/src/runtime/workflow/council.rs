@@ -468,7 +468,9 @@ async fn stopped_effects(
     let rows=query("SELECT o.completion,o.completion_digest,o.producer FROM (
         SELECT tenant_id,principal_id,job_id,completion,completion_digest,'command' AS producer FROM zuno_enterprise_preview.gateway_operation
         UNION ALL SELECT tenant_id,principal_id,job_id,completion,completion_digest,'workspace_merge' AS producer
-          FROM zuno_enterprise_preview.gateway_merge_operation WHERE admitted) o
+          FROM zuno_enterprise_preview.gateway_merge_operation WHERE admitted
+        UNION ALL SELECT tenant_id,principal_id,job_id,completion,completion_digest,'workspace_edit' AS producer
+          FROM zuno_enterprise_preview.gateway_edit_operation WHERE admitted) o
         JOIN zuno_enterprise_preview.runtime_stop s ON s.tenant_id=o.tenant_id AND s.principal_id=o.principal_id AND s.job_id=o.job_id
         JOIN zuno_enterprise_preview.runtime_council_attempt a ON a.tenant_id=s.tenant_id AND a.principal_id=s.principal_id AND a.child_job_id=s.root_job_id
         JOIN zuno_enterprise_preview.runtime_council_seat c ON c.tenant_id=a.tenant_id AND c.principal_id=a.principal_id AND c.node_run_id=a.node_run_id
@@ -489,6 +491,16 @@ async fn stopped_effects(
             pending = true;
             continue;
         };
+        if row
+            .try_get::<String, _>("producer")
+            .map_err(database_error)?
+            == "workspace_edit"
+        {
+            let completion: zuno_application::workspace_edit::WorkspaceEditCompletion =
+                serde_json::from_value(raw).map_err(ApplicationError::storage)?;
+            completion.validate()?;
+            continue;
+        }
         if row
             .try_get::<String, _>("producer")
             .map_err(database_error)?

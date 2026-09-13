@@ -3,11 +3,13 @@ import type {
   WorkspaceView, SessionPage, SessionSummary, CreateSession, JobView,
   SubmitTurn, InputVersionView, ApprovalView, ApprovalDecision, CancelJob, CancellationReceipt, WorkflowRunView, WorkspaceMergeView, MergeContentSide, BeginWorkspaceImport, WorkspaceImportView,
   LearningJobView, LearningPage, LearningPageRequest, CancelLearning, LearningCancellation,
+  WorkspaceEditView,
 } from "./generated/application.js";
 import {
   validateWorkspaceView, validateSessionPage, validateSessionSummary, validateJobView,
   validateInputVersionView, validateApprovalView, validateCancellationReceipt, validateWorkflowRunView, validateWorkspaceMergeView, validateMergeContentRequest, validateWorkspaceImportView,
   validateLearningJobView, validateLearningPage, validateLearningPageRequest, validateLearningCancellation,
+  validateWorkspaceEditView,
 } from "./generated/application-validators.mjs";
 
 function checked<T>(value: unknown, validate: (value: unknown) => unknown): T {
@@ -20,6 +22,11 @@ function id(value: string): string {
 }
 
 export class EnterpriseClient extends ActivityClient {
+  async editReview(approval: string, signal?: AbortSignal): Promise<WorkspaceEditView> {
+    const value=checked<WorkspaceEditView>(await this.get(new URL(`approvals/${id(approval)}/edit`,this.base),signal),validateWorkspaceEditView);
+    if (value.approvalId!==approval) throw new Error("Edit review identity mismatch");
+    return value;
+  }
   async learningJobs(workspace: string, query: LearningPageRequest = {}, signal?: AbortSignal): Promise<LearningPage> {
     if (!validateLearningPageRequest(query)) throw new Error("Invalid learning page request");
     const url = new URL(`workspaces/${id(workspace)}/learning/jobs`, this.base);

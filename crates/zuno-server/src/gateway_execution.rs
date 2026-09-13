@@ -33,6 +33,7 @@ pub struct GatewayExecutionService {
     gateway: Arc<DockerGateway>,
     state: GatewayStateClient,
     merges: Arc<zuno_environment::MergeExecutor>,
+    edits: Arc<zuno_environment::EditExecutor>,
     snapshot_exports: Arc<tokio::sync::Semaphore>,
     snapshot_imports: Arc<tokio::sync::Semaphore>,
 }
@@ -62,6 +63,13 @@ impl GatewayExecutionService {
             }
         }
         self.merges.advance()?;
+        for admission in self.state.edit_cancellations(limit.min(32)).await? {
+            if admission.gateway_id != self.id {
+                return Err(ApplicationError::Forbidden);
+            }
+            self.gateway.cancel_admitted_workspace_edit(&admission)?;
+        }
+        self.edits.advance()?;
         if let Some(error) = failure {
             return Err(error);
         }
@@ -87,11 +95,17 @@ impl GatewayExecutionService {
             Arc::new(state.clone()),
             2,
         )?);
+        let edits = Arc::new(zuno_environment::EditExecutor::new(
+            gateway.clone(),
+            Arc::new(state.clone()),
+            2,
+        )?);
         Ok(Self {
             id,
             gateway,
             state,
             merges,
+            edits,
             snapshot_exports: Arc::new(tokio::sync::Semaphore::new(2)),
             snapshot_imports: Arc::new(tokio::sync::Semaphore::new(2)),
         })
@@ -118,6 +132,7 @@ impl GatewayExecutionService {
     }
     pub async fn drain_merges(&self, timeout: std::time::Duration) {
         self.merges.drain(timeout).await;
+        self.edits.drain(timeout).await;
     }
 
     pub fn router(self) -> Router {
@@ -163,6 +178,36 @@ impl GatewayExecutionService {
             return Err(ApplicationError::Forbidden);
         }
         let reply = match request.command {
+            GatewayCommand::PreviewEdit { operation } => {
+                self.environment(&context).await?;
+                GatewayReply::EditPreview(Box::new(
+                    self.gateway
+                        .preview_workspace_edit(self.id.clone(), &context.lease, *operation)
+                        .await?,
+                ))
+            }
+            GatewayCommand::PrepareEdit { mut admission } => {
+                admission.lease = context.lease.clone();
+                GatewayReply::Approval(Box::new(self.state.prepare_edit(*admission).await?))
+            }
+            GatewayCommand::SubmitEdit { mut admission } => {
+                admission.lease = context.lease.clone();
+                let receipt = self
+                    .gateway
+                    .admit_workspace_edit(&admission, &self.state)
+                    .await?;
+                self.edits.advance()?;
+                GatewayReply::EditReceipt(receipt)
+            }
+            GatewayCommand::InspectEdit { operation_id } => {
+                let receipt = self
+                    .gateway
+                    .inspect_workspace_edit(&context.lease.owner, &operation_id)?;
+                if receipt.environment_id != context.assignment.environment.id {
+                    return Err(ApplicationError::Forbidden);
+                }
+                GatewayReply::EditReceipt(receipt)
+            }
             GatewayCommand::PrepareFiles { operation } => GatewayReply::Approval(Box::new(
                 self.state
                     .prepare_files(zuno_application::workspace_files::GatewayFileRequest {

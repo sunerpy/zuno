@@ -76,6 +76,10 @@ ACP bridge 不应为了跳过 HITL 而加入审批应用白名单。审批决定
 初始化，导入与首轮输入不能同时接纳。恢复接纳前可取消；开始后重试同一归档或查看状态。
 详见[项目初始化](WORKSPACES.zh.md#初始化项目)。
 
+`GET /approvals/{approval}/edit` 通过当前审批查看权限返回文件编辑的完整前后文本，
+并标记是否已接纳执行。返回值不含租约、内部网关凭证或私有路径；现有审批答复接口提交
+人工决定。SDK 对应方法为 `editReview`。
+
 装配 Memory 后，`GET /workspaces/{workspace}/learning/jobs` 提供作用域化学习任务分页，
 `GET /learning/jobs/{job}` 返回安全状态和精确预算，`POST /learning/jobs/{job}/cancel`
 接受 `requestId` 幂等取消。分页参数为 `limit`（1–100）、完整的

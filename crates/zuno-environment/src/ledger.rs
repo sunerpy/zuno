@@ -1,13 +1,16 @@
 use crate::storage;
+mod edits;
 mod forks;
 mod merges;
+pub(crate) use edits::EditRecord;
 pub(crate) use forks::ForkPreparation;
 pub(crate) use merges::MergeRecord;
 const SCHEMA: &str = include_str!("schema.sql");
 const DELIVERY_SCHEMA: &str = include_str!("schema_delivery.sql");
 const FORK_SCHEMA: &str = include_str!("schema_fork.sql");
 const MERGE_SCHEMA: &str = include_str!("schema_merge.sql");
-const FORMAT: i64 = 4;
+const EDIT_SCHEMA: &str = include_str!("schema_edit.sql");
+const FORMAT: i64 = 5;
 
 fn source_digest(version: i64) -> String {
     if version == 1 {
@@ -16,9 +19,13 @@ fn source_digest(version: i64) -> String {
         zuno_orchestration::sha256_text(&format!("{SCHEMA}\n{DELIVERY_SCHEMA}"))
     } else if version == 3 {
         zuno_orchestration::sha256_text(&format!("{SCHEMA}\n{DELIVERY_SCHEMA}\n{FORK_SCHEMA}"))
-    } else {
+    } else if version == 4 {
         zuno_orchestration::sha256_text(&format!(
             "{SCHEMA}\n{DELIVERY_SCHEMA}\n{FORK_SCHEMA}\n{MERGE_SCHEMA}"
+        ))
+    } else {
+        zuno_orchestration::sha256_text(&format!(
+            "{SCHEMA}\n{DELIVERY_SCHEMA}\n{FORK_SCHEMA}\n{MERGE_SCHEMA}\n{EDIT_SCHEMA}"
         ))
     }
 }
@@ -116,7 +123,10 @@ impl Ledger {
                 if version < 3 {
                     tx.execute_batch(FORK_SCHEMA).map_err(storage)?;
                 }
-                tx.execute_batch(MERGE_SCHEMA).map_err(storage)?;
+                if version < 4 {
+                    tx.execute_batch(MERGE_SCHEMA).map_err(storage)?;
+                }
+                tx.execute_batch(EDIT_SCHEMA).map_err(storage)?;
                 tx.execute(
                     "UPDATE gateway_format SET version=?1,source_digest=?2,manifest=?3 WHERE singleton=1 AND version=?4",
                     params![FORMAT,source_digest(FORMAT),manifest(&tx)?,version],
@@ -139,6 +149,7 @@ impl Ledger {
             tx.execute_batch(DELIVERY_SCHEMA).map_err(storage)?;
             tx.execute_batch(FORK_SCHEMA).map_err(storage)?;
             tx.execute_batch(MERGE_SCHEMA).map_err(storage)?;
+            tx.execute_batch(EDIT_SCHEMA).map_err(storage)?;
             tx.execute(
                 "INSERT INTO gateway_format VALUES(1,?1,'enterprise-preview',?2,?3)",
                 params![FORMAT, source_digest(FORMAT), manifest(&tx)?],
@@ -332,7 +343,8 @@ impl Ledger {
         if pending {
             return Err(ApplicationError::Conflict);
         }
-        let merge_pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_merge WHERE tenant=?1 AND principal=?2 AND environment_id=?3 AND acknowledged=0)",
+        let merge_pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_merge WHERE tenant=?1 AND principal=?2 AND environment_id=?3 AND acknowledged=0)
+            OR EXISTS(SELECT 1 FROM workspace_edit WHERE tenant=?1 AND principal=?2 AND environment_id=?3 AND acknowledged=0)",
             params![owner.tenant_id.as_str(),owner.principal_id.as_str(),id.as_str()],|row|row.get(0)).map_err(storage)?;
         if merge_pending {
             return Err(ApplicationError::Conflict);
@@ -537,7 +549,8 @@ impl Ledger {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(storage)?;
         let owner = &lease.owner;
-        let merge_exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_merge WHERE tenant=?1 AND principal=?2 AND id=?3)",
+        let merge_exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_merge WHERE tenant=?1 AND principal=?2 AND id=?3)
+            OR EXISTS(SELECT 1 FROM workspace_edit WHERE tenant=?1 AND principal=?2 AND id=?3)",
             params![owner.tenant_id.as_str(),owner.principal_id.as_str(),request.id.as_str()],|row|row.get(0)).map_err(storage)?;
         if merge_exists {
             return Err(ApplicationError::Conflict);

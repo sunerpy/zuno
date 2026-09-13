@@ -38,6 +38,8 @@ mod browser;
 mod completion;
 #[path = "processes/council.rs"]
 mod council;
+#[path = "processes/edit.rs"]
+mod edit;
 #[path = "processes/executable.rs"]
 mod executable;
 #[path = "processes/import.rs"]
@@ -175,6 +177,9 @@ async fn model(
     }
     if user.contains("WORKFLOW-PROBE") {
         return workflow::model(&body);
+    }
+    if user.contains("EDIT-PROBE") {
+        return edit::model(&body);
     }
     if user.contains("COUNCIL-PROBE") {
         return council::model(&body);
@@ -1143,6 +1148,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
         &issuer,
     )
     .await;
+    edit::verify(&http, &control_url, &tokens["alice"], &tokens["bob"]).await;
     for child in &mut children {
         assert!(
             tokio::process::Command::new("kill")

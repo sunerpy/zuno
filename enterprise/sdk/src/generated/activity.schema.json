@@ -1464,6 +1464,23 @@
         {
           "type": "object",
           "properties": {
+            "approvalId": {
+              "$ref": "#/$defs/ApprovalId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "view_workspace_edit"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "approvalId"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "importId": {
               "$ref": "#/$defs/WorkspaceImportId"
             },

@@ -67,7 +67,7 @@ provider／model 和凭据引用，普通 task 调用不能注入任意模型／
 首次子请求只记录意图并返回稳定 Job／会话 ID。需要工作区的子任务在准备得到持久确认前
 不可领取；后台模式也先完成准备，再返回可执行 Job 句柄。
 
-Worker 协议 11 通过网关协议 6 请求 `PrepareChildWorkspace`，请求只携带已暂存子 Job ID。
+Worker 协议 11 通过网关协议 7 请求 `PrepareChildWorkspace`，请求只携带已暂存子 Job ID。
 控制面核验父租约、子归属，解析父子环境规格并记录准入；Worker 不能自行选择其他卷、
 镜像、网关或宿主路径。
 
@@ -141,7 +141,7 @@ Worker 随后持久等待，释放执行名额。网关以有界后台并发恢�
 权威。原 Worker 租约失效后，真实回执仍可投递并消费一次。
 
 网关日志格式 4、PostgreSQL 预览格式 17 通过受保护迁移增加状态。Worker 协议 11 和
-网关协议 6 需匹配部署。SDK 提供 `mergeReview` 和流式 `mergeContent`，
+网关协议 7 需匹配部署。SDK 提供 `mergeReview` 和流式 `mergeContent`，
 `UiAction::ViewWorkspaceMerge` 标识查看入口。App UI 继续等待 Penpot 设计。
 远程产物存储及完整保留／备份／滚动升级验收继续单独实施。
 

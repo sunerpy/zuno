@@ -101,6 +101,8 @@ async fn operation_ready(
         "SELECT invocation_id,completion,completion_digest,'command' AS producer FROM zuno_enterprise_preview.gateway_operation
          WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND session_id=$4 AND operation_id=$5
          UNION ALL SELECT invocation_id,completion,completion_digest,'workspace_merge' AS producer FROM zuno_enterprise_preview.gateway_merge_operation
+         WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND session_id=$4 AND operation_id=$5 AND admitted
+         UNION ALL SELECT invocation_id,completion,completion_digest,'workspace_edit' AS producer FROM zuno_enterprise_preview.gateway_edit_operation
          WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND session_id=$4 AND operation_id=$5 AND admitted",
     ).bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(job.id.as_str())
         .bind(job.session_id.as_str()).bind(operation_id.as_str()).fetch_all(&mut **tx).await.map_err(database_error)?;
@@ -130,6 +132,48 @@ async fn operation_ready(
         != Some(zuno_orchestration::sha256_json(&raw).as_str())
     {
         return Err(ApplicationError::Conflict);
+    }
+    if row
+        .try_get::<String, _>("producer")
+        .map_err(database_error)?
+        == "workspace_edit"
+    {
+        let completion: zuno_application::workspace_edit::WorkspaceEditCompletion =
+            serde_json::from_value(raw).map_err(ApplicationError::storage)?;
+        completion.validate()?;
+        let admission = &completion.admission;
+        if admission.lease.owner != owner
+            || admission.lease.job_id != job.id
+            || admission.lease.session_id != job.session_id
+            || admission.operation.id != *operation_id
+            || admission.operation.invocation_id != reference.invocation_id
+        {
+            return Err(ApplicationError::Conflict);
+        }
+        let output = zuno_tool::ToolOutput::text(
+            "Workspace edit",
+            serde_json::to_string(&completion.receipt).map_err(ApplicationError::storage)?,
+        );
+        let result = if completion.receipt.state
+            == zuno_application::workspace_edit::WorkspaceEditState::Committed
+        {
+            zuno_engine::r#loop::ToolDispatchResult::success(output)
+        } else {
+            zuno_engine::r#loop::ToolDispatchResult::error(output)
+        };
+        return Ok(Some(WaitCompletion::tool_result(
+            zuno_types::identity::CompletionId::new(format!(
+                "cmp_{}",
+                zuno_orchestration::sha256_json(&json!([
+                    "workspace-edit-result",
+                    operation_id,
+                    reference.id
+                ]))
+            ))
+            .expect("derived identity"),
+            reference.clone(),
+            result,
+        )));
     }
     if row
         .try_get::<String, _>("producer")

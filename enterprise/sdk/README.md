@@ -57,3 +57,7 @@ Rust 生成的判别联合。来源不代表执行授权。历史分页固定快
 并通过接纳查询核查。旧历史阅读窗口用 `retain: "older"` 保留旧页，返回最新时获取新快照。
 学习管理提供 `learningJobs`、`learningJob`、`cancelLearning`；保留原游标和 request ID，
 预算使用精确字符串，背景活动由类型化种类和操作展示。App/UI 仍待 Penpot 设计。
+
+`editReview(approvalId)` returns the exact approved file before/after proposal. It verifies the approval identity and excludes internal lease data; submit the existing approval answer only after reviewing this content.
+
+`editReview` 返回确切文件前后提案，核对审批身份并拒绝内部租约字段；复核内容后使用现有审批答复接口。

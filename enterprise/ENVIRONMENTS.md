@@ -119,3 +119,10 @@ Ledger format 2 adds durable completion capture and acknowledgement. Environment
 release retains output until the result owner has acknowledged it. A bounded
 delivery scan survives restarts, and an unavailable response does not discard its
 pending item. See [operation results](OPERATION_RESULTS.md).
+
+Ledger format 5 adds a separate file-edit journal and extends the active-volume
+pointer to select either a merge or an edit. The exact format-4 source digest is
+`54a732e7ef97d171824eb073d21a466353534c518b0c64e93b4ec2c227ac8b7e`.
+Atomic migration preserves existing selections; publication changes the selected
+volume, revision and receipt together. Merge and edit share candidate restore and
+read-back verification, while retaining their distinct authorization semantics.

@@ -1,7 +1,9 @@
+mod edit;
 mod files;
 mod import;
 mod merge;
 mod metadata;
+mod publication;
 mod transfer;
 mod workspace;
 
@@ -244,6 +246,9 @@ impl DockerGateway {
         owner: &PrincipalKey,
         id: &EnvironmentId,
     ) -> Result<String, ApplicationError> {
+        if let Some(edit) = self.ledger.active_edit(owner, id)? {
+            return Ok(edit.volume);
+        }
         Ok(self
             .ledger
             .active_volume(owner, id)?

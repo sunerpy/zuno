@@ -126,6 +126,7 @@ export interface ApplicationProtocol {
   submit_turn: SubmitTurn;
   workflow: WorkflowRunView;
   workspace: WorkspaceView;
+  workspace_edit: WorkspaceEditView;
   workspace_import: WorkspaceImportView;
   workspace_merge: WorkspaceMergeView;
 }
@@ -331,6 +332,17 @@ export interface NodeRunView {
 export interface WorkspaceView {
   id: WorkspaceId;
   title: string;
+}
+export interface WorkspaceEditView {
+  admitted: boolean;
+  approvalId: ApprovalId;
+  operationId: OperationId;
+  review: WorkspaceEditReview[];
+}
+export interface WorkspaceEditReview {
+  after?: string | null;
+  before?: string | null;
+  path: WorkspacePath;
 }
 export interface WorkspaceImportView {
   bytes: Counter;

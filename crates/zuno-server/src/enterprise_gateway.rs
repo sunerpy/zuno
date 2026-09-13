@@ -1,4 +1,5 @@
 //! Data-owner endpoints for gateway delegation and current operation approval.
+mod edit;
 mod files;
 mod import;
 mod merge;
@@ -104,6 +105,22 @@ impl GatewayControlService {
             .route(&format!("/{GATEWAY_TICKET_PATH}"), post(issue_ticket))
             .route(&format!("/{GATEWAY_RESOLVE_PATH}"), post(resolve))
             .route(&format!("/{GATEWAY_PREPARE_PATH}"), post(prepare))
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_EDIT_PREPARE_PATH),
+                post(edit::prepare),
+            )
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_EDIT_AUTHORIZE_PATH),
+                post(edit::authorize),
+            )
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_EDIT_COMPLETE_PATH),
+                post(edit::complete),
+            )
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_EDIT_CANCELLATIONS_PATH),
+                post(edit::cancellations),
+            )
             .route(
                 &format!("/{}", zuno_worker::GATEWAY_FILES_PREPARE_PATH),
                 post(files::prepare),
@@ -403,6 +420,23 @@ fn target(request: &GatewayRequest, context: &GatewayExecutionContext) -> Result
         && operation.environment_id != context.assignment.environment.id
     {
         return Err(Failure(StatusCode::FORBIDDEN));
+    }
+    match &request.command {
+        GatewayCommand::PreviewEdit { operation }
+            if operation.environment_id != context.assignment.environment.id =>
+        {
+            return Err(Failure(StatusCode::FORBIDDEN));
+        }
+        GatewayCommand::PrepareEdit { admission } | GatewayCommand::SubmitEdit { admission }
+            if admission.environment.spec != context.assignment.environment
+                || admission.gateway_id != context.assignment.gateway_id
+                || admission.lease.owner != context.lease.owner
+                || admission.lease.job_id != context.lease.job_id
+                || admission.lease.session_id != context.lease.session_id =>
+        {
+            return Err(Failure(StatusCode::FORBIDDEN));
+        }
+        _ => {}
     }
     Ok(())
 }
