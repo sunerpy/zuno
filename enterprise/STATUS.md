@@ -678,3 +678,14 @@ poll frame. Non-inlined entries keep future construction out of the outer
 coordinator frame. This changes test execution only; production
 behavior, schemas and public documentation contracts are unchanged. Native
 arm64 confirmation is required before merging the synchronization PR.
+
+The second CI run passed both PostgreSQL architectures but found a nonzero
+service exit during the amd64 process fixture's final shutdown. Claim conflicts
+caused by cancellation are now treated as a lost individual claim, while service
+authorization and protocol failures remain terminal. HTTPS regression covers
+409 followed by another poll and the distinct 403 refusal. Shutdown assertions
+now identify the role, exit result and bounded log tail. The updated native
+five-role fixture passed SIGTERM drain, as did workspace check/Clippy and all
+104 documentation/release contracts. The original CI exit did not record its
+role or status, so attribution to the reproduced claim race remains an inference;
+the next exact-head CI run must pass before merging.

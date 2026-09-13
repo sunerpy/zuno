@@ -200,7 +200,10 @@ impl WorkerRuntime {
                                 }
                             }
                         }
-                        Err(TurnStateError::Unavailable) => {}
+                        // A Job can be cancelled after DB claim and before its
+                        // grant response. Losing that claim does not revoke this
+                        // Worker service or authorize replay of the old Job.
+                        Err(TurnStateError::Unavailable | TurnStateError::LeaseLost) => {}
                         Err(error) => return Err(state_error(error)),
                     }
                 }
