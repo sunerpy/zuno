@@ -52,6 +52,7 @@ impl PostgresLearningRuntime {
             query("UPDATE zuno_enterprise_preview.learning_execution SET reserved_tokens=$4 WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3")
                 .bind(request.lease.owner.tenant_id.as_str()).bind(request.lease.owner.principal_id.as_str())
                 .bind(job.id.as_str()).bind(job.limits.request_tokens as i64).execute(&mut **tx).await.map_err(sql_error)?;
+            crate::learning_client::publish_in(tx,&request.lease.owner,&job.id).await.map_err(app_error)?;
             Ok(())
         })).await
     }
@@ -169,6 +170,9 @@ impl PostgresLearningRuntime {
             .bind(request.lease.owner.tenant_id.as_str()).bind(request.lease.owner.principal_id.as_str()).bind(request.lease.job_id.as_str())
             .bind(request_id).bind(if matches!(outcome,LearningModelOutcome::Completed{..}){"completed"}else{"failed"})
             .bind(json!(request.record)).bind(digest).bind(now).execute(&mut *tx).await.map_err(sql_error)?;
+        crate::learning_client::publish_in(&mut tx, &request.lease.owner, &request.lease.job_id)
+            .await
+            .map_err(app_error)?;
         tx.commit().await.map_err(sql_error)
     }
 }

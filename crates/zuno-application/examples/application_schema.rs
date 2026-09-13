@@ -3,6 +3,9 @@ use zuno_application::{
     CreateSession, SessionPage, SessionSummary,
     api::{ApprovalDecision, ApprovalView, InputVersionView, JobView, SubmitTurn, WorkspaceView},
     control::{CancelJob, CancellationReceipt},
+    learning_api::{
+        CancelLearning, LearningCancellation, LearningJobView, LearningPage, LearningPageRequest,
+    },
     workflow::WorkflowRunView,
     workspace_import::{BeginWorkspaceImport, WorkspaceImportView},
     workspace_merge::{MergeContentRequest, WorkspaceMergeView},
@@ -30,6 +33,11 @@ struct ApplicationProtocol {
     merge_content: MergeContentRequest,
     begin_workspace_import: BeginWorkspaceImport,
     workspace_import: WorkspaceImportView,
+    learning_job: LearningJobView,
+    learning_jobs: LearningPage,
+    learning_query: LearningPageRequest,
+    cancel_learning: CancelLearning,
+    learning_cancellation: LearningCancellation,
 }
 fn main() {
     println!(

@@ -11,4 +11,6 @@ export type {
   CouncilView, CouncilPhase, CouncilSeatView, CouncilSeatState,
   WorkspaceMergeView, WorkspaceMergePlan, WorkspaceChange, WorkspaceEntry, WorkspacePath, MergeChoice, MergeContentSide, MergeContentRequest,
   BeginWorkspaceImport, WorkspaceImportView, WorkspaceImportState, WorkspaceImportId,
+  LearningJobView, LearningPage, LearningPageRequest, LearningCursor,
+  LearningStage, LearningState, LearningBudgetView, LearningFailureView, CancelLearning, LearningCancellation,
 } from "./generated/application.js";

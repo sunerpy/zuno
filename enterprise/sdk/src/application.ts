@@ -2,10 +2,12 @@ import { ActivityClient } from "./client.js";
 import type {
   WorkspaceView, SessionPage, SessionSummary, CreateSession, JobView,
   SubmitTurn, InputVersionView, ApprovalView, ApprovalDecision, CancelJob, CancellationReceipt, WorkflowRunView, WorkspaceMergeView, MergeContentSide, BeginWorkspaceImport, WorkspaceImportView,
+  LearningJobView, LearningPage, LearningPageRequest, CancelLearning, LearningCancellation,
 } from "./generated/application.js";
 import {
   validateWorkspaceView, validateSessionPage, validateSessionSummary, validateJobView,
   validateInputVersionView, validateApprovalView, validateCancellationReceipt, validateWorkflowRunView, validateWorkspaceMergeView, validateMergeContentRequest, validateWorkspaceImportView,
+  validateLearningJobView, validateLearningPage, validateLearningPageRequest, validateLearningCancellation,
 } from "./generated/application-validators.mjs";
 
 function checked<T>(value: unknown, validate: (value: unknown) => unknown): T {
@@ -18,6 +20,34 @@ function id(value: string): string {
 }
 
 export class EnterpriseClient extends ActivityClient {
+  async learningJobs(workspace: string, query: LearningPageRequest = {}, signal?: AbortSignal): Promise<LearningPage> {
+    if (!validateLearningPageRequest(query)) throw new Error("Invalid learning page request");
+    const url = new URL(`workspaces/${id(workspace)}/learning/jobs`, this.base);
+    url.searchParams.set("limit", (query.limit ?? 50).toString());
+    if (query.before) {
+      url.searchParams.set("beforeCreatedAtMs", query.before.createdAtMs);
+      url.searchParams.set("beforeJobId", query.before.jobId);
+    }
+    if (query.stage) url.searchParams.set("stage", query.stage);
+    if (query.state) url.searchParams.set("state", query.state);
+    const value = checked<LearningPage>(await this.get(url, signal), validateLearningPage);
+    if (value.items.length > (query.limit ?? 50) || value.items.some((job) => job.workspaceId !== workspace)) throw new Error("Learning page identity mismatch");
+    if (value.before) {
+      const last = value.items.at(-1);
+      if (!last || value.before.createdAtMs !== last.createdAtMs || value.before.jobId !== last.id) throw new Error("Learning cursor identity mismatch");
+    }
+    return value;
+  }
+  async learningJob(job: string, signal?: AbortSignal): Promise<LearningJobView> {
+    const value = checked<LearningJobView>(await this.get(new URL(`learning/jobs/${id(job)}`, this.base), signal), validateLearningJobView);
+    if (value.id !== job) throw new Error("Learning job identity mismatch");
+    return value;
+  }
+  async cancelLearning(job: string, request: CancelLearning, signal?: AbortSignal): Promise<LearningCancellation> {
+    const value = checked<LearningCancellation>(await this.get(new URL(`learning/jobs/${id(job)}/cancel`, this.base), signal, "POST", request), validateLearningCancellation);
+    if (value.requestId !== request.requestId || value.job.id !== job) throw new Error("Learning cancellation identity mismatch");
+    return value;
+  }
   async beginWorkspaceImport(session: string, request: BeginWorkspaceImport, signal?: AbortSignal): Promise<WorkspaceImportView> {
     const value = checked<WorkspaceImportView>(await this.get(new URL(`sessions/${id(session)}/workspace/imports`, this.base), signal, "POST", request), validateWorkspaceImportView);
     if (value.sessionId !== session || value.sha256 !== request.sha256 || value.bytes !== request.bytes) throw new Error("Workspace import identity mismatch");

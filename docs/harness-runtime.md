@@ -1466,6 +1466,12 @@ Learning outcome usage retains partial reports and discarded provider-attempt
 costs, normalizes cache buckets once, keeps reasoning inside output and marks
 incomplete reports as unaccounted. The port permits a data-owner state adapter;
 it does not register an automatic enterprise producer.
+Enterprise assembly installs its separate private-learning producer only with
+authorized consent and complete extraction/maintenance profiles. Public management
+and committed background activity expose stable Job/state/budget fields; cancellation
+fences future work while retaining late accounting. Internal model snapshots and
+learning grants never enter client DTOs. See the preview
+[Memory contract](../enterprise/MEMORY.md#inspect-and-cancel-learning).
 There is no quota-percentage, daily-token, or currency budget; eligibility,
 idempotency, the wake cap, the three-attempt ceiling, and `learning.execution`
 input/output/step and total-time limits bound background work.

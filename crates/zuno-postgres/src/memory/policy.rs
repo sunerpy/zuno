@@ -263,10 +263,16 @@ impl TransactionMemory {
         )
         .bind(self.principal.tenant_id().as_str())
         .bind(self.principal.principal_id().as_str())
-        .bind(jobs)
+        .bind(&jobs)
         .execute(&mut **tx)
         .await
         .map_err(sql_error)?;
+        for id in jobs {
+            let id = zuno_types::identity::JobId::new(id).map_err(decode_error)?;
+            crate::learning_client::publish_in(tx, &self.principal.owner(), &id)
+                .await
+                .map_err(app_error)?;
+        }
         Ok(())
     }
 }

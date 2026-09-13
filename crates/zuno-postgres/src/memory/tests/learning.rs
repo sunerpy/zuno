@@ -187,6 +187,45 @@ pub(super) async fn exercise(backend: &PostgresBackend, admin: &PgPool) {
     let source_id = source(backend, admin, &actor, &workspace, "after-consent").await;
     assert_eq!(runtime.schedule(8).await.unwrap(), 1);
     assert_eq!(runtime.schedule(8).await.unwrap(), 0);
+    let page = backend
+        .client_learning_jobs(&actor, &workspace, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    let queued = &page.items[0];
+    assert_eq!(
+        queued.state,
+        zuno_application::learning_api::LearningState::Queued
+    );
+    assert_eq!(queued.source_job_id, source_id);
+    let serialized = json!(queued).to_string();
+    for private in [
+        "leaseToken",
+        "configuration",
+        "inputDigest",
+        "prompt",
+        "sources",
+        "credential",
+    ] {
+        assert!(
+            !serialized.contains(private),
+            "private field leaked: {private}"
+        );
+    }
+    let foreign = principal("learning-foreign");
+    setup(backend, admin, &foreign, &workspace).await;
+    assert!(matches!(
+        backend.client_learning_job(&foreign, &queued.id).await,
+        Err(ApplicationError::NotFound)
+    ));
+    assert!(
+        backend
+            .client_learning_jobs(&foreign, &workspace, Default::default())
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
     let (one, two) = tokio::join!(
         runtime.claim(
             WorkerInstanceId::new("learning-one").unwrap(),
@@ -355,6 +394,153 @@ pub(super) async fn exercise(backend: &PostgresBackend, admin: &PgPool) {
         })
         .await
         .unwrap();
+
+    source(backend, admin, &actor, &workspace, "managed-cancellation").await;
+    let cancellable = runtime
+        .claim(
+            WorkerInstanceId::new("cancel-worker").unwrap(),
+            vec![binding.extraction.clone()],
+            30000,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    runtime
+        .journal(prepared(&cancellable, "cancel-request"))
+        .await
+        .unwrap();
+    let control = zuno_application::learning_api::CancelLearning {
+        request_id: RequestId::new("cancel-learning").unwrap(),
+    };
+    assert!(matches!(
+        backend
+            .cancel_learning_job(&foreign, &cancellable.execution.id, control.clone())
+            .await,
+        Err(ApplicationError::NotFound)
+    ));
+    raw_sql("CREATE FUNCTION public.refuse_learning_frame() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'injected learning projection failure'; END $$;
+        CREATE TRIGGER refuse_learning_frame BEFORE INSERT ON zuno_enterprise_preview.activity_frame
+          FOR EACH ROW WHEN(NEW.item_id LIKE 'learning:%') EXECUTE FUNCTION public.refuse_learning_frame();")
+        .execute(admin).await.unwrap();
+    assert!(
+        backend
+            .cancel_learning_job(&actor, &cancellable.execution.id, control.clone())
+            .await
+            .is_err()
+    );
+    raw_sql("DROP TRIGGER refuse_learning_frame ON zuno_enterprise_preview.activity_frame; DROP FUNCTION public.refuse_learning_frame();")
+        .execute(admin).await.unwrap();
+    let before_cancel = backend
+        .client_learning_job(&actor, &cancellable.execution.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        before_cancel.state,
+        zuno_application::learning_api::LearningState::Running
+    );
+    assert_eq!(
+        before_cancel.budget.reserved.0,
+        binding.extraction_limits.request_tokens
+    );
+    let cancelled = backend
+        .cancel_learning_job(&actor, &cancellable.execution.id, control.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        cancelled.job.state,
+        zuno_application::learning_api::LearningState::Cancelled
+    );
+    assert!(!cancelled.job.can_cancel);
+    assert_eq!(cancelled.job.budget.reserved.0, 0);
+    assert_eq!(cancelled.job.budget.unconfirmed_requests.0, 1);
+    let repeated = backend
+        .cancel_learning_job(&actor, &cancellable.execution.id, control.clone())
+        .await
+        .unwrap();
+    assert_eq!(json!(cancelled), json!(repeated));
+    assert!(
+        backend
+            .cancel_learning_job(&actor, &claimed.execution.id, control)
+            .await
+            .is_err(),
+        "request identity cannot be rebound"
+    );
+    assert!(
+        runtime
+            .renew(cancellable.lease.clone(), 30000)
+            .await
+            .is_err()
+    );
+    runtime
+        .journal(finished(&cancellable, "cancel-request"))
+        .await
+        .unwrap();
+    let resolved = backend
+        .client_learning_job(&actor, &cancellable.execution.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved.state,
+        zuno_application::learning_api::LearningState::Cancelled
+    );
+    assert_eq!(resolved.budget.charged.0, 120);
+    assert_eq!(resolved.budget.unconfirmed_requests.0, 0);
+    use zuno_application::activity::{ActivityPersistence, HistoryQuery};
+    let history = backend
+        .activity(actor.clone())
+        .history(&cancellable.execution.session, HistoryQuery::default())
+        .await
+        .unwrap();
+    let item = history
+        .items
+        .iter()
+        .find(|item| item.record.id == format!("learning:{}", cancellable.execution.id))
+        .unwrap();
+    assert!(matches!(
+        item.record.item,
+        zuno_types::activity::SessionItem::Background {
+            activity_kind: Some(zuno_types::activity::BackgroundKind::MemoryExtraction),
+            state: zuno_types::activity::WorkState::Cancelled,
+            ..
+        }
+    ));
+    assert!(
+        item.record
+            .actions
+            .iter()
+            .any(|action| matches!(action, zuno_types::activity::UiAction::ViewLearning { .. }))
+    );
+    assert!(!item.record.actions.iter().any(|action| matches!(
+        action,
+        zuno_types::activity::UiAction::CancelLearning { .. }
+    )));
+    let first = backend
+        .client_learning_jobs(
+            &actor,
+            &workspace,
+            zuno_application::learning_api::LearningPageRequest {
+                limit: zuno_application::PageSize::new(1).unwrap(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let second = backend
+        .client_learning_jobs(
+            &actor,
+            &workspace,
+            zuno_application::learning_api::LearningPageRequest {
+                limit: zuno_application::PageSize::new(1).unwrap(),
+                before: first.before.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.items.len(), 1);
+    assert_eq!(second.items.len(), 1);
+    assert_ne!(first.items[0].id, second.items[0].id);
 
     source(backend, admin, &actor, &workspace, "revoked-in-flight").await;
     let active = runtime

@@ -133,3 +133,17 @@ and verify it disappears after completion; SDK tests cover generation replacemen
 retry clearing and fresh progress after a silent interval.
 
 `UiAction::ViewWorkflow` names the durable orchestration Job. The data owner derives it from the original message execution Job and invocation relation, including completed calls. A model-authored tool name or output cannot create this link.
+
+Private learning uses `SessionItem::Background` with optional
+`BackgroundKind::MemoryExtraction` / `MemoryMaintenance` and
+`BackgroundProgress::Learning`. Its logical `learning:{jobId}` item belongs to the
+source Job and carries exact budget/request counters. `ViewLearning` is always
+available; `CancelLearning` is derived from current queued/running state.
+Existing background records without the additive fields remain valid.
+
+Queue, claim, model reservation/outcome, retry, cancellation and settlement publish
+with their source transaction. An independent activity-session row orders writers
+before reading prior projection state; background learning does not acquire a
+foreground execution lock. Unchanged projections consume no sequence. Format 21
+backfills prior learning executions atomically, without exposing private snapshots.
+The generated SDK supports these records; no App layout or UI is delivered here.

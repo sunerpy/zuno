@@ -5,6 +5,48 @@ import { EnterpriseClient, EnterpriseHttpError } from "../dist/src/index.js";
 const job = { id: "job", sessionId: "session", turnId: "turn", inputId: "input", phase: "ready", inputVersion: "1", waits: [], stopRequested: false, pendingOperations: [] };
 const response = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 
+const learning = {
+  id: "learn-one", workspaceId: "workspace", sessionId: "session", sourceJobId: "root",
+  stage: "extraction", state: "running", attempts: "2",
+  budget: { limit: "9007199254740993", charged: "120", reserved: "1000", modelRequests: "2", unconfirmedRequests: "1" },
+  createdAtMs: "1000", updatedAtMs: "1005", readyAtMs: null, deadlineAtMs: "4000", failure: null, canCancel: true,
+};
+
+test("learning management preserves exact counters, scoped cursors and cancellation identity", async () => {
+  const calls = [];
+  const client = new EnterpriseClient({
+    baseUrl: "https://enterprise.example/app/api/v1/",
+    browserContext: () => '["tenant","alice","web"]',
+    fetch: async (url, options) => {
+      calls.push({ url, options });
+      if (url.pathname.endsWith("/cancel")) {
+        return response({ requestId: "cancel-one", job: { ...learning, state: "cancelled", canCancel: false, budget: { ...learning.budget, charged: "1120", reserved: "0" } } });
+      }
+      if (url.pathname.endsWith("/jobs")) return response({ items: [learning], before: { createdAtMs: "1000", jobId: learning.id } });
+      return response(learning);
+    },
+  });
+  const page = await client.learningJobs("workspace", { limit: 1, before: { createdAtMs: "2000", jobId: "later" }, stage: "extraction" });
+  assert.equal(page.items[0].budget.limit, "9007199254740993");
+  assert.equal(calls[0].url.searchParams.get("beforeCreatedAtMs"), "2000");
+  assert.equal(calls[0].url.searchParams.get("beforeJobId"), "later");
+  assert.equal((await client.learningJob(learning.id)).id, learning.id);
+  const cancelled = await client.cancelLearning(learning.id, { requestId: "cancel-one" });
+  assert.equal(cancelled.job.state, "cancelled");
+  assert.deepEqual(JSON.parse(calls[2].options.body), { requestId: "cancel-one" });
+  assert.equal(calls[2].options.headers.get("x-zuno-csrf"), "1");
+  assert.equal(calls[2].options.headers.get("x-zuno-browser-context"), '["tenant","alice","web"]');
+});
+
+test("learning responses cannot substitute a job, workspace, cursor or cancellation receipt", async () => {
+  const client = (value) => new EnterpriseClient({ baseUrl: "https://enterprise.example/api/v1/", accessToken: async () => "test-token", fetch: async () => response(value) });
+  await assert.rejects(client({ ...learning, id: "other" }).learningJob(learning.id), /identity mismatch/);
+  await assert.rejects(client({ items: [{ ...learning, workspaceId: "other" }], before: null }).learningJobs("workspace"), /identity mismatch/);
+  await assert.rejects(client({ items: [learning], before: { createdAtMs: "1001", jobId: "other" } }).learningJobs("workspace"), /cursor identity mismatch/);
+  await assert.rejects(client({ requestId: "different", job: learning }).cancelLearning(learning.id, { requestId: "expected" }), /identity mismatch/);
+  await assert.rejects(client({ ...learning, grant: "private-credential" }).learningJob(learning.id), /Invalid enterprise application response/);
+});
+
 test("mutations preserve request identity, send CSRF/context and do not mechanically retry", async () => {
   const calls = [];
   const client = new EnterpriseClient({

@@ -143,7 +143,7 @@ gateway and two Workers: private reads/updates, prompt refresh, consent revocati
 while awaiting command approval, checkpoint continuation and isolated execution.
 
 Automatic private extraction and independent maintenance are described below.
-Organization-shared Memory, learning-management clients and the complete P6 fault
+Organization-shared Memory, learning-management UI and the complete P6 fault
 matrix remain separate work. Skill evaluation and application retain independent
 review requirements.
 
@@ -201,6 +201,35 @@ PostgreSQL format 20 preserves existing data and leaves automatic learning disab
 for all previous consent rows. Source format 19 is frozen at
 `c7697391f1025e4fc0b7f6c959d0329fdffb44181bb6bdb18661bcc2c328e037`.
 The native process fixture covers opt-in, separate extraction/maintenance,
-private recall, cross-user isolation and opt-out. Shared organization Memory,
-learning management clients and full operational acceptance remain pending; UI
+private recall, cross-user isolation and opt-out. Shared organization Memory
+and full operational acceptance remain pending; UI
 design and implementation stay deferred to Penpot.
+
+## Inspect and cancel learning
+
+With the Memory backend installed, both application prefixes expose:
+
+| Route | Result |
+| --- | --- |
+| `GET /workspaces/{workspace}/learning/jobs` | Owner-scoped page, optional stage/state filters |
+| `GET /learning/jobs/{job}` | Current typed state and budget |
+| `POST /learning/jobs/{job}/cancel` | Idempotent cancellation with `requestId` |
+
+Pages accept `limit` 1–100 and the complete cursor pair `beforeCreatedAtMs` /
+`beforeJobId`, ordered newest first. Counters and timestamps are exact decimal
+strings. Views distinguish extraction/maintenance and queued, running, completed,
+skipped, failed, cancelled or uncertain state. They expose charges, reservations,
+model request counts and unconfirmed accounting, never frozen prompts, credentials,
+configuration or execution grants. Every request rechecks current authorization.
+
+Cancellation fences queued/running work, conservatively charges outstanding
+reservations and publishes its durable activity in one transaction. It stops
+future model admission and Memory settlement; it cannot undo an already sent model
+request. A valid late usage receipt may adjust accounting without resuming the Job.
+Repeated cancellation with the same request ID returns its original receipt;
+changed reuse conflicts. Cancelling a terminal Job preserves its result.
+
+Session history includes the same logical learning Job from queueing through
+settlement, with typed kind, budget progress and supported actions. Public SDK
+methods are `learningJobs`, `learningJob` and `cancelLearning`. This provides
+backend/client contracts; App design and UI delivery remain paused.

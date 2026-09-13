@@ -1,5 +1,6 @@
 //! Client application routes. No Worker grants, checkpoints or private replay
 //! material are serialized by this module.
+mod learning;
 
 use crate::enterprise_browser::EnterpriseBrowser;
 use axum::{
@@ -154,6 +155,10 @@ impl EnterpriseApplication {
         }
         if self.memory.is_some() {
             router = router.route("/workspaces/{workspace}/memory", post(memory_request));
+            router = router
+                .route("/workspaces/{workspace}/learning/jobs", get(learning::list))
+                .route("/learning/jobs/{job}", get(learning::get))
+                .route("/learning/jobs/{job}/cancel", post(learning::cancel));
         }
         router
             .layer(DefaultBodyLimit::max(

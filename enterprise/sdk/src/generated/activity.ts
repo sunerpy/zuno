@@ -21,6 +21,14 @@ export type UiAction =
       kind: "view_workflow";
     }
   | {
+      jobId: JobId;
+      kind: "view_learning";
+    }
+  | {
+      jobId: JobId;
+      kind: "cancel_learning";
+    }
+  | {
       approvalId: ApprovalId;
       kind: "view_workspace_merge";
     }
@@ -99,9 +107,11 @@ export type SessionItem =
       resource: ResourceRef;
     }
   | {
+      activityKind?: BackgroundKind | null;
       jobId: JobId;
       kind: "background";
       label: string;
+      progress?: BackgroundProgress | null;
       state: WorkState;
     };
 export type ContentBlock =
@@ -238,6 +248,16 @@ export type ApprovalStatus = "pending" | "approved" | "rejected" | "expired" | "
 export type PlanStepStatus = "pending" | "in_progress" | "completed" | "superseded";
 export type WorkState =
   "pending" | "active" | "waiting" | "paused" | "completed" | "failed" | "cancelled" | "uncertain";
+export type BackgroundKind = "memory_extraction" | "memory_maintenance";
+export type BackgroundProgress = {
+  attempts: Counter;
+  chargedTokens: Counter;
+  kind: "learning";
+  modelRequests: Counter;
+  reservedTokens: Counter;
+  tokenLimit: Counter;
+  unconfirmedRequests: Counter;
+};
 export type LiveEvent =
   | {
       items: LiveItem[];

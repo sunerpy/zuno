@@ -8,6 +8,7 @@ mod browser;
 #[cfg(test)]
 mod browser_tests;
 mod client;
+mod learning_client;
 mod live;
 mod memory;
 mod migration;

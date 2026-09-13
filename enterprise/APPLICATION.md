@@ -36,6 +36,9 @@ bootstrap remains an explicit schema-owner operation.
 | `GET /approvals/{approval}` | Authorized approval presentation |
 | `POST /approvals/{approval}/answer` | Idempotent human decision |
 | `POST /workspaces/{workspace}/memory` | Typed private Memory requests, when the backend is installed |
+| `GET /workspaces/{workspace}/learning/jobs` | Filtered, paged private learning Jobs, when Memory is installed |
+| `GET /learning/jobs/{job}` | Safe learning state and exact budget counters |
+| `POST /learning/jobs/{job}/cancel` | Idempotent user cancellation and durable activity |
 
 Turn requests contain `requestId`, `expectedInputVersion` and `text`. Versions are
 canonical decimal strings to preserve JavaScript precision. Repeating an identical
@@ -49,6 +52,11 @@ Session paging accepts `limit` (1–100) and an optional complete pair
 `beforeUpdatedAt`/`beforeSessionId`. Foreign resources return not-found. Unknown
 fields, owner overrides and invalid IDs fail before resource mutation. Responses
 are not cacheable.
+
+Learning paging uses the complete pair `beforeCreatedAtMs`/`beforeJobId` and
+optional `stage`/`state` filters. Cancellation accepts only `requestId`, preserves
+terminal outcomes and fences running work; late usage remains reconcilable.
+See [learning management](MEMORY.md#inspect-and-cancel-learning).
 
 Approval answers contain `requestId` and `answer` (`approve` or `reject`). The
 existing atomic service checks current role, requester/designated-approver audience,

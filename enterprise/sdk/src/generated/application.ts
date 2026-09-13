@@ -55,6 +55,8 @@ export type WaitTarget =
       deadline_ms: number;
       kind: "timer";
     };
+export type LearningStage = "extraction" | "maintenance";
+export type LearningState = "queued" | "running" | "completed" | "skipped" | "failed" | "cancelled" | "uncertain";
 export type WorkspacePath = string;
 export type MergeContentSide = "base" | "parent" | "child";
 export type CouncilPhase = "seats" | "stopping" | "synthesis" | "completed" | "failed" | "cancelled" | "uncertain";
@@ -109,10 +111,15 @@ export interface ApplicationProtocol {
   approval: ApprovalView;
   begin_workspace_import: BeginWorkspaceImport;
   cancel: CancelJob;
+  cancel_learning: CancelLearning;
   cancellation: CancellationReceipt;
   create_session: CreateSession;
   input_version: InputVersionView;
   job: JobView;
+  learning_cancellation: LearningCancellation;
+  learning_job: LearningJobView;
+  learning_jobs: LearningPage;
+  learning_query: LearningPageRequest;
   merge_content: MergeContentRequest;
   session: SessionSummary;
   sessions: SessionPage;
@@ -170,6 +177,9 @@ export interface CancelJob {
   reason: string;
   requestId: RequestId;
 }
+export interface CancelLearning {
+  requestId: RequestId;
+}
 /**
  * The logical tree is fenced when this receipt commits. External operations
  * have their own observed receipts; this does not claim their processes stopped.
@@ -209,6 +219,51 @@ export interface JobView {
 export interface JobWaitView {
   invocationId: InvocationId;
   target: WaitTarget;
+}
+export interface LearningCancellation {
+  job: LearningJobView;
+  requestId: RequestId;
+}
+export interface LearningJobView {
+  attempts: Counter;
+  budget: LearningBudgetView;
+  canCancel: boolean;
+  createdAtMs: Counter;
+  deadlineAtMs?: Counter | null;
+  failure?: LearningFailureView | null;
+  id: JobId;
+  readyAtMs?: Counter | null;
+  sessionId: SessionId;
+  sourceJobId: JobId;
+  stage: LearningStage;
+  state: LearningState;
+  updatedAtMs: Counter;
+  workspaceId: WorkspaceId;
+}
+export interface LearningBudgetView {
+  charged: Counter;
+  limit: Counter;
+  modelRequests: Counter;
+  reserved: Counter;
+  unconfirmedRequests: Counter;
+}
+export interface LearningFailureView {
+  code: string;
+  message?: string | null;
+}
+export interface LearningPage {
+  before?: LearningCursor | null;
+  items: LearningJobView[];
+}
+export interface LearningCursor {
+  createdAtMs: Counter;
+  jobId: JobId;
+}
+export interface LearningPageRequest {
+  before?: LearningCursor | null;
+  limit?: number;
+  stage?: LearningStage | null;
+  state?: LearningState | null;
 }
 export interface MergeContentRequest {
   approvalId: ApprovalId;

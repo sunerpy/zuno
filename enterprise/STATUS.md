@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p2-memory-producers`.
+- Current phase branch: `codex/enterprise-p5-learning-activity`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -493,3 +493,11 @@ Workflow PR #218 initially exposed an arm64 stack overflow in the PostgreSQL con
 - Model requests reserve tokens before provider contact. Epochs, total deadlines, retry deadlines and charges survive takeover. Repeated outcomes settle once; truthful late receipts can resolve a reservation after revocation but cannot write Memory. Checksum-validated cached output can be finalized without new model budget, including after request/attempt ceilings.
 - PostgreSQL format 20 has an exact format-19 fixture and atomic rollback/preservation checks. The native five-process fixture passes with 46 model requests: explicit opt-in, separate extraction and maintenance, private recall, cross-user isolation, opt-out and drain. PostgreSQL tests also cover concurrent claims, duplicate/changed receipts, typed retry delays, stale workers, lost-worker reservations and cached-result recovery. Final native lease-boundary verification passed locally.
 - Current deployment supports private Memory. Organization-shared writes, richer learning management/projections, broader source selection, full fairness/retention/backup/upgrade acceptance and the remaining backend plan are still open. UI remains paused for Penpot. No preview tag or Release is enabled. PR #228's latest head still awaits a hosted runner.
+
+## Learning management and committed activity
+
+- Public Memory-backed routes now list private learning Jobs by workspace/stage/state, retrieve safe state/budget details and cancel by stable request ID. Owner/current-policy checks, bounded cursor paging and exact decimal counters are shared by API/BFF and the generated SDK. Private inputs, model configuration and grants are excluded.
+- Cancellation fences queued/running work, conservatively settles outstanding reservations and writes its receipt/activity atomically. Changed duplicate requests conflict; terminal outcomes remain unchanged; a legitimate late usage receipt updates accounting without resuming execution.
+- Learning queue/claim/model/retry/settlement transitions publish `SessionItem::Background` with typed extraction/maintenance kind, budget progress and view/cancel actions. The independent activity-session lock orders projection before reading old state. Format 21 preserves the exact format-20 fixture and backfills prior executions transactionally.
+- Real PostgreSQL/HTTPS tests pass isolation, paging, replay, injected projection-failure rollback and late-usage checks. The native five-process fixture passes 46 model requests and verifies learning history, pagination and private-data exclusion. All 23 SDK tests and workspace Clippy pass locally; final shared gates and exact-head CI are still required.
+- English/Chinese application, Memory, activity, migration and runtime guides plus generated schema/TypeScript are updated. This batch has no App/UI delivery. Remaining shared Memory, maintenance wake sources, ACP/TUI and full P6 operational acceptance remain active.
