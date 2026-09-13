@@ -300,6 +300,9 @@ pub enum UiAction {
     ViewWorkspaceMerge {
         approval_id: ApprovalId,
     },
+    ViewWorkspaceEdit {
+        approval_id: ApprovalId,
+    },
     ViewWorkspaceImport {
         session_id: crate::identity::SessionId,
         import_id: crate::identity::WorkspaceImportId,

@@ -60,6 +60,9 @@
     "workspace": {
       "$ref": "#/$defs/WorkspaceView"
     },
+    "workspace_edit": {
+      "$ref": "#/$defs/WorkspaceEditView"
+    },
     "workspace_import": {
       "$ref": "#/$defs/WorkspaceImportView"
     },
@@ -81,6 +84,7 @@
     "cancellation",
     "workflow",
     "workspace_merge",
+    "workspace_edit",
     "merge_content",
     "begin_workspace_import",
     "workspace_import",
@@ -1258,6 +1262,57 @@
       "required": [
         "path",
         "choice"
+      ]
+    },
+    "WorkspaceEditReview": {
+      "type": "object",
+      "properties": {
+        "after": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "before": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "$ref": "#/$defs/WorkspacePath"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path"
+      ]
+    },
+    "WorkspaceEditView": {
+      "type": "object",
+      "properties": {
+        "admitted": {
+          "type": "boolean"
+        },
+        "approvalId": {
+          "$ref": "#/$defs/ApprovalId"
+        },
+        "operationId": {
+          "$ref": "#/$defs/OperationId"
+        },
+        "review": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkspaceEditReview"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "approvalId",
+        "operationId",
+        "review",
+        "admitted"
       ]
     },
     "WorkspaceEntry": {

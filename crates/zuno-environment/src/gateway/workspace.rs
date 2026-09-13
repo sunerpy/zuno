@@ -78,6 +78,10 @@ impl DockerGateway {
             labels["zuno.merge"] = json!(record.request.id);
             labels["zuno.merge.nonce"] = json!(record.nonce);
         }
+        if let Some(record) = self.ledger.active_edit(owner, &spec.id)? {
+            labels["zuno.edit"] = json!(record.admission.operation.id);
+            labels["zuno.edit.nonce"] = json!(record.nonce);
+        }
         Ok(labels)
     }
 

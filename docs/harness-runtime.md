@@ -3057,7 +3057,7 @@ the target verifies bytes before its existing atomic fork publication. Merge
 imports the completed child's snapshot back to the parent gateway, retaining the
 original lineage, manifest and human approval. Receiving a snapshot cannot renew
 a lease or replay an external command. Separate bounded export/import pools
-avoid reciprocal transfer deadlocks. PostgreSQL format 19 and gateway protocol 6
+avoid reciprocal transfer deadlocks. PostgreSQL format 19 and gateway protocol 7
 carry this private contract; public activity and Worker checkpoint schemas stay
 unchanged. See the preview workspace and gateway guides.
 
@@ -3078,4 +3078,11 @@ approval before and after the scan. `workspace_read`, `workspace_list` and
 `workspace_search` use the shared durable tool handoff and approval waits.
 Application read whitelists are separate from command/MCP authority. Lease
 renewal may extend the deadline but cannot change owner, Job, session, attempt,
-Worker, epoch or checkpoint identity. Gateway protocol 6 carries this boundary.
+Worker, epoch or checkpoint identity. Gateway protocol 7 carries this boundary.
+
+`workspace_edit` is a separate typed file mutation over the same bounded tool
+driver. Human approval binds exact prior hashes, complete before/after content and
+the base workspace revision. The gateway owns copy-on-write restore/verification
+and atomic publication, while PostgreSQL atomically records admission attempts,
+late completion facts and parent wait consumption. A cancelled parent retains a
+truthful late result without resuming. Public review/SDK DTOs omit execution leases.

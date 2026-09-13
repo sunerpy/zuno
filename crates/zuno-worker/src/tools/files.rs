@@ -214,8 +214,15 @@ impl GatewayToolDispatcher {
                         {
                             let text = match &receipt.result {
                                 WorkspaceFileResult::Read {
-                                    text: Some(text), ..
-                                } => text.clone(),
+                                    item,
+                                    text: Some(text),
+                                    offset,
+                                    next_offset,
+                                    truncated,
+                                } => format!(
+                                    "{}\n\n{text}",
+                                    json!({"file":item,"offset":offset,"nextOffset":next_offset,"truncated":truncated})
+                                ),
                                 _ => serde_json::to_string(&receipt.result).unwrap_or_default(),
                             };
                             let output = ToolOutput::text(&definition.display_name, text)

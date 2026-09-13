@@ -8714,6 +8714,7 @@ dependencies = [
  "zuno-memory",
  "zuno-network",
  "zuno-orchestration",
+ "zuno-permission",
  "zuno-runtime",
  "zuno-tool",
  "zuno-tools",

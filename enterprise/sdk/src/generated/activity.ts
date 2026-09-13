@@ -33,6 +33,10 @@ export type UiAction =
       kind: "view_workspace_merge";
     }
   | {
+      approvalId: ApprovalId;
+      kind: "view_workspace_edit";
+    }
+  | {
       importId: WorkspaceImportId;
       kind: "view_workspace_import";
       sessionId: SessionId;

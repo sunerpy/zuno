@@ -34,6 +34,7 @@ bootstrap remains an explicit schema-owner operation.
 | `GET /jobs/{job}/workflow` | Authorized Workflow state, typed nodes, dependencies and public waits |
 | `POST /jobs/{job}/cancel` | Durable tree cancellation, old-lease fencing and operation stop intent |
 | `GET /approvals/{approval}` | Authorized approval presentation |
+| `GET /approvals/{approval}/edit` | Complete authorized file-edit before/after review |
 | `POST /approvals/{approval}/answer` | Idempotent human decision |
 | `POST /workspaces/{workspace}/memory` | Typed private Memory requests, when the backend is installed |
 | `GET /workspaces/{workspace}/learning/jobs` | Filtered, paged private learning Jobs, when Memory is installed |

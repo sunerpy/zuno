@@ -48,7 +48,7 @@ operation; an earlier approval or revision cannot authorize a different operatio
 
 ## Private protocol
 
-`GatewayRequest` is protocol version 6, with bounded tagged commands:
+`GatewayRequest` is protocol version 7, with bounded tagged commands:
 
 | Command | Behavior |
 | --- | --- |
@@ -130,7 +130,7 @@ also starts a control plane, gateway and two independent Worker binaries; see
 
 The gateway supervisor also polls authenticated `internal/gateway/v1/cancellations`. This service-only path returns immutable admissions for stopped Jobs and stays valid after Worker revocation. It cannot start new operations. Docker stop and its actual terminal receipt remain separate; completed facts are preserved and unknown outcomes remain uncertain. See [control](CONTROL.md).
 
-Gateway protocol 6 routes child preparation to the target gateway and separately
+Gateway protocol 7 routes child preparation to the target gateway and separately
 identifies the authorized source, including an existing Workflow group workspace.
 Ordinary commands still require the executing session.
 
@@ -166,4 +166,30 @@ built-in reads. Other allowed applications wait for the existing authoritative
 HITL decision. This whitelist does not approve Shell or arbitrary MCP operations.
 Control endpoints are `/internal/gateway/v1/files/prepare` and `/authorize`;
 they accept only assigned gateway service identities. Both roles must support
-gateway protocol 6; the state/Worker protocol remains 11. This batch provides no file mutation or App UI.
+gateway protocol 7; the state/Worker protocol remains 11.
+
+## Reviewed file edits
+
+`workspace_edit` creates, replaces or deletes regular UTF-8 files through a
+copy-on-write candidate. Every existing file requires the SHA from `workspace_read`;
+creation requires `expected.kind: "absent"`. Null content deletes, while an empty
+string creates/replaces with an empty file. Parent directories must exist. Links,
+hardlink aliases, duplicate paths, NUL content and stale hashes are refused.
+Up to 32 files and 256 KiB of new text are accepted, with a 512 KiB complete review
+envelope. No shell command or host path is generated from file content.
+
+Every edit requires human approval, including applications on the read whitelist.
+`GET /approvals/{approval}/edit` exposes the exact before/after text under the
+current approval-viewer policy. Approval binds all content, paths, expected hashes,
+base snapshot and environment revision. A changed review needs a new decision.
+The gateway builds and verifies an unpublished candidate, then atomically changes
+the volume pointer, revision and receipt. The original workspace stays active until
+publication succeeds.
+
+The gateway-owned edit executor persists admission, retries delivery after restart
+and preserves a committed receipt after response loss. Cancellation can win before
+publication; a legitimate late committed receipt is retained without resuming a
+cancelled Job. Worker approval/operation waits use the shared checkpoint and
+exactly-once completion-consumption path. Private protocol commands are
+`preview_edit`, `prepare_edit`, `submit_edit` and `inspect_edit`; control endpoints
+live under `/internal/gateway/v1/edit/`. App/UI remains paused.

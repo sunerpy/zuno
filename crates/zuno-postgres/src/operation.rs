@@ -251,6 +251,8 @@ pub(crate) async fn admit_in(
     identity_lock(tx, &admission.lease.owner, &admission.operation.id).await?;
     let conflict: bool = sqlx_core::query_scalar::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM zuno_enterprise_preview.gateway_merge_operation
+        WHERE tenant_id=$1 AND principal_id=$2 AND operation_id=$3)
+        OR EXISTS(SELECT 1 FROM zuno_enterprise_preview.gateway_edit_operation
         WHERE tenant_id=$1 AND principal_id=$2 AND operation_id=$3)",
     )
     .bind(admission.lease.owner.tenant_id.as_str())

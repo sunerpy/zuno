@@ -23,6 +23,7 @@ mod tests;
 mod turn;
 #[cfg(test)]
 mod turn_tests;
+mod workspace_edit;
 mod workspace_import;
 mod workspace_merge;
 mod workspace_transfer;

@@ -307,9 +307,122 @@ pub fn normalize_import_archive(
     write_tree_archive(&tree.entries, &[&tree], destination)
 }
 
+/// Build the complete candidate and exact before/after review without mutating
+/// any workspace. File replacement keeps metadata and rejects link aliases.
+pub fn write_edited_archive(
+    source: &SnapshotTree,
+    edits: &[zuno_application::workspace_edit::WorkspaceFileEdit],
+    destination: &Path,
+) -> Result<
+    (
+        String,
+        u64,
+        Vec<zuno_application::workspace_edit::WorkspaceEditReview>,
+    ),
+    ApplicationError,
+> {
+    use zuno_application::workspace_edit::{FileExpectation, MAX_EDIT_BYTES, WorkspaceEditReview};
+    crate::archive::verify(&source.source, &source.archive_sha256, source.archive_bytes)?;
+    let mut resolved = source.entries.clone();
+    let mut blobs = BTreeMap::new();
+    let mut review = Vec::new();
+    let mut before_bytes = 0usize;
+    for edit in edits {
+        let parent = edit.path.parent().unwrap_or_else(WorkspacePath::root);
+        if !matches!(
+            source.entries.get(&parent),
+            Some(WorkspaceEntry::Directory { .. })
+        ) {
+            return Err(invalid("file edits require an existing parent directory"));
+        }
+        if source
+            .entries
+            .values()
+            .any(|entry| matches!(entry,WorkspaceEntry::Hardlink{target} if target==&edit.path))
+        {
+            return Err(invalid(
+                "file edits cannot implicitly change hardlink aliases",
+            ));
+        }
+        let (before, metadata) = match (&edit.expected, source.entries.get(&edit.path)) {
+            (FileExpectation::Absent, None) => (None, (0o644, 0, 0)),
+            (
+                FileExpectation::File { sha256 },
+                Some(
+                    entry @ WorkspaceEntry::File {
+                        sha256: actual,
+                        mode,
+                        uid,
+                        gid,
+                        bytes,
+                    },
+                ),
+            ) if sha256 == actual => {
+                before_bytes = before_bytes
+                    .checked_add(usize::try_from(bytes.0).map_err(storage)?)
+                    .ok_or(ApplicationError::Conflict)?;
+                if before_bytes > MAX_EDIT_BYTES {
+                    return Err(invalid("existing files exceed the bounded edit review"));
+                }
+                let WorkspaceContent::File {
+                    mut file,
+                    offset,
+                    bytes,
+                    ..
+                } = source.content(&edit.path, entry)?
+                else {
+                    return Err(ApplicationError::Conflict);
+                };
+                file.seek(SeekFrom::Start(offset)).map_err(storage)?;
+                let mut data = String::new();
+                file.take(bytes)
+                    .read_to_string(&mut data)
+                    .map_err(storage)?;
+                if data.contains('\0') {
+                    return Err(invalid("file edit review requires UTF-8 text"));
+                }
+                (Some(data), (*mode, *uid, *gid))
+            }
+            _ => return Err(ApplicationError::Conflict),
+        };
+        if let Some(after) = &edit.content {
+            blobs.insert(edit.path.clone(), after.as_bytes().to_vec());
+            resolved.insert(
+                edit.path.clone(),
+                WorkspaceEntry::File {
+                    mode: metadata.0,
+                    uid: metadata.1,
+                    gid: metadata.2,
+                    sha256: zuno_orchestration::sha256_text(after),
+                    bytes: Counter(after.len() as u64),
+                },
+            );
+        } else {
+            resolved.remove(&edit.path);
+        }
+        review.push(WorkspaceEditReview {
+            path: edit.path.clone(),
+            before,
+            after: edit.content.clone(),
+        });
+    }
+    zuno_application::workspace_merge::validate_tree(&resolved)?;
+    let (sha, bytes) = write_tree_with_blobs(&resolved, &[source], &blobs, destination)?;
+    Ok((sha, bytes, review))
+}
+
 fn write_tree_archive(
     resolved: &WorkspaceTree,
     sources: &[&SnapshotTree],
+    destination: &Path,
+) -> Result<(String, u64), ApplicationError> {
+    write_tree_with_blobs(resolved, sources, &BTreeMap::new(), destination)
+}
+
+fn write_tree_with_blobs(
+    resolved: &WorkspaceTree,
+    sources: &[&SnapshotTree],
+    blobs: &BTreeMap<WorkspacePath, Vec<u8>>,
     destination: &Path,
 ) -> Result<(String, u64), ApplicationError> {
     let file = std::fs::OpenOptions::new()
@@ -365,24 +478,32 @@ fn write_tree_archive(
                     sha256,
                     bytes,
                 } => {
-                    let source = sources
-                        .iter()
-                        .copied()
-                        .find(|snapshot| snapshot.entries.get(path) == Some(entry))
-                        .ok_or_else(|| invalid("merged member has no immutable blob source"))?;
-                    let blob = source.blobs.get(path).ok_or(ApplicationError::Conflict)?;
-                    if blob.size != bytes.0 {
-                        return Err(ApplicationError::Conflict);
-                    }
-                    let mut file = std::fs::File::open(&source.source).map_err(storage)?;
-                    file.seek(SeekFrom::Start(blob.offset)).map_err(storage)?;
+                    let input: Box<dyn Read> = if let Some(data) = blobs.get(path) {
+                        if data.len() as u64 != bytes.0 {
+                            return Err(ApplicationError::Conflict);
+                        }
+                        Box::new(std::io::Cursor::new(data))
+                    } else {
+                        let source = sources
+                            .iter()
+                            .copied()
+                            .find(|snapshot| snapshot.entries.get(path) == Some(entry))
+                            .ok_or_else(|| invalid("merged member has no immutable blob source"))?;
+                        let blob = source.blobs.get(path).ok_or(ApplicationError::Conflict)?;
+                        if blob.size != bytes.0 {
+                            return Err(ApplicationError::Conflict);
+                        }
+                        let mut file = std::fs::File::open(&source.source).map_err(storage)?;
+                        file.seek(SeekFrom::Start(blob.offset)).map_err(storage)?;
+                        Box::new(file.take(bytes.0))
+                    };
                     header.set_entry_type(tar::EntryType::Regular);
                     header.set_mode(*mode);
                     header.set_uid((*uid).into());
                     header.set_gid((*gid).into());
                     header.set_size(bytes.0);
                     let mut data = HashingRead {
-                        inner: file.take(bytes.0),
+                        inner: input,
                         hash: Sha256::new(),
                         read: 0,
                     };
@@ -521,6 +642,110 @@ mod tests {
             bytes.len() as u64,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn text_edit_candidates_preserve_unrelated_data_and_require_exact_original_bytes() {
+        use zuno_application::workspace_edit::{FileExpectation, WorkspaceFileEdit};
+        let directory = tempfile::tempdir().unwrap();
+        let source = archive(
+            &directory.path().join("base.tar"),
+            &[
+                Member::File("change", b"before\n"),
+                Member::File("keep", b"unrelated\n"),
+                Member::File("remove", b"old\n"),
+            ],
+        );
+        let edits = vec![
+            WorkspaceFileEdit {
+                path: WorkspacePath::new("change").unwrap(),
+                expected: FileExpectation::File {
+                    sha256: zuno_orchestration::sha256_text("before\n"),
+                },
+                content: Some("after\n".to_owned()),
+            },
+            WorkspaceFileEdit {
+                path: WorkspacePath::new("new").unwrap(),
+                expected: FileExpectation::Absent,
+                content: Some(String::new()),
+            },
+            WorkspaceFileEdit {
+                path: WorkspacePath::new("remove").unwrap(),
+                expected: FileExpectation::File {
+                    sha256: zuno_orchestration::sha256_text("old\n"),
+                },
+                content: None,
+            },
+        ];
+        let target = directory.path().join("edited.tar");
+        let (sha, bytes, review) = write_edited_archive(&source, &edits, &target).unwrap();
+        let changed = SnapshotTree::read(&target, &sha, bytes).unwrap();
+        assert_eq!(review[0].before.as_deref(), Some("before\n"));
+        assert_eq!(review[0].after.as_deref(), Some("after\n"));
+        assert_eq!(
+            changed.entries()[&WorkspacePath::new("keep").unwrap()],
+            source.entries()[&WorkspacePath::new("keep").unwrap()]
+        );
+        assert!(
+            !changed
+                .entries()
+                .contains_key(&WorkspacePath::new("remove").unwrap())
+        );
+        assert!(matches!(
+            &changed.entries()[&WorkspacePath::new("change").unwrap()],
+            WorkspaceEntry::File {
+                mode: 0o640,
+                uid: 21,
+                gid: 34,
+                ..
+            }
+        ));
+        let mut stale = edits.clone();
+        stale[0].expected = FileExpectation::File {
+            sha256: "0".repeat(64),
+        };
+        assert!(
+            write_edited_archive(&source, &stale, &directory.path().join("stale.tar")).is_err()
+        );
+        assert_eq!(
+            source.entries()[&WorkspacePath::new("change").unwrap()]
+                .content_descriptor()
+                .unwrap()
+                .1,
+            zuno_orchestration::sha256_text("before\n")
+        );
+    }
+
+    #[test]
+    fn text_edits_refuse_link_side_effects_and_missing_parents() {
+        use zuno_application::workspace_edit::{FileExpectation, WorkspaceFileEdit};
+        let directory = tempfile::tempdir().unwrap();
+        let source = archive(
+            &directory.path().join("links.tar"),
+            &[
+                Member::File("data", b"before"),
+                Member::Link("alias", "data", true),
+                Member::Link("link", "data", false),
+            ],
+        );
+        for path in ["data", "alias", "link", "missing/file"] {
+            let edit = WorkspaceFileEdit {
+                path: WorkspacePath::new(path).unwrap(),
+                expected: if path == "missing/file" {
+                    FileExpectation::Absent
+                } else {
+                    FileExpectation::File {
+                        sha256: zuno_orchestration::sha256_text("before"),
+                    }
+                },
+                content: Some("after".to_owned()),
+            };
+            assert!(
+                write_edited_archive(&source, &[edit], &directory.path().join("refused.tar"))
+                    .is_err(),
+                "{path}"
+            );
+        }
     }
     #[test]
     fn merged_archives_preserve_binary_data_links_and_metadata_without_host_extraction() {

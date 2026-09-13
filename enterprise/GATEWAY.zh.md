@@ -35,7 +35,7 @@
 
 ## 私有协议
 
-`GatewayRequest` 为版本 6，使用有界的 tagged enum：
+`GatewayRequest` 为版本 7，使用有界的 tagged enum：
 
 | 命令 | 行为 |
 | --- | --- |
@@ -102,7 +102,7 @@ socket 会使该 gate 失败。可以通过 `ZUNO_ROOTLESS_DOCKER_SOCKET` 指定
 
 网关 supervisor 通过独立服务认证轮询 `internal/gateway/v1/cancellations`，领取已停止 Job 的不可变操作接纳记录。该入口在 Worker 撤权后仍有效，只允许停止原操作；完成事实保持原样，不确定状态继续核查。见[控制](CONTROL.zh.md)。
 
-网关协议 6 将子工作区准备路由至目标网关，单独标识经过授权的来源，包括已经存在的
+网关协议 7 将子工作区准备路由至目标网关，单独标识经过授权的来源，包括已经存在的
 Workflow 协调工作区。普通命令仍要求执行会话一致。
 
 快照交换使用 `/internal/execution/v1/snapshot` 及独立的
@@ -128,4 +128,23 @@ Docker 提供者读取分配工作区版本的已验证不可变归档，不执�
 只有 `autoReadApps` 中的应用能自动批准这些内置读取，其他允许接入的应用沿用权威 HITL
 流程。该白名单不批准 Shell 或任意 MCP 操作。控制入口为
 `/internal/gateway/v1/files/prepare`、`/authorize`，仅接受分配网关的服务身份。
-Worker 与网关须匹配网关协议 6；本批不交付文件修改或 App UI。
+Worker 与网关须匹配网关协议 7，状态／Worker 协议保持 11。
+
+## 人工审阅的文件修改
+
+`workspace_edit` 通过写时复制候选创建、替换或删除普通 UTF-8 文件。已有文件必须提供
+`workspace_read` 返回的 SHA；新文件使用 `expected.kind: "absent"`。`content: null`
+表示删除，空字符串表示空文件。父目录须已存在，链接、硬链接别名、重复路径、NUL 内容
+及过期哈希直接拒绝。最多 32 个文件、256 KiB 新文本，完整审阅信封上限 512 KiB，
+文件内容不会转换为 Shell 命令或宿主路径。
+
+所有编辑都需要人工批准，读取白名单也不例外。`GET /approvals/{approval}/edit`
+按当前审批查看权限返回完整前后文本；批准绑定内容、路径、原哈希、基础快照和环境版本。
+提案改变需要重新决策。网关构建并验证未公布候选，随后原子切换 volume 指针、版本和回执；
+成功公布前原工作区保持有效。
+
+网关拥有有界编辑执行器，接纳及回执持久保存，重启或响应丢失不重复修改。
+取消可以在公布前胜出，真实迟到的已提交回执仍保留，但不恢复已经取消的 Job。
+Worker 复用公共检查点及一次性完成消费。私有命令为 `preview_edit`、`prepare_edit`、
+`submit_edit`、`inspect_edit`，控制入口位于 `/internal/gateway/v1/edit/`。
+App/UI 保持暂停。

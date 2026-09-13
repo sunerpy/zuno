@@ -111,3 +111,10 @@ principal, invocation, approval binding and returned snapshot/query identity.
 Preparation may yield the existing approval wait; execution starts after durable
 tool handoff and remains in the enterprise environment. Completion profiles expose
 none of these tools. See [gateway reads](GATEWAY.md#workspace-read-operations).
+
+`workspace_edit` uses the same gateway-equipped profile but always requires human
+review. Read results include the original file SHA for expected-content binding.
+The Worker freezes the complete edit proposal, waits for approval, records tool
+handoff and then waits for the authoritative operation completion. A lost submit
+response is inspected by stable operation ID; unresolved outcomes remain uncertain.
+No Worker-held Future is needed to finish an admitted edit after process loss.

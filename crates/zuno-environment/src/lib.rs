@@ -4,9 +4,11 @@
 mod archive;
 mod authority;
 mod docker;
+mod edit_executor;
 mod gateway;
 mod ledger;
 mod merge_executor;
+pub use edit_executor::EditExecutor;
 pub mod workspace_merge;
 
 pub use authority::OrganizationOperationAuthority;

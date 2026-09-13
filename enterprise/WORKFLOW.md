@@ -90,7 +90,7 @@ PostgreSQL preview format 15 adds workflow/node coordination and frozen dependen
 inputs. The exact format-14 fixture preserves sessions, messages, Memory, committed
 frames and live rows through migration and rollback. Earlier supported formats
 advance in the same guarded transaction. Worker protocol 11 carries workflow
-commands; checkpoint schema 4 is unchanged and gateway protocol 6 validates Workflow workspace preparation. Use matching
+commands; checkpoint schema 4 is unchanged and gateway protocol 7 validates Workflow workspace preparation. Use matching
 control-plane/Worker versions and regenerate the public SDK when updating these contracts.
 
 ## Durable Council

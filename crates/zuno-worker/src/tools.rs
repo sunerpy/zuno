@@ -1,5 +1,6 @@
 //! Durable gateway tools. Preparation can wait for approval; actual submission
 //! starts only after the kernel's durable handoff and can yield an operation wait.
+mod edit;
 mod files;
 
 use crate::{WorkerClient, WorkerExecution, gateway::GatewayClient};
@@ -338,9 +339,16 @@ impl ToolDispatcher for GatewayToolDispatcher {
     fn available_tools(&self) -> AvailableTools {
         let mut definitions = vec![self.definition.clone()];
         definitions.extend(files::definitions());
+        definitions.push(edit::definition());
         AvailableTools::new(definitions, McpToolStatus::Ready)
     }
     async fn prepare(&self, request: DispatchRequest) -> PreparedToolDispatch {
+        if request.call.name == edit::WORKSPACE_EDIT {
+            return self
+                .prepare_edit(request)
+                .await
+                .unwrap_or_else(|result| PreparedToolDispatch::ready(*result));
+        }
         if request.call.name != ENVIRONMENT_COMMAND {
             return self
                 .prepare_files(request)

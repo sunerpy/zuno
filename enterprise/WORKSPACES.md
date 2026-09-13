@@ -87,7 +87,7 @@ A child requiring a workspace remains unclaimable until preparation is durably
 confirmed. Background dispatch also waits for this preparation before returning
 an executable Job handle.
 
-Worker protocol 11 requests `PrepareChildWorkspace` through gateway protocol 6.
+Worker protocol 11 requests `PrepareChildWorkspace` through gateway protocol 7.
 The request carries only a staged child Job ID. The control plane verifies the
 parent lease and child relation, resolves both environment specifications and
 records the workspace admission. The Worker cannot choose another volume, image,
@@ -200,7 +200,7 @@ committed facts remain authoritative. Truthful receipts remain deliverable after
 Worker lease loss and are consumed once.
 
 Gateway ledger 4 and PostgreSQL preview format 17 add guarded migrations.
-Worker protocol 11 and gateway protocol 6 require matching roles. The SDK exposes
+Worker protocol 11 and gateway protocol 7 require matching roles. The SDK exposes
 `mergeReview` and streaming `mergeContent`; `UiAction::ViewWorkspaceMerge` identifies
 review. App UI remains deferred to Penpot. Remote artifact storage and full
 retention/backup/rolling-upgrade acceptance remain separate work.

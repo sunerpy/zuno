@@ -380,3 +380,14 @@ Migration pages through prior extraction manifests, preserving cancellation and
 all old rows while backfilling captured origins. It restores forced RLS before the
 marker commits. Injected DDL failure preserves format 21 and its original data;
 repeated migration does not duplicate claims.
+
+## Format 23: reviewed file editing
+
+Scoped edit offers, admitted attempts, completion facts and cancellation delivery
+reuse organization approval transactions and generic operation waits. The exact
+format-22 source digest is
+`7716b34c4b3c6f0866d9a7a5af9ed26d16b77074e6902afcb85c5c7921513eae`.
+Migration preserves sessions/messages/Memory and pending learning-scan versions;
+injected DDL failure keeps the old format and original rows. Execution admission
+and its attempt record commit together, as do completion, activity and wait wakeup.
+Only an originally admitted gateway attempt can submit a late completion.

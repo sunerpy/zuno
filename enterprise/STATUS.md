@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p3-workspace-reads`.
+- Current phase branch: `codex/enterprise-p3-workspace-edits`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -546,3 +546,11 @@ Workflow PR #218 initially exposed an arm64 stack overflow in the PostgreSQL con
 - Provider and HTTPS tests pass snapshot replay, paging/search, binary/link behavior, owner isolation, revoked access, changed-argument refusal, automatic/HITL policy and cancelled execution. A real Worker failure exposed an overly strict lease equality check; the fix preserves all execution identity fields while allowing deadline extension and has an explicit renewal regression.
 - Both real user sessions complete all three file calls with the original command-approval count. The complete five-process fixture passes with 61 model requests. Application tests, workspace check/Clippy, 100 documentation/release contracts and fmt/diff pass. Gateway protocol is 6, Worker protocol stays 11, PostgreSQL stays 22 and ledger stays 4.
 - English/Chinese gateway, Worker, workspace, Workflow and runtime documentation is updated. App/UI remains paused and excluded. PR #233 passed its required checks and merged only into preview at `fd9921edae0c0b2a8380cb56c50a2aaae7dd6ef0`; PR #234 is separate.
+
+## Reviewed workspace editing
+
+- `workspace_edit` creates/replaces/deletes bounded regular UTF-8 files with exact prior SHA or absence and mandatory human review. Gateway preview, current approval, durable admission, background execution, cancellation and operation-result waits are connected; public review and SDK return the complete before/after text without leases.
+- Merge and edit share candidate restore/read-back verification, with distinct business journals and approval bindings. The active volume pointer, revision and receipt publish atomically. Duplicate delivery does not repeat a write; admitted-attempt validation retains truthful late facts without resuming cancelled Jobs.
+- PostgreSQL format 23 preserves exact format 22; gateway ledger format 5 preserves exact format 4, with injected migration/publication rollback tests. Native Docker verifies no pre-approval changes, COW publication and lost-ack recovery. The real Agent create/read-SHA/replace/read workflow passed two explicit reviews and foreign-review refusal.
+- PostgreSQL/HTTPS fault checks pass changed offers, approval/attempt atomicity, completion/wakeup rollback, duplicate results, forged attempts, cancellation delivery and late completion. The full five-process native run passes. SDK tests pass 24 cases; workspace check/Clippy, 100 documentation/release contracts, generated drift and fmt/diff pass locally.
+- Gateway protocol is 7; Worker protocol remains 11. English/Chinese runtime, gateway, storage, application and SDK docs are updated. UI stays paused. PR #235 passed required gates and merged only into preview at `8ce74bfe3edd51fbd8bba78bf7bd22e00ac113fc`.
