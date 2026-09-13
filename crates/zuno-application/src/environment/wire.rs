@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{ApplicationError, authorization::ApprovalRecord, runtime::ExecutionLease};
 
-pub const GATEWAY_PROTOCOL_VERSION: u32 = 7;
+pub const GATEWAY_PROTOCOL_VERSION: u32 = 8;
 pub const MAX_GATEWAY_FRAME_BYTES: usize = 1024 * 1024;
 
 /// A data-owner response, never a caller-selected deployment.
@@ -52,6 +52,15 @@ pub struct GatewayOperationRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayCommand {
+    PrepareMcp {
+        operation: Box<crate::mcp::McpOperation>,
+    },
+    SubmitMcp {
+        operation: Box<crate::mcp::McpOperation>,
+    },
+    InspectMcp {
+        operation_id: OperationId,
+    },
     Acquire,
     Get,
     PreviewEdit {
@@ -108,6 +117,7 @@ pub enum GatewayCommand {
 impl GatewayCommand {
     pub fn validate(&self) -> Result<(), ApplicationError> {
         match self {
+            Self::PrepareMcp { operation } | Self::SubmitMcp { operation } => operation.validate(),
             Self::PreviewEdit { operation } => operation.validate(),
             Self::PrepareEdit { admission } | Self::SubmitEdit { admission } => {
                 admission.validate()
@@ -202,6 +212,7 @@ impl GatewayRequest {
     deny_unknown_fields
 )]
 pub enum GatewayReply {
+    Mcp(crate::mcp::McpReceipt),
     Environment(Environment),
     EditPreview(Box<crate::workspace_edit::WorkspaceEditAdmission>),
     EditReceipt(crate::workspace_edit::WorkspaceEditReceipt),

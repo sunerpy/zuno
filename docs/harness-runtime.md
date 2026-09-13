@@ -3086,3 +3086,14 @@ the base workspace revision. The gateway owns copy-on-write restore/verification
 and atomic publication, while PostgreSQL atomically records admission attempts,
 late completion facts and parent wait consumption. A cancelled parent retains a
 truthful late result without resuming. Public review/SDK DTOs omit execution leases.
+
+### Enterprise external MCP operations
+
+`McpOperationAuthority`, `McpConnectionProvider`, `PreparedMcpCall` and
+`McpCompletionSink` separate current permission, owner credentials, one external
+call and durable delivery. The existing bounded Worker handoff and operation
+wait consume results. A gateway journal marks invocation before `tools/call`;
+restart or lost outcome preserves uncertainty and never repeats a side effect.
+Human approval includes the exact HTTPS target, declaration, arguments and
+assignment revision. Details are in the preview archive `enterprise/MCP.md`;
+this change does not implement an App/UI.

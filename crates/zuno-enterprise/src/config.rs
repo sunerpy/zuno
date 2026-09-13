@@ -147,6 +147,10 @@ pub struct GatewayConfig {
     /// Peer gateways may use a different private CA from the control plane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_root_certificate: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_connections: Vec<crate::mcp::McpConnectionConfig>,
+    #[serde(default = "merge_parallelism")]
+    pub mcp_parallelism: u32,
 }
 fn merge_parallelism() -> u32 {
     2
@@ -343,6 +347,8 @@ pub struct Definition {
     pub councils: Vec<CouncilDefinition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_learning: Option<MemoryLearningDefinition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_tools: Vec<zuno_application::mcp::McpToolBinding>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -446,6 +452,22 @@ impl Definition {
     pub fn validate(&self) -> Result<(), Error> {
         self.reference().validate()?;
         self.selection().validate()?;
+        if self.mcp_tools.len() > 64
+            || (!self.mcp_tools.is_empty()
+                && (self.environment.is_none()
+                    || self.agent.mode == AgentExecutionMode::Completion))
+        {
+            return Err(invalid(
+                "MCP tools require an Agent gateway profile and at most 64 declarations",
+            ));
+        }
+        let mut tool_names = BTreeSet::new();
+        for binding in &self.mcp_tools {
+            binding.validate()?;
+            if !tool_names.insert(binding.wire_name()) {
+                return Err(invalid("duplicate immutable MCP declaration"));
+            }
+        }
         if let Some(learning) = &self.memory_learning {
             learning.extraction.validate()?;
             learning.maintenance.validate()?;

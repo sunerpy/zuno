@@ -272,11 +272,15 @@ impl WorkerServiceFactory for ConfiguredWorkerFactory {
             Arc::new(zuno_worker::tools::CompletionToolDispatcher)
         } else {
             Arc::new(MemoryToolDispatcher::new(
-                Arc::new(GatewayToolDispatcher::new(
-                    self.state.clone(),
-                    execution.clone(),
-                    self.gateway.clone(),
-                )),
+                Arc::new(
+                    GatewayToolDispatcher::new(
+                        self.state.clone(),
+                        execution.clone(),
+                        self.gateway.clone(),
+                    )
+                    .with_mcp(entry.definition.mcp_tools.clone())
+                    .map_err(|_| WorkerError::Configuration)?,
+                ),
                 memory.clone(),
                 execution.clone(),
             ))

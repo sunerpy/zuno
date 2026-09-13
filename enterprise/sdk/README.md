@@ -61,3 +61,8 @@ Rust 生成的判别联合。来源不代表执行授权。历史分页固定快
 `editReview(approvalId)` returns the exact approved file before/after proposal. It verifies the approval identity and excludes internal lease data; submit the existing approval answer only after reviewing this content.
 
 `editReview` 返回确切文件前后提案，核对审批身份并拒绝内部租约字段；复核内容后使用现有审批答复接口。
+
+Use `mcpReview(approvalId)` to retrieve the complete approved target, declaration
+and arguments. Identity/schema validation rejects unrelated approvals and
+private execution fields. `view_mcp_call` is a typed client action; no App/UI is
+implemented by this SDK change.

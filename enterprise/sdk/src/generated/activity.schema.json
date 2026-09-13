@@ -1481,6 +1481,23 @@
         {
           "type": "object",
           "properties": {
+            "approvalId": {
+              "$ref": "#/$defs/ApprovalId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "view_mcp_call"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "approvalId"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "importId": {
               "$ref": "#/$defs/WorkspaceImportId"
             },

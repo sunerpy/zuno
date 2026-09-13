@@ -35,7 +35,7 @@
 
 ## 私有协议
 
-`GatewayRequest` 为版本 7，使用有界的 tagged enum：
+`GatewayRequest` 为版本 8，使用有界的 tagged enum：
 
 | 命令 | 行为 |
 | --- | --- |
@@ -102,7 +102,7 @@ socket 会使该 gate 失败。可以通过 `ZUNO_ROOTLESS_DOCKER_SOCKET` 指定
 
 网关 supervisor 通过独立服务认证轮询 `internal/gateway/v1/cancellations`，领取已停止 Job 的不可变操作接纳记录。该入口在 Worker 撤权后仍有效，只允许停止原操作；完成事实保持原样，不确定状态继续核查。见[控制](CONTROL.zh.md)。
 
-网关协议 7 将子工作区准备路由至目标网关，单独标识经过授权的来源，包括已经存在的
+网关协议 8 将子工作区准备路由至目标网关，单独标识经过授权的来源，包括已经存在的
 Workflow 协调工作区。普通命令仍要求执行会话一致。
 
 快照交换使用 `/internal/execution/v1/snapshot` 及独立的
@@ -128,7 +128,7 @@ Docker 提供者读取分配工作区版本的已验证不可变归档，不执�
 只有 `autoReadApps` 中的应用能自动批准这些内置读取，其他允许接入的应用沿用权威 HITL
 流程。该白名单不批准 Shell 或任意 MCP 操作。控制入口为
 `/internal/gateway/v1/files/prepare`、`/authorize`，仅接受分配网关的服务身份。
-Worker 与网关须匹配网关协议 7，状态／Worker 协议保持 11。
+Worker 与网关须匹配网关协议 8，状态／Worker 协议保持 11。
 
 ## 人工审阅的文件修改
 
@@ -148,3 +148,9 @@ Worker 与网关须匹配网关协议 7，状态／Worker 协议保持 11。
 Worker 复用公共检查点及一次性完成消费。私有命令为 `preview_edit`、`prepare_edit`、
 `submit_edit`、`inspect_edit`，控制入口位于 `/internal/gateway/v1/edit/`。
 App/UI 保持暂停。
+
+## 外部 MCP
+
+网关协议 8 在配置真实用户级 `McpConnectionProvider` 时支持 `prepare_mcp`、
+`submit_mcp`、`inspect_mcp`。独立 MCP 日志保存不确定结果，禁止重放已提交的外部
+调用。配置、审批和取消限制见 [MCP.zh.md](MCP.zh.md)。

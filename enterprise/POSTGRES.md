@@ -391,3 +391,15 @@ Migration preserves sessions/messages/Memory and pending learning-scan versions;
 injected DDL failure keeps the old format and original rows. Execution admission
 and its attempt record commit together, as do completion, activity and wait wakeup.
 Only an originally admitted gateway attempt can submit a late completion.
+
+## Format 24: external MCP receipts
+
+Owner-scoped `gateway_mcp_operation`, `gateway_mcp_attempt` and
+`gateway_mcp_cancellation` join the existing approval and persistent wait
+transactions. Completion and notification commit together; a stale Worker cannot
+admit a new call, while the gateway may deliver an originally admitted result.
+The exact format-23 source digest is
+`89f0406fe0680077c5d10ff6835523d8fe4c984b77216f94bd4bbae97ccda926`.
+The migration preserves sessions, messages, Memory, learning scan watermarks and
+file-edit rows; DDL failure rolls back the entire upgrade. MCP failure semantics
+and the independent gateway journal are documented in [MCP.md](MCP.md).

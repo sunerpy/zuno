@@ -303,6 +303,9 @@ pub enum UiAction {
     ViewWorkspaceEdit {
         approval_id: ApprovalId,
     },
+    ViewMcpCall {
+        approval_id: ApprovalId,
+    },
     ViewWorkspaceImport {
         session_id: crate::identity::SessionId,
         import_id: crate::identity::WorkspaceImportId,

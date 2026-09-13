@@ -934,3 +934,12 @@ Worker 辅助消费者装配。已结束来源 Job 生成有界提炼请求，�
 完整前后内容和基础工作区版本。网关负责候选恢复／验证及原子公布，PostgreSQL 原子
 记录已接纳尝试、真实迟到结果及父等待消费；父任务取消后保留真实结果而不恢复执行。
 公共审阅和 SDK DTO 不暴露执行租约。
+
+### 企业外部 MCP 操作
+
+`McpOperationAuthority`、`McpConnectionProvider`、`PreparedMcpCall`、
+`McpCompletionSink` 分离当前权限、用户凭证、一次外部调用与持久投递。
+结果沿用有界 Worker 交接和操作等待消费。网关日志先记录调用，再进入
+`tools/call`；重启或响应丢失保留不确定状态，不重复副作用。人工审批绑定
+精确 HTTPS 地址、声明、参数和分配版本，详见预览产物中的 `enterprise/MCP.zh.md`。
+本变更不实施 App/UI。

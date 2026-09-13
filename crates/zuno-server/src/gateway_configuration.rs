@@ -18,9 +18,15 @@ pub struct GatewayDeployment {
     pub memory_bytes: u64,
     pub pids_limit: u32,
     pub cpu_millis: u32,
+    pub mcp_tools: Vec<zuno_application::mcp::McpToolBinding>,
 }
 
 pub trait GatewayConfigurationResolver: Send + Sync {
+    fn mcp_tools(
+        &self,
+        tenant: &TenantId,
+        configuration: &ConfigurationRef,
+    ) -> Result<Vec<zuno_application::mcp::McpToolBinding>, ApplicationError>;
     fn resolve(
         &self,
         tenant: &TenantId,
@@ -42,6 +48,14 @@ impl ConfiguredGateways {
         }
         let mut seen = BTreeSet::new();
         for entry in &deployments {
+            if entry.mcp_tools.len() > 64 {
+                return Err(ApplicationError::Invalid(
+                    "too many MCP declarations".to_owned(),
+                ));
+            }
+            for binding in &entry.mcp_tools {
+                binding.validate()?;
+            }
             let endpoint = &entry.endpoint;
             if endpoint.scheme() != "https"
                 || endpoint.host_str().is_none()
@@ -91,6 +105,17 @@ impl GatewayDeployment {
 }
 
 impl GatewayConfigurationResolver for ConfiguredGateways {
+    fn mcp_tools(
+        &self,
+        tenant: &TenantId,
+        configuration: &ConfigurationRef,
+    ) -> Result<Vec<zuno_application::mcp::McpToolBinding>, ApplicationError> {
+        self.deployments
+            .iter()
+            .find(|entry| entry.tenant == *tenant && entry.configuration == *configuration)
+            .map(|entry| entry.mcp_tools.clone())
+            .ok_or(ApplicationError::Forbidden)
+    }
     fn resolve(
         &self,
         tenant: &TenantId,

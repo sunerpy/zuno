@@ -3,6 +3,8 @@ mod boundaries;
 mod edit_results;
 mod environment;
 mod lifecycle;
+#[path = "authorization_tests/mcp_results.rs"]
+mod mcp_results;
 mod operation_results;
 mod waiting;
 
@@ -169,6 +171,7 @@ fn answer(id: &ApprovalId, key: &str) -> AnswerApproval {
 }
 pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator: &PgPool) {
     Box::pin(edit_results::exercise(backend, admin, migrator)).await;
+    Box::pin(mcp_results::exercise(backend, admin, migrator)).await;
     lifecycle::exercise(backend, admin, migrator).await;
     boundaries::exercise(backend, admin, migrator).await;
     administration::exercise(backend, admin, migrator).await;

@@ -11,6 +11,7 @@ mod client;
 mod learning_client;
 mod learning_sources;
 mod live;
+mod mcp;
 mod memory;
 mod migration;
 mod operation;

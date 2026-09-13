@@ -45,6 +45,8 @@ mod format_twelve;
 mod format_twenty;
 #[path = "tests/format_twenty_one.rs"]
 mod format_twenty_one;
+#[path = "tests/format_twenty_three.rs"]
+mod format_twenty_three;
 #[path = "tests/format_twenty_two.rs"]
 mod format_twenty_two;
 
@@ -373,6 +375,7 @@ async fn real_postgres_enforces_scopes_transactions_role_boundaries_and_schema_i
     Box::pin(format_twenty::upgrade(&fixture, &admin)).await;
     Box::pin(format_twenty_one::upgrade(&fixture, &admin)).await;
     Box::pin(format_twenty_two::upgrade(&fixture, &admin)).await;
+    Box::pin(format_twenty_three::upgrade(&fixture, &admin)).await;
     let expected_count: i64 = query_scalar("SELECT count(*) FROM zuno_enterprise_preview.session")
         .fetch_one(&admin)
         .await

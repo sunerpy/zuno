@@ -42,6 +42,9 @@
     "learning_query": {
       "$ref": "#/$defs/LearningPageRequest"
     },
+    "mcp_call": {
+      "$ref": "#/$defs/McpCallView"
+    },
     "merge_content": {
       "$ref": "#/$defs/MergeContentRequest"
     },
@@ -85,6 +88,7 @@
     "workflow",
     "workspace_merge",
     "workspace_edit",
+    "mcp_call",
     "merge_content",
     "begin_workspace_import",
     "workspace_import",
@@ -95,6 +99,11 @@
     "learning_cancellation"
   ],
   "$defs": {
+    "ActivityName": {
+      "type": "string",
+      "maxLength": 256,
+      "minLength": 1
+    },
     "ApprovalAnswer": {
       "type": "string",
       "enum": [
@@ -817,6 +826,43 @@
         "failed",
         "cancelled",
         "uncertain"
+      ]
+    },
+    "McpCallView": {
+      "description": "Human review of the full frozen declaration, target and arguments. No\nexecution lease, token or gateway credential is exposed.",
+      "type": "object",
+      "properties": {
+        "admitted": {
+          "type": "boolean"
+        },
+        "approvalId": {
+          "$ref": "#/$defs/ApprovalId"
+        },
+        "arguments": true,
+        "definition": true,
+        "endpoint": {
+          "type": "string"
+        },
+        "operationId": {
+          "$ref": "#/$defs/OperationId"
+        },
+        "server": {
+          "$ref": "#/$defs/ActivityName"
+        },
+        "tool": {
+          "$ref": "#/$defs/ActivityName"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "approvalId",
+        "operationId",
+        "server",
+        "tool",
+        "definition",
+        "arguments",
+        "endpoint",
+        "admitted"
       ]
     },
     "MergeChoice": {

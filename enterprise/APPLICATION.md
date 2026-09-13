@@ -105,3 +105,9 @@ Only an authenticated user in a current approval application may initialize.
 Pending import and first input cannot both win. Cancellation is available before
 restore admission; after initialization starts, retry the same archive or inspect
 status. See [initial project setup](WORKSPACES.md#initialize-a-project).
+
+MCP approval details use `GET /api/v1/approvals/{id}/mcp`. The typed `McpCallView`
+contains the reviewed endpoint, full tool declaration and exact arguments, with
+the same current requester/approver authorization as other approval details.
+It contains no execution lease or credentials. `UiAction::ViewMcpCall` and SDK
+`mcpReview` describe this backend interaction; App/UI implementation is paused.
