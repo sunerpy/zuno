@@ -3956,7 +3956,7 @@ async fn inject_live_inputs(
     );
     let delivery = live.guard.take_soft_interrupts_at_safe_point();
     let mut batch = crate::input_delivery::prepare(
-        &live.inbox,
+        live.inbox,
         &request.session_id,
         &request.turn_id,
         delivery.messages,

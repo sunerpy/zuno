@@ -653,11 +653,17 @@ continues accepting only the assigned primary input and rejects native live
 claims. A transport acknowledgement does not authorize further model work.
 
 Local validation passed 223 SQLite tests including 54 migration fixtures, 373
-engine tests, 144 ACP tests, 750 host tests, 31 SDK tests and generated-contract
-drift checks. The isolated rootless Docker/PostgreSQL five-role process fixture
-passed. Final workspace gates, the packaged artifact and preview CI remain
-required. The foreground-wait regression now observes durable process registration
-before sampling; it no longer assumes startup completes within 150 milliseconds.
+engine tests, 144 ACP tests, 750 host tests, 343 Goal tests plus its integration
+test, 82 session-control contracts, 31 SDK tests and generated-contract drift
+checks. The additional state/protocol tests verify refused consumption. Final
+workspace compilation and Clippy passed; the isolated PostgreSQL transaction
+suite, five HTTPS contracts and rootless Docker five-role process fixture passed.
+All 104 documentation/release contracts passed. The packaged artifact and
+preview CI remain required.
+The foreground-wait regression now observes durable process registration before
+sampling; it no longer assumes startup completes within 150 milliseconds.
+The repair fixture checks that admitting one recovery control increments only
+the corresponding preview input CAS while preserving leases and other state.
 
 ADK Go v2.4.0 source and official MCP docs were reviewed; adoption decisions are
 in [ADK-REFERENCE.md](ADK-REFERENCE.md) and [ADK-REFERENCE.zh.md](ADK-REFERENCE.zh.md).
