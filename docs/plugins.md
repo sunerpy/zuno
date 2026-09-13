@@ -334,3 +334,7 @@ This guarantee covers framework-owned registrations, tasks, process trees,
 component instances, and routing. It cannot undo an external mutation the plugin
 already completed. Such a mutation remains a durable fact and needs an explicit
 compensating operation.
+
+A pre-cancelled tool call does not start a dormant plugin or send a request.
+If cancellation arrives after bytes may have been dispatched, Zuno still reports
+uncertainty unless the existing authoritative cleanup conditions are met.
