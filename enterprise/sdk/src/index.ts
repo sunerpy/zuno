@@ -13,6 +13,7 @@ export type {
   WorkspaceEditView, WorkspaceEditReview, McpCallView,
   SharedMemorySpace, SharedMemoryPage, SharedMemoryChange, SharedMemoryRole, SharedMemoryDecision,
   ConfigureSharedMemory, ProposeSharedMemory, ReviewSharedMemory, SharedMemoryEdit, SharedMemoryMember,
+  ShareMemoryEvidence, RevokeSharedEvidence, SharedEvidenceGrant, SharedEvidencePage, SharedEvidenceKind, SharedEvidenceBinding, SharedEvidenceTransition,
   ProposeSkill, ReviewSkillEvaluation, SkillCandidateView, SkillEvaluationReport, SkillEvaluationCase,
   InstallSkill, ActivateSkill, RollbackSkill, InstalledSkillView, InstalledSkillPage, InstalledSkillDocument,
   BeginWorkspaceImport, WorkspaceImportView, WorkspaceImportState, WorkspaceImportId,

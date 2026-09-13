@@ -1,6 +1,8 @@
 //! Tenant-owned Memory spaces. Current actor authority and namespace ownership
 //! remain separate throughout the transaction.
+mod evidence;
 mod mutations;
+mod support;
 use crate::{PostgresBackend, database_error, database_time, owner_transaction};
 use async_trait::async_trait;
 use serde::{Serialize, de::DeserializeOwned};
@@ -54,13 +56,18 @@ pub(crate) async fn snapshots(
             Err(ApplicationError::NotFound) => continue,
             Err(error) => return Err(error),
         };
-        if space.entries.is_empty() {
+        let entries = space
+            .entries
+            .into_iter()
+            .filter(|entry| !space.suppressed.contains(entry))
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
             continue;
         }
         let content = format!(
             "MEMORY (organization shared: {})\n{}\n",
             space.title,
-            zuno_memory::render::serialize(&space.entries)
+            zuno_memory::render::serialize(&entries)
         );
         if bytes + content.len() > 65536 {
             omitted_spaces.push(id);
@@ -174,6 +181,7 @@ async fn read(
     if digest(&entries) != hash {
         return Err(ApplicationError::Conflict);
     }
+    let suppressed = support::suppressed(tx, principal, id, &entries).await?;
     Ok(SharedMemorySpace {
         id: id.clone(),
         workspace_id: WorkspaceId::new(
@@ -193,6 +201,7 @@ async fn read(
                 .map_err(database_error)?,
         )
         .map_err(|_| invalid())?,
+        suppressed,
     })
 }
 async fn prior<T: DeserializeOwned>(

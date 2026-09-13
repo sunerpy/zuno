@@ -1,4 +1,6 @@
 use super::*;
+#[path = "shared_memory/evidence.rs"]
+mod evidence;
 pub fn model(body: &Value, user: &str) -> Response {
     let checkpoint = user.contains("SHARED-CHECKPOINT");
     let resumed =
@@ -160,6 +162,7 @@ pub async fn verify(
         .unwrap();
     complete(http, &waiting, bob).await;
     turn(http, control, bob, "SHARED-REVOKED bob", "after-revoke").await;
+    evidence::verify(http, control, alice, bob, identities).await;
 }
 async fn turn(http: &reqwest::Client, control: &str, token: &str, text: &str, key: &str) {
     let url = start(http, control, token, text, key).await;

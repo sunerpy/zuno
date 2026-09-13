@@ -2,6 +2,61 @@ use super::*;
 use serde::Deserialize;
 use zuno_application::shared_memory::*;
 use zuno_types::identity::{MemorySpaceId, RequestId};
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct EvidenceQuery {
+    after: Option<RequestId>,
+    #[serde(default)]
+    limit: zuno_application::PageSize,
+}
+pub(super) async fn evidence(
+    State(service): State<EnterpriseApplication>,
+    Extension(identity): Extension<VerifiedIdentity>,
+    Path(id): Path<MemorySpaceId>,
+    Query(query): Query<EvidenceQuery>,
+) -> Result<Json<SharedEvidencePage>, Failure> {
+    let principal = service.principal(&identity).await?;
+    Ok(Json(
+        SharedEvidenceStore::list(
+            &service.backend.shared_memory(),
+            &principal,
+            &id,
+            query.after.as_ref(),
+            query.limit,
+        )
+        .await?,
+    ))
+}
+pub(super) async fn share_evidence(
+    State(service): State<EnterpriseApplication>,
+    Extension(identity): Extension<VerifiedIdentity>,
+    Path(id): Path<MemorySpaceId>,
+    Json(request): Json<ShareMemoryEvidence>,
+) -> Result<Json<SharedEvidenceGrant>, Failure> {
+    let principal = service.principal(&identity).await?;
+    Ok(Json(
+        service
+            .backend
+            .shared_memory()
+            .share(&principal, &id, request)
+            .await?,
+    ))
+}
+pub(super) async fn revoke_evidence(
+    State(service): State<EnterpriseApplication>,
+    Extension(identity): Extension<VerifiedIdentity>,
+    Path((space, id)): Path<(MemorySpaceId, RequestId)>,
+    Json(request): Json<RevokeSharedEvidence>,
+) -> Result<Json<SharedEvidenceGrant>, Failure> {
+    let principal = service.principal(&identity).await?;
+    Ok(Json(
+        service
+            .backend
+            .shared_memory()
+            .revoke(&principal, &space, &id, request)
+            .await?,
+    ))
+}
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -21,11 +76,14 @@ pub(super) async fn list(
         return Err(ApplicationError::NotFound.into());
     }
     Ok(Json(
-        service
-            .backend
-            .shared_memory()
-            .list(&principal, &workspace, query.after.as_ref(), query.limit)
-            .await?,
+        SharedMemoryStore::list(
+            &service.backend.shared_memory(),
+            &principal,
+            &workspace,
+            query.after.as_ref(),
+            query.limit,
+        )
+        .await?,
     ))
 }
 pub(super) async fn get(

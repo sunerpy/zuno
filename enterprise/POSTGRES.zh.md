@@ -326,3 +326,13 @@ schema、权限和 marker 同事务提交；已有单网关准备摘要保留原
 来源摘要为 `4897df28fc1284381212ed51dcd9e2b5c6c7c28175bdbe791c71eabfb3f7a91e`。
 迁移保留候选、会话、消息及个人／共享 Memory；注入 DDL 故障保留原格式和
 数据。详见 [SKILLS.zh.md](SKILLS.zh.md)。
+
+## 格式 28：明确共享的证据
+
+`shared_memory_evidence`、`shared_memory_support`、`shared_memory_evidence_audit`
+保存有界来源授权、条目证据及撤回审计。RLS 分离空间可读和来源所有者可写；
+作者退出空间后仍可撤回自己的授权。应用先选中获准读取的共享授权，再临时
+切换事务所有者检查私人来源，只返回有效性和已共享摘录，不暴露私人定位。
+正文／证据／审核与撤回／审计／回执分别原子提交。精确格式 27 摘要为
+`c87cff03b870109f419207512120352792ba605b1979f94be93284f194dd8f31`；注入 DDL
+故障保留原 marker、会话、消息、Memory 和 Skill 行。

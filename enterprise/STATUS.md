@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p5-acp-bridge`.
+- Current phase branch: `codex/enterprise-p2-shared-memory-evidence`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -627,3 +627,14 @@ Penpot must precede future design/development. No enterprise tag or release exis
 ## Remote ACP bridge under validation
 
 The Linux bridge role, public actor identity, text admission, cancellation, paged history, committed/live protocol projection and existing-Job observation are wired. Real two-user process tests passed cross-user isolation, authority-only approval, cancellation, disconnect/observe continuation and token identity replacement refusal. A TLS proxy drops a committed input response and confirms receipt lookup without a second POST. ACP 98 tests, SDK 29 tests and generated drift, workspace check, Clippy and 100 documentation/release contracts passed. Exact-archive and preview CI proof remain required. App/UI remains paused and no preview release is enabled.
+
+## Shared private evidence under validation
+
+Explicit excerpt grants, independent organization review, per-entry provenance,
+withdrawal and current-source recall checks are wired through scoped ports and
+PostgreSQL 28. Old-format migration and source/recall tests passed, including independent-source
+forgetting, audit rollback and owner withdrawal after leaving a space. Native
+same-Job recovery passed source-grant revocation with unchanged reader membership.
+SDK 30 tests, generated drift, workspace check, Clippy and 100 documentation/release
+contracts passed. Exact-archive and preview CI evidence remain required. Shared automatic model maintenance remains
+open. UI is paused; no enterprise publication is enabled.

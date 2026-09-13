@@ -6,7 +6,7 @@
 
 mod candidates;
 mod documents;
-mod evidence;
+pub(crate) mod evidence;
 mod learning;
 mod maintenance;
 pub use learning::PostgresLearningRuntime;

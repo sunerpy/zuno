@@ -5,6 +5,7 @@ import type {
   LearningJobView, LearningPage, LearningPageRequest, CancelLearning, LearningCancellation,
   WorkspaceEditView, McpCallView,
   SharedMemorySpace, SharedMemoryPage, SharedMemoryChange, ConfigureSharedMemory, ProposeSharedMemory, ReviewSharedMemory,
+  ShareMemoryEvidence, RevokeSharedEvidence, SharedEvidenceGrant, SharedEvidencePage,
   ProposeSkill, ReviewSkillEvaluation, SkillCandidateView,
   InstallSkill, ActivateSkill, RollbackSkill, InstalledSkillView, InstalledSkillPage, InstalledSkillDocument,
 } from "./generated/application.js";
@@ -15,6 +16,7 @@ import {
   validateWorkspaceEditView, validateMcpCallView,
   validateSharedMemorySpace, validateSharedMemoryPage, validateSharedMemoryChange,
   validateConfigureSharedMemory, validateProposeSharedMemory, validateReviewSharedMemory,
+  validateShareMemoryEvidence, validateRevokeSharedEvidence, validateSharedEvidenceGrant, validateSharedEvidencePage,
   validateProposeSkill,validateReviewSkillEvaluation,validateSkillCandidateView,
   validateInstallSkill,validateActivateSkill,validateRollbackSkill,validateInstalledSkillView,validateInstalledSkillPage,validateInstalledSkillDocument,
 } from "./generated/application-validators.mjs";
@@ -29,6 +31,25 @@ function id(value: string): string {
 }
 
 export class EnterpriseClient extends ActivityClient {
+  async shareMemoryEvidence(space: string, request: ShareMemoryEvidence, signal?: AbortSignal): Promise<SharedEvidenceGrant> {
+    if(!validateShareMemoryEvidence(request)) throw new Error("Invalid shared evidence request");
+    const value=checked<SharedEvidenceGrant>(await this.get(new URL(`memory/spaces/${id(space)}/evidence`,this.base),signal,"POST",request),validateSharedEvidenceGrant);
+    if(value.spaceId!==space || value.evidenceDigest!==request.expectedDigest) throw new Error("Shared evidence identity mismatch");
+    return value;
+  }
+  async sharedMemoryEvidence(space: string, after?: string, signal?: AbortSignal): Promise<SharedEvidencePage> {
+    const url=new URL(`memory/spaces/${id(space)}/evidence`,this.base);
+    if(after) url.searchParams.set("after",id(after));
+    const page=checked<SharedEvidencePage>(await this.get(url,signal),validateSharedEvidencePage);
+    if(page.items.some(value=>value.spaceId!==space) || (page.after && page.items.at(-1)?.id!==page.after)) throw new Error("Shared evidence identity mismatch");
+    return page;
+  }
+  async revokeSharedEvidence(space: string, evidence: string, request: RevokeSharedEvidence, signal?: AbortSignal): Promise<SharedEvidenceGrant> {
+    if(!validateRevokeSharedEvidence(request)) throw new Error("Invalid evidence revocation");
+    const value=checked<SharedEvidenceGrant>(await this.get(new URL(`memory/spaces/${id(space)}/evidence/${id(evidence)}/revoke`,this.base),signal,"POST",request),validateSharedEvidenceGrant);
+    if(value.id!==evidence || value.spaceId!==space || value.active || value.current || BigInt(value.revision)!==BigInt(request.expectedRevision)+1n) throw new Error("Shared evidence identity mismatch");
+    return value;
+  }
   async identity(signal?: AbortSignal): Promise<ActorView> {
     return checked<ActorView>(await this.get(new URL("identity",this.base),signal),validateActorView);
   }

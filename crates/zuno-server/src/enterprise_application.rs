@@ -195,6 +195,15 @@ impl EnterpriseApplication {
                     get(shared_memory::change),
                 )
                 .route("/memory/spaces/{space}/review", post(shared_memory::review));
+            router = router
+                .route(
+                    "/memory/spaces/{space}/evidence",
+                    get(shared_memory::evidence).post(shared_memory::share_evidence),
+                )
+                .route(
+                    "/memory/spaces/{space}/evidence/{evidence}/revoke",
+                    post(shared_memory::revoke_evidence),
+                );
             router = router.route("/workspaces/{workspace}/memory", post(memory_request));
             router = router
                 .route("/workspaces/{workspace}/learning/jobs", get(learning::list))

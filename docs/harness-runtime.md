@@ -3171,3 +3171,12 @@ not host-directory discovery or resource-package execution. See
 [enterprise Skills](../enterprise/SKILLS.md).
 
 Enterprise `acp_bridge` consumes public activity and application APIs. It owns connection/session observers, not Agent execution. Explicit request withdrawal is visible before admission through the native ACP transport; accepted admission outlives a detached observer. Persistent Job cancellation and approval authority remain on the control plane. See [enterprise ACP](../enterprise/ACP.md).
+
+### Shared evidence authority
+
+Private and organization Memory now share the same authoritative source verifier.
+An explicit owner grant publishes only a bounded excerpt. Shared proposals and
+undo retain a versioned support transition; recall recomputes source/grant
+validity and omits unsupported entries before assembling a provider request.
+Organization readers do not gain private session or operation access. See
+[shared Memory evidence](../enterprise/SHARED_MEMORY.md#explicit-private-evidence-sharing).

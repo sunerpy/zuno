@@ -2,8 +2,11 @@ use super::*;
 use sqlx_core::raw_sql::raw_sql;
 use zuno_application::shared_memory::*;
 use zuno_types::{activity::Counter, identity::MemorySpaceId};
+#[path = "shared_memory/evidence.rs"]
+mod evidence;
 
 pub(super) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator: &PgPool) {
+    Box::pin(evidence::exercise(backend, admin, migrator)).await;
     let f = fixture(backend, admin, migrator, "shared-memory").await;
     let store = backend.shared_memory();
     let id = MemorySpaceId::new("runbooks").unwrap();
@@ -50,6 +53,7 @@ pub(super) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
     );
     tx.rollback().await.unwrap();
     let proposal = ProposeSharedMemory {
+        evidence: Vec::new(),
         request_id: RequestId::new("proposal").unwrap(),
         expected_revision: Counter(1),
         edits: vec![SharedMemoryEdit::Add {
@@ -130,6 +134,7 @@ pub(super) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
             &f.reviewer,
             &id,
             ProposeSharedMemory {
+                evidence: Vec::new(),
                 request_id: RequestId::new("pending-before-policy-change").unwrap(),
                 expected_revision: Counter(3),
                 edits: vec![SharedMemoryEdit::Add {

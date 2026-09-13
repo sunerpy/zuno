@@ -11,7 +11,8 @@ use zuno_application::{
     },
     mcp::McpCallView,
     shared_memory::{
-        ConfigureSharedMemory, ProposeSharedMemory, ReviewSharedMemory, SharedMemoryChange,
+        ConfigureSharedMemory, ProposeSharedMemory, ReviewSharedMemory, RevokeSharedEvidence,
+        ShareMemoryEvidence, SharedEvidenceGrant, SharedEvidencePage, SharedMemoryChange,
         SharedMemoryPage, SharedMemorySpace,
     },
     skill::{
@@ -46,6 +47,10 @@ struct ApplicationProtocol {
     configure_shared_memory: ConfigureSharedMemory,
     propose_shared_memory: ProposeSharedMemory,
     review_shared_memory: ReviewSharedMemory,
+    share_evidence: ShareMemoryEvidence,
+    revoke_evidence: RevokeSharedEvidence,
+    evidence_grant: SharedEvidenceGrant,
+    evidence_page: SharedEvidencePage,
     workspace: WorkspaceView,
     session: SessionSummary,
     sessions: SessionPage,

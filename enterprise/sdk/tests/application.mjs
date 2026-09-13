@@ -5,6 +5,19 @@ import { EnterpriseClient, EnterpriseHttpError } from "../dist/src/index.js";
 const job = { id: "job", sessionId: "session", turnId: "turn", inputId: "input", phase: "ready", inputVersion: "1", waits: [], stopRequested: false, pendingOperations: [] };
 const response = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 
+test("shared evidence preserves space, source digest and revoke revision",async()=>{
+  const grant={id:"grant",spaceId:"runbooks",author:"alice",revision:"2",kind:"user_statement",
+    excerpt:"reviewed excerpt",evidenceDigest:"a".repeat(64),active:false,current:false};
+  const client=value=>new EnterpriseClient({baseUrl:"https://enterprise.example/api/v1/",accessToken:async()=>"token",fetch:async()=>response(value)});
+  const revoke={requestId:"revoke",expectedRevision:"1"};
+  assert.equal((await client(grant).revokeSharedEvidence("runbooks","grant",revoke)).current,false);
+  await assert.rejects(client({...grant,active:true}).revokeSharedEvidence("runbooks","grant",revoke),/identity mismatch/);
+  await assert.rejects(client({...grant,spaceId:"foreign"}).shareMemoryEvidence("runbooks",
+    {requestId:"share",evidenceId:"evidence",expectedDigest:grant.evidenceDigest}),/identity mismatch/);
+  await assert.rejects(client({items:[grant],after:"foreign"}).sharedMemoryEvidence("runbooks"),/identity mismatch/);
+  await assert.rejects(client({...grant,privateSession:"secret"}).revokeSharedEvidence("runbooks","grant",revoke),/Invalid enterprise application response/);
+});
+
 test("public identity contains only validated actor coordinates",async()=>{
   const actor={owner:{tenantId:"tenant",principalId:"alice"},kind:"user",clientId:"web"};
   const client=value=>new EnterpriseClient({baseUrl:"https://enterprise.example/api/v1/",accessToken:async()=>"token",fetch:async()=>response(value)});
