@@ -11,6 +11,7 @@ use zuno_application::{
         ConfigureSharedMemory, ProposeSharedMemory, ReviewSharedMemory, SharedMemoryChange,
         SharedMemoryPage, SharedMemorySpace,
     },
+    skill::{ProposeSkill, ReviewSkillEvaluation, SkillCandidateView},
     workflow::WorkflowRunView,
     workspace_edit::WorkspaceEditView,
     workspace_import::{BeginWorkspaceImport, WorkspaceImportView},
@@ -23,6 +24,9 @@ use zuno_application::{
     reason = "schema-only root collects public application DTOs for generated clients"
 )]
 struct ApplicationProtocol {
+    skill_candidate: SkillCandidateView,
+    propose_skill: ProposeSkill,
+    review_skill: ReviewSkillEvaluation,
     shared_memory_space: SharedMemorySpace,
     shared_memory_page: SharedMemoryPage,
     shared_memory_change: SharedMemoryChange,

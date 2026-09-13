@@ -411,3 +411,14 @@ and audit rows commit in one PostgreSQL transaction with forced namespace RLS.
 The exact format-24 migration retains private user data and MCP records; its
 source digest is `9ec0c1656e9e6518afdaf61de00b4689d4f2d603270677c942c3ada589485078`.
 See [SHARED_MEMORY.md](SHARED_MEMORY.md) for role and recovery semantics.
+
+## Format 26: reviewed Skill evaluation
+
+`skill_candidate`, `skill_request` and `skill_audit` are owner-scoped with forced
+RLS. Learning executions add `skill_evaluation` while retaining existing leases,
+request reservations, normalized usage and cancellation. Review and Job admission
+commit together; final reports are checked against durable attempt/grade records.
+The exact format-25 source digest is
+`97894f2d63508374da797882c724f702886eb1fbbae4d5b390c12d277e498c15`.
+Migration preserves private/shared Memory and MCP state and rolls back atomically
+on DDL failure. See [SKILLS.md](SKILLS.md).

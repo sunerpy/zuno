@@ -166,6 +166,11 @@ pub fn learning_input_budget(
             crate::memory::memory_prompt(),
             strict_schema::<crate::MemoryConsolidation>(),
         ),
+        crate::distributed::LearningPhase::SkillEvaluation => {
+            return Err(invalid(
+                "paired Skill evaluation validates its complete case and attempt envelopes",
+            ));
+        }
     };
     payload_budget(system, &schema, &parameters, maximum_input_bytes)
 }

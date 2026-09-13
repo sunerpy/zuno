@@ -3136,3 +3136,18 @@ operation IDs are refused, and divergent bytes remain uncertain.
 The effect DTO contains no host path or runtime handle. A remote host must bind
 it to current authorization, a logical environment target and a real operation
 receipt before use. This interface does not register a remote Skill executor.
+
+### Enterprise reviewed Skill evaluation
+
+The existing learning Job/lease/accounting runtime supports a separate
+`SkillEvaluation` purpose authorized by explicit review, independently from
+private Memory automation. Immutable source configuration selects a
+completion-only evaluation profile. Workers run the shared real paired model
+evaluator and recorded cassettes, then grade the resulting answers. Tool results
+use the provider-neutral Tool role so every supported adapter replays them.
+
+The data owner validates case/role/model/tool schema identity, reconstructs the
+actual trace from durable model outcomes, verifies grade inputs and outputs, and
+recomputes final policy/metrics. PostgreSQL 26 and learning protocol 2 carry this
+state; Worker state protocol remains 12. Evaluation success does not install a
+Skill. See `enterprise/SKILLS.md` in the preview archive.

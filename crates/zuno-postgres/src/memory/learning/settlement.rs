@@ -19,10 +19,9 @@ struct MaintenanceContext {
 
 impl PostgresLearningRuntime {
     pub async fn complete(&self, completion: LearningCompletion) -> Result<(), Error> {
-        let (actor, workspace, session) = self
-            .job_binding(&completion.lease.owner, &completion.lease.job_id)
-            .await?;
-        self.memory.automate(actor,workspace,session,move |provider| {
+        let owner = completion.lease.owner.clone();
+        let id = completion.lease.job_id.clone();
+        self.with_job(&owner,&id,move |provider| {
             let digest=zuno_orchestration::sha256_json(&json!(completion.result));
             let prior=provider.execute(async |tx| {
                 let row=provider.execution_row(tx,&completion.lease.job_id).await?;
@@ -41,6 +40,10 @@ impl PostgresLearningRuntime {
                 if job.tokens_charged>job.limits.total_tokens {return Err(Error::Denied);}
                 let row=provider.execution_row(tx,&job.id).await?;
                 let context:Value=row.try_get("context").map_err(sql_error)?;
+                if let (LearningInput::SkillEvaluation(input),LearningOutput::SkillEvaluation(report))=(&job.input,&completion.result) {
+                    provider.verify_skill_report(tx,&job,input,report,completion.lease.epoch).await?;
+                    return Ok((job,context));
+                }
                 let row=query("SELECT outcome,outcome_digest FROM zuno_enterprise_preview.learning_model_request
                     WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND state='completed'
                     ORDER BY created_at DESC,request_id DESC LIMIT 1")
@@ -65,6 +68,9 @@ impl PostgresLearningRuntime {
                 (LearningInput::Maintenance(_),LearningOutput::Maintenance(output))=>{
                     let context:MaintenanceContext=serde_json::from_value(context).map_err(decode_error)?;
                     provider.settle_maintenance(&job,&completion.lease,output,&context)?;
+                }
+                (LearningInput::SkillEvaluation(input),LearningOutput::SkillEvaluation(output))=>{
+                    provider.execute(async |tx|provider.settle_skill(tx,&job,input,output).await)?;
                 }
                 _=>return Err(Error::Denied),
             }

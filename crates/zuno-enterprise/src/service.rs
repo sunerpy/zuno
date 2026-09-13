@@ -400,6 +400,27 @@ async fn control(options: ControlConfig, shutdown: InterruptSignal) -> Result<()
     let mut application =
         EnterpriseApplication::new(backend.clone(), options.tenant_id.clone(), active)?
             .with_memory(memory.clone());
+    let learning_runtime = if !learning.grants().is_empty() || !learning.skills().is_empty() {
+        Some(
+            zuno_postgres::PostgresLearningRuntime::with_skills(
+                memory.clone(),
+                options.tenant_id.clone(),
+                learning.grants().to_vec(),
+                learning.skills().to_vec(),
+            )
+            .map_err(|_| invalid("invalid learning runtime"))?,
+        )
+    } else {
+        None
+    };
+    if !learning.skills().is_empty() {
+        application = application.with_skills(Arc::new(
+            learning_runtime
+                .as_ref()
+                .expect("installed learning")
+                .clone(),
+        ));
+    }
     if has_environments {
         application = application.with_workspace_gateway(Arc::new(
             zuno_server::workspace_gateway::GatewayWorkspaceClient::new(
@@ -438,15 +459,10 @@ async fn control(options: ControlConfig, shutdown: InterruptSignal) -> Result<()
         .clone()
         .api_router(users.clone())
         .merge(worker_state.router());
-    if !learning.grants().is_empty() {
+    if let Some(runtime) = learning_runtime {
         routes = routes.merge(
             zuno_server::enterprise_learning::LearningStateService::new(
-                zuno_postgres::PostgresLearningRuntime::new(
-                    memory,
-                    options.tenant_id.clone(),
-                    learning.grants().to_vec(),
-                )
-                .map_err(|_| invalid("invalid learning runtime"))?,
+                runtime,
                 workers.clone(),
                 grants.clone(),
                 options.tenant_id.clone(),

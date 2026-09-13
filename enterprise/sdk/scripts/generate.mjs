@@ -12,7 +12,7 @@ const directory = fileURLToPath(new URL("../src/generated", import.meta.url));
 const checking = process.argv.includes("--check");
 for (const [name,crate,example,title,sourceName,validatorName,roots] of [
   ["activity","zuno-types","activity_schema","ActivityProtocol","zuno-types/activity.rs","validators.mjs",["HistoryPage","FramePage","CommittedFrame","LiveFrame"]],
-  ["application","zuno-application","application_schema","ApplicationProtocol","zuno-application/api.rs","application-validators.mjs",["WorkspaceView","SessionSummary","SessionPage","JobView","ApprovalView","InputVersionView","CancellationReceipt","WorkflowRunView","WorkspaceMergeView","WorkspaceEditView","McpCallView","SharedMemorySpace","SharedMemoryPage","SharedMemoryChange","ConfigureSharedMemory","ProposeSharedMemory","ReviewSharedMemory","MergeContentRequest","WorkspaceImportView","LearningJobView","LearningPage","LearningPageRequest","LearningCancellation"]],
+  ["application","zuno-application","application_schema","ApplicationProtocol","zuno-application/api.rs","application-validators.mjs",["WorkspaceView","SessionSummary","SessionPage","JobView","ApprovalView","InputVersionView","CancellationReceipt","WorkflowRunView","WorkspaceMergeView","WorkspaceEditView","McpCallView","ProposeSkill","ReviewSkillEvaluation","SkillCandidateView","SharedMemorySpace","SharedMemoryPage","SharedMemoryChange","ConfigureSharedMemory","ProposeSharedMemory","ReviewSharedMemory","MergeContentRequest","WorkspaceImportView","LearningJobView","LearningPage","LearningPageRequest","LearningCancellation"]],
 ]) {
 const source = execFileSync(
   "cargo", ["run", "--quiet", "-p", crate, "--example", example],
@@ -32,10 +32,11 @@ function portableFormats(value) {
   if (!value || typeof value !== "object") return;
   // Schemars emits a Rust numeric annotation. Express its constraint in portable
   // JSON Schema instead of disabling unknown-format validation globally.
-  if (value.format === "uint32") {
+  if (value.format === "uint32" || value.format === "uint8") {
+    const maximum = value.format === "uint8" ? 255 : 4294967295;
     if (value.type !== "integer") throw new Error("uint32 must be an integer");
     value.minimum = Math.max(value.minimum ?? 0, 0);
-    value.maximum = Math.min(value.maximum ?? 4294967295, 4294967295);
+    value.maximum = Math.min(value.maximum ?? maximum, maximum);
     delete value.format;
   }
   if (value.format === "int64" || value.format === "uint64") {

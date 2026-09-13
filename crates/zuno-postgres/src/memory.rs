@@ -137,6 +137,7 @@ struct TransactionMemory {
     workspace: WorkspaceId,
     lease: Option<ExecutionLease>,
     automation_session: Option<SessionId>,
+    skill_evaluation: Option<zuno_types::identity::JobId>,
     limits: ScopeLimits,
     project_key: String,
     deadline: tokio::time::Instant,
@@ -222,6 +223,7 @@ impl MemoryDataService for PostgresMemoryService {
             workspace,
             lease,
             automation_session: None,
+            skill_evaluation: None,
             limits: self.backend.limits,
             deadline: tokio::time::Instant::now() + self.backend.transaction_timeout,
         });

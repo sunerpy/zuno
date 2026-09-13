@@ -996,6 +996,11 @@ async fn candidate_execution_reads_cassette_results_before_a_blind_grading_reque
             .expect("continuation")
             .contains("RECORDED_RESULT")
     );
+    assert!(requests[1].messages.iter().any(|message|
+        message.role==zuno_llm::event::Role::Tool && message.content.iter().any(|block|
+            matches!(block,zuno_llm::event::RequestContentBlock::ToolResult{content,..} if content.contains("RECORDED_RESULT"))
+        )
+    ),"provider adapters require tool results to use the Tool role");
     assert!(requests[2].tools.is_empty());
     assert!(
         serde_json::to_string(&requests[2].messages)

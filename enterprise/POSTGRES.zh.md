@@ -310,3 +310,11 @@ schema、权限和 marker 同事务提交；已有单网关准备摘要保留原
 命名空间 RLS。精确格式 24 升级保留个人数据和 MCP 记录，源摘要为
 `9ec0c1656e9e6518afdaf61de00b4689d4f2d603270677c942c3ada589485078`。
 权限与恢复语义见 [SHARED_MEMORY.zh.md](SHARED_MEMORY.zh.md)。
+
+## 格式 26：明确审核的 Skill 评测
+
+`skill_candidate`、`skill_request`、`skill_audit` 按用户隔离并强制 RLS。
+学习执行新增 `skill_evaluation`，沿用租约、请求预留、规范化计量与取消。审核
+和 Job 接纳原子提交，最终报告须对应持久尝试／评分记录。格式 25 的冻结摘要为
+`97894f2d63508374da797882c724f702886eb1fbbae4d5b390c12d277e498c15`。
+迁移保留私人／共享 Memory 和 MCP 状态，DDL 失败整体回滚，详见 [SKILLS.zh.md](SKILLS.zh.md)。

@@ -226,13 +226,26 @@ impl EvaluationService {
                         baseline_metric.saturating_add(baseline.score.saturating_mul(weight));
                     candidate_metric =
                         candidate_metric.saturating_add(candidate.score.saturating_mul(weight));
-                    let cited_failure_fixed =
-                        case.kind != EvaluationCaseKind::Failure || candidate.passed;
-                    let critical_regression = case.kind == EvaluationCaseKind::Protection
-                        && baseline.passed
-                        && (!candidate.passed
-                            || candidate.critical_failure
-                            || candidate.score < baseline.score);
+                    let kind = match case.kind {
+                        EvaluationCaseKind::Failure => {
+                            zuno_application::skill::SkillCaseKind::Failure
+                        }
+                        EvaluationCaseKind::Protection => {
+                            zuno_application::skill::SkillCaseKind::Protection
+                        }
+                        EvaluationCaseKind::General => {
+                            zuno_application::skill::SkillCaseKind::General
+                        }
+                    };
+                    let (cited_failure_fixed, critical_regression) =
+                        zuno_application::skill::skill_case_policy(
+                            kind,
+                            baseline.score,
+                            candidate.score,
+                            baseline.passed,
+                            candidate.passed,
+                            candidate.critical_failure,
+                        );
                     cited_failures_fixed &= cited_failure_fixed;
                     protection_regressed |= critical_regression;
                     results.push(NewEvaluationResult {

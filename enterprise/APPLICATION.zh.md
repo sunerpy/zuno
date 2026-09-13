@@ -95,3 +95,7 @@ MCP 审批详情使用 `GET /api/v1/approvals/{id}/mcp`，`McpCallView` 包含�
 组织 Memory 空间使用类型化存储接口和 [SHARED_MEMORY.zh.md](SHARED_MEMORY.zh.md)
 所列路由。配置要求组织管理员，内容发布要求独立空间审核者。本轮仅交付后端和
 SDK，不交付 App/UI。
+
+配置 Skill 评测后提供 `POST jobs/{job}/skills`、`GET skills/{id}`、
+`POST skills/{id}/evaluate`。仅当模型配置存在时安装真实 `SkillApplication`
+提供方，详见 [SKILLS.zh.md](SKILLS.zh.md)。

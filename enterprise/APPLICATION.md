@@ -116,3 +116,7 @@ Organization Memory spaces use the typed shared Memory store and routes document
 in [SHARED_MEMORY.md](SHARED_MEMORY.md). Configuration requires an organization
 administrator; publication requires an independent namespace reviewer. These
 backend and SDK capabilities do not deliver an App/UI.
+
+Configured Skill evaluation adds `POST jobs/{job}/skills`, `GET skills/{id}` and
+`POST skills/{id}/evaluate`; their typed `SkillApplication` provider is installed
+only when a reviewed model profile exists. See [SKILLS.md](SKILLS.md).

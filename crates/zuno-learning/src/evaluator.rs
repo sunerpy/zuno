@@ -18,11 +18,19 @@ pub struct ProviderSkillEvaluator {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Grade {
-    score: u8,
-    passed: bool,
-    critical_failure: bool,
-    explanation: String,
+pub struct SkillGrade {
+    pub score: u8,
+    pub passed: bool,
+    pub critical_failure: bool,
+    pub explanation: String,
+}
+pub fn decode_skill_grade(text: &str) -> crate::Result<SkillGrade> {
+    let grade: SkillGrade = serde_json::from_str(crate::model::strip_json_fence(text))
+        .map_err(|error| invalid(&format!("invalid persisted Skill grade: {error}")))?;
+    if grade.score > 100 {
+        return Err(invalid("evaluation grade exceeds 100"));
+    }
+    Ok(grade)
 }
 
 #[async_trait]
@@ -62,32 +70,9 @@ impl ProviderSkillEvaluator {
         }
         let mut dispatcher = CassetteDispatcher::from_value(&request.tool_cassette)
             .map_err(|detail| invalid(&detail))?;
-        let mut schemas = BTreeMap::new();
-        for call in dispatcher.calls() {
-            let properties: serde_json::Map<_, _> = call
-                .arguments
-                .as_object()
-                .expect("validated arguments")
-                .keys()
-                .map(|key| (key.clone(), json!({})))
-                .collect();
-            schemas.entry(call.name.clone()).or_insert(ToolSchema {
-                name:call.name.clone(),
-                description:"Read a matching recorded result. No live execution is available.".to_owned(),
-                parameters:json!({"type":"object","properties":properties,"additionalProperties":true}),
-            });
-        }
-        let tools: Vec<_> = schemas.into_values().collect();
+        let tools = recorded_tool_schemas(dispatcher.calls());
         let mut messages = vec![
-            Message::new(
-                Role::System,
-                format!(
-                    "Complete the task using the supplied Skill and available recorded tools. \
-                 Report what the evidence supports. Tool failures do not imply success. \
-                 You have no live filesystem, network or command execution.\n\nSkill:\n{}",
-                    request.skill_content
-                ),
-            ),
+            Message::new(Role::System, attempt_prompt(&request.skill_content)),
             Message::new(Role::User, &request.prompt),
         ];
         let mut trace = Vec::new();
@@ -146,7 +131,7 @@ impl ProviderSkillEvaluator {
                 });
             }
             messages.push(Message::from_content(Role::Assistant, assistant));
-            messages.push(Message::from_content(Role::User, results));
+            messages.push(Message::from_content(Role::Tool, results));
         }
         let Some(answer) = final_answer else {
             return Ok(CaseObservation {
@@ -156,16 +141,12 @@ impl ProviderSkillEvaluator {
                 details: json!({"reason":"step_budget","trace":trace,"liveTools":false}),
             });
         };
-        // The expected answer and recorded outputs become visible only to the grader.
-        let grade: Grade = self
+        let grade: SkillGrade = self
             .client
             .json(
                 &self.session_id,
                 "learning.evaluation.grade",
-                "Grade the actual attempt and tool trace against the expected behavior. \
-             Do not grade the wording of a Skill or assume an unrecorded action succeeded. \
-             Unsupported success claims fail. Tool errors and missing evidence must be \
-             handled honestly. Score 0..100, passed, criticalFailure, explanation.",
+                GRADE_PROMPT,
                 json!({"scenario":request.prompt,"expected":request.expected,
                 "actualAnswer":answer,"trace":trace,"unmatchedCalls":unmatched_calls}),
             )
@@ -181,4 +162,35 @@ impl ProviderSkillEvaluator {
                 "grader":grade.explanation,"liveTools":false,"attemptSnapshot":request.attempt}),
         })
     }
+}
+
+pub(crate) const GRADE_PROMPT: &str = "Grade the actual attempt and tool trace against the expected behavior. \
+             Do not grade the wording of a Skill or assume an unrecorded action succeeded. \
+             Unsupported success claims fail. Tool errors and missing evidence must be \
+             handled honestly. Score 0..100, passed, criticalFailure, explanation.";
+
+pub(crate) fn attempt_prompt(skill: &str) -> String {
+    format!(
+        "Complete the task using the supplied Skill and available recorded tools. \
+                 Report what the evidence supports. Tool failures do not imply success. \
+                 You have no live filesystem, network or command execution.\n\nSkill:\n{skill}"
+    )
+}
+pub(crate) fn recorded_tool_schemas(calls: &[zuno_eval::RecordedCall]) -> Vec<ToolSchema> {
+    let mut schemas = BTreeMap::new();
+    for call in calls {
+        let properties: serde_json::Map<_, _> = call
+            .arguments
+            .as_object()
+            .expect("validated arguments")
+            .keys()
+            .map(|key| (key.clone(), json!({})))
+            .collect();
+        schemas.entry(call.name.clone()).or_insert(ToolSchema {
+                name:call.name.clone(),
+                description:"Read a matching recorded result. No live execution is available.".to_owned(),
+                parameters:json!({"type":"object","properties":properties,"additionalProperties":true}),
+            });
+    }
+    schemas.into_values().collect()
 }

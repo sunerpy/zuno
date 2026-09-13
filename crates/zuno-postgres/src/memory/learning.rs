@@ -7,6 +7,8 @@ use zuno_types::identity::{JobId, PrincipalKey, TenantId};
 
 mod journal;
 mod settlement;
+mod skill;
+mod skill_api;
 mod sources;
 mod store;
 mod wake;
@@ -17,6 +19,7 @@ pub struct PostgresLearningRuntime {
     memory: PostgresMemoryBackend,
     tenant: TenantId,
     grants: Vec<MemoryLearningGrant>,
+    skills: Vec<SkillLearningGrant>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -41,7 +44,15 @@ impl PostgresLearningRuntime {
         tenant: TenantId,
         grants: Vec<MemoryLearningGrant>,
     ) -> Result<Self, Error> {
-        if grants.is_empty() || grants.len() > 64 {
+        Self::with_skills(memory, tenant, grants, Vec::new())
+    }
+    pub fn with_skills(
+        memory: PostgresMemoryBackend,
+        tenant: TenantId,
+        grants: Vec<MemoryLearningGrant>,
+        skills: Vec<SkillLearningGrant>,
+    ) -> Result<Self, Error> {
+        if grants.len() + skills.len() == 0 || grants.len() + skills.len() > 64 {
             return Err(invalid(
                 "learning requires 1–64 installed source definitions",
             ));
@@ -70,10 +81,19 @@ impl PostgresLearningRuntime {
                 return Err(invalid("duplicate learning source definition"));
             }
         }
+        for grant in &skills {
+            grant.source.validate().map_err(app_error)?;
+            grant.evaluation.validate().map_err(app_error)?;
+            grant.limits.validate().map_err(app_error)?;
+            if !(1..=8).contains(&grant.maximum_steps) {
+                return Err(invalid("invalid Skill evaluation steps"));
+            }
+        }
         Ok(Self {
             memory,
             tenant,
             grants,
+            skills,
         })
     }
 
@@ -437,6 +457,17 @@ impl PostgresMemoryBackend {
         session: SessionId,
         work: impl FnOnce(Arc<TransactionMemory>) -> Result<T, Error> + Send + 'static,
     ) -> Result<T, Error> {
+        self.learning_transaction(principal, workspace, session, None, work)
+            .await
+    }
+    pub(super) async fn learning_transaction<T: Send + 'static>(
+        &self,
+        principal: PrincipalScope,
+        workspace: WorkspaceId,
+        session: SessionId,
+        skill_evaluation: Option<JobId>,
+        work: impl FnOnce(Arc<TransactionMemory>) -> Result<T, Error> + Send + 'static,
+    ) -> Result<T, Error> {
         let permit = self
             .slots
             .clone()
@@ -462,6 +493,7 @@ impl PostgresMemoryBackend {
             workspace,
             lease: None,
             automation_session: Some(session),
+            skill_evaluation,
             limits: self.limits,
             deadline: tokio::time::Instant::now() + self.transaction_timeout,
         });
@@ -471,13 +503,13 @@ impl PostgresMemoryBackend {
                 let session = provider.automation_session.as_ref().ok_or(Error::Denied)?;
                 provider.execute(async |tx| {
                     provider
-                        .require_automation(tx, Some(session.as_str()))
+                        .require_learning_authority(tx, Some(session.as_str()))
                         .await
                 })?;
                 let output = work(provider.clone())?;
                 provider.execute(async |tx| {
                     provider
-                        .require_automation(tx, Some(session.as_str()))
+                        .require_learning_authority(tx, Some(session.as_str()))
                         .await
                 })?;
                 let tx = provider

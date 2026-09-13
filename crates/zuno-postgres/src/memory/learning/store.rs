@@ -17,6 +17,7 @@ fn phase(input: &LearningInput) -> &'static str {
     match input {
         LearningInput::Extraction(_) => "extraction",
         LearningInput::Maintenance(_) => "maintenance",
+        LearningInput::SkillEvaluation(_) => "skill_evaluation",
     }
 }
 
@@ -67,6 +68,9 @@ impl TransactionMemory {
         tx: &mut Tx,
         job: &LearningExecution,
     ) -> Result<Option<LearningOutput>, Error> {
+        if matches!(job.input, LearningInput::SkillEvaluation(_)) {
+            return Ok(None);
+        }
         let row=query("SELECT request_id,outcome,outcome_digest FROM zuno_enterprise_preview.learning_model_request
             WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND state='completed' ORDER BY created_at DESC,request_id DESC LIMIT 1")
             .bind(self.principal.tenant_id().as_str()).bind(self.principal.principal_id().as_str()).bind(job.id.as_str())
@@ -110,50 +114,7 @@ impl TransactionMemory {
         tx: &mut Tx,
         new: NewExecution<'_>,
     ) -> Result<(), Error> {
-        new.limits.validate().map_err(app_error)?;
-        let now = database_time(tx).await.map_err(app_error)?;
-        let input_digest = zuno_orchestration::sha256_json(&json!(new.input));
-        let payload = match &new.input {
-            LearningInput::Extraction(_) => {
-                json!({"purpose":"memory_extraction","inputDigest":input_digest})
-            }
-            LearningInput::Maintenance(_) => new
-                .context
-                .get("batch")
-                .cloned()
-                .ok_or(Error::InvalidData)?,
-        };
-        query(
-            "INSERT INTO zuno_enterprise_preview.learning_job
-            (tenant_id,principal_id,id,workspace_id,session_id,kind,status,payload,time_updated)
-            VALUES($1,$2,$3,$4,$5,$6,'queued',$7,$8)",
-        )
-        .bind(self.principal.tenant_id().as_str())
-        .bind(self.principal.principal_id().as_str())
-        .bind(new.id.as_str())
-        .bind(self.workspace.as_str())
-        .bind(new.session.as_str())
-        .bind(if matches!(new.input, LearningInput::Extraction(_)) {
-            "extraction"
-        } else {
-            "project_aggregation"
-        })
-        .bind(payload)
-        .bind(now)
-        .execute(&mut **tx)
-        .await
-        .map_err(sql_error)?;
-        query("INSERT INTO zuno_enterprise_preview.learning_execution
-            (tenant_id,principal_id,job_id,source_job_id,phase,principal,configuration,input,input_digest,limits,context,ready_at,created_at)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12)")
-            .bind(self.principal.tenant_id().as_str()).bind(self.principal.principal_id().as_str())
-            .bind(new.id.as_str()).bind(new.source_job.as_str()).bind(phase(&new.input)).bind(json!(self.principal))
-            .bind(json!(new.configuration)).bind(json!(new.input)).bind(input_digest).bind(json!(new.limits))
-            .bind(new.context).bind(now).execute(&mut **tx).await.map_err(sql_error)?;
-        crate::learning_client::publish_in(tx, &self.principal.owner(), new.id)
-            .await
-            .map_err(app_error)?;
-        Ok(())
+        insert_execution_in(tx, &self.principal, &self.workspace, new).await
     }
 
     pub(super) async fn execution_row(&self, tx: &mut Tx, job: &JobId) -> Result<PgRow, Error> {
@@ -217,7 +178,7 @@ impl TransactionMemory {
             return Err(Error::Conflict);
         }
         let result = execution(&row)?;
-        self.require_automation(tx, Some(result.session.as_str()))
+        self.require_learning_authority(tx, Some(result.session.as_str()))
             .await?;
         Ok(result)
     }
@@ -292,7 +253,7 @@ impl TransactionMemory {
                 .map_err(app_error)?;
             return Ok(None);
         }
-        self.require_automation(tx, Some(value.session.as_str()))
+        self.require_learning_authority(tx, Some(value.session.as_str()))
             .await?;
         if !self.extraction_sources_current(tx, &value).await? {
             return Err(Error::Denied);
@@ -467,11 +428,10 @@ impl PostgresLearningRuntime {
             for job in jobs {
                 let job = JobId::new(job).map_err(decode_error)?;
                 let denied_job = job.clone();
-                let (actor, workspace, session) = self.job_binding(&owner, &job).await?;
                 let worker = worker.clone();
+                let operation_job = job.clone();
                 match self
-                    .memory
-                    .automate(actor, workspace, session, move |provider| {
+                    .with_job(&owner, &operation_job, move |provider| {
                         provider.execute(async |tx| {
                             provider.claim_execution(tx, &job, &worker, lease_ms).await
                         })
@@ -496,33 +456,33 @@ impl PostgresLearningRuntime {
         if !(1000..=300000).contains(&lease_ms) {
             return Err(invalid("invalid learning lease duration"));
         }
-        let (actor, workspace, session) = self.job_binding(&lease.owner, &lease.job_id).await?;
-        self.memory
-            .automate(actor, workspace, session, move |provider| {
-                provider.execute(async |tx| {
-                    let job = provider.check_execution(tx, &lease).await?;
-                    let now = database_time(tx).await.map_err(app_error)?;
-                    let expires = now.saturating_add(i64::from(lease_ms)).min(job.deadline_ms);
-                    let expires_at_ms: i64 = query_scalar(
-                        "UPDATE zuno_enterprise_preview.learning_job
+        let owner = lease.owner.clone();
+        let job = lease.job_id.clone();
+        self.with_job(&owner, &job, move |provider| {
+            provider.execute(async |tx| {
+                let job = provider.check_execution(tx, &lease).await?;
+                let now = database_time(tx).await.map_err(app_error)?;
+                let expires = now.saturating_add(i64::from(lease_ms)).min(job.deadline_ms);
+                let expires_at_ms: i64 = query_scalar(
+                    "UPDATE zuno_enterprise_preview.learning_job
                     SET lease_expires=GREATEST(lease_expires,$4),time_updated=$5
                     WHERE tenant_id=$1 AND principal_id=$2 AND id=$3 RETURNING lease_expires",
-                    )
-                    .bind(lease.owner.tenant_id.as_str())
-                    .bind(lease.owner.principal_id.as_str())
-                    .bind(lease.job_id.as_str())
-                    .bind(expires)
-                    .bind(now)
-                    .fetch_one(&mut **tx)
-                    .await
-                    .map_err(sql_error)?;
-                    Ok(LearningExecutionLease {
-                        expires_at_ms,
-                        ..lease.clone()
-                    })
+                )
+                .bind(lease.owner.tenant_id.as_str())
+                .bind(lease.owner.principal_id.as_str())
+                .bind(lease.job_id.as_str())
+                .bind(expires)
+                .bind(now)
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(sql_error)?;
+                Ok(LearningExecutionLease {
+                    expires_at_ms,
+                    ..lease.clone()
                 })
             })
-            .await
+        })
+        .await
     }
 
     pub async fn stop(
@@ -530,8 +490,9 @@ impl PostgresLearningRuntime {
         lease: LearningExecutionLease,
         stop: LearningStop,
     ) -> Result<(), Error> {
-        let (actor, workspace, session) = self.job_binding(&lease.owner, &lease.job_id).await?;
-        self.memory.automate(actor,workspace,session,move |provider| provider.execute(async |tx| {
+        let owner = lease.owner.clone();
+        let id = lease.job_id.clone();
+        self.with_job(&owner,&id,move |provider| provider.execute(async |tx| {
             let job=provider.check_execution_lease(tx,&lease).await?;
             let now=database_time(tx).await.map_err(app_error)?;
             let amount:i64=query_scalar("WITH changed AS(UPDATE zuno_enterprise_preview.learning_model_request
@@ -565,4 +526,59 @@ impl PostgresLearningRuntime {
             Ok(())
         })).await
     }
+}
+
+pub(super) async fn insert_execution_in(
+    tx: &mut Tx,
+    principal: &PrincipalScope,
+    workspace: &WorkspaceId,
+    new: NewExecution<'_>,
+) -> Result<(), Error> {
+    new.limits.validate().map_err(app_error)?;
+    let now = database_time(tx).await.map_err(app_error)?;
+    let input_digest = zuno_orchestration::sha256_json(&json!(new.input));
+    let payload = match &new.input {
+        LearningInput::SkillEvaluation(_) => {
+            json!({"purpose":"skill_evaluation","inputDigest":input_digest})
+        }
+        LearningInput::Extraction(_) => {
+            json!({"purpose":"memory_extraction","inputDigest":input_digest})
+        }
+        LearningInput::Maintenance(_) => new
+            .context
+            .get("batch")
+            .cloned()
+            .ok_or(Error::InvalidData)?,
+    };
+    query(
+        "INSERT INTO zuno_enterprise_preview.learning_job
+            (tenant_id,principal_id,id,workspace_id,session_id,kind,status,payload,time_updated)
+            VALUES($1,$2,$3,$4,$5,$6,'queued',$7,$8)",
+    )
+    .bind(principal.tenant_id().as_str())
+    .bind(principal.principal_id().as_str())
+    .bind(new.id.as_str())
+    .bind(workspace.as_str())
+    .bind(new.session.as_str())
+    .bind(match new.input {
+        LearningInput::Extraction(_) => "extraction",
+        LearningInput::Maintenance(_) => "project_aggregation",
+        LearningInput::SkillEvaluation(_) => "evaluation",
+    })
+    .bind(payload)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(sql_error)?;
+    query("INSERT INTO zuno_enterprise_preview.learning_execution
+            (tenant_id,principal_id,job_id,source_job_id,phase,principal,configuration,input,input_digest,limits,context,ready_at,created_at)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12)")
+            .bind(principal.tenant_id().as_str()).bind(principal.principal_id().as_str())
+            .bind(new.id.as_str()).bind(new.source_job.as_str()).bind(phase(&new.input)).bind(json!(principal))
+            .bind(json!(new.configuration)).bind(json!(new.input)).bind(input_digest).bind(json!(new.limits))
+            .bind(new.context).bind(now).execute(&mut **tx).await.map_err(sql_error)?;
+    crate::learning_client::publish_in(tx, &principal.owner(), new.id)
+        .await
+        .map_err(app_error)?;
+    Ok(())
 }

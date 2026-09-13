@@ -126,3 +126,8 @@ only those exact declarations, using typed MCP activity metadata. Preparation
 waits for human approval; submission follows the durable tool handoff and awaits
 a persisted operation result. Credentials and transport sessions stay on the
 gateway. See [MCP.md](MCP.md); completion profiles expose no MCP tools.
+
+Learning protocol 2 supports explicitly reviewed Skill evaluations. Baseline,
+candidate and grading requests remain in the same scoped Job budget. Recorded
+cassettes never acquire the Worker's live gateway/tool executor. Profiles use
+`skillEvaluation`; see [SKILLS.md](SKILLS.md).

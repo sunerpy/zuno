@@ -56,7 +56,7 @@ export type WaitTarget =
       deadline_ms: number;
       kind: "timer";
     };
-export type LearningStage = "extraction" | "maintenance";
+export type LearningStage = "extraction" | "maintenance" | "skill_evaluation";
 export type LearningState = "queued" | "running" | "completed" | "skipped" | "failed" | "cancelled" | "uncertain";
 export type ActivityName = string;
 export type WorkspacePath = string;
@@ -75,9 +75,12 @@ export type SharedMemoryEdit =
       kind: "remove";
       oldText: string;
     };
+export type SkillCaseKind = "failure" | "protection" | "general";
 export type SharedMemoryDecision = "apply" | "reject" | "undo";
 export type MemorySpaceId = string;
 export type SharedMemoryChangeState = "pending" | "applied" | "rejected" | "undone" | "invalidated";
+export type ConfigurationId = string;
+export type SkillEvaluationState = "pending_review" | "evaluating" | "passed" | "failed" | "cancelled";
 export type CouncilPhase = "seats" | "stopping" | "synthesis" | "completed" | "failed" | "cancelled" | "uncertain";
 export type CouncilSeatState =
   | "pending"
@@ -143,12 +146,15 @@ export interface ApplicationProtocol {
   mcp_call: McpCallView;
   merge_content: MergeContentRequest;
   propose_shared_memory: ProposeSharedMemory;
+  propose_skill: ProposeSkill;
   review_shared_memory: ReviewSharedMemory;
+  review_skill: ReviewSkillEvaluation;
   session: SessionSummary;
   sessions: SessionPage;
   shared_memory_change: SharedMemoryChange;
   shared_memory_page: SharedMemoryPage;
   shared_memory_space: SharedMemorySpace;
+  skill_candidate: SkillCandidateView;
   submit_turn: SubmitTurn;
   workflow: WorkflowRunView;
   workspace: WorkspaceView;
@@ -330,10 +336,35 @@ export interface ProposeSharedMemory {
   reason: string;
   requestId: RequestId;
 }
+export interface ProposeSkill {
+  baselineContent: string;
+  cases: SkillEvaluationCase[];
+  name: string;
+  proposedContent: string;
+  requestId: RequestId;
+}
+export interface SkillEvaluationCase {
+  calls: SkillRecordedCall[];
+  expected: string;
+  id: RequestId;
+  kind: SkillCaseKind;
+  prompt: string;
+  weight: number;
+}
+export interface SkillRecordedCall {
+  arguments: unknown;
+  isError: boolean;
+  name: string;
+  output: string;
+}
 export interface ReviewSharedMemory {
   changeId: RequestId;
   decision: SharedMemoryDecision;
   expectedState: string;
+  requestId: RequestId;
+}
+export interface ReviewSkillEvaluation {
+  expectedDigest: string;
   requestId: RequestId;
 }
 /**
@@ -386,6 +417,41 @@ export interface SharedMemorySpace {
   role: SharedMemoryRole;
   title: string;
   workspaceId: WorkspaceId;
+}
+export interface SkillCandidateView {
+  baselineContent: string;
+  cases: SkillEvaluationCase[];
+  digest: string;
+  evaluation: ConfigurationRef;
+  id: RequestId;
+  jobId?: JobId | null;
+  name: string;
+  proposedContent: string;
+  report?: SkillEvaluationReport | null;
+  sourceJobId: JobId;
+  state: SkillEvaluationState;
+}
+export interface ConfigurationRef {
+  id: ConfigurationId;
+  sha256: string;
+  version: number;
+}
+export interface SkillEvaluationReport {
+  baselineMetric: number;
+  candidateMetric: number;
+  cases: SkillCaseResult[];
+  passed: boolean;
+}
+export interface SkillCaseResult {
+  baseline: SkillCaseObservation;
+  candidate: SkillCaseObservation;
+  caseId: RequestId;
+}
+export interface SkillCaseObservation {
+  criticalFailure: boolean;
+  details: unknown;
+  passed: boolean;
+  score: number;
 }
 export interface SubmitTurn {
   expectedInputVersion: string;

@@ -232,6 +232,12 @@ impl zuno_worker::learning::LearningModelFactory for ConfiguredWorkerFactory {
             provider,
             journal,
             limits: zuno_config::ResolvedLearningConfig {
+                execution_max_steps: match &execution.input {
+                    zuno_learning::distributed::LearningInput::SkillEvaluation(input) => {
+                        input.maximum_steps
+                    }
+                    _ => 1,
+                },
                 execution_max_input_bytes: execution.limits.maximum_input_bytes,
                 execution_max_output_tokens: execution.limits.maximum_output_tokens,
                 execution_timeout_ms: execution.limits.duration_ms,

@@ -9,6 +9,7 @@ use zuno_types::identity::JobId;
 mod child_evidence;
 mod input_limits;
 mod maintenance_wake;
+mod skill;
 mod source_claims;
 
 fn configured() -> ConfigurationRef {
@@ -151,6 +152,7 @@ fn finished(claimed: &ClaimedLearning, id: &str) -> LearningJournalRequest {
 }
 
 pub(super) async fn exercise(backend: &PostgresBackend, admin: &PgPool) {
+    Box::pin(skill::exercise(backend, admin)).await;
     let actor = principal("learning-runtime");
     let workspace = WorkspaceId::new("learning-workspace").unwrap();
     setup(backend, admin, &actor, &workspace).await;

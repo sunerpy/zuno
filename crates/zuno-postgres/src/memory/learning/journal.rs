@@ -6,22 +6,25 @@ impl PostgresLearningRuntime {
         if matches!(request.record.event, LearningModelEvent::Outcome { .. }) {
             return self.outcome(request).await;
         }
-        let (actor, workspace, session) = self
-            .job_binding(&request.lease.owner, &request.lease.job_id)
-            .await?;
         let grants = self.grants.clone();
-        self.memory.automate(actor,workspace,session,move |provider| provider.execute(async |tx| {
+        let skills = self.skills.clone();
+        let owner = request.lease.owner.clone();
+        let id = request.lease.job_id.clone();
+        self.with_job(&owner,&id,move |provider| provider.execute(async |tx| {
             let job=provider.check_execution(tx,&request.lease).await?;
             if request.record.session_id != job.session.as_str() {return Err(Error::Denied);}
             let expected_model=grants.iter().find_map(|grant| {
                 if grant.extraction==job.configuration {Some(&grant.extraction_model)}
                 else if grant.maintenance==job.configuration {Some(&grant.maintenance_model)}
                 else {None}
-            }).ok_or(Error::Denied)?;
+            }).or_else(||skills.iter().find(|grant|grant.evaluation==job.configuration).map(|grant|&grant.model)).ok_or(Error::Denied)?;
             let LearningModelEvent::Request {request_id,model,request:input,prompt_digest,tools,..}=&request.record.event else{return Err(Error::Denied);};
-            let operation=match job.input {LearningInput::Extraction(_)=>"learning.extraction",LearningInput::Maintenance(_)=>"learning.memory_consolidation"};
-            if request.record.operation!=operation || model!=expected_model || !tools.is_empty()
-                || input.get("tools")!=Some(&json!([]))
+            let permitted=match &job.input {
+                LearningInput::Extraction(_)=>request.record.operation=="learning.extraction" && tools.is_empty() && input.get("tools")==Some(&json!([])),
+                LearningInput::Maintenance(_)=>request.record.operation=="learning.memory_consolidation" && tools.is_empty() && input.get("tools")==Some(&json!([])),
+                LearningInput::SkillEvaluation(skill)=>zuno_learning::validate_skill_model_request(skill,&request.record),
+            };
+            if !permitted || model!=expected_model
                 || zuno_db::learning_source::digest(&input.to_string())!=*prompt_digest
                 || input.to_string().len()>job.limits.maximum_input_bytes as usize
                 || input.pointer("/parameters/maxTokens").and_then(Value::as_u64)
@@ -35,6 +38,15 @@ impl PostgresLearningRuntime {
                 .bind(job.id.as_str()).bind(request_id).fetch_optional(&mut **tx).await.map_err(sql_error)?;
             if let Some(prior)=prior {
                 return if prior==digest {Ok(())} else {Err(Error::Conflict)};
+            }
+            if let LearningInput::SkillEvaluation(skill)=&job.input {
+                let (_,_,grade)=zuno_learning::skill_request_identity(skill,&request.record.operation).ok_or(Error::Denied)?;
+                let count:i64=query_scalar("SELECT count(*) FROM zuno_enterprise_preview.learning_model_request
+                    WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND epoch=$4 AND request->>'operation'=$5")
+                    .bind(request.lease.owner.tenant_id.as_str()).bind(request.lease.owner.principal_id.as_str()).bind(job.id.as_str())
+                    .bind(request.lease.epoch as i64).bind(&request.record.operation).fetch_one(&mut **tx).await.map_err(sql_error)?;
+                if count>=i64::from(if grade{2}else{skill.maximum_steps}){return Err(Error::Denied);}
+                provider.validate_skill_grader(tx,&job,skill,&request.record,request.lease.epoch).await?;
             }
             let row=provider.execution_row(tx,&job.id).await?;
             let reserved:i64=row.try_get("reserved_tokens").map_err(sql_error)?;
@@ -78,7 +90,7 @@ impl PostgresLearningRuntime {
             tool_calls,
         } = outcome
             && (zuno_db::learning_source::digest(output) != *output_digest
-                || !tool_calls.is_empty()
+                || tool_calls.len() > 32
                 || output.len() > 2_097_152)
         {
             return Err(Error::InvalidData);
@@ -104,10 +116,11 @@ impl PostgresLearningRuntime {
             .execute(&mut *tx)
             .await
             .map_err(sql_error)?;
-        let row=query("SELECT r.*,a.worker_id,a.lease_token,j.session_id FROM zuno_enterprise_preview.learning_model_request r
+        let row=query("SELECT r.*,a.worker_id,a.lease_token,j.session_id,e.phase FROM zuno_enterprise_preview.learning_model_request r
             JOIN zuno_enterprise_preview.learning_execution_attempt a
               ON a.tenant_id=r.tenant_id AND a.principal_id=r.principal_id AND a.job_id=r.job_id AND a.epoch=r.epoch
             JOIN zuno_enterprise_preview.learning_job j ON j.tenant_id=r.tenant_id AND j.principal_id=r.principal_id AND j.id=r.job_id
+            JOIN zuno_enterprise_preview.learning_execution e ON e.tenant_id=r.tenant_id AND e.principal_id=r.principal_id AND e.job_id=r.job_id
             WHERE r.tenant_id=$1 AND r.principal_id=$2 AND r.job_id=$3 AND r.request_id=$4 FOR UPDATE OF r")
             .bind(request.lease.owner.tenant_id.as_str()).bind(request.lease.owner.principal_id.as_str())
             .bind(request.lease.job_id.as_str()).bind(request_id).fetch_optional(&mut *tx).await.map_err(sql_error)?.ok_or(Error::Denied)?;
@@ -123,6 +136,13 @@ impl PostgresLearningRuntime {
         let prepared: zuno_learning::LearningModelRecord =
             serde_json::from_value(row.try_get("request").map_err(sql_error)?)
                 .map_err(decode_error)?;
+        if let LearningModelOutcome::Completed { tool_calls, .. } = outcome
+            && !tool_calls.is_empty()
+            && (row.try_get::<String, _>("phase").map_err(sql_error)? != "skill_evaluation"
+                || !prepared.operation.ends_with(".learning.evaluation.attempt"))
+        {
+            return Err(Error::Denied);
+        }
         if prepared.operation != request.record.operation
             || zuno_orchestration::sha256_json(&json!(prepared))
                 != row

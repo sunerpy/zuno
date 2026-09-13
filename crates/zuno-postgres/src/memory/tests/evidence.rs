@@ -255,6 +255,7 @@ impl BatchFixture<'_> {
             workspace: (*workspace).clone(),
             lease: None,
             automation_session: None,
+            skill_evaluation: None,
             limits: ScopeLimits::default(),
             project_key: project.path.clone(),
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(10),

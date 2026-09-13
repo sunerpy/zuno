@@ -71,3 +71,8 @@ Shared Memory methods validate namespace, workspace and change identity while
 keeping revisions as decimal strings. Configuration and review use the same
 authenticated API/BFF transport; a client role field is never an approval grant.
 See `enterprise/SHARED_MEMORY.md` for the complete backend contract.
+
+Skill methods `proposeSkill`, `skillCandidate` and `evaluateSkill` validate source,
+candidate and reviewed digest identities. Candidate reports expose bounded
+0–100 scores; existing learning detail/cancel methods handle `skill_evaluation`.
+See `enterprise/SKILLS.md` for configuration and authorization.
