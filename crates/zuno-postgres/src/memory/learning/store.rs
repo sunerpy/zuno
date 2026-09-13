@@ -280,6 +280,12 @@ impl TransactionMemory {
         if value.deadline_ms == 0 {
             value.deadline_ms = now.saturating_add(value.limits.duration_ms as i64);
         }
+        if !crate::quota::can_claim(tx, &self.principal.owner(), true)
+            .await
+            .map_err(app_error)?
+        {
+            return Ok(None);
+        }
         let token = format!(
             "{}{}",
             uuid::Uuid::new_v4().simple(),
@@ -403,13 +409,14 @@ impl PostgresLearningRuntime {
             config.validate().map_err(app_error)?;
         }
         self.schedule(8).await?;
-        let owners: Vec<String> =
-            query_scalar("SELECT principal_id FROM zuno_enterprise_preview.dispatch_owners($1)")
+        let owners =
+            query("SELECT principal_id,dispatch_clock FROM zuno_enterprise_preview.learning_dispatch_owners($1)")
                 .bind(self.tenant.as_str())
                 .fetch_all(&self.memory.backend.pool)
                 .await
                 .map_err(sql_error)?;
-        for id in owners {
+        for (index, row) in owners.into_iter().enumerate() {
+            let id: String = row.try_get("principal_id").map_err(sql_error)?;
             let owner = PrincipalKey {
                 tenant_id: self.tenant.clone(),
                 principal_id: zuno_types::identity::PrincipalId::new(id).map_err(decode_error)?,
@@ -424,6 +431,15 @@ impl PostgresLearningRuntime {
                 ORDER BY e.ready_at,e.job_id LIMIT 16")
                 .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(json!(configurations))
                 .bind(database_time(&mut tx).await.map_err(app_error)?).fetch_all(&mut *tx).await.map_err(sql_error)?;
+            let sequence = row
+                .try_get::<i64, _>("dispatch_clock")
+                .map_err(sql_error)?
+                .checked_add(index as i64 + 1)
+                .ok_or(Error::Conflict)?;
+            query("UPDATE zuno_enterprise_preview.runtime_owner_schedule SET learning_dispatch_sequence=GREATEST(learning_dispatch_sequence,$3)
+                WHERE tenant_id=$1 AND principal_id=$2")
+                .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(sequence)
+                .execute(&mut *tx).await.map_err(sql_error)?;
             tx.commit().await.map_err(sql_error)?;
             for job in jobs {
                 let job = JobId::new(job).map_err(decode_error)?;
@@ -535,6 +551,13 @@ pub(super) async fn insert_execution_in(
     new: NewExecution<'_>,
 ) -> Result<(), Error> {
     new.limits.validate().map_err(app_error)?;
+    crate::quota::admit(
+        tx,
+        &principal.owner(),
+        zuno_application::quota::QuotaResource::LearningJobs,
+    )
+    .await
+    .map_err(app_error)?;
     let now = database_time(tx).await.map_err(app_error)?;
     let input_digest = zuno_orchestration::sha256_json(&json!(new.input));
     let payload = match &new.input {

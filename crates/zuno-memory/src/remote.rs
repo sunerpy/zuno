@@ -266,6 +266,7 @@ pub fn read_scopes(
 pub enum MemoryFailure {
     Denied,
     Unavailable,
+    Capacity,
     Conflict,
     InvalidData,
     Invalid { message: String },
@@ -277,6 +278,7 @@ impl From<MemoryServiceError> for MemoryFailure {
             MemoryServiceError::Denied => Self::Denied,
             MemoryServiceError::InvalidData => Self::InvalidData,
             MemoryServiceError::Unavailable => Self::Unavailable,
+            MemoryServiceError::Capacity => Self::Capacity,
             MemoryServiceError::Conflict
             | MemoryServiceError::Database(zuno_error::DbError::Conflict { .. }) => Self::Conflict,
             MemoryServiceError::Invalid(message) => Self::Invalid { message },
@@ -295,6 +297,7 @@ impl From<MemoryFailure> for MemoryServiceError {
             MemoryFailure::Denied => Self::Denied,
             MemoryFailure::InvalidData => Self::InvalidData,
             MemoryFailure::Unavailable => Self::Unavailable,
+            MemoryFailure::Capacity => Self::Capacity,
             MemoryFailure::Conflict => Self::Conflict,
             MemoryFailure::Invalid { message } => Self::Invalid(message),
         }

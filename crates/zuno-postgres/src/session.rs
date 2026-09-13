@@ -64,6 +64,12 @@ impl SessionPersistence for PostgresSessionPersistence {
         )
         .await?;
         if new {
+            crate::quota::admit(
+                &mut tx,
+                &self.principal.owner(),
+                zuno_application::quota::QuotaResource::RootSessions,
+            )
+            .await?;
             let time = database_time(&mut tx).await?;
             sqlx_core::query::query(
                 "INSERT INTO zuno_enterprise_preview.session(tenant_id,principal_id,id,workspace_id,title,time_created,time_updated)

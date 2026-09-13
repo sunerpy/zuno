@@ -106,6 +106,10 @@ impl RuntimeStore for PostgresRuntimeStore {
                 continue;
             };
             let id: String = candidate.try_get("job_id").map_err(database_error)?;
+            if !crate::quota::can_claim(&mut tx, &owner, false).await? {
+                tx.commit().await.map_err(database_error)?;
+                continue;
+            }
             let job = read_job(&mut tx, &owner, &id).await?;
             let attempt = format!("attempt_{}", Uuid::new_v4().simple());
             let time = database_time(&mut tx).await?;

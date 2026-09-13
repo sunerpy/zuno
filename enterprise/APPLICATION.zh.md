@@ -112,3 +112,5 @@ SDK，不交付 App/UI。
 共享证据路由通过 `SharedEvidenceStore` 明确授权、分页读取及撤回私人摘录。
 共享提案绑定条目与来源授权，`SharedMemorySpace.suppressed` 区分保留历史和当前
 召回。详见 [共享证据](SHARED_MEMORY.zh.md#明确授权私人证据共享)。
+
+`QuotaStore` 提供 `GET/PUT /api/v1/quotas`，读取仅包含本人用量，策略修改要求有效管理员和获准审核应用。新请求超额在消耗输入 CAS 前返回 quota_exceeded／429。详见 [配额](QUOTAS.zh.md)。

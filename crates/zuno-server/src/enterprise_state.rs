@@ -319,6 +319,7 @@ fn child_error(error: zuno_application::ApplicationError) -> ApiFailure {
         E::Forbidden | E::NotFound => StatusCode::FORBIDDEN,
         E::Conflict | E::LeaseLost => StatusCode::CONFLICT,
         E::Invalid(_) => StatusCode::BAD_REQUEST,
+        E::QuotaExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
         _ => StatusCode::SERVICE_UNAVAILABLE,
     })
 }

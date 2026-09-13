@@ -25,6 +25,8 @@ pub(super) enum ApiError {
     NotFound,
     #[error("enterprise state changed")]
     Conflict,
+    #[error("enterprise admission quota is exhausted")]
+    Capacity,
     #[error("enterprise API response is invalid")]
     Invalid,
     #[error("enterprise API request did not return a confirmed response")]
@@ -51,6 +53,7 @@ impl Api {
         }
         let mut builder = zuno_network::client_builder()
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10));
         if let Some(path) = &options.root_certificate {
@@ -152,6 +155,7 @@ async fn decode<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, A
         401 | 403 => return Err(ApiError::Forbidden),
         404 => return Err(ApiError::NotFound),
         409 => return Err(ApiError::Conflict),
+        429 => return Err(ApiError::Capacity),
         _ => return Err(ApiError::Unavailable),
     }
     const MAX_BYTES: usize = 2 * 1024 * 1024;

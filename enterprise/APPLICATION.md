@@ -136,3 +136,5 @@ Shared evidence routes grant, list and revoke explicitly shared private excerpts
 through `SharedEvidenceStore`. Reviewed proposals bind entries to source grants;
 `SharedMemorySpace.suppressed` distinguishes retained history from current recall.
 See [shared evidence](SHARED_MEMORY.md#explicit-private-evidence-sharing).
+
+`QuotaStore` provides `GET/PUT /api/v1/quotas`. Reads expose only current-owner usage; policy replacement requires an active administrator and trusted review application. New admissions return `quota_exceeded`/429 before consuming input CAS. See [quotas](QUOTAS.md).

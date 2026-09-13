@@ -52,6 +52,8 @@ mod learning;
 mod mcp;
 #[path = "processes/merge.rs"]
 mod merge;
+#[path = "processes/quota.rs"]
+mod quota;
 #[path = "processes/shared_memory.rs"]
 mod shared_memory;
 #[path = "processes/skill.rs"]
@@ -1240,6 +1242,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
     )
     .await;
     acp::verify(&http, &control_url, &tokens, &fixture, root).await;
+    quota::verify(&http, &control_url, &tokens["alice"], &tokens["bob"]).await;
     for child in &mut children {
         assert!(
             tokio::process::Command::new("kill")

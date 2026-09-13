@@ -5,6 +5,7 @@ export * from "./live.js";
 export * from "./application.js";
 export type {
   ActorView, WorkspaceView, SessionPage, SessionSummary, SessionCursor, CreateSession, JobView,
+  QuotaPolicy, QuotaSnapshot, ReplaceQuotaPolicy, QuotaLimits, QuotaUsage, QuotaResource,
   SubmitTurn, InputVersionView, ApprovalView, ApprovalDecision, CancelJob, CancellationReceipt,
   ApprovalState, JobPhase,
   WorkflowRunView, NodeRunView, WorkflowState, WorkflowKind,

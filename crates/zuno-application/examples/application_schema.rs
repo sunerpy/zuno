@@ -10,6 +10,7 @@ use zuno_application::{
         CancelLearning, LearningCancellation, LearningJobView, LearningPage, LearningPageRequest,
     },
     mcp::McpCallView,
+    quota::{QuotaPolicy, QuotaSnapshot, ReplaceQuotaPolicy},
     shared_memory::{
         ConfigureSharedMemory, ProposeSharedMemory, ReviewSharedMemory, RevokeSharedEvidence,
         ShareMemoryEvidence, SharedEvidenceGrant, SharedEvidencePage, SharedMemoryChange,
@@ -32,6 +33,9 @@ use zuno_application::{
 )]
 struct ApplicationProtocol {
     actor: ActorView,
+    quota_policy: QuotaPolicy,
+    quota_snapshot: QuotaSnapshot,
+    replace_quota: ReplaceQuotaPolicy,
     skill_candidate: SkillCandidateView,
     propose_skill: ProposeSkill,
     review_skill: ReviewSkillEvaluation,

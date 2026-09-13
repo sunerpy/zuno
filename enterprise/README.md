@@ -113,3 +113,5 @@ and license notices from the exact release commit. Local edits and untracked fil
 are excluded; these archives do not update the stable documentation site.
 
 Remote ACP bridge and durable recovery: [English](ACP.md), [中文](ACP.zh.md).
+
+Admission quotas and fair scheduling: [English](QUOTAS.md), [中文](QUOTAS.zh.md).

@@ -72,6 +72,9 @@ pub(super) async fn root_in(
         &request.configuration,
     )
     .await?;
+    if completion.is_none() {
+        crate::quota::admit(tx, &owner, zuno_application::quota::QuotaResource::RootJobs).await?;
+    }
     let time = database_time(tx).await?;
     let turn = format!("turn_{key}");
     let input = format!("msg_{key}");
