@@ -1,6 +1,7 @@
 mod import;
 mod merge;
 mod metadata;
+mod transfer;
 mod workspace;
 
 use crate::docker::Docker;

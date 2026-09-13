@@ -97,7 +97,10 @@ pub fn finish(model_requests: usize) {
     );
     let mut roles = ROLES.lock().unwrap().clone();
     roles.sort();
-    assert_eq!(roles, ["control", "gateway", "worker-a", "worker-b"]);
+    assert_eq!(
+        roles,
+        ["control", "gateway", "gateway-peer", "worker-a", "worker-b"]
+    );
     write(
         Path::new(&proof),
         serde_json::to_vec_pretty(&json!({
@@ -105,7 +108,7 @@ pub fn finish(model_requests: usize) {
             "version":std::env::var("ZUNO_ENTERPRISE_TEST_VERSION").unwrap(),
             "roles":roles,"modelRequests":model_requests,"userIsolation":true,
             "humanApproval":true,"workflow":true,"council":true,"workspaceMerge":true,
-            "contentReview":true,"shutdown":true
+            "contentReview":true,"workspaceTransfer":true,"shutdown":true
         }))
         .unwrap(),
     );

@@ -119,7 +119,6 @@ async fn verify_source(
         crate::runtime::merge_source_in(tx, &admission.lease, &admission.operation.child_job_id)
             .await?;
     if source != admission.source
-        || source.gateway_id != admission.gateway_id
         || source.base != admission.operation.base
         || source.source_environment.id != admission.operation.child.environment_id
         || admission.environment.owner != admission.lease.owner
@@ -129,6 +128,17 @@ async fn verify_source(
         || admission.source.base.environment_id != admission.environment.spec.id
     {
         return Err(ApplicationError::Forbidden);
+    }
+    if source.gateway_id != admission.gateway_id {
+        crate::workspace_transfer::require_snapshot_in(
+            tx,
+            &admission.lease.owner,
+            &admission.lease.job_id,
+            &source.gateway_id,
+            &admission.gateway_id,
+            &admission.operation.child,
+        )
+        .await?;
     }
     Ok(())
 }

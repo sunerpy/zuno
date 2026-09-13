@@ -49,13 +49,12 @@ impl ConfiguredChildren {
                     ChildWorkspacePolicy::ModelOnly
                 } else if let (Some(parent), Some(child)) =
                     (&parent.environment, &child.environment)
-                    && child.gateway_id == parent.gateway_id
-                    && child.endpoint == parent.endpoint
+                    && (child.gateway_id != parent.gateway_id || child.endpoint == parent.endpoint)
                 {
                     ChildWorkspacePolicy::ForkParent
                 } else {
                     return Err(invalid(
-                        "child workspace forks require the parent's workspace and assigned Docker gateway",
+                        "child workspace forks require configured environments and consistent gateway endpoints",
                     ));
                 };
                 if !agents.insert(child.agent.name.clone()) {
@@ -220,5 +219,21 @@ mod tests {
         child.environment.as_mut().unwrap().endpoint = "https://other-gateway.example/".to_owned();
         parent.delegation.as_mut().unwrap().targets = vec![child.reference()];
         assert!(ConfiguredChildren::new(&[parent, child]).is_err());
+    }
+
+    #[test]
+    fn child_workspace_can_use_another_configured_gateway() {
+        let (mut parent, mut child) = definitions();
+        let environment = child.environment.as_mut().unwrap();
+        environment.gateway_id = zuno_types::identity::GatewayId::new("remote-gateway").unwrap();
+        environment.endpoint = "https://other-gateway.example/".to_owned();
+        parent.delegation.as_mut().unwrap().targets = vec![child.reference()];
+        let catalog = ConfiguredChildren::new(&[parent.clone(), child.clone()])
+            .expect("a configured remote child receives a verified snapshot of the parent");
+        let grant = catalog
+            .resolve(&parent.reference(), "helper", None)
+            .unwrap();
+        assert_eq!(grant.child, child.reference());
+        assert_eq!(grant.workspace, ChildWorkspacePolicy::ForkParent);
     }
 }

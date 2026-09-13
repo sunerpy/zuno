@@ -305,6 +305,7 @@ async fn workspace_authority(backend: &PostgresBackend, admin: &PgPool) {
     let group_assignment = ChildWorkspaceAssignment {
         child_job_id: staged.group.job_id.clone(),
         gateway_id: GatewayId::new("gateway").unwrap(),
+        parent_gateway_id: None,
         parent: spec(&root.job.session_id),
         target: spec(&staged.group.session_id),
         resume: false,
@@ -354,6 +355,7 @@ async fn workspace_authority(backend: &PostgresBackend, admin: &PgPool) {
     let assignment = ChildWorkspaceAssignment {
         child_job_id: node.job_id.clone(),
         gateway_id: GatewayId::new("gateway").unwrap(),
+        parent_gateway_id: None,
         parent: spec(&view.group.session_id),
         target: spec(&node.session_id),
         resume: false,

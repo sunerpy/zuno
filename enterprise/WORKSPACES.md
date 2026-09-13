@@ -2,9 +2,9 @@
 
 Configured enterprise children now run with a separate Docker workspace cloned
 from a named, immutable parent snapshot. Workers may execute on different Linux
-machines. The first Docker fork adapter requires parent and child environments to
-belong to the same configured gateway; cross-gateway snapshot transfer is not
-advertised by this adapter.
+machines, and parent/child definitions may select different configured gateways.
+Cross-gateway forks transfer an immutable, source-authenticated snapshot before
+the child becomes executable.
 
 ## Initialize a project
 
@@ -69,7 +69,8 @@ Add the returned object to the parent's optional `delegation.targets`:
 ```
 
 This fragment is a template. A target must match its exact ID, version and digest,
-workspace and gateway. Changing child bytes requires updating the parent
+logical workspace. Gateway routing remains fixed by that target definition.
+Changing child bytes requires updating the parent
 reference and version. Each Agent name resolves to one installed child definition.
 The child uses that definition's native provider/model and credentials binding;
 ordinary task calls cannot supply arbitrary model/effort option overrides.
@@ -86,7 +87,7 @@ A child requiring a workspace remains unclaimable until preparation is durably
 confirmed. Background dispatch also waits for this preparation before returning
 an executable Job handle.
 
-Worker protocol 11 requests `PrepareChildWorkspace` through gateway protocol 4.
+Worker protocol 11 requests `PrepareChildWorkspace` through gateway protocol 5.
 The request carries only a staged child Job ID. The control plane verifies the
 parent lease and child relation, resolves both environment specifications and
 records the workspace admission. The Worker cannot choose another volume, image,
@@ -113,6 +114,43 @@ Existing child sessions retain their workspace on `task_id` continuation. A
 prepared child uses `get`, not an empty-volume fallback, when it acquires an
 execution environment. Lost environments require explicit recovery.
 
+## Transfer between gateways
+
+The control plane resolves both gateways from the original Job, child lineage
+and immutable definitions. `PrepareChildWorkspace` goes to the target gateway.
+For a remote source, the target obtains a separate snapshot ticket. Its purpose
+binds the exact lease/request, source, target and stable snapshot identity; it
+cannot execute a command, upload a project or read arbitrary files. Only the
+configured source gateway can redeem it through its own service identity.
+
+The source records the immutable snapshot descriptor in PostgreSQL before
+streaming bytes. The target checks that independent source fact, receives at most
+512 MiB into a private temporary file, verifies the archive and SHA-256, fsyncs
+and publishes without replacing existing bytes. It rechecks current policy,
+lease and lineage before publishing the child workspace. No host paths, Docker
+sockets, model credentials or service tokens cross into a command container.
+
+Retries retain the original snapshot even if the source workspace has advanced.
+An interrupted download cannot publish a partial snapshot. A cached verified
+copy can finish the same transfer without contacting the source again. A fork
+published before a lost response is recovered from the gateway journal; a
+prepared child is never replaced by an empty workspace. Source facts may arrive
+after lease loss, but do not authorize more work.
+
+Cross-gateway `workspace_merge` imports the completed child's immutable snapshot
+back into the parent gateway. The common baseline stays bound to the earliest
+verified fork below that parent, including nested Workflow/Agent descendants.
+The existing three-way manifest, content review and human approval apply to
+those exact bytes. Snapshot ownership, metadata, safe links and binary contents
+are preserved. The transfer does not merge changes automatically.
+
+Gateway `snapshotParallelism` defaults to 2 and accepts 1–16 operations per
+direction. Separate send/receive pools prevent reciprocal copies from holding
+each other's slots. `snapshotRootCertificate` can configure a private peer CA;
+when omitted, peer transport shares the configured state client's trust.
+Transport requires HTTPS, refuses redirects and automatic POST retry, and
+bounds an individual download to ten minutes.
+
 Workspace inheritance does not approve commands. Child command preparation and
 execution use the same current-user approval and fencing checks as root commands.
 Child writes stay in the child volume; integrating them into the parent remains
@@ -123,7 +161,7 @@ a separate approved merge operation.
 Definitions with an installed child catalog expose `workspace_merge`. Arguments
 are `childJobId` and optional `resolutions`, a map of logical paths to `parent`
 or `child`. The source must be a completed descendant of this Job with no newer
-input and a provable fork baseline on the assigned gateway. Workflow nodes use
+input and a provable fork baseline. The source may live on another configured gateway. Workflow nodes use
 the original group's fork as their baseline. Unproven legacy/resumed-child
 origins fail closed.
 
@@ -162,10 +200,10 @@ committed facts remain authoritative. Truthful receipts remain deliverable after
 Worker lease loss and are consumed once.
 
 Gateway ledger 4 and PostgreSQL preview format 17 add guarded migrations.
-Worker protocol 11 and gateway protocol 4 require matching roles. The SDK exposes
+Worker protocol 11 and gateway protocol 5 require matching roles. The SDK exposes
 `mergeReview` and streaming `mergeContent`; `UiAction::ViewWorkspaceMerge` identifies
-review. App UI remains deferred to Penpot. Cross-gateway transfer, remote artifact
-storage and full retention/backup/rolling-upgrade acceptance remain separate work.
+review. App UI remains deferred to Penpot. Remote artifact storage and full
+retention/backup/rolling-upgrade acceptance remain separate work.
 
 ## Migrations and evidence
 
@@ -181,11 +219,17 @@ ledger's volume. The authenticated gateway test drops a workspace acknowledgemen
 retrieves the same receipt, verifies inherited files and proves child writes leave
 the parent unchanged.
 
-The executable fixture runs one control plane, one gateway and two Workers with
-two users, real parent/child Jobs, fourteen provider requests, four human command
-approvals, private Memory and clean SIGTERM shutdown. These are deterministic
-provider fixtures. Approved merge, cross-gateway transfer,
-Workflow/Council and the remaining P5–P6 acceptance continue under the main plan.
+PostgreSQL format 19 adds owner-scoped snapshot admissions and source facts.
+An exact format-18 fixture preserves session, message, Memory, Job and project
+import data, including rollback on an injected migration failure. Legacy
+same-gateway preparation digests remain readable without rewriting old receipts.
+
+The executable fixture runs one control plane, two gateways with separate
+ledgers and two Workers. It exercises two users, remote parent/child workspaces,
+Workflow, Council, approval/content review, initial import and 42 model requests
+without the optional Web fixture. Provider fault tests cover truncation,
+interruption, changed bytes, repeated transfer and restart after publication.
+The model/identity issuer is a fixture; full P6 operational acceptance remains.
 
 See [中文](WORKSPACES.zh.md), [child dispatch](CHILDREN.md),
 [deployment](DEPLOYMENT.md) and [platforms](PLATFORMS.md).

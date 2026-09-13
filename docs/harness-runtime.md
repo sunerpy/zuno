@@ -3015,3 +3015,13 @@ until the assigned gateway's validated initialization receipt is committed.
 The stream is size/digest checked, host ownership is normalized, and restoration
 uses the existing isolated fork mechanism. Import tickets cannot execute Agent
 tools. See `enterprise/WORKSPACES.md` for the API and recovery limits.
+
+Enterprise child preparation routes to the configured target gateway. A remote
+source snapshot uses a separate request-scoped ticket and durable source fact;
+the target verifies bytes before its existing atomic fork publication. Merge
+imports the completed child's snapshot back to the parent gateway, retaining the
+original lineage, manifest and human approval. Receiving a snapshot cannot renew
+a lease or replay an external command. Separate bounded export/import pools
+avoid reciprocal transfer deadlocks. PostgreSQL format 19 and gateway protocol 5
+carry this private contract; public activity and Worker checkpoint schemas stay
+unchanged. See the preview workspace and gateway guides.

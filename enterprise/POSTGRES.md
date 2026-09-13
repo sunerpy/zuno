@@ -319,3 +319,20 @@ upload was cancelled. Exact format-17 migration uses source digest
 `0283f316583aeff2c9da642747f54430c9fd1035a5183355d9a2b86deb3aeebc`
 and tests preservation of sessions, messages, Memory, Jobs and merge offers,
 including rollback before the marker.
+
+## Format 19: snapshot source facts
+
+`workspace_snapshot_transfer` binds an existing runtime Job to a source gateway,
+target gateway and stable snapshot ID. The admission digest excludes the mutable
+Worker lease while fixing the owner, logical request and both deployments.
+Re-admission checks current lease, policy and child lineage. Only the source
+service identity may commit a descriptor, and a conflicting descriptor is refused.
+The destination verifies that fact before child readiness or merge admission.
+Late source facts do not reactivate cancelled or expired execution.
+
+The new table uses forced owner RLS and a Job index. An exact format-18 fixture
+uses source digest
+`d7fc4601474c99b0d759cd26c5818b891af72d4e6e751fc9edd4c90614e02e14`;
+tests preserve sessions, messages, Memory, Jobs and imports across migration and
+injected rollback. Schema, grants and marker commit together. Existing
+same-gateway preparation digests retain their original serialization.

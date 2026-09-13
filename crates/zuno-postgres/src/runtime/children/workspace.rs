@@ -110,9 +110,6 @@ pub(crate) async fn merge_source_in(
         let (admission, receipt) = preparation(tx, &lease.owner, &cursor)
             .await?
             .ok_or(ApplicationError::Forbidden)?;
-        if admission.assignment.gateway_id != gateway {
-            return Err(ApplicationError::Forbidden);
-        }
         let receipt = receipt.ok_or(ApplicationError::Conflict)?;
         if record.parent_job_id == parent.id {
             if record.parent_session_id != parent.session_id
@@ -135,6 +132,46 @@ pub(crate) async fn merge_source_in(
     };
     verify_lease(tx, lease).await?;
     Ok(source)
+}
+
+pub(crate) async fn validate_snapshot_transfer_in(
+    tx: &mut Transaction<'_, Postgres>,
+    assigned: &zuno_application::workspace_transfer::SnapshotTransferAssignment,
+) -> Result<(), ApplicationError> {
+    use zuno_application::workspace_transfer::SnapshotTransferPurpose;
+    assigned.source.environment.validate()?;
+    let lease = &assigned.request.lease;
+    let parent = authorized_parent(tx, lease).await?;
+    match &assigned.request.purpose {
+        SnapshotTransferPurpose::ChildWorkspace { child_job_id } => {
+            let (admission, _) = preparation(tx, &lease.owner, child_job_id)
+                .await?
+                .ok_or(ApplicationError::Forbidden)?;
+            let expected = admission.assignment;
+            let child = read(tx, &lease.owner, child_job_id).await?;
+            if admission.lease.job_id != parent.id
+                || admission.lease.session_id != parent.session_id
+                || child.state == "cancelled"
+                || expected.resume
+                || assigned.source.environment != expected.parent
+                || &assigned.source.gateway_id != expected.parent_gateway()
+                || assigned.target_gateway_id != expected.gateway_id
+            {
+                return Err(ApplicationError::Forbidden);
+            }
+        }
+        SnapshotTransferPurpose::MergeSource { child_job_id, .. } => {
+            let source = merge_source_in(tx, lease, child_job_id).await?;
+            if source.gateway_id != assigned.source.gateway_id
+                || source.source_environment != assigned.source.environment
+                || !assigned.existing_source
+            {
+                return Err(ApplicationError::Forbidden);
+            }
+        }
+    }
+    verify_lease(tx, lease).await?;
+    Ok(())
 }
 
 impl PostgresRuntimeStore {
@@ -223,7 +260,7 @@ impl PostgresRuntimeStore {
         if let Some((prior, _)) =
             preparation(&mut tx, &lease.owner, &assignment.child_job_id).await?
         {
-            if prior.assignment != *assignment {
+            if !prior.assignment.same_operation(assignment) {
                 return Err(ApplicationError::Conflict);
             }
         } else {
@@ -265,6 +302,9 @@ impl PostgresRuntimeStore {
         {
             return Err(ApplicationError::Forbidden);
         }
+        if prior.as_ref().is_some_and(|prior| prior != receipt) {
+            return Err(ApplicationError::Conflict);
+        }
         if let Some(snapshot) = &receipt.snapshot {
             let expected_id = format!("child-{}", receipt.child_job_id);
             if snapshot.id.as_str() != expected_id
@@ -280,6 +320,17 @@ impl PostgresRuntimeStore {
                 || receipt.target.revision != 1
             {
                 return Err(ApplicationError::Conflict);
+            }
+            if expected.parent_gateway() != gateway {
+                crate::workspace_transfer::require_snapshot_in(
+                    &mut tx,
+                    owner,
+                    &admission.lease.job_id,
+                    expected.parent_gateway(),
+                    gateway,
+                    snapshot,
+                )
+                .await?;
             }
         }
         if let Some(prior) = prior {

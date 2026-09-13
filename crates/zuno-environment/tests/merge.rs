@@ -185,6 +185,7 @@ async fn approved_copy_on_write_merge_preserves_parent_edits_and_recovers_atomic
                 child_job_id: child_lease.job_id.clone(),
                 environment_id: spec.id.clone(),
                 source_id: child.id.clone(),
+                source_snapshot: None,
                 base: base.clone(),
             },
         )
@@ -345,6 +346,7 @@ async fn background_merge_recovers_admission_and_lost_completion_ack_without_rep
                 child_job_id: child_lease.job_id,
                 environment_id: spec.id.clone(),
                 source_id: child.id,
+                source_snapshot: None,
                 base,
             },
         )

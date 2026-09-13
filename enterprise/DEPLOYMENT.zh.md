@@ -98,13 +98,13 @@ Worker 协议 11 承载检查点 schema 4。旧 schema 3 只按未提交等待�
 备份恢复验收仍属 P6。
 
 `python3 scripts/check_enterprise_docker.py` 会启动真实可执行文件：一个控制面、
-一个网关和两个独立 Worker。真实 TLS RSA issuer、原生兼容模型传输、PostgreSQL 和
+两个网关和两个独立 Worker。真实 TLS RSA issuer、原生兼容模型传输、PostgreSQL 和
 rootless Docker 验证双用户、私有 Memory 读写及提示刷新、审批等待期间撤销 Memory 使用、
 父／子工作区分支、Workflow／Council／合并执行和明确审批、两个 Worker 参与、每命令一次操作及 SIGTERM
 退出。这是测试提供商证据，不是实际 Entra 租户验证。
 
-工作区初始导入、后台／共享 Memory、剩余
-Web／ACP 功能及完整故障矩阵仍需继续完成。构建此二进制不会启用预览发布。
+工作区保留／恢复、后台／共享 Memory、ACP／TUI 适配及完整故障矩阵仍需继续完成。
+构建此二进制不会启用预览发布。UI 交付暂停，App 先通过 Penpot 完成设计再进入前端开发。
 
 参见 [English](DEPLOYMENT.md)、[平台](PLATFORMS.zh.md)及[进度](STATUS.md)。
 
@@ -129,6 +129,13 @@ Agent 的 `mode` 默认 `agent`，保留现有定义的规范化摘要。`mode: 
 可选 `councils` 安装原生 `council_run`，提供持久席位以及模型专用修正／综合。模型绑定、quorum、容量和期限由不可变定义控制，见 [Council 配置](WORKFLOW.zh.md#持久-council)。
 
 网关 `mergeParallelism` 默认 2，允许 1–16 个后台合并任务；退出时有界排空，日志和回执可在重启后恢复。控制面的 `gatewayRootCertificate` 可为配置网关的审批内容下载设置私有 CA，省略时使用系统信任库。查看变更不需要活跃 Worker 租约，客户端也不会收到 Worker 凭证。
+
+子定义可以指定另一配置网关，同时保留父逻辑工作区。控制面需登记两个网关的服务身份，
+各网关保有独立私有日志和 Docker 环境所有权。`snapshotParallelism` 默认 2，
+允许每方向 1–16 个传输。`snapshotRootCertificate` 可单独配置网关间 HTTPS 信任，
+与 `state.rootCertificate` 的控制面信任分开；省略时复用状态客户端信任。
+网关需能访问所配置的对端地址，服务令牌不会转发给对端；来源事实和归档字节校验后
+才公布目标。详见[工作区](WORKSPACES.zh.md#网关间传输)。
 
 归档验证使用 `scripts/enterprise_artifact_smoke.py --archive <归档> --target
 <本机Linux目标> --version <版本> --source-sha <SHA> --output <proof.json>`，

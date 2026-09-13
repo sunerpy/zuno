@@ -1,4 +1,5 @@
 use super::*;
+use serde_json::Value;
 use zuno_application::{
     child::{
         ChildWorkspaceAssignment, ChildWorkspaceCompletion, ChildWorkspacePolicy,
@@ -20,14 +21,15 @@ fn spec(session: &SessionId) -> EnvironmentSpec {
 }
 
 pub(super) async fn exercise(backend: &PostgresBackend, admin: &PgPool) {
-    for late in [false, true] {
+    for (remote, late) in [(false, false), (false, true), (true, false), (true, true)] {
         let (actor, parent) = parent(
             backend,
             admin,
-            if late {
-                "workspace-late"
-            } else {
-                "workspace-ready"
+            match (remote, late) {
+                (false, false) => "workspace-ready",
+                (false, true) => "workspace-late",
+                (true, false) => "workspace-remote-ready",
+                (true, true) => "workspace-remote-late",
             },
         )
         .await;
@@ -66,7 +68,8 @@ pub(super) async fn exercise(backend: &PostgresBackend, admin: &PgPool) {
         assert_eq!(info.child_session_id, ticket.session_id);
         let assignment = ChildWorkspaceAssignment {
             child_job_id: ticket.job_id.clone(),
-            gateway_id: GatewayId::new("gateway").unwrap(),
+            gateway_id: GatewayId::new(if remote { "peer" } else { "gateway" }).unwrap(),
+            parent_gateway_id: remote.then(|| GatewayId::new("gateway").unwrap()),
             parent: spec(&parent.job.session_id),
             target: spec(&ticket.session_id),
             resume: false,
@@ -75,6 +78,39 @@ pub(super) async fn exercise(backend: &PostgresBackend, admin: &PgPool) {
             .admit_child_workspace(&parent.lease, &assignment)
             .await
             .unwrap();
+        if !remote {
+            let before: Value = query_scalar(
+                "SELECT admission FROM zuno_enterprise_preview.child_workspace_preparation
+                WHERE tenant_id=$1 AND principal_id=$2 AND child_job_id=$3",
+            )
+            .bind(actor.tenant_id().as_str())
+            .bind(actor.principal_id().as_str())
+            .bind(ticket.job_id.as_str())
+            .fetch_one(admin)
+            .await
+            .unwrap();
+            assert!(before["assignment"].get("parentGatewayId").is_none());
+            let mut explicit = assignment.clone();
+            explicit.parent_gateway_id = Some(assignment.gateway_id.clone());
+            store
+                .admit_child_workspace(&parent.lease, &explicit)
+                .await
+                .unwrap();
+            let after: Value = query_scalar(
+                "SELECT admission FROM zuno_enterprise_preview.child_workspace_preparation
+                WHERE tenant_id=$1 AND principal_id=$2 AND child_job_id=$3",
+            )
+            .bind(actor.tenant_id().as_str())
+            .bind(actor.principal_id().as_str())
+            .bind(ticket.job_id.as_str())
+            .fetch_one(admin)
+            .await
+            .unwrap();
+            assert_eq!(
+                after, before,
+                "explicit gateway resolution retains the legacy admission and its digest"
+            );
+        }
         let mut changed = assignment.clone();
         changed.target.memory_bytes *= 2;
         assert!(matches!(
@@ -114,9 +150,83 @@ pub(super) async fn exercise(backend: &PostgresBackend, admin: &PgPool) {
                 .await,
             Err(ApplicationError::Forbidden)
         ));
+        let transfer = if remote {
+            use zuno_application::workspace_transfer::*;
+            assert!(
+                matches!(
+                    store
+                        .complete_child_workspace(&assignment.gateway_id, &completion)
+                        .await,
+                    Err(ApplicationError::Forbidden)
+                ),
+                "a target cannot invent the source's snapshot"
+            );
+            let assigned = SnapshotTransferAssignment {
+                request: SnapshotTransferRequest {
+                    lease: parent.lease.clone(),
+                    purpose: SnapshotTransferPurpose::ChildWorkspace {
+                        child_job_id: ticket.job_id.clone(),
+                    },
+                },
+                source: zuno_application::environment::wire::GatewayAssignment {
+                    gateway_id: assignment.parent_gateway().clone(),
+                    endpoint: "https://source.example/".to_owned(),
+                    environment: assignment.parent.clone(),
+                },
+                target_gateway_id: assignment.gateway_id.clone(),
+                existing_source: false,
+            };
+            assert!(
+                backend
+                    .admit_snapshot_transfer(&assigned)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let fact = SnapshotTransferCompletion {
+                assignment: assigned,
+                snapshot: completion.receipt.snapshot.clone().unwrap(),
+            };
+            assert!(matches!(
+                backend
+                    .complete_snapshot_transfer(&assignment.gateway_id, &fact)
+                    .await,
+                Err(ApplicationError::Forbidden)
+            ));
+            Some(fact)
+        } else {
+            None
+        };
         if late {
             query("UPDATE zuno_enterprise_preview.runtime_session SET lease_expires=0 WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3")
                 .bind(actor.tenant_id().as_str()).bind(actor.principal_id().as_str()).bind(parent.job.session_id.as_str()).execute(admin).await.unwrap();
+        }
+        if let Some(fact) = &transfer {
+            backend
+                .complete_snapshot_transfer(assignment.parent_gateway(), fact)
+                .await
+                .unwrap();
+            backend
+                .complete_snapshot_transfer(assignment.parent_gateway(), fact)
+                .await
+                .unwrap();
+            let mut changed = fact.clone();
+            changed.snapshot.sha256 = "e".repeat(64);
+            assert!(matches!(
+                backend
+                    .complete_snapshot_transfer(assignment.parent_gateway(), &changed)
+                    .await,
+                Err(ApplicationError::Conflict)
+            ));
+            if late {
+                assert!(
+                    matches!(
+                        backend.admit_snapshot_transfer(&fact.assignment).await,
+                        Err(ApplicationError::LeaseLost)
+                    ),
+                    "a late source fact cannot renew its transfer authority"
+                );
+            }
         }
         store
             .complete_child_workspace(&assignment.gateway_id, &completion)
@@ -249,6 +359,13 @@ async fn merge_authorization(
         },
     )]
     .into();
+    let transfer_request = zuno_application::workspace_transfer::SnapshotTransferRequest {
+        lease: parent.lease.clone(),
+        purpose: zuno_application::workspace_transfer::SnapshotTransferPurpose::MergeSource {
+            operation_id: OperationId::new("merge-test").unwrap(),
+            child_job_id: source.child_job_id.clone(),
+        },
+    };
     let operation = WorkspaceMergeOperation {
         id: OperationId::new("merge-test").unwrap(),
         invocation_id: InvocationId::new("merge-call").unwrap(),
@@ -264,7 +381,7 @@ async fn merge_authorization(
             bytes: 1024,
         },
         child: EnvironmentSnapshot {
-            id: EnvironmentSnapshotId::new("merge-child").unwrap(),
+            id: transfer_request.snapshot_id().unwrap(),
             environment_id: assignment.target.id.clone(),
             revision: 2,
             sha256: "d".repeat(64),
@@ -273,7 +390,7 @@ async fn merge_authorization(
         plan: plan(&base, &base, &target).unwrap(),
     };
     let admission = WorkspaceMergeAdmission {
-        gateway_id: assignment.gateway_id.clone(),
+        gateway_id: assignment.parent_gateway().clone(),
         lease: parent.lease.clone(),
         environment: Environment {
             owner: actor.owner(),
@@ -283,7 +400,38 @@ async fn merge_authorization(
         source: source.clone(),
         operation: operation.clone(),
     };
-    let merge = backend.workspace_merges(assignment.gateway_id.clone());
+    let merge = backend.workspace_merges(assignment.parent_gateway().clone());
+    if assignment.parent_gateway() != &assignment.gateway_id {
+        use zuno_application::workspace_transfer::*;
+        assert!(
+            matches!(
+                merge.offer(&admission).await,
+                Err(ApplicationError::Forbidden)
+            ),
+            "cross-gateway merge requires the source's immutable fact"
+        );
+        let assigned = SnapshotTransferAssignment {
+            request: transfer_request,
+            source: zuno_application::environment::wire::GatewayAssignment {
+                gateway_id: source.gateway_id.clone(),
+                endpoint: "https://peer.example/".to_owned(),
+                environment: source.source_environment.clone(),
+            },
+            target_gateway_id: assignment.parent_gateway().clone(),
+            existing_source: true,
+        };
+        backend.admit_snapshot_transfer(&assigned).await.unwrap();
+        backend
+            .complete_snapshot_transfer(
+                &source.gateway_id,
+                &SnapshotTransferCompletion {
+                    assignment: assigned,
+                    snapshot: operation.child.clone(),
+                },
+            )
+            .await
+            .unwrap();
+    }
     merge.offer(&admission).await.unwrap();
     merge.offer(&admission).await.unwrap();
     let proposal = ApprovalProposal {

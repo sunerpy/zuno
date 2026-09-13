@@ -132,6 +132,8 @@ pub struct WorkspaceMergePreviewRequest {
     pub child_job_id: JobId,
     pub environment_id: EnvironmentId,
     pub source_id: EnvironmentId,
+    /// A verified immutable snapshot already imported from the source gateway.
+    pub source_snapshot: Option<EnvironmentSnapshot>,
     pub base: EnvironmentSnapshot,
 }
 

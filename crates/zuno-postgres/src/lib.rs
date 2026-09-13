@@ -23,6 +23,7 @@ mod turn;
 mod turn_tests;
 mod workspace_import;
 mod workspace_merge;
+mod workspace_transfer;
 
 pub use activity::PostgresActivityPersistence;
 pub use authorization::{PostgresOrganizationStore, bootstrap_organization};

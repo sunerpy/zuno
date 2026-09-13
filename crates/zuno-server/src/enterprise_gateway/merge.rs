@@ -19,6 +19,13 @@ impl GatewayControlService {
             | GatewayCommand::SubmitWorkspaceMerge { operation } => &operation.child_job_id,
             _ => return Ok(()),
         };
+        self.merge_source_context(child, context).await
+    }
+    pub(super) async fn merge_source_context(
+        &self,
+        child: &zuno_types::identity::JobId,
+        context: &mut GatewayExecutionContext,
+    ) -> Result<(), Failure> {
         let source = self
             .backend
             .runtime(self.tenant.clone())
@@ -33,14 +40,13 @@ impl GatewayControlService {
                 &source.child_session_id,
             )
             .map_err(application)?;
-        if source.gateway_id != context.assignment.gateway_id
-            || configured.gateway_id != source.gateway_id
+        if configured.gateway_id != source.gateway_id
             || configured.environment != source.source_environment
-            || configured.endpoint != context.assignment.endpoint
             || source.base.environment_id != context.assignment.environment.id
         {
             return Err(Failure(StatusCode::FORBIDDEN));
         }
+        context.workspace_source = Some(configured);
         context.merge_source = Some(source);
         Ok(())
     }

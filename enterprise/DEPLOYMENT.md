@@ -133,16 +133,17 @@ protocol and retain their definitions and durable data. Full rolling-upgrade and
 backup/restore acceptance remain P6 work.
 
 `python3 scripts/check_enterprise_docker.py` now runs the binary with a control
-plane, a gateway and two independent Worker processes. A real TLS RSA issuer,
+plane, two gateways and two independent Worker processes. A real TLS RSA issuer,
 native compatible model transport, PostgreSQL and rootless Docker verify two
 users, private Memory reads and updates, fresh prompts after changes, Memory-use
 revocation during approval waits, parent/child workspace forks, Workflow/Council/merge execution, explicit approvals, both Workers participating, one operation per
 command and SIGTERM cleanup. This is fixture provider evidence,
 not a live Entra tenant.
 
-Remaining work includes richer workspace provisioning, background/shared Memory,
-remaining Web/ACP features
+Remaining work includes workspace retention/recovery, background/shared Memory,
+ACP/TUI adapters
 and the full failure matrix. No preview release is enabled by building this binary.
+UI delivery is paused; App design will use Penpot before frontend work resumes.
 
 See [中文](DEPLOYMENT.zh.md), [platforms](PLATFORMS.md) and [status](STATUS.md).
 
@@ -161,6 +162,16 @@ internal completions; it does not enable distributed Council coordination.
 Optional `councils` installs native `council_run` with durable seats and completion-only repair/synthesis profiles. Model bindings, quorum, capacity and deadlines belong to the immutable definition. See [Council configuration](WORKFLOW.md#durable-council).
 
 Gateway `mergeParallelism` defaults to 2 and accepts 1–16 background merge tasks. The gateway drains these tasks on shutdown; their journal and receipts survive interruption. Control-plane `gatewayRootCertificate` configures an optional private CA for authenticated review downloads from the configured gateway. Omit it for system trust. Review downloads require no active Worker lease and expose no Worker credential to clients.
+
+Child definitions may select another configured gateway while retaining the
+parent's logical workspace. Install both gateway service identities in the
+control plane; each gateway keeps its own private ledger and Docker environment
+ownership. Gateway `snapshotParallelism` defaults to 2 (1–16 per direction).
+`snapshotRootCertificate` optionally configures trust for peer HTTPS, separately
+from the control-plane trust in `state.rootCertificate`; omission reuses state
+trust. Gateways must reach the configured peer endpoints. Requests never forward
+service tokens to peers. Transfers verify source facts and archive bytes before
+publishing a target. See [workspaces](WORKSPACES.md#transfer-between-gateways).
 
 Release artifact validation uses `scripts/enterprise_artifact_smoke.py --archive
 <archive> --target <native-linux-triple> --version <version> --source-sha <sha>

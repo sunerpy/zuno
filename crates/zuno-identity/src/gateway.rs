@@ -1,5 +1,7 @@
 //! Request-scoped delegation to one authenticated execution gateway.
 //! A ticket is request admission, not tool approval or proof of current lease.
+mod snapshot;
+pub use snapshot::GatewaySnapshotTicket;
 
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
@@ -500,6 +502,103 @@ mod tests {
     }
     fn tickets(key: &str, entries: Vec<(String, Vec<u8>)>) -> GatewayTicketAuthority {
         GatewayTicketAuthority::new(key.to_owned(), entries, 5000).unwrap()
+    }
+    #[tokio::test]
+    async fn snapshot_ticket_binds_source_target_lease_and_transfer_purpose() {
+        use zuno_application::{
+            environment::{EnvironmentSpec, wire::GatewayAssignment},
+            workspace_transfer::{
+                SnapshotTransferAssignment, SnapshotTransferPurpose, SnapshotTransferRequest,
+            },
+        };
+        let gateways = GatewayServiceAuthority::new(
+            Arc::new(Verifier),
+            [
+                (subject("source"), GatewayId::new("a").unwrap()),
+                (subject("target"), GatewayId::new("b").unwrap()),
+            ]
+            .into(),
+        )
+        .unwrap();
+        let source = gateways.authenticate("source").await.unwrap();
+        let target = gateways.authenticate("target").await.unwrap();
+        let authority = tickets("current", vec![("current".to_owned(), vec![2; 32])]);
+        let assignment = SnapshotTransferAssignment {
+            request: SnapshotTransferRequest {
+                lease: lease(),
+                purpose: SnapshotTransferPurpose::ChildWorkspace {
+                    child_job_id: JobId::new("child").unwrap(),
+                },
+            },
+            source: GatewayAssignment {
+                gateway_id: source.id().clone(),
+                endpoint: "https://source.example/".to_owned(),
+                environment: EnvironmentSpec {
+                    id: EnvironmentId::new("environment").unwrap(),
+                    session_id: lease().session_id,
+                    image: format!("image@sha256:{}", "a".repeat(64)),
+                    memory_bytes: 67108864,
+                    pids_limit: 32,
+                    cpu_millis: 500,
+                },
+            },
+            target_gateway_id: target.id().clone(),
+            existing_source: true,
+        };
+        let ticket = authority.issue_snapshot(&assignment, 1000).unwrap();
+        assert_eq!(
+            authority
+                .verify_snapshot(&source, &ticket, &assignment.request, 2000)
+                .unwrap(),
+            assignment.digest()
+        );
+        assert!(
+            authority
+                .verify_snapshot(&target, &ticket, &assignment.request, 2000)
+                .is_err()
+        );
+        assert!(
+            authority
+                .verify_snapshot(&source, &ticket, &assignment.request, 6000)
+                .is_err()
+        );
+        let mut request = assignment.request.clone();
+        request.lease.epoch += 1;
+        assert!(
+            authority
+                .verify_snapshot(&source, &ticket, &request, 2000)
+                .is_err()
+        );
+        request = assignment.request.clone();
+        request.purpose = SnapshotTransferPurpose::MergeSource {
+            operation_id: OperationId::new("merge").unwrap(),
+            child_job_id: JobId::new("child").unwrap(),
+        };
+        assert!(
+            authority
+                .verify_snapshot(&source, &ticket, &request, 2000)
+                .is_err()
+        );
+        let mut changed = assignment.clone();
+        changed.target_gateway_id = GatewayId::new("unassigned").unwrap();
+        assert_ne!(
+            changed.digest(),
+            authority
+                .verify_snapshot(&source, &ticket, &assignment.request, 2000)
+                .unwrap()
+        );
+        assert!(
+            authority
+                .verify(
+                    &source,
+                    &GatewayTicket::try_from(ticket.expose().to_owned()).unwrap(),
+                    &GatewayRequest::new(GatewayCommand::Acquire).unwrap(),
+                    2000,
+                )
+                .is_err(),
+            "snapshot credentials cannot execute commands"
+        );
+        assert!(!format!("{ticket:?}").contains(ticket.expose()));
     }
     #[tokio::test]
     async fn initialization_tickets_cannot_read_other_imports_or_execute_commands() {

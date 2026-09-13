@@ -1,4 +1,6 @@
 //! Gateway transports carry scoped capabilities, never database credentials.
+mod transfer;
+pub use transfer::SnapshotDownload;
 
 use super::*;
 use async_trait::async_trait;
@@ -65,6 +67,7 @@ impl WorkerClient {
 #[derive(Clone)]
 pub struct GatewayStateClient {
     control: WorkerClient,
+    snapshots: reqwest::Client,
 }
 impl GatewayStateClient {
     pub async fn import_context(
@@ -176,9 +179,27 @@ impl GatewayStateClient {
         tokens: Arc<dyn AccessTokenSource>,
         certificate: Option<reqwest::Certificate>,
     ) -> Result<Self, TurnStateError> {
+        let control = WorkerClient::new(endpoint, tokens, certificate)?;
         Ok(Self {
-            control: WorkerClient::new(endpoint, tokens, certificate)?,
+            snapshots: control.client.clone(),
+            control,
         })
+    }
+
+    pub fn with_snapshot_certificate(
+        mut self,
+        certificate: reqwest::Certificate,
+    ) -> Result<Self, TurnStateError> {
+        self.snapshots = zuno_network::client_builder()
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(600))
+            .add_root_certificate(certificate)
+            .build()
+            .map_err(|_| TurnStateError::Unavailable)?;
+        Ok(self)
     }
 
     pub async fn resolve(
@@ -210,9 +231,12 @@ impl GatewayStateClient {
                 .as_ref()
                 .ok_or(ApplicationError::Forbidden)?;
             if assignment.child_job_id != *child_job_id
-                || assignment.parent != context.assignment.environment
+                || assignment.target != context.assignment.environment
                 || assignment.gateway_id != context.assignment.gateway_id
-                || !context.existing_workspace
+                || context.workspace_source.as_ref().is_none_or(|source| {
+                    source.environment != assignment.parent
+                        || &source.gateway_id != assignment.parent_gateway()
+                })
             {
                 return Err(ApplicationError::Forbidden);
             }
@@ -454,6 +478,17 @@ impl GatewayClient {
                     .join(GATEWAY_EXECUTE_PATH)
                     .map_err(ApplicationError::storage)?,
             )
+            .timeout(
+                if matches!(
+                    request.command,
+                    GatewayCommand::PrepareChildWorkspace { .. }
+                        | GatewayCommand::PreviewWorkspaceMerge { .. }
+                ) {
+                    Duration::from_secs(600)
+                } else {
+                    Duration::from_secs(30)
+                },
+            )
             .header(GATEWAY_TICKET_HEADER, credential)
             .header(CONTENT_TYPE, "application/json")
             .body(request.encode()?)
@@ -548,7 +583,7 @@ impl GatewayClient {
                 GatewayReply::ChildWorkspace(receipt),
             ) => {
                 receipt.child_job_id == *child_job_id
-                    && receipt.parent_environment_id == issued.assignment.environment.id
+                    && receipt.target.spec == issued.assignment.environment
                     && receipt.target.spec.validate().is_ok()
                     && receipt.target.revision > 0
             }

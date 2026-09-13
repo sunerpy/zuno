@@ -15,6 +15,9 @@
       "rootCertificate": "/etc/zuno-enterprise-preview/ca.pem"
     },
     "dockerSocket": "/run/user/1000/docker.sock",
-    "deliveryMillis": 500
+    "deliveryMillis": 500,
+    "mergeParallelism": 2,
+    "snapshotParallelism": 2,
+    "snapshotRootCertificate": "/etc/zuno-enterprise-preview/ca.pem"
   }
 }

@@ -159,6 +159,7 @@ impl DockerGateway {
             child_job_id,
             environment_id,
             source_id,
+            source_snapshot,
             base,
         } = request;
         let (environment_id, source_id, base) = (&environment_id, &source_id, &base);
@@ -170,7 +171,6 @@ impl DockerGateway {
         if parent.spec.session_id != lease.session_id {
             return Err(ApplicationError::Forbidden);
         }
-        let source = self.get(owner, source_id).await?;
         let snapshot_id = |role: &str| {
             EnvironmentSnapshotId::new(format!(
                 "merge-{}",
@@ -186,9 +186,19 @@ impl DockerGateway {
                 &snapshot_id("parent")?,
             )
             .await?;
-        let source_snapshot = self
-            .snapshot_named(owner, source_id, source.revision, &snapshot_id("child")?)
-            .await?;
+        let source_snapshot = if let Some(snapshot) = source_snapshot {
+            if snapshot.id != snapshot_id("child")?
+                || snapshot.environment_id != *source_id
+                || self.ledger.snapshot(owner, &snapshot.id)? != snapshot
+            {
+                return Err(ApplicationError::Conflict);
+            }
+            snapshot
+        } else {
+            let source = self.get(owner, source_id).await?;
+            self.snapshot_named(owner, source_id, source.revision, &snapshot_id("child")?)
+                .await?
+        };
         let paths = [
             self.snapshot_path(owner, &base.id),
             self.snapshot_path(owner, &parent_snapshot.id),

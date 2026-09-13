@@ -1,5 +1,6 @@
 //! Execution-side router. The gateway owns Docker and its ledger; it has only a
 //! scoped HTTP state client, never a PostgreSQL pool or model credential.
+mod transfer;
 
 use axum::{
     Json, Router,
@@ -31,6 +32,8 @@ pub struct GatewayExecutionService {
     gateway: Arc<DockerGateway>,
     state: GatewayStateClient,
     merges: Arc<zuno_environment::MergeExecutor>,
+    snapshot_exports: Arc<tokio::sync::Semaphore>,
+    snapshot_imports: Arc<tokio::sync::Semaphore>,
 }
 impl GatewayExecutionService {
     /// Host lifecycle calls this bounded scan repeatedly with interruptible
@@ -88,6 +91,8 @@ impl GatewayExecutionService {
             gateway,
             state,
             merges,
+            snapshot_exports: Arc::new(tokio::sync::Semaphore::new(2)),
+            snapshot_imports: Arc::new(tokio::sync::Semaphore::new(2)),
         })
     }
     pub fn with_merge_parallelism(mut self, parallelism: u32) -> Result<Self, ApplicationError> {
@@ -98,12 +103,28 @@ impl GatewayExecutionService {
         )?);
         Ok(self)
     }
+    pub fn with_snapshot_parallelism(mut self, parallelism: u32) -> Result<Self, ApplicationError> {
+        if !(1..=16).contains(&parallelism) {
+            return Err(ApplicationError::Invalid(
+                "snapshot parallelism must be 1–16".to_owned(),
+            ));
+        }
+        // Independent direction pools avoid cyclic waits when two gateways
+        // simultaneously copy workspaces from one another.
+        self.snapshot_exports = Arc::new(tokio::sync::Semaphore::new(parallelism as usize));
+        self.snapshot_imports = Arc::new(tokio::sync::Semaphore::new(parallelism as usize));
+        Ok(self)
+    }
     pub async fn drain_merges(&self, timeout: std::time::Duration) {
         self.merges.drain(timeout).await;
     }
 
     pub fn router(self) -> Router {
         Router::new()
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_SNAPSHOT_EXPORT_PATH),
+                post(transfer::export),
+            )
             .route(
                 &format!("/{}", zuno_worker::GATEWAY_IMPORT_PATH),
                 post(import_workspace),
@@ -146,10 +167,24 @@ impl GatewayExecutionService {
                 invocation_id,
                 child_job_id,
             } => {
-                let source = context.merge_source.ok_or(ApplicationError::Forbidden)?;
-                if source.child_job_id != child_job_id || source.gateway_id != self.id {
+                let source = context
+                    .merge_source
+                    .as_ref()
+                    .ok_or(ApplicationError::Forbidden)?;
+                if source.child_job_id != child_job_id {
                     return Err(ApplicationError::Forbidden);
                 }
+                let source_snapshot = if source.gateway_id != self.id {
+                    Some(self.transfer_snapshot(
+                        &context,
+                        zuno_application::workspace_transfer::SnapshotTransferPurpose::MergeSource {
+                            operation_id: id.clone(),
+                            child_job_id: child_job_id.clone(),
+                        },
+                    ).await?)
+                } else {
+                    None
+                };
                 GatewayReply::WorkspaceMergePreview(Box::new(
                     self.gateway
                         .preview_workspace_merge(
@@ -159,8 +194,9 @@ impl GatewayExecutionService {
                                 invocation_id,
                                 child_job_id,
                                 environment_id: context.assignment.environment.id,
-                                source_id: source.source_environment.id,
-                                base: source.base,
+                                source_id: source.source_environment.id.clone(),
+                                source_snapshot,
+                                base: source.base.clone(),
                             },
                         )
                         .await?,
@@ -209,12 +245,26 @@ impl GatewayExecutionService {
                     .ok_or(ApplicationError::Forbidden)?;
                 if assignment.child_job_id != child_job_id
                     || assignment.gateway_id != self.id
-                    || assignment.parent != context.assignment.environment
+                    || assignment.target != context.assignment.environment
+                    || context.workspace_source.as_ref().is_none_or(|source| {
+                        source.environment != assignment.parent
+                            || &source.gateway_id != assignment.parent_gateway()
+                    })
                 {
                     return Err(ApplicationError::Forbidden);
                 }
                 let receipt = if let Some(receipt) = context.prepared_workspace {
                     receipt
+                } else if !assignment.resume && assignment.parent_gateway() != &self.id {
+                    let snapshot = self.transfer_snapshot(
+                        &context,
+                        zuno_application::workspace_transfer::SnapshotTransferPurpose::ChildWorkspace {
+                            child_job_id,
+                        },
+                    ).await?;
+                    self.gateway
+                        .fork_transferred_workspace(&context.lease.owner, assignment, &snapshot)
+                        .await?
                 } else {
                     self.gateway
                         .prepare_child_workspace(
