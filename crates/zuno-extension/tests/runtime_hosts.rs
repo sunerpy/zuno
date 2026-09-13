@@ -852,11 +852,8 @@ for raw in sys.stdin:
 
 /// A cancellation that beat the request out of the host reports that nothing ran.
 ///
-/// The certain branch is a positive claim to the model — "the call was stopped before the
-/// plugin received it" — so it needs a host-level test of its own, not only the metadata
-/// unit test. The fixture stops reading stdin after `initialize`, so a request larger than
-/// the pipe buffer can never be flushed and the outcome is decided by the protocol rather
-/// than by which arm of the select happened to be polled first.
+/// A pre-cancelled call must not start a lazy plugin, encode a request or depend
+/// on stopping a process before it can truthfully report that nothing ran.
 #[tokio::test]
 async fn cancelling_a_call_the_plugin_never_received_reports_that_nothing_ran() {
     let Some(python) = python() else {
@@ -872,6 +869,9 @@ async fn cancelling_a_call_the_plugin_never_received_reports_that_nothing_ran() 
 import json
 import sys
 import time
+from pathlib import Path
+
+Path("started").write_text("started")
 
 for raw in sys.stdin:
     request = json.loads(raw)
@@ -898,9 +898,7 @@ for raw in sys.stdin:
         .await
         .expect("process host initializes");
 
-    // `activate_profile` returned, so the fixture answered `initialize` and stopped
-    // reading. A request that cannot fit in the pipe buffer therefore never completes its
-    // flush, and the interrupt is already pending before the first poll.
+    // Mounting is lazy. Cancellation is already pending before the first invoke.
     let interrupt = Cancel::new();
     interrupt.fire();
     let output = tool
@@ -910,6 +908,10 @@ for raw in sys.stdin:
         )
         .await
         .expect("a cancelled call settles as a report, not a failure");
+    assert!(
+        !fixture.path().join("undelivered-process/started").exists(),
+        "pre-cancellation must not start a plugin process"
+    );
 
     assert_eq!(output.title, "review_outline cancelled");
     let cancellation = &output.metadata["cancellation"];

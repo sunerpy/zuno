@@ -448,7 +448,21 @@ impl PluginHostSlot {
         self: &Arc<Self>,
         request: PluginInvocation,
     ) -> Result<PluginResult, PluginHostError> {
+        if request.interrupt.is_set() {
+            return Err(PluginHostError::Cancelled {
+                package: self.package.clone(),
+                dispatched: false,
+                cleanup: None,
+            });
+        }
         let host = self.host().await?;
+        if request.interrupt.is_set() {
+            return Err(PluginHostError::Cancelled {
+                package: self.package.clone(),
+                dispatched: false,
+                cleanup: None,
+            });
+        }
         host.invoke(request).await
     }
 

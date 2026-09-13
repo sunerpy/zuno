@@ -3136,3 +3136,9 @@ operation IDs are refused, and divergent bytes remain uncertain.
 The effect DTO contains no host path or runtime handle. A remote host must bind
 it to current authorization, a logical environment target and a real operation
 receipt before use. This interface does not register a remote Skill executor.
+
+A plugin invocation that is already cancelled is rejected before lazy startup
+and before encoding or writing its RPC frame. This proves only that this call
+was not dispatched; it does not require stopping an unrelated or idle host.
+Cancellation after possible dispatch retains the existing uncertain/cleanup
+contract.
