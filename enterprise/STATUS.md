@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p2-shared-memory`.
+- Current phase branch: `codex/enterprise-p2-skill-evaluation-storage`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -581,3 +581,12 @@ contracts pass; workspace checks, Clippy and 100 documentation/release contracts
 passed. Exact-archive and preview CI validation remain required. Private-source
 sharing and automatic shared maintenance are still pending full-goal work.
 App/UI remains paused; publication remains disabled.
+
+## Skill persistence interfaces under validation
+
+Evaluation suites/runs/results and Skill candidate/evidence storage now use
+replaceable ports, coordinated through a backend bundle. SQLite providers and
+existing consumers are wired. All 129 evaluation/learning tests passed, including
+replacement-persistence settlement failure. No enterprise Skill endpoint or
+backend is registered by this foundation; distributed Skill integration remains
+uncompleted plan work. UI remains paused.

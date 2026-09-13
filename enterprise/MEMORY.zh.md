@@ -220,3 +220,11 @@ SDK 提供 `learningJobs`、`learningJob` 和 `cancelLearning`。本批交付后
 成员资格和独立审核，个人自动学习不会隐式公开。Worker 协议 12 在每次模型请求
 前读取有界共享快照，并遵循继承的 `useMemories`。实际 API 与限制见
 [SHARED_MEMORY.zh.md](SHARED_MEMORY.zh.md)。
+
+## Skill 后端基础
+
+Skill 候选与证据通过 `SkillBackendBundle` 中的可替换持久化接口访问，成对
+评测使用 `EvaluationPersistence`。当前实现为 SQLite；已有 Skill 命令已经
+消费这些接口，保留原审核、模型、来源摘要和不确定副作用行为。这项基础重构
+不注册企业 Skill 评测／应用路由，PostgreSQL 作用域结算、远程执行与应用授权
+仍属于完整实施计划的后续工作。

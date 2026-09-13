@@ -381,3 +381,7 @@ Project Experience、Memory、pattern、evaluation result 与 Skill candidate �
 - [Session 与回合](/zh/guide/sessions)
 - [常驻 Memory 设计（英文）](/design/memory-learning)
 - [用户学习闭环设计（英文）](/design/user-learning-flywheel)
+
+Skill 存储适配器通过 `SkillBackendBundle` 协调候选、来源证据与评测持久化，
+默认仍使用 SQLite。该扩展点不自动启动 Skill 评测，也不改变模型配置；审核、
+实际成对模型评测和应用仍是独立步骤。企业远程 Skill 执行继续在预览通道实施。

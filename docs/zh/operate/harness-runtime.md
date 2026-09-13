@@ -950,3 +950,14 @@ Worker 辅助消费者装配。已结束来源 Job 生成有界提炼请求，�
 并将完整前后内容、版本和当前空间权限绑定至独立审核。Worker 协议 12 在模型请求
 前刷新共享内容，成员资格或使用授权撤销后不保留旧共享提示词。个人自动学习仍为
 个人数据，详见预览归档中的 `enterprise/SHARED_MEMORY.zh.md`。
+
+### Skill 持久化装配
+
+`SkillCandidateService` 从一个 `SkillBackendBundle` 获取候选、证据和评测存储。
+`SqliteSkillBackend` 将其绑定到同一连接池；宿主可提供带用户归属的实现，无需
+改变 Skill 审核或评测策略。`EvaluationService` 使用 `EvaluationPersistence`，
+运行结果与终态仍须原子结算，结算失败不能返回已通过的评测。
+
+评测器仍实际调用模型，基线与候选使用同一不可变尝试快照和录制工具结果。存储
+构造函数不选择新的评测模型。文件应用与核查仍由本地 Skill 宿主管理，单独定义
+这些接口不会注册尚未完成的分布式 Skill 后端。
