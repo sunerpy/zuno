@@ -402,6 +402,34 @@ tool surface could only invite a call Zuno would refuse. When a turn carries no
 locked set — a title, summary, or compaction request — `options.tools` is sent
 unchanged.
 
+Historical tool input is separate from the tools currently available for execution.
+Ordinary Agent requests preserve native history when the effective surface is known
+to be Responses, or when resolved options explicitly set `reasoningReplay: "encrypted"`.
+Surface precedence is explicit `ResolvedModel.surface` > adapter-resolved
+`Capabilities.default_surface` > `Spec.surface`. With no explicit model surface,
+the Spec is a fallback only when the adapter still reports `Default` (unknown);
+it cannot override an already resolved adapter surface. If all remain `Default`,
+the surface stays unknown rather than being guessed. Without a model override,
+fixed compatible profiles ignore conflicting Spec declarations: `xai` stays Responses
+with `Spec.surface = Chat`, while `openrouter` stays Chat with
+`Spec.surface = Responses`. OpenAI resolves to Responses even when both model and
+Spec surfaces are `Default`. The `Provider` trait still has three
+methods and this capability declaration adds no user configuration.
+Existing calls and results retain their original content, call ids, raw argument
+strings, order, and boundaries even if a tool is missing, permissions are narrowed,
+a hook removes its declaration, or its schema changes structurally. They are not
+converted into inert text, and old Goal, Plan, or Todo state-tool interactions are
+not removed by `AuthoritativeState` history policy. The Responses rule does not
+require encrypted replay; `reasoningReplay: "off"` still sends no sealed reasoning.
+
+Preserving history neither expands the current tool list nor restores permissions
+or re-executes old calls. Engine tool dispatch uses the same snapshot narrowed by
+`prepare_request` that the provider receives, not the wider pre-hook registry.
+New calls remain subject to that snapshot, schema validation, permissions, and risk gates. Other protocols retain
+the existing declaration fallback. Tool-free internal compaction keeps its own
+tool-independent projection: historical interactions become bounded explanatory
+text, without sealed reasoning.
+
 `toolChoice` is sent only when the body actually carries the tool it names.
 `{"type": "tool", "name": "…"}` on the Anthropic and Vertex Anthropic surfaces,
 and a single-function restriction on Gemini, are permanent 400s when the named
@@ -513,6 +541,46 @@ sent alone, which a Responses endpoint refuses, and it is counted as withheld
 rather than as a replay. The item id is not echoed: a
 replayed item carries `type`, `summary`, `encrypted_content`, and `status`.
 
+A dedicated sealed-history hash guard reuses the shared Responses maximal assistant-group
+boundaries to protect bound output, item order, and input boundaries across request hooks.
+A hook cannot inject or alter adjacent unsealed assistant content inside a protected
+group; unsealed ordinary prose outside it retains the existing behavior. Once eligible
+sealed replay is assembled, the guard also pins the request's model and surface across
+hooks. Request-parameter overrides of `input`, `messages`, or `model` are rejected before
+dispatch; they cannot replace the protected transcript or route through another path.
+Changes to the current tool list are not a reason to rewrite bound historical
+output. Zuno preserves that history without reopening tools, adding user settings
+or a database migration, or changing the original durable records.
+
+If `text_complete` rewrites freshly completed provider-sealed output, Zuno restores
+the original text and returns a Hook error. The mismatched text is not persisted,
+and the error is not automatically retried. The sealed-history guard uses hash-only
+snapshots and never prints capsule contents.
+
+This protection does not change existing replay eligibility or withholding rules.
+Provider/model matching, `reasoningReplayMaxAge`, `reasoningReplay: "off"`, and
+withholding for ambiguous replay groups still apply, as does withholding a sealed
+item with no following output. Preserving historical tool interactions is not a
+promise to send every stored reasoning envelope.
+
+For an error such as `400 reasoning_replay_context_mismatch`, retain the original
+history and redacted diagnostics and investigate the replay content and binding.
+Blind retries, globally disabling or deleting reasoning, or switching accounts to
+bypass validation are not the recovery procedure. Kiro Provider v3.1.1 retains its
+replay-binding checks; existing valid Zuno Responses configurations need no new
+setting for this fix. The rejection does not become retryable under this policy.
+Successful recovery of a real session requires separate verification and cannot
+be inferred from configuration or version numbers.
+
+Kiro v3.1.1 returns `missing_tool_declaration` when preserved history references
+a tool absent from the current tool list. Use the v3.1.2 historical-tool-scope fix,
+which separates historical validation and current tool authorization without a
+new Zuno configuration value. Old namespace/custom history without a provable
+alias binding still fails as `missing_historical_tool_binding` instead of guessing
+an identity. Do not expose denied tools again or delete sealed reasoning to bypass
+these checks; validate reduced-tool replay against the actual endpoint before
+reporting a real session as recovered.
+
 Autonomous Goal continuations preserve the input boundary as well as the output
 order. Zuno stores a prompt-receipt reference on the first assistant row of the
 new turn and resolves the receipt's actual post-hook developer suffix into a
@@ -534,12 +602,10 @@ replay-token bytes.
 
 The default `off` is a request that carries neither `include` nor any sealed
 item, including envelopes an earlier session stored while the option was
-`encrypted`. It is not a promise that the request bytes match earlier releases.
-This release also sends each assistant turn's Responses `input` in the order the
-model streamed it, so a turn that wrote text and then called a tool now sends the
-text item before the function call, for every Responses provider and whatever
-`reasoningReplay` says. That ordering is what a sealing endpoint validates;
-the one-time cost is an invalidated append-only prompt-cache prefix.
+`encrypted`. Native historical tool replay and assistant-item ordering apply to
+every Responses provider regardless of `reasoningReplay`: a turn that wrote text
+and then called a tool sends the text item before the function call. That ordering
+is what a sealing endpoint validates.
 
 `reasoningReplayMaxAge` without `reasoningReplay: "encrypted"` is rejected at
 config time as well. Do not add `reasoningSummary` to a sealing endpoint, which

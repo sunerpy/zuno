@@ -254,10 +254,31 @@ Catalog 会把这个会话边界传递到子回合与后台续跑。
 相关已授权 MCP，区分配置、连接、缓存和延迟状态；普通服务调用不先加载 `customize-zuno`，
 也不把扩展／资源列表当作工具发现。
 
-每个新工具 part 还会保存准入该调用的 provider-visible schema identity。组装下一次请求时，
-只对更早 turn 的保留历史与当前 hook 后的工具定义对账；当前 turn 刚产生的调用始终保留原生
-配对，以便未知或被拒绝的调用仍能收到协议完整的 tool result。对更早历史，声明一致时保留原生
-tool-use/result 协议。新的 replay hash 只在 schema 与子 schema 位置移除 description、
+每个新工具 part 还会保存准入该调用的 provider-visible schema identity。历史输入与当前可执行
+工具声明是两个独立契约。普通 Agent 请求在有效 surface 为 Responses 时保留原生历史：
+优先级为显式 `ResolvedModel.surface` > adapter 已解析的 `Capabilities.default_surface` >
+`Spec.surface`。没有显式模型 surface 时，仅在 adapter 仍为 `Default`（未知）时回退到 Spec；
+Spec 不能覆盖 adapter 已解析的结果，全部仍为 `Default` 时保持未知、不猜测。
+没有模型覆盖时，compatible fixed profile 忽略冲突的 Spec：`xai` 即使设置
+`Spec.surface = Chat` 仍走 Responses；`openrouter` 即使设置 `Spec.surface = Responses`
+仍走 Chat。OpenAI 在 model 与 Spec 都为 `Default` 时仍解析为 Responses。`Provider` trait 仍只有三个方法，
+复用已有能力声明，不新增用户配置。解析后的选项
+显式设置 `reasoningReplay: "encrypted"` 时也采用同一保留策略。即使工具缺失、被权限隐藏、
+被 hook 删除或 schema 发生结构性变化，历史调用及结果仍保留原始内容、call id、arguments
+字符串、顺序和边界，既不转成惰性文本，也不按 `AuthoritativeState` 删除。Responses 的这条
+规则在 `reasoningReplay` 为 `off` 时同样生效，但不会因此开启封装推理重放。
+
+保留历史不会扩张当前请求的工具清单、恢复缺失实现或授予执行权限。新调用仍通过当前锁定的
+工具快照、schema 校验、权限规则与风险门禁；回放已有调用及结果不会再次派发工具。这一边界
+参考 Codex `9ba1d9eb5bbbd87ba2fc528d91ad239eea975ee9`：
+`core/src/client_common.rs:19/56` 分离 `input` 与 `tools`，
+`protocol/src/models.rs:1034/1068` 保留封装推理和原始 arguments，
+`core/src/client.rs:315/1335` 校验增量请求一致性。这些是设计依据，不代表已完成 provider 验收。
+
+不属于上述保留策略的普通请求继续使用现有声明 fallback：只对更早 turn 的保留历史与当前
+hook 后的工具定义对账；当前 turn 刚产生的调用始终保留原生配对，以便未知或被拒绝的调用
+仍能收到协议完整的 tool result。对更早历史，声明一致时保留原生 tool-use/result 协议。
+新的 replay hash 只在 schema 与子 schema 位置移除 description、
 title、examples、comment、default 等纯注解键，保留 required、type、enum 与其他取值约束。
 参数名、定义名，以及 const、enum 或未知扩展值中的对象均保持原样，即使它们的键也叫
 description、title 或其他注解名称。没有 replay hash 的旧记录
@@ -267,24 +288,30 @@ description、title 或其他注解名称。没有 replay hash 的旧记录
 重放而把当前不可执行的旧工具重新宣传成可调用能力。旧版本没有 identity 的记录会先按
 assistant message 从不可变 provider-request Attempt 中恢复确切 hash；若这份证据也不存在，
 即使当前存在同名工具也会降级，而不会把旧调用静默绑定到新 schema。无工具的内部压缩请求
-采用更严格的同一原则：工具调用和结果以有界的惰性 JSON 文本进入摘要模型，绝不会在没有
-声明的情况下继续使用原生函数协议。
+使用独立于普通 Agent 回放的工具无关投影：工具调用和结果以有界的惰性 JSON 文本进入摘要
+模型，绝不会在没有声明的情况下继续使用原生函数协议，也不携带封装推理。
 降级到不认识新增 `replaySchemaSha256` 字段的旧 Zuno 时，会失败关闭为惰性历史；
 持久调用本身不会损坏或被改写。
 
-Goal、Plan 与 Todo 状态工具使用 `AuthoritativeState` 历史策略。旧声明不兼容时，历史调用与
-结果会被省略，不转成模型可见的惰性说明；当前状态由每次请求同源生成的 `runtime.work_state`
-提供。通用工具继续采用精确声明 fallback。历史修复 notice 使用 Diagnostic audience，按会话、
+在声明 fallback 路径中，Goal、Plan 与 Todo 状态工具使用 `AuthoritativeState` 历史策略。
+旧声明不兼容时，历史调用与结果会被省略，不转成模型可见的惰性说明；这种省略不适用于普通
+Responses 请求或显式启用加密重放的请求。当前状态仍由每次请求同源生成的 `runtime.work_state`
+提供，保留旧状态工具的结果既不覆盖当前状态，也不会恢复 Goal。上述保留策略之外的通用工具
+继续采用精确声明 fallback。历史修复 notice 使用 Diagnostic audience，按会话、
 context epoch、工具及新旧 identity 去重，只写结构化日志，不进入 ACP thought、TUI 对话或
 HTTP 事件历史。
 
 `prepare_request` hook 仍然只能缩小已锁定的工具集合；新增、替换或重复 schema 会在发送前
-失败。若 hook 删除的是保留历史仍需的声明，引擎采用上面的角色感知降级，而不是以 hook
-错误终止回合。当前 turn 刚产生的调用不参与这项历史修复。历史
-`ToolUse`/`ToolResult` 块另有一份按出现次序与 role 锁定的快照：hook 仍可修改普通文本，
-但不能新增、删除、替换、复制、重排、拆分、在原生调用与结果之间插入另一条消息，或改变
-工具协议历史的 role。持久 identity 失败与 hook 后声明删除会先合并，再执行一次按 occurrence
-排序的 fallback 投影，因此混合并行批次仍保持持久结果顺序。
+失败。engine 工具 dispatch 使用同一份 hook 后已收窄的快照，不回到更宽的 hook 前 registry。
+若 hook 删除的是保留历史仍引用的声明，普通 Responses 请求和显式加密重放请求保留
+历史调用及结果；其他协议继续使用上述角色感知 fallback，不把声明删除本身当作 hook 错误。
+当前 turn 刚产生的调用不参与这项历史修复。历史 `ToolUse`/`ToolResult` 块另有一份按出现次序
+与 role 锁定的快照：hook 不能新增、删除、替换、复制、重排、拆分、在原生调用与结果之间
+插入另一条消息，或改变工具协议历史的 role。独立的 sealed-history guard 还保护封装推理绑定的
+assistant 内容、项顺序与输入边界，复用共享 Responses 最大 assistant 组边界；同组相邻的
+未密封 assistant 内容也受保护，受保护组外的未密封普通文本仍允许原先的 hook 行为。
+在适用声明 fallback 的路径中，持久 identity 失败与 hook 后声明删除
+会先合并，再执行一次按 occurrence 排序的投影，因此混合并行批次仍保持持久结果顺序。
 
 仓库与用户的规则文件要么整份进入 Prompt，要么不进入。宿主无法读取的本地规则文件仍会在第一
 次 provider 请求前以类型化错误停止本轮，并点名文件与修复方式。一个内容完整但超出指令预算
@@ -314,6 +341,29 @@ CLI 启动。无法抓取的远程规则来源使用同一类非致命 notice，
 默认值是 `off`：请求既不带 `include`，也不带任何封装项，包括同一会话在选项为 `encrypted` 时存下的信封。它并不表示请求字节与既有版本一致：下面的顺序修正对所有 Responses provider 生效，与该选项无关，因此先写文本再调用工具的一轮现在会先发文本项。每个重放的工具调用也会带上 provider 自己的 `arguments` 字节而不是重新序列化的结果，因为端点对它发出的那个字符串做指纹；而某个步骤的封装项后面没有任何输出时，这一项会被扣留而不是单独发出，并计入被扣留数而不算作一次重放。
 
 封装信封属于持久状态，因此一个步骤会被持久化成带位置的 part 账本，而不是一段文本加上尾部堆积的工具调用。每个 part id 携带它在流中的位置 `prt_{turn}_{step}_{position}_{kind}`，且同一步骤的所有 part 共享 assistant 消息的创建时间，于是水合出来的顺序就是 provider 的产出顺序。一个先推理、写文本、调用工具、再推理、再调用第二个工具的步骤，会按同样的次序重放，每个信封都紧挨在它所解释的输出之前。这正是封装端点会校验的内容：顺序被打乱或只回送摘要都会在链路上被拒绝。
+
+独立的 sealed-history guard 复用共享 Responses 最大 assistant 组边界，在请求 hook 前后
+保护绑定输出、项顺序与输入边界，阻止通过插入或改写同组相邻未密封 assistant 内容绕过保护；
+受保护组外的未密封普通文本仍允许原先的 hook 行为。不能因工具不可用而改写绑定输出、
+删除旧状态调用或移动边界并继续携带旧信封。符合重放条件的密封请求组装后，guard 还锁定
+hook 前后的模型与 surface，并在 dispatch 前拒绝请求参数中的 `input`、`messages` 或 `model`
+覆盖。该保护不新增用户配置或数据库迁移，不改写原始持久历史；provider/model、年龄、
+`off` 与歧义组 withholding 策略保持不变。
+
+若 `text_complete` 改写刚完成的 provider-sealed 输出，Zuno 会恢复原始文本并返回 Hook 错误；
+失配文本不会持久化，该错误也不会自动重试。sealed-history guard 仅使用哈希快照保护历史，
+不会打印 capsule 内容。
+
+Kiro 返回的 `400 reasoning_replay_context_mismatch` 等端点拒绝不会因此变成可重试错误。
+本策略不新增 400 盲重试，不全局删除 reasoning，也不放宽 provider 对账户、会话、模型和
+输出的绑定校验。Kiro Provider v3.1.1 保留这些校验；现有有效的 Zuno Responses 配置无需
+新增设置。实际运行验收与既有失败输入的恢复结果仍需分别核验。
+
+Kiro v3.1.1 会对本轮清单未声明的历史调用返回 `missing_tool_declaration`。
+此场景需使用 Kiro v3.1.2 的历史工具作用域修复，将历史校验与当前工具授权分离，
+无需新增 Zuno 设置。缺少可证明原始别名绑定的旧 namespace/custom 历史仍返回
+`missing_historical_tool_binding`，双方都不会猜测该身份。不要重新公开已禁用工具或
+删除密封推理来绕过校验；真实失败会话仍需在实际端点上完成恢复验收。
 
 自动 Goal continuation 即使没有新的用户消息，也属于一个新的 provider turn。Zuno 会在该 turn 的第一条 assistant 行上只保存 prompt receipt 引用，而不是再复制一份提示词；当两个 assistant 响应在 Responses `input` 中本来会直接相邻时，引擎会把 receipt 中 hook 后实际发送的 developer 项解析成后一个请求消息上的结构化 `ResponsesInputBoundary` sidecar。OpenAI、OpenAI-compatible 与 Bedrock Mantle/Runtime 共用同一 Responses cursor，把这些标准输入项投影到两个 assistant 输出之间，再重放后一轮的推理信封。通用 `Message` 内容、Chat Completions、Anthropic Messages 与 Bedrock Converse 不携带该 sidecar；空边界的序列化与普通消息完全一致。旧版本写入的行会沿持久化的 `assistantMessageID -> promptReceiptID -> actualProviderProjection.developer` 证据链恢复同一 receipt；只有没有 hook 改写时才回退到 `providerProjection`。恢复时会剥离稳定的 runtime policy 前缀，因此历史边界只包含原始 turn context、memory 与 request hook context。这个过程不会伪造 user 消息或工具结果。
 

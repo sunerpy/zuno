@@ -689,3 +689,16 @@ five-role fixture passed SIGTERM drain, as did workspace check/Clippy and all
 104 documentation/release contracts. The original CI exit did not record its
 role or status, so attribution to the reproduced claim race remains an inference;
 the next exact-head CI run must pass before merging.
+
+## Main synchronization after the v0.10.37 baseline
+
+Main commit `0f069d1e6d24581ad941ab6bf681141480084330` landed while the baseline
+synchronization was under CI. A separate follow-up worktree incorporates sealed
+Responses history, post-hook tool authority and provider replay fixes into the
+existing bounded engine loop. Provider-sealed history cannot be rewritten by a
+hook; preserving an old call does not authorize executing that tool now.
+The stable release baseline remains v0.10.37. Local follow-up validation passed
+357 engine/dispatch/protocol tests, 460 LLM/provider tests, 104 documentation and
+release contracts, and workspace check/Clippy. Native process and exact-artifact
+validation plus preview CI are still required. App/UI stays paused and publication
+remains disabled.

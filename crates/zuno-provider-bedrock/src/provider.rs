@@ -606,6 +606,7 @@ impl Provider for BedrockProvider {
             prompt_cache: true,
             attachments: true,
             sampling_params: true,
+            default_surface: ApiSurface::Default,
         }
     }
 

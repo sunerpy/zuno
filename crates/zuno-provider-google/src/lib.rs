@@ -482,6 +482,7 @@ fn gemini_capabilities() -> Capabilities {
         prompt_cache: false,
         attachments: true,
         sampling_params: true,
+        default_surface: ApiSurface::Default,
     }
 }
 
@@ -1338,6 +1339,7 @@ impl Provider for VertexAnthropic {
             prompt_cache: true,
             attachments: true,
             sampling_params: true,
+            default_surface: ApiSurface::Default,
         }
     }
 
