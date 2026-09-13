@@ -670,3 +670,11 @@ in [ADK-REFERENCE.md](ADK-REFERENCE.md) and [ADK-REFERENCE.zh.md](ADK-REFERENCE.
 These are source-review conclusions, not ADK runtime validation. Shared service
 conformance, versioned Skill resources/artifacts and operational recovery remain
 implementation work. App/UI is paused; publication remains disabled.
+
+The first synchronization CI run found an arm64 stack overflow in the monolithic
+PostgreSQL test future. Independent kernel/wait/approval/learning fixtures now use
+boxed boundaries; learning suites no longer retain an unrelated runtime case's
+poll frame. Non-inlined entries keep future construction out of the outer
+coordinator frame. This changes test execution only; production
+behavior, schemas and public documentation contracts are unchanged. Native
+arm64 confirmation is required before merging the synchronization PR.

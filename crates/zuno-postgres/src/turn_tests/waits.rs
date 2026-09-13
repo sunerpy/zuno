@@ -80,7 +80,7 @@ pub(super) async fn advance(
     let interrupt = InterruptSignal::new();
     let (sender, mut receiver) = event_channel();
     let (outcome, _) = tokio::join!(
-        advance_turn(
+        Box::pin(advance_turn(
             request,
             TurnContext::from_persistence(
                 Arc::new(state),
@@ -91,7 +91,7 @@ pub(super) async fn advance(
             )
             .with_principal_scope(claimed.job.principal.clone()),
             sender
-        ),
+        )),
         async { while receiver.recv().await.is_some() {} },
     );
     outcome

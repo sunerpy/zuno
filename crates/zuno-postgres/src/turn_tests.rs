@@ -111,9 +111,20 @@ fn usage() -> StreamEvent {
     }
 }
 
-pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator: &PgPool) {
-    waits::exercise(backend, admin, migrator).await;
-    approval_wait::exercise(backend, admin, migrator).await;
+#[inline(never)]
+pub(crate) fn exercise<'a>(
+    backend: &'a PostgresBackend,
+    admin: &'a PgPool,
+    migrator: &'a PgPool,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
+    Box::pin(exercise_contracts(backend, admin, migrator))
+}
+
+async fn exercise_contracts(backend: &PostgresBackend, admin: &PgPool, migrator: &PgPool) {
+    // Keep independent contract state off the nested test executor's stack.
+    // Each branch includes the complete resumable engine and provider fixture.
+    Box::pin(waits::exercise(backend, admin, migrator)).await;
+    Box::pin(approval_wait::exercise(backend, admin, migrator)).await;
     let actor = PrincipalScope::new(
         TenantId::new("turn-contract").unwrap(),
         PrincipalId::new("alice").unwrap(),
@@ -316,7 +327,7 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
     let interrupt = InterruptSignal::new();
     let (sender, mut receiver) = event_channel();
     let (outcome, _) = tokio::join!(
-        advance_turn(
+        Box::pin(advance_turn(
             request(),
             TurnContext::from_persistence(
                 Arc::new(state.clone()),
@@ -327,7 +338,7 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
             )
             .with_principal_scope(actor.clone()),
             sender
-        ),
+        )),
         async { while receiver.recv().await.is_some() {} },
     );
     assert!(
@@ -400,7 +411,7 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
         .unwrap();
     let (sender, mut receiver) = event_channel();
     let (outcome, _) = tokio::join!(
-        advance_turn(
+        Box::pin(advance_turn(
             request().resume(reference),
             TurnContext::from_persistence(
                 Arc::new(next.clone()),
@@ -411,7 +422,7 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
             )
             .with_principal_scope(actor.clone()),
             sender
-        ),
+        )),
         async { while receiver.recv().await.is_some() {} },
     );
     assert!(
@@ -617,7 +628,7 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
     .unwrap();
     let (sender, mut receiver) = event_channel();
     let (failed, _) = tokio::join!(
-        advance_turn(
+        Box::pin(advance_turn(
             failed_request.clone(),
             TurnContext::from_persistence(
                 Arc::new(failed_state.clone()),
@@ -628,7 +639,7 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
             )
             .with_principal_scope(actor.clone()),
             sender
-        ),
+        )),
         async { while receiver.recv().await.is_some() {} },
     );
     assert!(failed.is_err());
