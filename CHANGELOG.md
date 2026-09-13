@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.37](https://github.com/sunerpy/zuno/compare/v0.10.36...v0.10.37) (2026-09-13)
+
+
+### Bug Fixes
+
+* **runtime:** 修复回合恢复边界与问答交付一致性 ([#236](https://github.com/sunerpy/zuno/issues/236)) ([9c47fd2](https://github.com/sunerpy/zuno/commit/9c47fd2e4930748384ccf2dbe04afcac3388d028))
+
 ## [0.10.36](https://github.com/sunerpy/zuno/compare/v0.10.35...v0.10.36) (2026-09-12)
 
 
