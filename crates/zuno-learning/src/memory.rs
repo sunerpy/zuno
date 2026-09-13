@@ -26,7 +26,7 @@ pub struct MemoryJobInput {
     pub project_revision: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConsolidationRequest {
     pub project_id: String,
     pub session_id: String,

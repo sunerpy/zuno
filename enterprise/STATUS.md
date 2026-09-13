@@ -6,7 +6,7 @@ Original baseline: `v0.10.29`, `d1212860dba6a6b420ce81d444ace58feaf0adb5`.
 | --- | --- | --- |
 | P0 | Complete | PR #176 merged into preview; native CI run 34553054820 succeeded |
 | P1 | In progress | Principal propagation implemented; ownership migration validated; local bounded driver and scoped session application validated; local runtime Job/lease port validated; Memory persistence/authority ports validated; backend assembly remains |
-| P2 | In progress | PostgreSQL, generic OAuth2/OIDC, BFF, scoped private Memory, organization policy and HITL integrated; shared/automatic Memory and full fault acceptance remain |
+| P2 | In progress | PostgreSQL, generic OAuth2/OIDC, BFF, scoped private Memory with separately authorized automatic extraction/maintenance, organization policy and HITL integrated locally; shared Memory and full operational acceptance remain |
 | P3 | In progress | Independent control/two-gateway/two-Worker executable loop validated locally; full fault/operational acceptance remains |
 | P4 | In progress | Child dispatch, persistent waits, workspace forks/import/transfer, cancellation, Workflow, Council and approved merge implemented; resumed baselines and operational acceptance remain |
 | P5 | Backend adapters in progress; UI paused | Public enums, transactional history/frames, live progress and generated SDK implemented; full ACP/TUI adapters remain. App design must use Penpot before UI implementation resumes |
@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p4-workspace-transfer`.
+- Current phase branch: `codex/enterprise-p2-memory-producers`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -476,3 +476,27 @@ Workflow PR #218 initially exposed an arm64 stack overflow in the PostgreSQL con
 - Local validation covers the real control plane, two gateway processes/ledgers and two Workers, 42 fixture model requests, remote child/Workflow/Council workspaces, approved return merge/content review and drain. Provider faults cover truncation, cancellation, corrupt/repeated bytes, changed source contents and restart after publication. PostgreSQL covers authenticated source facts, conflicting receipts, expired leases, legacy re-admission and atomic migration; five HTTPS cases pass.
 - Documentation impact: English/Chinese architecture, configuration, workspace, gateway, workflow, child and PostgreSQL guides are updated. The 21 SDK tests and generated-schema drift checks pass, as do 16 archive/publication contracts. Preview artifact proof now requires all five actual process images and workspace-transfer evidence.
 - Current-commit Linux amd64/arm64 CI is still required before preview integration. Unproven resumed baselines, remote artifact retention, Memory producers, ACP/TUI, quotas, backup/rolling upgrade and remaining P6 acceptance remain open. UI files stay unchanged and excluded; App design/delivery awaits Penpot. No preview version/tag or Release is enabled.
+
+## Learning model journal and usage foundation
+
+- PR #228's amd64 Docker run exposed an existing Council fixture assumption: concurrent non-blocking claims may temporarily return no candidate during coordination. The isolated fix keeps both claimers competing, bounds polling to one second and captures persistent Job/session state on failure. Exact-tree PostgreSQL/HTTPS and shared gates passed before commit `516923c6` updated the preview PR; current-head CI remains required.
+- `LearningModelClient` now uses the async `LearningModelJournal` port. Typed request/outcome records have a real SQLite adapter and updated local consumers. A refused or stalled request journal prevents provider contact. An unrecorded outcome cannot become successful extraction or trigger immediate replay; combined journal/provider failures retain typed recovery and the longer retry deadline.
+- Learning outcomes record disjoint input/cache/output buckets, optional reasoning detail, total tokens and provider attempts. Partial usage reports combine without charging cache twice. Provider rollback clears text but retains observed usage; missing/incomplete/non-terminal usage stays explicitly unaccounted. Timeout and failed stream receipts retain available usage.
+- Learning/Memory suites passed 215 tests, native wire tests passed 3, and CLI learning tests passed 9. The regression first failed against the original implementation because the outcome had no usage. English/Chinese user and architecture guides document the journal boundary and accounting; public UI files remain deferred and unchanged.
+- This completes the shared local journal interface/provider/consumer. Enterprise automatic extraction still needs configured models, separate consent, scoped scheduling/leases, remote journal and atomic budget/Memory settlement. These producers and APIs remain unregistered; the full backend plan remains active.
+
+## Private automatic Memory runtime
+
+- `automaticPrivate` is a separately approved, revisioned choice; foreground generation does not enable it. Existing rows migrate with automation disabled. Consent captures the approving principal and activation watermark; source selection rechecks that watermark inside the owner transaction. Revocation stops queued/running learning work and preserves unknown reservations.
+- Exact completion-model references in `Definition.memoryLearning` configure extraction and maintenance. The data owner freezes bounded, redacted completed-root input/command evidence. Extraction stores source-checked experiences and hints; a separate maintenance Job uses the shared Memory service and atomic candidate/evidence/revision/Job/watermark settlement.
+- Learning uses the ordinary Worker slot bound with foreground claims first, independent model/renewal polling and bounded drain. Separate signed learning grants cannot execute normal Jobs or tools. Internal claim/renew/journal/complete/stop handlers are mounted only with installed learning profiles. The control plane performs no model request.
+- Model requests reserve tokens before provider contact. Epochs, total deadlines, retry deadlines and charges survive takeover. Repeated outcomes settle once; truthful late receipts can resolve a reservation after revocation but cannot write Memory. Checksum-validated cached output can be finalized without new model budget, including after request/attempt ceilings.
+- PostgreSQL format 20 has an exact format-19 fixture and atomic rollback/preservation checks. The native five-process fixture passes with 46 model requests: explicit opt-in, separate extraction and maintenance, private recall, cross-user isolation, opt-out and drain. PostgreSQL tests also cover concurrent claims, duplicate/changed receipts, typed retry delays, stale workers, lost-worker reservations and cached-result recovery. Final native lease-boundary verification passed locally.
+- Current deployment supports private Memory. Organization-shared writes, richer learning management/projections, broader source selection, full fairness/retention/backup/upgrade acceptance and the remaining backend plan are still open. UI remains paused for Penpot. No preview tag or Release is enabled. PR #228's latest head still awaits a hosted runner.
+
+## Private learning CI follow-up
+
+- PR #228 passed all 21 checks in run `34723150742` and merged only into preview at `bbaf1b709dc66251028422826bcdda1d2213fd9b`.
+- PR #229's ancestry synchronization retained the validated source tree. Run `34729620253` passed enterprise Linux amd64/arm64 and all other independent gates, but a personal Windows fixture failed: its shared-memory SQL polling opened a connection during asynchronous journal writing (`SQLITE_LOCKED`).
+- The fixture now waits for a notification emitted after settlement, stops the owned supervisor, and verifies exactly one durable completion and model request. Runtime scheduling and timeouts remain unchanged. All 25 learning runtime tests pass locally; exact-head Windows CI remains required.
+- Documentation impact: this is test synchronization only, with no user-facing behavior or configuration change. UI work remains paused and excluded.

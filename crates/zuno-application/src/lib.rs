@@ -11,6 +11,7 @@ pub mod child;
 pub mod control;
 pub mod council;
 pub mod environment;
+pub mod learning;
 pub mod live;
 pub mod runtime;
 pub mod workflow;

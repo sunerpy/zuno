@@ -28,7 +28,7 @@ pub(super) async fn upgrade(fixture: &Fixture, admin: &PgPool) {
             'jobs',(SELECT jsonb_agg(to_jsonb(j)-'deadline_at') FROM zuno_enterprise_preview.runtime_job j),
             'slots',(SELECT jsonb_agg(to_jsonb(s)) FROM zuno_enterprise_preview.runtime_session s),
             'memory',(SELECT jsonb_agg(to_jsonb(m)) FROM zuno_enterprise_preview.memory_document m),
-            'policy',(SELECT jsonb_agg(to_jsonb(p)) FROM zuno_enterprise_preview.memory_policy p)
+            'policy',(SELECT jsonb_agg(to_jsonb(p)-'automatic_private'-'automation_actor'-'automation_since') FROM zuno_enterprise_preview.memory_policy p)
         )",
         )
         .fetch_one(pool)

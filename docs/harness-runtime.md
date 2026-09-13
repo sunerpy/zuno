@@ -1455,6 +1455,17 @@ including sampling support and output limits. Diagnostic records retain bounded,
 redacted provider response details, HTTP status and request identity. A historical
 400 is a diagnostic task, not authorization to retry unchanged input or select
 another model blindly.
+Learning model I/O uses `LearningModelJournal`, with typed request and outcome
+records. The SQLite adapter preserves the existing session-event vocabulary and
+performs database work off the async reactor. The model runner awaits request
+admission within its execution deadline; outcome receipt I/O is separately bounded
+to at most 30 seconds. Journal failure cannot become successful extraction or
+trigger an inline replay. Combined provider/journal failure preserves typed
+recovery and the longer retry deadline.
+Learning outcome usage retains partial reports and discarded provider-attempt
+costs, normalizes cache buckets once, keeps reasoning inside output and marks
+incomplete reports as unaccounted. The port permits a data-owner state adapter;
+it does not register an automatic enterprise producer.
 There is no quota-percentage, daily-token, or currency budget; eligibility,
 idempotency, the wake cap, the three-attempt ceiling, and `learning.execution`
 input/output/step and total-time limits bound background work.
@@ -3025,3 +3036,13 @@ a lease or replay an external command. Separate bounded export/import pools
 avoid reciprocal transfer deadlocks. PostgreSQL format 19 and gateway protocol 5
 carry this private contract; public activity and Worker checkpoint schemas stay
 unchanged. See the preview workspace and gateway guides.
+
+Enterprise private learning now composes an explicit automation consent, fixed
+completion model profiles, a scoped PostgreSQL scheduler and a Worker auxiliary
+consumer. Closed source Jobs become bounded extraction requests; separate
+maintenance leases settle Memory through the shared service. The model journal
+reserves budget before provider contact and records normalized usage afterwards.
+Valid cached outcomes can be consumed after takeover without another model call;
+consent revocation fences queued/running work while retaining truthful late facts.
+Learning cannot gain foreground or gateway authority. See the preview Memory,
+Worker and deployment guides; App/UI work remains deferred to Penpot.

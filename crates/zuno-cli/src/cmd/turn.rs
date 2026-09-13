@@ -3825,9 +3825,13 @@ impl TurnHost {
                                             .max_output_tokens,
                                         ..learning_settings.clone()
                                     },
-                                    events: zuno_db::event_log::SessionEventLog::new(Arc::clone(
-                                        &database,
-                                    )),
+                                    journal: Arc::new(
+                                        zuno_learning::SqliteLearningModelJournal::new(
+                                            zuno_db::event_log::SessionEventLog::new(Arc::clone(
+                                                &database,
+                                            )),
+                                        ),
+                                    ),
                                 });
                                 let evaluator: Arc<dyn OfflineCaseEvaluator> =
                                     Arc::new(ProviderSkillEvaluator {

@@ -80,6 +80,35 @@ pub(super) async fn exercise(
         session: &session,
     };
     assert!(
+        matches!(
+            fixture
+                .consolidate(
+                    "unapproved-automation",
+                    vec![references[0].clone()],
+                    "run cargo test",
+                    true,
+                )
+                .await,
+            Err(Error::Denied)
+        ),
+        "foreground generation consent must not authorize independent maintenance"
+    );
+    let MemoryReply::Policy { policy } = service
+        .request(request(
+            "authorize-automation",
+            MemoryCommand::SetAutomation {
+                session_id: None,
+                expected_revision: 1,
+                enabled: true,
+            },
+        ))
+        .await
+        .unwrap()
+    else {
+        panic!("automation policy");
+    };
+    assert!(policy.generate_private && policy.automatic_private);
+    assert!(
         fixture
             .consolidate(
                 "expired-batch",
@@ -225,6 +254,7 @@ impl BatchFixture<'_> {
             principal: (*actor).clone(),
             workspace: (*workspace).clone(),
             lease: None,
+            automation_session: None,
             limits: ScopeLimits::default(),
             project_key: project.path.clone(),
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(10),

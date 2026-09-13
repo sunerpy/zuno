@@ -7,7 +7,9 @@
 mod candidates;
 mod documents;
 mod evidence;
+mod learning;
 mod maintenance;
+pub use learning::PostgresLearningRuntime;
 mod persistence;
 mod policy;
 #[cfg(test)]
@@ -134,6 +136,7 @@ struct TransactionMemory {
     principal: PrincipalScope,
     workspace: WorkspaceId,
     lease: Option<ExecutionLease>,
+    automation_session: Option<SessionId>,
     limits: ScopeLimits,
     project_key: String,
     deadline: tokio::time::Instant,
@@ -218,6 +221,7 @@ impl MemoryDataService for PostgresMemoryService {
             project_key: format!("project:{}", workspace.as_str()),
             workspace,
             lease,
+            automation_session: None,
             limits: self.backend.limits,
             deadline: tokio::time::Instant::now() + self.backend.transaction_timeout,
         });
@@ -276,7 +280,7 @@ impl TransactionMemory {
     }
 
     fn host_only(&self) -> Result<(), Error> {
-        if self.lease.is_some() {
+        if self.lease.is_some() || self.automation_session.is_some() {
             Err(Error::Denied)
         } else {
             Ok(())
@@ -307,7 +311,9 @@ impl TransactionMemory {
             MemoryDocumentKey::new("global")?,
             MemoryDocumentKey::new(&self.project_key)?,
             self.limits,
-            if self.lease.is_some() {
+            if self.automation_session.is_some() {
+                PromotionPolicy::HighConfidence { threshold: 8500 }
+            } else if self.lease.is_some() {
                 PromotionPolicy::Automatic
             } else {
                 PromotionPolicy::Review
@@ -575,6 +581,25 @@ impl TransactionMemory {
                     })
                 });
             }
+            MemoryCommand::SetAutomation {
+                session_id,
+                expected_revision,
+                enabled,
+            } => {
+                self.review_action()?;
+                return self.execute(async |tx| {
+                    Ok(MemoryReply::Policy {
+                        policy: self
+                            .set_automation(
+                                tx,
+                                session_id.as_ref().map(SessionId::as_str),
+                                expected_revision,
+                                enabled,
+                            )
+                            .await?,
+                    })
+                });
+            }
             MemoryCommand::Forget { evidence_ids } => {
                 self.host_only()?;
                 if evidence_ids.is_empty() || evidence_ids.len() > 128 {
@@ -628,6 +653,13 @@ impl TransactionMemory {
 
 impl MemoryAuthority for TransactionMemory {
     fn authorize(&self, _scope: MemoryScope, access: MemoryAccess) -> Result<(), Error> {
+        if let Some(session) = &self.automation_session {
+            if !matches!(access, MemoryAccess::Read | MemoryAccess::Maintain) {
+                return Err(Error::Denied);
+            }
+            return self
+                .execute(async |tx| self.require_automation(tx, Some(session.as_str())).await);
+        }
         if access == MemoryAccess::Import {
             return Err(Error::Denied);
         }

@@ -6,6 +6,7 @@
 //! always pass explicit review, offline evaluation, and source-digest CAS.
 
 mod consolidation;
+pub mod distributed;
 mod evaluator;
 mod execution;
 mod experience;
@@ -13,6 +14,7 @@ mod extraction;
 mod feedback;
 mod history;
 mod ingestion;
+mod journal;
 mod memory;
 mod model;
 mod pattern;
@@ -22,6 +24,7 @@ mod scheduler;
 mod skill;
 mod supervisor;
 mod text;
+mod usage;
 mod worker;
 
 pub use crate::consolidation::{
@@ -43,6 +46,10 @@ pub use crate::extraction::{
 pub use crate::feedback::FeedbackService;
 pub use crate::history::{LearningHistoryAction, LearningHistoryItem, LearningHistoryRepair};
 pub use crate::ingestion::LearningIngestion;
+pub use crate::journal::{
+    LearningModelEvent, LearningModelIdentity, LearningModelJournal, LearningModelOutcome,
+    LearningModelRecord, LearningToolCall, SqliteLearningModelJournal,
+};
 pub use crate::memory::{
     MemoryConsolidation, MemoryConsolidationRequest, MemoryConsolidationUpdate, MemoryConsolidator,
     MemoryJobInput, MemoryMaintainer,
@@ -57,6 +64,7 @@ pub use crate::skill::{
     SkillTarget,
 };
 pub use crate::supervisor::{LearningSupervisor, LearningWork};
+pub use crate::usage::LearningUsage;
 pub use crate::worker::ProjectLearningService;
 pub use zuno_eval::EvaluationService;
 
@@ -66,6 +74,17 @@ use zuno_memory::MemoryServiceError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LearningServiceError {
+    #[error("learning model journal failed: {source}")]
+    Journal {
+        #[source]
+        source: BoxSource,
+    },
+    #[error("learning outcome journal failed: {journal}")]
+    OutcomeJournal {
+        #[source]
+        journal: Box<LearningServiceError>,
+        provider: Option<Box<LearningServiceError>>,
+    },
     #[error(transparent)]
     Database(#[from] DbError),
     #[error(transparent)]
@@ -93,6 +112,17 @@ impl LearningServiceError {
     #[must_use]
     pub fn diagnostic(&self) -> String {
         match self {
+            Self::OutcomeJournal { journal, provider } => ProviderError::sanitize_diagnostic(
+                &format!(
+                    "learning outcome journal failed: {}; provider: {}",
+                    journal.diagnostic(),
+                    provider.as_deref().map_or_else(
+                        || "response received".to_owned(),
+                        LearningServiceError::diagnostic,
+                    ),
+                ),
+                &[],
+            ),
             Self::ExtractorProvider { version, source } => ProviderError::sanitize_diagnostic(
                 &format!(
                     "learning extractor `{version}` provider failed: {}",
@@ -119,6 +149,24 @@ impl LearningServiceError {
 impl Recoverable for LearningServiceError {
     fn recovery(&self) -> Recovery {
         match self {
+            Self::OutcomeJournal { journal, provider } => {
+                let journal = journal.recovery();
+                let Recovery::Retry {
+                    after: journal_after,
+                } = journal
+                else {
+                    return journal;
+                };
+                match provider.as_deref().map(LearningServiceError::recovery) {
+                    Some(Recovery::Retry { after }) => Recovery::Retry {
+                        after: after.max(journal_after),
+                    },
+                    Some(other) => other,
+                    None => Recovery::Retry {
+                        after: journal_after,
+                    },
+                }
+            }
             Self::Database(error) => Recoverable::recovery(error),
             Self::Learning(error) => Recoverable::recovery(error),
             Self::Memory(MemoryServiceError::Database(error)) => Recoverable::recovery(error),
@@ -136,9 +184,9 @@ impl Recoverable for LearningServiceError {
                 EvaluationError::InvalidSnapshot | EvaluationError::EmptySuite { .. },
             ) => Recovery::Fail,
             Self::ExtractorProvider { source, .. } => Recoverable::recovery(source),
-            Self::Evaluation(EvaluationError::Evaluator { .. }) | Self::Extractor { .. } => {
-                Recovery::Retry { after: None }
-            }
+            Self::Evaluation(EvaluationError::Evaluator { .. })
+            | Self::Extractor { .. }
+            | Self::Journal { .. } => Recovery::Retry { after: None },
         }
     }
 }

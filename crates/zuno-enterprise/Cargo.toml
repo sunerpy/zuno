@@ -36,6 +36,7 @@ zuno-engine = { workspace = true }
 zuno-error = { workspace = true }
 zuno-identity = { workspace = true }
 zuno-llm = { workspace = true }
+zuno-learning = { workspace = true }
 zuno-memory = { workspace = true }
 zuno-network = { workspace = true }
 zuno-observability = { workspace = true }
@@ -59,6 +60,7 @@ rusqlite = { workspace = true }
 aws-lc-rs = { workspace = true }
 base64 = { workspace = true }
 sqlx-core = { workspace = true }
+sqlx-postgres = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

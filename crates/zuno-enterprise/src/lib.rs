@@ -6,6 +6,7 @@ pub mod config;
 mod councils;
 mod http;
 mod identity;
+pub mod learning;
 pub use http::serve as serve_tls;
 pub mod profile;
 pub mod service;

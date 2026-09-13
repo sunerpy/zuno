@@ -86,3 +86,19 @@ chain. Remote cancellation and remaining P3–P6 acceptance are still required.
 Preview publication remains disabled.
 
 See [中文](WORKERS.zh.md), [state service](POSTGRES.md) and [status](STATUS.md).
+
+## Background learning capacity
+
+A Worker with configured `memoryLearning` bindings installs `LearningWorker` as
+an auxiliary consumer in `WorkerRuntime`. Ordinary Job claims run first; learning
+shares the same slot bound and shutdown drain instead of launching an unbounded
+parallel service. The learning model and heartbeat are polled independently.
+Renewal cannot extend the original Job deadline, and local grant expiry stops
+model work. The remote journal rechecks its current grant after request admission.
+
+Internal learning protocol 1 uses `/internal/worker/v1/learning/claim`, `renew`,
+`journal`, `complete` and `stop`, with a separate `x-zuno-learning-grant`. Learning
+grants cannot be exchanged for foreground or gateway authority. Receipt-only
+verification can retain a truthful late outcome but cannot launch a request or
+apply Memory. No database credential, tool dispatcher or local Memory file is
+provided to the isolated model helper.

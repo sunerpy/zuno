@@ -112,6 +112,18 @@ pub struct WorkerRuntime {
     observer: Arc<dyn WorkerObserver>,
     settings: WorkerSettings,
     configurations: Vec<ConfigurationRef>,
+    auxiliary: Option<Arc<dyn WorkerAuxiliary>>,
+}
+
+pub type AuxiliaryTask =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), WorkerError>> + Send>>;
+#[async_trait]
+pub trait WorkerAuxiliary: Send + Sync {
+    async fn claim(
+        &self,
+        worker: WorkerInstanceId,
+        renew: Duration,
+    ) -> Result<Option<AuxiliaryTask>, WorkerError>;
 }
 
 impl WorkerRuntime {
@@ -132,7 +144,12 @@ impl WorkerRuntime {
             observer,
             settings,
             configurations,
+            auxiliary: None,
         })
+    }
+    pub fn with_auxiliary(mut self, worker: Arc<dyn WorkerAuxiliary>) -> Self {
+        self.auxiliary = Some(worker);
+        self
     }
 
     /// Draining stops new claims and lets already claimed bounded advances finish.
@@ -167,7 +184,23 @@ impl WorkerRuntime {
                                 observer.settled(&id,&result);
                             });
                         }
-                        Ok(None) | Err(TurnStateError::Unavailable) => {}
+                        Ok(None) => {
+                            if let Some(auxiliary)=&self.auxiliary {
+                                let claimed=tokio::select!{
+                                    biased;
+                                    _=shutdown.notified()=>break,
+                                    result=auxiliary.claim(self.worker.clone(),self.settings.renew_interval)=>result,
+                                };
+                                match claimed {
+                                    Ok(Some(work))=>{running.spawn(async move {
+                                        if let Err(error)=work.await {tracing::warn!(error=%error,"learning execution deferred");}
+                                    });}
+                                    Ok(None)|Err(WorkerError::Unavailable)=>{},
+                                    Err(error)=>return Err(error),
+                                }
+                            }
+                        }
+                        Err(TurnStateError::Unavailable) => {}
                         Err(error) => return Err(state_error(error)),
                     }
                 }

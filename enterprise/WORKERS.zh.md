@@ -60,3 +60,15 @@ Docker runner 另外验证真实控制面、网关与两个独立 Worker 可执�
 完成审批／回执链。远程取消与其余 P3–P6 验收仍需继续完成，预览发布保持关闭。
 
 参见 [English](WORKERS.md)、[状态服务](POSTGRES.zh.md) 和[进度](STATUS.md)。
+
+## 后台学习容量
+
+安装 `memoryLearning` 绑定的 Worker 通过 `WorkerRuntime` 的辅助消费者接入
+`LearningWorker`。先领取普通 Job，学习共用同一槽位上限和退出排空。模型执行与续租
+独立轮询，续租不能延长任务原期限，本地授权过期会停止模型工作。远端日志准入返回后
+再次检查授权，防止日志等待耗尽租约后继续请求模型。
+
+内部学习协议 1 使用 `/internal/worker/v1/learning/` 下的 `claim`、`renew`、
+`journal`、`complete`、`stop` 及独立的 `x-zuno-learning-grant`。学习票据不能转换为
+前台或网关权限；仅回执验证可保存真实迟到终态，不能发起请求或应用 Memory。隔离模型
+帮助器不获得数据库凭证、工具派发器或本地 Memory 文件。

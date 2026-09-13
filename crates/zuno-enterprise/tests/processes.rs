@@ -42,6 +42,8 @@ mod council;
 mod executable;
 #[path = "processes/import.rs"]
 mod import;
+#[path = "processes/learning.rs"]
+mod learning;
 #[path = "processes/merge.rs"]
 mod merge;
 #[path = "processes/workflow.rs"]
@@ -138,6 +140,9 @@ async fn model(
     issuer.model_requests.fetch_add(1, Ordering::SeqCst);
     // Ensure two one-slot Workers can claim distinct ready sessions.
     tokio::time::sleep(Duration::from_millis(250)).await;
+    if let Some(response) = learning::model(&body) {
+        return response;
+    }
     let messages = body["messages"].as_array().unwrap();
     let user = messages
         .iter()
@@ -549,6 +554,19 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
     });
     definition.workflows = vec![workflow::template()];
     definition.councils = vec![council::configuration(&council_completion)];
+    let mut memory_model = completion::definition(&definition);
+    memory_model.id = ConfigurationId::new("memory-model").unwrap();
+    memory_model.agent.name = "memory-model".to_owned();
+    memory_model.workspace = definition.workspace.clone();
+    let memory_model_file = root.join("memory-model.json");
+    write(
+        &memory_model_file,
+        serde_json::to_vec(&memory_model).unwrap(),
+    );
+    definition.memory_learning = Some(MemoryLearningDefinition {
+        extraction: memory_model.reference(),
+        maintenance: memory_model.reference(),
+    });
     let definition_file = root.join("definition.json");
     write(&definition_file, serde_json::to_vec(&definition).unwrap());
     let job_key = root.join("job.key");
@@ -608,6 +626,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
                     child_definition_file.clone(),
                     completion_file.clone(),
                     council_completion_file.clone(),
+                    memory_model_file.clone(),
                 ],
                 active_definitions: vec![
                     DefinitionKey {
@@ -679,6 +698,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
                         child_definition_file.clone(),
                         completion_file.clone(),
                         council_completion_file.clone(),
+                        memory_model_file.clone(),
                     ],
                     credentials: [(
                         "model".to_owned(),
@@ -1067,6 +1087,15 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
             "a receiver must not acquire a peer's environment locally"
         );
     }
+    learning::verify(
+        &http,
+        &control_url,
+        &tokens["alice"],
+        &tokens["bob"],
+        &admin,
+        &issuer,
+    )
+    .await;
     for child in &mut children {
         assert!(
             tokio::process::Command::new("kill")

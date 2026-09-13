@@ -10,6 +10,8 @@ pub fn definition(parent: &Definition) -> Definition {
     value.environment = None;
     value.delegation = None;
     value.workflows.clear();
+    value.councils.clear();
+    value.memory_learning = None;
     value
 }
 

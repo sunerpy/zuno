@@ -108,7 +108,7 @@ pub fn finish(model_requests: usize) {
             "version":std::env::var("ZUNO_ENTERPRISE_TEST_VERSION").unwrap(),
             "roles":roles,"modelRequests":model_requests,"userIsolation":true,
             "humanApproval":true,"workflow":true,"council":true,"workspaceMerge":true,
-            "contentReview":true,"workspaceTransfer":true,"shutdown":true
+            "contentReview":true,"workspaceTransfer":true,"automaticMemory":true,"shutdown":true
         }))
         .unwrap(),
     );
