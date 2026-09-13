@@ -317,7 +317,15 @@ fn native_repair_defaults_to_read_only_inspection_of_published_evidence() {
 #[test]
 fn repair_rebinds_only_saved_input_and_admits_one_independent_native_control() {
     let mut fixture = RepairFixture::new();
-    let before = snapshot(&fixture.connection);
+    let mut before = snapshot(&fixture.connection);
+    let input_version: i64 = fixture
+        .connection
+        .query_row(
+            "SELECT input_version FROM runtime_session WHERE session_id=?1",
+            [SESSION],
+            |row| row.get(0),
+        )
+        .expect("preview input version");
     let old_input = inbox::read_in(&fixture.connection, SESSION, OLD).expect("old input");
     let old_receipt =
         input_receipt::get_in(&fixture.connection, SESSION, OLD).expect("old receipt");
@@ -375,6 +383,20 @@ fn repair_rebinds_only_saved_input_and_admits_one_independent_native_control() {
                 .is_none()
         );
     }
+    // The one newly admitted control advances the preview input CAS. Every
+    // other runtime row/column, including execution leases, must remain intact.
+    let runtime_row = before
+        .iter_mut()
+        .find(|(name, _)| name == "runtime_session")
+        .expect("preview runtime")
+        .1
+        .iter_mut()
+        .find(|row| row[0] == format!("{:?}", rusqlite::types::ValueRef::Text(SESSION.as_bytes())))
+        .expect("repaired session runtime");
+    runtime_row[1] = format!(
+        "{:?}",
+        rusqlite::types::ValueRef::Integer(input_version + 1)
+    );
     let after = snapshot(&fixture.connection);
     for (name, values) in &before {
         if !matches!(
