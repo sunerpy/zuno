@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.39](https://github.com/sunerpy/zuno/compare/v0.10.38...v0.10.39) (2026-09-13)
+
+
+### Bug Fixes
+
+* **runtime:** 修复执行门禁并保留任务自主性与问题迟答 ([cb41cd2](https://github.com/sunerpy/zuno/commit/cb41cd242111b9e1ab1e6d3e464bb4a835d074d9))
+
 ## [0.10.38](https://github.com/sunerpy/zuno/compare/v0.10.37...v0.10.38) (2026-09-13)
 
 
