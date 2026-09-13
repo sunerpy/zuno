@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p2-learning-input-bounds`.
+- Current phase branch: `codex/enterprise-p2-memory-child-evidence`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -523,3 +523,10 @@ Workflow PR #218 initially exposed an arm64 stack overflow in the PostgreSQL con
 - Oversized enterprise maintenance becomes a durable `learning_input_budget` failure with bounded coordinates, no provider request and no repeated admission for unchanged input. Completed extraction survives; another active user's small-profile learning proceeds. Current Memory documents are never silently truncated to make a model request fit.
 - The 8 KiB regression failed on the original code and now passes. Learning/Memory suites passed 217 tests, enterprise configuration tests passed 14, and actual PostgreSQL/HTTPS and five-process validation passed with 47 requests using an 8 KiB learning profile. Workspace check/Clippy, 100 documentation/release contracts and fmt/diff passed locally.
 - Public protocols and format 21 are unchanged. English/Chinese Memory, runtime and learning guides document the behavior. UI stays paused and excluded. PR #230 passed its required gates and merged only into preview at `ffba34a985447ac776c17185646f80ae491ff04e`; PR #231 is separate.
+
+## Completed descendant evidence and current ancestor policy
+
+- New child sessions copy `automatic_private` with the other explicit parent policy fields. Read/generation checks intersect the current owner and ancestor policies, bounded to the existing 16-level delegation contract; cycles, missing or foreign ancestry fail closed. Existing explicit child restrictions are retained.
+- Extraction traverses at most 256 completed owned Jobs in one workspace, validates native child completion envelopes and selects only authoritative successful complete command receipts. The 63-operation and serialized-input bounds remain. Delegated prompts and Agent report prose do not become evidence. Claim, renewal, model admission and settlement recheck frozen source bytes and current policy.
+- The child-policy regression initially failed because the automation flag was omitted. PostgreSQL/HTTPS now pass inheritance, immediate parent revocation, cyclic ancestry, completed-versus-failed child selection, corrupt completion refusal, child opt-out and stale model-admission refusal. The five-process fixture passed with actual child execution, extraction of its receipt, exclusion of unverified report text and 50 model requests. Workspace check/Clippy, 100 documentation/release contracts and fmt/diff pass; final archive validation remains required.
+- Late quiet child completions after an extraction snapshot are not retroactively ingested by this batch. Public protocol and format 21 remain unchanged. UI stays paused for Penpot. PR #231 passed required gates and merged only into preview at `9e43c95e5d3ce328ffd036ec24d4ff6c4ac9dc7b`.

@@ -6,6 +6,7 @@ use zuno_learning::{
 };
 use zuno_types::identity::JobId;
 
+mod child_evidence;
 mod input_limits;
 mod maintenance_wake;
 
@@ -595,4 +596,5 @@ pub(super) async fn exercise(backend: &PostgresBackend, admin: &PgPool) {
     );
     Box::pin(maintenance_wake::exercise(backend, admin)).await;
     Box::pin(input_limits::exercise(backend, admin)).await;
+    Box::pin(child_evidence::exercise(backend, admin)).await;
 }

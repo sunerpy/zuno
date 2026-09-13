@@ -2,6 +2,7 @@ use super::*;
 
 const NOTE: &str = "Use cargo test for enterprise memory checks.";
 const CORRECTION: &str = "Also retain the migration rollback evidence.";
+const CHILD_PROOF: &str = "MEMORY-CHILD-VALIDATED";
 pub fn model(body: &Value) -> Option<Response> {
     let messages = body["messages"].as_array()?;
     let system = messages
@@ -29,10 +30,22 @@ pub fn model(body: &Value) -> Option<Response> {
             })
             .unwrap();
         assert_eq!(source["kind"], "user");
+        let child = input["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|source| source["content"].as_str().unwrap().contains(CHILD_PROOF))
+            .expect("the completed child command must be available to extraction");
+        assert_eq!(child["kind"], "tool");
+        assert_eq!(child["proves_success"], true);
+        assert!(!input.to_string().contains("UNVERIFIED-CHILD-PROSE"));
         let response = json!({
             "experiences":[{"kind":"user_correction","title":"alice validation preference",
                 "summary":"alice requests cargo test for enterprise memory checks","resolution":null,"confidence":1.0,
-                "evidence":[{"kind":"user","source_id":source["source_id"],"excerpt":NOTE}]}],
+                "evidence":[{"kind":"user","source_id":source["source_id"],"excerpt":NOTE}]},
+                {"kind":"procedure","title":"Child validation","summary":"Child command completed",
+                "resolution":null,"confidence":1.0,
+                "evidence":[{"kind":"tool","source_id":child["source_id"],"excerpt":CHILD_PROOF}]}],
             "memories":[{"experience_ordinal":0,"scope":"project","action":"add","content":NOTE,
                 "old_text":null,"reason":"Explicit user preference","confidence":1.0}]
         });
@@ -80,6 +93,43 @@ pub fn model(body: &Value) -> Option<Response> {
         ));
     }
     if user.contains("AUTOMATIC-MEMORY") {
+        let has_tool = |id: &str| {
+            messages
+                .iter()
+                .any(|message| message["role"] == "tool" && message["tool_call_id"] == id)
+        };
+        if system.contains("CHILD-EXECUTOR") {
+            return Some(if has_tool("memory-child-command") {
+                model_response(
+                    json!({"role":"assistant","content":"UNVERIFIED-CHILD-PROSE"}),
+                    true,
+                )
+            } else {
+                model_response(
+                    json!({"role":"assistant","tool_calls":[{
+                        "index":0,"id":"memory-child-command","type":"function","function":{
+                            "name":"environment_command","arguments":json!({"argv":["sh","-c",
+                                format!("printf '{CHILD_PROOF}\\n'")]}).to_string()
+                        }
+                    }]}),
+                    false,
+                )
+            });
+        }
+        if !user.contains("disabled") && !has_tool("memory-child") {
+            return Some(model_response(
+                json!({"role":"assistant","tool_calls":[{
+                    "index":0,"id":"memory-child","type":"function","function":{
+                        "name":"task","arguments":json!({
+                            "agent":"workspace-helper","objective":"AUTOMATIC-MEMORY child validation for alice",
+                            "deliverable":"Validation result","instructions":"Run the validation command.",
+                            "success_evidence":"An authoritative successful command receipt."
+                        }).to_string()
+                    }
+                }]}),
+                false,
+            ));
+        }
         return Some(model_response(
             json!({"role":"assistant","content":"Memory source turn complete."}),
             true,
@@ -122,7 +172,7 @@ async fn turn(http: &reqwest::Client, control: &str, token: &str, suffix: &str) 
         .bearer_auth(token)
         .json(
             &json!({"requestId":format!("automatic-source-{suffix}"),"expectedInputVersion":"0",
-            "text":format!("AUTOMATIC-MEMORY alice: {NOTE}")}),
+            "text":format!("AUTOMATIC-MEMORY {suffix} alice: {NOTE}")}),
         )
         .send()
         .await
@@ -148,6 +198,32 @@ async fn turn(http: &reqwest::Client, control: &str, token: &str, suffix: &str) 
             .unwrap();
         if value["phase"] == "completed" {
             break;
+        }
+        for wait in value["waits"].as_array().unwrap() {
+            if wait["target"]["kind"] != "child" {
+                continue;
+            }
+            let child = wait["target"]["job_id"].as_str().unwrap();
+            let child: Value = http
+                .get(format!("{control}api/v1/jobs/{child}"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            for wait in child["waits"].as_array().unwrap() {
+                if wait["target"]["kind"] != "approval" {
+                    continue;
+                }
+                let approval = wait["target"]["approval_id"].as_str().unwrap();
+                http.post(format!("{control}api/v1/approvals/{approval}/answer")).bearer_auth(token)
+                    .json(&json!({"requestId":format!("memory-approve-{approval}"),"answer":"approve"}))
+                    .send().await.unwrap().error_for_status().unwrap();
+            }
         }
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -228,7 +304,7 @@ pub async fn verify(
         jobs, 2,
         "extraction and maintenance are separately settled jobs"
     );
-    assert_eq!(issuer.model_requests.load(Ordering::SeqCst), before + 3);
+    assert_eq!(issuer.model_requests.load(Ordering::SeqCst), before + 6);
     let page: Value = http
         .get(format!(
             "{control}api/v1/workspaces/workspace/learning/jobs?limit=1"
@@ -356,7 +432,7 @@ pub async fn verify(
     }
     assert_eq!(
         issuer.model_requests.load(Ordering::SeqCst),
-        before + 4,
+        before + 7,
         "a manual correction needs maintenance only, with no new foreground or extraction request"
     );
     let policy = memory(
@@ -379,5 +455,5 @@ pub async fn verify(
     .await
     .unwrap();
     assert_eq!(jobs, 0);
-    assert_eq!(issuer.model_requests.load(Ordering::SeqCst), before + 5);
+    assert_eq!(issuer.model_requests.load(Ordering::SeqCst), before + 8);
 }

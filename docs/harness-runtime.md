@@ -1481,6 +1481,11 @@ evidence changes using current consent/configuration. Stale queued snapshots are
 retired before model I/O; in-flight settlement keeps the original revision checks.
 Only changed input creates a new logical batch, and unchanged cancelled work stays
 cancelled. No foreground Agent turn is created by this maintenance path.
+Enterprise extraction may collect authoritative commands from completed descendants
+of its closed root Job. A bounded owner/workspace traversal validates child
+completion facts; delegated prompts and Agent report prose are excluded. Current
+ancestor Memory policy constrains existing child sessions, and frozen sources are
+revalidated before a learning model request as well as at settlement.
 There is no quota-percentage, daily-token, or currency budget; eligibility,
 idempotency, the wake cap, the three-attempt ceiling, and `learning.execution`
 input/output/step and total-time limits bound background work.

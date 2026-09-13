@@ -206,6 +206,12 @@ pub(super) async fn exercise(backend: &PostgresBackend, admin: &PgPool) {
     let stale_completion =
         record_output(&runtime, &fresh, "in-flight", json!({"updates":[]})).await;
     manual_note(&human, "in-flight-change", "Retain authoritative receipts.").await;
+    let mut stale_request = prepared(&fresh, "stale-new-request");
+    stale_request.record.operation = "learning.memory_consolidation".to_owned();
+    assert!(
+        runtime.journal(stale_request).await.is_err(),
+        "changed frozen maintenance inputs cannot authorize another model request"
+    );
     assert!(
         runtime.complete(stale_completion).await.is_err(),
         "in-flight old revisions cannot apply"

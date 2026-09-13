@@ -7,6 +7,7 @@ use zuno_types::identity::{JobId, PrincipalKey, TenantId};
 
 mod journal;
 mod settlement;
+mod sources;
 mod store;
 mod wake;
 use store::NewExecution;
@@ -233,14 +234,15 @@ impl TransactionMemory {
         if exists {
             return Ok(false);
         }
+        let (jobs, mut truncated) = self.completed_source_jobs(tx, source).await?;
         let operations: Vec<String> = query_scalar(
             "SELECT operation_id FROM zuno_enterprise_preview.gateway_operation
-             WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND completion IS NOT NULL
+             WHERE tenant_id=$1 AND principal_id=$2 AND job_id=ANY($3) AND completion IS NOT NULL
              ORDER BY operation_id LIMIT 64",
         )
         .bind(self.principal.tenant_id().as_str())
         .bind(self.principal.principal_id().as_str())
-        .bind(source.id.as_str())
+        .bind(jobs)
         .fetch_all(&mut **tx)
         .await
         .map_err(sql_error)?;
@@ -248,7 +250,7 @@ impl TransactionMemory {
             session_id: source.session_id.clone(),
             input_id: source.input_id.clone(),
         }];
-        let mut truncated = operations.len() > 63;
+        truncated |= operations.len() > 63;
         origins.extend(
             operations
                 .into_iter()
@@ -266,6 +268,11 @@ impl TransactionMemory {
             let Some(value) = self.source(tx, &origin, self.workspace.as_str()).await? else {
                 continue;
             };
+            match self.require_automation(tx, Some(&value.session)).await {
+                Ok(()) => {}
+                Err(Error::Denied) => continue,
+                Err(error) => return Err(error),
+            }
             let text = zuno_error::ProviderError::sanitize_diagnostic(&value.text, &[]);
             truncated |= text.len() < value.text.len();
             if text.trim().is_empty() {
@@ -353,7 +360,7 @@ impl TransactionMemory {
 }
 
 impl PostgresMemoryBackend {
-    async fn automate<T: Send + 'static>(
+    pub(super) async fn automate<T: Send + 'static>(
         &self,
         principal: PrincipalScope,
         workspace: WorkspaceId,
