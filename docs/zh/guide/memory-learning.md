@@ -385,3 +385,7 @@ Project Experience、Memory、pattern、evaluation result 与 Skill candidate �
 Skill 存储适配器通过 `SkillBackendBundle` 协调候选、来源证据与评测持久化，
 默认仍使用 SQLite。该扩展点不自动启动 Skill 评测，也不改变模型配置；审核、
 实际成对模型评测和应用仍是独立步骤。企业远程 Skill 执行继续在预览通道实施。
+
+Skill 应用先记录完整预期文件变更，写入后核查实际内容再结算。中断后重建并核查
+原操作，不重放不确定写入。宿主适配器可以复用应用准备／回执接口，企业远程执行
+仍需单独完成授权和网关接入。

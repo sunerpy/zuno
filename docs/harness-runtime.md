@@ -3121,3 +3121,18 @@ the same immutable attempt snapshot and recorded tool cassettes. No new evaluato
 model is selected by these persistence constructors. Filesystem application and
 reconciliation still belong to the local Skill host; a distributed Skill backend
 is not registered by these interfaces alone.
+
+### Prepared Skill effects
+
+`prepare_apply` and `prepare_undo` persist a `PreparedSkillEffect` with stable
+candidate/operation identity and exact before/after file snapshots. These
+preparation methods do not write a file. Native application holds its target
+write lock, performs the write, reads the resulting bytes and calls
+`settle_effect`. `pending_effect` reconstructs an unfinished operation from
+durable state; reconciliation classifies authoritative observed bytes without
+issuing a second write. Exact duplicate receipts are idempotent, unrelated
+operation IDs are refused, and divergent bytes remain uncertain.
+
+The effect DTO contains no host path or runtime handle. A remote host must bind
+it to current authorization, a logical environment target and a real operation
+receipt before use. This interface does not register a remote Skill executor.
