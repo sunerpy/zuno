@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p2-memory-child-evidence`.
+- Current phase branch: `codex/enterprise-p2-memory-late-sources`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -530,3 +530,11 @@ Workflow PR #218 initially exposed an arm64 stack overflow in the PostgreSQL con
 - Extraction traverses at most 256 completed owned Jobs in one workspace, validates native child completion envelopes and selects only authoritative successful complete command receipts. The 63-operation and serialized-input bounds remain. Delegated prompts and Agent report prose do not become evidence. Claim, renewal, model admission and settlement recheck frozen source bytes and current policy.
 - The child-policy regression initially failed because the automation flag was omitted. PostgreSQL/HTTPS now pass inheritance, immediate parent revocation, cyclic ancestry, completed-versus-failed child selection, corrupt completion refusal, child opt-out and stale model-admission refusal. The five-process fixture passed with actual child execution, extraction of its receipt, exclusion of unverified report text and 50 model requests. Workspace check/Clippy, 100 documentation/release contracts and fmt/diff pass; final archive validation remains required.
 - Late quiet child completions after an extraction snapshot are not retroactively ingested by this batch. Public protocol and format 21 remain unchanged. UI stays paused for Penpot. PR #231 passed required gates and merged only into preview at `9e43c95e5d3ce328ffd036ec24d4ff6c4ac9dc7b`.
+
+## Incremental late-result ingestion
+
+- Runtime completion atomically advances an owned root-scan version. Extraction selects previously unseen origins, records captured/omitted/unavailable decisions with the new Job/activity and acknowledges only its observed version. Duplicate completion notifications and cancelled captured batches do not replay model requests.
+- Format 22 adds forced-owner-RLS scan and claim tables, backfills prior frozen manifests in bounded pages, and preserves old sessions/messages/Memory/learning state. Exact format-21 source digest is `94aad8f67be291df7c50d24b2046b9a3ab78813314562179129b7c7e0c47a835`; failed-DDL rollback and repeated migration pass.
+- The real process regression first failed because a late quiet completion was never ingested. The five-process loop now passes: root completion and initial extraction, later human approval of the quiet command, then an extraction containing only that new receipt and separate maintenance. It completes 55 model requests.
+- PostgreSQL/HTTPS pass injected source-claim rollback, competing schedulers, cancellation/deduplication and a new completion version arriving during acknowledgement. Workspace check/Clippy, 100 documentation/release contracts and fmt/diff pass locally. Original traversal and input bounds remain explicit; UI stays paused.
+- PR #232 passed required checks and merged only into preview at `d1f1cdd63d5e8d89104c34aa4503cd03b6c5caee`. PR #233 is separate; no preview version/tag or Release is enabled.

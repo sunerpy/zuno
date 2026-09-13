@@ -3,6 +3,7 @@ use super::*;
 const NOTE: &str = "Use cargo test for enterprise memory checks.";
 const CORRECTION: &str = "Also retain the migration rollback evidence.";
 const CHILD_PROOF: &str = "MEMORY-CHILD-VALIDATED";
+const LATE_PROOF: &str = "MEMORY-LATE-VALIDATED";
 pub fn model(body: &Value) -> Option<Response> {
     let messages = body["messages"].as_array()?;
     let system = messages
@@ -18,6 +19,30 @@ pub fn model(body: &Value) -> Option<Response> {
                 .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty))
         );
         let input: Value = serde_json::from_str(user).unwrap();
+        if input["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| source["content"].as_str().unwrap().contains(LATE_PROOF))
+        {
+            let sources = input["sources"].as_array().unwrap();
+            assert_eq!(
+                sources.len(),
+                1,
+                "late ingestion must not replay the root or prior child"
+            );
+            assert_eq!(sources[0]["kind"], "tool");
+            assert_eq!(sources[0]["proves_success"], true);
+            return Some(model_response(
+                json!({"role":"assistant","content":json!({
+                "experiences":[{"kind":"procedure","title":"Late validation","summary":"Late command completed",
+                    "resolution":null,"confidence":1.0,
+                    "evidence":[{"kind":"tool","source_id":sources[0]["source_id"],"excerpt":LATE_PROOF}]}],
+                "memories":[]
+            }).to_string()}),
+                true,
+            ));
+        }
         let source = input["sources"]
             .as_array()
             .unwrap()
@@ -99,6 +124,11 @@ pub fn model(body: &Value) -> Option<Response> {
                 .any(|message| message["role"] == "tool" && message["tool_call_id"] == id)
         };
         if system.contains("CHILD-EXECUTOR") {
+            let proof = if user.contains("late-child") {
+                LATE_PROOF
+            } else {
+                CHILD_PROOF
+            };
             return Some(if has_tool("memory-child-command") {
                 model_response(
                     json!({"role":"assistant","content":"UNVERIFIED-CHILD-PROSE"}),
@@ -109,7 +139,7 @@ pub fn model(body: &Value) -> Option<Response> {
                     json!({"role":"assistant","tool_calls":[{
                         "index":0,"id":"memory-child-command","type":"function","function":{
                             "name":"environment_command","arguments":json!({"argv":["sh","-c",
-                                format!("printf '{CHILD_PROOF}\\n'")]}).to_string()
+                                format!("printf '{proof}\\n'")]}).to_string()
                         }
                     }]}),
                     false,
@@ -124,6 +154,20 @@ pub fn model(body: &Value) -> Option<Response> {
                             "agent":"workspace-helper","objective":"AUTOMATIC-MEMORY child validation for alice",
                             "deliverable":"Validation result","instructions":"Run the validation command.",
                             "success_evidence":"An authoritative successful command receipt."
+                        }).to_string()
+                    }
+                }]}),
+                false,
+            ));
+        }
+        if !user.contains("disabled") && !has_tool("memory-late") {
+            return Some(model_response(
+                json!({"role":"assistant","tool_calls":[{
+                    "index":0,"id":"memory-late","type":"function","function":{
+                        "name":"task","arguments":json!({
+                            "agent":"workspace-helper","objective":"AUTOMATIC-MEMORY late-child for alice",
+                            "deliverable":"Late validation","instructions":"Run the validation command.",
+                            "success_evidence":"A successful receipt.","background":true,"reportDelivery":"quiet"
                         }).to_string()
                     }
                 }]}),
@@ -304,7 +348,42 @@ pub async fn verify(
         jobs, 2,
         "extraction and maintenance are separately settled jobs"
     );
-    assert_eq!(issuer.model_requests.load(Ordering::SeqCst), before + 6);
+    let late: String = query_scalar(
+        "SELECT job_id FROM zuno_enterprise_preview.runtime_child
+        WHERE parent_job_id=$1 AND invocation_id='memory-late'",
+    )
+    .bind(&source)
+    .fetch_one(admin)
+    .await
+    .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let late_approval = loop {
+        let late: Value = http
+            .get(format!("{control}api/v1/jobs/{late}"))
+            .bearer_auth(alice)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if let Some(wait) = late["waits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|wait| wait["target"]["kind"] == "approval")
+        {
+            break wait["target"]["approval_id"].as_str().unwrap().to_owned();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "late child did not await approval"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(issuer.model_requests.load(Ordering::SeqCst), before + 8);
     let page: Value = http
         .get(format!(
             "{control}api/v1/workspaces/workspace/learning/jobs?limit=1"
@@ -432,9 +511,50 @@ pub async fn verify(
     }
     assert_eq!(
         issuer.model_requests.load(Ordering::SeqCst),
-        before + 7,
+        before + 9,
         "a manual correction needs maintenance only, with no new foreground or extraction request"
     );
+    http.post(format!("{control}api/v1/approvals/{late_approval}/answer"))
+        .bearer_auth(alice)
+        .json(&json!({"requestId":"approve-late-memory","answer":"approve"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+    loop {
+        let late_extraction: bool = query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM zuno_enterprise_preview.learning_execution e
+             JOIN zuno_enterprise_preview.learning_job j
+               ON j.tenant_id=e.tenant_id AND j.principal_id=e.principal_id AND j.id=e.job_id
+             WHERE e.source_job_id=$1 AND e.phase='extraction' AND j.status='completed'
+               AND e.input::text LIKE '%MEMORY-LATE-VALIDATED%')",
+        )
+        .bind(&source)
+        .fetch_one(admin)
+        .await
+        .unwrap();
+        let maintenance: i64 = query_scalar(
+            "SELECT count(*) FROM zuno_enterprise_preview.learning_execution e
+             JOIN zuno_enterprise_preview.learning_job j
+               ON j.tenant_id=e.tenant_id AND j.principal_id=e.principal_id AND j.id=e.job_id
+             WHERE e.source_job_id=$1 AND e.phase='maintenance' AND j.status='completed'",
+        )
+        .bind(&source)
+        .fetch_one(admin)
+        .await
+        .unwrap();
+        if late_extraction && maintenance == 3 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "late quiet completion was not ingested"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(issuer.model_requests.load(Ordering::SeqCst), before + 12);
     let policy = memory(
         http,
         control,
@@ -455,5 +575,5 @@ pub async fn verify(
     .await
     .unwrap();
     assert_eq!(jobs, 0);
-    assert_eq!(issuer.model_requests.load(Ordering::SeqCst), before + 8);
+    assert_eq!(issuer.model_requests.load(Ordering::SeqCst), before + 13);
 }

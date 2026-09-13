@@ -365,3 +365,18 @@ The exact format-20 source digest is
 Tests preserve sessions, messages, Memory and learning inputs on failed DDL,
 then verify successful backfill and duplicate-free migration replay. Cancellation,
 reservation settlement, receipt and activity either all commit or all roll back.
+
+## Format 22: incremental learning sources
+
+`learning_root_scan` stores completion and acknowledged scan versions per owned
+root. Runtime completion marks it in the same transaction as terminal state.
+`learning_source_claim` records captured, omitted or unavailable origin decisions,
+with the optional learning Job and source digest. Forced owner RLS protects both
+tables, and the pending index supports bounded scheduling.
+
+The exact format-21 fixture has source digest
+`94aad8f67be291df7c50d24b2046b9a3ab78813314562179129b7c7e0c47a835`.
+Migration pages through prior extraction manifests, preserving cancellation and
+all old rows while backfilling captured origins. It restores forced RLS before the
+marker commits. Injected DDL failure preserves format 21 and its original data;
+repeated migration does not duplicate claims.

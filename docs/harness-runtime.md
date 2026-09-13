@@ -1486,6 +1486,10 @@ of its closed root Job. A bounded owner/workspace traversal validates child
 completion facts; delegated prompts and Agent report prose are excluded. Current
 ancestor Memory policy constrains existing child sessions, and frozen sources are
 revalidated before a learning model request as well as at settlement.
+Completion also publishes a durable root-scan version. Late background results
+are extracted from new origins only; source decisions and scan acknowledgement
+commit atomically with the new learning Job. Acknowledging an observed version
+cannot discard a later completion, and cancelled captured sources remain consumed.
 There is no quota-percentage, daily-token, or currency budget; eligibility,
 idempotency, the wake cap, the three-attempt ceiling, and `learning.execution`
 input/output/step and total-time limits bound background work.
