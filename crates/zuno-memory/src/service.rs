@@ -161,6 +161,8 @@ pub enum MemoryServiceError {
     Denied,
     #[error("the Memory state service is temporarily unavailable")]
     Unavailable,
+    #[error("the enterprise learning queue is at capacity")]
+    Capacity,
     #[error("Memory state changed concurrently")]
     Conflict,
     #[error("Memory state is corrupt or incompatible")]
@@ -183,6 +185,7 @@ impl MemoryServiceError {
             Self::Database(_)
             | Self::Denied
             | Self::Unavailable
+            | Self::Capacity
             | Self::Conflict
             | Self::InvalidData => false,
         }

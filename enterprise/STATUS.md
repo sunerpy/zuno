@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p2-shared-memory-evidence`.
+- Current phase branch: `codex/enterprise-p6-admission-quotas`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -638,3 +638,7 @@ same-Job recovery passed source-grant revocation with unchanged reader membershi
 SDK 30 tests, generated drift, workspace check, Clippy and 100 documentation/release
 contracts passed. Exact-archive and preview CI evidence remain required. Shared automatic model maintenance remains
 open. UI is paused; no enterprise publication is enabled.
+
+## Admission quotas under validation
+
+A persisted quota port now covers user root sessions/Jobs, children, active execution leases and learning queue/leases. Learning has a separate fair dispatch clock. Quota rejection preserves input CAS and existing receipts; follow-up maintenance can defer without rolling back completed extraction. Real transaction, fairness, waiting-capacity and native API checks passed. Quota rejection preserved input CAS, and deferred maintenance resumed after queue capacity returned. Memory/Learning 218 tests, SDK 31 tests and generated drift, workspace check, Clippy and 100 documentation/release contracts passed. Exact-archive and preview CI validation remain required. UI remains paused and publication disabled.

@@ -63,7 +63,10 @@ impl PostgresLearningRuntime {
                 (LearningInput::Extraction(input),LearningOutput::Extraction(output))=>{
                     let context:ExtractionContext=serde_json::from_value(context).map_err(decode_error)?;
                     provider.execute(async |tx| provider.settle_extraction(tx,&job,input,output,&context).await)?;
-                    provider.schedule_maintenance(&job,&context)?;
+                    match provider.schedule_maintenance(&job,&context) {
+                        Ok(_) | Err(Error::Capacity) => {},
+                        Err(error) => return Err(error),
+                    }
                 }
                 (LearningInput::Maintenance(_),LearningOutput::Maintenance(output))=>{
                     let context:MaintenanceContext=serde_json::from_value(context).map_err(decode_error)?;

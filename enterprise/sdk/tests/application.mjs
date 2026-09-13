@@ -5,6 +5,18 @@ import { EnterpriseClient, EnterpriseHttpError } from "../dist/src/index.js";
 const job = { id: "job", sessionId: "session", turnId: "turn", inputId: "input", phase: "ready", inputVersion: "1", waits: [], stopRequested: false, pendingOperations: [] };
 const response = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 
+test("quota policy revisions are exact and capacity responses never retry admission",async()=>{
+  const limits={rootSessions:2048,rootJobs:64,childJobs:1024,executions:8,learningJobs:64,learningExecutions:2};
+  const client=value=>new EnterpriseClient({baseUrl:"https://enterprise.example/api/v1/",accessToken:async()=>"token",fetch:async()=>response(value)});
+  const request={requestId:"policy",expectedRevision:"9007199254740992",limits};
+  assert.equal((await client({revision:"9007199254740993",limits}).replaceQuotas(request)).revision,"9007199254740993");
+  await assert.rejects(client({revision:"1",limits}).replaceQuotas(request),/Quota revision mismatch/);
+  let calls=0;
+  const full=new EnterpriseClient({baseUrl:"https://enterprise.example/api/v1/",accessToken:async()=>"token",fetch:async()=>{calls++;return response({error:"quota_exceeded"},429);}});
+  await assert.rejects(full.submit("session",{requestId:"input",expectedInputVersion:"0",text:"task"}),error=>error instanceof EnterpriseHttpError&&error.status===429);
+  assert.equal(calls,1);
+});
+
 test("shared evidence preserves space, source digest and revoke revision",async()=>{
   const grant={id:"grant",spaceId:"runbooks",author:"alice",revision:"2",kind:"user_statement",
     excerpt:"reviewed excerpt",evidenceDigest:"a".repeat(64),active:false,current:false};

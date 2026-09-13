@@ -83,6 +83,8 @@ export type SharedMemoryEdit =
       oldText: string;
     };
 export type SkillCaseKind = "failure" | "protection" | "general";
+export type QuotaResource =
+  "root_sessions" | "root_jobs" | "child_jobs" | "executions" | "learning_jobs" | "learning_executions";
 export type SharedMemoryDecision = "apply" | "reject" | "undo";
 export type SharedMemoryChangeState = "pending" | "applied" | "rejected" | "undone" | "invalidated";
 export type ConfigurationId = string;
@@ -161,6 +163,9 @@ export interface ApplicationProtocol {
   merge_content: MergeContentRequest;
   propose_shared_memory: ProposeSharedMemory;
   propose_skill: ProposeSkill;
+  quota_policy: QuotaPolicy;
+  quota_snapshot: QuotaSnapshot;
+  replace_quota: ReplaceQuotaPolicy;
   review_shared_memory: ReviewSharedMemory;
   review_skill: ReviewSkillEvaluation;
   revoke_evidence: RevokeSharedEvidence;
@@ -431,6 +436,32 @@ export interface SkillRecordedCall {
   isError: boolean;
   name: string;
   output: string;
+}
+export interface QuotaPolicy {
+  limits: QuotaLimits;
+  revision: Counter;
+}
+export interface QuotaLimits {
+  childJobs: number;
+  executions: number;
+  learningExecutions: number;
+  learningJobs: number;
+  rootJobs: number;
+  rootSessions: number;
+}
+export interface QuotaSnapshot {
+  policy: QuotaPolicy;
+  usage: QuotaUsage[];
+}
+export interface QuotaUsage {
+  limit: Counter;
+  resource: QuotaResource;
+  used: Counter;
+}
+export interface ReplaceQuotaPolicy {
+  expectedRevision: Counter;
+  limits: QuotaLimits;
+  requestId: RequestId;
 }
 export interface ReviewSharedMemory {
   changeId: RequestId;

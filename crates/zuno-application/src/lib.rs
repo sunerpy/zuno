@@ -15,6 +15,7 @@ pub mod learning;
 pub mod learning_api;
 pub mod live;
 pub mod mcp;
+pub mod quota;
 pub mod runtime;
 pub mod shared_memory;
 pub mod skill;
@@ -49,6 +50,8 @@ pub enum ApplicationError {
     LeaseLost,
     #[error("the state service is temporarily unavailable")]
     Unavailable,
+    #[error("enterprise quota exceeded for {0:?}")]
+    QuotaExceeded(quota::QuotaResource),
     #[error("the state service failed")]
     Storage {
         #[source]

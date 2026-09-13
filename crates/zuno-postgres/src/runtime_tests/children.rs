@@ -534,6 +534,8 @@ async fn foreground_admission(backend: &PostgresBackend, admin: &PgPool) {
     use crate::runtime::{children, waiting};
     let (actor, parent) = parent(backend, admin, "child-foreground").await;
     let store = backend.runtime(actor.tenant_id().clone());
+    query("UPDATE zuno_enterprise_preview.organization_quota SET limits=jsonb_set(jsonb_set(limits,'{executions}','1'),'{childJobs}','1') WHERE tenant_id=$1")
+        .bind(actor.tenant_id().as_str()).execute(admin).await.unwrap();
     let grant = grant(&parent.job);
     let intent = invocation(ChildDelivery::Foreground);
     let ticket = store
@@ -547,6 +549,17 @@ async fn foreground_admission(backend: &PostgresBackend, admin: &PgPool) {
             .unwrap(),
         ticket
     );
+    let mut over_limit = intent.clone();
+    over_limit.invocation_id = InvocationId::new("over-quota").unwrap();
+    over_limit.logical_key = "over-quota".to_owned();
+    assert!(matches!(
+        store
+            .dispatch_child(&parent.lease, over_limit, &grant)
+            .await,
+        Err(ApplicationError::QuotaExceeded(
+            zuno_application::quota::QuotaResource::ChildJobs
+        ))
+    ));
     let mut changed = intent;
     changed.prompt.push_str(" different");
     assert!(matches!(

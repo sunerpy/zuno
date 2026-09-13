@@ -23,7 +23,7 @@ fn invalid_rpc() -> RpcError {
 fn rpc(error: ApiError) -> RpcError {
     RpcError::internal(error.to_string()).with_data(json!({"zuno":{"reason":match error{
         ApiError::Forbidden=>"authorization",ApiError::NotFound=>"not_found",
-        ApiError::Conflict=>"conflict",ApiError::Invalid=>"invalid_response",ApiError::Unavailable=>"unavailable",ApiError::Unconfirmed=>"unconfirmed",
+        ApiError::Conflict=>"conflict",ApiError::Capacity=>"quota_exceeded",ApiError::Invalid=>"invalid_response",ApiError::Unavailable=>"unavailable",ApiError::Unconfirmed=>"unconfirmed",
     }}}))
 }
 fn required<'a>(value: &'a Value, key: &str) -> Result<&'a str, RpcError> {

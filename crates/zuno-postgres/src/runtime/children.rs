@@ -226,6 +226,12 @@ pub(super) async fn stage_in(
     if let Some(session) = &invocation.resume_session_id {
         resume_allowed(tx, parent, session).await?;
     }
+    crate::quota::admit(
+        tx,
+        &owner,
+        zuno_application::quota::QuotaResource::ChildJobs,
+    )
+    .await?;
     let key = zuno_orchestration::sha256_json(&json!([
         "child-job",
         owner,

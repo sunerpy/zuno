@@ -6,6 +6,9 @@ fn app(error: Error) -> ApplicationError {
     match error {
         Error::Denied => ApplicationError::Forbidden,
         Error::Conflict => ApplicationError::Conflict,
+        Error::Capacity => {
+            ApplicationError::QuotaExceeded(zuno_application::quota::QuotaResource::LearningJobs)
+        }
         Error::Invalid(message) => ApplicationError::Invalid(message),
         _ => ApplicationError::Unavailable,
     }

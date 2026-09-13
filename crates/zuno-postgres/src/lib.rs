@@ -15,6 +15,7 @@ mod mcp;
 mod memory;
 mod migration;
 mod operation;
+mod quota;
 mod runtime;
 #[cfg(test)]
 mod runtime_tests;

@@ -3180,3 +3180,7 @@ undo retain a versioned support transition; recall recomputes source/grant
 validity and omits unsupported entries before assembling a provider request.
 Organization readers do not gain private session or operation access. See
 [shared Memory evidence](../enterprise/SHARED_MEMORY.md#explicit-private-evidence-sharing).
+
+### Enterprise quota boundaries
+
+The data owner applies persistent QuotaStore policy during session, root/child Job, learning and lease admission. Counts use durable identity and database-time leases. Already accepted completion delivery and checkpoint recovery do not acquire a second logical user admission. Background learning uses a separate persisted fairness clock, and a full maintenance queue does not invalidate completed extraction. See [enterprise quotas](../enterprise/QUOTAS.md).

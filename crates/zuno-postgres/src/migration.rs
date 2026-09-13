@@ -7,7 +7,7 @@ use zuno_application::ApplicationError;
 use crate::database_error;
 
 pub const PREVIEW_SCHEMA: &str = "zuno_enterprise_preview";
-pub(crate) const FORMAT: i32 = 28;
+pub(crate) const FORMAT: i32 = 29;
 const TABLES: &[&str] = &["workspace", "session", "request_receipt", "input", "event"];
 const RUNTIME_TABLES: &[&str] = &[
     "agent_job",
@@ -55,6 +55,7 @@ const SHARED_MEMORY_DDL: &str = include_str!("schema_shared_memory.sql");
 const SKILL_DDL: &str = include_str!("schema_skill.sql");
 const SKILL_LIBRARY_DDL: &str = include_str!("schema_skill_library.sql");
 const SHARED_EVIDENCE_DDL: &str = include_str!("schema_shared_evidence.sql");
+const QUOTA_DDL: &str = include_str!("schema_quota.sql");
 const LEARNING_TABLES: &[&str] = &[
     "learning_execution",
     "learning_execution_attempt",
@@ -196,9 +197,11 @@ fn source_digest(version: i32) -> String {
         "4897df28fc1284381212ed51dcd9e2b5c6c7c28175bdbe791c71eabfb3f7a91e".to_owned()
     } else if version == 27 {
         "c87cff03b870109f419207512120352792ba605b1979f94be93284f194dd8f31".to_owned()
+    } else if version == 28 {
+        "fc2f9ebc13cb54948703895506f44b6e8146ef7a351748d0888d03757c527ca5".to_owned()
     } else {
         zuno_orchestration::sha256_text(&format!(
-            "{FORMAT}\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{WAIT_DDL}\n{CONTEXT_DDL}\n{BROWSER_DDL}\n{OPERATION_DDL}\n{MEMORY_DDL}\n{CHILD_DDL}\n{CHILD_WORKSPACE_DDL}\n{CONTROL_DDL}\n{ACTIVITY_DDL}\n{LIVE_DDL}\n{WORKFLOW_DDL}\n{COUNCIL_DDL}\n{MERGE_DDL}\n{IMPORT_DDL}\n{TRANSFER_DDL}\n{LEARNING_DDL}\n{LEARNING_CONTROL_DDL}\n{LEARNING_SOURCES_DDL}\n{EDIT_DDL}\n{MCP_DDL}\n{SHARED_MEMORY_DDL}\n{SKILL_DDL}\n{SKILL_LIBRARY_DDL}\n{SHARED_EVIDENCE_DDL}\n{POLICY}\n{TENANT_POLICY}"
+            "{FORMAT}\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{WAIT_DDL}\n{CONTEXT_DDL}\n{BROWSER_DDL}\n{OPERATION_DDL}\n{MEMORY_DDL}\n{CHILD_DDL}\n{CHILD_WORKSPACE_DDL}\n{CONTROL_DDL}\n{ACTIVITY_DDL}\n{LIVE_DDL}\n{WORKFLOW_DDL}\n{COUNCIL_DDL}\n{MERGE_DDL}\n{IMPORT_DDL}\n{TRANSFER_DDL}\n{LEARNING_DDL}\n{LEARNING_CONTROL_DDL}\n{LEARNING_SOURCES_DDL}\n{EDIT_DDL}\n{MCP_DDL}\n{SHARED_MEMORY_DDL}\n{SKILL_DDL}\n{SKILL_LIBRARY_DDL}\n{SHARED_EVIDENCE_DDL}\n{QUOTA_DDL}\n{POLICY}\n{TENANT_POLICY}"
         ))
     }
 }
@@ -349,7 +352,10 @@ pub async fn migrate(admin: &PgPool, runtime_role: &str) -> Result<(), Applicati
                 if version < 27 {
                     install_skill_library(&mut tx).await?;
                 }
-                install_shared_evidence(&mut tx).await?;
+                if version < 28 {
+                    install_shared_evidence(&mut tx).await?;
+                }
+                install_quotas(&mut tx).await?;
                 if version < 13 {
                     crate::activity::backfill(&mut tx).await?;
                 }
@@ -425,6 +431,7 @@ pub async fn migrate(admin: &PgPool, runtime_role: &str) -> Result<(), Applicati
     install_skills(&mut tx).await?;
     install_skill_library(&mut tx).await?;
     install_shared_evidence(&mut tx).await?;
+    install_quotas(&mut tx).await?;
     crate::activity::backfill(&mut tx).await?;
     sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
         "REVOKE ALL ON SCHEMA {PREVIEW_SCHEMA} FROM PUBLIC;
@@ -669,6 +676,7 @@ async fn grant_runtime(connection: &mut PgConnection, role: &str) -> Result<(), 
             .iter(),
         )
         .chain(["skill_candidate", "skill_request", "skill_audit"].iter())
+        .chain(["organization_quota", "organization_quota_request"].iter())
         .chain(
             [
                 "shared_memory_evidence",
@@ -711,6 +719,7 @@ async fn grant_runtime(connection: &mut PgConnection, role: &str) -> Result<(), 
          GRANT EXECUTE ON FUNCTION {PREVIEW_SCHEMA}.gateway_edit_cancellations(text,text,integer) TO \"{role}\";
          GRANT EXECUTE ON FUNCTION {PREVIEW_SCHEMA}.gateway_mcp_cancellations(text,text,integer) TO \"{role}\";
          GRANT EXECUTE ON FUNCTION {PREVIEW_SCHEMA}.dispatch_owners(text) TO \"{role}\";
+         GRANT EXECUTE ON FUNCTION {PREVIEW_SCHEMA}.learning_dispatch_owners(text) TO \"{role}\";
          GRANT EXECUTE ON FUNCTION {PREVIEW_SCHEMA}.create_runtime_session() TO \"{role}\";
          GRANT EXECUTE ON FUNCTION {PREVIEW_SCHEMA}.advance_input_version() TO \"{role}\";
          GRANT EXECUTE ON FUNCTION {PREVIEW_SCHEMA}.create_input_execution_receipt() TO \"{role}\";
@@ -2217,5 +2226,80 @@ pub(crate) async fn install_format_twenty_seven_fixture(
     sqlx_core::query::query("UPDATE zuno_enterprise_preview.schema_format SET version=27,source_digest=$1,manifest=$2 WHERE singleton=1")
         .bind("c87cff03b870109f419207512120352792ba605b1979f94be93284f194dd8f31").bind(manifest)
         .execute(&mut *tx).await.map_err(database_error)?;
+    tx.commit().await.map_err(database_error)
+}
+
+async fn install_quotas(connection: &mut PgConnection) -> Result<(), ApplicationError> {
+    sqlx_core::raw_sql::raw_sql(QUOTA_DDL)
+        .execute(&mut *connection)
+        .await
+        .map_err(database_error)?;
+    // Migrations hold exclusive schema ownership. Restore forced RLS before the
+    // marker commits; runtime users never receive the schema-owner credential.
+    sqlx_core::raw_sql::raw_sql(
+        "ALTER TABLE zuno_enterprise_preview.organization_policy NO FORCE ROW LEVEL SECURITY;",
+    )
+    .execute(&mut *connection)
+    .await
+    .map_err(database_error)?;
+    sqlx_core::query::query("INSERT INTO zuno_enterprise_preview.organization_quota(tenant_id,revision,limits) SELECT tenant_id,1,$1 FROM zuno_enterprise_preview.organization_policy")
+        .bind(serde_json::json!(zuno_application::quota::QuotaLimits::default())).execute(&mut *connection).await.map_err(database_error)?;
+    sqlx_core::raw_sql::raw_sql(
+        "ALTER TABLE zuno_enterprise_preview.organization_policy FORCE ROW LEVEL SECURITY;",
+    )
+    .execute(&mut *connection)
+    .await
+    .map_err(database_error)?;
+    for table in ["organization_quota", "organization_quota_request"] {
+        let policy = if table == "organization_quota" {
+            TENANT_POLICY
+        } else {
+            POLICY
+        };
+        sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
+            "ALTER TABLE {PREVIEW_SCHEMA}.{table} ENABLE ROW LEVEL SECURITY;
+             ALTER TABLE {PREVIEW_SCHEMA}.{table} FORCE ROW LEVEL SECURITY;
+             CREATE POLICY quota_scope ON {PREVIEW_SCHEMA}.{table} USING ({policy}) WITH CHECK ({policy});
+             REVOKE ALL ON {PREVIEW_SCHEMA}.{table} FROM PUBLIC;"
+        ))).execute(&mut *connection).await.map_err(database_error)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn install_format_twenty_eight_fixture(
+    pool: &PgPool,
+    role: &str,
+) -> Result<(), ApplicationError> {
+    Box::pin(install_format_twenty_seven_fixture(pool, role)).await?;
+    let mut tx = pool.begin().await.map_err(database_error)?;
+    sqlx_core::raw_sql::raw_sql(include_str!("fixtures/format28-shared-evidence.sql"))
+        .execute(&mut *tx)
+        .await
+        .map_err(database_error)?;
+    for table in [
+        "shared_memory_evidence",
+        "shared_memory_support",
+        "shared_memory_evidence_audit",
+    ] {
+        let namespace = format!(
+            "tenant_id=current_setting('zuno.tenant_id',true) AND EXISTS(SELECT 1 FROM {PREVIEW_SCHEMA}.shared_memory_space s WHERE s.tenant_id={table}.tenant_id AND s.id={table}.space_id)"
+        );
+        let (read, write) = match table {
+            "shared_memory_evidence" => (format!("({POLICY}) OR ({namespace})"), POLICY.to_owned()),
+            "shared_memory_evidence_audit" => (POLICY.to_owned(), POLICY.to_owned()),
+            _ => (namespace.clone(), namespace),
+        };
+        sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
+            "ALTER TABLE {PREVIEW_SCHEMA}.{table} ENABLE ROW LEVEL SECURITY;
+             ALTER TABLE {PREVIEW_SCHEMA}.{table} FORCE ROW LEVEL SECURITY;
+             CREATE POLICY evidence_scope ON {PREVIEW_SCHEMA}.{table} USING ({read}) WITH CHECK ({write});
+             REVOKE ALL ON {PREVIEW_SCHEMA}.{table} FROM PUBLIC;
+             GRANT SELECT,INSERT,UPDATE,DELETE ON {PREVIEW_SCHEMA}.{table} TO \"{role}\";"
+        ))).execute(&mut *tx).await.map_err(database_error)?;
+    }
+    let manifest = schema_manifest(&mut tx).await?;
+    sqlx_core::query::query("UPDATE zuno_enterprise_preview.schema_format SET version=28,source_digest=$1,manifest=$2 WHERE singleton=1")
+        .bind("fc2f9ebc13cb54948703895506f44b6e8146ef7a351748d0888d03757c527ca5").bind(manifest).execute(&mut *tx).await.map_err(database_error)?;
     tx.commit().await.map_err(database_error)
 }

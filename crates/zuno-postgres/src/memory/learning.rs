@@ -186,14 +186,14 @@ impl PostgresLearningRuntime {
                         .await;
                     match result {
                         Ok(true) => inserted += 1,
-                        Ok(false) | Err(Error::Denied | Error::Conflict) => {}
+                        Ok(false) | Err(Error::Denied | Error::Conflict | Error::Capacity) => {}
                         Err(error) => return Err(error),
                     }
                 }
                 if inserted < maximum {
                     match self.refresh_maintenance(&actor, grant).await {
                         Ok(true) => inserted += 1,
-                        Ok(false) | Err(Error::Denied | Error::Conflict) => {}
+                        Ok(false) | Err(Error::Denied | Error::Conflict | Error::Capacity) => {}
                         Err(error) => return Err(error),
                     }
                 }

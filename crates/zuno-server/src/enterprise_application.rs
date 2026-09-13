@@ -1,6 +1,7 @@
 //! Client application routes. No Worker grants, checkpoints or private replay
 //! material are serialized by this module.
 mod learning;
+mod quota;
 mod shared_memory;
 mod skill;
 
@@ -143,6 +144,7 @@ impl EnterpriseApplication {
     fn routes(self) -> Router {
         let mut router = Router::new()
             .route("/identity", get(actor_identity))
+            .route("/quotas", get(quota::get).put(quota::replace))
             .route("/workspaces", get(workspaces))
             .route("/sessions", post(create_session).get(list_sessions))
             .route("/sessions/{session}", get(session))
@@ -635,6 +637,7 @@ impl From<ApplicationError> for Failure {
             ApplicationError::NotFound => StatusCode::NOT_FOUND,
             ApplicationError::Forbidden => StatusCode::FORBIDDEN,
             ApplicationError::Conflict | ApplicationError::LeaseLost => StatusCode::CONFLICT,
+            ApplicationError::QuotaExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             _ => StatusCode::SERVICE_UNAVAILABLE,
         })
     }
@@ -647,6 +650,7 @@ impl IntoResponse for Failure {
             StatusCode::FORBIDDEN => "forbidden",
             StatusCode::NOT_FOUND => "not_found",
             StatusCode::CONFLICT => "conflict",
+            StatusCode::TOO_MANY_REQUESTS => "quota_exceeded",
             _ => "unavailable",
         };
         (self.0, Json(serde_json::json!({"error":error}))).into_response()

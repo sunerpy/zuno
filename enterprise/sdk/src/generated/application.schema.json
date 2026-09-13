@@ -81,6 +81,15 @@
     "propose_skill": {
       "$ref": "#/$defs/ProposeSkill"
     },
+    "quota_policy": {
+      "$ref": "#/$defs/QuotaPolicy"
+    },
+    "quota_snapshot": {
+      "$ref": "#/$defs/QuotaSnapshot"
+    },
+    "replace_quota": {
+      "$ref": "#/$defs/ReplaceQuotaPolicy"
+    },
     "review_shared_memory": {
       "$ref": "#/$defs/ReviewSharedMemory"
     },
@@ -135,6 +144,9 @@
   },
   "required": [
     "actor",
+    "quota_policy",
+    "quota_snapshot",
+    "replace_quota",
     "skill_candidate",
     "propose_skill",
     "review_skill",
@@ -1369,6 +1381,142 @@
         "baselineContent",
         "proposedContent",
         "cases"
+      ]
+    },
+    "QuotaLimits": {
+      "type": "object",
+      "properties": {
+        "childJobs": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 100000,
+          "minimum": 1
+        },
+        "executions": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 1024,
+          "minimum": 1
+        },
+        "learningExecutions": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 128,
+          "minimum": 1
+        },
+        "learningJobs": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 100000,
+          "minimum": 1
+        },
+        "rootJobs": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 100000,
+          "minimum": 1
+        },
+        "rootSessions": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 1000000,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "rootSessions",
+        "rootJobs",
+        "childJobs",
+        "executions",
+        "learningJobs",
+        "learningExecutions"
+      ]
+    },
+    "QuotaPolicy": {
+      "type": "object",
+      "properties": {
+        "limits": {
+          "$ref": "#/$defs/QuotaLimits"
+        },
+        "revision": {
+          "$ref": "#/$defs/Counter"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "revision",
+        "limits"
+      ]
+    },
+    "QuotaResource": {
+      "type": "string",
+      "enum": [
+        "root_sessions",
+        "root_jobs",
+        "child_jobs",
+        "executions",
+        "learning_jobs",
+        "learning_executions"
+      ]
+    },
+    "QuotaSnapshot": {
+      "type": "object",
+      "properties": {
+        "policy": {
+          "$ref": "#/$defs/QuotaPolicy"
+        },
+        "usage": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/QuotaUsage"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "policy",
+        "usage"
+      ]
+    },
+    "QuotaUsage": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "$ref": "#/$defs/Counter"
+        },
+        "resource": {
+          "$ref": "#/$defs/QuotaResource"
+        },
+        "used": {
+          "$ref": "#/$defs/Counter"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "resource",
+        "used",
+        "limit"
+      ]
+    },
+    "ReplaceQuotaPolicy": {
+      "type": "object",
+      "properties": {
+        "expectedRevision": {
+          "$ref": "#/$defs/Counter"
+        },
+        "limits": {
+          "$ref": "#/$defs/QuotaLimits"
+        },
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "requestId",
+        "expectedRevision",
+        "limits"
       ]
     },
     "RequestId": {

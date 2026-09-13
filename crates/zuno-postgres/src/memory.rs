@@ -723,6 +723,7 @@ fn sql_error(error: sqlx_core::Error) -> Error {
 fn app_error(error: ApplicationError) -> Error {
     match error {
         ApplicationError::Unavailable => Error::Unavailable,
+        ApplicationError::QuotaExceeded(_) => Error::Capacity,
         ApplicationError::Forbidden | ApplicationError::NotFound => Error::Denied,
         ApplicationError::Conflict | ApplicationError::LeaseLost => Error::Conflict,
         _ => Error::InvalidData,

@@ -5,6 +5,7 @@ mod children;
 mod concurrency;
 mod import;
 mod live;
+mod quota;
 mod recovery;
 
 use crate::{PostgresBackend, scoped_transaction};
@@ -84,6 +85,7 @@ async fn consume(admin: &PgPool, job: &RuntimeJob) {
         .execute(admin).await.unwrap();
 }
 pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool) {
+    Box::pin(quota::exercise(backend, admin)).await;
     Box::pin(import::exercise(backend, admin)).await;
     for (tenant, subject) in [
         ("runtime-concurrency", "alice"),

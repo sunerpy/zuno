@@ -1,6 +1,7 @@
 import { ActivityClient } from "./client.js";
 import type {
   ActorView, WorkspaceView, SessionPage, SessionSummary, CreateSession, JobView,
+  QuotaPolicy, QuotaSnapshot, ReplaceQuotaPolicy,
   SubmitTurn, InputVersionView, ApprovalView, ApprovalDecision, CancelJob, CancellationReceipt, WorkflowRunView, WorkspaceMergeView, MergeContentSide, BeginWorkspaceImport, WorkspaceImportView,
   LearningJobView, LearningPage, LearningPageRequest, CancelLearning, LearningCancellation,
   WorkspaceEditView, McpCallView,
@@ -11,6 +12,7 @@ import type {
 } from "./generated/application.js";
 import {
   validateActorView, validateWorkspaceView, validateSessionPage, validateSessionSummary, validateJobView,
+  validateQuotaPolicy, validateQuotaSnapshot, validateReplaceQuotaPolicy,
   validateInputVersionView, validateApprovalView, validateCancellationReceipt, validateWorkflowRunView, validateWorkspaceMergeView, validateMergeContentRequest, validateWorkspaceImportView,
   validateLearningJobView, validateLearningPage, validateLearningPageRequest, validateLearningCancellation,
   validateWorkspaceEditView, validateMcpCallView,
@@ -31,6 +33,15 @@ function id(value: string): string {
 }
 
 export class EnterpriseClient extends ActivityClient {
+  async quotas(signal?: AbortSignal): Promise<QuotaSnapshot> {
+    return checked<QuotaSnapshot>(await this.get(new URL("quotas",this.base),signal),validateQuotaSnapshot);
+  }
+  async replaceQuotas(request: ReplaceQuotaPolicy, signal?: AbortSignal): Promise<QuotaPolicy> {
+    if(!validateReplaceQuotaPolicy(request)) throw new Error("Invalid quota replacement");
+    const value=checked<QuotaPolicy>(await this.get(new URL("quotas",this.base),signal,"PUT",request),validateQuotaPolicy);
+    if(BigInt(value.revision)!==BigInt(request.expectedRevision)+1n || Object.entries(request.limits).some(([key,limit])=>value.limits[key as keyof typeof value.limits]!==limit)) throw new Error("Quota revision mismatch");
+    return value;
+  }
   async shareMemoryEvidence(space: string, request: ShareMemoryEvidence, signal?: AbortSignal): Promise<SharedEvidenceGrant> {
     if(!validateShareMemoryEvidence(request)) throw new Error("Invalid shared evidence request");
     const value=checked<SharedEvidenceGrant>(await this.get(new URL(`memory/spaces/${id(space)}/evidence`,this.base),signal,"POST",request),validateSharedEvidenceGrant);

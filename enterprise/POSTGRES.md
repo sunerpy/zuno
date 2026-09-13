@@ -445,3 +445,7 @@ source locators. Content/support/review and revoke/audit/receipt are atomic.
 The exact format-27 source digest is
 `c87cff03b870109f419207512120352792ba605b1979f94be93284f194dd8f31`; injected DDL
 failure preserves the old marker, sessions, messages, Memory and Skill rows.
+
+## Format 29: admission quotas
+
+Persistent organization quota policy, owner audit/receipts and an independent learning dispatch clock are created in the schema transaction. The exact format-28 source digest is `fc2f9ebc13cb54948703895506f44b6e8146ef7a351748d0888d03757c527ca5`. Migration retains shared evidence, Skill installation, sessions, messages and Memory. Default policies are backfilled atomically and new-organization bootstrap inserts one through a schema-owned trigger.
