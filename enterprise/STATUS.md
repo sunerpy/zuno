@@ -501,3 +501,10 @@ Workflow PR #218 initially exposed an arm64 stack overflow in the PostgreSQL con
 - Learning queue/claim/model/retry/settlement transitions publish `SessionItem::Background` with typed extraction/maintenance kind, budget progress and view/cancel actions. The independent activity-session lock orders projection before reading old state. Format 21 preserves the exact format-20 fixture and backfills prior executions transactionally.
 - Real PostgreSQL/HTTPS tests pass isolation, paging, replay, injected projection-failure rollback and late-usage checks. The native five-process fixture passes 46 model requests and verifies learning history, pagination and private-data exclusion. All 23 SDK tests and workspace Clippy pass locally; final shared gates and exact-head CI are still required.
 - English/Chinese application, Memory, activity, migration and runtime guides plus generated schema/TypeScript are updated. This batch has no App/UI delivery. Remaining shared Memory, maintenance wake sources, ACP/TUI and full P6 operational acceptance remain active.
+
+## Private learning CI follow-up
+
+- PR #228 passed all 21 checks in run `34723150742` and merged only into preview at `bbaf1b709dc66251028422826bcdda1d2213fd9b`.
+- PR #229's ancestry synchronization retained the validated source tree. Run `34729620253` passed enterprise Linux amd64/arm64 and all other independent gates, but a personal Windows fixture failed: its shared-memory SQL polling opened a connection during asynchronous journal writing (`SQLITE_LOCKED`).
+- The fixture now waits for a notification emitted after settlement, stops the owned supervisor, and verifies exactly one durable completion and model request. Runtime scheduling and timeouts remain unchanged. All 25 learning runtime tests pass locally; exact-head Windows CI remains required.
+- Documentation impact: this is test synchronization only, with no user-facing behavior or configuration change. UI work remains paused and excluded.
