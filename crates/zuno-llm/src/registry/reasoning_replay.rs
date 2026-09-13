@@ -276,6 +276,12 @@ struct ReplayGroup {
     invalid_envelope: bool,
 }
 
+#[derive(Clone, Copy)]
+enum ReplayGroupSelection {
+    Sealed,
+    Ambiguous,
+}
+
 impl ReplayGroup {
     fn observe(&mut self, index: usize, message: &RequestMessage) {
         let output = assistant_emits_responses_output(message);
@@ -299,10 +305,14 @@ impl ReplayGroup {
         }
     }
 
-    fn take_ambiguous(&mut self) -> Option<(usize, usize)> {
+    fn take_selected(&mut self, selection: ReplayGroupSelection) -> Option<(usize, usize)> {
         let ambiguous =
             self.sealed && (self.messages > 1 || self.distinct_envelopes || self.invalid_envelope);
-        let range = ambiguous.then_some((self.start?, self.last));
+        let selected = match selection {
+            ReplayGroupSelection::Sealed => self.sealed,
+            ReplayGroupSelection::Ambiguous => ambiguous,
+        };
+        let range = selected.then_some((self.start?, self.last));
         *self = Self::default();
         range
     }
@@ -350,12 +360,29 @@ fn has_preceding_responses_boundary(message: &RequestMessage) -> bool {
 }
 
 fn ambiguous_replay_groups(messages: &[RequestMessage]) -> Vec<(usize, usize)> {
+    replay_groups(messages, ReplayGroupSelection::Ambiguous)
+}
+
+/// Maximal Responses assistant-output groups containing replayable sealed reasoning.
+///
+/// Uses the same wire-boundary rules as ambiguity validation. Consumers protecting
+/// history must include adjacent unsealed output: a hook must not turn a valid
+/// sealed group into an ambiguous one and thereby trigger capsule withholding.
+#[must_use]
+pub fn sealed_responses_replay_groups(messages: &[RequestMessage]) -> Vec<(usize, usize)> {
+    replay_groups(messages, ReplayGroupSelection::Sealed)
+}
+
+fn replay_groups(
+    messages: &[RequestMessage],
+    selection: ReplayGroupSelection,
+) -> Vec<(usize, usize)> {
     let mut groups = Vec::new();
     let mut group = ReplayGroup::default();
     let mut system_claimed_as_instructions = false;
     for (index, message) in messages.iter().enumerate() {
         if has_preceding_responses_boundary(message)
-            && let Some(range) = group.take_ambiguous()
+            && let Some(range) = group.take_selected(selection)
         {
             groups.push(range);
         }
@@ -365,19 +392,19 @@ fn ambiguous_replay_groups(messages: &[RequestMessage]) -> Vec<(usize, usize)> {
                 system_claimed_as_instructions = true;
             }
             Role::System | Role::User => {
-                if let Some(range) = group.take_ambiguous() {
+                if let Some(range) = group.take_selected(selection) {
                     groups.push(range);
                 }
             }
             Role::Tool if tool_emits_responses_boundary(message) => {
-                if let Some(range) = group.take_ambiguous() {
+                if let Some(range) = group.take_selected(selection) {
                     groups.push(range);
                 }
             }
             Role::Tool => {}
         }
     }
-    if let Some(range) = group.take_ambiguous() {
+    if let Some(range) = group.take_selected(selection) {
         groups.push(range);
     }
     groups

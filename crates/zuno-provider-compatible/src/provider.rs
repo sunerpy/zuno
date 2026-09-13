@@ -30,11 +30,11 @@ use zuno_llm::registry::{
 };
 use zuno_llm::sse::{SseParser, StreamIdleTimeout};
 
-use crate::family::{self, Profile, UnsupportedProvider};
+use crate::family::{self, Profile, SurfaceRule, UnsupportedProvider};
 use crate::quirks::Quirks;
 use crate::request::{RequestBody, Sampling};
 use crate::stream::SurfaceTranslator;
-use crate::surface::endpoint_path;
+use crate::surface::{endpoint_path, resolve_surface};
 use crate::transport::{HttpRequest, HttpTimeouts, Transport, capture_timeout_phase};
 
 /// The `provider.*.options` key carrying provider-wide capabilities.
@@ -167,8 +167,9 @@ impl CompatibleProvider {
             .base_url
             .clone()
             .ok_or(Declined::Unavailable(Unavailable::IncompleteConfiguration))?;
-        let capabilities = read_capabilities(spec.options.get(CAPABILITIES_OPTION))
+        let mut capabilities = read_capabilities(spec.options.get(CAPABILITIES_OPTION))
             .unwrap_or_else(compatible_default_capabilities);
+        capabilities.default_surface = static_default_surface(profile, &spec);
         let extra_body = spec
             .options
             .get(EXTRA_BODY_OPTION)
@@ -679,6 +680,20 @@ fn unsupported(error: UnsupportedProvider) -> Declined {
     Declined::Failed(ProviderError::fatal(error))
 }
 
+/// Reuse the wire resolver only when its answer is independent of the model id.
+fn static_default_surface(profile: Profile, spec: &Spec) -> ApiSurface {
+    if profile.surface == SurfaceRule::Copilot && spec.surface == ApiSurface::Default {
+        return ApiSurface::Default;
+    }
+    // Fixed profiles and Azure do not inspect the model id. An explicitly pinned
+    // Copilot spec also returns before the resolver's model-dependent branch.
+    match resolve_surface(profile, spec, ApiSurface::Default, "") {
+        // The compatible adapter's SDK-default wire path is chat-completions.
+        ApiSurface::Default => ApiSurface::Chat,
+        surface => surface,
+    }
+}
+
 /// The capability floor for an endpoint whose catalog entry says nothing.
 ///
 /// Chat-completions endpoints universally accept `tools` and `temperature`, and a
@@ -694,6 +709,7 @@ pub const fn compatible_default_capabilities() -> Capabilities {
         prompt_cache: false,
         attachments: false,
         sampling_params: true,
+        default_surface: ApiSurface::Default,
     }
 }
 
@@ -735,6 +751,7 @@ fn read_capabilities(value: Option<&Value>) -> Option<Capabilities> {
         prompt_cache: flag("prompt_cache", default.prompt_cache),
         attachments: flag("attachments", default.attachments),
         sampling_params: flag("sampling_params", default.sampling_params),
+        default_surface: ApiSurface::Default,
     })
 }
 
@@ -1028,6 +1045,87 @@ mod tests {
     #[test]
     fn the_provider_reports_the_identity_it_was_constructed_for() {
         assert_eq!(groq().id(), "groq");
+    }
+
+    #[test]
+    fn static_default_surface_matches_the_resolved_wire_route_and_body() {
+        for (id, configured, use_chat, expected) in [
+            ("groq", ApiSurface::Default, false, ApiSurface::Chat),
+            ("xai", ApiSurface::Default, false, ApiSurface::Responses),
+            // These fixed profiles already pin the SDK surface ahead of the
+            // spec. Metadata must describe that existing route, not change it.
+            ("xai", ApiSurface::Chat, false, ApiSurface::Responses),
+            ("openrouter", ApiSurface::Responses, false, ApiSurface::Chat),
+            ("azure", ApiSurface::Default, false, ApiSurface::Responses),
+            ("azure", ApiSurface::Default, true, ApiSurface::Chat),
+            ("azure", ApiSurface::Chat, false, ApiSurface::Chat),
+            (
+                "openai-compatible",
+                ApiSurface::Responses,
+                false,
+                ApiSurface::Responses,
+            ),
+            ("github-copilot", ApiSurface::Chat, false, ApiSurface::Chat),
+            (
+                "github-copilot",
+                ApiSurface::Responses,
+                false,
+                ApiSurface::Responses,
+            ),
+        ] {
+            let provider = build(
+                Spec::new(id)
+                    .with_base_url("https://example.invalid/v1")
+                    .with_surface(configured)
+                    .with_option("useCompletionUrls", json!(use_chat)),
+            )
+            .expect("provider");
+            assert_eq!(provider.capabilities().default_surface, expected, "{id}");
+            for model in ["gpt-5", "gpt-4o"] {
+                assert_eq!(provider.capabilities_for(model).default_surface, expected);
+                let request = CompletionRequest::new(
+                    model,
+                    vec![zuno_llm::event::Message::new(
+                        zuno_llm::event::Role::User,
+                        "hello",
+                    )],
+                );
+                let http = provider.http_request(&request).expect("request");
+                assert!(http.url.ends_with(endpoint_path(expected)));
+                match expected {
+                    ApiSurface::Responses => {
+                        assert!(http.body["input"].is_array());
+                        assert!(http.body.get("messages").is_none());
+                    }
+                    ApiSurface::Chat => {
+                        assert!(http.body["messages"].is_array());
+                        assert!(http.body.get("input").is_none());
+                    }
+                    _ => unreachable!("fixture uses Responses or Chat"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn model_dependent_defaults_are_not_declared_as_static_responses() {
+        let provider = build(
+            Spec::new("github-copilot")
+                .with_base_url("https://example.invalid/v1")
+                .with_option("capabilities", json!({"default_surface": "responses"})),
+        )
+        .expect("provider");
+        assert_eq!(provider.capabilities().default_surface, ApiSurface::Default);
+        assert!(
+            provider
+                .endpoint("gpt-5", ApiSurface::Default)
+                .ends_with("/responses")
+        );
+        assert!(
+            provider
+                .endpoint("gpt-4o", ApiSurface::Default)
+                .ends_with("/chat/completions")
+        );
     }
 
     #[test]

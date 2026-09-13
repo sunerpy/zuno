@@ -51,6 +51,8 @@ const SESSION_ID: &str = "ses_loop_test";
 mod context_usage_tests;
 #[path = "loop/live_input_gates.rs"]
 mod live_input_gate_tests;
+#[path = "loop/sealed_replay.rs"]
+mod sealed_replay_tests;
 
 #[derive(Debug)]
 struct ScriptedResponse {
