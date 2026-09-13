@@ -116,6 +116,11 @@ pub enum GoalBlockReason {
         /// HTTP status retained from the typed provider error, when available.
         status: Option<u16>,
     },
+    /// A known request-local rejection. It still blocks an owned Goal, but does
+    /// not acquire a persistent gate over an independent ordinary conversation.
+    ProviderRequestRejected {
+        reason: zuno_error::ProviderRequestRejection,
+    },
     /// Durable or streamed turn state violated an internal invariant.
     InvalidTurnState,
     /// Durable storage failed in a way retry cannot repair.
@@ -143,6 +148,7 @@ impl GoalBlockReason {
             Self::ProviderUnsupportedCapability => "provider_unsupported_capability",
             Self::ProviderProtocol => "provider_protocol",
             Self::ProviderFatal { .. } => "provider_fatal",
+            Self::ProviderRequestRejected { .. } => "provider_request_rejected",
             Self::InvalidTurnState => "invalid_turn_state",
             Self::DatabasePermanent => "database_permanent",
             Self::HookPermanent => "hook_permanent",
@@ -163,6 +169,9 @@ impl GoalBlockReason {
             }
             Self::ProviderProtocol => "the provider violated the required response protocol",
             Self::ProviderFatal { .. } => "the provider returned a non-recoverable failure",
+            Self::ProviderRequestRejected { .. } => {
+                "the provider rejected this request; do not retry it unchanged"
+            }
             Self::InvalidTurnState => "the turn violated a durable or streamed state invariant",
             Self::DatabasePermanent => "durable storage failed in a non-recoverable way",
             Self::HookPermanent => "a request hook failed permanently",

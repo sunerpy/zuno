@@ -1017,26 +1017,34 @@ async fn invalid_question_definitions_do_not_publish_a_successful_receipt_or_inb
 #[tokio::test]
 async fn child_attempts_cannot_publish_clarifications_required_input_or_plan_approval() {
     let fixture = QuestionFixture::new();
-    let tools: Vec<(Arc<dyn Tool>, Value)> = vec![
+    let tools: Vec<(Arc<dyn Tool>, Value, bool)> = vec![
         (
             erase(QuestionTool::new(fixture.shared_port())),
             one_question(),
+            true,
         ),
         (
             erase(QuestionTool::asynchronous(fixture.shared_port())),
             one_question(),
+            true,
         ),
         (
             erase(QuestionTool::for_work(fixture.shared_port())),
             one_question(),
+            true,
         ),
         (
             erase(QuestionTool::required(fixture.shared_port())),
             one_question(),
+            false,
         ),
-        (erase(PlanExitTool::new(fixture.shared_port())), json!({})),
+        (
+            erase(PlanExitTool::new(fixture.shared_port())),
+            json!({}),
+            false,
+        ),
     ];
-    for (tool, args) in tools {
+    for (tool, args, clarification) in tools {
         let error = tool
             .invoke(
                 args,
@@ -1044,7 +1052,21 @@ async fn child_attempts_cannot_publish_clarifications_required_input_or_plan_app
             )
             .await
             .expect_err("children cannot ask their own human questions");
-        assert!(matches!(error, ToolError::Denied { .. }));
+        if clarification {
+            let ToolError::Failed { source, .. } = error else {
+                panic!("ordinary child questions must retain a typed ownership rejection");
+            };
+            assert!(matches!(
+                source.downcast_ref::<QuestionError>(),
+                Some(QuestionError::Rejected {
+                    code: "root_question_required",
+                    ..
+                })
+            ));
+            assert!(source.to_string().contains("parent agent"));
+        } else {
+            assert!(matches!(error, ToolError::Denied { .. }));
+        }
     }
     assert!(fixture.port.opened().is_empty());
     assert_no_questions(&fixture).await;

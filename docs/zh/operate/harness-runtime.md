@@ -56,6 +56,29 @@ Unicode 字符；嵌套错误不借用同名顶层说明，新增提示不复制
 或输出路径。评审保留稳定 finding ID、证据和处置，修复后复查变更与受影响路径，不设固定
 评审轮数上限。这些是提示词指导，不增加工具硬门禁。
 
+实施 Agent 自行决定任务范围内的技术实现，包括修复自己引入的问题、补齐产物流及修正
+验收失败；存在多种实现不等于必须询问。明确的“只验证、不改代码”仍然有效。
+子代理把跨模块取舍交给主 Agent；只有缺少用户专属信息、改变目标、增加对外影响或
+改变保护／授权时，主 Agent 才向用户询问。负向安全检查通过不等于正向交付成功。
+
+原生 `task_context` 工具有界保存长任务理解：目标、交付／检查意图、动作摘要、禁止事项、
+真实用户消息来源、决策归属、阻塞，以及分别记录的交付／安全检查。
+`session.task_context.updated.1` 保存带 revision 检查与幂等键的快照；更新保留省略字段，
+合并约束和检查，切换任务须显式 replace。验收定义修订须显式关联用户来源，并重置检查
+状态和证据。来源同时绑定消息元数据及全部持久输入部分摘要（含附件引用），变更或
+丢失时投影仅作历史参考。更新后刷新 `runtime.task_context`，重启时重新加载。
+它是 Agent 维护的理解，不是权限授予、宿主验收认证、Goal 恢复或自动唤醒。
+交付完成除全部已有检查通过并附证据引用外，还必须有正向交付检查通过。
+普通 final 仍结束当前周期，不因这份上下文存在未完成事项而强制续跑。
+
+设计对照固定在 Codex `9ba1d9eb5bbbd87ba2fc528d91ad239eea975ee9`：
+`codex-rs/core/gpt_5_2_prompt.md` 的端到端任务责任、
+`core/src/tools/handlers/request_user_input.rs` 的根会话提问与 Plan 阻塞边界，
+以及 `tui/src/bottom_pane/request_user_input/mod.rs` 的 60 秒宽限加 60 秒倒计时、
+交互暂停和空答案自动结束（后两路径同样相对 `codex-rs/`）。
+Zuno 将这些边界适配到 QuestionPort 和持久事件；`task_context`、来源摘要及交付检查
+校验是 Zuno 的接入设计，不声称 Codex 存在同名工具，也不替代原生授权和执行门禁。
+
 ### 提问、批准与会话调度
 
 `QuestionPort` 将发布、查询、回答、等待分离；`QuestionService` 在同一事务中维护请求
@@ -67,6 +90,17 @@ Work／Goal 的可选问题使用 deferred 投递，`question_async` 同样不�
 续跑，也不禁止新输入；等待权威是 runtime execution wait reference。
 TUI 用 Ctrl+S 选择稍后；`/questions` 列出可回答表单和已关闭但仍待投递的状态行，只重开
 可回答表单。高亮、空输入、取消都不是批准。
+
+原本以 deferred 投递的普通澄清问题持久保存 120 秒自动延后期限；TUI、ACP、HTTP
+宿主持有原生计时驱动，重连／重启后读取问题也会核对过期状态。
+到期记录 `question.auto_deferred`，更新 `QuestionView.autoDefer` 的 `deadlineAt`
+和 `armed|snoozed|deferred` 状态，不生成答案或 inbox 输入，之后仍可回答。
+TUI 开始交互后暂停自动收起，高亮项不会因超时被选中。同步阻塞澄清、必需输入、
+Plan 批准、Goal 恢复没有此期限；旧问题没有期限元数据时保持不变。
+ACP 迟答仅可跨越显示 revision 的精确自动延后后继，不能覆盖已变更的草稿、答案或授权。
+问题展示限定在绑定会话及其子会话；通知不能把另一个根会话加入展示范围。
+TUI 和 HTTP 事件转发同时核对持久状态与本地通知，避免漏掉其他服务实例已提交的延后。
+HTTP SSE 的实时和有界补发路径均包含 `question.auto_deferred`，保留原事件身份。
 
 `QuestionView.delivery` 从关联输入回执派生，不是第二份持久 question 状态：
 
@@ -355,6 +389,24 @@ ID、准入序号和预期 revision。`session.input.delivery_batch.1` 的状态
 也不会授权旧周期 callback。
 
 ### 单条旧误阻塞输入的显式修复
+
+已分类的 HTTP 400 `reasoning_replay_context_mismatch` 只终结独立普通请求的工作周期，
+不会锁住之后的新用户输入。它仍是不可原样重试的失败：不会自动重投、更改回放密文，
+也不会让迟到报告复活旧周期。属于活跃 Goal 的失败仍由该 Goal 记录阻塞；认证、
+未知永久错误、协议／配置错误、预算、审批和未知副作用保护保持原有边界。
+该行为参考 Codex `9ba1d9eb5bbbd87ba2fc528d91ad239eea975ee9` 的
+`codex-rs/core/src/session/turn_input.rs` 中 User／Automatic／Recovery 分离，
+不是将所有 HTTP 400 当成可重试错误。
+
+安装二进制不会自动清除旧门禁。有界修复除了旧重试耗尽缺陷，还可以核验这一确切的
+请求拒绝链，范围限于此前经审计的旧误阻塞修复所建立的 recovery 周期；必须同时匹配原生失败结算和请求
+诊断。只恢复后续那条 recorded、从未绑定的新输入。旧失败输入即使没有 `appliedAt`，
+也不能重置终态回执或重投。
+连续继承同一门禁时，最多逐层核验 16 条中间输入的周期归属和六事件准入链，
+要求从未绑定执行、执行 revision 逐次递增，再重新核验最初被拒绝的恢复请求。
+中间周期只能增加由下一次已证明准入所保存的 scheduling 快照；任何夹入的执行、控制、
+未知事件版本、等待条件变化或证据缺失都会拒绝修复。只重新绑定选中的最新输入，
+更早的输入原样保留，并通过 `inheritedInputIds` 记录在修复证据中。
 
 命令使用当前配置指向的既有数据库和确切的 session／input ID。默认只读检查，不创建或
 迁移数据库；将 `N` 替换为检查返回的正整数 `expectedRevision`：
@@ -714,6 +766,30 @@ canonical workspace、完整解析后的目标、schema／参数摘要及原 par
 结算完成，前端断线也不能提前释放；模型调用仍须匹配活跃 turn。原生检查可以读取已停周期，
 但不会重新打开它。report-delivery alias 不授予工具调用权限。缺少原生记录的旧调用、
 Shell 和远程操作失败关闭。检查保留原 uncertain outcome，不授权重放或自动恢复。
+
+不可重放工具（含远程 MCP 调用）返回类型化 timeout、network-timeout 或 transient
+错误时，也会形成逐调用的 `lost_outcome` 未决记录，而不是进入重试队列。同名工具后来
+成功不能消除较早调用的检查义务；明确允许安全重放的工具仍使用退避。经预算接口返回的
+未知结果停止仍保留 `uncertain_side_effect`，不会误标为 `turn_budget` 耗尽。
+
+对于 Goal 已因未知结果暂停、却缺少结构化调用记录的旧会话，`/inspect-outcome` 返回
+`goalPause` 和 `legacyUncertaintyWithoutCallRecords: true`；`pending` 为空不代表已经安全。
+新生成的输入门禁诊断可根据类型化 Goal 暂停原因解释旧的笼统 `blocked`，但不修改执行
+门禁、不恢复 Goal，也不重写已有的冻结回执。远程状态仍需权威核验，不能用重发消息、
+重启或通用数据库修复来代替。
+
+未知结果暂停下，真实的新用户消息可以进入**禁用全部工具的讨论回合**。原生会话服务
+核验输入、门禁 revision、独立周期、Goal 和其他保护条件后，原子绑定一次回合并记录
+`session.discussion.started.1`；不会更改原执行暂停或 Goal。引擎在请求 hook 后清除当前
+工具声明，同时保留历史调用和密封回放；模型若尝试调用工具，在进入 dispatcher 前即失败。
+宿主跳过 Work 前置处理、按消息加载 skill、Plan 对账和 Goal 自动续跑，仍使用现有模型与
+回合预算检查。可解释和提供方案，不可编辑文件、操作浏览器、调用 MCP 或委派任务。
+认证、待决审批、Plan 授权、已耗尽／未知的 Goal 预算及明确 turn-budget 门禁仍然阻塞。
+
+ACP 重新打开会话后，也可认领最新一条已 consumed、从未绑定回合的用户咨询。不会重插入
+原文或重跑 failed／applied 输入。回执 applied／completed 只表示这次讨论已进入模型并完成，
+不表示原未知结果已核验。宿主输入 ID 与转录 message ID 通过持久映射关联，不按文本去重，
+也不假设 ID 前缀。未决绘图等工作仍须按原生安全流程核验后，才能显式恢复。
 
 读取或记账 Goal 预算时遇到 SQLite 争用（`SQLITE_BUSY`）会持久化一次 `database_busy` 指数退避重试，Goal 保持活跃，而不是以 `turn_budget` 暂停；其他数据库失败仍以 `usage_unknown` 停止回合并暂停 Goal；本构建无法读取的持久状态仍然阻塞。CLI 回合中的 Plan 对账驱动、human request 创建与重试上下文压缩标记路径也经同一 `GoalTerminalFailure::from_db_error` 规则分类：争用现在以 `database_busy` 重试，过去则以 `host_permanent` 阻塞。
 

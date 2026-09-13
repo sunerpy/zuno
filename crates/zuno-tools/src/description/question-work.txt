@@ -3,8 +3,13 @@ materially improves the outcome and cannot be discovered from available evidence
 The question is durable and this tool returns a receipt immediately, without waiting
 for a human or pausing Work/Goal execution. Continue independent work and state any
 assumptions; the user may answer later or skip the question.
+An unattended ordinary question is automatically deferred after 120 seconds.
+Actual user interaction snoozes that deadline. Deferral preserves the question
+and drafts for a later explicit answer; it does not select the recommended option
+or trigger another model turn.
 
 Usage notes:
+- Only the root agent asks ordinary user questions. A child returns the required decision and evidence to its parent; it does not ask the user directly.
 - Prefer one concise question and ask no more than three at once
 - Provide 2-3 mutually exclusive options; set `multiple: true` only when combinations are meaningful
 - Put a recommended option first and suffix its label with "(Recommended)"

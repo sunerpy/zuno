@@ -200,6 +200,14 @@ retain their typed controls and identity/revision checks. Older pending forms an
 unfinished Plans alone neither authorize continuation nor prevent new input:
 the runtime execution wait reference is the authority.
 
+Ordinary deferred clarifications expose `_meta.zuno.autoDefer` with
+`deadlineAt` and `state` (`armed`, `snoozed`, or `deferred`). After 120 seconds,
+the native service defers the form without selecting an option, submitting an
+answer, or stopping the Agent. A late reply is still accepted; the adapter only
+rebases across the exact automatic-deferral revision, never another user's
+answer or draft. Blocking questions, required input, Plan approval, and Goal
+resume do not auto-resolve. No reply means no consent.
+
 `QuestionView.delivery` is derived from input receipts, with phases
 `WaitingAnswer` (`waiting_answer`), `AnsweredPendingDelivery`
 (`answered_pending_delivery`) and `Applied` (`applied`). Question lists may include
@@ -304,6 +312,22 @@ has a `recorded` receipt and was never applied/bound to a provider turn is eligi
 Ambiguous or missing native evidence, stale revisions, competing work, real
 protected gates and uncertain effects are refused. Old `failed`, `cancelled`,
 `applied` or `completed` receipts are not reopened.
+
+Do not treat every `blocked` receipt as the same defect. A Goal paused with
+`uncertain_side_effect` may represent an MCP mutation that timed out after it
+changed remote state. New gate diagnostics report `inspect_outcome` and the
+Goal's identity when that typed legacy pause is available; no safety gate is
+cleared. `/inspect-outcome` lists recorded obligations, or explicitly reports
+`legacyUncertaintyWithoutCallRecords` when old records cannot identify them.
+The native file inspector does not verify Penpot, browser or other remote state.
+Neither restart nor `session repair` substitutes for that inspection.
+
+New user messages may receive text-only discussion while an uncertainty gate is
+retained. Zuno emits `discussion.tools_disabled`; all tool execution is disabled
+in the engine, including calls invented by the model or introduced by hooks.
+This does not resume the Goal. On reopen, the latest saved, never-applied user
+question can be claimed once through the same native path; do not resend it.
+Other authentication, approval and budget gates are not bypassed.
 
 Apply queues one audited recovery control and preserves the original consumed
 input and its visible gate until real execution binds it. It does not requeue or

@@ -5,6 +5,27 @@ use crate::source::BoxSource;
 use std::fmt;
 use std::time::Duration;
 
+/// A known request-local rejection. It forbids retrying the unchanged request,
+/// but is not evidence that an ordinary conversation must remain locked.
+/// Authentication, unknown codes and protocol violations are deliberately absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderRequestRejection {
+    ReasoningReplayContextMismatch,
+}
+
+impl ProviderRequestRejection {
+    #[must_use]
+    pub fn from_wire(status: u16, code: &str) -> Option<Self> {
+        match (status, code) {
+            (400, "reasoning_replay_context_mismatch") => {
+                Some(Self::ReasoningReplayContextMismatch)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// A structured provider stream failure that may be replayed as a replacement attempt.
 ///
 /// These codes are emitted only after the HTTP response has started, so no status
@@ -313,6 +334,25 @@ pub enum ProviderError {
 }
 
 impl ProviderError {
+    /// Classify the scope of a recognized rejection, not its retryability.
+    /// The variant and captured wire status must agree. Never inspect prose or
+    /// infer a request-local failure from a bare HTTP 400.
+    #[must_use]
+    pub fn request_rejection(&self) -> Option<ProviderRequestRejection> {
+        let Self::Fatal {
+            status: Some(status),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let wire = self.captured_diagnostic()?;
+        if wire.status != Some(*status) {
+            return None;
+        }
+        ProviderRequestRejection::from_wire(*status, wire.code.as_deref()?)
+    }
+
     /// Bounded diagnostic text, never a recovery classifier.
     /// Causes retain the provider's actual reason instead of only the taxonomy label.
     #[must_use]
@@ -837,6 +877,68 @@ impl Recoverable for ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_rejection_requires_matching_typed_http_evidence_and_never_retries() {
+        let code = "reasoning_replay_context_mismatch";
+        let rejected = ProviderError::from_status("fixture", 400).with_http_diagnostic(
+            400,
+            Some(code),
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(
+            rejected.request_rejection(),
+            Some(ProviderRequestRejection::ReasoningReplayContextMismatch)
+        );
+        assert_eq!(rejected.recovery(), Recovery::Fail);
+        for error in [
+            ProviderError::from_status("fixture", 400),
+            ProviderError::from_status("fixture", 400).with_http_diagnostic(
+                400,
+                None,
+                None,
+                Some(code),
+                &[],
+            ),
+            ProviderError::from_status("fixture", 400).with_http_diagnostic(
+                400,
+                Some("invalid_model"),
+                None,
+                Some(code),
+                &[],
+            ),
+            ProviderError::from_status("fixture", 400).with_http_diagnostic(
+                401,
+                Some(code),
+                None,
+                None,
+                &[],
+            ),
+            ProviderError::from_status("fixture", 401).with_http_diagnostic(
+                400,
+                Some(code),
+                None,
+                None,
+                &[],
+            ),
+            ProviderError::from_status("fixture", 503).with_http_diagnostic(
+                400,
+                Some(code),
+                None,
+                None,
+                &[],
+            ),
+            ProviderError::Protocol {
+                code: ProviderProtocolFailure::UpstreamInvalidState,
+                source: None,
+            }
+            .with_http_diagnostic(400, Some(code), None, None, &[]),
+        ] {
+            assert_eq!(error.request_rejection(), None);
+        }
+    }
 
     #[test]
     fn redaction_preserves_nested_wire_metadata_and_unknown_phase() {

@@ -60,6 +60,65 @@ fn input(id: &str, text: &str, delivery: InputDelivery, time: i64) -> NewSession
 }
 
 #[test]
+fn user_message_identity_resolves_native_payload_without_text_deduplication() {
+    let pool = initialized(&DbLocation::Memory);
+    let inbox = SessionInbox::new(pool.clone());
+    for (id, message_id) in [("native-a", "message-a"), ("native-b", "message-b")] {
+        inbox
+            .admit(NewSessionInput::new(
+                id,
+                SESSION_ID,
+                json!({"message":{"id":message_id,"role":"user"},"parts":[]}),
+                InputDelivery::Queue,
+                2,
+            ))
+            .unwrap();
+    }
+    inbox
+        .admit(NewSessionInput::new(
+            "message-c",
+            SESSION_ID,
+            json!({"kind":"acpPrompt","text":"same question"}),
+            InputDelivery::Queue,
+            3,
+        ))
+        .unwrap();
+    let connection = pool.get().unwrap();
+    for (message_id, expected) in [
+        ("message-a", "native-a"),
+        ("message-b", "native-b"),
+        ("message-c", "message-c"),
+    ] {
+        assert_eq!(
+            zuno_db::inbox::input_for_message_in(&connection, SESSION_ID, message_id)
+                .unwrap()
+                .unwrap()
+                .id,
+            expected
+        );
+    }
+    assert!(
+        zuno_db::inbox::input_for_message_in(&connection, "other-session", "message-a")
+            .unwrap()
+            .is_none()
+    );
+    drop(connection);
+    inbox
+        .admit(NewSessionInput::new(
+            "ambiguous",
+            SESSION_ID,
+            json!({"message":{"id":"message-a","role":"user"}}),
+            InputDelivery::Queue,
+            4,
+        ))
+        .unwrap();
+    assert!(
+        zuno_db::inbox::input_for_message_in(&pool.get().unwrap(), SESSION_ID, "message-a")
+            .is_err()
+    );
+}
+
+#[test]
 fn admission_commits_the_event_and_pending_input_together() {
     let pool = initialized(&DbLocation::Memory);
     let inbox = SessionInbox::new(Arc::clone(&pool));

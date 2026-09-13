@@ -2,6 +2,7 @@ use super::*;
 use crate::{migration, session};
 use zuno_paths::DbLocation;
 use zuno_types::execution::TurnExecutionIdentity;
+use zuno_types::question::QuestionOption;
 
 const SESSION: &str = "ses_question";
 
@@ -132,6 +133,352 @@ fn input_prompt(pool: &Pool, receipt: &QuestionReceipt) -> Value {
         )
         .expect("input");
     serde_json::from_str(&prompt).expect("prompt")
+}
+
+fn expire(pool: &Pool, at: i64) -> Vec<QuestionReceipt> {
+    pool.try_transaction(|tx| auto_defer_due_in(tx, Some(SESSION), at))
+        .expect("native deadline reconciliation")
+}
+
+#[test]
+fn scoped_deadlines_include_descendants_but_never_another_root_or_required_input() {
+    let (pool, store) = fixture();
+    for (id, parent) in [
+        ("ses_child", Some(SESSION)),
+        ("ses_grandchild", Some("ses_child")),
+        ("ses_foreign", None),
+    ] {
+        let mut create =
+            session::SessionCreate::new(id, id, "project", "/workspace", "/workspace", id, "test");
+        if let Some(parent) = parent {
+            create = create.with_parent(parent);
+        }
+        session::Store::new(pool.as_ref())
+            .create(&create)
+            .expect("session");
+    }
+    for owner in [SESSION, "ses_child", "ses_grandchild", "ses_foreign"] {
+        let mut definition = spec();
+        definition.origin.session_id = owner.to_owned();
+        pool.try_transaction(|tx| create_in(tx, &format!("que_{owner}"), &definition, 10))
+            .expect("optional request");
+    }
+    let mut required = spec();
+    required.origin.session_id = "ses_child".to_owned();
+    required.purpose = QuestionPurpose::RequiredInput;
+    required.mode = QuestionMode::Blocking;
+    let required = pool
+        .try_transaction(|tx| create_in(tx, "que_required", &required, 10))
+        .expect("required request")
+        .question;
+    let scope = presentation_sessions_in(&pool.get().expect("connection"), SESSION).expect("scope");
+    assert_eq!(
+        scope.into_iter().collect::<std::collections::BTreeSet<_>>(),
+        [SESSION, "ses_child", "ses_grandchild"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    );
+    let deferred = expire(&pool, 120_010);
+    assert_eq!(deferred.len(), 3);
+    assert!(
+        deferred
+            .iter()
+            .all(|receipt| receipt.question.is_auto_deferred()
+                && receipt.question.answers.is_empty()
+                && receipt.input_id.is_none())
+    );
+    assert_eq!(
+        store
+            .get("ses_foreign", "que_ses_foreign")
+            .expect("foreign")
+            .revision,
+        1
+    );
+    assert_eq!(
+        store.get("ses_child", &required.id).expect("required"),
+        required
+    );
+    assert_eq!(inbox_count(&pool), 0);
+}
+
+#[test]
+fn ordinary_deadline_defers_once_without_selecting_an_option_or_admitting_input() {
+    let (pool, store) = fixture();
+    let mut spec = spec();
+    spec.questions = vec![QuestionRequest::closed(
+        "Which implementation?",
+        "Approach",
+        vec![QuestionOption::new(
+            "recommended",
+            "A suggestion, never a default answer",
+        )],
+    )];
+    let opened = create(&pool, &spec);
+    let deadline = opened.time_created + QUESTION_AUTO_DEFER_MS;
+    assert_eq!(
+        opened.auto_defer.as_ref().expect("timer").deadline_at,
+        deadline
+    );
+    assert!(expire(&pool, deadline - 1).is_empty());
+    let deferred = expire(&pool, deadline).pop().expect("one transition");
+    assert!(deferred.question.is_auto_deferred());
+    assert_eq!(deferred.question.revision, opened.revision + 1);
+    assert_eq!(deferred.question.state, QuestionState::Pending);
+    assert!(deferred.question.answers.is_empty());
+    assert!(deferred.input_id.is_none());
+    assert_eq!(inbox_count(&pool), 0);
+    assert!(expire(&pool, deadline + 60_000).is_empty());
+    assert_eq!(store.pending(SESSION).expect("late-answer list").len(), 1);
+    let resolved: Option<i64> = pool
+        .get()
+        .expect("connection")
+        .query_row(
+            "SELECT time_resolved FROM human_request WHERE id=?1",
+            [&opened.id],
+            |row| row.get(0),
+        )
+        .expect("lifecycle");
+    assert_eq!(resolved, None, "deferral must not close the question");
+}
+
+#[test]
+fn timeout_late_answer_and_reconnect_are_revision_checked_and_admitted_once() {
+    let (pool, store) = fixture();
+    let mut spec = spec();
+    spec.questions.truncate(1);
+    let opened = create(&pool, &spec);
+    let deadline = opened.time_created + QUESTION_AUTO_DEFER_MS;
+    let old = answer("late-answer", opened.revision, "q1", "linux");
+    let deferred = expire(&pool, deadline).pop().expect("timeout").question;
+    assert!(matches!(
+        store.apply(SESSION, &opened.id, &old, deadline + 1),
+        Err(QuestionError::Conflict { .. })
+    ));
+    assert_eq!(
+        inbox_count(&pool),
+        0,
+        "a stale form is not silently rebound"
+    );
+    let command = answer("late-answer", deferred.revision, "q1", "linux");
+    let answered = store
+        .apply(SESSION, &opened.id, &command, deadline + 2)
+        .expect("explicit refreshed late answer");
+    assert_eq!(answered.question.state, QuestionState::Answered);
+    assert!(
+        matches!(
+            store.apply(SESSION, &opened.id, &old, deadline + 3),
+            Err(QuestionError::CommandConflict { .. })
+        ),
+        "the same pre-timeout key proves a stored adapted receipt, never a new write"
+    );
+    let reopened = QuestionStore::new(Arc::clone(&pool));
+    let duplicate = reopened
+        .apply(SESSION, &opened.id, &command, deadline + 3)
+        .expect("retry");
+    assert!(duplicate.duplicate);
+    assert_eq!(duplicate.input_id, answered.input_id);
+    assert_eq!(inbox_count(&pool), 1);
+    assert!(expire(&pool, deadline + 4).is_empty());
+}
+
+#[test]
+fn interaction_snoozes_without_answer_and_drafts_survive_restart() {
+    let (pool, store) = fixture();
+    let opened = create(&pool, &spec());
+    let snooze = command("interaction", opened.revision, QuestionAction::Snooze);
+    let interacted = store
+        .apply(SESSION, &opened.id, &snooze, 100)
+        .expect("interaction");
+    assert_eq!(
+        interacted.question.revision, opened.revision,
+        "typing must not invalidate the displayed answer contract"
+    );
+    assert_eq!(
+        interacted
+            .question
+            .auto_defer
+            .as_ref()
+            .expect("timer")
+            .state,
+        QuestionAutoDeferState::Snoozed
+    );
+    assert!(interacted.question.answers.is_empty());
+    assert_eq!(inbox_count(&pool), 0);
+    let saved = store
+        .apply(
+            SESSION,
+            &opened.id,
+            &command(
+                "draft",
+                interacted.question.revision,
+                QuestionAction::Defer {
+                    draft_answers: draft(&[("q1", &["draft only"])]),
+                },
+            ),
+            101,
+        )
+        .expect("save draft");
+    assert!(expire(&pool, 1_000_000).is_empty());
+    let restarted = QuestionStore::new(Arc::clone(&pool));
+    assert_eq!(
+        restarted.get(SESSION, &opened.id).expect("restore"),
+        saved.question
+    );
+    assert!(saved.question.answers.is_empty());
+    assert_eq!(saved.question.draft_answers["q1"], ["draft only"]);
+    assert_eq!(inbox_count(&pool), 0);
+}
+
+#[test]
+fn explicit_answer_winning_deadline_race_cannot_be_reopened_by_timeout() {
+    let (pool, store) = fixture();
+    let mut spec = spec();
+    spec.questions.truncate(1);
+    let opened = create(&pool, &spec);
+    let deadline = opened.time_created + QUESTION_AUTO_DEFER_MS;
+    let answered = store
+        .apply(
+            SESSION,
+            &opened.id,
+            &answer("first", opened.revision, "q1", "macos"),
+            deadline,
+        )
+        .expect("answer wins transaction ordering");
+    assert!(expire(&pool, deadline).is_empty());
+    assert_eq!(
+        store.get(SESSION, &opened.id).expect("read"),
+        answered.question
+    );
+    assert_eq!(inbox_count(&pool), 1);
+}
+
+#[test]
+fn blocking_and_required_questions_never_gain_auto_defer_even_after_manual_defer() {
+    for (mode, purpose) in [
+        (QuestionMode::Blocking, QuestionPurpose::Clarification),
+        (QuestionMode::Blocking, QuestionPurpose::RequiredInput),
+        (QuestionMode::Deferred, QuestionPurpose::RequiredInput),
+    ] {
+        let (pool, store) = fixture();
+        let mut spec = spec();
+        spec.mode = mode;
+        spec.purpose = purpose;
+        let opened = create(&pool, &spec);
+        assert!(opened.auto_defer.is_none());
+        assert!(matches!(
+            store.apply(
+                SESSION,
+                &opened.id,
+                &command("no-timer", 1, QuestionAction::Snooze),
+                100
+            ),
+            Err(QuestionError::Rejected {
+                code: "question_timer_unavailable",
+                ..
+            })
+        ));
+        let deferred = store
+            .apply(
+                SESSION,
+                &opened.id,
+                &command(
+                    "manual",
+                    1,
+                    QuestionAction::Defer {
+                        draft_answers: Default::default(),
+                    },
+                ),
+                101,
+            )
+            .expect("manual defer");
+        assert!(expire(&pool, 1_000_000).is_empty());
+        assert!(deferred.question.auto_defer.is_none());
+        assert_eq!(
+            store.get(SESSION, &opened.id).expect("read"),
+            deferred.question
+        );
+        assert_eq!(inbox_count(&pool), 0);
+    }
+}
+
+#[test]
+fn plan_authorization_and_goal_resume_cannot_auto_approve() {
+    for purpose in [
+        QuestionPurpose::PlanAuthorization,
+        QuestionPurpose::GoalResume,
+    ] {
+        let (pool, store) = fixture();
+        let mut spec = spec();
+        spec.purpose = purpose;
+        match purpose {
+            QuestionPurpose::PlanAuthorization => {
+                spec.plan = Some(PlanQuestionBinding {
+                    plan_id: "plan_exact".to_owned(),
+                    plan_revision: 1,
+                    source_cycle_id: None,
+                    title: "Explicit approval".to_owned(),
+                    completed_steps: 1,
+                    total_steps: 1,
+                    work_identity: TurnExecutionIdentity::new("build", "test", "model"),
+                    review_gate: json!({"status": "not_required"}),
+                });
+            }
+            QuestionPurpose::GoalResume => {
+                use zuno_types::goal_resume::{KEEP_GOAL_PAUSED_CHOICE, RESUME_GOAL_CHOICE};
+                spec.origin.goal_id = Some("goal-paused".to_owned());
+                spec.expected_goal_revision = Some(1);
+                spec.questions = vec![QuestionRequest::closed(
+                    "Resume the paused Goal?",
+                    "Goal",
+                    vec![
+                        QuestionOption::new(RESUME_GOAL_CHOICE, "Resume"),
+                        QuestionOption::new(KEEP_GOAL_PAUSED_CHOICE, "Leave paused"),
+                    ],
+                )];
+            }
+            _ => unreachable!("test cases"),
+        }
+        let opened = create(&pool, &spec);
+        assert!(opened.auto_defer.is_none());
+        assert!(expire(&pool, 1_000_000).is_empty());
+        assert_eq!(store.get(SESSION, &opened.id).expect("unchanged"), opened);
+        assert!(opened.answers.is_empty());
+        assert!(opened.decision.is_none());
+        assert_eq!(inbox_count(&pool), 0);
+    }
+}
+
+#[test]
+fn old_timerless_definition_stays_timerless_and_does_not_auto_resolve() {
+    let (pool, store) = fixture();
+    let opened = create(&pool, &spec());
+    pool.get().expect("connection").execute(
+        "UPDATE question_interaction SET definition=json_remove(definition,'$.autoDefer') WHERE request_id=?1",
+        [&opened.id],
+    ).expect("exact old JSON shape");
+    let old = store
+        .get(SESSION, &opened.id)
+        .expect("decode previous shape");
+    assert!(old.auto_defer.is_none());
+    assert!(expire(&pool, 1_000_000).is_empty());
+    assert_eq!(store.get(SESSION, &opened.id).expect("read"), old);
+}
+
+#[test]
+fn rolled_back_timeout_does_not_lose_the_deadline_or_change_answers() {
+    let (pool, store) = fixture();
+    let opened = create(&pool, &spec());
+    let result: QuestionResult<()> = pool.try_transaction(|tx| {
+        assert_eq!(auto_defer_due_in(tx, Some(SESSION), 1_000_000)?.len(), 1);
+        Err(QuestionError::Invalid(
+            "rollback injected after transition".to_owned(),
+        ))
+    });
+    assert!(result.is_err());
+    assert_eq!(store.get(SESSION, &opened.id).expect("read"), opened);
+    assert_eq!(expire(&pool, 1_000_000).len(), 1);
+    assert_eq!(inbox_count(&pool), 0);
 }
 
 #[test]

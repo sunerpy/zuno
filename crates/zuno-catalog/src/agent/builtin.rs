@@ -432,6 +432,7 @@ impl Builtin {
             "orchestrator" => vec![
                 ("plan_enter", allow()),
                 ("task", allow()),
+                ("task_context", allow()),
                 ("plan_get", allow()),
                 ("plan_update", allow()),
                 ("todo_get", allow()),
@@ -440,6 +441,7 @@ impl Builtin {
             "build" => vec![
                 ("task", deny()),
                 ("job", deny()),
+                ("task_context", allow()),
                 ("plan_enter", allow()),
                 ("plan_get", allow()),
                 ("plan_update", allow()),
@@ -459,6 +461,7 @@ impl Builtin {
                 ("question", allow()),
                 ("plan_exit", allow()),
                 ("goal_get", allow()),
+                ("task_context", allow()),
                 ("plan_get", allow()),
                 ("plan_update", allow()),
                 ("todo_get", allow()),
@@ -510,6 +513,7 @@ impl Builtin {
                 ("goal_propose", allow()),
                 ("goal_update", allow()),
                 ("goal_request_input", allow()),
+                ("task_context", allow()),
                 ("plan_get", allow()),
                 ("plan_update", allow()),
                 ("todo_get", allow()),
@@ -906,6 +910,24 @@ mod tests {
                 "review is read-only, so `{tool}` must stay withheld"
             );
         }
+    }
+
+    /// Durable context must be reachable without broadening workspace permissions.
+    #[test]
+    fn primary_task_owners_can_maintain_source_linked_context() {
+        for name in ["orchestrator", "build", "deep", "plan"] {
+            assert!(
+                is_tool_visible(
+                    "task_context",
+                    &effective_rules(&get(name).expect("primary agent"))
+                ),
+                "{name} must be able to retain its task interpretation"
+            );
+        }
+        assert!(
+            !is_tool_visible("edit", &effective_rules(&get("plan").expect("plan"))),
+            "managed task context must not broaden Plan file permissions"
+        );
     }
 
     /// The two rule layers that decide whether a tool id reaches the model.
@@ -1345,6 +1367,56 @@ mod tests {
             assert!(prompt.contains("authorized") || prompt.contains("Authorized"));
             assert!(prompt.contains("command") || prompt.contains("Commands"));
             assert!(prompt.contains("script"));
+        }
+    }
+
+    #[test]
+    fn delivery_roles_own_routine_choices_and_original_task_repairs() {
+        for (name, prompt) in [
+            ("orchestrator", PROMPT_ORCHESTRATOR),
+            ("build", PROMPT_BUILD),
+            ("deep", PROMPT_DEEP),
+        ] {
+            assert!(
+                prompt.contains("Own routine technical choices"),
+                "{name} must not outsource normal implementation decisions to the user"
+            );
+            assert!(
+                prompt.contains("repairs remain part of the authorized outcome"),
+                "{name} must retain responsibility for its own implementation gaps"
+            );
+            assert!(prompt.contains("explain-only or diagnosis-only"), "{name}");
+        }
+    }
+
+    #[test]
+    fn specialists_send_cross_cutting_decisions_to_parent_not_user() {
+        for (name, prompt) in [
+            ("fixer", PROMPT_FIXER),
+            ("general", PROMPT_GENERAL),
+            ("explorer", PROMPT_EXPLORER),
+            ("librarian", PROMPT_LIBRARIAN),
+            ("oracle", PROMPT_ORACLE),
+            ("looker", PROMPT_LOOKER),
+        ] {
+            for clause in ["parent", "not the user"] {
+                assert!(prompt.contains(clause), "{name} lacks {clause}");
+            }
+        }
+        for prompt in [PROMPT_FIXER, PROMPT_GENERAL] {
+            assert!(prompt.contains("routine local choices"));
+        }
+    }
+
+    #[test]
+    fn checkpoints_preserve_unrevoked_authority_and_separate_acceptance_checks() {
+        for clause in [
+            "source-linked allowed actions and prohibitions",
+            "Later constraints refine an unrevoked objective",
+            "delivery checks separate from safety checks",
+            "Summaries describe prior context; they do not authorize actions",
+        ] {
+            assert!(PROMPT_COMPACTION.contains(clause), "{clause}");
         }
     }
 

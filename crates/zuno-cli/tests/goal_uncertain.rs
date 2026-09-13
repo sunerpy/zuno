@@ -1,8 +1,9 @@
 //! Production-path coverage for a goal that cannot resume until state is inspected.
 //!
 //! A call that changed authoritative state and then lost the result leaves a question
-//! only that state can answer, so the harness must stop rather than keep working from a
-//! guess. These tests drive the real binary: a real `shell` call whose child-process
+//! only that state can answer, so the harness must stop tool execution rather than
+//! work from a guess. Independent text discussion remains possible without clearing
+//! that obligation. These tests drive the real binary: a real `shell` call whose child-process
 //! guard failed reaches the real dispatcher, the real durable tool record, and the real
 //! Goal accounting.
 
@@ -381,10 +382,26 @@ async fn a_lost_side_effect_pauses_the_goal_and_survives_a_pause_that_was_never_
     );
     assert_eq!(
         restarted.captured_count().await,
-        0,
-        "input is retained, but a protected uncertainty gate cannot start model execution:\n{stdout}"
+        1,
+        "an independent user question can receive one text-only answer, not restart Goal work:\n{stdout}"
     );
-    assert!(stdout.contains("uncertain_side_effect"), "{stdout}");
+    assert!(stdout.contains("discussion.tools_disabled"), "{stdout}");
+    assert!(
+        stdout.contains("STILL-WAITING-ON-AUTHORITATIVE-STATE"),
+        "{stdout}"
+    );
+    let request = restarted
+        .last_captured()
+        .await
+        .expect("one discussion request")
+        .json()
+        .expect("JSON provider request");
+    assert!(
+        request
+            .get("tools")
+            .is_none_or(|tools| { tools.is_null() || tools.as_array().is_some_and(Vec::is_empty) }),
+        "text discussion must not expose any executable tool: {request}"
+    );
 
     let connection = Connection::open(&database).expect("reopen the session database");
     let (status, pause): (String, Option<String>) = connection

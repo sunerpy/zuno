@@ -1054,6 +1054,38 @@ pub fn read_by_source_key_in(
 /// This is the transactional counterpart to [`SessionInbox::get`]. It lets a
 /// driver persist the model-visible message and settle the matching inbox row
 /// against the exact same database snapshot.
+/// Resolve a transcript user message to its durable input identity. Native host
+/// messages carry `prompt.message.id`; ACP/TUI may use the message id directly.
+/// This is identity mapping, never text deduplication or a prefix convention.
+pub fn input_for_message_in(
+    connection: &rusqlite::Connection,
+    session_id: &str,
+    message_id: &str,
+) -> Result<Option<SessionInput>, DbError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id FROM session_input WHERE session_id=?1
+         AND (id=?2 OR json_extract(prompt,'$.message.id')=?2) ORDER BY admitted_seq LIMIT 2",
+        )
+        .map_err(open::map_error)?;
+    let ids = statement
+        .query_map(params![session_id, message_id], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(open::map_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(open::map_error)?;
+    if ids.len() > 1 {
+        return Err(query_error(std::io::Error::other(
+            "multiple durable inputs reference the same user message identity",
+        )));
+    }
+    ids.first()
+        .map(|id| read_in(connection, session_id, id))
+        .transpose()
+        .map(Option::flatten)
+}
+
 pub fn read_in(
     connection: &rusqlite::Connection,
     session_id: &str,

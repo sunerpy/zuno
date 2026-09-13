@@ -4,6 +4,7 @@ wait without supplying an answer or authorizing Work. Use question_async for opt
 clarification while continuing independent planning.
 
 Usage notes:
+- Only the root agent asks ordinary user questions. A child returns the required decision and evidence to its parent, rather than interrupting the user.
 - Ask only when the answer materially changes the outcome and cannot be discovered from available evidence
 - Defer non-blocking choices and do not ask for reassurance
 - Prefer one concise question and ask no more than three at once

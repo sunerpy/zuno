@@ -16,7 +16,7 @@ use tokio::sync::broadcast;
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use zuno_acp::{AcpQuestionPresenter, AcpSessionRoute, ClientConnection, RpcError};
 use zuno_db::inbox::{SessionInbox, SessionInput};
-use zuno_session_control::QuestionService;
+use zuno_session_control::{QuestionService, SessionControlService};
 use zuno_tool::question::{QuestionError, QuestionPort};
 use zuno_types::execution::WakeAdmission;
 use zuno_types::question::{QuestionCommand, QuestionReceipt, QuestionView};
@@ -34,6 +34,9 @@ pub(super) fn capabilities() -> Value {
         "respondMethod": RESPOND_METHOD,
         "requiresExpectedRevision": true,
         "supportsPartialAnswers": true,
+        "supportsAutoDefer": true,
+        "supportsSnooze": true,
+        "autoDeferMs": zuno_types::question::QUESTION_AUTO_DEFER_MS,
     })
 }
 
@@ -156,12 +159,18 @@ pub(super) fn next_input(
     inbox: &SessionInbox,
     session_id: &str,
     scope: DurableInputScope,
+    control: &SessionControlService,
 ) -> Result<Option<(SessionInput, AcpDurableInput)>, RpcError> {
     for input in inbox.pending(session_id).map_err(db_error)? {
         let Some(drivable) = scope.admits(&input) else {
             continue;
         };
-        if inbox.wake_admission(&input).map_err(db_error)? != WakeAdmission::Reject {
+        if inbox.wake_admission(&input).map_err(db_error)? != WakeAdmission::Reject
+            || (scope == DurableInputScope::Prompts
+                && control
+                    .may_admit_discussion(&input)
+                    .map_err(super::session_control_rpc_error)?)
+        {
             return Ok(Some((input, drivable)));
         }
     }
@@ -171,13 +180,14 @@ pub(super) fn next_input(
 pub(super) fn next_input_scope(
     inbox: &SessionInbox,
     session_id: &str,
+    control: &SessionControlService,
 ) -> Result<Option<DurableInputScope>, RpcError> {
     for scope in [
         DurableInputScope::Controls,
         DurableInputScope::Automatic,
         DurableInputScope::Prompts,
     ] {
-        if next_input(inbox, session_id, scope)?.is_some() {
+        if next_input(inbox, session_id, scope, control)?.is_some() {
             return Ok(Some(scope));
         }
     }
@@ -195,7 +205,7 @@ pub(super) struct PresentationLedger {
 
 impl PresentationLedger {
     pub(super) fn claim(&mut self, view: &QuestionView) -> bool {
-        !view.state.is_terminal() && self.seen.insert(view.id.clone())
+        !view.state.is_terminal() && !view.is_auto_deferred() && self.seen.insert(view.id.clone())
     }
 }
 
@@ -213,6 +223,14 @@ impl SessionQuestions {
         let mut tasks = Vec::new();
         let root = session.id.clone();
         let service = Arc::clone(&session.questions);
+        let deadline_service = service.clone();
+        let deadline_root = root.clone();
+        // The existing task group owns registration and shutdown.
+        tasks.push(tokio::spawn(async move {
+            deadline_service
+                .run_auto_defer_for_session(&deadline_root)
+                .await;
+        }));
         let client = client.session_scoped();
         if state
             .elicitation_form
@@ -325,9 +343,12 @@ async fn present_pending(
                 // Superseded forms cannot apply a stale reply. A defer remains
                 // seen even though its new revision is still pending.
                 active.retain(|id, (revision, task)| {
-                    let current = pending
-                        .iter()
-                        .any(|view| &view.id == id && view.revision == *revision);
+                    let current = pending.iter().any(|view| {
+                        &view.id == id
+                            && (view.revision == *revision
+                                || (view.is_auto_deferred()
+                                    && revision.checked_add(1) == Some(view.revision)))
+                    });
                     if !current {
                         task.abort();
                     }
@@ -420,11 +441,18 @@ impl AcpSession {
             return Ok(());
         }
         let inbox = SessionInbox::new(Arc::clone(&state.question_pool));
-        let Some(scope) = next_input_scope(&inbox, &self.id)? else {
+        let control = SessionControlService::new(Arc::clone(&state.question_pool));
+        let scope = next_input_scope(&inbox, &self.id, &control)?;
+        if scope.is_none()
+            && control
+                .pending_discussion(&self.id)
+                .map_err(super::session_control_rpc_error)?
+                .is_none()
+        {
             return Ok(());
-        };
+        }
         self.ensure_active(state, client.clone()).await?;
-        if scope == DurableInputScope::Controls {
+        if scope == Some(DurableInputScope::Controls) {
             let configuration = self
                 .reconfigure_from_prompt(
                     super::SessionReconfiguration::Mode("build".to_owned()),
@@ -440,7 +468,11 @@ impl AcpSession {
         let Ok(guard) = self.runs.begin_turn(self.id.clone()) else {
             return Ok(());
         };
-        let next = self.drive_next_durable_input(client, &guard, scope).await?;
+        let next = if let Some(scope) = scope {
+            self.drive_next_durable_input(client, &guard, scope).await?
+        } else {
+            self.drive_pending_discussion(client, &guard).await?
+        };
         drop(guard);
         if let Some((driven, projected)) = next {
             self.settle_turn(driven, projected, false, client).await?;

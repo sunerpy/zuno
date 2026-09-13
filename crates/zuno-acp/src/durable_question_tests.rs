@@ -63,7 +63,11 @@ impl QuestionPort for ScriptedPort {
     }
 
     async fn get(&self, _session_id: &str, _request_id: &str) -> QuestionResult<QuestionView> {
-        panic!("the presenter already owns the displayed snapshot")
+        assert!(
+            self.stored.auto_defer.is_some(),
+            "only an ordinary timed question may inspect a newer snapshot"
+        );
+        Ok(self.stored.clone())
     }
 
     async fn pending(&self, _session_id: &str) -> QuestionResult<Vec<QuestionView>> {
@@ -120,6 +124,7 @@ fn view() -> QuestionView {
         ],
         answers: BTreeMap::new(),
         draft_answers: BTreeMap::new(),
+        auto_defer: None,
         plan: None,
         decision: None,
         authorization: None,
@@ -793,6 +798,146 @@ async fn stale_revision_errors_are_returned_without_reloading_or_replaying() {
     ));
     assert_eq!(port.commands().len(), 1);
     assert_eq!(port.stored, view);
+}
+
+fn timed_view() -> QuestionView {
+    let mut view = view();
+    view.auto_defer = Some(zuno_types::question::QuestionAutoDefer {
+        deadline_at: view.time_created + zuno_types::question::QUESTION_AUTO_DEFER_MS,
+        state: zuno_types::question::QuestionAutoDeferState::Armed,
+    });
+    view
+}
+
+fn deferred_view(displayed: &QuestionView) -> QuestionView {
+    let mut deferred = displayed.clone();
+    deferred.revision += 1;
+    deferred.auto_defer.as_mut().expect("timer").state =
+        zuno_types::question::QuestionAutoDeferState::Deferred;
+    deferred
+}
+
+fn late_answer() -> Value {
+    json!({
+        "action": "accept",
+        "content": {"answer:item-approach": "Keep", "answer:item-notes": "User note"},
+    })
+}
+
+#[tokio::test]
+async fn late_answer_refreshes_only_the_native_auto_defer_transition() {
+    let displayed = timed_view();
+    let deferred = deferred_view(&displayed);
+    let mut expected = receipt(&deferred);
+    expected.question.state = QuestionState::Answered;
+    expected.input_id = Some("human-late-once".to_owned());
+    let port = Arc::new(ScriptedPort::new(
+        deferred,
+        vec![
+            Err(QuestionError::Conflict {
+                request_id: displayed.id.clone(),
+                expected: displayed.revision,
+                actual: displayed.revision + 1,
+            }),
+            Ok(expected.clone()),
+        ],
+    ));
+    let client = ScriptedClient::new(|_, _| Ok(late_answer()));
+    let received = AcpQuestionPresenter::new(port.clone(), client.connection())
+        .present(displayed.clone())
+        .await
+        .expect("late explicit answer remains usable");
+    assert_eq!(received, Some(expected));
+    let commands = port.commands();
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[0].2.expected_revision, displayed.revision);
+    assert_eq!(commands[1].2.expected_revision, displayed.revision + 1);
+    assert_eq!(commands[0].2.action, commands[1].2.action);
+    assert_eq!(
+        commands[0].2.command_id, commands[1].2.command_id,
+        "the original client response keeps one idempotency key"
+    );
+}
+
+#[tokio::test]
+async fn timed_form_exposes_native_deadline_without_default_answers() {
+    let displayed = timed_view();
+    let timer = serde_json::to_value(&displayed.auto_defer).expect("timer");
+    let port = port_for(&displayed);
+    let client = ScriptedClient::new(move |_, params| {
+        assert_eq!(params["_meta"]["zuno"]["autoDefer"], timer);
+        assert_eq!(
+            params["requestedSchema"]["properties"]["answer:item-approach"]["default"],
+            Value::Null
+        );
+        Ok(json!({"action": "cancel"}))
+    });
+    AcpQuestionPresenter::new(port, client.connection())
+        .present(displayed)
+        .await
+        .expect("metadata-backed form");
+}
+
+#[tokio::test]
+async fn late_answer_never_rebases_over_newer_drafts_or_answers() {
+    for draft in [true, false] {
+        let displayed = timed_view();
+        let mut changed = deferred_view(&displayed);
+        let values = BTreeMap::from([("item-notes".to_owned(), vec!["Other client".to_owned()])]);
+        if draft {
+            changed.draft_answers = values;
+        } else {
+            changed.answers = values;
+        }
+        let port = Arc::new(ScriptedPort::new(
+            changed,
+            vec![Err(QuestionError::Conflict {
+                request_id: displayed.id.clone(),
+                expected: displayed.revision,
+                actual: displayed.revision + 1,
+            })],
+        ));
+        let client = ScriptedClient::new(|_, _| Ok(late_answer()));
+        let result = AcpQuestionPresenter::new(port.clone(), client.connection())
+            .present(displayed)
+            .await;
+        assert!(matches!(result, Err(QuestionError::Conflict { .. })));
+        assert_eq!(
+            port.commands().len(),
+            1,
+            "newer human state must not be overwritten"
+        );
+    }
+}
+
+#[tokio::test]
+async fn retried_late_answer_uses_the_existing_idempotent_receipt_after_lost_ack() {
+    let displayed = timed_view();
+    let deferred = deferred_view(&displayed);
+    let mut duplicate = receipt(&deferred);
+    duplicate.question.state = QuestionState::Answered;
+    duplicate.input_id = Some("human-late-once".to_owned());
+    duplicate.duplicate = true;
+    let (_, original) = apply_response(&displayed, late_answer()).await;
+    let port = Arc::new(ScriptedPort::new(
+        duplicate.question.clone(),
+        vec![
+            Err(QuestionError::CommandConflict {
+                command_id: original.command_id.clone(),
+            }),
+            Ok(duplicate.clone()),
+        ],
+    ));
+    let client = ScriptedClient::new(|_, _| Ok(late_answer()));
+    let received = AcpQuestionPresenter::new(port.clone(), client.connection())
+        .present(displayed.clone())
+        .await
+        .expect("receipt replay");
+    assert_eq!(received, Some(duplicate));
+    let commands = port.commands();
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[1].2.command_id, original.command_id);
+    assert_eq!(commands[1].2.expected_revision, displayed.revision + 1);
 }
 
 #[tokio::test]

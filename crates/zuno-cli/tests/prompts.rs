@@ -197,6 +197,11 @@ fn descriptions() -> Vec<Description> {
             text: zuno_tools::read::DESCRIPTION,
         },
         Description {
+            wire_id: "task_context",
+            file: "crates/zuno-tools/src/description/task-context.txt",
+            text: zuno_tools::task_context::DESCRIPTION,
+        },
+        Description {
             wire_id: zuno_tools::report_write::WIRE_ID,
             file: "crates/zuno-tools/src/description/report-write.txt",
             text: zuno_tools::report_write::DESCRIPTION,

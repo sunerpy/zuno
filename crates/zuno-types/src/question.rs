@@ -149,6 +149,28 @@ pub struct QuestionItem {
 /// Actual answers keyed by stable item ID. An omitted/empty item is unanswered.
 pub type QuestionAnswers = BTreeMap<String, Vec<String>>;
 
+/// Ordinary, non-blocking questions get Codex's 60s grace + 60s countdown.
+/// The deadline is a host policy, not a model-selected timeout or answer.
+pub const QUESTION_AUTO_DEFER_MS: i64 = 120_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionAutoDeferState {
+    Armed,
+    Snoozed,
+    Deferred,
+}
+
+/// Native deadline projection. Deferral never resolves the question: stable
+/// item IDs and drafts remain available for an explicit, possibly late answer.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct QuestionAutoDefer {
+    /// Unix epoch milliseconds, frozen from the original publication time.
+    pub deadline_at: i64,
+    pub state: QuestionAutoDeferState,
+}
+
 /// Whether the originating tool waits. This is not an authorization policy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -362,6 +384,9 @@ pub struct QuestionView {
     /// Unsubmitted form values, including explicit blank slots.
     #[serde(default)]
     pub draft_answers: QuestionAnswers,
+    /// Absent on old records and all blocking/required/authorization questions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_defer: Option<QuestionAutoDefer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<PlanQuestionBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -396,6 +421,46 @@ pub struct QuestionDeliverySnapshot {
 }
 
 impl QuestionView {
+    #[must_use]
+    pub fn is_auto_deferred(&self) -> bool {
+        !self.state.is_terminal()
+            && self
+                .auto_defer
+                .as_ref()
+                .is_some_and(|timer| timer.state == QuestionAutoDeferState::Deferred)
+    }
+
+    /// A client may refresh a still-displayed form only across this exact native
+    /// timeout transition. Other revision conflicts remain conflicts; in
+    /// particular newer answers, drafts, or authority must never be rebased.
+    #[must_use]
+    pub fn is_auto_defer_successor_of(&self, displayed: &Self) -> bool {
+        self.purpose == QuestionPurpose::Clarification
+            && self.mode == QuestionMode::Deferred
+            && self.state == QuestionState::Pending
+            && displayed.state == QuestionState::Pending
+            && displayed.revision.checked_add(1) == Some(self.revision)
+            && self.id == displayed.id
+            && self.origin == displayed.origin
+            && self.purpose == displayed.purpose
+            && self.mode == displayed.mode
+            && self.questions == displayed.questions
+            && self.answers == displayed.answers
+            && self.draft_answers == displayed.draft_answers
+            && self.plan == displayed.plan
+            && self.decision == displayed.decision
+            && self.authorization == displayed.authorization
+            && self
+                .auto_defer
+                .as_ref()
+                .zip(displayed.auto_defer.as_ref())
+                .is_some_and(|(current, previous)| {
+                    current.deadline_at == previous.deadline_at
+                        && current.state == QuestionAutoDeferState::Deferred
+                        && previous.state == QuestionAutoDeferState::Armed
+                })
+    }
+
     pub fn validate_answers(
         &self,
         answers: &QuestionAnswers,
@@ -487,6 +552,9 @@ pub enum PlanAuthorizationState {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QuestionAction {
+    /// A trusted client reports actual interaction, not a submitted answer.
+    /// This only suspends an ordinary question's native auto-defer timer.
+    Snooze,
     Answer {
         answers: QuestionAnswers,
     },
@@ -581,12 +649,51 @@ mod tests {
             }],
             answers: QuestionAnswers::new(),
             draft_answers: QuestionAnswers::new(),
+            auto_defer: None,
             plan: None,
             decision: None,
             authorization: None,
             delivery: None,
             time_created: 1,
             time_updated: 1,
+        }
+    }
+
+    #[test]
+    fn only_the_exact_empty_timeout_transition_can_refresh_a_displayed_form() {
+        let mut displayed = view();
+        displayed.auto_defer = Some(QuestionAutoDefer {
+            deadline_at: 120_001,
+            state: QuestionAutoDeferState::Armed,
+        });
+        let mut deferred = displayed.clone();
+        deferred.revision += 1;
+        deferred.auto_defer.as_mut().expect("timer").state = QuestionAutoDeferState::Deferred;
+        assert!(deferred.is_auto_defer_successor_of(&displayed));
+        assert!(!displayed.is_auto_defer_successor_of(&deferred));
+        for changed in [
+            "answer", "draft", "state", "origin", "purpose", "revision", "question",
+        ] {
+            let mut wrong = deferred.clone();
+            match changed {
+                "answer" => {
+                    wrong
+                        .answers
+                        .insert("stable-item".to_owned(), vec!["first".to_owned()]);
+                }
+                "draft" => {
+                    wrong
+                        .draft_answers
+                        .insert("stable-item".to_owned(), vec!["first".to_owned()]);
+                }
+                "state" => wrong.state = QuestionState::Answered,
+                "origin" => wrong.origin.turn_id = Some("replacement".to_owned()),
+                "purpose" => wrong.purpose = QuestionPurpose::GoalResume,
+                "revision" => wrong.revision += 1,
+                "question" => wrong.questions[0].question.question = "Different".to_owned(),
+                _ => unreachable!(),
+            }
+            assert!(!wrong.is_auto_defer_successor_of(&displayed), "{changed}");
         }
     }
 

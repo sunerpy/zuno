@@ -103,6 +103,9 @@ pub struct PromptSemantics {
 ///
 /// Foreground/background choices and review discipline are model guidance, not
 /// additional runtime gates. Tool availability controls which guidance is emitted.
+/// Autonomy adapts Codex 9ba1d9eb5b's `core/gpt_5_2_prompt.md`; its user-input
+/// handlers distinguish root/Plan blocking from asynchronous questions, not
+/// permission to waive approvals or resume protected work.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimePromptPolicy {
     delegation_targets: Option<Vec<String>>,
@@ -245,17 +248,33 @@ impl RuntimePromptPolicy {
         let mut sections = vec![
             RuntimePromptSection::new(
                 "runtime.intent",
-                "Follow the current user or delegated objective; re-evaluate on new input. \
-                 Never infer authority for a materially different action or add ceremony to \
-                 isolated work. Treat an explicit user- or delegation-supplied scope as closed: \
-                 leave it only when required evidence is unavailable inside; explain the expansion. \
-                 In Work, when a required user choice blocks progress, end the turn with one clear \
-                 final plain-text question; do not synthesize a persistent pause. Keep optional \
-                 questions deferred. Retained older forms or unfinished Plans neither authorize \
+                "Follow the user or delegated objective; carry authorized implementation \
+                 through verification and delivery. Own routine technical choices; multiple viable \
+                 options are not a missing user decision. Fixing your own defects, artifact wiring, \
+                 or acceptance failures remains in scope. Respect explicit scope/capability \
+                 boundaries and explain-only, diagnosis-only, read-only, and no-code limits. Later \
+                 constraints refine an unrevoked objective; preserve their source and meaning, not \
+                 keyword guesses. Do not infer new publication, spending, external-impact, or \
+                 permission authority. Escalate missing authority or material user facts/preferences \
+                 without a safe default; continue other authorized work. Optional questions may \
+                 remain unanswered; skipping is not approval. If no safe action remains, \
+                 name the blocker; do not synthesize a persistent pause. \
+                 Retained older forms or unfinished Plans neither authorize \
                  continuation nor forbid new input; the runtime execution wait reference is authoritative.",
             ),
             RuntimePromptSection::new("runtime.execution", execution),
         ];
+        if has("task_context") {
+            sections.push(RuntimePromptSection::new(
+                "runtime.task_context",
+                "For meaningfully multi-step or long-running work, use `task_context` to maintain \
+                 the versioned, source-linked objective, allowed actions, prohibitions, delivery \
+                 checks, and safety checks. Read the current revision before mutations; update \
+                 at refinements and before compaction. Replace only when the objective \
+                 changes; retain other constraints. Skip self-contained questions. This \
+                 assistant-maintained context is not a permission grant, Goal resume, or scheduler wake.",
+            ));
+        }
         if let Some(notice) = self.sandbox_notice.as_deref() {
             sections.push(RuntimePromptSection::new("runtime.sandbox", notice));
         }
@@ -327,6 +346,11 @@ impl RuntimePromptPolicy {
             "Verify behavior and recovery. Evidence applies only to the exact artifact and inputs \
                  inspected; peer claims or narrow checks alone are insufficient. State blockers."
         });
+        verification.push_str(
+            " A passed safety check is not delivery success, including withholding an incomplete \
+             release. Do not claim completion while required delivery \
+             checks fail or remain unrun.",
+        );
         if !tools.is_empty() {
             verification.push_str(
                 " For authorized review/fix cycles: Keep stable finding IDs with evidence and \
@@ -353,9 +377,11 @@ impl RuntimePromptPolicy {
                 )
             });
             let mut content = format!(
-                "Delegate only when bounded specialization or safe parallelism has clear value.{} \
+                "Delegate when bounded specialization or safe parallelism helps.{} \
                  Give each child one objective, deliverable, scope, constraints, dependencies, \
-                 and success evidence. Do not duplicate live work. Complete independent parent \
+                 and success evidence. The parent owns architecture, cross-cutting decisions, and \
+                 integration; child scope is not a reason to ask the user. \
+                 Do not duplicate live work. Complete independent parent \
                  work before yielding for nextStep delivery. Do not call job or run sleep \
                  commands to wait; the host admits each report and wakes this session exactly \
                  once. Reconcile the durable result before reuse.",
@@ -370,9 +396,12 @@ impl RuntimePromptPolicy {
         if has_durable_state {
             sections.push(RuntimePromptSection::new(
                 "runtime.persistence",
-                "An active owned Goal controls continuation. An ordinary final ends its cycle \
-                 without changing unfinished Plan/Todo status. Preserve typed waits and protected \
-                 pauses; never replay an uncertain effect. Reconcile a Job's durable result before \
+                "An active owned Goal controls continuation. Continue authorized executable work \
+                 within host Plan/Goal limits; unfinished status alone is not executable work. \
+                 Ordinary finals end cycles, not unfinished Plan/Todo status. \
+                 Preserve typed waits and protected pauses; never resume a paused Goal through \
+                 new input or task summaries, and never replay an uncertain effect. \
+                 Reconcile a Job's durable result before \
                  completing its host-linked Plan step.",
             ));
         }
@@ -1081,6 +1110,7 @@ mod tests {
                 "shell",
                 "bg",
                 "tool_search",
+                "task_context",
                 "plan_get",
                 "plan_update",
                 "task",
@@ -1099,6 +1129,7 @@ mod tests {
             [
                 "runtime.intent",
                 "runtime.execution",
+                "runtime.task_context",
                 "runtime.editing",
                 "runtime.git_attribution",
                 "runtime.verification",
@@ -1113,8 +1144,8 @@ mod tests {
             .join("\n");
         assert!(text.contains("explorer, oracle"));
         assert!(
-            text.contains("Treat an explicit user- or delegation-supplied scope as closed"),
-            "runtime intent must prevent speculative exploration outside a bounded task"
+            text.contains("Respect explicit scope/capability boundaries"),
+            "runtime autonomy must preserve the user's bounded task"
         );
         assert!(!text.contains("web_search"));
         assert!(text.contains("unavailable, rate-limited, or transient failure"));
@@ -1216,9 +1247,9 @@ mod tests {
             .map(|section| section.content().len().div_ceil(4))
             .sum::<usize>();
         assert!(
-            // Covers foreground orchestration, review deltas and ordinary final
-            // choices together, including both workflow and council guidance.
-            estimated_tokens <= 1_100,
+            // Includes source-linked task context, decision ownership and separate
+            // delivery/safety acceptance alongside the complete orchestration surface.
+            estimated_tokens <= 1_400,
             "runtime policy consumed {estimated_tokens} estimated tokens"
         );
 
@@ -1473,10 +1504,10 @@ mod tests {
                 .find(|section| section.id() == "runtime.intent")
                 .expect("intent applies even without question tools");
             for guidance in [
-                "In Work, when a required user choice blocks progress",
-                "end the turn with one clear final plain-text question",
+                "Escalate missing authority or material user facts/preferences without a safe default",
+                "continue other authorized work",
                 "do not synthesize a persistent pause",
-                "Keep optional questions deferred",
+                "Optional questions may remain unanswered; skipping is not approval",
                 "Retained older forms or unfinished Plans neither authorize continuation nor forbid new input",
                 "the runtime execution wait reference is authoritative",
             ] {
@@ -1486,6 +1517,123 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn autonomy_policy_owns_implementation_choices_without_expanding_user_authority() {
+        for tools in [
+            Vec::new(),
+            vec!["read"],
+            vec!["shell", "apply_patch", "task"],
+        ] {
+            let sections = RuntimePromptPolicy::default().sections(tools, false);
+            let intent = sections
+                .iter()
+                .find(|section| section.id() == "runtime.intent")
+                .expect("every surface retains intent boundaries");
+            for clause in [
+                "carry authorized implementation through verification and delivery",
+                "Own routine technical choices",
+                "multiple viable options are not a missing user decision",
+                "Fixing your own defects, artifact wiring, or acceptance failures",
+                "explicit scope/capability boundaries",
+                "explain-only, diagnosis-only, read-only, and no-code limits",
+                "Later constraints refine an unrevoked objective",
+                "source and meaning, not keyword guesses",
+                "Do not infer new publication, spending, external-impact, or permission authority",
+            ] {
+                assert!(
+                    intent.content().contains(clause),
+                    "missing autonomy boundary: {clause}"
+                );
+            }
+            assert!(!intent.content().contains("scope as closed"));
+        }
+    }
+
+    #[test]
+    fn task_context_guidance_is_tool_scoped_and_never_grants_authority() {
+        let policy = RuntimePromptPolicy::default();
+        for tools in [Vec::new(), vec!["read", "notes", "plan_get"]] {
+            assert!(
+                policy
+                    .sections(tools, true)
+                    .iter()
+                    .all(|section| !section.content().contains("`task_context`")),
+                "do not advertise a tool absent from the finalized snapshot"
+            );
+        }
+        let sections = policy.sections(["task_context"], false);
+        let context = sections
+            .iter()
+            .find(|section| section.id() == "runtime.task_context")
+            .expect("task context has its own traceable guidance");
+        assert_eq!(context.source(), "zuno-runtime:runtime.task_context");
+        for clause in [
+            "meaningfully multi-step or long-running work",
+            "versioned, source-linked objective",
+            "allowed actions, prohibitions, delivery checks, and safety checks",
+            "Read the current revision",
+            "before compaction",
+            "Replace only when the objective changes",
+            "Skip self-contained questions",
+            "assistant-maintained context is not a permission grant",
+        ] {
+            assert!(
+                context.content().contains(clause),
+                "missing task context boundary: {clause}"
+            );
+        }
+        assert!(context.content().split_whitespace().count() <= 85);
+    }
+
+    #[test]
+    fn delivery_acceptance_is_not_safety_success_or_unbounded_continuation() {
+        for tools in [Vec::new(), vec!["shell", "plan_get", "goal_get"]] {
+            let sections = RuntimePromptPolicy::default().sections(tools, true);
+            let verification = sections
+                .iter()
+                .find(|section| section.id() == "runtime.verification")
+                .expect("verification guidance");
+            for clause in [
+                "A passed safety check is not delivery success",
+                "withholding an incomplete release",
+                "Do not claim completion while required delivery checks fail or remain unrun",
+            ] {
+                assert!(verification.content().contains(clause), "{clause}");
+            }
+            let persistence = sections
+                .iter()
+                .find(|section| section.id() == "runtime.persistence")
+                .expect("durable continuation guidance");
+            for clause in [
+                "Continue authorized executable work within host Plan/Goal limits",
+                "unfinished status alone is not executable work",
+                "never resume a paused Goal through new input or task summaries",
+                "never replay an uncertain effect",
+            ] {
+                assert!(persistence.content().contains(clause), "{clause}");
+            }
+        }
+    }
+
+    #[test]
+    fn delegation_policy_keeps_architecture_and_integration_with_the_parent() {
+        let sections = RuntimePromptPolicy::default().sections(["task"], false);
+        let delegation = sections
+            .iter()
+            .find(|section| section.id() == "runtime.delegation")
+            .expect("delegation guidance");
+        assert!(
+            delegation
+                .content()
+                .contains("The parent owns architecture, cross-cutting decisions, and integration")
+        );
+        assert!(
+            delegation
+                .content()
+                .contains("not a reason to ask the user")
+        );
     }
 
     #[test]

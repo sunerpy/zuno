@@ -116,6 +116,17 @@ impl SessionControlService {
                     )?;
                 }
                 SessionFailureDisposition::Goal(result)
+            } else if matches!(failure, GoalTerminalFailure::Block(
+                zuno_goal::GoalBlockReason::ProviderRequestRejected { .. }
+            )) {
+                // Codex's User/Automatic/Recovery boundary: a failed request is
+                // not a lock on the next independent user turn. Stop this cycle
+                // so automatic reports cannot replay it. The Goal-owned branch
+                // above and every previously protected gate remain authoritative.
+                Self::stop_cycle_in(
+                    tx, session_id, &scope.cycle_id, scope.turn_id.as_deref(), false, at_ms,
+                )?;
+                SessionFailureDisposition::OrdinaryStopped
             } else if let Some(reason) = pause_reason(failure)
                 .filter(|reason| *reason != SessionPauseReason::User)
             {
@@ -137,6 +148,10 @@ impl SessionControlService {
             zuno_db::event_log::append_in(tx, session_id,
                 zuno_db::event_log::NewSessionEvent::new("session.turn.failure_settled",
                     json!({"scope":scope,"effectiveGoalId":current.goal_id,"category":category,
+                        "blockReason":match failure {
+                            GoalTerminalFailure::Block(reason) => json!(reason),
+                            _ => serde_json::Value::Null,
+                        },
                         "retryable":matches!(failure, GoalTerminalFailure::Retry { .. }),
                         "ordinaryStopped":matches!(disposition, SessionFailureDisposition::OrdinaryStopped),
                         "time":at_ms}).as_object().expect("object").clone())?)?;

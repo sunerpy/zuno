@@ -91,6 +91,60 @@ fn spec() -> QuestionSpec {
 }
 
 #[tokio::test]
+async fn native_timeout_is_listed_for_late_answers_without_reopening_a_modal_or_waking_work() {
+    let pool = pool();
+    let before = paused(&pool);
+    let service = QuestionService::new(Arc::clone(&pool));
+    let view = service.open(spec()).await.expect("open").question;
+    service
+        .reconcile_auto_defer_at(
+            Some(SESSION),
+            view.time_created + zuno_types::question::QUESTION_AUTO_DEFER_MS,
+        )
+        .await
+        .expect("deadline");
+    let listed = durable_questions::list(&service, &json!({"sessionId": SESSION}))
+        .await
+        .expect("list");
+    assert_eq!(listed["questions"][0]["autoDefer"]["state"], "deferred");
+    assert_eq!(listed["questions"][0]["answers"], json!({}));
+    let current = service.get(SESSION, &view.id).await.expect("current");
+    assert!(current.is_auto_defer_successor_of(&view));
+    let mut reopened = durable_questions::PresentationLedger::default();
+    assert!(
+        !reopened.claim(&current),
+        "a restart must not reopen an auto-deferred modal"
+    );
+    let inbox = SessionInbox::new(Arc::clone(&pool));
+    assert!(inbox.pending(SESSION).expect("inbox").is_empty());
+    assert_eq!(
+        SessionExecutionStore::new(Arc::clone(&pool))
+            .get(SESSION)
+            .expect("execution"),
+        Some(before),
+    );
+    let command = QuestionCommand {
+        command_id: "late-client-answer".to_owned(),
+        expected_revision: current.revision,
+        action: QuestionAction::Answer {
+            answers: [(current.questions[0].id.clone(), vec!["Keep".to_owned()])]
+                .into_iter()
+                .collect(),
+        },
+    };
+    let params = json!({"sessionId": SESSION, "requestId": current.id, "command": command});
+    let once = durable_questions::respond(&service, &params)
+        .await
+        .expect("late answer");
+    let twice = durable_questions::respond(&service, &params)
+        .await
+        .expect("retry");
+    assert_eq!(once["inputId"], twice["inputId"]);
+    assert_eq!(twice["duplicate"], true);
+    assert_eq!(inbox.pending(SESSION).expect("inbox").len(), 1);
+}
+
+#[tokio::test]
 async fn native_list_and_empty_response_preserve_no_progress_and_pending_questions() {
     let pool = pool();
     let before = paused(&pool);
@@ -129,9 +183,14 @@ async fn native_list_and_empty_response_preserve_no_progress_and_pending_questio
     );
     for _ in 0..3 {
         assert!(
-            durable_questions::next_input(&inbox, SESSION, DurableInputScope::Automatic)
-                .expect("scheduling check")
-                .is_none()
+            durable_questions::next_input(
+                &inbox,
+                SESSION,
+                DurableInputScope::Automatic,
+                &SessionControlService::new(pool.clone())
+            )
+            .expect("scheduling check")
+            .is_none()
         );
     }
     assert_eq!(
@@ -292,16 +351,31 @@ fn rejected_reports_are_retained_and_do_not_starve_an_admissible_query() {
         .expect("query");
     assert!(DurableInputScope::Automatic.admits(&report).is_some());
     assert!(
-        durable_questions::next_input(&inbox, SESSION, DurableInputScope::Automatic)
-            .expect("gate")
-            .is_none()
+        durable_questions::next_input(
+            &inbox,
+            SESSION,
+            DurableInputScope::Automatic,
+            &SessionControlService::new(pool.clone())
+        )
+        .expect("gate")
+        .is_none()
     );
-    let (selected, _) = durable_questions::next_input(&inbox, SESSION, DurableInputScope::Prompts)
-        .expect("query gate")
-        .expect("query can be answered without resuming work");
+    let (selected, _) = durable_questions::next_input(
+        &inbox,
+        SESSION,
+        DurableInputScope::Prompts,
+        &SessionControlService::new(pool.clone()),
+    )
+    .expect("query gate")
+    .expect("query can be answered without resuming work");
     assert_eq!(selected.id, query.id);
     assert_eq!(
-        durable_questions::next_input_scope(&inbox, SESSION).expect("session pump selection"),
+        durable_questions::next_input_scope(
+            &inbox,
+            SESSION,
+            &SessionControlService::new(pool.clone())
+        )
+        .expect("session pump selection"),
         Some(DurableInputScope::Prompts),
         "a resumed or reconnected input needs no surviving RPC waiter"
     );
@@ -318,6 +392,68 @@ fn rejected_reports_are_retained_and_do_not_starve_an_admissible_query() {
             .get(SESSION)
             .expect("state"),
         Some(before)
+    );
+}
+
+#[test]
+fn typed_user_prompt_can_reach_discussion_but_background_and_auth_cannot() {
+    let pool = pool();
+    let state = paused(&pool);
+    SessionExecutionStore::new(pool.clone())
+        .set_scheduling(
+            SESSION,
+            state.revision,
+            SessionScheduling {
+                readiness: SessionReadiness::Paused {
+                    reason: SessionPauseReason::UncertainSideEffect,
+                },
+                ..Default::default()
+            },
+            20,
+        )
+        .unwrap();
+    let inbox = SessionInbox::new(pool.clone());
+    let input = inbox
+        .admit(
+            NewSessionInput::new(
+                "typed-discussion",
+                SESSION,
+                json!({"kind":"acpPrompt","text":"Explain only."}),
+                InputDelivery::Queue,
+                21,
+            )
+            .with_trigger_kind(InputTriggerKind::User),
+        )
+        .unwrap();
+    let control = SessionControlService::new(pool.clone());
+    assert!(control.may_admit_discussion(&input).unwrap());
+    let (selected, _) =
+        durable_questions::next_input(&inbox, SESSION, DurableInputScope::Prompts, &control)
+            .unwrap()
+            .unwrap();
+    assert_eq!(selected.id, input.id);
+    assert!(
+        durable_questions::next_input(&inbox, SESSION, DurableInputScope::Automatic, &control,)
+            .unwrap()
+            .is_none()
+    );
+    let state = control.state(SESSION).unwrap().unwrap();
+    SessionExecutionStore::new(pool)
+        .set_scheduling(
+            SESSION,
+            state.revision,
+            SessionScheduling {
+                readiness: SessionReadiness::Paused {
+                    reason: SessionPauseReason::Authentication,
+                },
+                ..Default::default()
+            },
+            22,
+        )
+        .unwrap();
+    assert!(
+        !control.may_admit_discussion(&input).unwrap(),
+        "durable acceptance is not permission to sample behind authentication"
     );
 }
 
@@ -339,13 +475,23 @@ fn explicit_resume_work_without_a_plan_is_a_drivable_control() {
             .plan_id
             .is_none()
     );
-    let inbox = SessionInbox::new(pool);
-    let (input, _) = durable_questions::next_input(&inbox, SESSION, DurableInputScope::Controls)
-        .expect("control gate")
-        .expect("resume is admitted");
+    let inbox = SessionInbox::new(pool.clone());
+    let (input, _) = durable_questions::next_input(
+        &inbox,
+        SESSION,
+        DurableInputScope::Controls,
+        &SessionControlService::new(pool.clone()),
+    )
+    .expect("control gate")
+    .expect("resume is admitted");
     assert_eq!(input.id, resumed.input.id);
     assert_eq!(
-        durable_questions::next_input_scope(&inbox, SESSION).expect("native control selection"),
+        durable_questions::next_input_scope(
+            &inbox,
+            SESSION,
+            &SessionControlService::new(pool.clone())
+        )
+        .expect("native control selection"),
         Some(DurableInputScope::Controls)
     );
 }

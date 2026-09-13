@@ -53,6 +53,168 @@ fn exhausted_retry() -> TurnFailure {
 }
 
 #[tokio::test]
+async fn rejected_replay_stops_only_the_request_without_reviving_a_completed_goal() {
+    for completed_goal in [false, true] {
+        let (_dir, mut host, _, _) =
+            scripted_reconciliation_host("build", ScriptedTurnBehavior::PreserveWork).await;
+        if completed_goal {
+            host.goal_store
+                .create_goal(&host.session_id, "already delivered", None)
+                .unwrap();
+            host.connection
+                .execute(
+                    "UPDATE goal SET status='complete',revision=7 WHERE session_id=?1",
+                    [&host.session_id],
+                )
+                .unwrap();
+        }
+        let goal_before = host.goal_store.goal(&host.session_id).unwrap();
+        let cycle = activate_failure_input(&host, "rejected-input");
+        host.session_control
+            .begin_engine_turn(&host.session_id, &cycle, "rejected-turn")
+            .unwrap();
+        host.failure_scope = host
+            .session_control
+            .capture_failure_scope(&host.session_id)
+            .unwrap();
+        let before = goal_usage(&host.connection, &host.session_id).unwrap();
+        let (events, _receiver) = zuno_engine::r#loop::event_channel();
+        let failure = TurnFailure::Engine(TurnError::Provider(
+            ProviderError::from_status("anonymous", 400).with_http_diagnostic(
+                400,
+                Some("reasoning_replay_context_mismatch"),
+                Some("anonymous-request"),
+                Some("Rejected replay context"),
+                &[],
+            ),
+        ));
+        assert!(
+            host.handle_turn_failure(before, Instant::now(), failure, &events)
+                .await
+                .is_err(),
+            "the rejected request remains failed, not automatically retried"
+        );
+        assert_eq!(
+            host.session_control
+                .state(&host.session_id)
+                .unwrap()
+                .unwrap()
+                .scheduling
+                .unwrap()
+                .readiness,
+            SessionReadiness::Completed,
+            "request-local rejection must not lock the whole conversation"
+        );
+        assert!(
+            zuno_db::session_work_cycle::is_stopped_in(&host.connection, &host.session_id, &cycle)
+                .unwrap(),
+            "late reports cannot revive the rejected cycle"
+        );
+        activate_failure_input(&host, "after-rejection");
+        assert_eq!(
+            host.session_control
+                .state(&host.session_id)
+                .unwrap()
+                .unwrap()
+                .scheduling
+                .unwrap()
+                .readiness,
+            SessionReadiness::Ready
+        );
+        assert_eq!(host.goal_store.goal(&host.session_id).unwrap(), goal_before);
+        host.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn request_rejection_retains_owned_goal_and_preexisting_safety_gates() {
+    use zuno_types::execution::SessionPauseReason;
+    for gate in [
+        None,
+        Some(SessionPauseReason::Authentication),
+        Some(SessionPauseReason::TurnBudget),
+        Some(SessionPauseReason::UncertainSideEffect),
+        Some(SessionPauseReason::Blocked),
+    ] {
+        let (_dir, mut host, _, _) =
+            scripted_reconciliation_host("build", ScriptedTurnBehavior::PreserveWork).await;
+        if gate.is_none() {
+            host.goal_store
+                .create_goal(&host.session_id, "owned objective", None)
+                .unwrap();
+        }
+        let cycle = activate_failure_input(&host, "protected-rejection");
+        host.session_control
+            .begin_engine_turn(&host.session_id, &cycle, "protected-turn")
+            .unwrap();
+        let scope = host
+            .session_control
+            .capture_failure_scope(&host.session_id)
+            .unwrap()
+            .unwrap();
+        if let Some(reason) = gate {
+            host.database
+                .transaction(|tx| {
+                    let state = zuno_db::session_execution::read_in(tx, &host.session_id)?.unwrap();
+                    zuno_db::session_execution::set_paused_in(
+                        tx,
+                        &host.session_id,
+                        state.revision,
+                        reason,
+                        30,
+                    )
+                    .map(|_| ())
+                })
+                .unwrap();
+        }
+        let before = host.session_control.state(&host.session_id).unwrap();
+        let result = host
+            .session_control
+            .settle_turn_failure(
+                &host.session_id,
+                &scope,
+                GoalTerminalFailure::Block(GoalBlockReason::ProviderRequestRejected {
+                    reason: zuno_error::ProviderRequestRejection::ReasoningReplayContextMismatch,
+                }),
+                host.goal_continuation.retry_policy(),
+                40,
+                5,
+            )
+            .unwrap();
+        if gate.is_some() {
+            assert!(matches!(
+                result,
+                zuno_session_control::SessionFailureDisposition::GateRetained
+            ));
+            assert_eq!(
+                host.session_control.state(&host.session_id).unwrap(),
+                before
+            );
+        } else {
+            assert!(matches!(
+                result,
+                zuno_session_control::SessionFailureDisposition::Goal(_)
+            ));
+            assert_eq!(
+                host.goal_store
+                    .goal(&host.session_id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                GoalStatus::Blocked
+            );
+            assert!(
+                host.goal_store
+                    .retry_state(&host.session_id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        host.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn ordinary_retry_exhaustion_stops_only_its_cycle_and_new_input_runs() {
     let (_dir, mut host, _driver, _work) =
         scripted_reconciliation_host("build", ScriptedTurnBehavior::PreserveWork).await;

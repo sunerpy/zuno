@@ -77,6 +77,228 @@ fn final_response(text: &str) -> Vec<StreamEvent> {
     ]
 }
 
+#[tokio::test]
+async fn uncertainty_pause_allows_fresh_toolless_discussion_without_resuming_goal() {
+    let accounted_answer = |text| {
+        let mut response = final_response(text);
+        response.insert(
+            1,
+            StreamEvent::TokenUsage {
+                input_tokens: Some(12),
+                output_tokens: Some(3),
+                reasoning_tokens: None,
+                cache_read_input_tokens: None,
+                cache_write_input_tokens: None,
+                accounting: zuno_llm::event::PromptAccounting::CacheInsideInput,
+            },
+        );
+        response
+    };
+    let (_dir, mut host, provider, _work) = mock_provider_host(
+        "build",
+        vec![
+            accounted_answer("A proposal only."),
+            accounted_answer("Another explanation."),
+        ],
+    )
+    .await;
+    host.session_control
+        .record_continuation(
+            &host.session_id,
+            "legacy-discussion-cycle",
+            host.current_turn_identity(),
+            CollaborationMode::Work,
+            None,
+            None,
+            None,
+            zuno_db::message::now_millis(),
+        )
+        .unwrap();
+    host.goal_store
+        .create_goal(&host.session_id, "Unfinished remote drawing", None)
+        .unwrap();
+    host.goal_store
+        .pause_with_reason(
+            &host.session_id,
+            zuno_goal::GoalPauseReason::UncertainSideEffect,
+        )
+        .unwrap();
+    host.pause_execution(PlanPauseReason::Blocked).unwrap();
+    let goal_before = host.goal_store.goal(&host.session_id).unwrap();
+    let pause_before = host.goal_store.pause_state(&host.session_id).unwrap();
+    for prompt in [
+        "Explain the earlier failure and propose a fix.",
+        "Clarify the proposal.",
+    ] {
+        let (sender, receiver) = zuno_engine::r#loop::event_channel();
+        let (result, events) =
+            tokio::join!(host.drive(prompt, sender), collect_turn_events(receiver));
+        result.unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TurnEvent::TurnCompleted { .. })),
+            "a fresh question must receive a discussion answer behind an uncertainty gate"
+        );
+        assert_eq!(host.goal_store.goal(&host.session_id).unwrap(), goal_before);
+        assert_eq!(
+            host.goal_store.pause_state(&host.session_id).unwrap(),
+            pause_before
+        );
+        assert_eq!(
+            execution(&host).scheduling.unwrap().readiness,
+            SessionReadiness::Paused {
+                reason: PlanPauseReason::Blocked
+            }
+        );
+    }
+    assert_eq!(provider.calls(), 2);
+    assert!(
+        provider
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|r| r.tools.is_empty())
+    );
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn saved_gated_question_is_discussed_once_without_requeue_or_goal_resume() {
+    let (_dir, mut host, provider, _work) = mock_provider_host(
+        "build",
+        vec![final_response("The saved question's answer.")],
+    )
+    .await;
+    host.session_control
+        .record_continuation(
+            &host.session_id,
+            "legacy-saved-cycle",
+            host.current_turn_identity(),
+            CollaborationMode::Work,
+            None,
+            None,
+            None,
+            zuno_db::message::now_millis(),
+        )
+        .unwrap();
+    host.goal_store
+        .create_goal(&host.session_id, "Paused remote work", None)
+        .unwrap();
+    host.goal_store
+        .pause_with_reason(
+            &host.session_id,
+            zuno_goal::GoalPauseReason::UncertainSideEffect,
+        )
+        .unwrap();
+    host.pause_execution(PlanPauseReason::Blocked).unwrap();
+    let (message, parts) = host
+        .prepare_turn_user_message(
+            "Explain the earlier issue.",
+            Some("saved-discussion-input"),
+            None,
+        )
+        .unwrap();
+    host.persist_user_input(&message, &parts).unwrap();
+    let input_id = format!("inp_{}", message.id);
+    host.session_control
+        .defer_input_at_execution_gate(&host.session_id, &input_id, zuno_db::message::now_millis())
+        .unwrap();
+    let input_before = host
+        .inbox
+        .get(&host.session_id, &input_id)
+        .unwrap()
+        .unwrap();
+    let goal_before = host.goal_store.goal(&host.session_id).unwrap();
+    let execution_before = execution(&host);
+    assert_eq!(
+        host.pending_discussion_input().unwrap().as_deref(),
+        Some(input_id.as_str())
+    );
+    let guard = host.runs.begin_turn(host.session_id.clone()).unwrap();
+    let (sender, receiver) = zuno_engine::r#loop::event_channel();
+    let (driven, _events) = tokio::join!(
+        host.drive_pending_discussion_with_guard(&guard, sender),
+        collect_turn_events(receiver)
+    );
+    assert!(driven.unwrap());
+    drop(guard);
+    assert!(host.pending_discussion_input().unwrap().is_none());
+    assert_eq!(provider.calls(), 1);
+    assert_eq!(
+        host.inbox
+            .get(&host.session_id, &input_id)
+            .unwrap()
+            .unwrap(),
+        input_before
+    );
+    assert_eq!(host.goal_store.goal(&host.session_id).unwrap(), goal_before);
+    assert_eq!(execution(&host), execution_before);
+    let receipt = zuno_db::input_receipt::InputReceiptStore::new(host.database.clone())
+        .get(&host.session_id, &input_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        receipt.state,
+        zuno_types::admission::InputReceiptState::Completed
+    );
+    assert!(receipt.applied_at.is_some());
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn inspect_outcome_discloses_legacy_goal_pause_with_missing_call_records() {
+    let (_dir, mut host, provider, _work) = mock_provider_host("build", vec![]).await;
+    host.session_control
+        .record_continuation(
+            &host.session_id,
+            "legacy-inspection-cycle",
+            host.current_turn_identity(),
+            CollaborationMode::Work,
+            None,
+            None,
+            None,
+            zuno_db::message::now_millis(),
+        )
+        .unwrap();
+    host.goal_store
+        .create_goal(&host.session_id, "Remote design", None)
+        .unwrap();
+    host.goal_store
+        .pause_with_reason(
+            &host.session_id,
+            zuno_goal::GoalPauseReason::UncertainSideEffect,
+        )
+        .unwrap();
+    host.pause_execution(PlanPauseReason::Blocked).unwrap();
+    let before = execution(&host);
+    let goal_before = host.goal_store.goal(&host.session_id).unwrap();
+    let (sender, receiver) = zuno_engine::r#loop::event_channel();
+    let (result, events) = tokio::join!(
+        host.execute_session_command(SessionCommand::InspectOutcome, "", sender),
+        collect_turn_events(receiver)
+    );
+    result.unwrap();
+    let output = events
+        .iter()
+        .find_map(|event| match event {
+            TurnEvent::SessionCommandOutput {
+                command: SessionCommand::InspectOutcome,
+                content,
+            } => Some(serde_json::from_str::<Value>(content).unwrap()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(output["pending"], json!([]));
+    assert_eq!(output["legacyUncertaintyWithoutCallRecords"], true);
+    assert_eq!(output["goalPause"]["reason"], "uncertain_side_effect");
+    assert_eq!(execution(&host), before);
+    assert_eq!(host.goal_store.goal(&host.session_id).unwrap(), goal_before);
+    assert_eq!(provider.calls(), 0);
+    host.shutdown().await.unwrap();
+}
+
 fn plan_exit_request() -> Vec<StreamEvent> {
     vec![
         StreamEvent::ToolUseStart {

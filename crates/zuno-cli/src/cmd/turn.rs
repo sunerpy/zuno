@@ -122,6 +122,7 @@ use zuno_types::execution::{
 
 use crate::environment::StartupEnvironment;
 
+mod discussion;
 #[path = "turn/foreground.rs"]
 mod foreground;
 #[path = "turn/input_receipts.rs"]
@@ -2438,6 +2439,7 @@ struct PromptRouting {
 /// Returned by the same transaction that consumes the input. Capturing its
 /// cycle must not require a fallible read after the commit.
 struct UserInputCommit {
+    input_id: String,
     materialized: bool,
     cycle_id: Option<String>,
 }
@@ -2857,6 +2859,10 @@ impl TurnFailure {
                 // turn that spent its token or time allowance as a user interruption
                 // tells the user they stopped the run themselves, and hides the one
                 // fact that would let them raise the allowance and continue.
+                Self::Engine(TurnError::BudgetLimited {
+                    kind: zuno_engine::budget::BudgetStopKind::UncertainSideEffect,
+                    ..
+                }) => zuno_goal::GoalPauseReason::UncertainSideEffect,
                 Self::Engine(TurnError::BudgetLimited { .. }) => {
                     zuno_goal::GoalPauseReason::TurnBudget
                 }
@@ -2874,6 +2880,11 @@ impl TurnFailure {
     }
 
     fn block_reason(&self) -> GoalBlockReason {
+        if let Self::Engine(TurnError::Provider(error)) = self
+            && let Some(reason) = error.request_rejection()
+        {
+            return GoalBlockReason::ProviderRequestRejected { reason };
+        }
         match self {
             Self::Engine(TurnError::AgentNotFound { .. }) => GoalBlockReason::AgentUnavailable,
             Self::Engine(TurnError::ModelNotFound { .. }) => GoalBlockReason::ModelUnavailable,
@@ -5131,13 +5142,28 @@ impl TurnHost {
             .map(str::to_owned)
             .collect::<Vec<_>>();
         let result = if ids.is_empty() {
-            zuno_db::message::MessageStore::new(&self.connection)
-                .pending_uncertain_tool_calls(&self.session_id, 0)
-                .map_err(SessionCommandError::internal)
-                .and_then(|pending| serde_json::to_string_pretty(&json!({
+            (|| {
+                let pending = zuno_db::message::MessageStore::new(&self.connection)
+                    .pending_uncertain_tool_calls(&self.session_id, 0)
+                    .map_err(SessionCommandError::internal)?;
+                let goal_pause = self
+                    .goal_store
+                    .pause_state(&self.session_id)
+                    .map_err(SessionCommandError::internal)?;
+                let legacy_uncertainty = pending.is_empty()
+                    && goal_pause.as_ref().is_some_and(|pause| {
+                        pause.reason == zuno_goal::GoalPauseReason::UncertainSideEffect
+                    });
+                serde_json::to_string_pretty(&json!({
                     "pending":pending, "usage":"/inspect-outcome <part-id> [part-id ...]",
                     "scope":"native witnessed workspace file calls only; no shell/remote inspection or replay",
-                })).map_err(SessionCommandError::internal))
+                    "goalPause":goal_pause,
+                    "legacyUncertaintyWithoutCallRecords":legacy_uncertainty,
+                    "notice":if legacy_uncertainty {
+                        Some("The Goal has an unresolved uncertainty pause, but this legacy session lacks structured call records. An empty pending list does not prove safety. Inspect authoritative external state before recovery; this command cannot inspect remote MCP outcomes or replay them.")
+                    } else { None },
+                })).map_err(SessionCommandError::internal)
+            })()
         } else {
             // Freeze owned collaborators before awaiting: TurnHost's SQLite
             // connection is Send, not Sync, and never crosses the worker boundary.
@@ -7617,7 +7643,6 @@ impl TurnHost {
         let mut driven_cycle_id = None;
         let result = async {
             self.require_active_extension_composition()?;
-            self.preload_turn_skills(&[prompt], &events).await?;
             let (message, parts) =
                 self.prepare_turn_user_message(prompt, options.message_id, options.content)?;
             driven_input_id = Some(message.id.clone());
@@ -7629,6 +7654,7 @@ impl TurnHost {
                     self.persist_promoted_user_input(&message, &parts)?
                 }
             };
+            driven_input_id = Some(committed.input_id.clone());
             driven_cycle_id = committed.cycle_id;
             if committed.materialized {
                 events
@@ -7639,6 +7665,13 @@ impl TurnHost {
                     .await
                     .map_err(to_string)?;
             }
+            if self
+                .drive_pending_discussion_with_guard(guard, events.clone())
+                .await?
+            {
+                return Ok(());
+            }
+            self.preload_turn_skills(&[prompt], &events).await?;
             self.drive_prepared(
                 prompt,
                 options.planning_source,
@@ -8097,6 +8130,7 @@ impl TurnHost {
                 consume_promoted_input(&transaction, &self.session_id, &durable_input_id)?;
                 transaction.commit().map_err(to_string)?;
                 Ok(UserInputCommit {
+                    input_id: durable_input_id,
                     materialized: false,
                     cycle_id: Some(cycle_id),
                 })
@@ -8133,6 +8167,7 @@ impl TurnHost {
                 self.session_materializer = SessionMaterializer::Existing;
                 self.session_identity.mark_materialized();
                 Ok(UserInputCommit {
+                    input_id: durable_input_id,
                     materialized: true,
                     cycle_id: Some(cycle_id),
                 })
@@ -8177,6 +8212,7 @@ impl TurnHost {
         consume_promoted_input(&transaction, &self.session_id, &message.id)?;
         transaction.commit().map_err(to_string)?;
         Ok(UserInputCommit {
+            input_id: message.id.clone(),
             materialized: false,
             cycle_id,
         })
@@ -10633,6 +10669,11 @@ fn goal_dynamic_context_from(
         })?;
     if let Some(work) = durable_work_context(connection, session_id)? {
         context = context.with_runtime_instruction(work);
+    }
+    if let Some(task) =
+        zuno_tools::task_context::runtime_context(connection, session_id).map_err(to_string)?
+    {
+        context = context.with_runtime_instruction(task);
     }
     Ok(context)
 }

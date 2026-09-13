@@ -1,0 +1,29 @@
+Read or update a bounded, durable summary for one meaningful multi-step task.
+This is task understanding, NOT a permission grant, Goal resume, or execution gate.
+
+- action=get reads current context and bounded recent user-source IDs/text/digests.
+  It can select sources with source_message_ids. Truncated excerpts are not the
+  whole authorization; use the actual user messages and current constraints.
+  Read it before update/replace and copy its revision
+  to expected_revision; omit that field only when no context exists.
+- A new context needs objective, task_kind (delivery or inspection), and source_message_ids
+  naming actual user messages in this session. Assistant text and background reports
+  are not authorization. Record the existing authorized_actions and prohibitions.
+- update is a patch: omitted fields retain their values; prohibitions and checks merge.
+  A later "do not announce" constraint must not silently discard the authorized repair.
+  Explicit inspection-only/no-code/new-task instructions still take precedence.
+- replace starts a new task and preserves the old snapshot in history. Use it only for
+  a genuine new task or explicit scope replacement, with its user sources.
+- Record checks with stable id, kind=delivery|safety, description, status=pending|passed|failed,
+  and checkable evidence references. Update checks by id; never count a passed fail-closed
+  safety test as successful delivery. Complete requires all checks passed; delivery intent
+  also requires a delivery check.
+- Check definitions stay fixed during ordinary updates. To revise a description, set
+  revise_checks=true with user sources, reset that check to pending and clear its evidence.
+  Old evidence cannot certify the revised check; a delivery check cannot become a safety check.
+- Routine implementation choices belong to decision_owner=agent. Multiple approaches,
+  fixing your own defect, artifact wiring and acceptance failures are not reasons to ask
+  the user again. status=waiting needs a real blocker (user_authority, user_information,
+  external_dependency or safety_gate). A context blocker alone does not pause the runtime.
+- Child agents report cross-module decisions to the parent; they cannot rewrite this context.
+- Skip this tool for simple questions or one-step work. Do not manufacture a Plan or task.

@@ -6,6 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rusqlite::Transaction;
 use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 use zuno_db::Pool;
 use zuno_db::inbox::{SessionInbox, read_in};
@@ -41,6 +42,19 @@ pub struct QuestionService {
     runs: Option<SessionRunRegistry>,
 }
 
+/// Session/component-owned task. Dropping the registration stops only this
+/// observer; durable questions and their deadlines are left intact.
+#[must_use = "retain the registration for the native question service's lifetime"]
+pub struct QuestionDeadlineDriver {
+    task: JoinHandle<()>,
+}
+
+impl Drop for QuestionDeadlineDriver {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 impl QuestionService {
     #[must_use]
     pub fn new(pool: Arc<Pool>) -> Self {
@@ -61,6 +75,76 @@ impl QuestionService {
 
     pub fn subscribe(&self) -> broadcast::Receiver<QuestionReceipt> {
         self.changes.subscribe()
+    }
+
+    /// Mount once alongside the native service, including headless HTTP hosts.
+    /// Frontends never decide that a timeout is an answer or a model wake.
+    pub fn start_auto_defer_driver(&self) -> QuestionDeadlineDriver {
+        let service = self.clone();
+        let task = tokio::spawn(async move { service.run_auto_defer().await });
+        QuestionDeadlineDriver { task }
+    }
+
+    pub fn start_auto_defer_driver_for_session(&self, root: &str) -> QuestionDeadlineDriver {
+        let service = self.clone();
+        let root = root.to_owned();
+        let task = tokio::spawn(async move { service.run_auto_defer_for_session(&root).await });
+        QuestionDeadlineDriver { task }
+    }
+
+    pub async fn presentation_sessions(&self, root: &str) -> QuestionResult<Vec<String>> {
+        let pool = Arc::clone(&self.pool);
+        let root = root.to_owned();
+        blocking(move || {
+            let connection = pool.get()?;
+            question::presentation_sessions_in(&connection, &root)
+        })
+        .await
+    }
+
+    /// Existing session task groups can own the reconciliation future directly.
+    pub async fn run_auto_defer(&self) {
+        self.run_auto_defer_scoped(None).await;
+    }
+
+    pub async fn run_auto_defer_for_session(&self, root: &str) {
+        self.run_auto_defer_scoped(Some(root)).await;
+    }
+
+    async fn run_auto_defer_scoped(&self, root: Option<&str>) {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if let Err(error) = self
+                .reconcile_auto_defer_at(root, zuno_db::message::now_millis())
+                .await
+            {
+                tracing::warn!(%error, "ordinary question deadline reconciliation deferred");
+            }
+        }
+    }
+
+    /// Deterministic, bounded native reconciliation. Public clock injection is
+    /// host-only; neither model tools nor QuestionCommand can supply `at_ms`.
+    pub async fn reconcile_auto_defer_at(
+        &self,
+        session_id: Option<&str>,
+        at_ms: i64,
+    ) -> QuestionResult<usize> {
+        let pool = Arc::clone(&self.pool);
+        let session_id = session_id.map(str::to_owned);
+        let receipts = blocking(move || {
+            pool.try_transaction(|tx| question::auto_defer_due_in(tx, session_id.as_deref(), at_ms))
+        })
+        .await?;
+        let count = receipts.len();
+        for receipt in receipts {
+            // No receipt has an input ID. This is presentation state only;
+            // after_commit cannot route a new model turn for an empty timeout.
+            self.after_commit(receipt);
+        }
+        Ok(count)
     }
 
     /// Offer consent without changing Goal, execution, or input state.
@@ -390,6 +474,22 @@ impl QuestionPort for QuestionService {
                     }
                 }
                 spec.validate()?;
+                // Codex request_user_input rejects non-root model agents before
+                // asking a human. The durable owner is authoritative here even
+                // when a tool context lacks its optional orchestration snapshot.
+                // Required input, permissions, OAuth and other host controls do
+                // not use this model-authored clarification contract.
+                if spec.purpose == QuestionPurpose::Clarification
+                    && spec.origin.call_id.is_some()
+                    && zuno_db::session::get(tx, &spec.origin.session_id)?
+                        .parent_id
+                        .is_some()
+                {
+                    return Err(QuestionError::Rejected {
+                        code: "root_question_required",
+                        detail: "Only the root agent may ask ordinary user questions. Return the missing decision and relevant evidence to the parent agent; do not ask the user from a child session.".to_owned(),
+                    });
+                }
                 if spec.purpose == QuestionPurpose::GoalResume {
                     let binding = GoalResumeRequest {
                         session_id: spec.origin.session_id.clone(),
@@ -526,6 +626,8 @@ impl QuestionPort for QuestionService {
     }
 
     async fn get(&self, session_id: &str, request_id: &str) -> QuestionResult<QuestionView> {
+        self.reconcile_auto_defer_at(Some(session_id), zuno_db::message::now_millis())
+            .await?;
         let store = self.store.clone();
         let session_id = session_id.to_owned();
         let request_id = request_id.to_owned();
@@ -533,12 +635,16 @@ impl QuestionPort for QuestionService {
     }
 
     async fn pending(&self, session_id: &str) -> QuestionResult<Vec<QuestionView>> {
+        self.reconcile_auto_defer_at(Some(session_id), zuno_db::message::now_millis())
+            .await?;
         let store = self.store.clone();
         let session_id = session_id.to_owned();
         blocking(move || store.pending(&session_id)).await
     }
 
     async fn visible(&self, session_id: &str) -> QuestionResult<Vec<QuestionView>> {
+        self.reconcile_auto_defer_at(Some(session_id), zuno_db::message::now_millis())
+            .await?;
         let pool = Arc::clone(&self.pool);
         let session_id = session_id.to_owned();
         blocking(move || {

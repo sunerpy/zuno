@@ -69,6 +69,133 @@ fn spec(mode: QuestionMode, questions: Vec<QuestionRequest>) -> QuestionSpec {
     }
 }
 
+async fn wait_question_snapshot(
+    broker: &QuestionBroker,
+    ready: impl Fn(&[QuestionView]) -> bool,
+) -> Vec<QuestionView> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let update = locked(&broker.pending).try_recv().ok();
+            match update {
+                Some(PresenterUpdate::Pending(views)) if ready(&views) => return views,
+                Some(PresenterUpdate::Error(error)) => panic!("question presenter: {error}"),
+                _ => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .expect("durable question snapshot catches up")
+}
+
+#[tokio::test]
+async fn deadline_receipts_never_expand_tui_presentation_into_another_root() {
+    let pool = database();
+    for (id, parent) in [("ses_foreign", None), ("ses_child", Some(SESSION))] {
+        let mut create =
+            zuno_db::session::SessionCreate::new(id, id, "prj", "/tmp", "/tmp", id, "test");
+        if let Some(parent) = parent {
+            create = create.with_parent(parent);
+        }
+        zuno_db::session::Store::new(pool.as_ref())
+            .create(&create)
+            .expect("related session");
+    }
+    let service = Arc::new(QuestionService::new(Arc::clone(&pool)));
+    let other_writer = QuestionService::new(Arc::clone(&pool));
+    let mut views = Vec::new();
+    for id in ["ses_foreign", SESSION, "ses_child"] {
+        let mut request_spec = spec(
+            QuestionMode::Deferred,
+            vec![request("Native optional detail", "Detail")],
+        );
+        request_spec.origin.session_id = id.to_owned();
+        views.push(
+            other_writer
+                .open(request_spec)
+                .await
+                .expect("publish")
+                .question,
+        );
+    }
+    let (broker, _wake) = broker(Arc::clone(&service));
+    let (shutdown, stopping) = watch::channel(false);
+    let worker = tokio::spawn(Arc::clone(&broker).run(stopping));
+    wait_question_snapshot(&broker, |views| !views.is_empty()).await;
+    // A database-wide worker belongs to a different service than the form's
+    // writer. Its notifications must not grant this TUI another root's scope.
+    service
+        .reconcile_auto_defer_at(None, views[2].time_created + 120_000)
+        .await
+        .expect("deadline");
+    let snapshot = wait_question_snapshot(&broker, |views| {
+        views
+            .iter()
+            .any(|view| view.origin.session_id == "ses_child" && view.is_auto_deferred())
+    })
+    .await;
+    assert!(
+        snapshot
+            .iter()
+            .all(|view| [SESSION, "ses_child"].contains(&view.origin.session_id.as_str())),
+        "foreign root leaked into TUI presentation: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.len(),
+        2,
+        "legitimate native child forms remain visible"
+    );
+    assert!(
+        zuno_db::inbox::SessionInbox::new(pool)
+            .pending(SESSION)
+            .expect("inbox")
+            .is_empty()
+    );
+    shutdown.send(true).expect("shutdown");
+    worker.await.expect("presenter exits");
+}
+
+#[tokio::test]
+async fn tui_catches_up_when_another_service_already_committed_auto_defer() {
+    let pool = database();
+    let service = Arc::new(QuestionService::new(Arc::clone(&pool)));
+    let view = service
+        .open(spec(
+            QuestionMode::Deferred,
+            vec![request("Cross-process optional detail", "Detail")],
+        ))
+        .await
+        .expect("question")
+        .question;
+    let (broker, _wake) = broker(Arc::clone(&service));
+    let (shutdown, stopping) = watch::channel(false);
+    let worker = tokio::spawn(Arc::clone(&broker).run(stopping));
+    wait_question_snapshot(&broker, |views| {
+        views.iter().any(|current| current.id == view.id)
+    })
+    .await;
+    let other_writer = QuestionService::new(Arc::clone(&pool));
+    other_writer
+        .reconcile_auto_defer_at(Some(SESSION), view.time_created + 120_000)
+        .await
+        .expect("other process commits without a local notification");
+    let snapshot = wait_question_snapshot(&broker, |views| {
+        views
+            .iter()
+            .any(|current| current.id == view.id && current.is_auto_deferred())
+    })
+    .await;
+    assert_eq!(snapshot.len(), 1);
+    assert!(snapshot[0].answers.is_empty());
+    assert!(
+        zuno_db::inbox::SessionInbox::new(pool)
+            .pending(SESSION)
+            .expect("inbox")
+            .is_empty()
+    );
+    shutdown.send(true).expect("shutdown");
+    worker.await.expect("presenter exits");
+}
+
 fn broker(service: Arc<QuestionService>) -> (Arc<QuestionBroker>, mpsc::Receiver<TerminalEvent>) {
     let (sender, receiver) = zuno_tui::app::terminal_event_channel();
     let broker = Arc::new(QuestionBroker::new(sender));
@@ -790,6 +917,7 @@ fn plan_view(review_gate: zuno_review::PlanReviewGate) -> QuestionView {
         }],
         answers: BTreeMap::new(),
         draft_answers: BTreeMap::new(),
+        auto_defer: None,
         plan: Some(PlanQuestionBinding {
             plan_id: "plan_exact".to_owned(),
             plan_revision: 12,
@@ -808,6 +936,84 @@ fn plan_view(review_gate: zuno_review::PlanReviewGate) -> QuestionView {
         time_created: 1,
         time_updated: 1,
     }
+}
+
+#[tokio::test]
+async fn opening_an_optional_question_snoozes_its_native_deadline_without_submitting() {
+    let pool = database();
+    let service = Arc::new(QuestionService::new(Arc::clone(&pool)));
+    let view = service
+        .open(spec(
+            QuestionMode::Deferred,
+            vec![request("Optional implementation detail", "Detail")],
+        ))
+        .await
+        .expect("open")
+        .question;
+    let (broker, mut wake) = broker(Arc::clone(&service));
+    let (shutdown, stopping) = watch::channel(false);
+    let worker = tokio::spawn(Arc::clone(&broker).run(stopping));
+    let mut bridge = bridge(&broker);
+    wait_for_frame(&mut bridge, &mut wake, "1 question/status entries").await;
+    broker
+        .show_questions(&view.id)
+        .expect("explicit interaction");
+    wait_for_frame(&mut bridge, &mut wake, "Optional implementation detail").await;
+    let current = service.get(SESSION, &view.id).await.expect("current");
+    assert_eq!(
+        current.auto_defer.as_ref().expect("native timer").state,
+        zuno_types::question::QuestionAutoDeferState::Snoozed,
+    );
+    assert!(current.answers.is_empty());
+    assert_eq!(
+        service
+            .reconcile_auto_defer_at(Some(SESSION), view.time_created + 1_000_000,)
+            .await
+            .expect("deadline"),
+        0
+    );
+    assert!(
+        zuno_db::inbox::SessionInbox::new(pool)
+            .pending(SESSION)
+            .expect("inbox")
+            .is_empty()
+    );
+    shutdown.send(true).expect("shutdown");
+    worker.await.expect("presenter exit");
+}
+
+#[tokio::test]
+async fn automatically_deferred_question_can_be_opened_later_with_empty_answers() {
+    let pool = database();
+    let service = QuestionService::new(Arc::clone(&pool));
+    let view = service
+        .open(spec(
+            QuestionMode::Deferred,
+            vec![request("Late optional detail", "Detail")],
+        ))
+        .await
+        .expect("open")
+        .question;
+    service
+        .reconcile_auto_defer_at(
+            Some(SESSION),
+            view.time_created + zuno_types::question::QUESTION_AUTO_DEFER_MS,
+        )
+        .await
+        .expect("deadline");
+    let current = service.get(SESSION, &view.id).await.expect("current");
+    assert_eq!(
+        question_delivery_label(&current),
+        "automatically deferred; answer any time"
+    );
+    let reopened = snooze_opened_question(&service, current.clone())
+        .await
+        .expect("late open");
+    assert_eq!(
+        reopened, current,
+        "opening never fabricates or defaults an answer"
+    );
+    assert!(reopened.answers.is_empty());
 }
 
 #[test]

@@ -229,15 +229,19 @@ impl QuestionBroker {
             return;
         };
         let mut changes = binding.service.subscribe();
-        let mut sessions = BTreeSet::from([binding.session_id.clone()]);
+        let _deadlines = binding
+            .service
+            .start_auto_defer_driver_for_session(&binding.session_id);
+        let mut reconcile = tokio::time::interval(std::time::Duration::from_secs(1));
+        reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        reconcile.tick().await;
         let mut previous = None;
-        self.refresh(&sessions, &mut previous).await;
+        self.refresh(&mut previous).await;
         loop {
             if *shutdown.borrow() {
                 break;
             }
             tokio::select! {
-                biased;
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         break;
@@ -247,14 +251,28 @@ impl QuestionBroker {
                     let Some(command) = command else { break };
                     match command {
                         PresenterCommand::List => {
-                            self.refresh(&sessions, &mut previous).await;
+                            self.refresh(&mut previous).await;
                             self.publish(PresenterUpdate::List).await;
                         }
                         PresenterCommand::Open(id) => {
+                            let sessions = match binding.service.presentation_sessions(&binding.session_id).await {
+                                Ok(sessions) => sessions,
+                                Err(error) => {
+                                    self.publish(PresenterUpdate::Error(error.to_string())).await;
+                                    continue;
+                                }
+                            };
                             let mut found = None;
                             for session in &sessions {
                                 match binding.service.get(session, &id).await {
-                                    Ok(view) => { found = Some(Ok(view)); break; }
+                                    Ok(view) => {
+                                        // Explicit expansion is interaction, as
+                                        // in Codex's async question pane. Merely
+                                        // listing or replaying never snoozes.
+                                        let result = snooze_opened_question(&binding.service, view).await;
+                                        found = Some(result);
+                                        break;
+                                    }
                                     Err(QuestionError::NotFound { .. }) => {}
                                     Err(error) => { found = Some(Err(error)); break; }
                                 }
@@ -268,6 +286,13 @@ impl QuestionBroker {
                             }
                         }
                         PresenterCommand::Apply { question, command } => {
+                            let allowed = binding.service.presentation_sessions(&binding.session_id).await;
+                            if !matches!(allowed, Ok(ref sessions) if sessions.contains(&question.origin.session_id)) {
+                                self.publish(PresenterUpdate::Error(
+                                    "the question is outside this session's presentation scope".to_owned()
+                                )).await;
+                                continue;
+                            }
                             match binding.service.apply(
                                 &question.origin.session_id, &question.id, command,
                             ).await {
@@ -276,34 +301,46 @@ impl QuestionBroker {
                                     "question action was not acknowledged: {error}; /questions reloads durable state"
                                 ))).await,
                             }
-                            self.refresh(&sessions, &mut previous).await;
+                            self.refresh(&mut previous).await;
                         }
                     }
                 }
                 change = changes.recv() => {
                     match change {
                         Ok(receipt) => {
-                            self.notify_work(&receipt);
-                            // Children inherit this exact service and retain their
-                            // own session identity when presented here.
-                            sessions.insert(receipt.question.origin.session_id);
+                            let allowed = binding.service.presentation_sessions(&binding.session_id).await;
+                            if matches!(allowed, Ok(ref sessions) if sessions.contains(&receipt.question.origin.session_id)) {
+                                self.notify_work(&receipt);
+                            }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {}
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
-                    self.refresh(&sessions, &mut previous).await;
+                    self.refresh(&mut previous).await;
                 }
+                _ = reconcile.tick() => self.refresh(&mut previous).await,
             }
         }
     }
 
-    async fn refresh(&self, sessions: &BTreeSet<String>, previous: &mut Option<Vec<QuestionView>>) {
+    async fn refresh(&self, previous: &mut Option<Vec<QuestionView>>) {
         let Ok(service) = self.service() else {
             return;
         };
+        let Some(binding) = self.binding.get() else {
+            return;
+        };
+        let sessions = match service.presentation_sessions(&binding.session_id).await {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                self.publish(PresenterUpdate::Error(error.to_string()))
+                    .await;
+                return;
+            }
+        };
         let mut pending = Vec::new();
         for session in sessions {
-            match service.visible(session).await {
+            match service.visible(&session).await {
                 Ok(questions) => pending.extend(questions),
                 Err(error) => {
                     self.publish(PresenterUpdate::Error(format!(
@@ -322,6 +359,26 @@ impl QuestionBroker {
             self.publish(PresenterUpdate::Pending(pending)).await;
         }
     }
+}
+
+async fn snooze_opened_question(
+    service: &QuestionService,
+    view: QuestionView,
+) -> QuestionResult<QuestionView> {
+    if !view.state.is_terminal()
+        && view
+            .auto_defer
+            .as_ref()
+            .is_some_and(|timer| timer.state == zuno_types::question::QuestionAutoDeferState::Armed)
+    {
+        let command =
+            question_command(&view, QuestionAction::Snooze).map_err(QuestionError::Invalid)?;
+        return service
+            .apply(&view.origin.session_id, &view.id, command)
+            .await
+            .map(|receipt| receipt.question);
+    }
+    Ok(view)
 }
 
 #[async_trait]
@@ -825,6 +882,9 @@ impl QuestionBridge {
 }
 
 fn question_delivery_label(view: &QuestionView) -> &'static str {
+    if view.is_auto_deferred() {
+        return "automatically deferred; answer any time";
+    }
     use zuno_types::question::QuestionDeliveryPhase;
     match view.delivery.as_ref().map(|delivery| delivery.phase) {
         Some(QuestionDeliveryPhase::WaitingAnswer) => "waiting for answer",

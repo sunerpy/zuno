@@ -4,7 +4,7 @@ mod route;
 mod store;
 mod types;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -29,6 +29,9 @@ pub struct EventPage {
 }
 
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const QUESTION_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
+const QUESTION_SESSION_BATCH: usize = 32;
+const QUESTION_EVENT_BATCH: usize = 128;
 
 /// Durable event storage plus per-session bounded live fan-out.
 #[derive(Clone)]
@@ -90,44 +93,84 @@ impl EventService {
     /// Run one forwarder per HTTP event service, subscribing before questions may
     /// be opened. The caller owns this future's lifetime. Replays preserve the
     /// database's event identities; a receipt is never appended as another event.
-    /// If notifications lag, discover the affected sessions from the durable log.
+    /// Periodic owner discovery covers missing/cross-process notifications. One
+    /// bounded event page is read per iteration; per-session cursors prevent
+    /// duplicate publication when live hints and durable catch-up overlap.
     pub async fn forward_question_events(
         &self,
         mut changes: broadcast::Receiver<zuno_types::question::QuestionReceipt>,
     ) -> Result<(), EventStreamError> {
         let mut cursors = BTreeMap::<String, i64>::new();
+        let mut discovery_after = None::<String>;
+        let mut ready = VecDeque::<String>::new();
+        let mut queued = BTreeSet::<String>::new();
+        let mut source_closed = false;
+        let mut reconcile = tokio::time::interval(QUESTION_RECONCILE_INTERVAL);
+        reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            let sessions = match changes.recv().await {
-                Ok(receipt) if receipt.duplicate => continue,
-                Ok(receipt) => vec![receipt.question.origin.session_id],
-                Err(broadcast::error::RecvError::Closed) => return Ok(()),
-                Err(broadcast::error::RecvError::Lagged(_)) => {
+            let sessions = tokio::select! {
+                change = changes.recv(), if !source_closed => match change {
+                    Ok(receipt) if !receipt.duplicate => vec![receipt.question.origin.session_id],
+                    Ok(_) => Vec::new(),
+                    Err(broadcast::error::RecvError::Closed) => {
+                        source_closed = true;
+                        Vec::new()
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        discovery_after = None;
+                        reconcile.reset_immediately();
+                        Vec::new()
+                    }
+                },
+                _ = reconcile.tick(), if !source_closed => {
                     let store = Arc::clone(&self.store);
-                    tokio::task::spawn_blocking(move || store.question_sessions())
+                    let after = discovery_after.clone();
+                    let sessions = tokio::task::spawn_blocking(move || {
+                        store.question_sessions_page(after.as_deref(), QUESTION_SESSION_BATCH)
+                    })
                         .await
-                        .map_err(|source| EventStreamError::Worker { source })??
-                }
+                        .map_err(|source| EventStreamError::Worker { source })??;
+                    discovery_after = (sessions.len() == QUESTION_SESSION_BATCH)
+                        .then(|| sessions.last().cloned()).flatten();
+                    sessions
+                },
+                _ = tokio::task::yield_now(), if !ready.is_empty() => Vec::new(),
             };
             for session_id in sessions {
-                let mut after = cursors.get(&session_id).copied();
-                loop {
-                    let page = self.history_page(&session_id, after, 128).await?;
-                    for event in page.events {
-                        after = Some(event.sequence());
-                        if matches!(
-                            event.event_type(),
-                            "question.opened" | "question.updated" | "question.authorization"
-                        ) {
-                            self.announce(&event);
-                        }
-                    }
-                    if let Some(sequence) = after {
-                        cursors.insert(session_id.clone(), sequence);
-                    }
-                    if !page.has_more {
-                        break;
+                if queued.insert(session_id.clone()) {
+                    ready.push_back(session_id);
+                }
+            }
+            if let Some(session_id) = ready.pop_front() {
+                queued.remove(&session_id);
+                let page = self
+                    .history_page(
+                        &session_id,
+                        cursors.get(&session_id).copied(),
+                        QUESTION_EVENT_BATCH,
+                    )
+                    .await?;
+                for event in page.events {
+                    cursors.insert(session_id.clone(), event.sequence());
+                    if matches!(
+                        event.event_type(),
+                        "question.opened"
+                            | "question.updated"
+                            | "question.authorization"
+                            | "question.auto_deferred"
+                    ) {
+                        self.announce(&event);
+                        // A catch-up page must not starve a responsive bounded
+                        // SSE consumer while it publishes several saved events.
+                        tokio::task::yield_now().await;
                     }
                 }
+                if page.has_more && queued.insert(session_id.clone()) {
+                    ready.push_back(session_id);
+                }
+            }
+            if source_closed && ready.is_empty() {
+                return Ok(());
             }
         }
     }

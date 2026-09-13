@@ -281,6 +281,92 @@ async fn pending_questions_survive_client_and_provider_replacement() {
 }
 
 #[tokio::test]
+async fn http_reconnect_lists_native_deferral_and_accepts_one_explicit_late_answer() {
+    let fixture = Fixture::new();
+    let opened = fixture.open().await;
+    fixture
+        .service
+        .reconcile_auto_defer_at(
+            Some(SESSION),
+            opened.time_created + zuno_types::question::QUESTION_AUTO_DEFER_MS,
+        )
+        .await
+        .expect("native deadline");
+    let recovered = Arc::new(QuestionService::new(Arc::clone(&fixture.pool)));
+    let app = fixture.app_with(recovered);
+    let (status, body) = send(
+        app.clone(),
+        Method::GET,
+        "/api/session/ses_question_api/question",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"][0]["autoDefer"]["state"], "deferred");
+    assert_eq!(body["data"][0]["answers"], json!({}));
+    let current: QuestionView = serde_json::from_value(body["data"][0].clone()).expect("view");
+    assert!(current.is_auto_deferred());
+    assert_eq!(fixture.counts().1, 0);
+    let old_answer = answer("late", opened.revision, "q1", "linux");
+    assert_eq!(
+        send(
+            app.clone(),
+            Method::POST,
+            &path(&opened, "reply"),
+            serde_json::to_string(&old_answer).expect("command")
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT,
+        "stale revisions must not be silently rebound",
+    );
+    let late = serde_json::to_string(&answer("late", current.revision, "q1", "linux"))
+        .expect("refreshed command");
+    let first = send(
+        app.clone(),
+        Method::POST,
+        &path(&opened, "reply"),
+        late.clone(),
+    )
+    .await;
+    let retry = send(app, Method::POST, &path(&opened, "reply"), late).await;
+    assert_eq!(first.0, StatusCode::OK);
+    assert_eq!(retry.0, StatusCode::OK);
+    assert_eq!(first.1["data"]["inputId"], retry.1["data"]["inputId"]);
+    assert_eq!(retry.1["data"]["duplicate"], true);
+    assert_eq!(fixture.counts().1, 1);
+}
+
+#[tokio::test]
+async fn http_interaction_snoozes_the_host_deadline_without_an_answer() {
+    let fixture = Fixture::new();
+    let opened = fixture.open().await;
+    let snooze = command("interacted", opened.revision, QuestionAction::Snooze);
+    let (status, response) = send(
+        fixture.app(),
+        Method::POST,
+        &path(&opened, "reply"),
+        serde_json::to_string(&snooze).expect("snooze"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        response["data"]["question"]["autoDefer"]["state"],
+        "snoozed"
+    );
+    assert_eq!(response["data"]["question"]["answers"], json!({}));
+    assert_eq!(
+        fixture
+            .service
+            .reconcile_auto_defer_at(Some(SESSION), opened.time_created + 1_000_000,)
+            .await
+            .expect("timer"),
+        0
+    );
+    assert_eq!(fixture.counts().1, 0);
+}
+
+#[tokio::test]
 async fn malformed_commands_and_wrong_scopes_never_close_or_claim_a_valid_question() {
     let fixture = Fixture::new();
     let opened = fixture.open().await;
