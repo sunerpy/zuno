@@ -2,6 +2,13 @@
 
 export type Counter = string;
 export type RequestId = string;
+export type ClientId = string;
+/**
+ * How the host obtained a subject. This is diagnostic data, not a permission.
+ */
+export type PrincipalKind = "local" | "user" | "application" | "workload";
+export type PrincipalId = string;
+export type TenantId = string;
 export type ApprovalAnswer = "approve" | "reject";
 export type ApprovalAudience = "requester" | "designatedApprover";
 /**
@@ -25,8 +32,6 @@ export type OperationId = string;
 export type SessionId = string;
 export type TurnId = string;
 export type ApprovalId = string;
-export type PrincipalId = string;
-export type TenantId = string;
 export type ApprovalState = "pending" | "automatic" | "approved" | "rejected" | "expired" | "invalidated";
 export type SharedMemoryRole = "reader" | "contributor" | "reviewer";
 export type WorkspaceId = string;
@@ -130,6 +135,7 @@ export type MergeChoice = "parent" | "child" | "conflict";
 
 export interface ApplicationProtocol {
   activate_skill: ActivateSkill;
+  actor: ActorView;
   answer: ApprovalDecision;
   approval: ApprovalView;
   begin_workspace_import: BeginWorkspaceImport;
@@ -173,6 +179,21 @@ export interface ActivateSkill {
   expectedRevision: Counter;
   requestId: RequestId;
 }
+/**
+ * Public authenticated actor coordinates. No bearer token or service grant.
+ */
+export interface ActorView {
+  clientId?: ClientId | null;
+  kind: PrincipalKind;
+  owner: PrincipalKey;
+}
+/**
+ * A private resource's stable owner. This value is not a permission grant.
+ */
+export interface PrincipalKey {
+  principalId: PrincipalId;
+  tenantId: TenantId;
+}
 export interface ApprovalDecision {
   answer: ApprovalAnswer;
   requestId: RequestId;
@@ -202,13 +223,6 @@ export interface ApprovalBinding {
   resourcesSha256: string;
   sessionId: SessionId;
   turnId: TurnId;
-}
-/**
- * A private resource's stable owner. This value is not a permission grant.
- */
-export interface PrincipalKey {
-  principalId: PrincipalId;
-  tenantId: TenantId;
 }
 export interface BeginWorkspaceImport {
   bytes: Counter;

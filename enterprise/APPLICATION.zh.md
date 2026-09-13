@@ -106,3 +106,5 @@ SDK，不交付 App/UI。
 回退；PostgreSQL 为提供方，HTTP 与生成 SDK 保留资源身份和十进制字符串版本。
 修改要求人类主体使用获准审核应用，安装或恢复不会自动激活。路由和嵌入式
 资源限制见 [SKILLS.zh.md](SKILLS.zh.md)。不交付 App/UI。
+
+已鉴权的 `GET /api/v1/identity` 仅返回 `ActorView` 所有者、主体类型和调用应用。远程桥接在刷新凭证时固定这些身份坐标，详见 [ACP.zh.md](ACP.zh.md)。

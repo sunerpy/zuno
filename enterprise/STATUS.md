@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p2-skill-activation`.
+- Current phase branch: `codex/enterprise-p5-acp-bridge`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -623,3 +623,7 @@ contracts passed. Final PostgreSQL transaction and five HTTPS checks passed. Exa
 remains required before publication. Resource packages and evidence-based proposal automation remain open.
 All 11 deferred UI files retain their recorded hashes. App/UI is paused and
 Penpot must precede future design/development. No enterprise tag or release exists.
+
+## Remote ACP bridge under validation
+
+The Linux bridge role, public actor identity, text admission, cancellation, paged history, committed/live protocol projection and existing-Job observation are wired. Real two-user process tests passed cross-user isolation, authority-only approval, cancellation, disconnect/observe continuation and token identity replacement refusal. A TLS proxy drops a committed input response and confirms receipt lookup without a second POST. ACP 98 tests, SDK 29 tests and generated drift, workspace check, Clippy and 100 documentation/release contracts passed. Exact-archive and preview CI proof remain required. App/UI remains paused and no preview release is enabled.

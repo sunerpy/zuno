@@ -161,3 +161,5 @@ fixture 默认采用 `release` profile，本地驱动检查可用 `--profile dev
 不代表用户授权；用户需在认可的审批应用中显式开启 `generatePrivate`，再提交
 `set_automation`。旧授权升级后不会自动扩大。学习使用普通 Worker 池的空余容量并
 参与排空，配额及恢复见[私有 Memory](MEMORY.zh.md#私有自动学习)。
+
+`acp_bridge` 角色将 Linux 上的 ACP stdio 客户端连接到公共 HTTPS API，使用用户 access-token 文件，不需要数据库或 Worker 密钥。详见 [ACP.zh.md](ACP.zh.md)。

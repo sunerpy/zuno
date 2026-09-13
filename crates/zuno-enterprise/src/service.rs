@@ -72,6 +72,7 @@ pub async fn run(config: ServiceConfig, shutdown: InterruptSignal) -> Result<(),
     )
     .map_err(|_| invalid("could not initialize enterprise operational logging"))?;
     match config.service {
+        ServiceRole::AcpBridge(options) => crate::acp::run(options, shutdown).await,
         ServiceRole::Worker(options) => worker(options, shutdown).await,
         ServiceRole::Gateway(options) => gateway(options, &config.state_directory, shutdown).await,
         ServiceRole::ControlPlane(options) => control(*options, shutdown).await,

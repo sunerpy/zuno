@@ -25,6 +25,11 @@ pub const STEER_REJECTED_CODE: i64 = -32002;
 pub struct RequestId(String);
 
 impl RequestId {
+    /// Stable within one connection, including the string/number distinction.
+    #[must_use]
+    pub fn canonical_key(&self) -> &str {
+        &self.0
+    }
     /// Canonicalize a JSON-RPC id, rejecting shapes JSON-RPC 2.0 does not allow.
     #[must_use]
     pub fn from_json(value: &Value) -> Option<Self> {
@@ -194,6 +199,7 @@ struct InFlightRequest {
     method: String,
     params: Value,
     response_ready: Arc<AtomicBool>,
+    withdrawn: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Copy)]
@@ -236,6 +242,7 @@ pub struct ClientConnection {
     next_id: Arc<AtomicU64>,
     deferred: Option<Arc<Mutex<DeferredState>>>,
     scoped_requests: Option<Arc<Mutex<HashMap<String, Value>>>>,
+    withdrawn: Option<Arc<AtomicBool>>,
 }
 
 struct PendingRequestGuard {
@@ -263,6 +270,14 @@ impl Drop for PendingRequestGuard {
 }
 
 impl ClientConnection {
+    /// Explicit withdrawal, visible even before the Agent's request future has
+    /// reached its admission gate. Disconnect does not set this flag.
+    #[must_use]
+    pub fn is_request_cancelled(&self) -> bool {
+        self.withdrawn
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
     /// Clone for outbound RPCs supervised by the session rather than one prompt.
     ///
     /// Only prompt-owned pending-request tracking is cleared. The connection's
@@ -276,6 +291,7 @@ impl ClientConnection {
     pub fn session_scoped(&self) -> Self {
         Self {
             scoped_requests: None,
+            withdrawn: None,
             ..self.clone()
         }
     }
@@ -405,6 +421,7 @@ impl ClientConnection {
             next_id: Arc::clone(&self.next_id),
             deferred: Some(Arc::new(Mutex::new(DeferredState::default()))),
             scoped_requests: Some(Arc::new(Mutex::new(HashMap::new()))),
+            withdrawn: self.withdrawn.clone(),
         }
     }
 
@@ -546,6 +563,7 @@ where
         next_id: Arc::new(AtomicU64::new(1)),
         deferred: None,
         scoped_requests: None,
+        withdrawn: None,
     };
     let agent = Arc::new(agent);
     let initialized = Arc::new(AtomicU8::new(UNINITIALIZED));
@@ -622,6 +640,7 @@ where
             if method == "$/cancel_request" {
                 if let Some(request_id) = params.get("requestId") {
                     if let Some((withdrawn, request)) = take_in_flight(&in_flight, request_id) {
+                        request.withdrawn.store(true, Ordering::Release);
                         agent
                             .request_cancelled(&request.method, &withdrawn, &request.params)
                             .await;
@@ -684,6 +703,7 @@ where
                 let request_method = method.to_owned();
                 let (cancel_tx, cancel_rx) = oneshot::channel();
                 let response_ready = Arc::new(AtomicBool::new(false));
+                let withdrawn = Arc::new(AtomicBool::new(false));
                 let duplicate = {
                     let mut active = lock(&in_flight);
                     if active.contains_key(&request_key) {
@@ -696,6 +716,7 @@ where
                                 method: request_method.clone(),
                                 params: params.clone(),
                                 response_ready: Arc::clone(&response_ready),
+                                withdrawn: withdrawn.clone(),
                             },
                         );
                         false
@@ -718,7 +739,8 @@ where
                 let in_flight = Arc::clone(&in_flight);
                 let method = request_method;
                 requests.spawn(async move {
-                    let request_client = client.request_scoped();
+                    let mut request_client = client.request_scoped();
+                    request_client.withdrawn = Some(withdrawn);
                     let result = tokio::select! {
                         result = agent.request(&method, &request_key, params, request_client.clone()) => result,
                         termination = cancel_rx => {
@@ -953,6 +975,7 @@ pub(crate) mod test_client {
                 next_id: Arc::new(AtomicU64::new(1)),
                 deferred: None,
                 scoped_requests: None,
+                withdrawn: None,
             };
             let methods = Arc::new(Mutex::new(Vec::new()));
             let pending = Arc::clone(&connection.pending);
@@ -1382,6 +1405,7 @@ mod tests {
         cancelled: Arc<Mutex<Option<RequestId>>>,
         disconnected: Arc<Mutex<Option<RequestId>>>,
         client: Arc<Mutex<Option<ClientConnection>>>,
+        request_client: Arc<Mutex<Option<ClientConnection>>>,
     }
 
     struct DropSignal(Arc<AtomicBool>);
@@ -1405,6 +1429,7 @@ mod tests {
                 return Ok(json!({}));
             }
             *lock(&self.served) = Some(request.clone());
+            *lock(&self.request_client) = Some(client.clone());
             *lock(&self.client) = Some(client.session_scoped());
             let _drop = DropSignal(Arc::clone(&self.dropped));
             self.started.notify_one();
@@ -1441,12 +1466,14 @@ mod tests {
         let served = Arc::new(Mutex::new(None));
         let cancelled = Arc::new(Mutex::new(None));
         let disconnected = Arc::new(Mutex::new(None));
+        let request_client = Arc::new(Mutex::new(None));
         let agent = BlockingAgent {
             started: Arc::clone(&started),
             dropped: Arc::clone(&dropped),
             served: Arc::clone(&served),
             cancelled: Arc::clone(&cancelled),
             disconnected: Arc::clone(&disconnected),
+            request_client: request_client.clone(),
             ..BlockingAgent::default()
         };
         let (mut input_writer, input_reader) = tokio::io::duplex(4096);
@@ -1491,6 +1518,19 @@ mod tests {
         assert_eq!(response["id"], 2);
         assert_eq!(response["error"]["code"], -32800);
         assert_eq!(response["error"]["data"]["reason"], "requestWithdrawn");
+        assert!(
+            lock(&request_client)
+                .as_ref()
+                .unwrap()
+                .is_request_cancelled()
+        );
+        assert!(
+            !lock(&request_client)
+                .as_ref()
+                .unwrap()
+                .session_scoped()
+                .is_request_cancelled()
+        );
         // The withdrawn request is reported by the identity the transport served
         // it under, not by its params: an Agent that keys per-request state on
         // params cannot tell two identical requests apart.

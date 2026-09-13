@@ -142,6 +142,7 @@ impl EnterpriseApplication {
 
     fn routes(self) -> Router {
         let mut router = Router::new()
+            .route("/identity", get(actor_identity))
             .route("/workspaces", get(workspaces))
             .route("/sessions", post(create_session).get(list_sessions))
             .route("/sessions/{session}", get(session))
@@ -255,6 +256,18 @@ impl EnterpriseApplication {
     fn sessions(&self, principal: PrincipalScope) -> AgentApplication {
         AgentApplication::new(Arc::new(self.backend.sessions(principal)))
     }
+}
+
+async fn actor_identity(
+    State(service): State<EnterpriseApplication>,
+    Extension(identity): Extension<VerifiedIdentity>,
+) -> Result<Json<zuno_application::api::ActorView>, Failure> {
+    let actor = service.principal(&identity).await?;
+    Ok(Json(zuno_application::api::ActorView {
+        owner: actor.owner(),
+        kind: actor.kind(),
+        client_id: actor.client_id().cloned(),
+    }))
 }
 
 async fn begin_workspace_import(

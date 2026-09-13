@@ -111,3 +111,5 @@ Durable Workflow coordination, dependency inputs and node approvals: [English](W
 Preview documentation archives contain the tracked guides, example configurations
 and license notices from the exact release commit. Local edits and untracked files
 are excluded; these archives do not update the stable documentation site.
+
+Remote ACP bridge and durable recovery: [English](ACP.md), [中文](ACP.zh.md).

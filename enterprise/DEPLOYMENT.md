@@ -214,3 +214,5 @@ user must explicitly enable `generatePrivate` and then `set_automation` through
 an approved application. Existing consent remains non-automatic after migration.
 Learning uses spare capacity in the normal Worker pool and participates in drain.
 See [private Memory](MEMORY.md#automatic-private-learning) for quotas and recovery.
+
+The `acp_bridge` role connects Linux-hosted ACP stdio clients to the public HTTPS API with a user access-token file. It needs no database or Worker secret. See [ACP.md](ACP.md).
