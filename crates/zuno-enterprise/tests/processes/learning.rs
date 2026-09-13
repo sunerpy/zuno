@@ -1,6 +1,7 @@
 use super::*;
 
 const NOTE: &str = "Use cargo test for enterprise memory checks.";
+const CORRECTION: &str = "Also retain the migration rollback evidence.";
 pub fn model(body: &Value) -> Option<Response> {
     let messages = body["messages"].as_array()?;
     let system = messages
@@ -46,6 +47,19 @@ pub fn model(body: &Value) -> Option<Response> {
                 .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty))
         );
         let input: Value = serde_json::from_str(user).unwrap();
+        if input["scopes"].as_array().unwrap().iter().any(|scope| {
+            scope["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["text"] == NOTE)
+        }) {
+            assert!(input["user_changes"].to_string().contains(CORRECTION));
+            return Some(model_response(
+                json!({"role":"assistant","content":json!({"updates":[]}).to_string()}),
+                true,
+            ));
+        }
         let source = input["experiences"]
             .as_array()
             .unwrap()
@@ -312,6 +326,39 @@ pub async fn verify(
         .to_string()
         .contains(NOTE)
     );
+    let candidate = memory(http, control, alice, "automation-correction", json!({
+        "kind":"propose","change":{"scope":"project","action":"add","content":CORRECTION,
+        "oldText":null,"reason":"Manual validation correction","expectedRevision":null,"confidence":1.0}
+    })).await;
+    memory(http, control, alice, "automation-correction-apply", json!({
+        "kind":"apply","candidateId":candidate["candidate"]["id"],"expectedState":candidate["stateDigest"]
+    })).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let completed: i64 = query_scalar(
+            "SELECT count(*) FROM zuno_enterprise_preview.learning_execution e
+             JOIN zuno_enterprise_preview.learning_job j
+               ON j.tenant_id=e.tenant_id AND j.principal_id=e.principal_id AND j.id=e.job_id
+             WHERE e.source_job_id=$1 AND e.phase='maintenance' AND j.status='completed'",
+        )
+        .bind(&source)
+        .fetch_one(admin)
+        .await
+        .unwrap();
+        if completed == 2 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "manual correction did not wake independent maintenance"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        issuer.model_requests.load(Ordering::SeqCst),
+        before + 4,
+        "a manual correction needs maintenance only, with no new foreground or extraction request"
+    );
     let policy = memory(
         http,
         control,
@@ -332,5 +379,5 @@ pub async fn verify(
     .await
     .unwrap();
     assert_eq!(jobs, 0);
-    assert_eq!(issuer.model_requests.load(Ordering::SeqCst), before + 4);
+    assert_eq!(issuer.model_requests.load(Ordering::SeqCst), before + 5);
 }

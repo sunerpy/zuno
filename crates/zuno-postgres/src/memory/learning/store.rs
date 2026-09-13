@@ -20,7 +20,7 @@ fn phase(input: &LearningInput) -> &'static str {
     }
 }
 
-fn execution(row: &PgRow) -> Result<LearningExecution, Error> {
+pub(super) fn execution(row: &PgRow) -> Result<LearningExecution, Error> {
     let input: LearningInput =
         serde_json::from_value(row.try_get("input").map_err(sql_error)?).map_err(decode_error)?;
     let digest: String = row.try_get("input_digest").map_err(sql_error)?;
@@ -278,6 +278,25 @@ impl TransactionMemory {
         }
         self.require_automation(tx, Some(value.session.as_str()))
             .await?;
+        if !self.maintenance_current(tx, &value).await? {
+            query(
+                "UPDATE zuno_enterprise_preview.learning_job SET status='skipped',
+                owner_id=NULL,lease_token=NULL,lease_expires=NULL,
+                result='{\"reason\":\"maintenance_superseded\"}',time_updated=$4
+                WHERE tenant_id=$1 AND principal_id=$2 AND id=$3",
+            )
+            .bind(self.principal.tenant_id().as_str())
+            .bind(self.principal.principal_id().as_str())
+            .bind(job.as_str())
+            .bind(now)
+            .execute(&mut **tx)
+            .await
+            .map_err(sql_error)?;
+            crate::learning_client::publish_in(tx, &self.principal.owner(), job)
+                .await
+                .map_err(app_error)?;
+            return Ok(None);
+        }
         if value.deadline_ms == 0 {
             value.deadline_ms = now.saturating_add(value.limits.duration_ms as i64);
         }

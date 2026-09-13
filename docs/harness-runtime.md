@@ -1472,6 +1472,11 @@ and committed background activity expose stable Job/state/budget fields; cancell
 fences future work while retaining late accounting. Internal model snapshots and
 learning grants never enter client DTOs. See the preview
 [Memory contract](../enterprise/MEMORY.md#inspect-and-cancel-learning).
+Its maintenance scheduler reconstructs missed wakes from durable corrections and
+evidence changes using current consent/configuration. Stale queued snapshots are
+retired before model I/O; in-flight settlement keeps the original revision checks.
+Only changed input creates a new logical batch, and unchanged cancelled work stays
+cancelled. No foreground Agent turn is created by this maintenance path.
 There is no quota-percentage, daily-token, or currency budget; eligibility,
 idempotency, the wake cap, the three-attempt ceiling, and `learning.execution`
 input/output/step and total-time limits bound background work.

@@ -6,6 +6,8 @@ use zuno_learning::{
 };
 use zuno_types::identity::JobId;
 
+mod maintenance_wake;
+
 fn configured() -> ConfigurationRef {
     ConfigurationRef {
         id: ConfigurationId::new("learning-root").unwrap(),
@@ -590,4 +592,5 @@ pub(super) async fn exercise(backend: &PostgresBackend, admin: &PgPool) {
         state, "skipped",
         "a truthful late model receipt cannot restore revoked automation"
     );
+    Box::pin(maintenance_wake::exercise(backend, admin)).await;
 }

@@ -8,6 +8,7 @@ use zuno_types::identity::{JobId, PrincipalKey, TenantId};
 mod journal;
 mod settlement;
 mod store;
+mod wake;
 use store::NewExecution;
 
 #[derive(Clone)]
@@ -149,6 +150,13 @@ impl PostgresLearningRuntime {
                         )
                         .await;
                     match result {
+                        Ok(true) => inserted += 1,
+                        Ok(false) | Err(Error::Denied | Error::Conflict) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                if inserted < maximum {
+                    match self.refresh_maintenance(&actor, grant).await {
                         Ok(true) => inserted += 1,
                         Ok(false) | Err(Error::Denied | Error::Conflict) => {}
                         Err(error) => return Err(error),
