@@ -228,31 +228,39 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
     );
     raw_sql("DROP TRIGGER zuno_expire_during_write ON zuno_enterprise_preview.message; DROP FUNCTION public.zuno_expire_during_write()")
         .execute(admin).await.unwrap();
-    state
-        .consume_input(
-            &scope,
-            InputMaterialization {
-                turn_id: None,
-                input_id: Some(job.input_id.to_string()),
-                message: MessageRecord::from_json(json!({
-                    "id":job.input_id,"sessionID":session.id,"role":"user","time":{"created":0},
-                    "agent":"build","model":{"providerID":"turn-test","modelID":"model"},
-                }))
-                .unwrap(),
-                parts: vec![
-                    PartRecord::from_json(
-                        json!({
-                            "id":"root-input-part","sessionID":session.id,"messageID":job.input_id,
-                            "type":"text","text":"Inspect the fixture",
-                        }),
-                        0,
-                    )
-                    .unwrap(),
-                ],
-            },
-        )
-        .await
-        .unwrap();
+    let input = InputMaterialization {
+        live: None,
+        turn_id: None,
+        input_id: Some(job.input_id.to_string()),
+        message: MessageRecord::from_json(json!({
+            "id":job.input_id,"sessionID":session.id,"role":"user","time":{"created":0},
+            "agent":"build","model":{"providerID":"turn-test","modelID":"model"},
+        }))
+        .unwrap(),
+        parts: vec![
+            PartRecord::from_json(
+                json!({
+                    "id":"root-input-part","sessionID":session.id,"messageID":job.input_id,
+                    "type":"text","text":"Inspect the fixture",
+                }),
+                0,
+            )
+            .unwrap(),
+        ],
+    };
+    let mut unsupported_live_input = input.clone();
+    unsupported_live_input.live = Some(zuno_engine::state::LiveInputGate {
+        revision: Some(1),
+        source: zuno_engine::interrupt::SoftInterruptSource::User,
+    });
+    assert!(
+        state
+            .consume_input(&scope, unsupported_live_input)
+            .await
+            .is_err()
+    );
+    assert!(state.history(&scope).await.unwrap().is_empty());
+    assert!(state.consume_input(&scope, input).await.unwrap());
     let script = Arc::new(Script {
         replies: Mutex::new(VecDeque::from([
             vec![
@@ -466,6 +474,7 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
         .turn_state(third.lease.clone(), "/workspace".to_owned())
         .unwrap();
     failed_state.consume_input(&scope,InputMaterialization {
+                    live: None,
                 turn_id: None,
         input_id:Some(next_job.input_id.to_string()),
         message:MessageRecord::from_json(json!({

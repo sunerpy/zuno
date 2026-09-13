@@ -274,6 +274,23 @@ are three attempts, a 180-second recovery window, 2-second initial delay,
 scoped, frozen with the resolved session model, and never enter SDK options or
 request JSON.
 
+The main conversation, delegated turns, restored sessions and internal requests
+all retain this policy from the complete resolved model. It must not silently
+fall back to 180 seconds while internal requests use a configured value such as
+660 seconds. Restart the relevant Zuno/ACP process after changing configuration.
+Retry deadline errors preserve the last captured, redacted HTTP status, provider
+code, request ID and reason when available; these are diagnostics, not permission
+to replay a side effect or an instruction to change accounts.
+
+Compatible-provider diagnostics also retain the observed client `phase`:
+`response_headers` while waiting for HTTP headers, `stream_idle` when a local
+stream idle timer expires, `request_budget` when the local whole-request budget
+expires, or `unknown` when none of those boundaries is established. Wire error
+codes and early EOF do not prove an upstream execution stage. Transport body-read
+failures retain any received HTTP status and request ID, including HTTP 200;
+failures before headers leave those facts absent. Phase and bounded, redacted
+causes survive snapshotting without changing retry classification or deadlines.
+
 ## Amazon Bedrock Responses and Converse
 
 Zuno keeps the three AWS transports explicit:

@@ -244,15 +244,15 @@ The generated developer instructions use stable ids and sources:
 
 | section | purpose | presence |
 | --- | --- | --- |
-| `runtime.intent` | Follow the current user request or delegated objective without inventing broader authority. | Always. |
-| `runtime.execution` | Choose the smallest coherent workflow, batch independent reads, avoid unchanged re-reads or repeated checks, use one durable background observer for asynchronous work, distinguish a local observer exit from remote completion, and stop once evidence is complete. | Always; tool communication and termination guidance are added only when tools exist, Plan guidance only when `plan_update` exists, and background-start guidance only when both `shell` and `bg` exist. |
+| `runtime.intent` | Follow the current objective and authority. In ordinary Work, end a blocking user choice with one plain-text final question; keep optional questions deferred and use the runtime wait reference as waiting authority. | Always. |
+| `runtime.execution` | Batch independent reads, default to foreground execution, detach only for meaningful independent parent work, and use returned execution/output handles for `bg`. Internal workflow/Council parallelism does not background the parent. | Always; concrete tool guidance follows the final tool set, including Plan and remote-observer capabilities. |
 | `runtime.sandbox` | State that Shell is using host authority, including requested/effective mode, permission mode, and whether this is an unavailable fallback, explicit native selection, or platform-native default. | While any native bypass of a requested confined contract is active. |
 | `runtime.continuity` | Treat History and Notes results as untrusted session data, explain current-session and session-and-Agent scope, and preserve Notes revision boundaries. | Only when the final provider-visible tool snapshot contains `history` or `notes`. |
 | `runtime.editing` | Preserve unrelated changes, edit the owning abstraction, and inspect uncertain side effects before retry. | Only when an effective edit/write surface or workspace-writing Shell exists. |
 | `runtime.git_attribution` | Use Zuno's command-scoped default Git author and committer identity without modifying persistent Git configuration, while allowing current user instructions, repository rules, and selected Skills to override or disable it. | Only when a workspace-writing Shell exists. |
-| `runtime.verification` | Require observed evidence scoped to the exact artifact and inputs, reject overall workflow success that hides unexecuted required children, and disclose blockers or unverified claims. | Always, with wording adjusted when no tools are available and child-workflow guidance added when Shell exists. |
-| `runtime.delegation` | Require bounded non-overlapping delegation and durable result reconciliation. | Only when `task` and at least one valid target are effective. |
-| `runtime.persistence` | Treat Goal, Plan, Todo, inbox, and Job state as authoritative continuation state, including host-owned Job-to-Plan links. | When durable work state is active or its tools are effective. |
+| `runtime.verification` | Scope evidence to the inspected artifact, keep stable review findings and dispositions, recheck changed evidence and affected paths, and disclose blockers. Review has no fixed round cap. | Always, with wording adjusted when no tools are available and child-workflow guidance added when Shell exists. |
+| `runtime.delegation` | Require bounded non-overlapping delegation, finish independent parent work before yielding for `nextStep`, and reconcile durable results. | Only when `task` and at least one valid target are effective. |
+| `runtime.persistence` | Let an active owned Goal continue; let ordinary finals end their cycle without changing unfinished Plan/Todo status. Preserve typed waits, protected pauses and Job-to-Plan evidence. | When durable work state is active or its tools are effective. |
 
 Each section is recorded with source `zuno-runtime:<section-id>`, exact content,
 estimated tokens, and a SHA-256 digest. A prompt cannot describe an editor,
@@ -276,17 +276,19 @@ value. An existing Plan remains authoritative and is updated on material transit
 
 Remote delivery guidance is split along the same ownership boundary. The
 `github-delivery` Skill carries GitHub-, Actions-, artifact-, and release-specific
-method only when relevant. The runtime owns the generic safety contract: a Shell
-command that only observes remote work uses `background: true` with
-`backgroundPurpose: "remoteObserver"`. Its durable terminal report wakes the
+method only when relevant. The runtime defaults to foreground execution when the
+parent needs the result next. `backgroundPurpose: "remoteObserver"` describes
+the command's purpose in either mode; it does not imply `background: true`.
+Explicit background execution requires meaningful independent parent work.
+For a background observer, its durable terminal report wakes the
 session, but does not prove the remote workflow or release succeeded. The
 resumed turn must inspect the retained output and re-query authoritative remote
 state by a stable run, attempt, ref, or release identifier. Required child jobs
 that were skipped, cancelled, missing, or never expanded are not execution
 evidence unless an explicit repository policy marks them optional.
 
-If durable Plan, Todo, or Job work remains while that remote observer is still
-running, reconciliation records `waiting_background` and ends the current turn
+When the host records an exact external execution wait for that observer,
+reconciliation records `waiting_background` and ends the current turn
 without polling or creating a generic human request. An active Goal is not auto-driven again while
 the observer remains live. The existing process-owned completion watcher admits
 the terminal report and wakes the session, which then refreshes authoritative
@@ -391,43 +393,83 @@ run, the engine passes the committed connection to a host-owned
 and a Plan mutation replaces the one-time Required instruction with Maintain.
 
 Machine execution state does not leak into the visible Plan. The
-`PlanReconciliationDriver` persists `idle`, `executing`, `reconciling`,
-`waiting_retry`, `waiting_background`, `paused`, and `terminal` phase
-events in the existing session event log. Before a successful answer is
-delivered it evaluates only typed Plan, Todo, Job, Goal, background-observer,
-tool-result, and verification state:
+`PlanReconciliationDriver` uses the existing phase event log, including legacy
+`reconciling` projections. Reconciliation runs after a genuine provider final;
+foreground execution waits and tool-result continuation are driven by the host
+before this boundary:
 
-- a session that recorded no durable work finishes on its first answer;
-- terminal Plan state with no active Todo or Job may finish;
+- ungated ordinary Work returns `Finish` even when Plan/Todo steps are unfinished or
+  runnable. It completes the cycle without marking those steps complete or
+  generating another provider request solely to reconcile them;
 - a completed answer from the built-in read-only `plan` Agent is a typed
   planning handoff: its current Plan and Todos remain durable for Start Work
   and do not trigger execution reconciliation. A matching Plan-authorization
   wait permits the source turn to finish its summary without authorizing Work;
 - a live background execution or required child Job can register an exact
   external source/cycle wait without consuming reconciliation attempts;
-- an active Goal owns the next durable continuation;
-- authorized ordinary Work continues from a durable `Recovery` token only when
-  the host proves executable Todo/dependency work. Unfinished Plan steps and
-  blocked Todos alone produce `no_executable_work`, not another provider call;
-- the driver hashes authoritative Plan, Todo, Job, and Goal revisions into a
-  progress fingerprint; three consecutive identical fingerprints pause with
-  typed `no_progress`;
-- no reconciliation branch manufactures a generic human confirmation request.
+- existing typed human/external waits and protected pauses take precedence over
+  ordinary completion and Goal continuation;
+- only an active Goal owned by the current cycle returns `ContinueGoal`. Its
+  authoritative progress fingerprint survives restart; three consecutive
+  identical observations still pause with typed `no_progress`;
+- no reconciliation branch manufactures a question or a persistent pause merely
+  because an ordinary final left Plan/Todo work unfinished.
 
-Unreconciled work means durably recorded work. A Work-mode `Optional` decision
-is not recorded work, so a request that creates no Plan, Todo, or Job settles
-rather than being driven again.
+In Work and Goal execution, optional questions remain deferred. A genuine
+required choice in ordinary Work ends the current turn with one clear plain-text
+final question before the affected action; it does not create a synthetic
+persistent pause. Required Goal input and Plan approval still use their typed
+native controls. Retained older forms and unfinished Plans neither authorize
+automatic continuation nor forbid new input. The runtime execution wait
+reference, rather than form visibility or assistant prose, establishes a wait.
 
-A process restart preserves the session-level fingerprint and unchanged-progress
-count, even across callback cycles. `session_execution_state.scheduling` owns the
+A process restart preserves the execution fingerprint and unchanged-progress
+count; a callback cannot reset them. `session_execution_state.scheduling` owns the
 ready, exact human/external wait, paused and completed gates for ordinary sessions
 and Goals alike. A pause is committed to that row, not only a Goal store or an
 event projection. Callbacks may be recorded while paused but cannot reopen it.
-A status query can run without resuming work; explicit `/resume` queues a Work
-control but cannot waive a pending wait or approve a Plan. Assistant prose is
+A real new user input is bound to `session_work_cycle` in the transaction that
+promotes and consumes it, never while it is merely queued behind another turn.
+Stopping records the exact old input/turn and closes that cycle; it does not make
+`/resume` necessary for the next ordinary request. A fresh request does not inherit
+the old Plan or no-progress streak. Native Work authorization and typed Plan/Todo
+mutations establish ownership; a read or unchanged `in_progress` step does not.
+Protected waits, approvals, authentication, budgets, and uncertain effects remain
+gates. Explicit `/resume` queues a Work control but cannot waive a pending wait,
+approve a Plan, or mark unknown effects inspected. Assistant prose is
 never parsed as evidence that work completed or as a substitute for a typed wait. Hiding
 `plan_update` prevents the model from creating or mutating a new strategic Plan;
 existing Plans remain durable, projected, and recoverable.
+
+Startup, reconnect, new input and upgrades do not automatically unlock legacy
+paused or blocked state. A successful later reply or a matching rendered error
+does not prove the origin of an old gate. Existing failed bridges stay failed;
+missing, pruned, changed or unknown provenance remains gated. Normal `/resume`
+retains all authorization and safety checks. The separately requested, bounded
+`session repair` operation described below can repair only its exact proven
+legacy false-block case; it is not a general pause reset or replay facility.
+
+The boundary follows local Codex `9ba1d9eb5bbbd87ba2fc528d91ad239eea975ee9`:
+`protocol/src/turn_input.rs:178` states that `TurnInputSubmission::Started` and
+`Steered` acknowledge admission for turn processing, without waiting for hooks,
+model-context updates, rollout persistence, or sampling.
+`core/src/session/turn_input.rs` separately classifies User/Automatic/Recovery;
+`core/src/session/turn.rs:475` derives follow-up from model work and pending input,
+then evaluates stop hooks. `core/src/tools/handlers/plan.rs:93` publishes a Plan
+update event; unfinished checklist entries do not themselves keep that turn
+running. `ext/goal/src/runtime.rs:399` owns the separate active-Goal continuation.
+`core/src/tasks/mod.rs` cancels active task work, while the TUI Goal menu handles
+explicit Goal resume separately. The Goal tool/spec were also
+checked at `eaa8b6d91701d6cabe464141facc677e5915fbfc`. Zuno's durable cycle ledger,
+report-transfer receipts and host-counted blocker audits are native adaptations,
+not claims that Codex exposes these database or protocol APIs.
+
+Format 15 atomically upgrades supported formats 5–14, preserving published state
+and updating the marker last. It adds `session_work_cycle`, `goal_turn_observation`,
+`goal_cycle_failure` and `goal_turn_audit`; old unbound observations remain
+historical, and migration does not infer user consent or resume a Goal.
+The ordinary-final, question-delivery and bounded-repair changes keep format 15
+and its schema unchanged. They add no automatic legacy unlock or migration.
 
 ACP mirrors this state through a session-owned projection pump subscribed to
 `TurnHost::work_state_changes()`. A wake causes an authoritative Plan read and a
@@ -618,7 +660,7 @@ The built-in catalog separates primary modes, delegable specialists, and hidden 
 
 `zuno-review` is a native Component publishing one typed `ReviewService`. It owns source
 and artifact probing, typed seat reports, the event-backed review projection and the four
-review tools. `review_open` invokes the configuration-owned `balanced-review` Council
+review tools. `review_open` invokes the pack-owned `balanced-review` Council
 through a host adapter; `council_run` is not exposed to the review model. A seat counts
 only after its `DelegationEvidenceReport` parses, its repository-relative anchors are
 reopened by the host, and a structured receipt binds the preset source, run, job, seat,
@@ -883,6 +925,22 @@ Codex configuration, role, MCP, Skill, wire, or runtime semantics.
 
 ### Typed delegation contract
 
+The contract is flat: `agent`, `objective`, `deliverable`, `instructions`, and
+`success_evidence` are required top-level strings, including on `task_id`
+continuations. The cross-cutting `intent` is an optional UI label removed before
+typed parsing; it cannot replace `objective`. Neither the schema nor the host
+fills missing fields or unwraps a `contract` object.
+
+The tool description carries a complete JSON example, tested through the erased
+tool invocation. Native direct-task callers (`orchestrator` and `deep`) receive a
+shared compact reminder without changing permissions or configured prompt
+overrides. Schema validation retains its original errors and, for missing root
+properties, adds at most four current field descriptions capped at 256 Unicode
+characters each. Nested errors do not borrow unrelated root descriptions;
+names over 128 bytes receive no additional hint, without changing validation;
+argument values are not copied into these hints. A corrected call still passes
+normal validation and authorization before dispatch.
+
 The model-facing `task` tool no longer accepts loose `description`, `prompt`, or
 `load_skills` arguments. Its required work agreement is:
 
@@ -910,9 +968,9 @@ The model-facing `task` tool no longer accepts loose `description`, `prompt`, or
 `scope`, `constraints`, and `dependencies` are optional. `agent` selects one
 member of the effective delegate roster. `task_id` resumes an existing child
 session owned by the same parent. Unknown fields and removed loose arguments,
-including `description`, `prompt`, `subagent_type`, `category`, `model`,
-`effort`, and `load_skills`, fail validation; there is no compatibility
-translation.
+including `description`, `prompt`, `subagent_type`, `category`, and `load_skills`,
+fail validation; there is no compatibility translation. `model` and `effort` are
+advertised only when the session's durable model-selection policy enables them.
 
 ## Prompt provenance
 
@@ -1263,6 +1321,29 @@ attempts, a 180-second window, 2-second initial delay, 30-second maximum delay,
 and 20 percent jitter. The policy is frozen with the resolved provider and is
 never sent upstream.
 
+Main, child and restored turns retain the same complete resolved model value as
+internal requests: provider retry policy, pricing, catalog/wire identity and API
+surface are not reconstructed from defaults. Agent sampling and inherited
+reasoning only replace their respective fields. Configuration changes still
+require resolving a new host/model; this is not live config mutation.
+
+Failed provider attempts persist a bounded, redacted `providerDiagnostic` with
+`status`, `code`, `requestID` and `reason`. Recovery deadlines retain an owned
+snapshot of the last **completed failure** as `lastProviderFailure`, including an
+HTTP code carried by a transient 503; cancelling the replacement attempt does not
+erase it or falsely attribute that HTTP response to the cancelled attempt.
+The same safe context appears in terminal request events and the error text of
+ACP processing receipts. Missing facts remain unknown; raw response bodies and
+credentials are not retained, and diagnostics never determine recovery policy.
+Old receipts are not retroactively reconstructed.
+
+Request/retry elapsed time is separate from the whole child task's wall clock.
+A direct `oracle` task may complete nine successful provider rounds before its
+last request and retries consume 510 seconds. That final request diagnostic
+does not bound the earlier rounds, tool execution, or total task duration.
+An absent last provider code does not imply that the task made no successful
+provider requests.
+
 The four native providers — OpenAI, Anthropic, Google, and Bedrock — do not read
 those keys. Each applies one fixed 330-second response-header deadline and no
 whole-request deadline, because a legitimate long turn has no upper bound the
@@ -1529,6 +1610,21 @@ guide, [resident Memory](design/memory-learning.md), and the
 
 Every model-visible external input is admitted to the session event log and durable inbox in one SQLite transaction before execution is attempted. The inbox is the source of truth across active turns, idle sessions, process restarts, and competing drivers.
 
+Before a resumed provider request, the engine scans eligible durable inputs at a
+safe point in admission-sequence order, even if the in-process wake notification
+was lost or already drained. Saved answers, settled reports and eligible steering
+cannot be overtaken merely because a resume control woke the host. Ordinary
+inputs explicitly queued for the next turn stay in that lane. Selection checks
+cycle/turn ownership, wake eligibility and input revision; it does not flatten
+unsupported client payloads or discard them.
+
+`InputDeliveryBatch` records the inputs actually consumed at that safe point:
+session, turn, cycle and each input's ID, admission sequence and expected revision.
+The `session.input.delivery_batch.1` event reports `state: "recorded"`. This is
+consumption evidence, not a second input lifecycle or proof of application.
+Only the corresponding input receipt at actual post-hook provider dispatch
+establishes `applied`; neither a wake nor a batch proves provider success.
+
 Format 14 adds a native `InputAdmissionReceipt` alongside each input. `admitted`,
 `recorded`, `applied`, and terminal `completed`/`failed`/`cancelled` are separate
 facts: recording a background report is not provider application. The actual
@@ -1537,9 +1633,103 @@ settles completion. Same-cycle recovery transfers receipt ownership explicitly;
 an unrelated turn cannot complete a receipt. Optional client message IDs are
 session-scoped and payload-validated, never derived by deduplicating text.
 
-Standard ACP prompt requests observe that receipt until the associated outcome,
-while `session/steer` returns immediate admission. Disconnect drops an observer;
-it is not implicit withdrawal or evidence that an old owner has stopped.
+For a consumed input already recorded in history but never applied, the native
+session-control transaction can persist `session.input.execution_gate` (stored
+as `session.input.execution_gate.1`) with the input ID, gate and time. The same
+writer snapshot reads execution eligibility and publishes the receipt. The
+optional `InputAdmissionReceipt.executionGate` is projected from that durable
+event; format 15 and its schema are unchanged. The receipt remains `recorded`,
+with no `appliedAt`, `completedAt`, or `turnId`, instead of becoming `failed`
+merely because the drive reached an execution gate without sampling.
+
+The input persistence transaction returns the captured cycle ID to the drive
+owner as part of its commit result; capture does not require a fallible read
+after commit. A late failure fallback rechecks receipt state, gate, turn binding,
+the input's expected cycle and the current session cycle inside the transaction
+that would update the receipt. An absent locally captured cycle permits only
+an input that is still unconsumed and unbound. A superseded owner cannot fail an
+input that native recovery has already taken over.
+
+`executionGate` freezes `reason`, `recovery`, `executionRevision`, `cycleId`,
+and optional `requestId`/`sourceId`. Its typed recovery is diagnostic, not
+authorization. Ordinary `/resume` first validates the existing Work revision,
+Plan and Goal authority, exact human/external waits, authentication, budget,
+blocked state and native uncertain-outcome evidence. On success, the same
+transaction carries only the matching gated, unapplied anchor into the new
+cycle and records `session.input.execution_recovered`; it does not re-admit or
+insert the original text. The gate stays observable until a real turn binds
+the input, after which the ordinary application/completion path owns progress.
+This path never resets a `failed`, `cancelled`, `applied`, or `completed` receipt
+and never authorizes an old-cycle callback.
+
+### Explicit repair of a legacy false block
+
+Use the configured existing database and exact session/input IDs. Inspection is
+the default and opens the database read-only; it neither creates nor migrates it.
+Replace `N` with the positive `expectedRevision` returned by inspection:
+
+```sh
+zuno session repair SESSION --input INPUT --dry-run
+zuno session repair SESSION --input INPUT --apply --expected-revision N
+```
+
+`--apply` and `--dry-run` conflict; `--expected-revision` requires `--apply`.
+Apply requires offline, exclusive access: close every ACP, TUI, server and other
+Zuno process holding this database, including idle connections. The standalone
+CLI uses SQLite exclusive locking in addition to the native recovery lease and
+rechecks the complete proof under the writer transaction.
+
+Eligibility requires an existing format-15 database and one real user input that
+is `consumed`, has a `recorded` receipt, and has never been bound/applied to a
+provider turn. Bounded native events must prove the exact legacy false block and
+its cycle, turn, provider failure and input lineage. Changed revisions, missing
+or ambiguous evidence, competing work, real gates and uncertain tool outcomes
+fail closed. A completed Goal or an idle-looking client is not sufficient proof.
+
+Successful apply writes `session.repair.legacy_false_blocked_applied.1` and admits
+one audited recovery control. It keeps the original input consumed, transfers
+its unapplied anchor without requeueing or reinserting its text, and preserves
+its gate until a real turn binds it. It does not replay tools, change any Goal,
+reset terminal receipts, or perform a format migration. Successful apply returns
+`control_queued`, which proves only that the audited control was queued, not input
+application or provider success. A repeat returns `already_queued` without another
+write or admission only while that exact control remains `queued` and its complete
+evidence and execution snapshot are unchanged. Once the control advances or the
+original input is bound/applied, repair rejects resubmission. Later native
+execution and its receipts remain authoritative.
+The repair command itself does not start a provider request.
+
+### Admission and client observation
+
+Standard ACP prompt requests observe the receipt until an associated outcome,
+including a saved execution gate. A gate returns `-32005` with
+`admission: "accepted"`, `reason: "executionGated"`, `recoveryRequired: true`,
+and `receipt` in the error data: clients must not resend the saved input.
+Duplicate message IDs observe the same gate even in the recovery handoff gap.
+`session/steer` returns immediate admission, which does not attest to sampling.
+Disconnect drops an observer; it is not implicit withdrawal or evidence that
+an old owner has stopped.
+
+ACP binds a `session/prompt` carrying ordinary `/resume` to the native resume
+control input (`ctl_…`) and its `InputAdmissionReceipt`. The session owns the FIFO
+driver, which uses a session-scoped client connection independently of the RPC
+observer. Losing that observer does not drop the drive future or implicitly
+cancel its client requests; this independence does not extend execution beyond
+closure of the ACP connection, runtime, or process. `ClientConnection::session_scoped`
+still shares disconnect state. Connection EOF allows up to 25 ms to drain ready
+requests before runtime shutdown cancels a running resume control. Its data and
+`cancelled` receipt remain durable; `session/load` does not replay that control.
+A `Queued` control is admission evidence, not
+completion: the prompt waits for its associated native execution to complete,
+wait for human input, be cancelled, or fail. Receipt and publication tracking
+keep the response behind the associated outcome and its pending updates, so an
+early `end_turn` cannot clear the client's busy state and Stop control.
+
+Explicit `$/cancel_request` remains bound to the control input contributed by
+that request. If execution has started, withdrawal checks the selected input at
+the cancellation boundary. `session/cancel` retains its exact-turn validation
+and legacy current-target capture; neither path arms cancellation for a later
+turn. An unrelated turn's completion cannot settle the resume control's receipt.
 
 Every multi-statement write transaction reserves SQLite's writer with `BEGIN IMMEDIATE`,
 including transactions opened through a caller-owned turn connection. This lets the configured
@@ -1719,10 +1909,12 @@ numbered choices, and a numbered `Other` input. They support Up/Down and `j/k`
 within a question, Left/Right and `h/l` across questions, number-key selection,
 Enter, Space for multi-select, and mouse selection. Per-question cursors and
 custom drafts survive navigation. Merely highlighting a choice does not select
-it. Ctrl+S defers a question, preserving partial answers; `/questions` reopens the
-pending set. Deferral, cancellation and an empty submission never fabricate an answer.
+it. Ctrl+S defers a question, preserving partial answers. `/questions` lists
+actionable forms and closed forms with inputs awaiting delivery; only actionable
+forms reopen for answers. Deferral, cancellation and an empty submission never
+fabricate an answer.
 
-`runtime.work_state` version 3 includes the session scheduling gate and bounded
+`runtime.work_state` version 4 includes current work ownership, the session scheduling gate and bounded
 pending-question summaries, including early approvals awaiting handoff. They are
 restored after compaction/restart even when no Goal exists. These state summaries
 do not manufacture answers or repeat answer content already delivered by inbox.
@@ -1730,17 +1922,38 @@ do not manufacture answers or repeat answer content already delivered by inbox.
 `QuestionPort` is shared by tools, TUI, HTTP and ACP. `QuestionService` commits
 the request definition, revision, keyed partial answers, command receipt, FIFO
 input and matching session/Goal transition together. `question_async` publishes
-optional input without parking a tool; `question` may wait until answered or
-deferred. Both return receipts, while response content is delivered only through
-the inbox. `goal_request_input` uses the same provider and returns
+optional input without parking a tool. Work/Goal optional `question` calls use
+deferred delivery; synchronous clarification belongs to Plan mode. These calls
+return receipts, while response content is delivered only through the inbox.
+`goal_request_input` remains the typed required-Goal gate and returns
 `TurnOutcome::WaitingForHuman`. Requests outlive their originating turn and
 client connection. Permission requests remain a distinct kind; closing a
 question never supplies a permission approval.
 
+`QuestionView.delivery` is derived from associated input receipts; it is not a
+second persisted question state:
+
+| Phase | Meaning |
+| --- | --- |
+| `WaitingAnswer` (`waiting_answer`) | The form is still pending and accepts an answer. |
+| `AnsweredPendingDelivery` (`answered_pending_delivery`) | The form is closed but associated inputs still lack `appliedAt`, or an early Plan approval awaits its source-turn handoff. |
+| `Applied` (`applied`) | The closed form's associated inputs have application evidence and none remain unapplied. |
+
+Settled controls that create no model input, such as Keep paused, have
+`delivery: None` (the field is omitted in serialization), not `WaitingAnswer`.
+They do not reopen a question. An early Plan approval still awaiting handoff
+retains `AnsweredPendingDelivery` even before its control input is admitted.
+
+The projection includes pending/applied counts and the latest input receipt
+coordinates. Closing a form does not prove model delivery; application does not
+prove a successful provider response. Lists retain closed forms awaiting input
+delivery as status rows without changing their state or reopening a modal.
+
 Interaction registration depends on an actual QuestionPort consumer, not a
 client-name or experimental Plan flag. Plan supports synchronous clarification
-and deferred `plan_exit`; ordinary Work can register required human input even
-without a Goal. Root turns support optional `question_async`; delegated children
+and deferred `plan_exit`; ordinary Work uses a plain-text final question for a
+blocking user choice, without synthesizing a persistent wait. Root turns support
+deferred optional questions in Work/Goal; delegated children
 report blockers to their parent. A headless host without the consumer advertises
 none of these tools. `question_async` shares the `question` permission key.
 
@@ -2102,6 +2315,20 @@ clears the provisional accumulator.
 
 ## Durable goal recovery
 
+Failure ownership is frozen before execution as `TurnFailureScope`: cycle,
+optional turn and optional Goal ID. Settlement rechecks that exact tuple and the
+unstopped cycle in one transaction. A late failure cannot acquire a replacement
+Goal or a newer user cycle. Existing protected waits/pauses and uncertain tool
+outcomes take precedence.
+
+After bounded provider retries or their recovery deadline are exhausted, a
+recoverable failure in an ordinary cycle closes only that cycle. Its failed
+receipt remains evidence, but it does not block an unrelated new input or mutate
+a retained Goal. The same failure schedules durable backoff only for the exact
+active Goal owned by the failed cycle. A genuine typed `turn_budget` stop,
+authentication failure, approval wait, uncertainty or permanent block retains
+its native gate; provider retry exhaustion is not a reason to clear those gates.
+
 An active goal uses two recovery layers. The provider request layer retries a bounded sequence in place and rolls back unpublished partial output before another request. Its recovery window starts only after the original request returns its first retryable failure. The original request remains governed by transport and stream-idle limits and does not consume that window, while rollback, locally jittered backoff, and every replacement attempt must finish before the resulting absolute deadline; expiry cancels an active replay and persists its attempt as a typed deadline failure. Before every wait Zuno commits a `provider_retry_backoff` checkpoint with the request id, turn id, failed and next attempt, typed reason, selected delay, and wait deadline. Its in-place backoff is interruptible by both hard cancellation and durable live steering; waking it does not replay the stale provider request. After a process restart, Zuno waits out any remaining checkpoint deadline and starts a new turn and provider request instead of attempting to revive the old transport. If the bounded sequence still ends in a recoverable error, the goal controller writes a `goal_retry` row before waiting and starts a fresh agent turn when its persisted deadline arrives. There is no cross-turn retry-count ceiling for recoverable failures: the delay grows exponentially, reaches the configured cap, and the goal remains active until it completes, is paused, reaches its token budget, or encounters a permanent failure.
 
 Goal continuation is a first-class turn origin. A prepared continuation captures the exact
@@ -2124,6 +2351,31 @@ Background reports may be recorded while paused, but apply only on a legitimatel
 eligible request. The rendered Goal context names its actual status and pause
 reason, rather than describing every existing Goal as active.
 
+Report persistence and provider continuation are separate boundaries. A completed
+observer can have a callback-owned completion receipt and a `consumed` history
+input without having reached a provider request. The native idle report path
+rechecks cycle and wake authority after committing all reports, in the same writer
+transaction that satisfies an exact external wait. Live application uses the same
+scope rules. Only the current work cycle's bound Goal must be active: an explicit
+ordinary scope with `goal_id=None` is not blocked or charged by a retained paused,
+completed, or budget-limited Goal. No Goal is created or resumed for it.
+
+The absence of a persisted scope is not proof of Goal independence. Unknown legacy
+ownership keeps its conservative inactive-Goal fence. Stopped cycles, human
+approval, budgets, authentication and uncertain-side-effect gates remain intact;
+an old completion cannot start a newer cycle without an explicit native transfer.
+In a mixed report batch, planning text/source and completion identity come from the
+same eligible report. Rejected reports remain historical facts, not planning seeds.
+Ineligible reports use `report_deferred_by_execution_state` and state that the
+current work cycle does not authorize automatic continuation, rather than telling
+every ordinary session to resume a Goal.
+
+This adapts Codex `9ba1d9eb5b`'s separate inter-agent notification and automatic
+turn-admission boundaries (`core/src/agent/control.rs`,
+`core/src/session/turn_input.rs`) and Goal-owned continuation
+(`ext/goal/src/runtime.rs`). Zuno retains its authorized `nextStep` wake behavior;
+it does not copy Codex's notification trigger policy or Plan-mode semantics.
+
 Goal completion reads Plan step statuses through the same shared type as the Plan
 writer. `completed` and `superseded` are terminal; missing, unknown, or legacy
 `cancelled` values fail closed as durable Plan corruption. A model update that settles
@@ -2139,7 +2391,7 @@ before the Goal is blocked; no started or provider-attempt event is fabricated.
 
 The retry row is tied to the exact `goal_id` and stores the attempt, typed reason, selected delay, schedule time, and next eligible time. Reopening the same session reconstructs the wait from SQLite. ACP load and resume first restore the durable session cold. If the root Goal is active, the stable session registry singleflights runtime activation and schedules the Goal through the detached continuation observer; otherwise no TurnHost, MCP, plugin host, or watcher starts until user-authorized work arrives. This recovery path is process-owned and uses the same per-session execution gate as a prompt, so it cannot race a second Goal turn. Queued user input has priority over an automatic turn, and long waits are split by `poll_interval_ms` so an interactive surface can notice that input promptly.
 
-Local delays use exponential backoff with symmetric jitter and never collapse to zero. A valid provider `Retry-After` value is never shortened by jitter; it is clamped to the configured ceiling rather than replaced by an earlier local delay. The same-request recovery window starts after the first retryable provider failure. When the peer's requested delay is at least as long as what remains, the provider layer neither sleeps past its window nor substitutes a shorter local delay: the turn ends with the peer's own typed error, and the goal-level retry waits the peer's value clamped to `max_delay_ms`. A local backoff that would outlive the window ends the turn as `provider_retry_deadline`, retaining the last structured provider code plus recovery and total elapsed times for durable diagnosis.
+Local delays use exponential backoff with symmetric jitter and never collapse to zero. A valid provider `Retry-After` value is never shortened by jitter; it is clamped to the configured ceiling rather than replaced by an earlier local delay. The same-request recovery window starts after the first retryable provider failure. When the peer's requested delay is at least as long as what remains, the provider layer neither sleeps past its window nor substitutes a shorter local delay: the turn ends with the peer's own typed error, and the goal-level retry waits the peer's value clamped to `max_delay_ms`. A local backoff that would outlive the window ends the turn as `provider_retry_deadline`, retaining the last safe provider diagnostic (status, code, request ID and reason) plus recovery and total elapsed times.
 
 ```json
 {
@@ -2173,6 +2425,19 @@ Recovery is selected from typed errors, never rendered messages:
   `state.uncertain.reconciledAtMs` is absent for exactly as long as the inspection is
   owed, and the Goal's `created_at_ms` scopes the query, so a new objective does not
   inherit the previous objective's obligations.
+  Generic session/Goal resume never writes that marker. `/inspect-outcome` is a
+  native, non-model command over the file inspection service. Concrete file
+  implementations record `native.filesystem.intent` after authorization and before
+  effects, binding the actual implementation, canonical workspace, resolved targets,
+  schema/input digests and original part/call/turn/cycle identities. A name, reported
+  path or successful command receipt alone is insufficient. The inspector performs
+  bounded handle-anchored reads on Unix/Windows and commits the observation event and
+  exact part markers atomically. It retains the actual native session lease, including
+  across frontend disconnect; model-originated callers retain strict active-turn
+  ownership. Native inspection can observe a stopped cycle without reopening it.
+  Report-delivery aliases do not authorize tool calls. Legacy calls without a native
+  witness, shell and remote actions fail closed. Inspection preserves the original
+  uncertain outcome and never authorizes replay or automatic Goal/session resume.
 - A turn stopped by its own budget policy pauses with `turn_budget`. The allowance
   belongs to one turn, so the Goal keeps whatever token budget remains, but execution
   does not resume automatically: the next turn would spend the same allowance the same
@@ -2360,6 +2625,47 @@ the Agent to invoke `council_run` exactly once with background execution and
 `nextStep` delivery, while the base resolver remains byte-identical for later
 turns. A launch entered while another turn is active waits in the durable input
 queue instead of steering the in-flight model generation.
+
+The pack-owned `balanced-review` Council has a 600000 ms total deadline and
+reserves 60000 ms for synthesis. Its three seats share one 540000 ms deadline
+relative to the start of Council execution. This replaces the built-in
+180000/60000 ms split only; custom preset descriptors retain their own bounds.
+The descriptor remains frozen in the capability snapshot, and neither user JSON
+configuration nor model-facing tool arguments can override these budgets.
+
+For every seat attempt the host calculates the actual remaining hard time and
+the corresponding UTC deadline in Unix milliseconds, then includes both in the
+durable task prompt.
+Delegation queue wait and retries consume the same seat-phase budget. The
+monotonic host deadline enforces the limit; the prompt communicates it without
+granting more time. Its scope instruction asks for evidence-backed partial
+conclusions and explicit unknowns in the required report format, rather than
+requiring a complete repository scan.
+
+Seat execution status and report validity are separate facts. A cancelled,
+failed, timed-out, or uncertain seat can have successful provider requests and
+completed tools without an accepted terminal report. Timeout settlement retains
+any child-session identity and usage/progress already recorded. Quorum counts
+validated terminal reports only: `0/2` does not mean every provider request failed.
+Council success still requires quorum and successful synthesis; preserved
+progress cannot substitute for either. Another seat attempt is allowed only
+after native `Completed` with an invalid structured report, within the preset's
+retry count and the same deadline. Native failed/cancelled/uncertain results
+and host `Err` settle without replay; provider same-request recovery remains
+separate. A terminal failed task or Council is not automatically replayed.
+
+The state boundaries adopt local Codex
+`9ba1d9eb5bbbd87ba2fc528d91ad239eea975ee9`, without copying its timeout constants.
+In `codex-rs/core/src/guardian/review_session.rs:1573`,
+`run_before_review_deadline` distinguishes `TimedOut` from externally `Aborted`;
+`run_before_review_deadline_with_cancel` at line 1591 signals the owned child
+on either outcome. Separately,
+`codex-rs/core/src/tools/handlers/multi_agents/wait.rs:191` returns `timed_out`
+when no final status was observed; `wait_agent_times_out_when_status_is_not_final`
+in `multi_agents_tests.rs:3196` verifies that observation without inventing a
+remote failure. Zuno preserves this distinction between a wait ending and an
+owned execution deadline cancelling work. Its Council budgets, durable child
+receipts, quorum, and synthesis requirements remain native Zuno policy.
 
 ```json
 {
@@ -2634,6 +2940,26 @@ than of running the CLI. See
 
 ## Background command execution
 
+Choose foreground when waiting is the only useful next action, including one
+serial command, child result, CI run, release or deployment dependency. Duration
+and task count alone are not reasons to detach. The purpose
+`backgroundPurpose: "remoteObserver"` works in either mode; it does not enable
+`background: true`. Detach only for an explicit parallel split: identify the
+independent work the parent will perform locally before dispatch, then perform
+it. Never detach the sole task and finalize while it runs. This is model
+guidance, not a new task-count heuristic or tool gate.
+
+The design reference is Codex `9ba1d9eb5b`'s unified execution handle and
+`write_stdin` continuation (`core/src/tools/handlers/unified_exec.rs`,
+`core/src/unified_exec/process_manager.rs`): yielding an observation window does
+not imply completion or require creating a separate observer agent. Zuno keeps
+its existing foreground handle, event-driven wait and cancellation contracts;
+it does not copy Codex's timing constants or tool wire shape.
+Codex's `core/src/tools/handlers/multi_agents_spec.rs` additionally requires
+identifying critical-path versus parallel sidecar work before delegation, keeping
+immediate blocking work local, and doing non-overlapping local work while a child
+runs. This is the source for Zuno's explicit parallel-split guidance.
+
 `shell` registers a command with the process-owned
 `BackgroundExecutionService` before spawning it. Explicit background mode and a
 foreground attention timeout therefore retain one execution identity and one
@@ -2658,8 +2984,8 @@ budgets still apply.
 Foreground terminal output, completion ownership and the original tool's
 verification receipt commit together before the handle is consumed. It does not
 also produce a detached callback. Serial CI/status dependencies therefore remain
-foreground by default; independent parallel work or an explicit user request
-can select detached execution.
+foreground by default; only explicitly planned independent work alongside
+useful mainline work selects detached execution.
 
 Durable commands keep a bounded 2 MiB live tail, persist complete output
 separately, and record status under `.zuno/background`. Each execution owns
@@ -2980,7 +3306,12 @@ privately. Cursor replay closes gaps after disconnects; live delivery is only a
 wake/latency path. See [client interface architecture](design/client-interfaces.md).
 
 Native file mutations likewise have one presentation policy for live delivery
-and replay. `edit`, `write`, and `apply_patch` use an `Editing files` card.
+and replay. `edit`, `write`, and `apply_patch` use a file-aware standard `title`
+such as `Editing main.rs`, falling back to `Editing files` until complete native
+arguments identify a target. Standard `locations` contain absolute paths, never
+paths guessed from the adapter's cwd. Intended patch paths are projected by the
+native parser; completion prefers actual mutation paths. Titles cap at three
+filenames and 160 Unicode characters with a `(+N more)` suffix when needed.
 Successful calls with typed state expose only structured add/modify/delete
 diffs as visible content while retaining the original result in `rawOutput`;
 successful calls without a diff keep a short fallback. Pre-write failures show
@@ -3184,3 +3515,7 @@ Organization readers do not gain private session or operation access. See
 ### Enterprise quota boundaries
 
 The data owner applies persistent QuotaStore policy during session, root/child Job, learning and lease admission. Counts use durable identity and database-time leases. Already accepted completion delivery and checkpoint recovery do not acquire a second logical user admission. Background learning uses a separate persisted fairness clock, and a full maintenance queue does not invalidate completed extraction. See [enterprise quotas](../enterprise/QUOTAS.md).
+
+### Stable v0.10.37 with the enterprise preview
+
+The preview retains core SQLite format 15 plus its independent overlay. Safe-point inbox preparation stays in the native inbox adapter; live input application is rechecked atomically by turn persistence. Worker protocol 14 distinguishes consumed input from deferred input. Provider deadline observations keep structured ProviderDiagnostic fields through the async state-service observer. ADK adoption decisions are recorded in [the enterprise design ledger](../enterprise/ADK-REFERENCE.md).

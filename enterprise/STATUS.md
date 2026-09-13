@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p6-admission-quotas`.
+- Current synchronization branch: `codex/enterprise-sync-v01037`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -642,3 +642,25 @@ open. UI is paused; no enterprise publication is enabled.
 ## Admission quotas under validation
 
 A persisted quota port now covers user root sessions/Jobs, children, active execution leases and learning queue/leases. Learning has a separate fair dispatch clock. Quota rejection preserves input CAS and existing receipts; follow-up maintenance can defer without rolling back completed extraction. Real transaction, fairness, waiting-capacity and native API checks passed. Quota rejection preserved input CAS, and deferred maintenance resumed after queue capacity returned. Memory/Learning 218 tests, SDK 31 tests and generated drift, workspace check, Clippy and 100 documentation/release contracts passed. Exact-archive and preview CI validation remain required. UI remains paused and publication disabled.
+
+## Stable v0.10.37 synchronization in progress
+
+The isolated sync worktree incorporates stable main
+`4762790adaab0a9af8c93152c1b6136446e4dbc8`. Core SQLite format 15 remains separate
+from preview overlay 1. SQLite live-input gates execute through the persistence
+port; Worker protocol 14 reports whether consumption committed. PostgreSQL
+continues accepting only the assigned primary input and rejects native live
+claims. A transport acknowledgement does not authorize further model work.
+
+Local validation passed 223 SQLite tests including 54 migration fixtures, 373
+engine tests, 144 ACP tests, 750 host tests, 31 SDK tests and generated-contract
+drift checks. The isolated rootless Docker/PostgreSQL five-role process fixture
+passed. Final workspace gates, the packaged artifact and preview CI remain
+required. The foreground-wait regression now observes durable process registration
+before sampling; it no longer assumes startup completes within 150 milliseconds.
+
+ADK Go v2.4.0 source and official MCP docs were reviewed; adoption decisions are
+in [ADK-REFERENCE.md](ADK-REFERENCE.md) and [ADK-REFERENCE.zh.md](ADK-REFERENCE.zh.md).
+These are source-review conclusions, not ADK runtime validation. Shared service
+conformance, versioned Skill resources/artifacts and operational recovery remain
+implementation work. App/UI is paused; publication remains disabled.

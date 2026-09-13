@@ -38,7 +38,7 @@ runtime，避免重复网络或子进程握手。结构性 MCP 配置发生变�
 日志会记录锁等待、解析、关闭、打开和总耗时，但不会记录所选值或凭据。
 
 忙碌时到达的 `session/prompt` 先进入持久 inbox，再于安全点 steer 或保留排队。
-该 RPC 等待这条输入的关联处理结果，返回合法 `stopReason`，不再用 `-32001` busy
+该 RPC 等待这条输入的关联处理结果，正常完成时返回合法 `stopReason`，不再用 `-32001` busy
 表示接收成功。执行由会话持有，不依赖某个 RPC 观察者存活；`_meta.zuno.receipt`
 区分已接收、已写入历史、已进入模型与执行终态。
 
@@ -53,12 +53,14 @@ runtime，避免重复网络或子进程握手。结构性 MCP 配置发生变�
 `reason` 为 `noActiveTurn`、`expectedTurnMismatch`、
 `activeTurnNotSteerable` 或 `emptyInput`。目标回合会在 inbox 事务提交前再次校验；
 如果等待 SQLite 期间原回合结束或已被替换，输入行与准入事件一起回滚，被拒绝的 steer
-不会进入后续回合。`session/cancel` 仍是显式停止整个会话当前执行的控制。
+不会进入后续回合。Stop 使用 `session/cancel`；后续输入使用 prompt 准入或
+`session/steer`，不能通过取消后重发来模拟 steer。
 
 斜杠命令无法被转向，会以 `reason: "commandRequiresIdleSession"` 被拒绝，且不写入任何
 持久内容；只有能解析到真实命令、Skill 或原生控制项的文本才算斜杠命令，因此仅以 `/`
-开头的提示词会作为普通内容被接纳。`$/cancel_request` 只在尚未进入模型时撤回该请求
-贡献的输入，不能抹掉已处理内容，也不能由重复 ID 的观察者撤回原输入。
+开头的提示词会作为普通内容被接纳。`$/cancel_request` 只撤回该请求贡献的输入；
+如果它选中的原生输入已经运行，实际发出取消时仍会核对输入身份。取消不能抹掉已处理
+历史，也不能由重复 ID 的观察者撤回原输入。
 断线不等于撤回：已接收输入与处理回执继续持久保留。完整形态见
 [Zed ACP 集成](/zh/guide/editors)。
 
@@ -77,11 +79,24 @@ entries 清除 Zed 旧面板。load、resume、detached Goal continuation 与 ho
 `parentPlanId`，客户端无需比对 entries 就能区分推入的子 Plan 与被替换的根 Plan；每个 entry 带
 `_meta.zuno.stepId`，清空更新只携带 `_meta.zuno.cleared: true`。
 
-`edit`、`write` 与 `apply_patch` 统一投影为 `Editing files` 卡片。成功且存在结构化
+`edit`、`write` 与 `apply_patch` 的标准 `title` 显示文件名，例如
+`Editing main.rs, lib.rs`。完整原生参数到达后、执行前即更新标题；JSON 尚不完整时
+保留 `Editing files`。标题最多展示三个文件名、160 个 Unicode 字符，其余数量用
+`(+N more)` 表示。标准 `locations` 保留绝对路径；相对 patch 路径可以显示名称，但不会
+借用 ACP 进程 cwd 猜测位置。目标来自原生 patch parser，不把 hunk 内容扫描为文件名。
+完成时以实际修改路径替换输入别名。权限卡片、历史 replay 同样保留文件名，历史中不可打开
+或越界的位置仍被过滤；展示这些信息不需要客户端理解 Zuno 的 `_meta`。
+
+成功且存在结构化
 diff 时，可见内容只保留 `A/M/D <path>`，不再重复显示成功文案；完整原始输出仍在
 `rawOutput`。写入前失败展示可操作错误而不伪造 diff；部分写入或其他不确定结果使用
 failed 状态，保留已观察到的路径/diff，并设置 `_meta.zuno.outcome: "uncertain"`。
 实时更新与历史 replay 使用同一策略。
+
+输入获准后发生 provider 重试失败时，处理回执的错误文字保留最后已捕获的 HTTP 状态、
+provider code、请求 ID 与脱敏原因。`admission: accepted` 仍只说明输入已保存，不代表
+模型成功完成。ACP 主会话与内部请求均从完整模型解析结果读取 provider 重试配置。
+上游缺失的信息保持未知，不回填旧回执。
 
 运维通知——无法抓取的远程规则文件，或因装不进 prompt 预算而整份跳过的完整本地规则文件
 （其规则本轮不生效，回合继续）、被 token、工具调用次数或墙上时间额度停下的回合，以及
@@ -104,6 +119,144 @@ ACP `usage_update` 使用原生 `ContextUsageSnapshot`：最近供应商确认�
 
 运行中的 ACP 会话会订阅统一 Skill catalog generation。新增、修改、删除或重命名
 Skill 后，会发送新的 `available_commands_update`，无需重启会话。
+
+## 精确取消与旧客户端
+
+初始化响应通过 `_meta.zuno.cancellation` 宣告 `version: 1`、
+`method: "session/cancel"`、`expectedTurnIdPath: "_meta.zuno.expectedTurnId"`、
+`legacySessionIdOnly: "currentTargetAtDispatch"` 与 `armsNextTurn: false`。
+客户端从实时 `session/update` 的 `params.update._meta.zuno.turnId` 读取回合 ID：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "session/cancel",
+  "params": {
+    "sessionId": "ses_example",
+    "_meta": { "zuno": { "expectedTurnId": "turn_example" } }
+  }
+}
+```
+
+目标 ID 必须是非空字符串，最多 256 字节。Zuno 在同一把原生锁内校验目标并发出取消，
+因此迟到的 T1 取消不会中断 T2。目标不存在或已结束、ID 不匹配、exact metadata 格式
+非法时，都不会降级为取消当前回合。这是 notification，不产生 JSON-RPC 响应；
+拒绝信息写到 stderr。实际执行结果以原 prompt 的持久回执和更新为准。
+
+旧客户端只发送 `sessionId` 时，Zuno 在处理通知时绑定一次当前执行目标。空闲时取消
+没有效果，也不会给未来回合预置取消。协议没有提供识别网络迟到意图的信息：原本想取消
+T1 的 session-only 通知如果在 T2 运行时到达，可能取消 T2。需要精确目标的客户端必须
+使用上述扩展。
+
+`$/cancel_request` 通过 `requestId` 标识原客户端 RPC，字符串与数字 ID 分开处理。
+响应后复用 wire ID 会获得新的内部请求身份；使用 `_meta.zuno.messageId` 幂等重试时，
+仍只观察原持久输入。撤回不能取消无关的 Agent 到客户端 RPC。`-32800` 表示请求撤回，
+不表示工具副作用已回滚；应通过持久回执观察执行结果。
+
+## 普通 final 与问题投递
+
+没有类型化等待或保护门禁时，真正的普通 provider final 会结束当前 cycle，即使
+Plan／Todo 步骤未完成或仍可执行。
+Plan 投影保留实际状态；`end_turn` 不证明所有步骤完成。前台工具等待和真实续步在 final
+对账之前处理，只有当前周期拥有的 active Goal 才授权 Goal 续跑。
+
+Work／Goal 的可选问题保持 deferred。普通 Work 真正被用户选择阻塞时，用一个清楚的
+纯文本 final 问题结束回合，不制造持久暂停。必需 Goal 输入与 Plan 批准保留类型化控制及
+身份／revision 检查。旧 pending 表单和未完成 Plan 本身既不授权续跑，也不禁止新输入；
+runtime execution wait reference 才是等待权威。
+
+`QuestionView.delivery` 从输入回执派生，阶段为 `WaitingAnswer`（`waiting_answer`）、
+`AnsweredPendingDelivery`（`answered_pending_delivery`）和 `Applied`（`applied`）。
+问题列表可以保留已关闭、但关联输入尚未全部应用的表单，作为投递状态展示，不重开表单。
+pending／applied 计数与最新输入回执区分回答已接受和应用到模型请求；表单关闭或输入应用
+都不证明 provider 已成功响应。
+
+「Keep paused」等已结束且不产生模型输入的控制，`delivery` 为 `None`，序列化时省略，
+不是 `WaitingAnswer`，不应重开。提前批准的 Plan 若仍待交接，即使控制输入尚未准入，
+也保持 `AnsweredPendingDelivery`。
+
+失败按冻结的 cycle／turn／Goal 归属结算。耗尽有界 provider 重试次数或恢复窗口，只关闭
+失败的普通周期，不阻塞之后的独立输入，也不改写无关 Goal。只有确切 active owned Goal
+才为可恢复失败安排退避。类型化审批、必需输入、认证、单回合预算、未知副作用和永久阻塞
+门禁仍然有效。
+
+## 已保存输入与执行门禁
+
+输入可以已经消费并写入历史，但原生执行仍被门禁阻止。此时 `InputAdmissionReceipt`
+保持 `recorded`，附带可选 `executionGate`，`appliedAt`、`completedAt`、`turnId`
+均缺省。门禁不会把这条已保存但未应用的输入改为 `failed`，也不证明模型已开始采样。
+
+恢复后的 provider 请求发送前，引擎即使没有进程内通知，也会扫描持久 FIFO 中合法的
+回答、报告和 steering。恢复控制不能跳过更早的合法回答；明确排在下一回合的普通输入
+仍排队。`InputDeliveryBatch` 与 `session.input.delivery_batch.1` 记录实际消费，不代表
+应用。post-hook provider dispatch 的输入回执建立应用事实，后续执行结果才结算完成。
+
+对于已保存但受执行门禁阻止的输入，`session/prompt` 返回 JSON-RPC error `-32005`，
+其 `error.data` 包含
+`admission: "accepted"`、`reason: "executionGated"`、`recoveryRequired: true`
+和权威 `receipt`。消息已经保存，不要作为新输入重发。重连后以相同
+`_meta.zuno.messageId` 重试，只会观察原回执。
+
+`executionGate` 包含：
+
+| 字段 | 含义 |
+| --- | --- |
+| `reason` | `user`、`authentication`、`turn_budget`、`uncertain_side_effect`、`blocked`、`waiting_human`、`waiting_external`、`no_progress`、`no_executable_work` 或 `execution_unavailable` |
+| `recovery` | `resume_work`、`resume_goal`、`start_work`、`resolve_human_request`、`wait_for_event`、`reauthenticate`、`inspect_outcome`、`review_budget` 或 `inspect_session` |
+| `executionRevision`、`cycleId` | 作出门禁决定时的原生执行 revision 与周期 |
+| `requestId`、`sourceId` | 可选的待答人工请求或所等待外部来源的身份 |
+
+恢复值只是提示，不授予权限，也不承诺一条命令即可解除门禁。`start_work` 指向 Start Work
+的 Plan 授权，`/resume` 不能代替。普通 `/resume` 必须先通过
+既有 Work、Plan、Goal、等待、认证、预算、blocked 状态及未知副作用审计，随后才把匹配的
+gated 且未应用 anchor 绑定到新周期，不会重复插入原文。直到真实 turn 绑定这条输入前，
+重复观察者仍可收到相同 gate；之后应用与完成按正常回执生命周期推进。既有 `failed`、
+`cancelled`、`applied`、`completed` 回执不会重置。
+
+通过 `session/prompt` 提交的普通 `/resume` 在通过这些检查后，由该 RPC 观察原生恢复
+控制的持久回执。控制入队不会提前返回 `stopReason: "end_turn"`：请求会保持待决，
+直到关联的原生执行完成、等待人工输入、被取消或失败。恢复执行期间，客户端可以保持
+面板 busy 和 Stop 可用。RPC 观察者丢失不会取消会话持有的执行；
+这仅指单个观察者，不包括整个 ACP 连接、运行时或进程关闭。连接 EOF 最多等待 25 ms
+以排空已就绪的请求，随后运行时关闭会取消正在运行的恢复控制；其数据和 `cancelled`
+回执继续持久保留，`session/load` 不会重放该控制。
+显式 `$/cancel_request` 只撤回该请求贡献的控制输入，`session/cancel` 仍遵循上文的
+精确回合或旧客户端目标规则。
+
+这不改变普通 Stop 的边界：下一条新消息可正常运行。中断 Goal 仍需显式 Goal 恢复控制，
+旧周期 callback 也不能复活已停止的工作。
+
+重连、普通输入和升级不会自动解锁旧暂停或误阻塞。既有 failed 桥接保持 failed，
+来源未知的门禁仍保留；普通 `/resume` 继续执行上述检查。数据库格式 15 不变，
+本次行为不增加迁移或自动改写旧状态。
+
+### 离线修复单条已证实的误阻塞
+
+独立 CLI 使用当前配置指向的既有数据库。提供确切 session／input ID，并将 `N` 替换为
+只读检查返回的正整数 `expectedRevision`：
+
+```sh
+zuno session repair SESSION --input INPUT --dry-run
+zuno session repair SESSION --input INPUT --apply --expected-revision N
+```
+
+默认只检查。`--apply` 与 `--dry-run` 互斥，且必须提供 `--expected-revision`；
+这里是执行状态 revision，不是 question 或 input revision。应用前关闭所有持有数据库的
+ACP、TUI、server 及其他进程，包括空闲连接。应用要求 SQLite 独占访问和原生恢复租约，
+随后在一个事务中重新验证完整证据。
+
+只接受确切可证为误阻塞的真实用户输入：它已 `consumed`，回执为 `recorded`，
+从未应用或绑定到 provider turn。原生证据不完整或有歧义、revision 过期、并发工作、
+真实保护门禁及未知副作用都会被拒绝。旧 `failed`、`cancelled`、`applied` 或
+`completed` 回执不会重开。
+
+应用只排入一个审计过的恢复控制，保留原 consumed 输入和真实执行绑定前仍可见的 gate。
+它不重排队或重插入原输入、不重放工具、不修改 Goal、不创建数据库，也不迁移格式 15。
+成功返回 `control_queued`，只证明控制已准入，不证明输入已应用或 provider 成功。
+仅当确切的控制仍为 `queued`，且完整证据与执行快照未变时，重复调用才以
+`already_queued` 幂等返回，不重复写入或准入。控制已推进或原输入已绑定／应用后，
+修复拒绝重投；之后仍需观察原生控制与输入回执。
+修复命令本身不会启动 provider 请求。
 
 ## Goal 续跑
 

@@ -48,7 +48,7 @@ resolves confinement from configuration rather than from the outer command line.
 
 | Command | Purpose |
 | --- | --- |
-| [`zuno session`](/cli/session) | List, prune, and delete durable sessions. |
+| [`zuno session`](/cli/session) | List, prune, delete, and inspect guarded recovery of durable sessions. |
 | [`zuno agent`](/cli/agent) | List the agents the current configuration chain resolves. |
 | [`zuno db`](/cli/db) | Run a query against the local session database. |
 | [`zuno export`](/cli/export) | Write configuration, Skills, extensions, and Agents into a portable bundle. |

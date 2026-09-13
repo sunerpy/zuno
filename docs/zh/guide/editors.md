@@ -223,7 +223,11 @@ Zed 呈现权限与征询请求，但策略拥有者仍然是 Zuno：
 - 可复用的 ACP 询问提供 `Allow once`、`Allow for session` 和 `Reject`；会话级授予对权限与资源模式是确切匹配的，能在 Agent/模型/推理重挂载后存活，并由 `session/close` 清除；
 - strict 或 Shell 风险类的仅人工询问只提供 `Allow once` 与 `Reject`；生效的 `allow_all`，包括 `danger-full-access`，完全不会发出权限请求；
 - Zuno 的 Shell 沙箱控制文件系统与网络权限；
-- 原生文件工具为 Zed 发出类型化的创建与编辑 diff；
+- 原生文件工具为 Zed 发出类型化的创建与编辑 diff，并在标准 `title` 中展示
+  `Editing <filename>`，在 `locations` 中提供绝对路径；完整参数到达前仍显示
+  `Editing files`。多文件标题最多三个文件名、160 个 Unicode 字符，其余用
+  `(+N more)` 表示。相对 patch 路径先显示名称，不借用进程 cwd 猜测位置；
+  完成时优先使用实际修改路径，权限请求及历史回放同样保留文件名；
 - 当所选 Agent profile 允许时，Zuno 配置的 MCP server 仍然可用；
 - ACP 客户端提供的 stdio 与 Streamable HTTP MCP server 以 session 为作用域，只有完整集合全部连接并发现成功后才发布工具；
 - 取消、会话加载、恢复、关闭、plan 状态、用量和工具历史使用与 TUI 相同的持久运行时。
@@ -297,10 +301,50 @@ Shell 工具调用的标题是提交时的确切命令，而不是加了解释�
 
 斜杠命令不同。它要对宿主命令目录解析，并作为自己的回合运行，因此无法被转向进已经在飞的工作里。Zuno 用同一个错误码拒绝它，`admission` 为 `"rejected"`，`reason` 为 `"commandRequiresIdleSession"`，并且不写入任何持久内容；等会话空闲后重新发送即可。只有真正指名了某个命令、某个无歧义 Skill 或某个原生会话控制项的提示词才算命令调用。仅仅以 `/` 开头的提示词 —— 一个 POSIX 绝对路径、一个正则表达式 —— 是普通内容，因此会像其他提示词一样被持久接纳并转向，而不是被当成无法解析的命令拒绝。
 
-取消按 RPC 请求 ID 键控，不按相同文本键控。`$/cancel_request` 只撤回该请求贡献且
-尚未处理的输入，以 `-32800` 和持久 receipt 回答；不能抹掉已进入模型的内容，
-重复 ID 的观察者也不能撤回原贡献者的输入。`session/cancel` 才是会话级中断。
+取消按 RPC 请求身份键控，不按相同文本键控。`$/cancel_request` 只撤回该请求贡献且
+尚未处理的输入，或在原子核对后取消它拥有且正在执行的原生输入。`-32800` 表示请求撤回，
+不表示工具副作用已回滚；执行结果以持久 receipt 为准。它不能抹掉已进入模型的内容，
+使用同一 `messageId` 的幂等观察者也不能撤回原贡献者的输入。响应后复用 JSON-RPC wire ID
+会获得新的内部请求身份，旧取消状态不能继承到新请求，也不能取消无关的 Agent 到客户端 RPC。
 观察者断开、显式撤回与 Zuno 进程退出是不同生命周期事件。
+
+### 精确取消扩展
+
+初始化响应通过 `_meta.zuno.cancellation` 宣告能力：
+
+```json
+{
+  "version": 1,
+  "method": "session/cancel",
+  "expectedTurnIdPath": "_meta.zuno.expectedTurnId",
+  "turnIdSource": "session/update._meta.zuno.turnId",
+  "legacySessionIdOnly": "currentTargetAtDispatch",
+  "armsNextTurn": false
+}
+```
+
+客户端把实时 `session/update` 中的 `params.update._meta.zuno.turnId` 放到取消通知：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "session/cancel",
+  "params": {
+    "sessionId": "ses_example",
+    "_meta": { "zuno": { "expectedTurnId": "turn_example" } }
+  }
+}
+```
+
+`expectedTurnId` 必须是非空字符串，最多 256 字节。原生注册表在同一把锁内核对身份并
+发出取消。迟到的 T1 取消不会中断 T2；目标已结束、ID 不匹配或 exact metadata 非法时，
+不会降级为取消当前回合。notification 没有响应 ID，拒绝信息写到 stderr；原 prompt 的
+持久回执和更新报告真实结果。取消也不能证明远端副作用已撤销。
+
+旧 `sessionId`-only 通知只在处理时绑定一次当前目标，空闲时没有效果，不会给下一回合
+预置取消。它无法识别网络迟到意图：想取消 T1 的通知若在 T2 运行时到达，可能取消 T2。
+只有携带精确身份的客户端才有更强的目标保证。后续输入仍走 prompt 准入或 `session/steer`，
+不能通过取消后重发来模拟 steer。
 
 ### 被委派的子会话
 
@@ -436,7 +480,8 @@ dev: open acp logs
 9. 发送一个只读的仓库问题，确认已提交的推理、答案和待处理工具行各出现一次；注入一次可重试的流失败，确认失败的部分尝试不存在；
 10. 委派一个前台子级，并根据客户端能力确认得到的是协商后的子会话流，或者完整的稳定 task 卡片；
 11. 委派一个后台子级，关闭根线程，确认该 job 被取消且没有前台原生子级流；
-12. 在 ask 策略下请求一次文件编辑，确认 Zed 同时显示权限请求和类型化 diff；
+12. 在 ask 策略下请求一次文件编辑，确认 Zed 在权限请求、执行中和完成后均显示文件名，
+    位置由标准 `locations` 提供，并保留类型化 diff；
 13. 取消一个正在运行的提示词，确认会话回到空闲；
 14. 关闭并重新加载该会话，确认内容、question/task 卡片、子级历史、工具、plan 和用量都被重放且仅一次；
 15. 再次加载同一个已打开的会话，确认对话记录没有被重复。

@@ -63,6 +63,244 @@ fn recorded(inbox: &SessionInbox, id: &str) {
         .expect("input");
 }
 
+fn execution_gate() -> zuno_types::admission::InputExecutionGate {
+    use zuno_types::admission::{InputExecutionGate, InputGateReason, InputGateRecovery};
+    InputExecutionGate {
+        reason: InputGateReason::User,
+        recovery: InputGateRecovery::ResumeWork,
+        execution_revision: 3,
+        cycle_id: "paused-cycle".into(),
+        request_id: None,
+        source_id: None,
+    }
+}
+
+#[test]
+fn execution_gate_is_durable_idempotent_and_never_attests_application() {
+    let (pool, inbox, receipts) = fixture();
+    receipts
+        .admit(input("gated", "work").with_cycle_id(Some("paused-cycle")))
+        .unwrap();
+    recorded(&inbox, "gated");
+    let base = receipts
+        .get("session", "gated")
+        .unwrap()
+        .unwrap()
+        .time_updated;
+    for at in [base + 20, base + 21] {
+        assert!(
+            pool.transaction(|tx| zuno_db::input_receipt::record_execution_gate_in(
+                tx,
+                "session",
+                "gated",
+                &execution_gate(),
+                at,
+            ))
+            .unwrap()
+        );
+    }
+    let receipt = receipts.get("session", "gated").unwrap().unwrap();
+    assert_eq!(receipt.state, InputReceiptState::Recorded);
+    assert_eq!(receipt.execution_gate, Some(execution_gate()));
+    assert_eq!(receipt.applied_at, None);
+    assert_eq!(receipt.completed_at, None);
+    assert_eq!(receipt.time_updated, base + 20);
+    let connection = pool.get().unwrap();
+    let count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM event WHERE aggregate_id='session'
+         AND type='session.input.execution_gate.1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    drop(connection);
+    assert!(
+        !pool
+            .transaction(|tx| zuno_db::input_receipt::recover_gated_input_in(
+                tx,
+                "other",
+                "gated",
+                "new-cycle",
+                30,
+            ))
+            .unwrap()
+    );
+    assert!(
+        pool.transaction(|tx| zuno_db::input_receipt::recover_gated_input_in(
+            tx,
+            "session",
+            "gated",
+            "new-cycle",
+            30,
+        ))
+        .unwrap()
+    );
+    assert!(
+        !pool
+            .transaction(|tx| zuno_db::input_receipt::recover_gated_input_in(
+                tx,
+                "session",
+                "gated",
+                "new-cycle",
+                31,
+            ))
+            .unwrap()
+    );
+    assert_eq!(receipts.get("session", "gated").unwrap().unwrap(), receipt);
+    receipts
+        .mark_applied("session", &["gated".into()], "new-turn", 40)
+        .unwrap();
+    let applied = receipts.get("session", "gated").unwrap().unwrap();
+    assert_eq!(applied.state, InputReceiptState::Applied);
+    assert_eq!(applied.execution_gate, None);
+    assert!(
+        !pool
+            .transaction(|tx| zuno_db::input_receipt::record_execution_gate_in(
+                tx,
+                "session",
+                "gated",
+                &execution_gate(),
+                50,
+            ))
+            .unwrap()
+    );
+    assert!(
+        !pool
+            .transaction(|tx| zuno_db::input_receipt::recover_gated_input_in(
+                tx,
+                "session",
+                "gated",
+                "another-cycle",
+                50,
+            ))
+            .unwrap()
+    );
+    assert_eq!(receipts.get("session", "gated").unwrap().unwrap(), applied);
+}
+
+#[test]
+fn failed_gate_publication_rolls_back_receipt_and_evidence() {
+    let (pool, inbox, receipts) = fixture();
+    receipts
+        .admit(input("gated", "work").with_cycle_id(Some("paused-cycle")))
+        .unwrap();
+    recorded(&inbox, "gated");
+    let before = receipts.get("session", "gated").unwrap();
+    pool.get()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_gate_receipt BEFORE INSERT ON event
+         WHEN NEW.type='session.input.receipt.1'
+         BEGIN SELECT RAISE(ABORT,'injected publication failure'); END;",
+        )
+        .unwrap();
+    assert!(
+        pool.transaction(|tx| zuno_db::input_receipt::record_execution_gate_in(
+            tx,
+            "session",
+            "gated",
+            &execution_gate(),
+            20,
+        ))
+        .is_err()
+    );
+    assert_eq!(receipts.get("session", "gated").unwrap(), before);
+    let count: i64 = pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM event WHERE aggregate_id='session'
+         AND type='session.input.execution_gate.1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn failed_or_cancelled_inputs_are_not_reopened_as_gated_work() {
+    for cancelled in [false, true] {
+        let (pool, inbox, receipts) = fixture();
+        receipts
+            .admit(input("gated", "work").with_cycle_id(Some("paused-cycle")))
+            .unwrap();
+        recorded(&inbox, "gated");
+        pool.transaction(|tx| {
+            zuno_db::input_receipt::record_execution_gate_in(
+                tx,
+                "session",
+                "gated",
+                &execution_gate(),
+                20,
+            )
+        })
+        .unwrap();
+        receipts
+            .fail_input("session", "gated", "real termination", cancelled, 30)
+            .unwrap();
+        let before = receipts.get("session", "gated").unwrap().unwrap();
+        assert!(before.state.is_terminal());
+        assert!(before.execution_gate.is_none());
+        assert!(
+            !pool
+                .transaction(|tx| zuno_db::input_receipt::recover_gated_input_in(
+                    tx,
+                    "session",
+                    "gated",
+                    "new-cycle",
+                    40,
+                ))
+                .unwrap()
+        );
+        assert_eq!(receipts.get("session", "gated").unwrap().unwrap(), before);
+    }
+}
+
+#[test]
+fn absent_captured_cycle_does_not_authorize_failing_a_consumed_input() {
+    let (_, inbox, receipts) = fixture();
+    receipts.admit(input("already-recorded", "work")).unwrap();
+    recorded(&inbox, "already-recorded");
+    let before = receipts.get("session", "already-recorded").unwrap();
+    assert!(
+        !receipts
+            .fail_unrecorded_input(
+                "session",
+                "already-recorded",
+                "capture failed after commit",
+                false,
+                20,
+            )
+            .unwrap()
+    );
+    assert_eq!(receipts.get("session", "already-recorded").unwrap(), before);
+    receipts
+        .admit(input("not-recorded", "another request"))
+        .unwrap();
+    assert!(
+        receipts
+            .fail_unrecorded_input(
+                "session",
+                "not-recorded",
+                "actual pre-persistence failure",
+                false,
+                20,
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        receipts
+            .get("session", "not-recorded")
+            .unwrap()
+            .unwrap()
+            .state,
+        InputReceiptState::Failed,
+    );
+}
+
 #[test]
 fn receipt_tracks_recording_application_and_real_completion_separately() {
     let (_, inbox, receipts) = fixture();

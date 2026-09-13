@@ -11,7 +11,10 @@ use zuno_types::context_usage::{
     InvalidContextUsage,
 };
 
-use crate::presentation::{decorate_completed_tool_update, decorate_tool_call};
+use crate::presentation::{
+    decorate_completed_tool_update, decorate_file_tool_call, decorate_file_tool_result,
+    decorate_tool_call,
+};
 
 #[derive(Debug, Default)]
 pub struct TurnEventProjector {
@@ -441,15 +444,14 @@ impl TurnEventProjector {
                     let mut update = json!({
                         "sessionUpdate": "tool_call_update",
                         "toolCallId": id,
-                        "rawInput": raw_input,
                     });
                     if let Some(command) = command {
                         update["title"] = Value::String(command);
                     }
                     if let Some(name) = name {
-                        let presentation_input = update.get("rawInput").cloned();
-                        decorate_tool_call(&mut update, name, presentation_input.as_ref());
+                        decorate_tool_call(&mut update, name, Some(&raw_input));
                     }
+                    update["rawInput"] = raw_input;
                     update
                 })
             }
@@ -492,12 +494,26 @@ impl TurnEventProjector {
                 Some(update)
             }
             TurnEvent::ToolDispatchBlocked { call_id, kind, .. } => {
-                self.raw_inputs.remove(call_id);
-                self.tool_names.remove(call_id);
+                // The engine follows this notice with ToolDispatchCompleted.
+                // Keep file target identity until that final update consumes it;
+                // other tools retain their existing blocked-result presentation.
+                let raw_input = if self
+                    .tool_names
+                    .get(call_id)
+                    .is_some_and(|name| is_file_edit_tool(name))
+                {
+                    self.raw_inputs
+                        .get(call_id)
+                        .map(|value| json_or_string(value))
+                } else {
+                    self.raw_inputs.remove(call_id);
+                    self.tool_names.remove(call_id);
+                    None
+                };
                 self.visible_tools.remove(call_id);
                 self.result_presentations.remove(call_id);
                 let kind = kind.as_str();
-                Some(json!({
+                let mut update = json!({
                     "sessionUpdate": "tool_call_update",
                     "toolCallId": call_id,
                     "status": "failed",
@@ -508,7 +524,11 @@ impl TurnEventProjector {
                             "blockedKind": kind,
                         },
                     },
-                }))
+                });
+                if let Some(name) = self.tool_names.get(call_id) {
+                    decorate_file_tool_call(&mut update, name, raw_input.as_ref());
+                }
+                Some(update)
             }
             TurnEvent::ToolDispatchInterrupted {
                 call_id,
@@ -599,17 +619,24 @@ impl TurnEventProjector {
                     },
                 ..
             } => {
-                self.raw_inputs.remove(tool_use_id);
-                self.tool_names.remove(tool_use_id);
+                let raw_input = self
+                    .raw_inputs
+                    .remove(tool_use_id)
+                    .map(|value| json_or_string(&value));
+                let name = self.tool_names.remove(tool_use_id);
                 self.visible_tools.remove(tool_use_id);
                 self.result_presentations.remove(tool_use_id);
-                Some(json!({
+                let mut update = json!({
                     "sessionUpdate": "tool_call_update",
                     "toolCallId": tool_use_id,
                     "status": if *is_error { "failed" } else { "completed" },
                     "rawOutput": json_or_string(content),
                     "content": [text_content(content)],
-                }))
+                });
+                if let Some(name) = name {
+                    decorate_file_tool_call(&mut update, &name, raw_input.as_ref());
+                }
+                Some(update)
             }
             TurnEvent::Provider {
                 step,
@@ -716,7 +743,6 @@ pub fn tool_call(
     status: &str,
     raw_input: Option<Value>,
 ) -> Value {
-    let presentation_input = raw_input.clone();
     let title = if is_file_edit_tool(name) {
         "Editing files"
     } else {
@@ -729,11 +755,11 @@ pub fn tool_call(
         "kind": tool_kind(name),
         "status": status,
     });
+    add_shell_interpreter(&mut update, name, display_name);
+    decorate_tool_call(&mut update, name, raw_input.as_ref());
     if let Some(raw_input) = raw_input {
         update["rawInput"] = raw_input;
     }
-    add_shell_interpreter(&mut update, name, display_name);
-    decorate_tool_call(&mut update, name, presentation_input.as_ref());
     update
 }
 
@@ -808,6 +834,15 @@ pub(crate) fn completed_tool_update(input: CompletedToolUpdate<'_>) -> Value {
         update["locations"] = Value::Array(locations);
     }
     add_shell_interpreter(&mut update, name, display_name);
+    decorate_file_tool_result(
+        &mut update,
+        name,
+        raw_input,
+        written_paths,
+        diff,
+        presentation,
+        metadata,
+    );
     decorate_completed_tool_update(
         &mut update,
         name,

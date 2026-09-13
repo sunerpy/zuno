@@ -17,6 +17,12 @@ const NOW: i64 = 200 * DAY_MILLIS;
 const OLD: i64 = 10 * DAY_MILLIS;
 const NEW: i64 = 190 * DAY_MILLIS;
 const SELECTED: [&str; 3] = ["ses_root", "ses_child", "ses_grandchild"];
+const TURN_LEDGER_TABLES: [&str; 4] = [
+    "goal_cycle_failure",
+    "goal_turn_audit",
+    "goal_turn_observation",
+    "session_work_cycle",
+];
 
 struct Reachable;
 
@@ -271,6 +277,7 @@ fn seed(connection: &Connection) {
             .expect("insert session_context_epoch");
         insert_event_aggregate(connection, session_id);
         insert_event_aggregate(connection, &format!("sse:{session_id}"));
+        insert_turn_ledgers(connection, session_id);
     }
 
     connection
@@ -360,6 +367,84 @@ fn count(connection: &Connection, table: &str) -> u64 {
     u64::try_from(rows).expect("row count is non-negative")
 }
 
+fn insert_turn_ledgers(connection: &Connection, session_id: &str) {
+    let cycle_id = format!("cycle_{session_id}");
+    let goal_id = format!("goal_{session_id}");
+    let turn_id = format!("turn_{session_id}");
+    // Pruning owns the rows, not the host's evolving typed JSON field set.
+    let data = serde_json::json!({
+        "sessionId": session_id,
+        "cycleId": cycle_id,
+        "goalId": goal_id,
+        "stopped": {"turnId":turn_id,"userCancelled":true,"atMs":2},
+        "fixtureNote": format!("Keep {session_id} — 保留原文")
+    })
+    .to_string();
+    connection
+        .execute(
+            "INSERT INTO session_work_cycle
+         (session_id,cycle_id,anchor_message_id,data,time_created,time_updated)
+         VALUES (?1,?2,?3,?4,1,2)",
+            rusqlite::params![session_id, cycle_id, format!("msg_{session_id}"), data],
+        )
+        .expect("insert nonempty host work cycle");
+    connection
+        .execute(
+            "INSERT INTO goal_turn_observation
+         (session_id,goal_id,cycle_id,turn_id,signal,time_created)
+         VALUES (?1,?2,?3,?4,'provider:offline',1)",
+            rusqlite::params![session_id, goal_id, cycle_id, turn_id],
+        )
+        .expect("insert Goal observation");
+    connection
+        .execute(
+            "INSERT INTO goal_turn_audit
+         (session_id,goal_id,cycle_id,turn_id,audit,time_recorded)
+         VALUES (?1,?2,?3,?4,?5,2)",
+            rusqlite::params![
+                session_id,
+                goal_id,
+                cycle_id,
+                turn_id,
+                serde_json::json!({"sessionId":session_id,"consecutiveTurns":2}).to_string()
+            ],
+        )
+        .expect("insert Goal audit");
+    connection
+        .execute(
+            "INSERT INTO goal_cycle_failure
+         (session_id,goal_id,cycle_id,active_turn_id,signal,consecutive_turns)
+         VALUES (?1,?2,?3,?4,'provider:offline',2)",
+            rusqlite::params![session_id, goal_id, cycle_id, turn_id],
+        )
+        .expect("insert Goal failure streak");
+}
+
+fn turn_ledger_rows(
+    connection: &Connection,
+    session_id: Option<&str>,
+) -> BTreeMap<&'static str, Vec<Vec<rusqlite::types::Value>>> {
+    TURN_LEDGER_TABLES
+        .into_iter()
+        .map(|table| {
+            let mut statement = connection.prepare(&format!(
+            "SELECT * FROM {table} WHERE ?1 IS NULL OR session_id=?1 ORDER BY session_id,rowid"
+        )).expect("prepare lifecycle snapshot");
+            let columns = statement.column_count();
+            let rows = statement
+                .query_map([session_id], |row| {
+                    (0..columns)
+                        .map(|column| row.get(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .expect("query lifecycle snapshot")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("read lifecycle snapshot");
+            (table, rows)
+        })
+        .collect()
+}
+
 fn all_table_counts(connection: &Connection) -> BTreeMap<String, u64> {
     let mut statement = connection
         .prepare(
@@ -383,6 +468,16 @@ fn prune_default_preview_is_inert_across_every_real_table() {
     let fixture = Fixture::build();
     let mut connection = fixture.connection();
     let before = all_table_counts(&connection);
+    let turns_before = turn_ledger_rows(&connection, None);
+    for session_id in SELECTED.into_iter().chain(["ses_bystander"]) {
+        for (table, rows) in turn_ledger_rows(&connection, Some(session_id)) {
+            assert_eq!(
+                rows.len(),
+                1,
+                "{table}/{session_id} must have a nonempty fixture"
+            );
+        }
+    }
     assert_eq!(
         before.len(),
         zuno_db::schema::TABLE_COUNT + 1 + 10,
@@ -400,24 +495,50 @@ fn prune_default_preview_is_inert_across_every_real_table() {
 
     assert_eq!(outcome.mode, PruneMode::Preview);
     assert_eq!(all_table_counts(&connection), before);
+    assert_eq!(turn_ledger_rows(&connection, None), turns_before);
     assert!(remote.calls.borrow().is_empty(), "preview never unshares");
-    // The projection is `PRUNE_TABLES` plus every session-keyed table the live schema
-    // declares that no foreign key covers and `DELETE_ORDER` does not name, so the preview
-    // describes exactly the rows the delete removes.
+    // The projection is `PRUNE_TABLES` plus the declared FK-less session tables
+    // outside `DELETE_ORDER`. Cascaded host-cycle rows are checked separately in
+    // the deletion test; this fixture does not expand the runtime's projection.
     let projected: BTreeSet<&str> = outcome
         .preview
         .tables
         .iter()
         .map(|table| table.table)
         .collect();
-    for derived in ["human_request", "provider_retry_backoff"] {
+    for derived in [
+        "goal_cycle_failure",
+        "goal_turn_audit",
+        "goal_turn_observation",
+        "human_request",
+        "provider_retry_backoff",
+    ] {
         assert!(
             projected.contains(derived),
             "{derived} is swept by the delete, so preview must count it"
         );
     }
-    assert_eq!(outcome.preview.tables.len(), PRUNE_TABLES.len() + 2);
-    assert_eq!(outcome.preview.total_rows, 57);
+    assert_eq!(outcome.preview.tables.len(), PRUNE_TABLES.len() + 5);
+    // Three selected sessions each have three FK-less Goal ledger rows.
+    // The host cycle follows the session FK; its cascade is asserted below.
+    assert_eq!(outcome.preview.total_rows, 57 + 3 * 3);
+    for table in [
+        "goal_cycle_failure",
+        "goal_turn_audit",
+        "goal_turn_observation",
+    ] {
+        let impact = outcome
+            .preview
+            .tables
+            .iter()
+            .find(|impact| impact.table == table)
+            .expect("Goal ledger is included in the prune projection");
+        assert_eq!(impact.rows, 3);
+        assert!(
+            impact.bytes > 0,
+            "{table} must project its real payload bytes"
+        );
+    }
     assert!(outcome.preview.total_bytes > 0);
     assert_eq!(outcome.preview.cost, 7.5);
     assert_eq!(outcome.preview.tokens.input, 6);
@@ -491,6 +612,7 @@ fn prune_delete_requires_confirmation_before_remote_or_local_side_effects() {
     let fixture = Fixture::build();
     let mut connection = fixture.connection();
     let before = all_table_counts(&connection);
+    let turns_before = turn_ledger_rows(&connection, None);
     let remote = FakeRemote::default();
 
     let error = execute(
@@ -503,6 +625,7 @@ fn prune_delete_requires_confirmation_before_remote_or_local_side_effects() {
 
     assert!(matches!(error, PruneError::ConfirmationRequired));
     assert_eq!(all_table_counts(&connection), before);
+    assert_eq!(turn_ledger_rows(&connection, None), turns_before);
     assert!(
         remote.calls.borrow().is_empty(),
         "confirmation is checked before remote unshare"
@@ -514,6 +637,10 @@ fn prune_preview_counts_exactly_match_the_subsequent_transactional_delete() {
     let fixture = Fixture::build();
     let mut connection = fixture.connection();
     let before = all_table_counts(&connection);
+    let bystander_turns = turn_ledger_rows(&connection, Some("ses_bystander"));
+    for table in TURN_LEDGER_TABLES {
+        assert_eq!(before[table], 4, "{table} has one row for each session");
+    }
     let expected = preview(&connection, &fixture.selection).expect("preview");
     let remote = FakeRemote::default();
 
@@ -539,6 +666,18 @@ fn prune_preview_counts_exactly_match_the_subsequent_transactional_delete() {
     }
     assert_eq!(remote.calls.borrow().as_slice(), ["ses_root"]);
     assert_eq!(count(&connection, "session"), 1, "bystander survives");
+    assert_eq!(
+        turn_ledger_rows(&connection, Some("ses_bystander")),
+        bystander_turns
+    );
+    for session_id in SELECTED {
+        for (table, rows) in turn_ledger_rows(&connection, Some(session_id)) {
+            assert!(
+                rows.is_empty(),
+                "{table} retained subtree member {session_id}"
+            );
+        }
+    }
 
     for (table, column) in [
         ("memory_reflection_job", "session_id"),
@@ -552,6 +691,10 @@ fn prune_preview_counts_exactly_match_the_subsequent_transactional_delete() {
         ("session_context_epoch", "session_id"),
         ("session_input", "session_id"),
         ("session_message", "session_id"),
+        ("session_work_cycle", "session_id"),
+        ("goal_cycle_failure", "session_id"),
+        ("goal_turn_audit", "session_id"),
+        ("goal_turn_observation", "session_id"),
         ("part", "session_id"),
         ("message", "session_id"),
         ("session_share", "session_id"),
@@ -600,6 +743,7 @@ fn prune_archive_is_reversible_without_deleting_session_data() {
     let fixture = Fixture::build();
     let mut connection = fixture.connection();
     let before = all_table_counts(&connection);
+    let turns_before = turn_ledger_rows(&connection, None);
     let remote = FakeRemote::default();
 
     let archived = execute(
@@ -621,6 +765,7 @@ fn prune_archive_is_reversible_without_deleting_session_data() {
         .expect("count archived rows");
     assert_eq!(archived_count, 3);
     assert_eq!(all_table_counts(&connection), before);
+    assert_eq!(turn_ledger_rows(&connection, None), turns_before);
 
     let restored = execute(
         &mut connection,
@@ -640,6 +785,7 @@ fn prune_archive_is_reversible_without_deleting_session_data() {
         )
         .expect("count restored rows");
     assert_eq!(still_archived, 0);
+    assert_eq!(turn_ledger_rows(&connection, None), turns_before);
     assert!(remote.calls.borrow().is_empty(), "archive never unshares");
 }
 
@@ -648,6 +794,7 @@ fn prune_shared_session_is_refused_when_remote_unshare_is_unreachable() {
     let fixture = Fixture::build();
     let mut connection = fixture.connection();
     let before = all_table_counts(&connection);
+    let turns_before = turn_ledger_rows(&connection, None);
     let remote = FakeRemote::failing();
 
     let error = execute(
@@ -664,6 +811,7 @@ fn prune_shared_session_is_refused_when_remote_unshare_is_unreachable() {
     ));
     assert_eq!(remote.calls.borrow().as_slice(), ["ses_root"]);
     assert_eq!(all_table_counts(&connection), before);
+    assert_eq!(turn_ledger_rows(&connection, None), turns_before);
 }
 
 #[test]
@@ -694,6 +842,7 @@ fn prune_rolled_back_delete_preserves_the_original_preview() {
     let fixture = Fixture::build();
     let mut connection = fixture.connection();
     let before = preview(&connection, &fixture.selection).expect("original preview");
+    let turns_before = turn_ledger_rows(&connection, None);
     let remote = FakeRemote::default();
 
     let transaction = connection
@@ -709,6 +858,7 @@ fn prune_rolled_back_delete_preserves_the_original_preview() {
         after, before,
         "an aborted transaction must expose no partial delete"
     );
+    assert_eq!(turn_ledger_rows(&connection, None), turns_before);
 }
 
 /// Rows one table holds for a set of session ids, for the FK-less sweep tests.
@@ -785,8 +935,8 @@ fn tables_no_session_cascade_reaches(connection: &Connection) -> Vec<(String, St
 /// which pins the other deletion path.
 ///
 /// The scope is this crate's own schema. Tables another crate creates in the same pool —
-/// `zuno_goal`'s `goal*` set — carry a `session_id` with no foreign key and are not swept by
-/// either path; see the boundary note in `zuno_db::session_keys`.
+/// legacy `zuno_goal` tables such as `goal` and `goal_pause` — are not swept by either
+/// path. The format-15 Goal turn ledgers are declared here and must be swept.
 #[test]
 fn prune_delete_sweeps_every_session_keyed_table_no_cascade_reaches() {
     let fixture = Fixture::build();
@@ -794,6 +944,9 @@ fn prune_delete_sweeps_every_session_keyed_table_no_cascade_reaches() {
     let uncovered = tables_no_session_cascade_reaches(&connection);
     let seeded = [
         ("event_sequence", "aggregate_id"),
+        ("goal_cycle_failure", "session_id"),
+        ("goal_turn_audit", "session_id"),
+        ("goal_turn_observation", "session_id"),
         ("human_request", "session_id"),
         ("part", "session_id"),
         ("provider_retry_backoff", "session_id"),
@@ -843,11 +996,13 @@ fn prune_delete_sweeps_every_session_keyed_table_no_cascade_reaches() {
             )
             .expect("insert verification receipt");
     }
-    for (table, key) in &seeded {
-        assert!(
-            count_keyed(&connection, table, key, "'ses_child'") > 0,
-            "{table} must hold a row before the delete or the sweep proves nothing"
-        );
+    for session_id in SELECTED.into_iter().chain(["ses_bystander"]) {
+        for (table, key) in &seeded {
+            assert!(
+                count_keyed(&connection, table, key, &format!("'{session_id}'")) > 0,
+                "{table}/{session_id} must hold a row before the delete"
+            );
+        }
     }
 
     let remote = FakeRemote::default();
@@ -875,6 +1030,68 @@ fn prune_delete_sweeps_every_session_keyed_table_no_cascade_reaches() {
             count_keyed(&connection, table, key, "'ses_bystander'"),
             1,
             "{table} lost the bystander's row: the sweep is too broad"
+        );
+    }
+}
+
+#[test]
+fn prune_does_not_expand_its_authority_to_operator_owned_cycle_copies() {
+    let fixture = Fixture::build();
+    let mut connection = fixture.connection();
+    connection
+        .execute_batch(
+            "CREATE TABLE operator_cycle_copy AS
+         SELECT session_id,cycle_id,data FROM session_work_cycle;",
+        )
+        .expect("operator-owned copy outside the schema allowlist");
+    let snapshot = |connection: &Connection| {
+        let mut statement = connection.prepare(
+            "SELECT session_id,cycle_id,data FROM operator_cycle_copy ORDER BY session_id,cycle_id",
+        ).expect("operator copy query");
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .expect("operator copy rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("operator copy snapshot")
+    };
+    let before = snapshot(&connection);
+    let remote = FakeRemote::default();
+    let outcome = execute(
+        &mut connection,
+        &fixture.selection,
+        &PruneRequest::delete().confirmed(),
+        &remote,
+    )
+    .expect("prune declared rows only");
+    assert!(
+        !outcome
+            .preview
+            .tables
+            .iter()
+            .any(|impact| impact.table == "operator_cycle_copy")
+    );
+    assert_eq!(count(&connection, "operator_cycle_copy"), 4);
+    assert_eq!(
+        snapshot(&connection),
+        before,
+        "pruning cannot rewrite operator-owned bytes"
+    );
+    assert_eq!(count(&connection, "session_work_cycle"), 1);
+    for table in [
+        "goal_cycle_failure",
+        "goal_turn_audit",
+        "goal_turn_observation",
+    ] {
+        assert_eq!(
+            count(&connection, table),
+            1,
+            "{table} retains only the bystander"
         );
     }
 }

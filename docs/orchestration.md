@@ -396,6 +396,20 @@ cannot change them.
 Reasoning or variant resolution uses the reasoning or variant attached to the
 winning Agent route, then the selected model/provider default.
 
+Every `task` call is one flat JSON object with five required non-empty strings:
+`agent`, `objective`, `deliverable`, `instructions`, and `success_evidence`.
+They remain required when using `task_id` to continue a child. The optional
+`intent` is only a UI label; it is removed before typed argument parsing and
+cannot replace `objective`. Do not wrap the fields in a `contract` object.
+
+The tool description includes an executable minimal JSON example. Native
+`orchestrator` and `deep` prompts repeat the short contract; direct `build` and
+Council-only `review` do not gain delegation instructions or authority.
+If a required root field is missing, validation names it and adds bounded
+guidance from that field's current schema description. Correct the arguments
+before submitting a new call. Zuno does not infer a missing objective from
+`intent`, start a child from incomplete input, or replay the rejected call.
+
 Example direct delegation:
 
 ```json
@@ -463,9 +477,39 @@ returns a job id. `reportDelivery` then controls the terminal result:
 that never began becomes cancelled; a job that was already running becomes
 uncertain and is never replayed.
 
-Use background delegation for independent research or long-running work. Keep a
-dependency on the critical path in the foreground unless the parent has other
-useful work and can reliably consume a later report.
+Finishing the foreground response does not itself forbid an authorized observer
+completion. A `nextStep` report can continue the same eligible ordinary work cycle
+without a Goal, including when the session retains an unrelated completed or
+paused Goal. The report's bound cycle, not the mere existence of a session Goal,
+controls this decision. A truly Goal-owned pause or another execution gate still
+defers it; missing legacy scope is not assumed independent.
+
+For diagnosis, distinguish process exit, callback/history consumption and provider
+application. `consumed` records history, not proof of a new model request.
+Deferred reports stay durable and are not automatically replayed after an upgrade.
+An explicit new user request can inspect existing results; do not restart the
+observer just because no model continuation appeared.
+
+Use background delegation only for explicitly planned independent work alongside
+the parent's local work. Identify what the parent will do before dispatch, then
+do that non-overlapping work. Never background the sole task and finalize while
+it runs. Keep critical-path dependencies local or in the foreground.
+
+Long-running alone does not select background mode. If waiting is the only
+useful next action, keep the main workflow foreground and await the same child
+or process handle. A background dispatch requires identified independent
+mainline work, not merely a long runtime. A `remoteObserver` purpose does
+not itself detach a command. Do not end the turn merely to replace an existing
+foreground wait with a promised background callback.
+
+Task elapsed time includes every model request, tool call, and wait in the child.
+A provider timeout describes the request that failed and its retry recovery.
+For example, a direct `oracle` task can take 1594.7 seconds in total: nine
+model rounds succeed before its final request and retries consume 510 seconds.
+The 510 seconds is not a task-wide timeout, and an absent last provider error
+code does not erase the earlier successful requests. Inspect the child session,
+usage, and completed tools before deciding whether another task is needed.
+A terminal failed task is not automatically replayed.
 
 ## Interacting with an attached child
 
@@ -588,6 +632,46 @@ route.
 The TUI `/council` launcher adds a one-turn routing instruction that asks the
 current Agent to invoke `council_run` once in the background with `nextStep`
 delivery. The original user message and resulting job remain durable.
+
+The built-in `balanced-review` preset runs `explorer`, `librarian`, and `oracle`,
+with quorum two and up to three seats in parallel. Its time budget is:
+
+| Bound | Built-in value | Meaning |
+| --- | --- | --- |
+| Total deadline | `600000` ms (600 s) | Seats and synthesis share one run deadline |
+| Synthesis reserve | `60000` ms (60 s) | Maximum synthesis time reserved inside the total |
+| Shared seat phase | `540000` ms (540 s) | Total minus reserve; all seats and their retries share this deadline |
+
+The built-in total was previously 180 seconds, leaving only 120 seconds for
+seats. This change does not replace another preset descriptor's own bounds.
+These are frozen preset values, not `council_run` arguments or user JSON
+configuration fields. Team model-routing presets remain a separate setting.
+
+Before each seat attempt, the host adds the actual remaining hard time and UTC
+deadline to its durable task prompt. Waiting for delegation capacity consumes
+the same time; a retry does not start a fresh 540-second allowance. The seat
+should inspect evidence within the assigned scope, return supported partial
+conclusions, and identify unknowns in the required report format. It need not
+scan the whole repository to produce a useful, valid report.
+Reporting unknowns does not mark uninspected work as passed.
+
+Only a seat that completed natively but returned an invalid structured report
+may use another attempt within the preset's retry count and remaining deadline.
+Native `failed`, `cancelled`, or `uncertain` outcomes and a host `Err` do not
+replay the seat. Provider same-request recovery is a separate policy.
+
+Quorum counts accepted terminal seat reports, not successful provider requests
+or completed tool calls. A `0/2` result means no valid report against a quorum
+of two; it does not mean every provider request failed. Inspect each seat's
+outcome separately from its retained child session, usage, and progress.
+Timeout, cancellation, failure, and uncertainty do not turn that progress into
+a valid report. A timeout retains any child-session identity and usage/progress
+already recorded. Council success still requires quorum and successful
+synthesis; failed jobs are not automatically replayed.
+
+The durable Council result records `deadlineMs`, `seatPhaseMs`, and
+`synthesisTimeoutMs`. Each seat carries its `status` and `sessionId`; when
+available, `execution.progress` preserves native progress for inspection.
 
 Use Council when multiple independent perspectives should assess the same
 question. Use a workflow DAG when seats have different prompts or dependencies.

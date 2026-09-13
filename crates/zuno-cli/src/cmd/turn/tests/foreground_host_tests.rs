@@ -77,9 +77,12 @@ fn plan_for(
             max_steps: None,
             requested_provider: "provider".to_owned(),
             requested_model: "model".to_owned(),
-            wire_model: "model".to_owned(),
-            spec: Spec::new(COMPATIBLE_PROVIDER).with_surface(ApiSurface::Chat),
-            reasoning_options: Map::new(),
+            model: EngineModel::new(
+                Spec::new(COMPATIBLE_PROVIDER).with_surface(ApiSurface::Chat),
+                "model",
+                ApiSurface::Chat,
+            )
+            .with_catalog_identity("provider", "model"),
             orchestration_seed: None,
         },
         catalog_models: Vec::new(),
@@ -268,7 +271,7 @@ async fn foreground_host_with_requests(
         profile,
         config,
     );
-    plan.resolver.spec = Spec::new(COMPATIBLE_PROVIDER)
+    plan.resolver.model.provider = Spec::new(COMPATIBLE_PROVIDER)
         .with_surface(ApiSurface::Chat)
         .with_base_url("http://127.0.0.1:9/v1");
     plan.credential = Some(Credential::Api {
@@ -333,6 +336,8 @@ async fn foreground_host_with_requests(
 #[tokio::test]
 async fn actual_host_waits_before_a_second_paid_request_and_defers_success() {
     let (_directory, mut host, provider) = foreground_host().await;
+    let processes = host.background_executions.clone();
+    let session_id = host.session_id.clone();
     let terminal_events = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&terminal_events);
     let (sender, mut receiver) = zuno_engine::r#loop::event_channel();
@@ -344,6 +349,18 @@ async fn actual_host_waits_before_a_second_paid_request_and_defers_success() {
         }
     });
     let mut drive = Box::pin(host.drive("Run the command and wait for its result.", sender));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while processes.foreground_for_session(&session_id).is_empty() {
+            tokio::select! {
+                result = &mut drive => {
+                    panic!("turn ended before foreground registration: {result:?}");
+                }
+                () = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+    })
+    .await
+    .expect("foreground execution must be durably registered");
     let early = tokio::time::timeout(Duration::from_millis(150), &mut drive).await;
     let returned_early = early.is_ok();
     let calls_before_release = provider.calls.load(Ordering::SeqCst);

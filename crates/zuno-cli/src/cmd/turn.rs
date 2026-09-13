@@ -128,7 +128,7 @@ mod foreground;
 mod input_receipts;
 
 const LEARNING_LEASE_MILLIS: i64 = 60 * 60 * 1_000;
-const DURABLE_WORK_CONTEXT_SCHEMA_VERSION: u32 = 3;
+const DURABLE_WORK_CONTEXT_SCHEMA_VERSION: u32 = 5;
 const DURABLE_WORK_CONTEXT_MAX_ENTRIES: usize = 64;
 const DURABLE_WORK_CONTEXT_MAX_BYTES: usize = 16 * 1024;
 const DURABLE_WORK_CONTEXT_TEXT_MAX_BYTES: usize = 512;
@@ -138,7 +138,11 @@ This is an authoritative SQLite snapshot regenerated after compaction or restart
 Preserve these identities and reconcile uncertain work before retrying side effects. \
 Unfinished work is not necessarily executable: record a typed human/external wait or \
 pause when appropriate, finish the current summary, and never manufacture another \
-turn or user approval merely because a Plan remains unfinished.\n";
+turn or user approval merely because a Plan remains unfinished. \
+workScope identifies only the current request's owned work. Other Plans, Todos and \
+Jobs below are historical context, not a mandate to continue them. A new user request \
+does not resume a paused Goal. Adopt a relevant Plan with plan_update only when the \
+current request actually asks for that work; reading it is not adoption.\n";
 
 const COMPATIBLE_PROVIDER: &str = "openai-compatible";
 
@@ -1058,6 +1062,13 @@ impl TurnPlan {
                 )
                 .map_err(to_string)?;
         }
+        let mut resolved_model = engine_model(&catalog, catalog_model, env)?;
+        resolved_model.provider = with_agent_options(
+            resolved_model.provider,
+            definition,
+            catalog_model.capabilities.temperature,
+        );
+        resolved_model.reasoning_options = reasoning.options;
         let mut resolver = Resolver {
             requested_agent: agent.name().to_owned(),
             system_prompt: prompt_assembly.render(),
@@ -1074,13 +1085,7 @@ impl TurnPlan {
             max_steps: definition.steps,
             requested_provider: provider_id.clone(),
             requested_model: model_id.clone(),
-            wire_model: catalog_model.api.id.clone(),
-            reasoning_options: reasoning.options,
-            spec: with_agent_options(
-                model_spec(&catalog, catalog_model, env)?,
-                definition,
-                catalog_model.capabilities.temperature,
-            ),
+            model: resolved_model,
             orchestration_seed: None,
         };
         let window = TokenWindow {
@@ -1492,7 +1497,7 @@ impl TurnPlan {
         &mut self,
         parameters: serde_json::Map<String, serde_json::Value>,
     ) {
-        self.resolver.reasoning_options = parameters;
+        self.resolver.model.reasoning_options = parameters;
     }
 
     /// Explicit surface-level reasoning override, excluding configured defaults.
@@ -2435,6 +2440,13 @@ struct PromptRouting {
     content: String,
 }
 
+/// Returned by the same transaction that consumes the input. Capturing its
+/// cycle must not require a fallible read after the commit.
+struct UserInputCommit {
+    materialized: bool,
+    cycle_id: Option<String>,
+}
+
 struct DriveInputOptions<'a> {
     message_id: Option<&'a str>,
     content: Option<&'a [RequestContentBlock]>,
@@ -2457,6 +2469,15 @@ impl<'a> DriveInputOptions<'a> {
             planning_source,
             routing: None,
         }
+    }
+}
+
+/// Keeps the real exclusive native lease alive through the inspection worker.
+struct FileInspectionLease(SessionRunGuard);
+
+impl zuno_tools::uncertain::NativeInspectionGuard for FileInspectionLease {
+    fn session_id(&self) -> &str {
+        self.0.session_id()
     }
 }
 
@@ -2600,6 +2621,7 @@ pub(crate) struct TurnHost {
     workflows: super::workflow::NativeWorkflowHost,
     background_reports_recovered: bool,
     last_turn_completed: bool,
+    failure_scope: Option<zuno_session_control::TurnFailureScope>,
     title_sink: Option<Arc<dyn SessionTitleSink>>,
     work_changes: super::child_turn::ChangeNotifier,
     memory: Option<Arc<MemoryService>>,
@@ -4254,6 +4276,7 @@ impl TurnHost {
                 workflows: workflow_host,
                 background_reports_recovered: false,
                 last_turn_completed: false,
+                failure_scope: None,
                 title_sink: None,
                 work_changes,
                 memory,
@@ -4753,16 +4776,9 @@ impl TurnHost {
                         )
                     })?
                     .revision;
-                self.goal_store
-                    .record_failure_signal(&self.session_id, Some(value))
-                    .map_err(SessionCommandError::goal)?;
                 let goal = self
                     .goal_store
-                    .update_status_as_model_checked(
-                        &self.session_id,
-                        zuno_goal::ModelStatus::Blocked,
-                        expected_revision,
-                    )
+                    .block_as_user_checked(&self.session_id, expected_revision, value)
                     .map_err(SessionCommandError::goal)?
                     .ok_or_else(|| {
                         SessionCommandError::invalid_arguments(
@@ -4988,16 +5004,17 @@ impl TurnHost {
                 .await
                 .map_err(SessionCommandError::internal),
             SessionCommand::Goal => self.execute_goal_command(arguments, events).await,
+            SessionCommand::InspectOutcome => self.execute_inspect_outcome(arguments, events).await,
             SessionCommand::Learn => self.execute_learn_command(arguments, events).await,
             SessionCommand::Reflect => self.execute_reflect_command(arguments, events).await,
             SessionCommand::Questions => {
-                let result = zuno_db::question::QuestionStore::new(Arc::clone(&self.database))
-                    .pending(&self.session_id)
+                let result = zuno_db::question::visible_in(&self.connection, &self.session_id)
                     .map_err(SessionCommandError::internal)
                     .and_then(|questions| serde_json::to_string_pretty(&questions.iter().map(|question| json!({
                         "id":question.id, "revision":question.revision, "purpose":question.purpose,
                         "state":question.state, "headers":question.questions.iter().map(|item| &item.question.header).collect::<Vec<_>>(),
                         "draftSaved":!question.draft_answers.is_empty(),
+                        "delivery":question.delivery,
                     })).collect::<Vec<_>>()).map_err(SessionCommandError::internal));
                 self.publish_session_command_result(
                     command,
@@ -5109,6 +5126,86 @@ impl TurnHost {
                 Err(error)
             }
         }
+    }
+
+    /// Explicit native inspection is available even when model execution is
+    /// gated. It records actual observations, never a resume or success claim.
+    async fn execute_inspect_outcome(
+        &mut self,
+        arguments: &str,
+        events: TurnEventSender,
+    ) -> Result<(), SessionCommandError> {
+        let guard = Arc::new(FileInspectionLease(
+            self.runs
+                .begin_turn(self.session_id.clone())
+                .map_err(SessionCommandError::internal)?,
+        ));
+        let ids = arguments
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let result = if ids.is_empty() {
+            zuno_db::message::MessageStore::new(&self.connection)
+                .pending_uncertain_tool_calls(&self.session_id, 0)
+                .map_err(SessionCommandError::internal)
+                .and_then(|pending| serde_json::to_string_pretty(&json!({
+                    "pending":pending, "usage":"/inspect-outcome <part-id> [part-id ...]",
+                    "scope":"native witnessed workspace file calls only; no shell/remote inspection or replay",
+                })).map_err(SessionCommandError::internal))
+        } else {
+            // Freeze owned collaborators before awaiting: TurnHost's SQLite
+            // connection is Send, not Sync, and never crosses the worker boundary.
+            let prepared = (|| {
+                let cycle_id = self
+                    .session_control
+                    .state(&self.session_id)
+                    .map_err(SessionCommandError::internal)?
+                    .and_then(|state| state.cycle_id)
+                    .ok_or_else(|| {
+                        SessionCommandError::invalid_arguments(
+                            "this session has no recorded work cycle",
+                        )
+                    })?;
+                let inspector = zuno_tools::uncertain::FileInspector::open(
+                    Arc::clone(&self.database),
+                    Path::new(&self.session_directory),
+                )
+                .map_err(SessionCommandError::internal)?;
+                let operation = format!("inspect_{}", Uuid::now_v7().simple());
+                let context = zuno_tool::ToolContext::new(
+                    self.session_id.clone(),
+                    operation.clone(),
+                    operation,
+                    self.agent.clone(),
+                    self.dispatcher.native_permission_asker(),
+                    Arc::new(guard.0.interrupt_signal().clone()),
+                );
+                Ok::<_, SessionCommandError>((inspector, cycle_id, context))
+            })();
+            match prepared {
+                Ok((inspector, cycle_id, context)) => inspector
+                    .inspect_native(ids, cycle_id, context, guard)
+                    .await
+                    .map_err(SessionCommandError::internal)
+                    .and_then(|receipt| {
+                        serde_json::to_string_pretty(&receipt)
+                            .map_err(SessionCommandError::internal)
+                    }),
+                Err(error) => Err(error),
+            }
+        };
+        if result.is_ok() {
+            self.write_goal_projection()
+                .map_err(SessionCommandError::internal)?;
+            self.work_changes.changed();
+        }
+        self.publish_session_command_result(
+            SessionCommand::InspectOutcome,
+            self.is_session_materialized(),
+            result,
+            &events,
+        )
+        .await
     }
 
     async fn drive_committed_goal_resume(
@@ -7288,6 +7385,9 @@ impl TurnHost {
         let plan = zuno_tools::WorkStateStore::new(Arc::clone(&self.database))
             .plan(&self.session_id)
             .map_err(to_string)?;
+        // An audited recovery of an independent input must not acquire the
+        // session's old visible Plan just because it still exists.
+        let plan = plan.filter(|plan| continuation.plan_id.as_deref() == Some(&plan.id));
         if !resume && plan.is_none() {
             return Err("Start Work requires a durable Plan".to_owned());
         }
@@ -7324,7 +7424,7 @@ impl TurnHost {
         }
         let objective = plan.as_ref().map_or_else(
             || {
-                "Resume the existing authorized work after the user's explicit resume command."
+                "Process the already admitted input in this authorized Work cycle. Do not adopt unrelated prior Plans or Goals."
                     .to_owned()
             },
             |plan| {
@@ -7529,22 +7629,23 @@ impl TurnHost {
         events: TurnEventSender,
     ) -> Result<(), String> {
         let mut driven_input_id = options.message_id.map(str::to_owned);
+        let mut driven_cycle_id = None;
         let result = async {
             self.require_active_extension_composition()?;
             self.preload_turn_skills(&[prompt], &events).await?;
             let (message, parts) =
                 self.prepare_turn_user_message(prompt, options.message_id, options.content)?;
             driven_input_id = Some(message.id.clone());
-            let materialized = match options.persistence {
+            let committed = match options.persistence {
                 UserInputPersistence::AdmitAndPromote => {
                     self.persist_user_input(&message, &parts)?
                 }
                 UserInputPersistence::AlreadyPromoted => {
-                    self.persist_promoted_user_input(&message, &parts)?;
-                    false
+                    self.persist_promoted_user_input(&message, &parts)?
                 }
             };
-            if materialized {
+            driven_cycle_id = committed.cycle_id;
+            if committed.materialized {
                 events
                     .publish(TurnEvent::SessionMaterialized {
                         session_id: self.session_id.clone(),
@@ -7568,22 +7669,50 @@ impl TurnHost {
             let receipts =
                 zuno_db::input_receipt::InputReceiptStore::new(Arc::clone(&self.database));
             if let Err(error) = &result {
-                receipts
-                    .fail_input(
-                        &self.session_id,
-                        &input_id,
-                        &redact_learning_text(error, self.credential.as_deref()),
-                        guard.interrupt_signal().is_set(),
-                        zuno_db::message::now_millis(),
-                    )
-                    .map_err(to_string)?;
+                let detail = redact_learning_text(error, self.credential.as_deref());
+                if let Some(cycle_id) = driven_cycle_id.as_deref() {
+                    // ReceiptCycle owns real engine failures. This outer owner
+                    // only settles pre-engine failures and may already have been
+                    // superseded by an explicit native recovery.
+                    receipts
+                        .fail_unapplied_input(
+                            &self.session_id,
+                            &input_id,
+                            cycle_id,
+                            &detail,
+                            guard.interrupt_signal().is_set(),
+                            zuno_db::message::now_millis(),
+                        )
+                        .map_err(to_string)?;
+                } else {
+                    receipts
+                        .fail_unrecorded_input(
+                            &self.session_id,
+                            &input_id,
+                            &detail,
+                            guard.interrupt_signal().is_set(),
+                            zuno_db::message::now_millis(),
+                        )
+                        .map_err(to_string)?;
+                }
             } else if receipts
                 .get(&self.session_id, &input_id)
                 .map_err(to_string)?
-                .is_some_and(|receipt| !receipt.state.is_terminal())
+                .is_some_and(|receipt| {
+                    !receipt.state.is_terminal() && receipt.execution_gate.is_none()
+                })
+                && !self
+                    .session_control
+                    .defer_input_at_execution_gate(
+                        &self.session_id,
+                        &input_id,
+                        zuno_db::message::now_millis(),
+                    )
+                    .map_err(to_string)?
+                && let Some(cycle_id) = driven_cycle_id
             {
-                receipts.fail_input(
-                    &self.session_id, &input_id,
+                receipts.fail_unapplied_input(
+                    &self.session_id, &input_id, &cycle_id,
                     "native processing stopped before this input was applied; its durable record was retained",
                     guard.interrupt_signal().is_set(), zuno_db::message::now_millis(),
                 ).map_err(to_string)?;
@@ -7599,27 +7728,19 @@ impl TurnHost {
     /// request is shared. Spending one turn per report is what let a session announce
     /// intermediate states that a later report in the same batch had already replaced.
     ///
-    /// Plan reconciliation reads the report the batch marks current, so a superseded
-    /// state cannot reopen work the newest report already finished.
+    /// Plan reconciliation uses an eligible report. A late report from a stopped
+    /// or unrelated cycle remains history but cannot seed the current work.
     pub(crate) async fn drive_promoted_reports_with_guard(
         &mut self,
         reports: &[ProjectedReport],
         guard: &SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<(), String> {
-        let newest = reports
-            .iter()
-            .find(|report| report.newest)
-            .or_else(|| reports.last())
-            .ok_or_else(|| "a batched report turn needs one promoted report".to_owned())?;
-        debug_assert!(matches!(
-            newest.source,
-            PlanningInputSource::ChildReport | PlanningInputSource::BackgroundReport
-        ));
-        let planning_prompt = newest.text.clone();
-        let planning_source = newest.source;
+        if reports.is_empty() {
+            return Err("a batched report turn needs one promoted report".to_owned());
+        }
         self.require_active_extension_composition()?;
-        let mut admitted_completion = None;
+        let mut committed_completions = Vec::new();
         for report in reports {
             let Some(input) = self
                 .inbox
@@ -7631,59 +7752,51 @@ impl TurnHost {
             if input.state != zuno_db::inbox::SubmissionState::Promoted {
                 continue;
             }
-            if zuno_db::session_wake::admission_in(&self.connection, &input).map_err(to_string)?
-                != WakeAdmission::Reject
-            {
-                admitted_completion = Some(input);
-            }
             let (message, parts) =
                 self.prepare_turn_user_message(&report.text, Some(report.input_id.as_str()), None)?;
             self.persist_promoted_user_input(&message, &parts)?;
+            committed_completions.push(input);
         }
-        let Some(admitted_completion) = admitted_completion else {
-            // The facts are durable, but a callback is not permission to reopen a
-            // paused/completed cycle or invent a new legacy completion cycle.
+        if committed_completions.is_empty() {
             return Ok(());
-        };
-        if self
-            .goal_store
-            .goal(&self.session_id)
-            .map_err(to_string)?
-            .is_some_and(|goal| goal.status != GoalStatus::Active)
-        {
+        }
+        // Promotion is a delivery claim, not continuing execution authority.
+        // Recheck after every report is durable, then satisfy only its exact
+        // wake in the same writer transaction. The native cycle resolver checks
+        // the bound Goal (if any), stopped cycles and explicit resume aliases;
+        // a historical session Goal does not own an independent ordinary cycle.
+        let admitted_completion = self
+            .database
+            .transaction(|tx| {
+                admit_report_continuation_in(tx, &self.session_id, reports, &committed_completions)
+            })
+            .map_err(to_string)?;
+        let Some((admitted_completion, planning_report)) = admitted_completion else {
+            // Reports remain durable even when current execution authority has
+            // changed. Only the owning native control can resolve that gate.
             events
                 .publish(TurnEvent::Notice {
                     audience: NoticeAudience::User,
                     severity: NoticeSeverity::Info,
-                    code: "report_deferred_by_goal_state".to_owned(),
+                    code: "report_deferred_by_execution_state".to_owned(),
                     detail: "Settled background reports were committed to durable history, but \
-                             the Goal is not active; provider continuation is deferred until the \
-                             Goal is resumed."
+                             the current work cycle does not authorize automatic continuation."
                         .to_owned(),
                 })
                 .await
                 .map_err(to_string)?;
             return Ok(());
-        }
-        let wake = zuno_db::session_wake::signal_in(&self.connection, &admitted_completion)
-            .map_err(to_string)?
-            .ok_or_else(|| "completion lost its durable wake identity".to_owned())?;
-        self.database
-            .transaction(|tx| {
-                zuno_db::session_execution::admit_wake_in(
-                    tx,
-                    &self.session_id,
-                    &wake,
-                    zuno_db::message::now_millis(),
-                )
-            })
-            .map_err(to_string)?;
+        };
+        debug_assert!(matches!(
+            planning_report.source,
+            PlanningInputSource::ChildReport | PlanningInputSource::BackgroundReport
+        ));
         let prompts = reports
             .iter()
             .map(|report| report.text.as_str())
             .collect::<Vec<_>>();
         self.preload_turn_skills(&prompts, &events).await?;
-        let completion_source = self.completion_source_for_input(&newest.input_id)?;
+        let completion_source = self.completion_source_for_input(&admitted_completion.id)?;
         let execution = self
             .session_control
             .state(&self.session_id)
@@ -7704,6 +7817,13 @@ impl TurnHost {
         let cycle_id = admitted_completion
             .cycle_id
             .ok_or_else(|| "completion has no original work cycle".to_owned())?;
+        let cycle_id = zuno_db::session_work_cycle::completion_cycle_in(
+            &self.connection,
+            &self.session_id,
+            &cycle_id,
+        )
+        .map_err(to_string)?
+        .ok_or_else(|| "completion has no current authorized delivery cycle".to_owned())?;
         let continuation = self
             .session_control
             .record_continuation(
@@ -7718,8 +7838,8 @@ impl TurnHost {
             )
             .map_err(|error| error.to_string())?;
         self.drive_prepared_with_start(
-            &planning_prompt,
-            planning_source,
+            &planning_report.text,
+            planning_report.source,
             None,
             None,
             TurnStart::Automatic {
@@ -7930,6 +8050,18 @@ impl TurnHost {
         turn_start: TurnStart,
         events: TurnEventSender,
     ) -> Result<Option<TurnOutcome>, TurnFailure> {
+        if self
+            .pause_for_uncertain_side_effects()
+            .map_err(TurnFailure::host)?
+            .blocks_execution()
+        {
+            events.publish(TurnEvent::Notice {
+                audience: NoticeAudience::User, severity: NoticeSeverity::Warning,
+                code: "uncertain_side_effect".to_owned(),
+                detail: "Input retained without model execution: inspect the pending exact outcomes before resuming. /goal and /inspect-outcome are native status/inspection controls.".to_owned(),
+            }).await.map_err(TurnFailure::event_consumer)?;
+            return Ok(None);
+        }
         let outcome = self.run_prelude(guard).await?;
         report_prelude(&events, &self.notes, &self.instruction_admission, &outcome)
             .await
@@ -7956,7 +8088,7 @@ impl TurnHost {
         &mut self,
         message: &zuno_db::message::MessageRecord,
         parts: &[zuno_db::message::PartRecord],
-    ) -> Result<bool, String> {
+    ) -> Result<UserInputCommit, String> {
         let durable_input = zuno_db::inbox::NewSessionInput::new(
             format!("inp_{}", message.id),
             self.session_id.clone(),
@@ -7966,7 +8098,7 @@ impl TurnHost {
             }),
             zuno_db::inbox::InputDelivery::Queue,
             message.time_created,
-        );
+        ).with_trigger_kind(zuno_types::execution::InputTriggerKind::User);
         let durable_input_id = durable_input.id.clone();
         match &self.session_materializer {
             SessionMaterializer::Existing => {
@@ -7975,9 +8107,14 @@ impl TurnHost {
                 zuno_db::inbox::admit_and_promote_in(&transaction, durable_input)
                     .map_err(to_string)?;
                 persist_prepared_user_message(&transaction, message, parts).map_err(to_string)?;
+                let cycle_id =
+                    self.activate_user_message_in(&transaction, &durable_input_id, message)?;
                 consume_promoted_input(&transaction, &self.session_id, &durable_input_id)?;
                 transaction.commit().map_err(to_string)?;
-                Ok(false)
+                Ok(UserInputCommit {
+                    materialized: false,
+                    cycle_id: Some(cycle_id),
+                })
             }
             SessionMaterializer::Pending(input) => {
                 let mut input = input.clone();
@@ -8003,12 +8140,17 @@ impl TurnHost {
                 zuno_db::inbox::admit_and_promote_in(&transaction, durable_input)
                     .map_err(to_string)?;
                 persist_prepared_user_message(&transaction, message, parts).map_err(to_string)?;
+                let cycle_id =
+                    self.activate_user_message_in(&transaction, &durable_input_id, message)?;
                 consume_promoted_input(&transaction, &self.session_id, &durable_input_id)?;
                 transaction.commit().map_err(to_string)?;
                 self.memory_policy = memory_policy;
                 self.session_materializer = SessionMaterializer::Existing;
                 self.session_identity.mark_materialized();
-                Ok(true)
+                Ok(UserInputCommit {
+                    materialized: true,
+                    cycle_id: Some(cycle_id),
+                })
             }
         }
     }
@@ -8017,7 +8159,7 @@ impl TurnHost {
         &self,
         message: &zuno_db::message::MessageRecord,
         parts: &[zuno_db::message::PartRecord],
-    ) -> Result<(), String> {
+    ) -> Result<UserInputCommit, String> {
         if !self.session_identity.is_materialized() {
             return Err(format!(
                 "promoted input `{}` belongs to an unmaterialized session",
@@ -8029,8 +8171,53 @@ impl TurnHost {
         let mut message = message.clone();
         attach_promoted_task_report_metadata(&transaction, &mut message).map_err(to_string)?;
         persist_prepared_user_message(&transaction, &message, parts).map_err(to_string)?;
+        let cycle_id = if zuno_db::inbox::read_in(&transaction, &self.session_id, &message.id)
+            .map_err(to_string)?
+            .is_some_and(|input| {
+                matches!(
+                    zuno_db::inbox::DurableInputKind::classify(&input.prompt),
+                    Some(
+                        zuno_db::inbox::DurableInputKind::User
+                            | zuno_db::inbox::DurableInputKind::TuiPrompt
+                            | zuno_db::inbox::DurableInputKind::AcpPrompt
+                            | zuno_db::inbox::DurableInputKind::HostMessage
+                            | zuno_db::inbox::DurableInputKind::HumanRequestAnswer
+                    )
+                )
+            }) {
+            Some(self.activate_user_message_in(&transaction, &message.id, &message)?)
+        } else {
+            None
+        };
         consume_promoted_input(&transaction, &self.session_id, &message.id)?;
-        transaction.commit().map_err(to_string)
+        transaction.commit().map_err(to_string)?;
+        Ok(UserInputCommit {
+            materialized: false,
+            cycle_id,
+        })
+    }
+
+    fn activate_user_message_in(
+        &self,
+        transaction: &zuno_db::Transaction<'_>,
+        input_id: &str,
+        message: &zuno_db::message::MessageRecord,
+    ) -> Result<String, String> {
+        zuno_session_control::SessionControlService::activate_user_input_in(
+            transaction,
+            &self.session_id,
+            input_id,
+            &message.id,
+            if self.agent == "plan" {
+                CollaborationMode::Plan
+            } else {
+                CollaborationMode::Work
+            },
+            self.current_turn_identity(),
+            message.time_created,
+        )
+        .map(|cycle| cycle.cycle_id)
+        .map_err(to_string)
     }
 
     pub(crate) async fn continue_goal_if_idle(
@@ -8310,7 +8497,17 @@ impl TurnHost {
                 .map_err(TurnFailure::goal)?;
         }
         let wake = match &turn_start {
-            TurnStart::UserMessage => SessionWakeSignal::UserQuery,
+            TurnStart::UserMessage => {
+                let anchor = self.latest_user_anchor().map_err(TurnFailure::host)?;
+                if zuno_db::session_work_cycle::current_in(&self.connection, &self.session_id)
+                    .map_err(TurnFailure::Database)?
+                    .is_some_and(|cycle| cycle.anchor_message_id == anchor)
+                {
+                    SessionWakeSignal::UserMessage
+                } else {
+                    SessionWakeSignal::UserQuery
+                }
+            }
             TurnStart::UserControl { .. } => SessionWakeSignal::ExplicitResume,
             TurnStart::Automatic { .. } => SessionWakeSignal::Automatic,
             TurnStart::Recovery { .. } | TurnStart::GoalContinuation { .. } => {
@@ -8327,6 +8524,16 @@ impl TurnHost {
             )
             .map_err(TurnFailure::Database)?
         else {
+            let state = self
+                .session_control
+                .state(&self.session_id)
+                .map_err(TurnFailure::host)?;
+            events.publish(TurnEvent::Notice {
+                audience: NoticeAudience::User, severity: NoticeSeverity::Warning,
+                code: "execution_gate".to_owned(),
+                detail: format!("Input retained without model execution: {:?}. Resolve this gate through its owning control; a new message does not waive it.",
+                    state.and_then(|state| state.scheduling).map(|s| s.readiness)),
+            }).await.map_err(TurnFailure::event_consumer)?;
             return Ok(None);
         };
         self.persist_turn_continuation(&cycle_id, &turn_start, false)
@@ -8344,6 +8551,23 @@ impl TurnHost {
         let work = zuno_tools::WorkStateStore::new(Arc::clone(&self.database));
         loop {
             let engine_turn_id = Uuid::new_v4().simple().to_string();
+            let goal_turn = self
+                .session_control
+                .begin_engine_turn(&self.session_id, &cycle_id, &engine_turn_id)
+                .map_err(TurnFailure::host)?;
+            self.failure_scope = self
+                .session_control
+                .capture_failure_scope(&self.session_id)
+                .map_err(TurnFailure::host)?
+                .filter(|scope| {
+                    scope.cycle_id == cycle_id
+                        && scope.turn_id.as_deref() == Some(engine_turn_id.as_str())
+                });
+            if self.failure_scope.is_none() {
+                // A newer control won admission. Do not run the old request or
+                // borrow the newer cycle's failure authority.
+                return Ok(None);
+            }
             let input_ids = match &turn_start {
                 TurnStart::UserMessage => self
                     .latest_user_anchor()
@@ -8441,8 +8665,79 @@ impl TurnHost {
                 ..
             } = &outcome
             else {
+                if matches!(outcome, TurnOutcome::Interrupted { .. }) {
+                    self.session_control
+                        .stop_turn(
+                            &self.session_id,
+                            &cycle_id,
+                            &completed_turn_id,
+                            guard.interrupt_request().is_some_and(|request| {
+                                matches!(
+                            request.reason,
+                            zuno_engine::interrupt::HardInterruptReason::UserCancel
+                                | zuno_engine::interrupt::HardInterruptReason::RequestCancelled
+                        )
+                            }),
+                            zuno_db::message::now_millis(),
+                        )
+                        .map_err(TurnFailure::host)?;
+                }
                 return Ok(Some(outcome));
             };
+            // A model proposal may create and bind a Goal during this actual
+            // engine turn. Prefer that native binding, never model JSON identity.
+            let goal_turn = self
+                .goal_store
+                .current_goal_turn(&self.session_id)
+                .map_err(TurnFailure::goal)?
+                .filter(|identity| {
+                    identity.cycle_id == cycle_id && identity.turn_id == completed_turn_id
+                })
+                .or(goal_turn);
+            if let Some(identity) = &goal_turn {
+                match self.goal_store.settle_goal_turn(
+                    &self.session_id,
+                    identity,
+                    GoalTurnOutcome::Progress,
+                ) {
+                    Ok(_) => {}
+                    Err(zuno_goal::GoalError::GoalTurnConflict { reason, .. })
+                        if reason.is_expected_invalidation() =>
+                    {
+                        // A user control or replacement won the race. Preserve it,
+                        // never turn this stale settlement into a failure of the new Goal.
+                        self.database
+                            .transaction(|tx| {
+                                zuno_db::event_log::append_in(
+                                    tx,
+                                    &self.session_id,
+                                    zuno_db::event_log::NewSessionEvent::new(
+                                        "session.goal.turn_settlement_invalidated",
+                                        json!({"identity":identity,"reason":reason})
+                                            .as_object()
+                                            .expect("object")
+                                            .clone(),
+                                    )?,
+                                )
+                                .map(|_| ())
+                            })
+                            .map_err(TurnFailure::Database)?;
+                    }
+                    Err(error) => return Err(TurnFailure::goal(error)),
+                }
+            }
+            if self
+                .finish_terminal_goal_cycle(
+                    &cycle_id,
+                    &completed_turn_id,
+                    assistant_message_id,
+                    *steps,
+                    &events,
+                )
+                .await?
+            {
+                return Ok(Some(outcome));
+            }
             let foreground = self
                 .foreground
                 .wait(&foreground::ForegroundWaitScope {
@@ -8457,6 +8752,18 @@ impl TurnHost {
                     .publish(publication.event(*steps))
                     .await
                     .map_err(TurnFailure::event_consumer)?;
+            }
+            if self
+                .finish_terminal_goal_cycle(
+                    &cycle_id,
+                    &completed_turn_id,
+                    assistant_message_id,
+                    *steps,
+                    &events,
+                )
+                .await?
+            {
+                return Ok(Some(outcome));
             }
             match &foreground.wake {
                 foreground::ForegroundWake::Completed | foreground::ForegroundWake::Steering => {
@@ -8480,6 +8787,19 @@ impl TurnHost {
                     continue;
                 }
                 foreground::ForegroundWake::Interrupted { request } => {
+                    self.session_control
+                        .stop_turn(
+                            &self.session_id,
+                            &cycle_id,
+                            &completed_turn_id,
+                            request.is_some_and(|request| {
+                                matches!(request.reason,
+                            zuno_engine::interrupt::HardInterruptReason::UserCancel
+                                | zuno_engine::interrupt::HardInterruptReason::RequestCancelled)
+                            }),
+                            zuno_db::message::now_millis(),
+                        )
+                        .map_err(TurnFailure::host)?;
                     self.questions
                         .interrupt_plan_turn(&self.session_id, &completed_turn_id)
                         .await
@@ -8505,20 +8825,22 @@ impl TurnHost {
                 }
                 foreground::ForegroundWake::Idle => {}
             }
-            let unsafe_outcome = !self
-                .pending_uncertain_side_effects()
+            let uncertain = self
+                .pause_for_uncertain_side_effects()
                 .map_err(TurnFailure::host)?
-                .is_empty()
-                || matches!(
-                    goal_tool_failure(unresolved_tool_failures),
-                    Some(GoalTerminalFailure::Pause(_))
-                );
+                .blocks_execution();
+            let unsafe_outcome = matches!(
+                goal_tool_failure(unresolved_tool_failures),
+                Some(GoalTerminalFailure::Pause(_))
+            );
             let no_active_goal = self
                 .goal_store
                 .goal(&self.session_id)
                 .map_err(TurnFailure::goal)?
                 .is_none_or(|goal| goal.status != GoalStatus::Active);
-            if unsafe_outcome || (no_active_goal && !unresolved_tool_failures.is_empty()) {
+            if !uncertain
+                && (unsafe_outcome || (no_active_goal && !unresolved_tool_failures.is_empty()))
+            {
                 self.pause_execution(PlanPauseReason::Blocked)
                     .map_err(TurnFailure::host)?;
             }
@@ -8562,6 +8884,20 @@ impl TurnHost {
                     }
                     self.cancel_reconciled_plan_requests(&cycle_id)
                         .map_err(TurnFailure::host)?;
+                    if !input.goal_active
+                        && !input.planning_handoff
+                        && mode == CollaborationMode::Work
+                    {
+                        self.session_control
+                            .stop_turn(
+                                &self.session_id,
+                                &cycle_id,
+                                &completed_turn_id,
+                                false,
+                                zuno_db::message::now_millis(),
+                            )
+                            .map_err(TurnFailure::host)?;
+                    }
                     events
                         .publish(TurnEvent::TurnCompleted {
                             assistant_message_id: assistant_message_id.clone(),
@@ -8570,26 +8906,6 @@ impl TurnHost {
                         .await
                         .map_err(TurnFailure::event_consumer)?;
                     return Ok(Some(outcome));
-                }
-                PlanReconciliationOutcome::Decision(
-                    PlanReconciliationDecision::ContinueOrdinary { attempt },
-                ) => {
-                    let instruction = format!(
-                        "Durable Work recovery observation {attempt}: authorized Plan, Todo, \
-                         or Job state still has executable work. Continue from authoritative \
-                         typed state, perform only the remaining operations, and update durable \
-                         state when material progress occurs. Do not infer completion from prior \
-                         assistant prose."
-                    );
-                    dynamic_context = self
-                        .goal_dynamic_context()
-                        .map_err(TurnFailure::host)?
-                        .with_runtime_instruction(instruction.clone());
-                    refresh_instruction = DynamicContextRefreshInstruction::Fixed(instruction);
-                    let continuation = self
-                        .persist_turn_continuation(&cycle_id, &turn_start, false)
-                        .map_err(TurnFailure::host)?;
-                    turn_start = TurnStart::Recovery { continuation };
                 }
                 PlanReconciliationOutcome::Paused { reason } => {
                     if input.planning_handoff {
@@ -8609,7 +8925,7 @@ impl TurnHost {
                     let (code, detail) = if reason == PlanPauseReason::NoExecutableWork {
                         (
                             "no_executable_work",
-                            "Automatic recovery paused: unfinished Plan or blocked Todo state does not identify executable work. Resolve the recorded wait or explicitly resume.",
+                            "Automatic recovery paused: no runnable step or Todo is owned by the current work cycle. Inspect the work state and any recorded gates before continuing.",
                         )
                     } else {
                         (
@@ -8682,6 +8998,72 @@ impl TurnHost {
         Ok(())
     }
 
+    /// A terminal Goal is not converted into ordinary unfinished work. Retained
+    /// process handles remain observable; this closes model continuation, not OS
+    /// process ownership. A typed human wait is not a terminal Goal.
+    async fn finish_terminal_goal_cycle(
+        &mut self,
+        cycle_id: &str,
+        turn_id: &str,
+        assistant_message_id: &str,
+        steps: u32,
+        events: &TurnEventSender,
+    ) -> Result<bool, TurnFailure> {
+        let state = self
+            .session_control
+            .state(&self.session_id)
+            .map_err(TurnFailure::host)?;
+        let scope =
+            zuno_db::session_work_cycle::read_in(&self.connection, &self.session_id, cycle_id)
+                .map_err(TurnFailure::Database)?;
+        let replaced = state.as_ref().and_then(|state| state.cycle_id.as_deref()) != Some(cycle_id);
+        let mut closed = replaced || scope.as_ref().is_some_and(|scope| scope.stopped.is_some());
+        if state
+            .as_ref()
+            .is_none_or(|state| state.mode != CollaborationMode::Plan)
+            && let Some(goal_id) = scope.as_ref().and_then(|scope| scope.goal_id.as_deref())
+        {
+            closed |= self
+                .goal_store
+                .goal(&self.session_id)
+                .map_err(TurnFailure::goal)?
+                .is_none_or(|goal| goal.goal_id != goal_id || goal.status != GoalStatus::Active);
+        }
+        if !closed {
+            return Ok(false);
+        }
+        let exact_wait = !replaced
+            && state
+                .as_ref()
+                .and_then(|state| state.scheduling.as_ref())
+                .is_some_and(|scheduling| {
+                    matches!(
+                        scheduling.readiness,
+                        SessionReadiness::WaitingHuman { .. }
+                            | SessionReadiness::WaitingExternal { .. }
+                    )
+                });
+        if !exact_wait {
+            self.session_control
+                .stop_turn(
+                    &self.session_id,
+                    cycle_id,
+                    turn_id,
+                    false,
+                    zuno_db::message::now_millis(),
+                )
+                .map_err(TurnFailure::host)?;
+        }
+        events
+            .publish(TurnEvent::TurnCompleted {
+                assistant_message_id: assistant_message_id.to_owned(),
+                steps,
+            })
+            .await
+            .map_err(TurnFailure::event_consumer)?;
+        Ok(true)
+    }
+
     fn persist_turn_continuation(
         &self,
         cycle_id: &str,
@@ -8720,6 +9102,13 @@ impl TurnHost {
         let plan = zuno_tools::WorkStateStore::new(Arc::clone(&self.database))
             .plan(&self.session_id)
             .map_err(to_string)?;
+        let scope = zuno_db::session_work_cycle::current_in(&self.connection, &self.session_id)
+            .map_err(to_string)?;
+        let plan = plan.filter(|plan| {
+            scope
+                .as_ref()
+                .is_none_or(|scope| scope.plan_id.as_deref() == Some(&plan.id))
+        });
         let plan_id = plan.as_ref().map(|plan| plan.id.clone());
         let plan_revision = plan.as_ref().map(|plan| plan.revision);
         let at_ms = zuno_db::message::now_millis();
@@ -8978,9 +9367,32 @@ impl TurnHost {
     }
 
     fn plan_reconciliation_state(&self) -> Result<(PlanReconciliationInput, bool, String), String> {
-        let work = zuno_tools::WorkStateStore::new(Arc::clone(&self.database))
+        let mut work = zuno_tools::WorkStateStore::new(Arc::clone(&self.database))
             .snapshot(&self.session_id)
             .map_err(to_string)?;
+        let scope = zuno_db::session_work_cycle::current_in(&self.connection, &self.session_id)
+            .map_err(to_string)?;
+        if let Some(scope) = &scope {
+            work.plan = work
+                .plan
+                .filter(|plan| scope.plan_id.as_deref() == Some(&plan.id));
+            let plan_steps = work.plan.as_ref().map(|plan| {
+                plan.steps
+                    .iter()
+                    .map(|step| step.id.as_str())
+                    .collect::<BTreeSet<_>>()
+            });
+            work.items.retain(|item| {
+                scope.todo_ids.contains(&item.id)
+                    || item
+                        .goal_id
+                        .as_ref()
+                        .is_some_and(|goal| Some(goal) == scope.goal_id.as_ref())
+                    || item.plan_step_id.as_deref().is_some_and(|id| {
+                        plan_steps.as_ref().is_some_and(|steps| steps.contains(id))
+                    })
+            });
+        }
         let plan_exists = work.plan.is_some();
         let plan_terminal = work
             .plan
@@ -8992,7 +9404,7 @@ impl TurnHost {
                 zuno_tools::WorkItemStatus::Completed | zuno_tools::WorkItemStatus::Cancelled
             )
         });
-        let executable_work = work.items.iter().any(|item| {
+        let executable_todo = work.items.iter().any(|item| {
             matches!(
                 item.status,
                 zuno_tools::WorkItemStatus::Pending | zuno_tools::WorkItemStatus::InProgress
@@ -9007,9 +9419,17 @@ impl TurnHost {
                     })
                 })
         });
-        let jobs = zuno_db::job::AgentJobStore::new(Arc::clone(&self.database))
+        let mut jobs = zuno_db::job::AgentJobStore::new(Arc::clone(&self.database))
             .list_for_parent(&self.session_id)
             .map_err(to_string)?;
+        if let Some(scope) = &scope {
+            jobs.retain(|job| {
+                job.orchestration_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.cycle_id.as_deref())
+                    .is_some_and(|origin| scope.accepts_origin(origin))
+            });
+        }
         let mut active_job = false;
         for job in &jobs {
             if matches!(
@@ -9043,7 +9463,12 @@ impl TurnHost {
             .goal_store
             .goal(&self.session_id)
             .map_err(to_string)?
-            .is_some_and(|goal| goal.status == zuno_goal::GoalStatus::Active);
+            .is_some_and(|goal| {
+                goal.status == zuno_goal::GoalStatus::Active
+                    && scope
+                        .as_ref()
+                        .is_none_or(|scope| scope.goal_id.as_deref() == Some(&goal.goal_id))
+            });
         let execution = self
             .session_control
             .state(&self.session_id)
@@ -9072,6 +9497,31 @@ impl TurnHost {
                     _ => true,
                 }
             });
+        // A Plan is sufficient to represent work: do not require a duplicate
+        // Todo for its current step. Only an explicitly adopted Work Plan may
+        // supply this evidence; old Plans and assistant prose cannot. Where a
+        // step has unfinished Todos, their ownership/dependencies decide, not
+        // the coarser Plan status. An unsettled child still owns its result.
+        let executable_plan = work_authorized
+            && !active_job
+            && scope.as_ref().is_some_and(|scope| {
+                scope.stopped.is_none()
+                    && work.plan.as_ref().is_some_and(|plan| {
+                        scope.plan_id.as_deref() == Some(plan.id.as_str())
+                            && plan.steps.iter().any(|step| {
+                                step.status == zuno_tools::PlanStepStatus::InProgress
+                                    && !work.items.iter().any(|item| {
+                                        item.plan_step_id.as_deref() == Some(step.id.as_str())
+                                            && !matches!(
+                                                item.status,
+                                                zuno_tools::WorkItemStatus::Completed
+                                                    | zuno_tools::WorkItemStatus::Cancelled
+                                            )
+                                    })
+                            })
+                    })
+            });
+        let executable_work = executable_todo || executable_plan;
         let input = PlanReconciliationInput {
             plan_exists,
             plan_terminal,
@@ -9085,6 +9535,11 @@ impl TurnHost {
                 .find(|info| {
                     info.status == zuno_pty::BackgroundExecutionStatus::Running
                         && info.cycle_id.is_some()
+                        && scope.as_ref().is_none_or(|scope| {
+                            info.cycle_id
+                                .as_deref()
+                                .is_some_and(|origin| scope.accepts_origin(origin))
+                        })
                 })
                 .map(|info| SessionWaitReference::External {
                     source_id: info.id.as_str().to_owned(),
@@ -9291,15 +9746,10 @@ impl TurnHost {
                     self.goal_continuation
                         .record_terminal_failure(&self.session_id, failure)
                         .map_err(to_string)?;
-                } else {
-                    self.goal_continuation
-                        .record_turn_outcome(&self.session_id, GoalTurnOutcome::Progress)
-                        .map_err(to_string)?;
                 }
                 self.compaction_state.reset_after_turn_success();
             }
             Some(TurnOutcome::Interrupted { .. }) => {
-                self.pause_execution(PlanPauseReason::User)?;
                 self.goal_continuation
                     .record_terminal_failure(
                         &self.session_id,
@@ -9418,22 +9868,6 @@ impl TurnHost {
         self.work_changes.changed();
     }
 
-    fn finish_goal_error(
-        &self,
-        usage_before: GoalUsage,
-        started: Instant,
-        failure: GoalTerminalFailure,
-    ) -> Result<GoalFailureDisposition, String> {
-        self.record_goal_usage(usage_before, started)?;
-        let disposition = self
-            .goal_continuation
-            .record_terminal_failure(&self.session_id, failure)
-            .map_err(to_string)?;
-        self.write_goal_projection()?;
-        self.work_changes.changed();
-        Ok(disposition)
-    }
-
     async fn handle_turn_failure(
         &mut self,
         usage_before: GoalUsage,
@@ -9447,50 +9881,56 @@ impl TurnHost {
                 format!("{rendered}; additionally failed to record the failed turn: {audit_error}")
             },
         )?;
+        self.record_goal_usage(usage_before, started)?;
+        let Some(scope) = self.failure_scope.take() else {
+            // Failure before any native execution was captured cannot acquire an
+            // arbitrary session Goal or manufacture a durable execution gate.
+            self.last_turn_completed = false;
+            return Err(rendered);
+        };
         let disposition = self
-            .finish_goal_error(usage_before, started, failure.goal_failure())
+            .session_control
+            .settle_turn_failure(
+                &self.session_id,
+                &scope,
+                failure.goal_failure(),
+                self.goal_continuation.retry_policy(),
+                zuno_db::message::now_millis(),
+                u64::from_le_bytes(
+                    Uuid::new_v4().as_bytes()[..8]
+                        .try_into()
+                        .expect("eight bytes"),
+                ),
+            )
             .map_err(|goal_error| {
-                format!(
-                    "{rendered}; additionally failed to record terminal goal state: {goal_error}"
-                )
+                format!("{rendered}; additionally failed to settle the captured turn: {goal_error}")
             })?;
+        self.write_goal_projection()?;
+        self.work_changes.changed();
+        use zuno_session_control::SessionFailureDisposition;
         match disposition {
-            GoalFailureDisposition::RetryScheduled(retry) => {
-                self.plan_reconciliation
-                    .waiting_retry_for_active_cycle(&self.session_id, retry.reason.as_str())
-                    .map_err(|driver_error| {
-                        format!(
-                            "{rendered}; additionally failed to record waiting_retry driver \
-                             phase: {driver_error}"
-                        )
-                    })?;
+            SessionFailureDisposition::Goal(GoalFailureDisposition::RetryScheduled(retry)) => {
                 self.last_turn_completed = true;
                 report_goal_retry(events, &retry, &rendered).await?;
                 Ok(true)
             }
-            GoalFailureDisposition::Paused(_)
-            | GoalFailureDisposition::Blocked(_)
-            | GoalFailureDisposition::NoActiveGoal => {
+            SessionFailureDisposition::Goal(_)
+            | SessionFailureDisposition::OrdinaryStopped
+            | SessionFailureDisposition::GateRetained => {
                 self.questions
-                    .interrupt_plan_turn(&self.session_id, "")
+                    .interrupt_plan_turn_for_cycle(
+                        &self.session_id,
+                        scope.turn_id.as_deref().unwrap_or(""),
+                        &scope.cycle_id,
+                    )
                     .await
                     .map_err(to_string)?;
-                let reason = match failure.goal_failure() {
-                    GoalTerminalFailure::Pause(zuno_goal::GoalPauseReason::Authentication) => {
-                        PlanPauseReason::Authentication
-                    }
-                    GoalTerminalFailure::Pause(zuno_goal::GoalPauseReason::NoProgress) => {
-                        PlanPauseReason::NoProgress
-                    }
-                    GoalTerminalFailure::Pause(zuno_goal::GoalPauseReason::TurnBudget) => {
-                        PlanPauseReason::TurnBudget
-                    }
-                    GoalTerminalFailure::Pause(zuno_goal::GoalPauseReason::UserInterruption) => {
-                        PlanPauseReason::User
-                    }
-                    _ => PlanPauseReason::Blocked,
-                };
-                self.pause_execution(reason)?;
+                self.last_turn_completed = false;
+                Err(rendered)
+            }
+            SessionFailureDisposition::Stale => {
+                // Invalidation of approvals consults the current cycle too.
+                // A late failure has no authority to run that cleanup.
                 self.last_turn_completed = false;
                 Err(rendered)
             }
@@ -9526,11 +9966,32 @@ impl TurnHost {
     /// rather than the session's own delta.
     fn record_goal_usage(&self, before: GoalUsage, started: Instant) -> Result<(), String> {
         let after = goal_usage(&self.connection, &self.session_id)?;
-        let token_delta = goal_turn_unaccounted_tokens(before, after);
+        if !matches!(
+            (&before.ownership, &after.ownership),
+            (GoalUsageOwnership::Legacy, GoalUsageOwnership::Legacy)
+        ) && !matches!((&before.ownership, &after.ownership),
+                (GoalUsageOwnership::Owned(before), GoalUsageOwnership::Owned(after)) if before == after)
+        {
+            // Session usage still includes independent work. It is not a charge
+            // to a paused/replaced Goal or to one created partway through this drive.
+            return Ok(());
+        }
+        let Some(accounting_goal_id) = before.accounting_goal_id.clone() else {
+            // Even the legacy no-cycle path must not charge a Goal created
+            // after this accounting baseline.
+            return Ok(());
+        };
+        let token_delta = goal_turn_unaccounted_tokens(before.clone(), after.clone());
         let accounting_known = goal_turn_accounting_known(before, after);
         let elapsed = i64::try_from(started.elapsed().as_secs()).unwrap_or(i64::MAX);
         self.goal_store
-            .record_usage(&self.session_id, token_delta, elapsed, accounting_known)
+            .record_usage_for_goal(
+                &self.session_id,
+                &accounting_goal_id,
+                token_delta,
+                elapsed,
+                accounting_known,
+            )
             .map_err(to_string)?;
         Ok(())
     }
@@ -9582,38 +10043,71 @@ impl TurnHost {
         // idle tick, so a guard that rewrote the row and republished the projection each
         // time would turn one stopped goal into an unbounded stream of identical client
         // notifications — the goal would look busy precisely because it is not.
-        let recorded = self
+        let goal_pause = self
             .goal_store
             .pause_state(&self.session_id)
-            .map_err(to_string)?
+            .map_err(to_string)?;
+        let recorded = goal_pause
+            .as_ref()
             .is_some_and(|pause| pause.reason == zuno_goal::GoalPauseReason::UncertainSideEffect);
-        let execution_recorded = self
+        let protected_goal_pause = goal_pause.as_ref().is_some_and(|pause| {
+            matches!(
+                pause.reason,
+                zuno_goal::GoalPauseReason::Authentication
+                    | zuno_goal::GoalPauseReason::Permission
+                    | zuno_goal::GoalPauseReason::TurnBudget
+                    | zuno_goal::GoalPauseReason::PlanMode
+                    | zuno_goal::GoalPauseReason::HumanInput
+            )
+        });
+        let execution = self
             .session_control
             .state(&self.session_id)
-            .map_err(to_string)?
-            .is_some_and(|state| {
-                state.scheduling.as_ref().is_some_and(|scheduling| {
-                    scheduling.readiness
-                        == SessionReadiness::Paused {
-                            reason: PlanPauseReason::Blocked,
+            .map_err(to_string)?;
+        let execution_recorded = execution.as_ref().is_some_and(|state| {
+            state.scheduling.as_ref().is_some_and(|scheduling| {
+                scheduling.readiness
+                    == SessionReadiness::Paused {
+                        reason: PlanPauseReason::UncertainSideEffect,
+                    }
+            })
+        });
+        let protected_execution = execution
+            .as_ref()
+            .and_then(|state| state.scheduling.as_ref())
+            .is_some_and(|s| {
+                matches!(
+                    s.readiness,
+                    SessionReadiness::WaitingHuman { .. }
+                        | SessionReadiness::WaitingExternal { .. }
+                        | SessionReadiness::Paused {
+                            reason: PlanPauseReason::Authentication
+                                | PlanPauseReason::TurnBudget
+                                | PlanPauseReason::Blocked
                         }
-                })
+                )
             });
         let no_goal = self
             .goal_store
             .goal(&self.session_id)
             .map_err(to_string)?
             .is_none();
-        if execution_recorded && (recorded || no_goal) {
+        if (execution_recorded || protected_execution)
+            && (recorded || no_goal || protected_goal_pause)
+        {
             return Ok(UncertainSideEffects::AlreadyPaused);
         }
-        self.pause_execution(PlanPauseReason::Blocked)?;
-        self.goal_continuation
-            .record_terminal_failure(
-                &self.session_id,
-                GoalTerminalFailure::Pause(zuno_goal::GoalPauseReason::UncertainSideEffect),
-            )
-            .map_err(to_string)?;
+        if !protected_execution {
+            self.pause_execution(PlanPauseReason::UncertainSideEffect)?;
+        }
+        if !protected_goal_pause {
+            self.goal_continuation
+                .record_terminal_failure(
+                    &self.session_id,
+                    GoalTerminalFailure::Pause(zuno_goal::GoalPauseReason::UncertainSideEffect),
+                )
+                .map_err(to_string)?;
+        }
         Ok(UncertainSideEffects::JustPaused)
     }
 
@@ -9657,6 +10151,10 @@ impl TurnHost {
             .map_err(to_string)?;
         let usage_before = goal_usage(&self.connection, &self.session_id)?;
         let started = Instant::now();
+        self.failure_scope = self
+            .session_control
+            .capture_failure_scope(&self.session_id)
+            .map_err(to_string)?;
         events
             .publish(TurnEvent::SessionCommandStarted {
                 command: SessionCommand::Compact,
@@ -9681,14 +10179,12 @@ impl TurnHost {
                 }
             }
             Err(error) => {
-                self.last_turn_completed = false;
                 let message = error.rendered(None);
-                match self.finish_goal_error(usage_before, started, error.goal_failure()) {
-                    Ok(_) => Err(message),
-                    Err(goal_error) => Err(format!(
-                        "{message}; additionally failed to record terminal goal state: {goal_error}"
-                    )),
-                }
+                Err(self
+                    .handle_turn_failure(usage_before, started, error, &events)
+                    .await
+                    .err()
+                    .unwrap_or(message))
             }
         };
         match result {
@@ -9753,6 +10249,10 @@ impl TurnHost {
         &mut self,
         guard: &SessionRunGuard,
     ) -> Result<PreludeOutcome, TurnFailure> {
+        self.failure_scope = self
+            .session_control
+            .capture_failure_scope(&self.session_id)
+            .map_err(TurnFailure::host)?;
         let internals = self.current_memory_internals().map_err(TurnFailure::host)?;
         let providers = RegistryProviders(&self.providers);
         let noop_hooks = zuno_engine::compaction::NoopCompactionHooks;
@@ -9918,6 +10418,7 @@ fn goal_tool_failure(recoveries: &[ToolFailureRecovery]) -> Option<GoalTerminalF
 #[serde(rename_all = "camelCase")]
 struct DurableWorkContextSnapshot {
     schema_version: u32,
+    work_scope: Option<DurableWorkScopeContext>,
     execution: Option<DurableExecutionContext>,
     questions: Vec<DurableQuestionContext>,
     omitted_questions: usize,
@@ -9929,6 +10430,15 @@ struct DurableWorkContextSnapshot {
     omitted_todos: usize,
     omitted_jobs: usize,
     omitted_pending_reports: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DurableWorkScopeContext {
+    #[serde(flatten)]
+    scope: zuno_db::session_work_cycle::SessionWorkCycle,
+    omitted_todo_ids: usize,
+    omitted_report_cycles: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -9955,6 +10465,8 @@ struct DurableQuestionContext {
     total_items: usize,
     decision: Option<zuno_types::question::PlanQuestionDecision>,
     authorization: Option<zuno_types::question::PlanAuthorizationState>,
+    delivery: Option<zuno_types::question::QuestionDeliverySnapshot>,
+    blocks_current_work: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -10076,6 +10588,18 @@ fn render_durable_work_context(mut snapshot: DurableWorkContextSnapshot) -> Resu
         {
             job.final_text = None;
             job.error = None;
+            continue;
+        }
+        if let Some(scope) = snapshot.work_scope.as_mut()
+            && scope.scope.todo_ids.pop_last().is_some()
+        {
+            scope.omitted_todo_ids = scope.omitted_todo_ids.saturating_add(1);
+            continue;
+        }
+        if let Some(scope) = snapshot.work_scope.as_mut()
+            && scope.scope.resumed_goal_cycles.pop_last().is_some()
+        {
+            scope.omitted_report_cycles = scope.omitted_report_cycles.saturating_add(1);
             continue;
         }
         if snapshot.todos.pop().is_some() {
@@ -10267,7 +10791,7 @@ fn durable_work_context(
             )
         });
     let mut questions =
-        zuno_db::question::pending_in(&transaction, session_id).map_err(to_string)?;
+        zuno_db::question::visible_in(&transaction, session_id).map_err(to_string)?;
     if let Some(SessionReadiness::WaitingHuman { request_id }) = execution
         .as_ref()
         .and_then(|state| state.scheduling.as_ref())
@@ -10285,6 +10809,9 @@ fn durable_work_context(
         questions
             .into_iter()
             .map(|question| DurableQuestionContext {
+                blocks_current_work: execution.as_ref()
+                    .and_then(|state| state.scheduling.as_ref())
+                    .is_some_and(|s| matches!(&s.readiness, SessionReadiness::WaitingHuman { request_id } if request_id == &question.id)),
                 id: question.id,
                 revision: question.revision,
                 purpose: question.purpose,
@@ -10298,6 +10825,7 @@ fn durable_work_context(
                 total_items: question.questions.len(),
                 decision: question.decision,
                 authorization: question.authorization,
+                delivery: question.delivery,
             })
             .collect(),
     );
@@ -10324,6 +10852,13 @@ fn durable_work_context(
         .map_err(to_string)?;
     let snapshot = DurableWorkContextSnapshot {
         schema_version: DURABLE_WORK_CONTEXT_SCHEMA_VERSION,
+        work_scope: zuno_db::session_work_cycle::current_in(&transaction, session_id)
+            .map_err(to_string)?
+            .map(|scope| DurableWorkScopeContext {
+                scope,
+                omitted_todo_ids: 0,
+                omitted_report_cycles: 0,
+            }),
         execution: execution.map(|state| DurableExecutionContext {
             mode: state.mode,
             phase: state.phase,
@@ -10345,6 +10880,49 @@ fn durable_work_context(
     };
     transaction.commit().map_err(to_string)?;
     render_durable_work_context(snapshot).map(Some)
+}
+
+/// Select and admit one report while holding the caller's writer transaction.
+/// The returned projection is the input to the automatic turn's planning policy.
+fn admit_report_continuation_in(
+    tx: &zuno_db::Transaction<'_>,
+    session_id: &str,
+    reports: &[ProjectedReport],
+    committed_completions: &[zuno_db::inbox::SessionInput],
+) -> Result<Option<(zuno_db::inbox::SessionInput, ProjectedReport)>, zuno_error::DbError> {
+    // Prefer the projected newest report when eligible, otherwise the latest
+    // admitted eligible report. Rejected reports remain history, never the
+    // planning seed or completion source of this continuation.
+    let candidates = reports
+        .iter()
+        .filter(|report| report.newest)
+        .chain(reports.iter().rev().filter(|report| !report.newest));
+    for report in candidates {
+        let Some(input) = committed_completions
+            .iter()
+            .find(|input| input.id == report.input_id && input.session_id == session_id)
+        else {
+            continue;
+        };
+        if zuno_db::session_wake::admission_in(tx, input)? == WakeAdmission::Reject {
+            continue;
+        }
+        let Some(wake @ SessionWakeSignal::ExternalCompletion { .. }) =
+            zuno_db::session_wake::signal_in(tx, input)?
+        else {
+            continue;
+        };
+        if zuno_db::session_execution::admit_wake_in(
+            tx,
+            session_id,
+            &wake,
+            zuno_db::message::now_millis(),
+        )? != WakeAdmission::Reject
+        {
+            return Ok(Some((input.clone(), report.clone())));
+        }
+    }
+    Ok(None)
 }
 
 struct HostPlanningRequest<'a> {
@@ -10383,13 +10961,24 @@ fn ensure_host_plan(
     } = request;
     let store = zuno_tools::WorkStateStore::new(Arc::clone(database));
     let existing = store.plan(session_id).map_err(to_string)?;
-    let existing_state = existing.as_ref().map_or(ExistingPlanState::None, |plan| {
-        if plan.steps.iter().all(|step| step.status.is_terminal()) {
-            ExistingPlanState::Terminal
-        } else {
-            ExistingPlanState::Active
-        }
-    });
+    let connection = database.get().map_err(to_string)?;
+    let scope =
+        zuno_db::session_work_cycle::current_in(&connection, session_id).map_err(to_string)?;
+    drop(connection);
+    let existing_state = existing
+        .as_ref()
+        .filter(|plan| {
+            scope
+                .as_ref()
+                .is_none_or(|scope| scope.plan_id.as_deref() == Some(&plan.id))
+        })
+        .map_or(ExistingPlanState::None, |plan| {
+            if plan.steps.iter().all(|step| step.status.is_terminal()) {
+                ExistingPlanState::Terminal
+            } else {
+                ExistingPlanState::Active
+            }
+        });
     let decision = PlanningPolicy::classify(
         PlanningInput::new(prompt, agent)
             .with_source(source)
@@ -10557,8 +11146,19 @@ fn planning_context_marker(value: &str) -> bool {
     .any(|marker| lower.contains(marker))
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum GoalUsageOwnership {
+    #[default]
+    Legacy,
+    Independent,
+    Owned(String),
+}
+
+#[derive(Debug, Clone, Default)]
 struct GoalUsage {
+    ownership: GoalUsageOwnership,
+    /// Freeze accounting identity separately from modern/legacy execution scope.
+    accounting_goal_id: Option<String>,
     tokens: i64,
     confirmed_known: bool,
     estimated_pending_prompt_tokens: Option<u64>,
@@ -10598,19 +11198,32 @@ fn goal_usage(connection: &rusqlite::Connection, session_id: &str) -> Result<Goa
             |row| row.get::<_, bool>(0),
         )
         .map_err(to_string)?;
-    let goal_charged = if goal_attached {
+    let goal_counter: Option<(String, i64)> = if goal_attached {
         connection
             .query_row(
-                "SELECT tokens_used FROM goal WHERE session_id = ?1",
+                "SELECT goal_id,tokens_used FROM goal WHERE session_id = ?1",
                 [session_id],
-                |row| row.get::<_, i64>(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(to_string)?
-            .unwrap_or_default()
     } else {
-        0
+        None
     };
+    let ownership =
+        match zuno_db::session_work_cycle::current_in(connection, session_id).map_err(to_string)? {
+            None => GoalUsageOwnership::Legacy,
+            Some(scope) => match scope.goal_id {
+                Some(id)
+                    if goal_counter
+                        .as_ref()
+                        .is_some_and(|(current, _)| current == &id) =>
+                {
+                    GoalUsageOwnership::Owned(id)
+                }
+                _ => GoalUsageOwnership::Independent,
+            },
+        };
     // Any stored version of the event answers the same question, so the pattern is a
     // prefix rather than the `.1` suffix a caller would have to keep in step with the
     // event log. Reading a version this build does not understand still tells the
@@ -10624,11 +11237,13 @@ fn goal_usage(connection: &rusqlite::Connection, session_id: &str) -> Result<Goa
         )
         .map_err(to_string)?;
     Ok(GoalUsage {
+        ownership,
+        accounting_goal_id: goal_counter.as_ref().map(|(id, _)| id.clone()),
         tokens: i64::try_from(snapshot.confirmed.total()).unwrap_or(i64::MAX),
         confirmed_known: snapshot.confirmed_known,
         estimated_pending_prompt_tokens: snapshot.estimated_pending_prompt_tokens,
         last_confirmed_at: snapshot.last_confirmed_at,
-        goal_charged,
+        goal_charged: goal_counter.map_or(0, |(_, tokens)| tokens),
         last_provider_request_seq,
         failed_turns: snapshot.failed_turns,
     })
@@ -10652,10 +11267,9 @@ fn goal_usage(connection: &rusqlite::Connection, session_id: &str) -> Result<Goa
 /// The result never goes below zero. The policy can charge a number the session's
 /// confirmed total has not caught up with, and a negative charge would hand budget
 /// back — a goal that spends its way *under* its ceiling is exactly the accounting
-/// hole this closes. The same clamp over-charges a goal replaced mid-turn, whose
-/// counter starts again at zero: the replacement wears the whole turn. That direction
-/// is deliberate, because a ceiling arriving early is a nuisance and one that never
-/// arrives is the failure being prevented.
+/// hole this closes. Native callers validate Goal ownership before applying this
+/// numeric delta; an independent or replaced Goal never receives the old drive's
+/// fallback charge.
 fn goal_turn_unaccounted_tokens(before: GoalUsage, after: GoalUsage) -> i64 {
     let already_charged = after
         .goal_charged
@@ -12471,9 +13085,10 @@ fn model_spec(
 
 /// Lift one catalog model into the engine without changing its resolved API surface.
 ///
-/// Main turns copy [`Spec::surface`] into [`EngineModel::surface`]. Internal Agents and
-/// reflection must do the same: forcing Chat here makes a Responses-only compatible
-/// endpoint fail even though its provider spec was resolved correctly.
+/// Main, delegated, internal and restored turns retain this complete value.
+/// Reconstructing it from just a Spec loses retry policy and pricing. Agent
+/// sampling and inherited reasoning may overlay their own fields, not replace
+/// provider configuration or the resolved API surface.
 fn engine_model(
     catalog: &Catalog,
     model: &zuno_llm::catalog::ResolvedModel,
@@ -12832,9 +13447,7 @@ struct Resolver {
     max_steps: Option<NonZeroU32>,
     requested_provider: String,
     requested_model: String,
-    wire_model: String,
-    reasoning_options: serde_json::Map<String, serde_json::Value>,
-    spec: Spec,
+    model: EngineModel,
     orchestration_seed: Option<Arc<AttemptSeed>>,
 }
 
@@ -12859,15 +13472,8 @@ impl AgentModelResolver for Resolver {
     }
 
     fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<EngineModel> {
-        (provider_id == self.requested_provider && model_id == self.requested_model).then(|| {
-            EngineModel::new(
-                self.spec.clone(),
-                self.wire_model.clone(),
-                self.spec.surface,
-            )
-            .with_catalog_identity(&self.requested_provider, &self.requested_model)
-            .with_reasoning_options(self.reasoning_options.clone())
-        })
+        (provider_id == self.requested_provider && model_id == self.requested_model)
+            .then(|| self.model.clone())
     }
 }
 

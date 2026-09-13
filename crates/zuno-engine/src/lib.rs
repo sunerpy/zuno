@@ -10,6 +10,7 @@ mod deferred_tools;
 pub mod dispatch;
 pub mod driver;
 pub mod hooks;
+mod input_delivery;
 pub mod interrupt;
 pub mod r#loop;
 pub mod plan_driver;

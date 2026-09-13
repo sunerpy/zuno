@@ -95,10 +95,18 @@ pub enum ToolPartCommitKind {
     Result,
 }
 
+/// A live-delivery claim is rechecked atomically with model-visible input storage.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LiveInputGate {
+    pub revision: Option<i64>,
+    pub source: crate::interrupt::SoftInterruptSource,
+}
 /// Attachment admission happens before this operation. All content is already
 /// validated; the store chooses the message time and consumes the inbox atomically.
 #[derive(Debug, Clone)]
 pub struct InputMaterialization {
+    pub live: Option<LiveInputGate>,
     pub input_id: Option<String>,
     pub turn_id: Option<String>,
     pub message: MessageRecord,
@@ -186,11 +194,13 @@ pub trait TurnPersistence: Send + Sync {
         kind: ToolPartCommitKind,
         persisted_at_ms: i64,
     ) -> Result<(), TurnError>;
+    /// Return true only after history and input consumption commit together.
+    /// A refused live claim returns false without becoming model-visible.
     async fn consume_input(
         &self,
         scope: &TurnStateScope,
         input: InputMaterialization,
-    ) -> Result<(), TurnError>;
+    ) -> Result<bool, TurnError>;
     async fn schedule_backoff(
         &self,
         scope: &TurnStateScope,

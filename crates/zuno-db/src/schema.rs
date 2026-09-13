@@ -5,7 +5,7 @@ use rusqlite::Transaction;
 use zuno_error::DbError;
 
 /// Number of application tables created by the current schema's single `up`.
-pub const TABLE_COUNT: usize = 56;
+pub const TABLE_COUNT: usize = 60;
 
 const MEMORY_RUNTIME_SCHEMA_SQL: &str = include_str!("schema/memory_runtime.sql");
 const AUTOMATIC_MEMORY_SCHEMA_SQL: &str = include_str!("schema/automatic_memory.sql");
@@ -19,6 +19,8 @@ const SCHEDULING_SCHEMA_SQL: &str = include_str!("schema/scheduling.sql");
 const GOAL_RESUME_SCHEMA_SQL: &str = include_str!("schema/goal_resume.sql");
 const INPUT_RECEIPT_SCHEMA_SQL: &str = include_str!("schema/input_receipt.sql");
 const CONTEXT_USAGE_SCHEMA_SQL: &str = include_str!("schema/context_usage.sql");
+const GOAL_TURN_SCHEMA_SQL: &str = include_str!("schema/goal_turn.sql");
+const WORK_CYCLE_SCHEMA_SQL: &str = include_str!("schema/work_cycle.sql");
 
 const CORE_SCHEMA_SQL: &str = r#"
 CREATE TABLE `workspace` (
@@ -804,6 +806,8 @@ pub(crate) fn declared_tables() -> Vec<&'static str> {
         PREVIEW_SCHEMA_SQL,
         INPUT_RECEIPT_SCHEMA_SQL,
         CONTEXT_USAGE_SCHEMA_SQL,
+        GOAL_TURN_SCHEMA_SQL,
+        WORK_CYCLE_SCHEMA_SQL,
     ]
     .into_iter()
     .flat_map(declared_tables_in)
@@ -840,6 +844,7 @@ pub fn up(transaction: &Transaction<'_>) -> Result<(), DbError> {
     up_questions(transaction)?;
     up_scheduling(transaction)?;
     up_runtime_consistency(transaction)?;
+    up_turn_boundaries(transaction)?;
     up_session_ownership(transaction)?;
     up_runtime_jobs(transaction)?;
     transaction
@@ -1077,6 +1082,19 @@ pub(crate) fn up_runtime_consistency(transaction: &Transaction<'_>) -> Result<()
                error,time_updated
              FROM session_input;",
         )
+        .map_err(migration::map_error)
+}
+
+/// Add format-15 host cycles and Goal turn ledgers without reconstructing any
+/// historical work ownership, stop, failure streak, or recovery authorization.
+///
+/// 中文：只新增空账本；不修改可选旧 Goal 表，也不自动恢复任何 Goal。
+pub(crate) fn up_turn_boundaries(transaction: &Transaction<'_>) -> Result<(), DbError> {
+    transaction
+        .execute_batch(GOAL_TURN_SCHEMA_SQL)
+        .map_err(migration::map_error)?;
+    transaction
+        .execute_batch(WORK_CYCLE_SCHEMA_SQL)
         .map_err(migration::map_error)
 }
 

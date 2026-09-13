@@ -292,6 +292,20 @@ const LEAVES: &[Leaf] = &[
         evidence: Evidence::Fragment("Session not found: ses_probe000000000000000000000a"),
     },
     Leaf {
+        path: &["session", "repair"],
+        argv: &[
+            "session",
+            "repair",
+            "ses_probe000000000000000000000a",
+            "--input",
+            "msg_probe000000000000000000000a",
+            "--dry-run",
+        ],
+        // A fresh probe owns no database. The native read-only handler refuses
+        // to create one, proving dispatch without changing any user state.
+        evidence: Evidence::Fragment("cannot open the existing database for session repair"),
+    },
+    Leaf {
         path: &["agent", "list"],
         argv: &["agent", "list"],
         evidence: Evidence::Fragment("build (primary)"),

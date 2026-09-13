@@ -103,6 +103,7 @@ pub(super) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
         .turn_state(first.lease.clone(), "/workspace".to_owned())
         .unwrap();
     state.consume_input(&scope,InputMaterialization {
+                    live: None,
         turn_id:None,input_id:Some(job.input_id.to_string()),
         message:MessageRecord::from_json(json!({
             "id":job.input_id,"sessionID":job.session_id,"role":"user","time":{"created":0},

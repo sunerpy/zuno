@@ -393,7 +393,7 @@ impl TurnPersistence for SqliteTurnPersistence<'_> {
         &self,
         scope: &TurnStateScope,
         mut input: InputMaterialization,
-    ) -> Result<(), TurnError> {
+    ) -> Result<bool, TurnError> {
         self.with(scope, |connection| {
             if input.message.session_id != scope.session_id
                 || input.message.role != zuno_db::message::MessageRole::User
@@ -404,6 +404,72 @@ impl TurnPersistence for SqliteTurnPersistence<'_> {
                 return Err(conflict(&input.message.id, "input scope differs"));
             }
             let transaction = open::immediate_transaction(connection)?;
+            if let Some(gate) = &input.live {
+                let claimed = input
+                    .input_id
+                    .as_deref()
+                    .map(|id| zuno_db::inbox::read_in(&transaction, &scope.session_id, id))
+                    .transpose()?
+                    .flatten();
+                if input.input_id.is_some()
+                    && (claimed.is_none()
+                        || gate.revision.is_some_and(|revision| {
+                            claimed
+                                .as_ref()
+                                .is_some_and(|value| value.revision != revision)
+                        }))
+                {
+                    transaction.commit().map_err(open::map_error)?;
+                    return Ok(false);
+                }
+                let admission = zuno_db::session_wake::model_application_admission_in(
+                    &transaction,
+                    &scope.session_id,
+                    claimed.as_ref(),
+                )?;
+                if admission == zuno_types::execution::WakeAdmission::Reject {
+                    if input.input_id.is_none() {
+                        let latest =
+                            MessageStore::new(&transaction).latest_time_created(&scope.session_id)?;
+                        let created = zuno_db::message::created_after(
+                            zuno_db::message::now_millis(),
+                            latest,
+                        );
+                        input.message.time_created = created;
+                        input.message.data.insert(
+                            "time".to_owned(),
+                            serde_json::json!({"created": created}),
+                        );
+                        for (index, part) in input.parts.iter_mut().enumerate() {
+                            part.time_created =
+                                created.saturating_add(i64::try_from(index).unwrap_or(i64::MAX));
+                        }
+                        let trigger = match gate.source {
+                            crate::interrupt::SoftInterruptSource::User => {
+                                zuno_types::execution::InputTriggerKind::User
+                            }
+                            _ => zuno_types::execution::InputTriggerKind::Recovery,
+                        };
+                        zuno_db::inbox::admit_in(
+                            &transaction,
+                            zuno_db::inbox::NewSessionInput::new(
+                                &input.message.id,
+                                &scope.session_id,
+                                serde_json::json!({
+                                    "message": input.message.to_json(),
+                                    "parts": input.parts.iter().map(PartRecord::to_json).collect::<Vec<_>>(),
+                                    "liveInputSource": format!("{:?}", gate.source),
+                                }),
+                                zuno_db::inbox::InputDelivery::Queue,
+                                created,
+                            )
+                            .with_trigger_kind(trigger),
+                        )?;
+                    }
+                    transaction.commit().map_err(open::map_error)?;
+                    return Ok(false);
+                }
+            }
             let store = MessageStore::new(&transaction);
             let created = zuno_db::message::created_after(
                 zuno_db::message::now_millis(),
@@ -462,7 +528,7 @@ impl TurnPersistence for SqliteTurnPersistence<'_> {
                 store.put_part_at(&part, part.time_created)?;
             }
             transaction.commit().map_err(open::map_error)?;
-            Ok(())
+            Ok(true)
         })
     }
 

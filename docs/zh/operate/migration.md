@@ -1,9 +1,9 @@
 # Zuno 数据库生命周期
 
-Zuno 管理自己的配置根目录和数据根目录。当前数据库格式为 14。空数据库直接创建为当前
+Zuno 管理自己的配置根目录和数据根目录。当前数据库格式为 15。空数据库直接创建为当前
 格式；受支持的旧格式通过受保护的前向迁移升级。format 5 是第一个受支持的历史格式，
-format 5 到 format 13 都会原地升级到 format 14，不需要重建数据库。
-迁移链显式覆盖 format 5、format 6、format 7、format 8、format 9、format 10、format 11、format 12 与 format 13。
+format 5 到 format 14 都会原地升级到 format 15，不需要重建数据库。
+迁移链显式覆盖 format 5、format 6、format 7、format 8、format 9、format 10、format 11、format 12、format 13 与 format 14。
 
 ## Channel 数据库
 
@@ -49,12 +49,13 @@ zuno session list
 
 数据库打开流程识别以下状态：
 
-1. **空数据库。** 完整的 format-14 schema 与唯一 `zuno_schema` marker 被原子创建。
-2. **Format 14。** 应用查询前校验 marker、表、约束、索引和触发器。
-3. **Format 5–13。** 在同一事务中按顺序执行所有剩余迁移：学习（6）、Plan 栈（7）、
+1. **空数据库。** 完整的 format-15 schema 与唯一 `zuno_schema` marker 被原子创建。
+2. **Format 15。** 应用查询前校验 marker、表、约束、索引和触发器。
+3. **Format 5–14。** 在同一事务中按顺序执行所有剩余迁移：学习（6）、Plan 栈（7）、
    验证账本（8）、会话记忆策略（9）、执行／收件箱状态（10）、记忆版本与检索（11）、
    自动记忆来源与处理水位（12）、持久问题与会话调度（13），以及输入处理回执、
-   统一 Context 快照与绑定 revision 的 Goal 恢复选择（14）。
+   统一 Context 快照与绑定 revision 的 Goal 恢复选择（14），再到工作周期归属及带身份的
+   Goal 回合观察／结算（15）。
 4. **其他任何状态。** 不受支持的更旧格式、未来格式、缺少 marker，或 marker 与必需
    表不匹配，都会失败关闭且不修改文件。
 
@@ -63,11 +64,11 @@ zuno session list
 总共最多尝试四次。不支持的 format 仍然报告为 schema 不匹配；如果 format 在打开过程中
 持续变化，则以 `zuno_schema` marker 上的冲突失败关闭。两种路径都不会写库。
 
-### Format 5–13 到 format 14
+### Format 5–14 到 format 15
 
 受支持的迁移使用一个 SQLite `BEGIN IMMEDIATE` 事务：
 
-1. 重新读取表清单，并要求 marker 恰好为 format 5、6、7、8、9、10、11、12 或 13。
+1. 重新读取表清单，并要求 marker 恰好为 format 5、6、7、8、9、10、11、12、13 或 14。
 2. 在任何变更前要求历史 `session` 与 `work_plan` 表存在。
 3. 从 format 5 出发时，创建全部 format-6 learning 表和索引。
 4. 从 format 5 或 6 出发时，增加可空的 `parent_plan_id`、默认值为 0 的 `stack_depth`
@@ -89,13 +90,19 @@ zuno session list
 12. 保留已发布问题定义的原始内容，把 purpose 约束扩展为允许原生 `goal_resume`；
     创建 `session_input_receipt`、`session_context_usage` 及索引。旧 consumed 输入只映射为
     `recorded`，没有供应商请求证据就不能晋升为 `applied` 或 `completed`。
-13. 最后用精确旧值条件把 marker 更新为 14；全部成功后才提交。
+13. 创建 `session_work_cycle` 及索引，以及 `goal_turn_observation`、`goal_cycle_failure`、
+    `goal_turn_audit`。新表初始为空；旧的未绑定阻塞观察保留，不计入新周期。
+14. 最后用精确旧值条件把 marker 更新为 15；全部成功后才提交。
 
 任何失败都会回滚整个事务。迁移不会重写已有的 `session`、`message`、
 `memory_candidate`、`verification_receipt` 或 `work_plan` 值；来源验证和租约仅执行已说明的回填。
-测试使用 format-5 到 format-13 的精确发布 fixture，比较 Session、Message、Memory 等保留值，
+测试使用 format-5 到 format-14 的精确发布 fixture，比较 Session、Message、Memory 等保留值，
 再验证新增对象和 marker。Format-11 用例包含已经发布的记忆版本，并验证最后一个索引创建失败时
 整个升级回滚。不需要重建用户数据库。
+
+工作周期区分当前请求的工作与已停止的旧周期。普通新输入不恢复旧 Goal，也不承接未变化的
+Plan。只有通过 revision 校验的显式 Goal 恢复，才能转交原 Goal 报告周期的投递权限；原始完成
+凭据保持不变。数据库打开和迁移不会把来源不明的暂停猜作用户取消，也不会自动恢复它。
 
 Format 14 迁移不会调用模型、提炼 Memory、编造 Context 数值或恢复暂停 Goal。
 历史补证与必要重处理由可恢复学习任务完成。先用 `/learn repair-history --dry-run`

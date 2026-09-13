@@ -437,6 +437,77 @@ fn changed_blocker_restarts_the_persistent_count() {
 }
 
 #[test]
+fn scoped_replayed_completed_turn_does_not_count_as_another_turn() {
+    let fixture = Fixture::new();
+    fixture.create("one real turn");
+    let identity =
+        crate::goal_turn_test_support::bind(&fixture.store, "ses_goal", "cycle", "real-turn");
+    let first = fixture
+        .store
+        .settle_goal_turn(
+            "ses_goal",
+            &identity,
+            GoalTurnOutcome::Blocking("external blocker"),
+        )
+        .unwrap();
+    let replay = fixture
+        .store
+        .settle_goal_turn(
+            "ses_goal",
+            &identity,
+            GoalTurnOutcome::Blocking("external blocker"),
+        )
+        .unwrap();
+    assert_eq!(
+        replay.audit, first.audit,
+        "redelivery of one completed turn must not advance the streak"
+    );
+    assert!(replay.replayed);
+}
+
+#[test]
+fn scoped_settlement_never_consumes_an_unbound_legacy_observation() {
+    let fixture = Fixture::new();
+    fixture.create("new scoped work");
+    let identity =
+        crate::goal_turn_test_support::bind(&fixture.store, "ses_goal", "cycle", "real-turn");
+    fixture
+        .store
+        .stage_failure_signal("ses_goal", "old unbound blocker")
+        .unwrap();
+    fixture
+        .store
+        .record_failure_signal("ses_goal", Some("legacy streak"))
+        .unwrap();
+    let result = fixture
+        .store
+        .settle_goal_turn("ses_goal", &identity, GoalTurnOutcome::Progress)
+        .unwrap();
+    assert_eq!(
+        result.audit.disposition,
+        crate::GoalTurnDisposition::Reset,
+        "a current turn without its own observation must not inherit legacy pending work"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .consume_staged_failure_signal("ses_goal")
+            .unwrap()
+            .as_deref(),
+        Some("old unbound blocker")
+    );
+    assert_eq!(
+        fixture
+            .store
+            .failure_streak("ses_goal")
+            .unwrap()
+            .unwrap()
+            .consecutive_turns,
+        1
+    );
+}
+
+#[test]
 fn retry_backoff_suppresses_until_due_then_prepares_the_goal() {
     let fixture = Fixture::new();
     fixture.create("keep working after a transient outage");

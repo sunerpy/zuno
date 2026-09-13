@@ -120,3 +120,92 @@ fn matching_completion_can_resume_only_its_external_wait() {
         SessionExecutionPhase::Waiting
     );
 }
+
+#[test]
+fn unknown_legacy_scope_keeps_the_goal_fence_but_explicit_independence_does_not() {
+    for independent_scope in [false, true] {
+        let pool = initialized(&DbLocation::Memory);
+        seeded(&pool);
+        pool.get()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE goal (
+                   session_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL, status TEXT NOT NULL
+                 );
+                 INSERT INTO goal VALUES ('ordinary-session','historical-goal','active');",
+            )
+            .unwrap();
+        if independent_scope {
+            pool.transaction(|tx| {
+                zuno_db::session_work_cycle::save_in(
+                    tx,
+                    &zuno_db::session_work_cycle::SessionWorkCycle {
+                        session_id: SESSION.to_owned(),
+                        cycle_id: "origin-cycle".to_owned(),
+                        anchor_message_id: Some("anchor-message".to_owned()),
+                        goal_id: None,
+                        plan_id: None,
+                        active_turn_id: None,
+                        todo_ids: Default::default(),
+                        resumed_goal_cycles: Default::default(),
+                        stopped: None,
+                        scheduling: None,
+                    },
+                    30,
+                )
+            })
+            .unwrap();
+        }
+        let before = SessionExecutionStore::new(Arc::clone(&pool))
+            .get(SESSION)
+            .unwrap();
+        for status in [
+            "active",
+            "paused",
+            "complete",
+            "blocked",
+            "budget_limited",
+            "cancelled",
+        ] {
+            let connection = pool.get().unwrap();
+            connection
+                .execute(
+                    "UPDATE goal SET status=?1 WHERE session_id=?2",
+                    (status, SESSION),
+                )
+                .unwrap();
+            let input = callback(&pool, status, Some("origin-cycle"));
+            let expected = if independent_scope || status == "active" {
+                WakeAdmission::Admit
+            } else {
+                WakeAdmission::Reject
+            };
+            assert_eq!(
+                zuno_db::session_wake::admission_in(&connection, &input).unwrap(),
+                expected,
+                "scope={independent_scope}, goal={status}"
+            );
+            let resolved = zuno_db::session_work_cycle::completion_cycle_in(
+                &connection,
+                SESSION,
+                "origin-cycle",
+            )
+            .unwrap();
+            assert_eq!(resolved.is_some(), expected == WakeAdmission::Admit);
+            assert_eq!(
+                pool.transaction(|tx| {
+                    zuno_db::session_wake::model_application_admission_in(tx, SESSION, None)
+                })
+                .unwrap(),
+                expected,
+                "model application must use the same ownership distinction"
+            );
+            assert_eq!(
+                SessionExecutionStore::new(Arc::clone(&pool))
+                    .get(SESSION)
+                    .unwrap(),
+                before
+            );
+        }
+    }
+}

@@ -377,6 +377,8 @@ impl TypedTool for BackgroundTool {
          cursor instead of slicing a file with a shell command. Background completion normally \
          notifies and wakes the parent automatically. Serial critical-path work stays foreground: \
          wait on the SAME taskID without rerunning the command or creating an observer agent. \
+         A handle or remoteObserver purpose does not mean detached work; if waiting is the only \
+         useful next action, keep the foreground workflow rather than ending it to await a callback. \
          Each wait is capped at 60 seconds; an observation timeout is not terminal status. \
          Keep polling bounded and honor steering/interruption between waits. A remoteObserver \
          exit still requires an authoritative remote-state recheck. Cancellation is a side effect and this tool is never \

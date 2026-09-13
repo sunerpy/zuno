@@ -102,6 +102,112 @@ impl fmt::Display for ProviderProtocolFailure {
     }
 }
 
+/// A boundary observed by the client, never an inferred upstream execution stage.
+///
+/// The existing diagnostic JSON projection uses [`Self::as_str`] for stable
+/// snake_case values. Errors without an observed boundary retain `Unknown`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderDiagnosticPhase {
+    /// Waiting for HTTP response headers, including transport setup.
+    ResponseHeaders,
+    /// A local wait for the next stream item exceeded its idle allowance.
+    StreamIdle,
+    /// A local whole-request or request-recovery budget expired.
+    RequestBudget,
+    /// The available evidence does not identify one of these boundaries.
+    #[default]
+    Unknown,
+}
+
+impl ProviderDiagnosticPhase {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ResponseHeaders => "response_headers",
+            Self::StreamIdle => "stream_idle",
+            Self::RequestBudget => "request_budget",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Owned, bounded and redacted provider facts. This is diagnostic data, never a
+/// retry classification. It survives cancellation of a replacement request after
+/// the original ProviderError (and its transport source) has been dropped. It can
+/// also be retained as a typed, sanitized cause in an error's source chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderDiagnostic {
+    phase: ProviderDiagnosticPhase,
+    status: Option<u16>,
+    code: Option<String>,
+    request_id: Option<String>,
+    reason: Option<String>,
+}
+
+impl ProviderDiagnostic {
+    #[must_use]
+    pub const fn phase(&self) -> ProviderDiagnosticPhase {
+        self.phase
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> Option<u16> {
+        self.status
+    }
+
+    #[must_use]
+    pub fn code(&self) -> Option<&str> {
+        self.code.as_deref()
+    }
+
+    #[must_use]
+    pub fn fields(&self) -> serde_json::Value {
+        serde_json::json!({
+            "phase": self.phase.as_str(),
+            "status": self.status,
+            "code": self.code,
+            "requestID": self.request_id,
+            "reason": self.reason,
+        })
+    }
+
+    fn redacted(mut self, credentials: &[&str]) -> Self {
+        let clean = |text: String, limit: usize| {
+            let text = ProviderError::sanitize_diagnostic(&text, credentials);
+            text[..text.floor_char_boundary(text.len().min(limit))].to_owned()
+        };
+        self.code = self.code.map(|text| clean(text, 192));
+        self.request_id = self.request_id.map(|text| clean(text, 256));
+        self.reason = self.reason.map(|text| clean(text, 3_072));
+        self
+    }
+}
+
+impl fmt::Display for ProviderDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(status) = self.status {
+            write!(f, "HTTP {status}")?;
+        } else {
+            f.write_str("provider failure")?;
+        }
+        if self.phase != ProviderDiagnosticPhase::Unknown {
+            write!(f, " phase={}", self.phase.as_str())?;
+        }
+        if let Some(code) = &self.code {
+            write!(f, " code={code}")?;
+        }
+        if let Some(request_id) = &self.request_id {
+            write!(f, " requestID={request_id}")?;
+        }
+        if let Some(reason) = &self.reason {
+            write!(f, ": {reason}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ProviderDiagnostic {}
+
 /// A failure from a model provider, classified by what recovery it permits.
 ///
 /// Every variant is a recovery class, not a description. A caller decides what to
@@ -211,6 +317,10 @@ impl ProviderError {
     /// Causes retain the provider's actual reason instead of only the taxonomy label.
     #[must_use]
     pub fn diagnostic(&self) -> String {
+        self.redacted_diagnostic(&[])
+    }
+
+    fn redacted_diagnostic(&self, credentials: &[&str]) -> String {
         use std::error::Error as _;
         let mut text = bounded_display(self);
         let mut source = self.source();
@@ -220,37 +330,128 @@ impl ProviderError {
             text.push_str(&bounded_display(cause));
             source = cause.source();
         }
-        Self::sanitize_diagnostic(&text, &[])
+        Self::sanitize_diagnostic(&text, credentials)
     }
 
     /// Structured wire metadata when the adapter captured it. Missing metadata
     /// stays missing; rendered prose is never parsed to infer a code or request id.
     #[must_use]
     pub fn diagnostic_fields(&self) -> serde_json::Value {
+        self.diagnostic_snapshot().fields()
+    }
+
+    /// Copy the sanitized metadata captured at the provider boundary without
+    /// retaining the original response body or transport source object.
+    #[must_use]
+    pub fn diagnostic_snapshot(&self) -> ProviderDiagnostic {
+        self.redacted_snapshot(&[])
+    }
+
+    fn redacted_snapshot(&self, credentials: &[&str]) -> ProviderDiagnostic {
+        if let Some(diagnostic) = self.captured_diagnostic() {
+            use std::error::Error as _;
+            let mut diagnostic = diagnostic.clone();
+            diagnostic.phase = self.diagnostic_phase();
+            let mut context = Vec::new();
+            let mut source = self.source();
+            for _ in 0..8 {
+                let Some(cause) = source else { break };
+                if cause.is::<ProviderDiagnostic>() {
+                    break;
+                }
+                // Phase annotations are already retained as data. Other outer
+                // causes can identify the endpoint or operation that failed.
+                if !cause.is::<DiagnosticContext>() {
+                    context.push(bounded_display(cause));
+                }
+                source = cause.source();
+            }
+            if !context.is_empty() {
+                context.extend(diagnostic.reason.take());
+                diagnostic.reason = Some(context.join(": "));
+            }
+            return diagnostic.redacted(credentials);
+        }
+        ProviderDiagnostic {
+            phase: self.diagnostic_phase(),
+            status: match self {
+                Self::Transient { status, .. } | Self::Fatal { status, .. } => *status,
+                _ => None,
+            },
+            code: self.structured_code().map(str::to_owned),
+            request_id: None,
+            reason: Some(self.redacted_diagnostic(credentials)),
+        }
+        .redacted(credentials)
+    }
+
+    fn captured_diagnostic(&self) -> Option<&ProviderDiagnostic> {
         use std::error::Error as _;
         let mut source = self.source();
         for _ in 0..8 {
             let Some(cause) = source else { break };
-            if let Some(wire) = cause.downcast_ref::<HttpDiagnostic>() {
-                return serde_json::json!({
-                    "status":wire.status,"code":wire.code,
-                    "requestID":wire.request_id,"reason":wire.reason,
-                });
+            if let Some(diagnostic) = cause.downcast_ref::<ProviderDiagnostic>() {
+                return Some(diagnostic);
             }
             source = cause.source();
         }
-        let status = match self {
-            Self::Transient { status, .. } | Self::Fatal { status, .. } => *status,
-            _ => None,
-        };
-        let code = match self {
-            Self::Stream { code, .. } => Some(code.as_str()),
-            Self::Protocol { code, .. } => Some(code.as_str()),
-            _ => None,
-        };
-        serde_json::json!({
-            "status":status,"code":code,"requestID":null,"reason":self.diagnostic()
-        })
+        None
+    }
+
+    fn diagnostic_phase(&self) -> ProviderDiagnosticPhase {
+        use std::error::Error as _;
+        let mut source = self.source();
+        for _ in 0..8 {
+            let Some(cause) = source else { break };
+            if let Some(context) = cause.downcast_ref::<DiagnosticContext>() {
+                return context.phase;
+            }
+            if let Some(diagnostic) = cause.downcast_ref::<ProviderDiagnostic>() {
+                return diagnostic.phase;
+            }
+            source = cause.source();
+        }
+        ProviderDiagnosticPhase::Unknown
+    }
+
+    /// Record an actually observed client boundary without changing recovery.
+    ///
+    /// Capture typed transport/deadline facts before calling [`Self::redacted`].
+    /// The original typed source remains chained until redaction replaces it with
+    /// the owned, sanitized [`ProviderDiagnostic`]. Variants without a source
+    /// retain their existing representation. `Unknown` adds no observation and
+    /// does not replace a phase already captured by an inner boundary.
+    #[must_use]
+    pub fn with_diagnostic_phase(mut self, phase: ProviderDiagnosticPhase) -> Self {
+        if phase == ProviderDiagnosticPhase::Unknown {
+            return self;
+        }
+        match &mut self {
+            Self::Transient { source, .. }
+            | Self::Fatal { source, .. }
+            | Self::Auth { source, .. }
+            | Self::Stream { source, .. }
+            | Self::Protocol { source, .. } => {
+                if let Some(context) = source
+                    .as_mut()
+                    .and_then(|cause| cause.downcast_mut::<DiagnosticContext>())
+                {
+                    context.phase = phase;
+                } else if let Some(captured) = source
+                    .as_mut()
+                    .and_then(|cause| cause.downcast_mut::<ProviderDiagnostic>())
+                {
+                    captured.phase = phase;
+                } else {
+                    *source = Some(Box::new(DiagnosticContext {
+                        phase,
+                        source: source.take(),
+                    }));
+                }
+            }
+            _ => {}
+        }
+        self
     }
 
     /// Attach facts read from a bounded HTTP response without changing recovery.
@@ -263,20 +464,24 @@ impl ProviderError {
         reason: Option<&str>,
         credentials: &[&str],
     ) -> Self {
-        let clean = |text: &str, max: usize| {
-            let text = Self::sanitize_diagnostic(text, credentials);
-            text[..text.floor_char_boundary(text.len().min(max))].to_owned()
-        };
-        let detail = HttpDiagnostic {
-            status,
-            code: code.map(|text| clean(text, 192)),
-            request_id: request_id.map(|text| clean(text, 256)),
-            reason: reason.map(|text| clean(text, 3_072)),
-        };
+        let mut detail = self.redacted_snapshot(credentials);
+        detail.status = Some(status);
+        if let Some(code) = code {
+            detail.code = Some(code.to_owned());
+        }
+        if let Some(request_id) = request_id {
+            detail.request_id = Some(request_id.to_owned());
+        }
+        if let Some(reason) = reason {
+            detail.reason = Some(reason.to_owned());
+        }
+        let detail = detail.redacted(credentials);
         match &mut self {
             Self::Transient { source, .. }
             | Self::Fatal { source, .. }
-            | Self::Auth { source, .. } => {
+            | Self::Auth { source, .. }
+            | Self::Stream { source, .. }
+            | Self::Protocol { source, .. } => {
                 *source = Some(Box::new(detail));
             }
             Self::Refused { provider_text, .. } => {
@@ -290,35 +495,17 @@ impl ProviderError {
     /// Remove adapter-owned secrets before a transport failure crosses its boundary.
     #[must_use]
     pub fn redacted(mut self, credentials: &[&str]) -> Self {
+        // Inspect the bounded typed chain before dropping transport-owned data.
+        // Capturing only the immediate Display loses nested wire facts and causes.
+        let diagnostic = self.redacted_snapshot(credentials);
         match &mut self {
             Self::Transient { source, .. }
             | Self::Fatal { source, .. }
             | Self::Auth { source, .. }
             | Self::Stream { source, .. }
             | Self::Protocol { source, .. } => {
-                if let Some(cause) = source.take() {
-                    if let Some(wire) = cause.downcast_ref::<HttpDiagnostic>() {
-                        *source = Some(Box::new(HttpDiagnostic {
-                            status: wire.status,
-                            code: wire
-                                .code
-                                .as_deref()
-                                .map(|s| Self::sanitize_diagnostic(s, credentials)),
-                            request_id: wire
-                                .request_id
-                                .as_deref()
-                                .map(|s| Self::sanitize_diagnostic(s, credentials)),
-                            reason: wire
-                                .reason
-                                .as_deref()
-                                .map(|s| Self::sanitize_diagnostic(s, credentials)),
-                        }));
-                    } else {
-                        *source = Some(Box::new(DiagnosticText(Self::sanitize_diagnostic(
-                            &bounded_display(cause.as_ref()),
-                            credentials,
-                        ))));
-                    }
+                if source.is_some() {
+                    *source = Some(Box::new(diagnostic));
                 }
             }
             Self::Refused { provider_text, .. } => {
@@ -447,7 +634,13 @@ impl ProviderError {
 
     /// The exact structured provider code, when the wire contract supplied one.
     #[must_use]
-    pub const fn structured_code(&self) -> Option<&'static str> {
+    pub fn structured_code(&self) -> Option<&str> {
+        if let Some(code) = self
+            .captured_diagnostic()
+            .and_then(|wire| wire.code.as_deref())
+        {
+            return Some(code);
+        }
         match self {
             Self::Stream { code, .. } => Some(code.as_str()),
             Self::Protocol { code, .. } => Some(code.as_str()),
@@ -470,38 +663,22 @@ impl ProviderError {
 }
 
 #[derive(Debug)]
-struct HttpDiagnostic {
-    status: u16,
-    code: Option<String>,
-    request_id: Option<String>,
-    reason: Option<String>,
+struct DiagnosticContext {
+    phase: ProviderDiagnosticPhase,
+    source: Option<BoxSource>,
 }
 
-impl fmt::Display for HttpDiagnostic {
+impl fmt::Display for DiagnosticContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "HTTP {}", self.status)?;
-        if let Some(code) = &self.code {
-            write!(f, " code={code}")?;
-        }
-        if let Some(id) = &self.request_id {
-            write!(f, " requestID={id}")?;
-        }
-        if let Some(reason) = &self.reason {
-            write!(f, " reason={reason}")?;
-        }
-        Ok(())
+        write!(f, "phase={}", self.phase.as_str())
     }
 }
-impl std::error::Error for HttpDiagnostic {}
 
-#[derive(Debug)]
-struct DiagnosticText(String);
-impl fmt::Display for DiagnosticText {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+impl std::error::Error for DiagnosticContext {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_deref().map(|source| source as _)
     }
 }
-impl std::error::Error for DiagnosticText {}
 
 fn bounded_display(value: &(impl fmt::Display + ?Sized)) -> String {
     struct Bounded(String);
@@ -660,6 +837,240 @@ impl Recoverable for ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redaction_preserves_nested_wire_metadata_and_unknown_phase() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("adapter failed")]
+        struct AdapterFailure(#[source] ProviderError);
+
+        let secret = "nested-fixture-secret";
+        let wire = ProviderError::from_status("test", 503).with_http_diagnostic(
+            503,
+            Some("upstream_unavailable"),
+            Some("req-nested-7"),
+            Some(&format!("server unavailable; reflected {secret}")),
+            &[],
+        );
+        let error = ProviderError::transient(AdapterFailure(wire)).redacted(&[secret]);
+        assert!(error.is_retryable());
+        let fields = error.diagnostic_snapshot().fields();
+        assert_eq!(
+            fields["status"], 503,
+            "redaction must preserve HTTP facts inside the typed source chain"
+        );
+        assert_eq!(fields["code"], "upstream_unavailable");
+        assert_eq!(fields["requestID"], "req-nested-7");
+        assert_eq!(fields["phase"], "unknown");
+        assert!(
+            fields["reason"]
+                .as_str()
+                .unwrap()
+                .contains("server unavailable")
+        );
+        assert!(!fields.to_string().contains(secret));
+        assert!(!error.diagnostic().contains(secret));
+    }
+
+    #[test]
+    fn redaction_preserves_outer_endpoint_context_and_nested_phase() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("request to http://gateway.invalid/v1/responses failed; reflected fixture-secret")]
+        struct EndpointFailure(#[source] ProviderError);
+
+        let inner = ProviderError::from_status("test", 503)
+            .with_http_diagnostic(
+                503,
+                Some("service_unavailable"),
+                Some("req-endpoint-7"),
+                Some("backend unavailable"),
+                &[],
+            )
+            .with_diagnostic_phase(ProviderDiagnosticPhase::StreamIdle);
+        let error = ProviderError::transient(EndpointFailure(inner)).redacted(&["fixture-secret"]);
+        let fields = error.diagnostic_fields();
+        let reason = fields["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("http://gateway.invalid/v1/responses"),
+            "captured inner metadata must not discard the outer endpoint: {reason}"
+        );
+        assert!(reason.contains("backend unavailable"));
+        assert_eq!(fields["phase"], "stream_idle");
+        assert_eq!(fields["status"], 503);
+        assert_eq!(fields["code"], "service_unavailable");
+        assert_eq!(fields["requestID"], "req-endpoint-7");
+        assert!(!error.diagnostic().contains("fixture-secret"));
+        assert!(reason.len() <= 3_072);
+        assert_eq!(
+            error.redacted(&["fixture-secret"]).diagnostic_fields(),
+            fields
+        );
+    }
+
+    #[test]
+    fn unknown_phase_does_not_erase_a_captured_observation() {
+        let error = ProviderError::transient(std::io::Error::other("local stream wait expired"))
+            .with_diagnostic_phase(ProviderDiagnosticPhase::StreamIdle)
+            .redacted(&[])
+            .with_diagnostic_phase(ProviderDiagnosticPhase::Unknown);
+        assert_eq!(
+            error.diagnostic_snapshot().phase(),
+            ProviderDiagnosticPhase::StreamIdle,
+            "an outer boundary without phase evidence must retain the captured phase"
+        );
+    }
+
+    #[test]
+    fn redaction_preserves_bounded_nested_cause_text_without_inventing_a_phase() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("transport failed")]
+        struct TransportFailure(#[source] std::io::Error);
+
+        let error = ProviderError::transient(TransportFailure(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset; upstream_stream_idle_timeout; password=fixture-secret",
+        )))
+        .redacted(&["fixture-secret"]);
+        let fields = error.diagnostic_fields();
+        assert!(
+            fields["reason"]
+                .as_str()
+                .unwrap()
+                .contains("connection reset"),
+            "the actual cause must survive redaction of its outer wrapper"
+        );
+        assert_eq!(fields["phase"], "unknown");
+        assert!(fields["status"].is_null());
+        assert!(!fields.to_string().contains("fixture-secret"));
+    }
+
+    #[test]
+    fn phase_annotation_preserves_the_typed_source_until_redaction() {
+        use std::error::Error as _;
+
+        let error = ProviderError::transient(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset; reflected fixture-secret",
+        ))
+        .with_diagnostic_phase(ProviderDiagnosticPhase::ResponseHeaders);
+        let original = error
+            .source()
+            .and_then(std::error::Error::source)
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .expect("annotation must preserve the original typed cause");
+        assert_eq!(original.kind(), std::io::ErrorKind::ConnectionReset);
+
+        let snapshot = {
+            let redacted = error.redacted(&["fixture-secret"]);
+            assert_eq!(redacted.recovery(), Recovery::Retry { after: None });
+            let source = redacted.source().unwrap();
+            let diagnostic = source
+                .downcast_ref::<ProviderDiagnostic>()
+                .expect("redaction retains owned diagnostic data as a typed cause");
+            assert_eq!(diagnostic.phase(), ProviderDiagnosticPhase::ResponseHeaders);
+            assert!(
+                source.source().is_none(),
+                "raw transport data must be dropped"
+            );
+            redacted.diagnostic_snapshot()
+        };
+        assert_eq!(snapshot.fields()["phase"], "response_headers");
+        assert!(snapshot.fields()["status"].is_null());
+        assert!(snapshot.to_string().contains("connection reset"));
+        assert!(!snapshot.to_string().contains("fixture-secret"));
+    }
+
+    #[test]
+    fn phase_and_wire_facts_survive_attachment_order_and_repeated_redaction() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("adapter failed")]
+        struct AdapterFailure(#[source] ProviderError);
+
+        let phase = ProviderDiagnosticPhase::RequestBudget;
+        let attach_wire = |error: ProviderError| {
+            error.with_http_diagnostic(
+                503,
+                Some("service_unavailable"),
+                Some("req-order-7"),
+                Some("unavailable; reflected fixture-secret"),
+                &["fixture-secret"],
+            )
+        };
+        let wire_first =
+            attach_wire(ProviderError::from_status("test", 503)).with_diagnostic_phase(phase);
+        let phase_first =
+            attach_wire(ProviderError::from_status("test", 503).with_diagnostic_phase(phase));
+        let mut expected = wire_first.diagnostic_fields();
+        assert_eq!(phase_first.diagnostic_fields(), expected);
+        expected["reason"] = serde_json::json!(
+            "adapter failed: transient provider failure (status=Some(503)): unavailable; reflected <redacted>"
+        );
+        let nested = ProviderError::transient(AdapterFailure(phase_first))
+            .redacted(&["fixture-secret"])
+            .redacted(&["fixture-secret"]);
+        assert_eq!(nested.diagnostic_fields(), expected);
+        assert_eq!(expected["phase"], "request_budget");
+        assert_eq!(expected["status"], 503);
+        assert_eq!(expected["code"], "service_unavailable");
+        assert_eq!(expected["requestID"], "req-order-7");
+        assert!(!expected.to_string().contains("fixture-secret"));
+    }
+
+    #[test]
+    fn phase_capture_scrubs_complete_credentials_before_clipping_the_cause() {
+        let secret = "boundary-secret-that-must-not-be-partially-retained";
+        for padding in (2_940..3_080).step_by(7) {
+            let cause = format!("{} {secret} {}", "中".repeat(padding / 3), "z".repeat(300));
+            let error = ProviderError::transient(std::io::Error::other(cause))
+                .with_diagnostic_phase(ProviderDiagnosticPhase::StreamIdle)
+                .redacted(&[secret]);
+            let fields = error.diagnostic_fields();
+            let reason = fields["reason"].as_str().unwrap();
+            assert!(reason.len() <= 3_072);
+            assert!(!reason.contains("boundary-secret"), "{padding}: {reason}");
+            assert_eq!(fields["phase"], "stream_idle");
+        }
+    }
+
+    #[test]
+    fn owned_http_diagnostic_retains_dynamic_metadata_and_recovery_class() {
+        let snapshot = {
+            let code = String::from("reasoning_replay_account_unavailable");
+            let error = ProviderError::from_status("test", 503).with_http_diagnostic(
+                503,
+                Some(&code),
+                Some("upstream-request-7"),
+                Some("Temporarily unavailable"),
+                &[],
+            );
+            assert!(error.is_retryable());
+            assert_eq!(error.structured_code(), Some(code.as_str()));
+            error.diagnostic_snapshot()
+        };
+        assert_eq!(snapshot.status(), Some(503));
+        assert_eq!(
+            snapshot.code(),
+            Some("reasoning_replay_account_unavailable")
+        );
+        assert_eq!(snapshot.fields()["requestID"], "upstream-request-7");
+        assert!(snapshot.to_string().contains("HTTP 503"));
+        assert!(snapshot.to_string().contains("Temporarily unavailable"));
+    }
+
+    #[test]
+    fn owned_diagnostic_stays_bounded_and_redacted_after_source_drop() {
+        let secret = "private-fixture-key";
+        let large = format!("{secret}\n\u{1b}[31m{}", "中".repeat(3000));
+        let snapshot = ProviderError::from_status("test", 503)
+            .with_http_diagnostic(503, Some(&large), Some(&large), Some(&large), &[secret])
+            .diagnostic_snapshot();
+        let fields = snapshot.fields();
+        assert!(fields["code"].as_str().unwrap().len() <= 192);
+        assert!(fields["requestID"].as_str().unwrap().len() <= 256);
+        assert!(fields["reason"].as_str().unwrap().len() <= 3072);
+        assert!(!fields.to_string().contains(secret));
+        assert!(!snapshot.to_string().chars().any(char::is_control));
+    }
 
     #[test]
     fn rate_limited_returns_the_duration_the_provider_sent() {

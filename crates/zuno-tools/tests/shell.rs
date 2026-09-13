@@ -2222,3 +2222,19 @@ async fn a_command_that_wrote_before_failing_still_reports_the_write() {
         "the file the command created before failing was not reported"
     );
 }
+#[test]
+fn remote_observer_purpose_does_not_select_background_mode() {
+    let params: zuno_tools::shell::ShellParams = serde_json::from_value(serde_json::json!({
+        "command": "echo synthetic",
+        "backgroundPurpose": "remoteObserver"
+    }))
+    .expect("purpose is independent of execution mode");
+    assert!(!params.background);
+    let explicit: zuno_tools::shell::ShellParams = serde_json::from_value(serde_json::json!({
+        "command": "echo synthetic",
+        "backgroundPurpose": "remoteObserver",
+        "background": true
+    }))
+    .expect("explicit background remains supported");
+    assert!(explicit.background);
+}

@@ -356,10 +356,11 @@ async fn advance_with_services(
             input.created_at_ms,
         )
         .map_err(|_| WorkerError::Configuration)?;
-        state
+        let consumed = state
             .consume_input(
                 &scope,
                 InputMaterialization {
+                    live: None,
                     input_id: Some(input.id.to_string()),
                     turn_id: Some(execution.job.turn_id.to_string()),
                     message,
@@ -368,6 +369,11 @@ async fn advance_with_services(
             )
             .await
             .map_err(|error| WorkerError::Advance(AdvanceError::Turn(error)))?;
+        if !consumed {
+            return Err(WorkerError::Advance(AdvanceError::Turn(
+                zuno_engine::state::TurnStateError::Conflict.into(),
+            )));
+        }
     }
     let mut run = RunTurnRequest::new(
         execution.job.session_id.to_string(),

@@ -1,0 +1,45 @@
+{
+  "adkGo": {
+    "repository": "google/adk-go",
+    "tag": "v2.4.0",
+    "sha": "4e57df40cbd35f055ba654b03ffb0e509fdd754a"
+  },
+  "docs": {
+    "llms.txt": {
+      "sha256": "6977601874da972fb481a85c3b04cd5229f2e5bd3a9db67a3aae691a25d877ca",
+      "url": "https://adk.dev/llms.txt"
+    },
+    "runtime_event-loop_index.md": {
+      "sha256": "12e24cb106fe94f362c85a34efb38424e8e35923d2b45fdca715398871a683ee",
+      "url": "https://adk.dev/runtime/event-loop/index.md"
+    },
+    "runtime_resume_index.md": {
+      "sha256": "aac77d934a5ce8c4043906ae46782510d51f287084afaddca308fc5edb093c60",
+      "url": "https://adk.dev/runtime/resume/index.md"
+    },
+    "sessions_state_index.md": {
+      "sha256": "f4f21d05a4d872caa26319fe562af812fbd1a8c85d8243db666f342bd1a22699",
+      "url": "https://adk.dev/sessions/state/index.md"
+    },
+    "sessions_memory_index.md": {
+      "sha256": "3ee5f1d089fd798ac44b35648b42a3c20823ec5dc46008c0b9e44fbc80ed5f1a",
+      "url": "https://adk.dev/sessions/memory/index.md"
+    },
+    "events_index.md": {
+      "sha256": "a94e0f7a8bf73171a8529edadcc6075c095041234aa94f33b2dfecb5acf040d3",
+      "url": "https://adk.dev/events/index.md"
+    },
+    "artifacts_index.md": {
+      "sha256": "4b1fcaac1cbab1d27820ed9fa775f6d5243973ed026a81042717a71307a0d78b",
+      "url": "https://adk.dev/artifacts/index.md"
+    },
+    "context_compaction_index.md": {
+      "sha256": "fda4d5b446f929217b8100c8bdf4bdf3b1b63d82e06720d51426eaee7a0c8bbd",
+      "url": "https://adk.dev/context/compaction/index.md"
+    },
+    "graphs_human-input_index.md": {
+      "sha256": "7d06e4c9a8db460be9d44bfa24e853d62ac467abd6a49ce667cf320b568fa457",
+      "url": "https://adk.dev/graphs/human-input/index.md"
+    }
+  }
+}

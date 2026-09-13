@@ -26,11 +26,11 @@ Format:
 - Every initial-content line in an Add File section must start with `+`.
 >>>
 
-## shell | crates/zuno-tools/src/description/shell.txt | 5389 bytes | trailing-newline: yes
+## shell | crates/zuno-tools/src/description/shell.txt | 5804 bytes | trailing-newline: yes
 <<<
 Executes a command with the configured shell. Commands are parsed with tree-sitter before execution so each constituent command is permission-checked independently. A deterministic destructive-command gate runs before every foreground or background spawn. Under approval-bearing permission modes, confirmable operations such as replacing an existing redirect target require fresh human approval; `allow_all` skips that ask, while catastrophic targets remain hard-denied in every mode. Local Git history rewrites (`commit --amend`, a new `rebase`, or forced tag movement) additionally require `expectedGitHead` containing the exact full object id returned by an immediately preceding `git rev-parse HEAD`; execution fails before spawning if HEAD changed. Select that repository with `workdir`: repository-changing Git global options or environment variables are refused for a rewrite. Published history may only be rewritten with an explicit atomic lease such as `--force-with-lease=refs/heads/main:<expected-full-oid>`; bare `--force`, an implicit lease, and `+` refspecs are refused. Creating a new static file in the OS temp directory does not require approval. For one-off scripts, prefer interpreter stdin such as `python3 - <<'PY'` over fixed `/tmp` filenames. Set `backgroundPurpose: "remoteObserver"` when a command only watches work owned by a remote system, such as a CI run or release. Its terminal process state is a durable wake signal, not proof that the remote work succeeded; after wake, inspect output and re-query the authoritative remote state by stable identifier. A pipeline's exit code is meaningless unless pipefail is in effect: `cargo test | tail -5` exits zero when the tests fail, because only `tail` decides it. `exitPolicy` defaults to `"pipefail"`, so a failure at any stage of a pipeline is the command's failure; `exitPolicy: "all"` also stops at the first failing command in a sequence, and `exitPolicy: "last"` is the way to run a command that is meant to tolerate a failing stage. Every result carries a verification receipt stating whether its exit status covers the whole command; PowerShell has no pipefail equivalent, so only `"all"` is authoritative there. The receipt is downgraded to derived when the command's own text takes the guarantee back: `|| true` or any fallback that cannot fail, `set +e` or `set +o pipefail`, a script handed to an inner `bash -c` or heredoc, and under `"pipefail"` a sequence of statements where only the last one decides the status. Only an authoritative receipt can close a goal success criterion, so run one command, chain with `&&`, or pass `exitPolicy: "all"` when the status has to mean something. Every result reports requested and effective sandbox authority, backend, network policy, resolution kind, and any fallback reason. `read-only` and `workspace-write` require a proved OS confinement backend and fail closed by default. A trusted `sandbox.onUnavailable: "run-unconfined"` policy may run a `workspace-write` request with host authority only for a typed platform, launcher-absence, or namespace-availability failure; it never applies to read-only Agents, untrusted launchers, invalid policy or paths, helper/internal failures, or command execution errors. This fallback preserves the configured permission mode, explicit denies, catastrophic-command refusals, background lifecycle, timeout, and cancellation, but requested filesystem and network restrictions are not OS-enforced. `danger-full-access` is a separate explicit trusted choice that skips restricted-backend discovery and runs as the Zuno user with host filesystem, process, credential, and network access. Explicit permission denies, history-rewrite guards, and catastrophic Shell denials remain terminal. Use workdir instead of changing directories inside the command.
 
-With `background: false` (the default), an attention deadline yields a resumable foreground handle. The same command, task ID, original work cycle, hard ceiling, sandbox authority and cancellation contract remain in effect. Serial critical-path waits, including CI needed by the current step, stay foreground: continue the SAME task ID with `bg` wait/output and do not create another observer agent or rerun the command. Each observation is bounded to 60 seconds; an observation timeout is not command completion. Keep polling bounded and honor steering or interruption between waits. Only explicit `background: true` detaches work and enables its normal completion callback. A foreground handle never schedules that callback. A remoteObserver exit in either mode still requires an authoritative remote-state recheck by stable identifier. A lost process or handle leaves an uncertain outcome; inspect authoritative state before any replay of side effects.
+With `background: false` (the default), an attention deadline yields a resumable foreground handle. If waiting is the only useful next action, stay foreground; expected duration or task count alone is not a reason to detach. `backgroundPurpose: "remoteObserver"` describes purpose in either mode and does not require `background: true`. The same command, task ID, original work cycle, hard ceiling, sandbox authority and cancellation contract remain in effect. Serial critical-path waits, including CI needed by the current step, stay foreground: continue the SAME task ID with `bg` wait/output and do not create another observer agent or rerun the command. Each observation is bounded to 60 seconds; an observation timeout is not command completion. Keep polling bounded and honor steering or interruption between waits. Only explicit `background: true` detaches work and enables its normal completion callback; use it only for an explicit parallel split, after identifying the independent work you will do locally while it runs. Do not background the sole task and finalize while it runs. A foreground handle never schedules that callback. A remoteObserver exit in either mode still requires an authoritative remote-state recheck by stable identifier. A lost process or handle leaves an uncertain outcome; inspect authoritative state before any replay of side effects.
 
 For source changes, prefer native `apply_patch` or structured `edit`, which validate current file bytes or context and report a structured diff. Use `git apply` only for an already-supplied standard unified diff whose provenance and paths you understand: read every affected existing file, run `git apply --check`, and apply it only when that preflight succeeds. Git is not a stale-read or rollback authority. If the check or apply fails, stop, re-read current files, and use a smaller native patch/edit. Do not automatically add `--3way` or `--reject`; never recover with `git reset --hard` or `git checkout --`.
 >>>
@@ -40,9 +40,11 @@ For source changes, prefer native `apply_patch` or structured `edit`, which vali
 Run tools in parallel with optional result binding.
 >>>
 
-## goal_propose | crates/zuno-goal/src/description/create-goal.txt | 927 bytes | trailing-newline: yes
+## goal_propose | crates/zuno-goal/src/description/create-goal.txt | 1261 bytes | trailing-newline: yes
 <<<
 Create a durable goal only when explicitly requested by the user or higher-priority instructions. Do not infer a goal from ordinary work. Preserve the requested objective without narrowing it. success_criteria is required: name at least one concrete check that decides whether the objective is met, stated as the check itself rather than as the outcome you hope for. Blank entries are not criteria, and the list is immutable to the model after creation, so a proposal with nothing to check is refused rather than accepted as a question. The result assigns each criterion a short id, such as c1, to cite later. Completing the goal closes every criterion you recorded: name each one in goal_update, either with the receipt id printed by the tool result that verified it or with the reason it will not be verified. An unfinished goal cannot be replaced. Set token_budget only when the user explicitly requested a positive budget.
+
+Creation requires the immutable host context for the current cycle and actual engine turn. The Goal, its criteria, cycle ownership and turn binding commit together, so the same turn can subsequently use goal_update. An old, stopped or already-settled turn cannot create a Goal; creation never resumes or replaces an unfinished Goal.
 >>>
 
 ## edit | crates/zuno-tools/src/description/edit.txt | 1411 bytes | trailing-newline: yes
@@ -153,13 +155,12 @@ Maintain durable memory: remember a stable fact, correct an outdated entry, or r
 Request the user's explicit approval to start implementing the current durable Plan. The host shows the exact Plan revision, Work Agent/model, and review status. This tool returns immediately so you can finish the planning summary; it does not change mode or authorize Work. Only a real explicit approval and successful source-turn handoff may start Work. Empty answers, deferral, cancellation, prose, and automatic callbacks never approve a Plan.
 >>>
 
-## question | crates/zuno-tools/src/description/question.txt | 1403 bytes | trailing-newline: yes
+## question | crates/zuno-tools/src/description/question.txt | 1391 bytes | trailing-newline: yes
 <<<
-Ask for a material user decision that cannot be discovered from available evidence.
-In Plan this is a clarification. In ordinary Work this registers required human input
-and suspends automatic execution until the exact request is answered.
-For an optional question that should not delay independent work or your final summary,
-use question_async instead.
+Ask a structured Plan clarification that cannot be discovered from available evidence.
+This Plan question waits for the first response. Choosing Defer releases the tool's
+wait without supplying an answer or authorizing Work. Use question_async for optional
+clarification while continuing independent planning.
 
 Usage notes:
 - Ask only when the answer materially changes the outcome and cannot be discovered from available evidence
@@ -170,14 +171,47 @@ Usage notes:
 - If you recommend a specific option, make that the first option in the list and add "(Recommended)" at the end of the label
 - The request persists independently of this tool call; the user may answer later or choose Defer
 - Tool results are receipts. Actual answers arrive through the durable session inbox once
-- A partial or empty answer leaves the unanswered items pending and is never approval
+- A partial or empty answer leaves the unanswered items pending; skipping, a saved draft, or silence is never approval
 - Cancellation is a refusal, not an answer; do not fabricate a selection
 - To request authorization of an exact Plan for Work, use plan_exit, not a generic question
 >>>
 
-## question_async | crates/zuno-tools/src/description/question-async.txt | 351 bytes | trailing-newline: yes
+## question | crates/zuno-tools/src/description/question-work.txt | 1256 bytes | trailing-newline: yes
 <<<
-Ask optional clarifying questions without waiting or ending the turn. The question is durable and the user's reply arrives later as new input. Continue independent work and state any assumptions; an unanswered question is not consent. Use question when required input prevents further work, and plan_exit only for explicit Plan-to-Work authorization.
+Ask an optional clarification during Work or active Goal execution when the answer
+materially improves the outcome and cannot be discovered from available evidence.
+The question is durable and this tool returns a receipt immediately, without waiting
+for a human or pausing Work/Goal execution. Continue independent work and state any
+assumptions; the user may answer later or skip the question.
+
+Usage notes:
+- Prefer one concise question and ask no more than three at once
+- Provide 2-3 mutually exclusive options; set `multiple: true` only when combinations are meaningful
+- Put a recommended option first and suffix its label with "(Recommended)"
+- A "Type your own answer" option is added automatically; do not include "Other" or catch-all options
+- Tool results are receipts. Actual answers arrive through the durable session inbox once
+- Skipping, deferring, saved drafts, partial or empty answers, cancellation, and silence never authorize an action
+- Do not repeat a question solely because it was skipped; continue within existing authorization using available evidence and stated assumptions
+- Use goal_request_input for required Goal input, bound to the observed Goal revision
+- Use plan_exit to request authorization of the exact Plan for Work
+>>>
+
+## question | crates/zuno-tools/src/description/question-required.txt | 621 bytes | trailing-newline: yes
+<<<
+Request explicit required human input through the host's required-input control.
+This question waits for the first response and keeps execution waiting until all
+required items have real answers. Defer, a partial or empty answer, a saved draft,
+cancellation, expiry, and delivery failure do not satisfy the required-input gate.
+
+Tool results are receipts. Actual answers enter the durable session inbox once.
+Do not infer an answer or authorization from a missing response. Goal-owned required
+input must use goal_request_input with the observed Goal revision. Use plan_exit
+for authorization of the exact Plan for Work.
+>>>
+
+## question_async | crates/zuno-tools/src/description/question-async.txt | 438 bytes | trailing-newline: yes
+<<<
+Ask optional clarifying questions without waiting or ending the turn. The question is durable and the user's reply arrives later as new input. Continue independent work and state any assumptions; skipping or leaving a question unanswered is never consent. In Work and Goal, question also returns immediately for optional clarification. Use goal_request_input for required Goal input and plan_exit for explicit Plan-to-Work authorization.
 >>>
 
 ## read | crates/zuno-tools/src/description/read.txt | 1083 bytes | trailing-newline: no
@@ -226,13 +260,27 @@ Use action `load` with the selected `name` and any advertised `source`. Follow `
 Use action `read_resource` with the same `name` and `source`, a relative `path` such as `references/ci.md`, and any returned continuation cursor. Do not use shell, find, glob, or broad filesystem scans to rediscover an advertised skill or locate its referenced files.
 >>>
 
-## task | crates/zuno-tools/src/description/task.txt | 1244 bytes | trailing-newline: yes
+## task | crates/zuno-tools/src/description/task.txt | 2525 bytes | trailing-newline: yes
 <<<
 Delegate a self-contained unit of work to the named child `agent` in its own session.
-Provide the required typed contract: `objective`, `deliverable`, `instructions`, and `success_evidence`. Use `scope.include`/`scope.exclude`, `constraints.must`/`constraints.must_not`, and `dependencies` when they materially bound or enable the work.
+Every call requires five non-empty top-level strings: `agent`, `objective`, `deliverable`, `instructions`, and `success_evidence`. This also applies when continuing with `task_id`.
+`intent` is an optional UI label, not the child's objective, and never replaces `objective`. Do not nest the fields under `contract` or use legacy `prompt`, `description`, `subagent_type`, or `load_skills` arguments.
+
+Minimal valid example:
+```json
+{
+  "agent": "explorer",
+  "objective": "Locate the tool argument validation boundary",
+  "deliverable": "A short report with file and symbol references",
+  "instructions": "Trace argument validation without editing files",
+  "success_evidence": "Identify the validation entry point and a matching test"
+}
+```
+Choose `agent` from the currently available delegation targets; keep the same five-field shape for other agents. On validation failure, correct the named arguments using the current schema; do not repeat the unchanged call or invent missing outcomes.
+Use `scope.include`/`scope.exclude`, `constraints.must`/`constraints.must_not`, and `dependencies` when they materially bound or enable the work.
 The child model, reasoning, MCP, Skill configuration, and sandbox inherit from the parent composition and are narrowed by the selected Agent's policy.
 The parent retains integration decisions and final verification. Do not duplicate the delegated work in the parent.
-Foreground is the default and blocks until the child answers; `background: true` returns immediately with a fresh job id.
+Foreground is the default and waits until the child answers. If waiting for that result is the only useful next action, stay foreground; do not detach just to end the parent turn. Use `background: true` only for an explicit parallel split: identify the independent local work you will do while the child runs, then do that work. It returns immediately with a fresh job id, not a completed result. Do not background the sole task and finalize while it runs; keep critical-path work local or use foreground delegation.
 Background jobs default to `reportDelivery: "nextStep"`, which adds the terminal report to the parent's next step and wakes it. Use `"quiet"` only when the persisted job result will be inspected separately.
 Pass `task_id` from a previous call to continue that same child session instead of starting a fresh one.
 Skills are not task arguments; the child can load only skills exposed by its effective Agent capabilities.
@@ -246,7 +294,7 @@ Returns null when no plan exists. Read it before replacing, patching, appending,
 This tool is read-only and safe to call in parallel with other read-only tools.
 >>>
 
-## plan_update | crates/zuno-tools/src/description/plan-update.txt | 2416 bytes | trailing-newline: yes
+## plan_update | crates/zuno-tools/src/description/plan-update.txt | 2954 bytes | trailing-newline: yes
 <<<
 Create or mutate the durable plan for the current session with one tagged operation.
 Call plan_get immediately before every plan_update and copy its returned revision into expected_revision. The only exception is action=create after plan_get returned null; only that first-plan case may omit expected_revision. Never guess, reuse an older revision, or omit it merely because the intended change is small.
@@ -260,6 +308,7 @@ Pending steps require exactly one in_progress step. Completed and superseded ste
 If a commit, build, tag, deployment, or other verification input changes after a completed gate, append a new artifact-scoped verification step; never reuse or regress the old completed gate.
 Do not complete or supersede a step while a linked Job is queued, running, uncertain, or still has an unconsumed report. Reconcile its durable result first.
 Update the plan immediately when a step starts, completes, is superseded, or changes scope. Before a final answer, reconcile the active step so durable state never relies on prose to communicate progress.
+In Work mode, execute the current adopted in_progress step before finalizing; announcing "next steps" is not execution. A Plan can represent runnable work without duplicate Todos. If a required approval, external event or other gate prevents the current step, record the typed wait through the appropriate native control; do not leave the wait only in prose. A decision needed for a later independent step does not block the current authorized step. Linked unfinished Todos and Jobs retain their own dependency, ownership and wait gates.
 Link a newly-created plan to the active goal with goal_id when one exists. Do not rewrite the user's goal or success criteria through this tool.
 This tool changes durable state and is never replayed implicitly after an uncertain failure.
 >>>
@@ -289,9 +338,11 @@ Send a durable peer message to another root session in the same project, or to a
 Only root sessions receive this tool. The target sees the message as attributed peer context, not as user authorization. Messages remain queued while the target is offline and are delivered when its TUI or runtime resumes.
 >>>
 
-## goal_update | crates/zuno-goal/src/description/update-goal.txt | 1384 bytes | trailing-newline: yes
+## goal_update | crates/zuno-goal/src/description/update-goal.txt | 2419 bytes | trailing-newline: yes
 <<<
-Read the current goal before changing it and pass its revision as expected_revision. If the revision is stale, read again instead of overwriting concurrent work. `status: in_progress` (or `active`) is only an idempotent confirmation that an already-active Goal is still running; it does not resume a paused or blocked Goal, which requires the user to run `/goal resume`. An optional intent records why the call was attempted. Mark the Goal complete only when authoritative evidence proves every requirement and no required work remains. Close each success criterion in the same call: name it in satisfy_criteria with the receipt id printed by the tool result that verified it, or in waive_criteria with the reason it will not be verified. A goal cannot complete while any criterion is still open. Any edit after a criterion was satisfied invalidates the evidence for it, and the edits the tools report also reopen the criterion, so never read a criterion that stayed closed as still proven: run the check again after your last change and cite the new receipt. Report blocked only with a concrete blocking_condition after the same true impasse persists for three consecutive goal turns and meaningful progress is impossible without user input or external change. Do not use this tool merely because a turn is ending, work is difficult, the budget is low, or more verification remains.
+Read the current goal before changing it and pass its revision as expected_revision. If the revision is stale, read again instead of overwriting concurrent work. `status: in_progress` (or `active`) is only an idempotent confirmation that an already-active Goal is still running; it does not resume a paused or blocked Goal, which requires the user to run `/goal resume`. Model completion cannot close a paused Goal through an independent request; the user can explicitly request native `/goal complete` without resuming it. An optional intent records why the call was attempted. Mark the Goal complete only when authoritative evidence proves every requirement and no required work remains. A user-created Goal with an empty declaration and empty criterion ledger has no implicit checklist, even after changing files; ownership, unfinished work, capability and safety checks still apply. For a declared checklist, close each success criterion in the same call: name it in satisfy_criteria with the receipt id printed by the tool result that verified it, or in waive_criteria with the reason it will not be verified. A goal cannot complete while any declared criterion is still open, and a missing or inconsistent ledger is a contract error. Any edit after a criterion was satisfied invalidates the evidence for it, and the edits the tools report also reopen the criterion, so never read a criterion that stayed closed as still proven: run the check again after your last change and cite the new receipt. Report blocked with a concrete blocking_condition as soon as a true impasse prevents meaningful progress. This stages an observation; the returned Goal remains in its actual state. The host counts completed Goal turns and applies blocked after three matching turns. Do not count three turns yourself before reporting. Repeated calls within one turn do not increase the count; progress or a different condition resets it. Do not use this tool merely because a turn is ending, work is difficult, the budget is low, or more verification remains.
+
+Completion also requires the current native Goal/cycle/actual-turn binding and immutable host snapshot. A fresh expected_revision does not grant authority over an old or unowned Goal, including a blocked Goal left behind by an independent request. Scope checks, criterion changes and completion are atomic; a stale turn cannot waive criteria or complete a different Goal.
 >>>
 
 ## capability_claim | crates/zuno-goal/src/description/capability-claim.txt | 1212 bytes | trailing-newline: yes

@@ -86,6 +86,17 @@ async fn assert_no_questions(fixture: &QuestionFixture) {
     assert!(pending.is_empty(), "{pending:?}");
 }
 
+#[track_caller]
+fn assert_durable_question_eq(actual: &QuestionView, expected: &QuestionView) {
+    // Delivery is a read-time projection, not part of the persisted form. A
+    // fresh read may advance it beyond the snapshot carried by an older receipt.
+    let mut actual = actual.clone();
+    let mut expected = expected.clone();
+    actual.delivery = None;
+    expected.delivery = None;
+    assert_eq!(actual, expected);
+}
+
 fn assert_receipt(output: &ToolOutput, view: &QuestionView, status: QuestionResultStatus) {
     assert_eq!(request_id(output), view.id);
     assert_eq!(output.metadata["questionStatus"], status.as_str());
@@ -140,6 +151,7 @@ impl InterruptHandle for TestInterrupt {
 async fn async_publication_is_durable_without_waiting_answering_or_stopping_the_turn() {
     let fixture = QuestionFixture::new();
     let tool = erase(QuestionTool::asynchronous(fixture.shared_port()));
+    assert_eq!(tool.id(), "question_async");
     let output = tool
         .invoke(one_question(), context("call_async"))
         .await
@@ -168,6 +180,185 @@ async fn async_publication_is_durable_without_waiting_answering_or_stopping_the_
     assert_eq!(published[0].purpose, QuestionPurpose::Clarification);
     assert_eq!(published[0].mode, QuestionMode::Deferred);
     assert_eq!(published[0].plan, None);
+}
+
+#[tokio::test]
+async fn work_publication_keeps_question_id_without_waiting_or_registering_required_input() {
+    let fixture = QuestionFixture::new();
+    fixture.port.bind_required_goal("goal_optional", 3);
+    let execution = SessionExecutionStore::new(fixture.pool());
+    let before = execution
+        .seed(
+            SESSION_ID,
+            CollaborationMode::Work,
+            Some(plan_binding().work_identity),
+            10,
+        )
+        .expect("Work execution state");
+    let tool = erase(QuestionTool::for_work(fixture.shared_port()));
+    assert_eq!(tool.id(), "question");
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        tool.invoke(one_question(), context("call_work")),
+    )
+    .await
+    .expect("optional clarification must return without a human response")
+    .expect("publication receipt");
+    let view = fixture
+        .reopen()
+        .get(SESSION_ID, request_id(&output))
+        .await
+        .expect("durable Work clarification");
+    assert_receipt(&output, &view, QuestionResultStatus::Pending);
+    assert_eq!(view.mode, QuestionMode::Deferred);
+    assert_eq!(view.purpose, QuestionPurpose::Clarification);
+    assert_eq!(view.origin.goal_id, None);
+    assert_eq!(view.plan, None);
+    assert_eq!(view.decision, None);
+    assert_eq!(view.authorization, None);
+    assert!(view.answers.is_empty());
+    assert_eq!(output.continuation, ToolContinuation::Continue);
+    assert_eq!(fixture.port.wait_count(), 0);
+    assert_eq!(execution.get(SESSION_ID).expect("execution"), Some(before));
+    assert_no_inputs(&fixture);
+    let published = fixture.port.opened();
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].mode, QuestionMode::Deferred);
+    assert_eq!(published[0].purpose, QuestionPurpose::Clarification);
+    assert_eq!(published[0].expected_goal_revision, None);
+}
+
+#[tokio::test]
+async fn skipping_work_clarification_keeps_it_optional_and_a_late_answer_arrives_once() {
+    for action in [
+        QuestionAction::Defer {
+            draft_answers: QuestionAnswers::new(),
+        },
+        QuestionAction::Answer {
+            answers: QuestionAnswers::new(),
+        },
+    ] {
+        let fixture = QuestionFixture::new();
+        let execution = SessionExecutionStore::new(fixture.pool());
+        let before = execution
+            .seed(
+                SESSION_ID,
+                CollaborationMode::Work,
+                Some(plan_binding().work_identity),
+                10,
+            )
+            .expect("Work execution state");
+        let tool = erase(QuestionTool::for_work(fixture.shared_port()));
+        let output = tool
+            .invoke(one_question(), context("call_work_skip"))
+            .await
+            .expect("publish optional clarification");
+        let opened = fixture
+            .port
+            .get(SESSION_ID, request_id(&output))
+            .await
+            .expect("pending clarification");
+        let skipped = fixture
+            .port
+            .apply(SESSION_ID, &opened.id, command("skip", &opened, action))
+            .await
+            .expect("skip without answering");
+        let receipt = tool
+            .invoke(one_question(), context("call_work_skip"))
+            .await
+            .expect("recover the skipped receipt");
+        assert_receipt(&receipt, &skipped.question, QuestionResultStatus::Deferred);
+        assert_eq!(receipt.continuation, ToolContinuation::Continue);
+        assert_eq!(skipped.input_id, None);
+        assert_eq!(skipped.question.state, QuestionState::Pending);
+        assert!(skipped.question.answers.is_empty());
+        assert_eq!(skipped.question.decision, None);
+        assert_eq!(skipped.question.authorization, None);
+        assert_eq!(
+            execution.get(SESSION_ID).expect("execution"),
+            Some(before.clone())
+        );
+        assert_no_inputs(&fixture);
+
+        let reopened = fixture.reopen();
+        let reply = command(
+            "late_work_answer",
+            &skipped.question,
+            answer(&skipped.question, 0, PRIVATE_ANSWER),
+        );
+        let answered = reopened
+            .apply(SESSION_ID, &opened.id, reply.clone())
+            .await
+            .expect("answer after the optional tool has returned");
+        let duplicate = reopened
+            .apply(SESSION_ID, &opened.id, reply)
+            .await
+            .expect("idempotent retry");
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.input_id, answered.input_id);
+        let receipt = tool
+            .invoke(one_question(), context("call_work_skip"))
+            .await
+            .expect("recover the answered receipt");
+        assert_receipt(&receipt, &answered.question, QuestionResultStatus::Answered);
+        assert_eq!(receipt.continuation, ToolContinuation::Continue);
+        assert_eq!(answered.question.authorization, None);
+        let inputs = fixture.inbox().pending(SESSION_ID).expect("answer inbox");
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(Some(inputs[0].id.clone()), answered.input_id);
+        assert_eq!(
+            inputs[0].prompt["response"]["answers"][&opened.questions[0].id],
+            json!([PRIVATE_ANSWER])
+        );
+        assert_eq!(fixture.port.wait_count(), 0);
+        assert_eq!(execution.get(SESSION_ID).expect("execution"), Some(before));
+    }
+}
+
+#[tokio::test]
+async fn unanswered_terminal_work_receipts_never_wait_for_human() {
+    for (state, status) in [
+        (
+            HumanRequestState::Cancelled,
+            QuestionResultStatus::Cancelled,
+        ),
+        (HumanRequestState::Expired, QuestionResultStatus::Expired),
+        (HumanRequestState::Failed, QuestionResultStatus::Failed),
+    ] {
+        let fixture = QuestionFixture::new();
+        let tool = erase(QuestionTool::for_work(fixture.shared_port()));
+        tool.invoke(one_question(), context("call_work_terminal"))
+            .await
+            .expect("publish optional question");
+        let opened = fixture.port.wait_for_request("call_work_terminal").await;
+        if state == HumanRequestState::Cancelled {
+            fixture
+                .port
+                .apply(
+                    SESSION_ID,
+                    &opened.id,
+                    command("cancel_work_question", &opened, QuestionAction::Cancel),
+                )
+                .await
+                .expect("cancel optional clarification");
+        } else {
+            fixture.port.settle(&opened.id, state);
+        }
+        let settled = fixture
+            .reopen()
+            .get(SESSION_ID, &opened.id)
+            .await
+            .expect("settled clarification");
+        let receipt = tool
+            .invoke(one_question(), context("call_work_terminal"))
+            .await
+            .expect("recover terminal receipt");
+        assert_receipt(&receipt, &settled, status);
+        assert_eq!(receipt.continuation, ToolContinuation::Continue);
+        assert!(settled.answers.is_empty());
+        assert_eq!(settled.authorization, None);
+        assert_eq!(fixture.port.wait_count(), 0);
+    }
 }
 
 #[tokio::test]
@@ -204,13 +395,13 @@ async fn a_blocking_answer_is_delivered_once_in_the_inbox_and_never_in_the_tool_
         inputs[0].prompt["response"]["answers"][&opened.questions[0].id],
         json!([PRIVATE_ANSWER])
     );
-    assert_eq!(
-        fixture
+    assert_durable_question_eq(
+        &fixture
             .reopen()
             .get(SESSION_ID, &opened.id)
             .await
             .expect("reopened question"),
-        applied.question
+        &applied.question,
     );
 }
 
@@ -367,14 +558,13 @@ async fn deferral_and_empty_submission_leave_the_question_open_without_an_invent
         assert_eq!(receipt.input_id, None);
         assert_eq!(receipt.question.decision, None);
         assert_eq!(output.continuation, ToolContinuation::Continue);
-        assert_eq!(
-            fixture
-                .port
-                .pending(SESSION_ID)
-                .await
-                .expect("still pending"),
-            [receipt.question]
-        );
+        let pending = fixture
+            .port
+            .pending(SESSION_ID)
+            .await
+            .expect("still pending");
+        assert_eq!(pending.len(), 1);
+        assert_durable_question_eq(&pending[0], &receipt.question);
         assert_no_inputs(&fixture);
     }
 }
@@ -416,12 +606,12 @@ async fn a_saved_draft_releases_the_waiter_and_survives_reopen_without_model_inp
     assert_eq!(output.continuation, ToolContinuation::Continue);
 
     let reopened = fixture.reopen();
-    assert_eq!(
-        reopened
+    assert_durable_question_eq(
+        &reopened
             .get(SESSION_ID, &opened.id)
             .await
             .expect("saved form"),
-        saved.question
+        &saved.question,
     );
     let repeated = reopened
         .apply(SESSION_ID, &opened.id, save)
@@ -837,6 +1027,10 @@ async fn child_attempts_cannot_publish_clarifications_required_input_or_plan_app
             one_question(),
         ),
         (
+            erase(QuestionTool::for_work(fixture.shared_port())),
+            one_question(),
+        ),
+        (
             erase(QuestionTool::required(fixture.shared_port())),
             one_question(),
         ),
@@ -925,6 +1119,41 @@ async fn required_input_keeps_waiting_for_human_after_deferral_until_a_real_answ
         .expect("confirmed input");
     assert_eq!(inputs.len(), 1);
     assert!(!inputs[0].prompt.to_string().contains(PRIVATE_DRAFT));
+}
+
+#[tokio::test]
+async fn empty_required_input_keeps_waiting_for_human() {
+    let fixture = QuestionFixture::new();
+    fixture.port.bind_required_goal("goal_required", 3);
+    let tool = erase(QuestionTool::required(fixture.shared_port()));
+    let task = tokio::spawn(async move {
+        tool.invoke(one_question(), context("call_required_empty"))
+            .await
+    });
+    let opened = fixture.port.wait_for_request("call_required_empty").await;
+    let skipped = fixture
+        .port
+        .apply(
+            SESSION_ID,
+            &opened.id,
+            command(
+                "empty_required_answer",
+                &opened,
+                QuestionAction::Answer {
+                    answers: QuestionAnswers::new(),
+                },
+            ),
+        )
+        .await
+        .expect("empty submission");
+    let output = finish(task).await;
+    assert_receipt(&output, &skipped.question, QuestionResultStatus::Deferred);
+    assert_eq!(output.continuation, ToolContinuation::WaitingForHuman);
+    assert_eq!(skipped.question.purpose, QuestionPurpose::RequiredInput);
+    assert_eq!(skipped.question.state, QuestionState::Pending);
+    assert!(skipped.question.answers.is_empty());
+    assert_eq!(skipped.input_id, None);
+    assert_no_inputs(&fixture);
 }
 
 #[tokio::test]
@@ -1034,14 +1263,36 @@ async fn an_unsubmitted_plan_approval_choice_is_only_a_draft_and_cannot_start_wo
     assert_receipt(&receipt, &saved.question, QuestionResultStatus::Deferred);
     assert_eq!(receipt.continuation, ToolContinuation::Continue);
     assert_eq!(execution.get(SESSION_ID).expect("execution"), Some(before));
-    assert_eq!(
-        fixture
+    assert_durable_question_eq(
+        &fixture
             .reopen()
             .get(SESSION_ID, &opened.id)
             .await
             .expect("saved Plan form"),
-        saved.question
+        &saved.question,
     );
+
+    let skipped = fixture
+        .port
+        .apply(
+            SESSION_ID,
+            &opened.id,
+            command(
+                "skip_plan_choice",
+                &saved.question,
+                QuestionAction::Defer {
+                    draft_answers: QuestionAnswers::new(),
+                },
+            ),
+        )
+        .await
+        .expect("skip the saved approval choice");
+    assert_eq!(skipped.question.draft_answers, drafts);
+    assert!(skipped.question.answers.is_empty());
+    assert_eq!(skipped.question.decision, None);
+    assert_eq!(skipped.question.authorization, None);
+    assert_eq!(skipped.input_id, None);
+    assert_no_inputs(&fixture);
 }
 
 #[tokio::test]

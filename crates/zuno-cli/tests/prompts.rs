@@ -177,6 +177,16 @@ fn descriptions() -> Vec<Description> {
             text: zuno_tools::question::DESCRIPTION,
         },
         Description {
+            wire_id: "question",
+            file: "crates/zuno-tools/src/description/question-work.txt",
+            text: zuno_tools::question::WORK_DESCRIPTION,
+        },
+        Description {
+            wire_id: "question",
+            file: "crates/zuno-tools/src/description/question-required.txt",
+            text: zuno_tools::question::REQUIRED_DESCRIPTION,
+        },
+        Description {
             wire_id: "question_async",
             file: "crates/zuno-tools/src/description/question-async.txt",
             text: zuno_tools::question::ASYNC_DESCRIPTION,
@@ -362,10 +372,12 @@ fn the_committed_golden_is_the_wire_text_of_every_static_description() {
     let mut drift = String::new();
     let committed = parse_golden(&actual);
     for entry in &entries {
-        let was = committed.iter().find(|(id, _)| id == entry.wire_id);
+        let was = committed
+            .iter()
+            .find(|(id, file, _)| id == entry.wire_id && file == entry.file);
         match was {
-            Some((_, text)) if text == entry.text => {}
-            Some((_, text)) => {
+            Some((_, _, text)) if text == entry.text => {}
+            Some((_, _, text)) => {
                 let _ = writeln!(
                     drift,
                     "  {} changed: {} bytes -> {} bytes ({})",
@@ -380,9 +392,12 @@ fn the_committed_golden_is_the_wire_text_of_every_static_description() {
             }
         }
     }
-    for (id, _) in &committed {
-        if !entries.iter().any(|entry| entry.wire_id == id) {
-            let _ = writeln!(drift, "  {id} was removed");
+    for (id, file, _) in &committed {
+        if !entries
+            .iter()
+            .any(|entry| entry.wire_id == id && entry.file == file)
+        {
+            let _ = writeln!(drift, "  {id} ({file}) was removed");
         }
     }
     if drift.is_empty() {
@@ -399,7 +414,8 @@ fn the_committed_golden_is_the_wire_text_of_every_static_description() {
     );
 }
 
-/// Recovers `(wire_id, text)` pairs from a rendered golden.
+/// Recovers `(wire_id, file, text)` entries, including mode-specific variants
+/// sharing a wire ID, from a rendered golden.
 ///
 /// Only used to describe a failure, but it must be *exact*: a diagnostic that
 /// misreports a description's length sends the reader after the wrong tool. The
@@ -407,7 +423,7 @@ fn the_committed_golden_is_the_wire_text_of_every_static_description() {
 /// contain a line starting with `## ` while no body contains a
 /// whole line equal to [`CLOSE`]. Header lines are therefore only recognised
 /// *outside* a fence.
-fn parse_golden(text: &str) -> Vec<(String, String)> {
+fn parse_golden(text: &str) -> Vec<(String, String, String)> {
     let mut out = Vec::new();
     let mut lines = text.lines();
     while let Some(line) = lines.next() {
@@ -416,6 +432,9 @@ fn parse_golden(text: &str) -> Vec<(String, String)> {
         };
         let mut fields = header.split(" | ");
         let Some(id) = fields.next() else {
+            continue;
+        };
+        let Some(file) = fields.next() else {
             continue;
         };
         let bare = header.contains(ENDS_BARE);
@@ -433,7 +452,7 @@ fn parse_golden(text: &str) -> Vec<(String, String)> {
         if bare {
             body.pop();
         }
-        out.push((id.to_owned(), body));
+        out.push((id.to_owned(), file.to_owned(), body));
     }
     out
 }

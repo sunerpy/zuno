@@ -90,15 +90,16 @@ pub fn create_in(
     }
     let payload = json!({
         "source": match spec.purpose {
-            QuestionPurpose::Clarification => match spec.mode {
-                QuestionMode::Blocking => "question",
-                QuestionMode::Deferred => "question_async",
-            },
+            // Family, not a guessed wire tool name: Work `question` and
+            // `question_async` both use deferred delivery. The tool call itself
+            // remains available through the immutable origin and tool event.
+            QuestionPurpose::Clarification => "question",
             QuestionPurpose::RequiredInput if spec.origin.goal_id.is_some() => "goal_request_input",
             QuestionPurpose::RequiredInput => "question",
             QuestionPurpose::PlanAuthorization => "plan_exit",
             QuestionPurpose::GoalResume => "goal_resume",
         },
+        "mode": spec.mode,
         "questions": spec.questions,
     });
     let request = human_request::create_in(
@@ -330,7 +331,7 @@ pub fn get_in(
         .map(|draft| serde_json::from_value(draft.clone()).map_err(decode_error))
         .transpose()?
         .unwrap_or_default();
-    let view = QuestionView {
+    let mut view = QuestionView {
         id: request.id,
         origin: definition.origin,
         revision: request.revision,
@@ -344,12 +345,101 @@ pub fn get_in(
         plan: definition.plan,
         decision: decision.map(decode_enum).transpose()?,
         authorization: authorization.map(decode_enum).transpose()?,
+        delivery: None,
         time_created: request.time_created,
         time_updated: request.time_updated,
     };
     view.validate_draft_answers(&view.draft_answers)
         .map_err(|error| corrupt(&format!("invalid stored question draft: {error}")))?;
+    view.delivery = delivery_in(connection, &view)?;
     Ok(view)
+}
+
+/// Native projection of submitted answers through the provider boundary.
+/// A terminal form is not reopened merely because its answer awaits delivery.
+pub fn delivery_in(
+    connection: &Connection,
+    view: &QuestionView,
+) -> Result<Option<zuno_types::question::QuestionDeliverySnapshot>, DbError> {
+    use zuno_types::question::{QuestionDeliveryPhase as Phase, QuestionDeliverySnapshot};
+    let mut statement = connection.prepare(
+        "SELECT DISTINCT i.id,r.state,r.applied_at,r.time_updated FROM session_input i
+         JOIN session_input_receipt r ON r.input_id=i.id
+         WHERE i.session_id=?1 AND (
+           json_extract(i.prompt,'$.requestID')=?2 OR i.id IN (
+             SELECT json_extract(receipt,'$.inputId') FROM question_action_receipt WHERE request_id=?2))
+         ORDER BY i.admitted_seq"
+    ).map_err(open::map_error)?;
+    let rows = statement
+        .query_map(params![view.origin.session_id, view.id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(open::map_error)?;
+    let mut snapshot = QuestionDeliverySnapshot {
+        phase: Phase::WaitingAnswer,
+        pending_inputs: 0,
+        applied_inputs: 0,
+        last_input_id: None,
+        last_input_state: None,
+        applied_at: None,
+        time_updated: view.time_updated,
+    };
+    for row in rows {
+        let (id, state, applied_at, updated) = row.map_err(open::map_error)?;
+        if applied_at.is_some() {
+            snapshot.applied_inputs += 1;
+            snapshot.applied_at = snapshot.applied_at.max(applied_at);
+        } else {
+            snapshot.pending_inputs += 1;
+        }
+        snapshot.last_input_id = Some(id);
+        snapshot.last_input_state = zuno_types::admission::InputReceiptState::parse(&state);
+        snapshot.time_updated = snapshot.time_updated.max(updated);
+    }
+    let awaiting_handoff = view.authorization == Some(PlanAuthorizationState::WaitingForHandoff);
+    if view.state != QuestionState::Pending && snapshot.last_input_id.is_none() && !awaiting_handoff
+    {
+        // Keep-paused/skipped Goal choices deliberately create no model input.
+        // A resolved control is not a request for another human answer.
+        return Ok(None);
+    }
+    snapshot.phase = if view.state == QuestionState::Pending {
+        Phase::WaitingAnswer
+    } else if snapshot.pending_inputs > 0 || awaiting_handoff {
+        Phase::AnsweredPendingDelivery
+    } else if snapshot.applied_inputs > 0 {
+        Phase::Applied
+    } else {
+        Phase::WaitingAnswer
+    };
+    Ok(Some(snapshot))
+}
+
+/// List actionable forms plus closed forms whose submitted answer is not yet
+/// applied. Consumers display the latter as delivery status, never as a modal.
+pub fn visible_in(connection: &Connection, session_id: &str) -> QuestionResult<Vec<QuestionView>> {
+    let mut statement = connection.prepare(
+        "SELECT h.id FROM human_request h JOIN question_interaction q ON q.request_id=h.id
+         WHERE h.session_id=?1 AND (h.state='pending' OR EXISTS(
+           SELECT 1 FROM session_input i JOIN session_input_receipt r ON r.input_id=i.id
+           WHERE i.session_id=h.session_id AND r.applied_at IS NULL AND
+             (json_extract(i.prompt,'$.requestID')=h.id OR i.id IN (
+               SELECT json_extract(receipt,'$.inputId') FROM question_action_receipt WHERE request_id=h.id))))
+         ORDER BY h.time_created,h.id"
+    ).map_err(open::map_error)?;
+    let ids = statement
+        .query_map([session_id], |row| row.get::<_, String>(0))
+        .map_err(open::map_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(open::map_error)?;
+    ids.into_iter()
+        .map(|id| get_in(connection, session_id, &id))
+        .collect()
 }
 
 pub fn pending_in(connection: &Connection, session_id: &str) -> QuestionResult<Vec<QuestionView>> {
@@ -598,6 +688,7 @@ pub fn apply_in(
     } else {
         None
     };
+    view.delivery = delivery_in(tx, &view)?;
     let receipt = QuestionReceipt {
         question: view,
         input_id: input.map(|input| input.id),
@@ -610,7 +701,7 @@ pub fn apply_in(
             request_id,
             command.command_id,
             encode(command)?,
-            encode(&receipt)?,
+            encode_stored_receipt(&receipt)?,
             now
         ],
     )
@@ -643,6 +734,7 @@ pub fn receipt_in(
         });
     }
     let mut receipt: QuestionReceipt = decode(&receipt)?;
+    receipt.question.delivery = delivery_in(connection, &receipt.question)?;
     receipt.duplicate = true;
     Ok(Some(receipt))
 }
@@ -790,7 +882,7 @@ pub fn set_authorization_in(
         "UPDATE question_action_receipt \
          SET receipt=json_set(receipt,'$.question',json(?1),'$.inputId',?2) \
          WHERE request_id=?3 AND json_extract(receipt,'$.question.decision')='approve'",
-        params![encode(&updated)?, input_id, request_id],
+        params![encode_stored_view(&updated)?, input_id, request_id],
     )
     .map_err(open::map_error)?;
     record_event(tx, "question.authorization", &updated)?;
@@ -828,7 +920,11 @@ pub fn record_receipt_in(
 ) -> Result<(), DbError> {
     tx.execute(
         "UPDATE question_action_receipt SET receipt=?1 WHERE request_id=?2 AND command_id=?3",
-        params![encode(receipt)?, receipt.question.id, command_id],
+        params![
+            encode_stored_receipt(receipt)?,
+            receipt.question.id,
+            command_id
+        ],
     )
     .map_err(open::map_error)?;
     Ok(())
@@ -868,6 +964,20 @@ fn not_found(session_id: &str, request_id: &str) -> QuestionError {
 
 fn encode(value: &impl Serialize) -> Result<String, DbError> {
     serde_json::to_string(value).map_err(decode_error)
+}
+
+/// Delivery is derived from input receipts on every read. Do not cache it in
+/// format-15 action receipts or change their stored QuestionView shape.
+fn encode_stored_receipt(receipt: &QuestionReceipt) -> Result<String, DbError> {
+    let mut stored = receipt.clone();
+    stored.question.delivery = None;
+    encode(&stored)
+}
+
+fn encode_stored_view(view: &QuestionView) -> Result<String, DbError> {
+    let mut stored = view.clone();
+    stored.delivery = None;
+    encode(&stored)
 }
 
 fn decode<T: serde::de::DeserializeOwned>(value: &str) -> Result<T, DbError> {

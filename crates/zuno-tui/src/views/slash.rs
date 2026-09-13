@@ -169,6 +169,8 @@ pub enum HostCommand {
     Redo,
     /// Inspect or mutate the durable top-level goal for this session.
     Goal(String),
+    /// Inspect exact uncertain native file calls without invoking a model.
+    InspectOutcome(String),
     /// Inspect or mutate durable learning state.
     Learn(String),
     /// Run isolated learning extraction.
@@ -331,6 +333,9 @@ impl SlashRouter {
             SlashCommandKind::Host(HostCommand::Goal(_)) => {
                 SlashSubmission::Host(HostCommand::Goal(arguments))
             }
+            SlashCommandKind::Host(HostCommand::InspectOutcome(_)) => {
+                SlashSubmission::Host(HostCommand::InspectOutcome(arguments))
+            }
             SlashCommandKind::Host(HostCommand::Learn(_)) => {
                 SlashSubmission::Host(HostCommand::Learn(arguments))
             }
@@ -445,6 +450,7 @@ fn native_session_command(command: SessionCommand) -> SlashCommand {
     let host = match command {
         SessionCommand::Compact => HostCommand::Compact,
         SessionCommand::Goal => HostCommand::Goal(String::new()),
+        SessionCommand::InspectOutcome => HostCommand::InspectOutcome(String::new()),
         SessionCommand::Learn => HostCommand::Learn(String::new()),
         SessionCommand::Reflect => HostCommand::Reflect(String::new()),
         SessionCommand::Plan => HostCommand::Plan,

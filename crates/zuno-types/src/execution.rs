@@ -199,6 +199,8 @@ pub enum SessionPauseReason {
     User,
     Authentication,
     TurnBudget,
+    /// Exact tool outcomes require a separate authoritative inspection.
+    UncertainSideEffect,
     Blocked,
 }
 
@@ -265,6 +267,10 @@ pub struct SessionScheduling {
     rename_all_fields = "camelCase"
 )]
 pub enum SessionWakeSignal {
+    /// A real user input. The native promotion transaction has assigned its
+    /// independent cycle; this signal itself never clears a protected gate.
+    UserMessage,
+    /// Native query/notification control, not an alias for every user message.
     UserQuery,
     UserAnswer {
         request_id: String,
@@ -295,6 +301,13 @@ impl SessionReadiness {
     #[must_use]
     pub fn wake_admission(&self, signal: &SessionWakeSignal) -> WakeAdmission {
         use SessionWakeSignal as Wake;
+        if matches!(signal, Wake::UserMessage) {
+            return match self {
+                Self::Ready => WakeAdmission::Admit,
+                Self::Completed => WakeAdmission::Resume,
+                _ => WakeAdmission::Reject,
+            };
+        }
         if matches!(signal, Wake::UserQuery) {
             return if matches!(self, Self::Completed) {
                 WakeAdmission::Resume

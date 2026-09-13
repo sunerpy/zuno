@@ -41,9 +41,9 @@ logs include phase timings but omit selected values and credentials.
 
 A `session/prompt` that arrives while the session is already running is committed
 to the durable inbox, then steered at a safe point or left queued. Its RPC waits
-for that input's associated processing outcome and returns a legal `stopReason`;
-accepted content is no longer reported as a `-32001` busy error. Session-owned
-execution outlives an individual RPC observer. Responses include
+for that input's associated processing outcome; a normal completion returns a
+legal `stopReason`. Accepted content is no longer reported as a `-32001` busy error.
+Session-owned execution outlives an individual RPC observer. Responses include
 `_meta.zuno.receipt`, separating admitted, recorded, applied and terminal state.
 
 Normal prompts may set `_meta.zuno.messageId` (1–256 bytes). Retrying the same ID
@@ -61,16 +61,18 @@ Rejections use `-32002` with `reason` equal to `noActiveTurn`,
 The expected turn is checked before the inbox transaction commits. If that turn
 ends or changes while admission waits for SQLite, the input and its admission
 event roll back together, so a rejected steer cannot reach a later turn.
-`session/cancel` remains the explicit session-wide stop control.
+Stop uses `session/cancel`; follow-up input uses prompt admission or
+`session/steer`, never cancellation followed by resubmission.
 
 A slash command cannot be steered and is refused with
 `reason: "commandRequiresIdleSession"` and nothing durable written; only text
 that resolves to a real command, Skill, or native control counts as a slash
 command, so a prompt that merely starts with `/` is admitted as ordinary content.
 
-Withdrawing a pending prompt with `$/cancel_request` retires the input contributed
-by that request when it has not entered the model. It cannot erase already
-processed input or withdraw the original on behalf of a duplicate retry observer.
+Withdrawing a pending prompt with `$/cancel_request` retires only the input
+contributed by that request. If its selected native input is already running,
+cancellation checks that input's identity at the signal boundary. It cannot erase
+processed history or withdraw the original on behalf of a duplicate retry observer.
 Disconnect is not withdrawal: accepted input and processing receipts remain durable.
 See [Zed ACP integration](/reference/zed-acp) for the full shape.
 
@@ -87,13 +89,32 @@ final revision before prompt completion, and emits empty entries when the Plan
 is removed. Load, resume, detached Goal continuation, and host remount share the
 same projector.
 
-`edit`, `write`, and `apply_patch` use one `Editing files` card. A successful
+`edit`, `write`, and `apply_patch` use edit cards whose standard `title` names
+the files, for example `Editing main.rs, lib.rs`. Complete native arguments
+update the title before dispatch; partial JSON keeps the `Editing files` fallback.
+Titles show up to three filenames and 160 Unicode characters, with `(+N more)`
+for additional files. Standard `locations` retain absolute paths, while relative
+patch targets can name a card without guessing the session directory. Patch
+targets use the native parser; hunk text is never scanned as a filename.
+Resolved mutation results take precedence over requested path aliases.
+Permission cards and history replay also retain filenames; replay still filters
+unopenable/out-of-worktree paths. These fields do not require Zuno-specific `_meta`.
+
+A successful
 typed mutation shows only its structured add/modify/delete diff in visible
 content while preserving the complete original result in `rawOutput`.
 Pre-write failures show actionable text without a fabricated diff. Partial or
 otherwise uncertain mutations remain failed, preserve observed paths or diffs,
 and carry `_meta.zuno.outcome: "uncertain"`. Live delivery and replay use the
 same policy.
+
+If a provider retry fails after input admission, the failed processing receipt
+retains the last captured HTTP status, provider code, request ID and redacted
+reason in its error text. `admission: accepted` still means the input was saved;
+it does not mean the provider completed it. Retry configuration is taken from
+the selected provider's complete resolved model on the main ACP path as well as
+internal requests. Missing upstream facts remain unknown, and old receipts are
+not backfilled.
 
 Operational notices — a remote rule file that could not be fetched or an intact local
 rule file skipped because it did not fit the prompt budget (its rules are not in force
@@ -122,6 +143,178 @@ A smaller request estimate cannot replace a confirmed baseline. Partial usage
 frames merge as snapshots; compaction changes the epoch. `_meta.zuno.contextUsage`
 carries source, request identity, freshness and update time. Cumulative disjoint
 usage is separate from current occupancy; unknown values remain unknown.
+
+## Exact cancellation and legacy clients
+
+Initialize advertises `_meta.zuno.cancellation` with `version: 1`,
+`method: "session/cancel"`, `expectedTurnIdPath: "_meta.zuno.expectedTurnId"`,
+`legacySessionIdOnly: "currentTargetAtDispatch"` and `armsNextTurn: false`.
+Use the turn ID from a live `session/update`'s
+`params.update._meta.zuno.turnId`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "session/cancel",
+  "params": {
+    "sessionId": "ses_example",
+    "_meta": { "zuno": { "expectedTurnId": "turn_example" } }
+  }
+}
+```
+
+The expected ID must be a non-empty string of at most 256 bytes. Zuno validates
+the target under the same native lock that fires cancellation. A delayed T1
+cancel cannot interrupt T2. Inactive named targets, mismatched IDs and malformed
+exact metadata do not fall back to cancelling the current turn. This is a
+notification, so there is no JSON-RPC response; rejected notifications produce
+stderr diagnostics. Observe the original prompt's durable receipt and updates
+for the actual processing outcome.
+
+A legacy notification containing only `sessionId` captures the live target
+once when handled. Idle cancellation is a no-op; it never arms a future turn.
+The protocol provides no evidence of network-stale intent: a session-only T1
+cancel that arrives while T2 is live can cancel T2. Clients requiring an exact
+target must send the extension.
+
+`$/cancel_request` identifies the original client RPC by `requestId`, including
+its string/number type. Reusing a wire ID after its response creates a new
+internal request identity; an idempotent `_meta.zuno.messageId` retry still only
+observes the original durable input. Withdrawal cannot cancel an unrelated
+Agent-to-client RPC. `-32800` reports request withdrawal, not rollback of tool
+effects; use the durable receipt to observe execution.
+
+## Ordinary completion and question delivery
+
+A genuine ordinary provider final ends the current cycle even when Plan/Todo
+steps remain unfinished or runnable, unless a typed wait or protected gate takes
+precedence. The Plan projection keeps their actual
+status; an `end_turn` is not evidence that every step completed. Foreground tool
+waits and real follow-up are handled before final reconciliation. Only the
+current cycle's active owned Goal authorizes Goal continuation.
+
+Work/Goal optional questions stay deferred. In ordinary Work, a required user
+choice that blocks progress is one clear plain-text final question ending the
+turn, without a synthetic persistent pause. Required Goal input and Plan approval
+retain their typed controls and identity/revision checks. Older pending forms and
+unfinished Plans alone neither authorize continuation nor prevent new input:
+the runtime execution wait reference is the authority.
+
+`QuestionView.delivery` is derived from input receipts, with phases
+`WaitingAnswer` (`waiting_answer`), `AnsweredPendingDelivery`
+(`answered_pending_delivery`) and `Applied` (`applied`). Question lists may include
+closed forms whose associated inputs still await application; display those as
+delivery status without reopening the form. The pending/applied counts and last
+input receipt distinguish answer acceptance from model application. Neither a
+closed form nor an applied input proves a successful provider response.
+
+Settled controls that create no model input, such as Keep paused, have
+`delivery: None` (omitted in serialization), not `WaitingAnswer`; do not reopen
+them. Early Plan approval still awaiting handoff remains
+`AnsweredPendingDelivery`, even before its control input is admitted.
+
+Failure settlement uses the frozen cycle/turn/Goal scope. Exhausting bounded
+provider retries or their recovery deadline closes only the failed ordinary
+cycle; it cannot block a later independent input or mutate an unrelated Goal.
+Recoverable failures schedule backoff only for the exact active owned Goal.
+Typed approval, required-input, authentication, turn-budget, uncertainty and
+permanent-block gates remain effective.
+
+## Saved input and execution gates
+
+An input can be consumed into history while native execution is still gated.
+Its `InputAdmissionReceipt` remains `recorded`, with an optional `executionGate`;
+`appliedAt`, `completedAt`, and `turnId` are absent. The gate does not turn that
+saved, unapplied input into a `failed` receipt or prove that sampling started.
+
+Before a resumed provider request, the engine scans the durable FIFO for eligible
+answers, reports and steering even without a live wake hint. Resume controls do
+not skip earlier eligible answers; explicitly queued next-turn prompts remain
+queued. `InputDeliveryBatch` and `session.input.delivery_batch.1` record actual
+consumption, not application. The input receipt at post-hook provider dispatch
+establishes application, and the eventual execution outcome establishes completion.
+
+For a saved input that is execution-gated, `session/prompt` returns JSON-RPC
+error `-32005`. Its `error.data`
+contains `admission: "accepted"`, `reason: "executionGated"`,
+`recoveryRequired: true`, and the authoritative `receipt`. The message is
+already saved: do not resend it as a new input. Reconnecting and retrying the
+same `_meta.zuno.messageId` observes the original receipt.
+
+`executionGate` contains:
+
+| Field | Meaning |
+| --- | --- |
+| `reason` | `user`, `authentication`, `turn_budget`, `uncertain_side_effect`, `blocked`, `waiting_human`, `waiting_external`, `no_progress`, `no_executable_work`, or `execution_unavailable` |
+| `recovery` | `resume_work`, `resume_goal`, `start_work`, `resolve_human_request`, `wait_for_event`, `reauthenticate`, `inspect_outcome`, `review_budget`, or `inspect_session` |
+| `executionRevision`, `cycleId` | The native execution revision and cycle at the gate decision |
+| `requestId`, `sourceId` | Optional identity of the human request or external source being awaited |
+
+Recovery values are hints, not permission or a promise that one command clears
+the gate. `start_work` points to Plan authorization through Start Work, which
+`/resume` cannot grant. Ordinary `/resume` must pass the existing Work, Plan,
+Goal, wait, authentication, budget, blocked-state, and uncertain-outcome checks. Only then
+does it bind the matching gated, unapplied anchor to a new cycle without
+inserting the original text again. Until a real turn binds that input, duplicate
+observers can still receive the same gate; application and completion then
+advance through the normal receipt lifecycle. Existing `failed`, `cancelled`,
+`applied`, and `completed` receipts are not reset.
+
+When ordinary `/resume` is submitted through `session/prompt` and passes these
+checks, the RPC observes the native resume control's durable receipt. Queuing
+the control does not return `stopReason: "end_turn"`: the request stays pending
+until its associated native execution completes, waits for human input, is
+cancelled, or fails. Clients can keep the panel busy and retain Stop while the
+resumed work runs. Losing the RPC observer does not cancel session-owned
+execution; this applies to an individual observer, not closure of the ACP
+connection, runtime, or process. Connection EOF allows up to 25 ms to drain ready
+requests before runtime shutdown cancels a running resume control. Its data and
+`cancelled` receipt remain durable; `session/load` does not replay that control.
+Explicit `$/cancel_request` withdraws only that request's control;
+`session/cancel` still follows the exact-turn or legacy target rules above.
+
+This recovery does not change ordinary Stop: the next new message can run
+normally. An interrupted Goal still requires its explicit Goal recovery control,
+and old-cycle callbacks cannot revive stopped work.
+
+Reconnect, ordinary input and upgrades do not automatically unlock legacy pauses
+or false blocks. Existing failed bridges remain failed, and unknown provenance
+remains gated. Ordinary `/resume` retains the checks above. Database format 15 is
+unchanged; no new migration or automatic legacy rewrite implements this behavior.
+
+### Offline repair of one proven false block
+
+The standalone command targets the configured existing database. Use exact
+session/input IDs and replace `N` with the positive `expectedRevision` from the
+read-only inspection:
+
+```sh
+zuno session repair SESSION --input INPUT --dry-run
+zuno session repair SESSION --input INPUT --apply --expected-revision N
+```
+
+Inspection is the default. `--apply` conflicts with `--dry-run` and requires
+`--expected-revision`; that revision is the execution revision, not a question or
+input revision. Before apply, close every ACP/TUI/server and other process holding
+the database, including idle connections. Apply requires SQLite exclusive access
+and the native recovery lease, then rechecks the complete proof atomically.
+
+Only an exact, provably false-blocked real user input that is already `consumed`,
+has a `recorded` receipt and was never applied/bound to a provider turn is eligible.
+Ambiguous or missing native evidence, stale revisions, competing work, real
+protected gates and uncertain effects are refused. Old `failed`, `cancelled`,
+`applied` or `completed` receipts are not reopened.
+
+Apply queues one audited recovery control and preserves the original consumed
+input and its visible gate until real execution binds it. It does not requeue or
+reinsert that input, replay tools, change a Goal, create a database or migrate
+format 15. Success returns `control_queued`, which proves control admission rather
+than provider application or success. A repeat returns `already_queued` only while
+the exact control is still `queued` and the complete evidence and execution
+snapshot remain unchanged; it performs no new write or admission. Once the control
+advances or the original input is bound/applied, repair rejects resubmission.
+Follow the later native control/input receipts.
+The repair command itself does not start a provider request.
 
 ## Goal continuation
 

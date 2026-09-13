@@ -205,6 +205,13 @@ fn views_autocomplete_production_slash_source_matches_aliases_and_descriptions()
     view.refresh("/continue", 9);
     assert_eq!(view.matches()[0].display, "/session");
     view.refresh("/inspect", 8);
+    assert_eq!(view.matches()[0].display, "/inspect-outcome");
+    assert!(
+        view.matches()
+            .iter()
+            .any(|candidate| candidate.display == "/audit")
+    );
+    view.refresh("/safety", 7);
     assert_eq!(view.matches()[0].display, "/audit");
 }
 

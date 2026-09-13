@@ -332,7 +332,46 @@ pub struct SessionInbox {
     pool: Arc<Pool>,
 }
 
+/// A native safe-point view. Final model application rechecks the same gates
+/// inside the consumption transaction.
+pub struct LiveDeliverySnapshot {
+    pub cycle_id: Option<String>,
+    pub permitted: bool,
+    pub inputs: Vec<SessionInput>,
+}
+
 impl SessionInbox {
+    pub fn live_delivery_snapshot(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<LiveDeliverySnapshot, DbError> {
+        let connection = self.pool.get()?;
+        let scope = crate::session_work_cycle::current_in(&connection, session_id)?;
+        let permitted = !scope.as_ref().is_some_and(|scope| {
+            scope.stopped.is_some()
+                || scope
+                    .active_turn_id
+                    .as_deref()
+                    .is_some_and(|active| active != turn_id)
+        });
+        let mut inputs = Vec::new();
+        if permitted {
+            for input in pending_in(&connection, session_id)? {
+                if crate::session_wake::pending_admission_in(&connection, &input)?
+                    != zuno_types::execution::WakeAdmission::Reject
+                {
+                    inputs.push(input);
+                }
+            }
+        }
+        Ok(LiveDeliverySnapshot {
+            cycle_id: scope.map(|scope| scope.cycle_id),
+            permitted,
+            inputs,
+        })
+    }
+
     /// Open an inbox over one initialized pool.
     #[must_use]
     pub fn new(pool: Arc<Pool>) -> Self {
