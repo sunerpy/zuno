@@ -378,8 +378,8 @@ pub(super) async fn activate(
             .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(parent.session_id.as_str()).bind(child.as_str())
             .bind(&record.invocation.description).bind(&record.selection.agent).bind(&model).bind(now)
             .bind(i32::try_from(record.depth_limit).map_err(ApplicationError::storage)?).execute(&mut **tx).await.map_err(database_error)?;
-        query("INSERT INTO zuno_enterprise_preview.session_memory_policy(tenant_id,principal_id,session_id,revision,use_memories,generate_private)
-            SELECT tenant_id,principal_id,$4,1,use_memories,generate_private FROM zuno_enterprise_preview.session_memory_policy
+        query("INSERT INTO zuno_enterprise_preview.session_memory_policy(tenant_id,principal_id,session_id,revision,use_memories,generate_private,automatic_private)
+            SELECT tenant_id,principal_id,$4,1,use_memories,generate_private,automatic_private FROM zuno_enterprise_preview.session_memory_policy
             WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3")
             .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(parent.session_id.as_str()).bind(child.as_str())
             .execute(&mut **tx).await.map_err(database_error)?;

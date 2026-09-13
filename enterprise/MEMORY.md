@@ -15,6 +15,12 @@ learning Job, request receipt and audit row is scoped by tenant and principal.
 Memory. `project:<workspaceId>` is that user's Memory in one registered workspace.
 A model or API command cannot supply another owner or a document path.
 
+Session restrictions apply through the current ancestor chain. A newly created
+child copies explicit parent policy, including automatic learning, and every read
+or generation check still intersects current ancestor restrictions. Revoking a
+parent therefore affects existing descendants. Missing, foreign, cyclic or
+overdeep ancestry fails closed. Existing explicit child restrictions are preserved.
+
 `PostgresMemoryBackend` is shared across the public application and Worker state
 routes. It acquires bounded capacity before opening a transaction. Current
 organization/app authorization, workspace membership, owner RLS and an owner
@@ -190,6 +196,18 @@ current private documents and correction signals, proposes bounded changes and
 commits candidates, evidence, revisions, Job settlement and watermark atomically.
 High-confidence supported changes may apply; other candidates remain reviewable.
 User-owned entries and explicitly retired content remain protected.
+
+When extracting a completed root, source selection can include commands from completed
+child Agent, Workflow and Council descendants in the same owned workspace. The
+data owner validates completed runtime state, child completion envelopes and
+current source-session consent. Traversal visits at most 256 Jobs and 16 delegation
+levels; the existing 63-operation and serialized-input limits still apply, with
+truncation recorded. Agent report prose and delegated prompts are not execution or
+user-authored evidence. Operation receipts must bind the exact Job/session, owner
+and operation ID, succeed without cancellation, and contain complete output.
+Frozen source bytes and policy are checked again at claim, renewal, model
+admission and settlement. A late quiet child finishing after this root snapshot
+is not retroactively added to that extraction.
 
 The data owner also reconstructs maintenance wakes from durable private Memory
 changes and evidence validity. Once an authorized source has been extracted,

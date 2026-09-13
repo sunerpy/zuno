@@ -47,7 +47,7 @@ impl TransactionMemory {
                 }
             }
             MemoryEvidenceOrigin::Operation { operation_id } => {
-                let row = query("SELECT o.completion,o.completion_digest,o.session_id FROM zuno_enterprise_preview.gateway_operation o
+                let row = query("SELECT o.completion,o.completion_digest,o.session_id,o.job_id FROM zuno_enterprise_preview.gateway_operation o
                     JOIN zuno_enterprise_preview.session s ON s.tenant_id=o.tenant_id AND s.principal_id=o.principal_id AND s.id=o.session_id
                     WHERE o.tenant_id=$1 AND o.principal_id=$2 AND o.operation_id=$3 AND s.workspace_id=$4 FOR SHARE OF o")
                     .bind(self.principal.tenant_id().as_str()).bind(self.principal.principal_id().as_str()).bind(operation_id.as_str())
@@ -71,6 +71,10 @@ impl TransactionMemory {
                     .as_deref()
                     != Some(&digest)
                     || completion.lease.owner != self.principal.owner()
+                    || completion.lease.job_id.as_str()
+                        != row.try_get::<String, _>("job_id").map_err(sql_error)?
+                    || completion.lease.session_id.as_str()
+                        != row.try_get::<String, _>("session_id").map_err(sql_error)?
                     || completion.operation.id != *operation_id
                     || completion.receipt.phase != OperationPhase::Completed
                     || completion.receipt.exit_code != Some(0)

@@ -170,6 +170,22 @@ impl TransactionMemory {
         tx: &mut Tx,
         lease: &LearningExecutionLease,
     ) -> Result<LearningExecution, Error> {
+        let result = self.check_execution_lease(tx, lease).await?;
+        if !self.extraction_sources_current(tx, &result).await?
+            || !self.maintenance_current(tx, &result).await?
+        {
+            return Err(Error::Denied);
+        }
+        Ok(result)
+    }
+
+    /// Releasing a valid lease does not read or apply its frozen inputs. Keep
+    /// stop/settlement of reservations possible after source policy changes.
+    async fn check_execution_lease(
+        &self,
+        tx: &mut Tx,
+        lease: &LearningExecutionLease,
+    ) -> Result<LearningExecution, Error> {
         lease.validate().map_err(app_error)?;
         if lease.owner != self.principal.owner() {
             return Err(Error::Denied);
@@ -278,6 +294,9 @@ impl TransactionMemory {
         }
         self.require_automation(tx, Some(value.session.as_str()))
             .await?;
+        if !self.extraction_sources_current(tx, &value).await? {
+            return Err(Error::Denied);
+        }
         if !self.maintenance_current(tx, &value).await? {
             query(
                 "UPDATE zuno_enterprise_preview.learning_job SET status='skipped',
@@ -513,7 +532,7 @@ impl PostgresLearningRuntime {
     ) -> Result<(), Error> {
         let (actor, workspace, session) = self.job_binding(&lease.owner, &lease.job_id).await?;
         self.memory.automate(actor,workspace,session,move |provider| provider.execute(async |tx| {
-            let job=provider.check_execution(tx,&lease).await?;
+            let job=provider.check_execution_lease(tx,&lease).await?;
             let now=database_time(tx).await.map_err(app_error)?;
             let amount:i64=query_scalar("WITH changed AS(UPDATE zuno_enterprise_preview.learning_model_request
                 SET state='unknown' WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3 AND state='prepared' RETURNING reserved_tokens)

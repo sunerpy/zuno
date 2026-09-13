@@ -2,6 +2,55 @@ use super::*;
 use zuno_memory::remote::MemoryPolicy;
 
 impl TransactionMemory {
+    /// A descendant can narrow current ancestor consent but cannot preserve old
+    /// copied permissions after an ancestor revokes them. Session ancestry is
+    /// immutable in the runtime; reject missing, foreign, cyclic or overdeep data.
+    async fn effective_policy(
+        &self,
+        tx: &mut Tx,
+        session: Option<&str>,
+    ) -> Result<MemoryPolicy, Error> {
+        let mut effective = self.policy(tx, None).await?;
+        let Some(session) = session else {
+            return Ok(effective);
+        };
+        self.ensure_session(tx, session).await?;
+        let mut current = Some(session.to_owned());
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(id) = current {
+            if seen.len() > 16 || !seen.insert(id.clone()) {
+                return Err(Error::InvalidData);
+            }
+            let row = query(
+                "SELECT s.parent_id,p.revision,p.use_memories,p.generate_private,p.automatic_private
+                 FROM zuno_enterprise_preview.session s
+                 LEFT JOIN zuno_enterprise_preview.session_memory_policy p
+                   ON p.tenant_id=s.tenant_id AND p.principal_id=s.principal_id AND p.session_id=s.id
+                 WHERE s.tenant_id=$1 AND s.principal_id=$2 AND s.id=$3 AND s.workspace_id=$4",
+            )
+            .bind(self.principal.tenant_id().as_str())
+            .bind(self.principal.principal_id().as_str())
+            .bind(id).bind(self.workspace.as_str())
+            .fetch_optional(&mut **tx).await.map_err(sql_error)?.ok_or(Error::Denied)?;
+            let revision: Option<i64> = row.try_get("revision").map_err(sql_error)?;
+            if revision.is_some_and(|revision| revision < 0) {
+                return Err(Error::InvalidData);
+            }
+            if revision.is_some_and(|revision| revision > 0) {
+                effective.use_memories &=
+                    row.try_get::<bool, _>("use_memories").map_err(sql_error)?;
+                effective.generate_private &= row
+                    .try_get::<bool, _>("generate_private")
+                    .map_err(sql_error)?;
+                effective.automatic_private &= row
+                    .try_get::<bool, _>("automatic_private")
+                    .map_err(sql_error)?;
+            }
+            current = row.try_get("parent_id").map_err(sql_error)?;
+        }
+        Ok(effective)
+    }
+
     pub(super) async fn ensure_session(&self, tx: &mut Tx, session: &str) -> Result<(), Error> {
         if self
             .lease
@@ -52,12 +101,7 @@ impl TransactionMemory {
         tx: &mut Tx,
         session: Option<&str>,
     ) -> Result<bool, Error> {
-        let owner = self.policy(tx, None).await?;
-        if let Some(session) = session {
-            Ok(owner.use_memories && self.policy(tx, Some(session)).await?.use_memories)
-        } else {
-            Ok(owner.use_memories)
-        }
+        Ok(self.effective_policy(tx, session).await?.use_memories)
     }
 
     pub(super) async fn require_generation(
@@ -65,17 +109,8 @@ impl TransactionMemory {
         tx: &mut Tx,
         session: Option<&str>,
     ) -> Result<(), Error> {
-        let owner = self.policy(tx, None).await?;
-        if !owner.generate_private {
+        if !self.effective_policy(tx, session).await?.generate_private {
             return Err(Error::Denied);
-        }
-        if let Some(session) = session {
-            let policy = self.policy(tx, Some(session)).await?;
-            // Absent session override inherits explicit owner consent. A session
-            // can narrow that consent; it cannot widen the owner's decision.
-            if policy.revision > 0 && !policy.generate_private {
-                return Err(Error::Denied);
-            }
         }
         Ok(())
     }
@@ -133,16 +168,9 @@ impl TransactionMemory {
         tx: &mut Tx,
         session: Option<&str>,
     ) -> Result<(), Error> {
-        self.require_generation(tx, session).await?;
-        let owner = self.policy(tx, None).await?;
-        if !owner.automatic_private {
+        let effective = self.effective_policy(tx, session).await?;
+        if !effective.generate_private || !effective.automatic_private {
             return Err(Error::Denied);
-        }
-        if let Some(session) = session {
-            let policy = self.policy(tx, Some(session)).await?;
-            if policy.revision > 0 && !policy.automatic_private {
-                return Err(Error::Denied);
-            }
         }
         let actor: Option<Value> = query_scalar(
             "SELECT automation_actor FROM zuno_enterprise_preview.memory_policy
