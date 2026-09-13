@@ -146,6 +146,9 @@ pub(crate) async fn finish_in(
          WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3",
     ).bind(lease.owner.tenant_id.as_str()).bind(lease.owner.principal_id.as_str()).bind(job.id.as_str()).bind(phase).bind(time)
         .execute(&mut **tx).await.map_err(database_error)?;
+    if phase == "completed" {
+        crate::learning_sources::completed(tx, &lease.owner, job.id.as_str()).await?;
+    }
     if matches!(phase, "completed" | "failed" | "cancelled") {
         query(
             "UPDATE zuno_enterprise_preview.input_execution_receipt SET state=$4,completed_at=COALESCE(completed_at,$5),time_updated=$5

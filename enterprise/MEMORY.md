@@ -206,8 +206,20 @@ truncation recorded. Agent report prose and delegated prompts are not execution 
 user-authored evidence. Operation receipts must bind the exact Job/session, owner
 and operation ID, succeed without cancellation, and contain complete output.
 Frozen source bytes and policy are checked again at claim, renewal, model
-admission and settlement. A late quiet child finishing after this root snapshot
-is not retroactively added to that extraction.
+admission and settlement.
+
+Root and descendant completion atomically mark the root's learning scan dirty.
+A late quiet result creates a new bounded extraction for previously unseen
+sources; it does not alter an earlier frozen request or replay its evidence.
+Source admission records distinguish captured, input-budget-omitted and unavailable
+origins. Those decisions, the learning Job/activity and the observed scan-version
+acknowledgement commit together. A concurrent newer completion stays pending.
+Duplicate wakeups and cancelled captured batches do not repeat model work.
+
+PostgreSQL format 22 backfills captured origins from existing frozen manifests,
+including cancelled Jobs, and initializes pending scans for completed roots.
+The scan retains current consent/configuration and all existing traversal/input
+bounds. It does not promise exhaustive harvesting outside those bounds.
 
 The data owner also reconstructs maintenance wakes from durable private Memory
 changes and evidence validity. Once an authorized source has been extracted,

@@ -126,14 +126,17 @@ impl PostgresLearningRuntime {
                     .map_err(app_error)?;
                 let roots: Vec<String> = query_scalar(
                     "SELECT r.job_id FROM zuno_enterprise_preview.runtime_job r
+                     JOIN zuno_enterprise_preview.learning_root_scan scan ON scan.tenant_id=r.tenant_id AND scan.principal_id=r.principal_id AND scan.root_job_id=r.job_id
                      JOIN zuno_enterprise_preview.session s ON s.tenant_id=r.tenant_id AND s.principal_id=r.principal_id AND s.id=r.session_id
                      JOIN zuno_enterprise_preview.memory_policy p ON p.tenant_id=r.tenant_id AND p.principal_id=r.principal_id
                      WHERE r.tenant_id=$1 AND r.principal_id=$2 AND r.phase='completed'
                        AND r.configuration=$3 AND s.workspace_id=$4 AND s.parent_id IS NULL
                        AND r.time_created>=p.automation_since
-                       AND NOT EXISTS(SELECT 1 FROM zuno_enterprise_preview.learning_execution e
-                         WHERE e.tenant_id=r.tenant_id AND e.principal_id=r.principal_id AND e.source_job_id=r.job_id AND e.phase='extraction')
-                     ORDER BY r.time_created,r.job_id LIMIT $5",
+                       AND NOT EXISTS(SELECT 1 FROM zuno_enterprise_preview.session_memory_policy sp
+                         WHERE sp.tenant_id=r.tenant_id AND sp.principal_id=r.principal_id AND sp.session_id=r.session_id
+                           AND sp.revision>0 AND (NOT sp.generate_private OR NOT sp.automatic_private))
+                       AND scan.source_version>scan.scanned_version
+                     ORDER BY scan.updated_at,r.job_id LIMIT $5",
                 ).bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(json!(grant.source))
                     .bind(grant.workspace.as_str()).bind(i64::from(maximum-inserted))
                     .fetch_all(&mut *tx).await.map_err(sql_error)?;
@@ -211,45 +214,51 @@ impl TransactionMemory {
         if !within_consent {
             return Ok(false);
         }
-        let id = JobId::new(format!(
-            "learn_{}",
-            zuno_orchestration::sha256_json(&json!([
-                self.principal.owner(),
-                source.id,
-                grant.extraction,
-                zuno_learning::LEARNING_EXTRACTOR_VERSION
-            ]))
-        ))
-        .map_err(decode_error)?;
-        let exists: bool = query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM zuno_enterprise_preview.learning_job
-            WHERE tenant_id=$1 AND principal_id=$2 AND id=$3)",
+        let version: Option<i64> = query_scalar(
+            "SELECT source_version FROM zuno_enterprise_preview.learning_root_scan
+             WHERE tenant_id=$1 AND principal_id=$2 AND root_job_id=$3 AND source_version>scanned_version",
         )
         .bind(self.principal.tenant_id().as_str())
         .bind(self.principal.principal_id().as_str())
-        .bind(id.as_str())
-        .fetch_one(&mut **tx)
+        .bind(source.id.as_str())
+        .fetch_optional(&mut **tx)
         .await
         .map_err(sql_error)?;
-        if exists {
+        let Some(version) = version else {
             return Ok(false);
-        }
+        };
         let (jobs, mut truncated) = self.completed_source_jobs(tx, source).await?;
         let operations: Vec<String> = query_scalar(
-            "SELECT operation_id FROM zuno_enterprise_preview.gateway_operation
-             WHERE tenant_id=$1 AND principal_id=$2 AND job_id=ANY($3) AND completion IS NOT NULL
-             ORDER BY operation_id LIMIT 64",
+            "SELECT o.operation_id FROM zuno_enterprise_preview.gateway_operation o
+             WHERE o.tenant_id=$1 AND o.principal_id=$2 AND o.job_id=ANY($3) AND o.completion IS NOT NULL
+               AND NOT EXISTS(SELECT 1 FROM zuno_enterprise_preview.learning_source_claim c
+                 WHERE c.tenant_id=o.tenant_id AND c.principal_id=o.principal_id AND c.root_job_id=$4
+                   AND c.origin=jsonb_build_object('kind','operation','operationId',o.operation_id))
+             ORDER BY o.operation_id LIMIT 64",
         )
         .bind(self.principal.tenant_id().as_str())
         .bind(self.principal.principal_id().as_str())
         .bind(jobs)
+        .bind(source.id.as_str())
         .fetch_all(&mut **tx)
         .await
         .map_err(sql_error)?;
-        let mut origins = vec![MemoryEvidenceOrigin::UserInput {
+        let user_origin = MemoryEvidenceOrigin::UserInput {
             session_id: source.session_id.clone(),
             input_id: source.input_id.clone(),
-        }];
+        };
+        let seen: bool = query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM zuno_enterprise_preview.learning_source_claim
+            WHERE tenant_id=$1 AND principal_id=$2 AND root_job_id=$3 AND origin=$4)",
+        )
+        .bind(self.principal.tenant_id().as_str())
+        .bind(self.principal.principal_id().as_str())
+        .bind(source.id.as_str())
+        .bind(json!(user_origin))
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(sql_error)?;
+        let mut origins = if seen { Vec::new() } else { vec![user_origin] };
         truncated |= operations.len() > 63;
         origins.extend(
             operations
@@ -262,6 +271,7 @@ impl TransactionMemory {
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         );
+        let considered = origins.clone();
         let mut sources = Vec::new();
         let mut frozen = Vec::new();
         for origin in origins {
@@ -331,31 +341,91 @@ impl TransactionMemory {
             .map_err(|error| invalid(&error.diagnostic()))?,
         )
         .map_err(|_| invalid("learning source exceeds the configured model input limit"))?;
+        let snapshots = frozen.clone();
         frozen.retain(|f| {
             request
                 .sources
                 .iter()
                 .any(|s| s.reference_id == f.reference)
         });
+        let prior: bool = query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM zuno_enterprise_preview.learning_execution
+            WHERE tenant_id=$1 AND principal_id=$2 AND source_job_id=$3 AND phase='extraction')",
+        )
+        .bind(self.principal.tenant_id().as_str())
+        .bind(self.principal.principal_id().as_str())
+        .bind(source.id.as_str())
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(sql_error)?;
+        let mut identity = json!([
+            self.principal.owner(),
+            source.id,
+            grant.extraction,
+            zuno_learning::LEARNING_EXTRACTOR_VERSION
+        ]);
+        if prior {
+            identity
+                .as_array_mut()
+                .ok_or(Error::InvalidData)?
+                .push(json!(considered));
+        }
+        let id = JobId::new(format!(
+            "learn_{}",
+            zuno_orchestration::sha256_json(&identity)
+        ))
+        .map_err(decode_error)?;
+        let admitted = !request.sources.is_empty();
         let context = ExtractionContext {
-            sources: frozen,
+            sources: frozen.clone(),
             maintenance: grant.maintenance.clone(),
             maintenance_limits: grant.maintenance_limits.clone(),
         };
-        self.insert_execution(
-            tx,
-            NewExecution {
-                id: &id,
-                source_job: &source.id,
-                session: &source.session_id,
-                configuration: &grant.extraction,
-                input: LearningInput::Extraction(request),
-                limits: &grant.extraction_limits,
-                context: json!(context),
-            },
-        )
-        .await?;
-        Ok(true)
+        if admitted {
+            self.insert_execution(
+                tx,
+                NewExecution {
+                    id: &id,
+                    source_job: &source.id,
+                    session: &source.session_id,
+                    configuration: &grant.extraction,
+                    input: LearningInput::Extraction(request),
+                    limits: &grant.extraction_limits,
+                    context: json!(context),
+                },
+            )
+            .await?;
+        }
+        for origin in considered {
+            use crate::learning_sources::SourceDisposition;
+            let included = frozen.iter().any(|entry| entry.origin == origin);
+            let digest = snapshots
+                .iter()
+                .find(|entry| entry.origin == origin)
+                .map(|entry| entry.source_digest.as_str());
+            crate::learning_sources::claim(
+                tx,
+                &self.principal.owner(),
+                source.id.as_str(),
+                &json!(origin),
+                digest,
+                if included {
+                    SourceDisposition::Captured
+                } else if digest.is_some() {
+                    SourceDisposition::Omitted
+                } else {
+                    SourceDisposition::Unavailable
+                },
+                admitted.then_some(id.as_str()),
+            )
+            .await
+            .map_err(app_error)?;
+        }
+        query("UPDATE zuno_enterprise_preview.learning_root_scan SET scanned_version=GREATEST(scanned_version,$4)
+            WHERE tenant_id=$1 AND principal_id=$2 AND root_job_id=$3")
+            .bind(self.principal.tenant_id().as_str()).bind(self.principal.principal_id().as_str())
+            .bind(source.id.as_str()).bind(version).execute(&mut **tx).await.map_err(sql_error)?;
+        Ok(admitted)
     }
 }
 

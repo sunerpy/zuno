@@ -9,6 +9,7 @@ mod browser;
 mod browser_tests;
 mod client;
 mod learning_client;
+mod learning_sources;
 mod live;
 mod memory;
 mod migration;
