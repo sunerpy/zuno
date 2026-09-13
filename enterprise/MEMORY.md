@@ -173,6 +173,15 @@ execution environment, delegation or recursively scheduled learning. Workers use
 their configured native provider/credential bindings. A user does not supply a
 model credential through the Memory API.
 
+Input selection uses the shared prompt/schema envelope and JSON escaping bound;
+the final request remains limited by the configured serialized-byte allowance.
+Small valid profiles can carry short evidence. If current Memory cannot fit a
+maintenance request, that batch becomes a durable `learning_input_budget` failure
+without a provider call. It retains bounded coordinates and the input fingerprint,
+preserves completed extraction, and does not block other owners' learning. An
+unchanged failed batch is not continually re-enqueued. The operator can choose a
+larger immutable model profile for subsequent source work.
+
 Only completed root Jobs admitted after the current automation opt-in are
 scheduled. Input and authoritative successful command evidence are frozen,
 bounded and redacted before extraction. Extraction stores validated experiences,

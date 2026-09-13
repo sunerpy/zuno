@@ -425,6 +425,40 @@ fn request() -> ExtractionRequest {
 }
 
 #[tokio::test]
+async fn small_learning_budget_uses_real_envelope_size_and_keeps_the_wire_bounded() {
+    use zuno_db::learning_source::{LearningSource, LearningSourceField, LearningSourceKind};
+    let (mut client, calls) = client(vec![answer(r#"{"experiences":[],"memories":[]}"#)]);
+    client.limits.execution_max_input_bytes = 8192;
+    client.limits.execution_max_output_tokens = 512;
+    let mut input = request();
+    input.sources = vec![LearningSource {
+        reference_id: "source-small".to_owned(),
+        source_id: "source-small".to_owned(),
+        message_id: "m".to_owned(),
+        kind: LearningSourceKind::User,
+        field: LearningSourceField::Text,
+        source_digest: "a".repeat(64),
+        content_digest: "b".repeat(64),
+        content: "Prefer exact validation; quote \"paths\" and keep backslashes \\\\.".to_owned(),
+        tool: None,
+        arguments: None,
+        proves_success: false,
+    }];
+    let prepared = client
+        .prepare_request(input.clone())
+        .expect("an 8 KiB profile can fit a short source");
+    assert_eq!(prepared.sources.len(), 1);
+    client.extract(input).await.unwrap();
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    let events = client.events.read_after("s", None).unwrap();
+    let request = events
+        .iter()
+        .find(|event| event.properties.get("request").is_some())
+        .unwrap();
+    assert!(request.properties["request"].to_string().len() <= 8192);
+}
+
+#[tokio::test]
 async fn copying_the_model_visible_source_id_preserves_verified_evidence() {
     use zuno_db::{
         learning_job::{LearningJobStore, NewLearningJob},

@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p2-memory-maintenance-wake`.
+- Current phase branch: `codex/enterprise-p2-learning-input-bounds`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -516,3 +516,10 @@ Workflow PR #218 initially exposed an arm64 stack overflow in the PostgreSQL con
 - The new regression first failed because a manual correction scheduled zero Jobs. PostgreSQL/HTTPS now pass queued/in-flight races, cancellation, evidence loss, recall suppression and two independent schedulers creating exactly one wake. The real five-process fixture passes with 47 model requests: a direct manual correction starts only maintenance, without another foreground turn or extraction. The large fault-test future is heap allocated to retain the default thread stack. Workspace check/Clippy, 100 documentation/release contracts and fmt/diff pass locally.
 - Private learning PR #229 passed all 21 checks in run `34731217056`, including native Windows, and merged only into preview at `56d95a2971c4ead8b00ddc87fa6023fd86734c2d`. Public learning activity PR #230 is separate; this maintenance batch still needs its own exact-head CI.
 - Public protocols and PostgreSQL format 21 are unchanged. English/Chinese Memory and runtime guides record the new behavior. Full P0–P6 backend acceptance remains open; UI stays paused for Penpot.
+
+## Learning input budgets and owner isolation
+
+- Shared pure request preparation now owns parameter normalization and instruction/schema serialization. Source budgets use the actual envelope plus the maximum JSON-string escaping expansion; a valid 8 KiB profile no longer loses all capacity to a fixed 16 KiB deduction. Final admission still checks the entire serialized request, including repairs and native structured-output parameters.
+- Oversized enterprise maintenance becomes a durable `learning_input_budget` failure with bounded coordinates, no provider request and no repeated admission for unchanged input. Completed extraction survives; another active user's small-profile learning proceeds. Current Memory documents are never silently truncated to make a model request fit.
+- The 8 KiB regression failed on the original code and now passes. Learning/Memory suites passed 217 tests, enterprise configuration tests passed 14, and actual PostgreSQL/HTTPS and five-process validation passed with 47 requests using an 8 KiB learning profile. Workspace check/Clippy, 100 documentation/release contracts and fmt/diff passed locally.
+- Public protocols and format 21 are unchanged. English/Chinese Memory, runtime and learning guides document the behavior. UI stays paused and excluded. PR #230 passed its required gates and merged only into preview at `ffba34a985447ac776c17185646f80ae491ff04e`; PR #231 is separate.

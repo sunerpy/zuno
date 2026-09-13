@@ -14,9 +14,7 @@ use zuno_config::ResolvedLearningConfig;
 use zuno_error::{LearningError, ProviderError};
 use zuno_llm::{
     event::{FinishReason, Message, Role, StreamEvent},
-    registry::{
-        ApiSurface, CompletionRequest, Provider, ProviderRequestContext, ToolSchema, generation,
-    },
+    registry::{ApiSurface, CompletionRequest, Provider, ProviderRequestContext, ToolSchema},
     stream::StreamAccumulator,
 };
 
@@ -53,13 +51,7 @@ impl LearningModelClient {
         input: Value,
     ) -> Result<T> {
         let schema = strict_schema::<T>();
-        let mut messages = vec![
-            Message::new(
-                Role::System,
-                format!("{system}\nOutput JSON schema:\n{schema}"),
-            ),
-            Message::new(Role::User, input.to_string()),
-        ];
+        let mut messages = crate::request::json_messages(system, &schema, &input.to_string());
         let deadline =
             tokio::time::Instant::now() + Duration::from_millis(self.limits.execution_timeout_ms);
         // A syntax repair is a new, fully logged request with the invalid answer.
@@ -115,82 +107,7 @@ impl LearningModelClient {
     ) -> Result<StreamAccumulator> {
         let deadline =
             tokio::time::Instant::now() + Duration::from_millis(self.limits.execution_timeout_ms);
-        let mut parameters = self.model.parameters.clone();
-        let mut output_limit = u64::from(self.limits.execution_max_output_tokens);
-        if output_limit == 0 {
-            return Err(invalid("learning execution output limit must be positive"));
-        }
-        for key in [
-            "maxTokens",
-            "max_tokens",
-            "max_output_tokens",
-            "max_completion_tokens",
-        ] {
-            if let Some(value) = parameters.remove(key) {
-                let limit = value
-                    .as_u64()
-                    .ok_or_else(|| invalid("model output limit must be a non-negative integer"))?;
-                // Like the foreground adapter, zero means no additional model cap.
-                // The isolated request still keeps its positive execution ceiling.
-                if limit > 0 {
-                    output_limit = output_limit.min(limit);
-                }
-            }
-        }
-        // The provider's shared apply_parameters path lowers this single bounded
-        // semantic cap after selecting its actual wire surface.
-        parameters.insert(generation::MAX_TOKENS.to_owned(), json!(output_limit));
-        if !self.model.sampling_params {
-            for key in [
-                "temperature",
-                "topP",
-                "top_p",
-                "frequencyPenalty",
-                "frequency_penalty",
-                "presencePenalty",
-                "presence_penalty",
-            ] {
-                parameters.remove(key);
-            }
-        }
-        if self.limits.execution_structured_output
-            && let Some(schema) = schema
-        {
-            match self.model.surface {
-                ApiSurface::Chat => {
-                    parameters.insert(
-                        "response_format".to_owned(),
-                        json!({"type":"json_schema","json_schema":{
-                            "name":"learning_output","strict":true,"schema":schema}}),
-                    );
-                }
-                ApiSurface::Responses => {
-                    let text = parameters.entry("text").or_insert_with(|| json!({}));
-                    let text = text
-                        .as_object_mut()
-                        .ok_or_else(|| invalid("Responses text options must be an object"))?;
-                    text.insert("format".to_owned(), json!({
-                        "type":"json_schema","name":"learning_output","strict":true,"schema":schema}));
-                }
-                ApiSurface::Messages => {
-                    let output = parameters
-                        .entry("output_config")
-                        .or_insert_with(|| json!({}));
-                    let output = output
-                        .as_object_mut()
-                        .ok_or_else(|| invalid("Messages output_config must be an object"))?;
-                    output.insert(
-                        "format".to_owned(),
-                        json!({"type":"json_schema","schema":schema}),
-                    );
-                }
-                ApiSurface::Default => {
-                    return Err(invalid(
-                        "structured output needs an explicit supported provider surface",
-                    ));
-                }
-            }
-        }
+        let parameters = self.model.request_parameters(&self.limits, schema)?;
         let tool_values: Vec<_> = tools
             .iter()
             .map(|tool| {
@@ -397,8 +314,9 @@ impl LearningExtractor for LearningModelClient {
     }
 
     fn prepare_request(&self, request: ExtractionRequest) -> Result<ExtractionRequest> {
-        // Reserve room for the schema, instructions, and one bounded syntax repair.
-        let budget = (self.limits.execution_max_input_bytes as usize).saturating_sub(16_384);
+        let budget = self
+            .model
+            .json_input_budget::<LearningExtraction>(&self.limits, extraction_prompt())?;
         request.bounded(budget)
     }
 
