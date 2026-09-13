@@ -291,6 +291,12 @@ pub enum UiAction {
     ViewWorkflow {
         job_id: JobId,
     },
+    ViewLearning {
+        job_id: JobId,
+    },
+    CancelLearning {
+        job_id: JobId,
+    },
     ViewWorkspaceMerge {
         approval_id: ApprovalId,
     },
@@ -375,6 +381,30 @@ pub enum WorkState {
     Uncertain,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundKind {
+    MemoryExtraction,
+    MemoryMaintenance,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum BackgroundProgress {
+    Learning {
+        attempts: Counter,
+        token_limit: Counter,
+        charged_tokens: Counter,
+        reserved_tokens: Counter,
+        model_requests: Counter,
+        unconfirmed_requests: Counter,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PlanStep {
@@ -441,6 +471,10 @@ pub enum SessionItem {
         job_id: JobId,
         label: String,
         state: WorkState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activity_kind: Option<BackgroundKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress: Option<BackgroundProgress>,
     },
 }
 

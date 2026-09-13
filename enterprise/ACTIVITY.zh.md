@@ -106,3 +106,14 @@ HTTPS 用例实际观察模型完成前的草稿，并验证完成后消失；SD
 重试清理和静默之后的新快照。
 
 `UiAction::ViewWorkflow` 指向持久编排 Job，数据所有者从原消息执行 Job 与调用关系生成，完成后的调用仍可查看。模型提供的工具名或结果文本不能创建该关联。
+
+私有学习使用 `SessionItem::Background`，可选 `BackgroundKind` 区分
+`MemoryExtraction`／`MemoryMaintenance`，`BackgroundProgress::Learning`
+保存精确预算和请求计数。`learning:{jobId}` 指向原始来源 Job；
+始终提供 `ViewLearning`，排队／运行时才提供 `CancelLearning`。
+旧背景记录可以缺少这些新增字段。
+
+排队、领取、模型预留／用量、重试、取消和结算都与持久活动同事务提交。
+独立 activity-session 行锁在读取旧投影之前排序写入，后台学习不获取前台执行锁；
+投影未变化不消耗游标。格式 21 原子补齐已有学习执行记录，不暴露私有快照。
+生成 SDK 支持这些记录，本批不交付 App 布局或 UI。

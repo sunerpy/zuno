@@ -42,8 +42,18 @@ The Web passes `browserContext: () => JSON.stringify([tenant, principal, client]
 after verifying `/auth/session`; that option is limited to the cookie/BFF surface.
 External API clients use a separately configured bearer token callback.
 
+`learningJobs(workspaceId, page)`, `learningJob(jobId)` and
+`cancelLearning(jobId, {requestId})` provide private learning management. Paging
+retains the returned creation-time/Job cursor; optional stage/state filters remain
+stable across pages. Counters are decimal strings, including values beyond the
+JavaScript safe-integer range. Background activity has typed extraction/maintenance
+kind, budget progress and view/cancel actions. Private execution data is rejected.
+Cancellation does not automatically retry or undo an in-flight model request.
+
 中文：该包只消费经过认证的公共历史／frame 接口；动态名称、工具来源和调用状态来自
 Rust 生成的判别联合。来源不代表执行授权。历史分页固定快照，断线从最后提交游标补读，
 整页验证失败不会留下部分更新。完整说明见 [ACTIVITY.zh.md](../ACTIVITY.zh.md)。
 `EnterpriseClient` 补充类型化应用操作；修改失败不自动重试，调用方保存原 request ID
 并通过接纳查询核查。旧历史阅读窗口用 `retain: "older"` 保留旧页，返回最新时获取新快照。
+学习管理提供 `learningJobs`、`learningJob`、`cancelLearning`；保留原游标和 request ID，
+预算使用精确字符串，背景活动由类型化种类和操作展示。App/UI 仍待 Penpot 设计。

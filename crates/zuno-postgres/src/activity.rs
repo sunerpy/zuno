@@ -27,14 +27,26 @@ impl PostgresBackend {
     }
 }
 
-/// Callers hold the source's session lock in this transaction. The counter is a
-/// logical public sequence; it is unrelated to physical rows or private events.
+/// Source updates are serialized by their owning state machine. The independent
+/// activity-session lock orders projection without requiring a background writer
+/// holding its Memory lock to acquire the foreground session execution lock.
+/// The counter is a logical public sequence, never a physical row position.
 pub(crate) async fn publish(
     connection: &mut PgConnection,
     owner: &PrincipalKey,
     session: &str,
     record: ItemRecord,
 ) -> Result<(), ApplicationError> {
+    query(
+        "SELECT sequence FROM zuno_enterprise_preview.activity_session
+        WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3 FOR UPDATE",
+    )
+    .bind(owner.tenant_id.as_str())
+    .bind(owner.principal_id.as_str())
+    .bind(session)
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(database_error)?;
     let value = json!(record);
     let previous: Option<Value> = query_scalar(
         "SELECT record FROM zuno_enterprise_preview.activity_item

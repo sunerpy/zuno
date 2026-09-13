@@ -15,6 +15,9 @@
     "cancel": {
       "$ref": "#/$defs/CancelJob"
     },
+    "cancel_learning": {
+      "$ref": "#/$defs/CancelLearning"
+    },
     "cancellation": {
       "$ref": "#/$defs/CancellationReceipt"
     },
@@ -26,6 +29,18 @@
     },
     "job": {
       "$ref": "#/$defs/JobView"
+    },
+    "learning_cancellation": {
+      "$ref": "#/$defs/LearningCancellation"
+    },
+    "learning_job": {
+      "$ref": "#/$defs/LearningJobView"
+    },
+    "learning_jobs": {
+      "$ref": "#/$defs/LearningPage"
+    },
+    "learning_query": {
+      "$ref": "#/$defs/LearningPageRequest"
     },
     "merge_content": {
       "$ref": "#/$defs/MergeContentRequest"
@@ -68,7 +83,12 @@
     "workspace_merge",
     "merge_content",
     "begin_workspace_import",
-    "workspace_import"
+    "workspace_import",
+    "learning_job",
+    "learning_jobs",
+    "learning_query",
+    "cancel_learning",
+    "learning_cancellation"
   ],
   "$defs": {
     "ApprovalAnswer": {
@@ -237,6 +257,18 @@
         "requestId",
         "expectedTurnId",
         "reason"
+      ]
+    },
+    "CancelLearning": {
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "requestId"
       ]
     },
     "CancellationReceipt": {
@@ -539,6 +571,250 @@
         "target"
       ]
     },
+    "LearningBudgetView": {
+      "type": "object",
+      "properties": {
+        "charged": {
+          "$ref": "#/$defs/Counter"
+        },
+        "limit": {
+          "$ref": "#/$defs/Counter"
+        },
+        "modelRequests": {
+          "$ref": "#/$defs/Counter"
+        },
+        "reserved": {
+          "$ref": "#/$defs/Counter"
+        },
+        "unconfirmedRequests": {
+          "$ref": "#/$defs/Counter"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "limit",
+        "charged",
+        "reserved",
+        "modelRequests",
+        "unconfirmedRequests"
+      ]
+    },
+    "LearningCancellation": {
+      "type": "object",
+      "properties": {
+        "job": {
+          "$ref": "#/$defs/LearningJobView"
+        },
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "requestId",
+        "job"
+      ]
+    },
+    "LearningCursor": {
+      "type": "object",
+      "properties": {
+        "createdAtMs": {
+          "$ref": "#/$defs/Counter"
+        },
+        "jobId": {
+          "$ref": "#/$defs/JobId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "createdAtMs",
+        "jobId"
+      ]
+    },
+    "LearningFailureView": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "code"
+      ]
+    },
+    "LearningJobView": {
+      "type": "object",
+      "properties": {
+        "attempts": {
+          "$ref": "#/$defs/Counter"
+        },
+        "budget": {
+          "$ref": "#/$defs/LearningBudgetView"
+        },
+        "canCancel": {
+          "type": "boolean"
+        },
+        "createdAtMs": {
+          "$ref": "#/$defs/Counter"
+        },
+        "deadlineAtMs": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Counter"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "failure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LearningFailureView"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "$ref": "#/$defs/JobId"
+        },
+        "readyAtMs": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Counter"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "sourceJobId": {
+          "$ref": "#/$defs/JobId"
+        },
+        "stage": {
+          "$ref": "#/$defs/LearningStage"
+        },
+        "state": {
+          "$ref": "#/$defs/LearningState"
+        },
+        "updatedAtMs": {
+          "$ref": "#/$defs/Counter"
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "workspaceId",
+        "sessionId",
+        "sourceJobId",
+        "stage",
+        "state",
+        "attempts",
+        "budget",
+        "createdAtMs",
+        "updatedAtMs",
+        "canCancel"
+      ]
+    },
+    "LearningPage": {
+      "type": "object",
+      "properties": {
+        "before": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LearningCursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LearningJobView"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "items"
+      ]
+    },
+    "LearningPageRequest": {
+      "type": "object",
+      "properties": {
+        "before": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LearningCursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "limit": {
+          "$ref": "#/$defs/PageSize",
+          "default": 50
+        },
+        "stage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LearningStage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LearningState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "LearningStage": {
+      "type": "string",
+      "enum": [
+        "extraction",
+        "maintenance"
+      ]
+    },
+    "LearningState": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "running",
+        "completed",
+        "skipped",
+        "failed",
+        "cancelled",
+        "uncertain"
+      ]
+    },
     "MergeChoice": {
       "type": "string",
       "enum": [
@@ -624,6 +900,11 @@
       "maxLength": 128,
       "minLength": 1,
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "PageSize": {
+      "type": "integer",
+      "maximum": 100,
+      "minimum": 1
     },
     "PrincipalId": {
       "type": "string",

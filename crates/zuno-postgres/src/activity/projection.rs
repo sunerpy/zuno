@@ -522,6 +522,8 @@ async fn job(
                 job_id,
                 label: "Agent turn".to_owned(),
                 state,
+                activity_kind: None,
+                progress: None,
             },
             actions,
         },

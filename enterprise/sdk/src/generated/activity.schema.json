@@ -44,6 +44,54 @@
         "revoked"
       ]
     },
+    "BackgroundKind": {
+      "type": "string",
+      "enum": [
+        "memory_extraction",
+        "memory_maintenance"
+      ]
+    },
+    "BackgroundProgress": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "attempts": {
+              "$ref": "#/$defs/Counter"
+            },
+            "chargedTokens": {
+              "$ref": "#/$defs/Counter"
+            },
+            "kind": {
+              "type": "string",
+              "const": "learning"
+            },
+            "modelRequests": {
+              "$ref": "#/$defs/Counter"
+            },
+            "reservedTokens": {
+              "$ref": "#/$defs/Counter"
+            },
+            "tokenLimit": {
+              "$ref": "#/$defs/Counter"
+            },
+            "unconfirmedRequests": {
+              "$ref": "#/$defs/Counter"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "attempts",
+            "tokenLimit",
+            "chargedTokens",
+            "reservedTokens",
+            "modelRequests",
+            "unconfirmedRequests"
+          ]
+        }
+      ]
+    },
     "CommittedEvent": {
       "oneOf": [
         {
@@ -1268,6 +1316,16 @@
         {
           "type": "object",
           "properties": {
+            "activityKind": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/BackgroundKind"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "jobId": {
               "$ref": "#/$defs/JobId"
             },
@@ -1277,6 +1335,16 @@
             },
             "label": {
               "type": "string"
+            },
+            "progress": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/BackgroundProgress"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "state": {
               "$ref": "#/$defs/WorkState"
@@ -1334,6 +1402,40 @@
             "kind": {
               "type": "string",
               "const": "view_workflow"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "jobId"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "jobId": {
+              "$ref": "#/$defs/JobId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "view_learning"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "jobId"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "jobId": {
+              "$ref": "#/$defs/JobId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "cancel_learning"
             }
           },
           "additionalProperties": false,

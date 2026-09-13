@@ -354,3 +354,14 @@ The exact format-19 fixture uses source digest
 `c7697391f1025e4fc0b7f6c959d0329fdffb44181bb6bdb18661bcc2c328e037`
 and verifies preserved sessions, messages, Memory, Jobs and prior consent through
 success and injected rollback. Preview migration does not touch personal data.
+
+## Format 21: learning control and public activity
+
+`learning_control_request` stores owner-scoped cancellation receipts with forced
+RLS. Workspace/history indexes support bounded cursor reads. Migration backfills
+existing learning executions into committed activity using only public DTO fields.
+The exact format-20 source digest is
+`221d2bd0288395486347b08c3f230a109d0ff6305948ece85f375e879034b1f1`.
+Tests preserve sessions, messages, Memory and learning inputs on failed DDL,
+then verify successful backfill and duplicate-free migration replay. Cancellation,
+reservation settlement, receipt and activity either all commit or all roll back.

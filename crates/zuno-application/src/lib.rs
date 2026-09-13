@@ -12,6 +12,7 @@ pub mod control;
 pub mod council;
 pub mod environment;
 pub mod learning;
+pub mod learning_api;
 pub mod live;
 pub mod runtime;
 pub mod workflow;

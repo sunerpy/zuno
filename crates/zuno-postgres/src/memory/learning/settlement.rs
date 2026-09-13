@@ -73,6 +73,7 @@ impl PostgresLearningRuntime {
                     WHERE tenant_id=$1 AND principal_id=$2 AND id=$3")
                     .bind(completion.lease.owner.tenant_id.as_str()).bind(completion.lease.owner.principal_id.as_str()).bind(job.id.as_str())
                     .bind(json!({"completionDigest":digest})).execute(&mut **tx).await.map_err(sql_error)?;
+                crate::learning_client::publish_in(tx,&completion.lease.owner,&job.id).await.map_err(app_error)?;
                 Ok(())
             })
         }).await

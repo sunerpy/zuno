@@ -247,6 +247,19 @@ async fn public_application_keeps_users_isolated_and_requires_current_policy_for
         .await
         .unwrap();
     assert_eq!(repeated_memory, applied);
+    let learning = http
+        .get(api("workspaces/workspace/learning/jobs"))
+        .bearer_auth("alice")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        learning.status(),
+        reqwest::StatusCode::OK,
+        "an installed Memory backend exposes its owner's learning management page"
+    );
+    let learning: Value = learning.json().await.unwrap();
+    assert_eq!(learning["items"], json!([]));
     let injected_owner = http
         .post(api("workspaces/workspace/memory"))
         .bearer_auth("bob")
@@ -309,6 +322,7 @@ async fn public_application_keeps_users_isolated_and_requires_current_policy_for
     let job: Value = response.json().await.unwrap();
     assert_eq!(job["inputVersion"], "1");
     assert_eq!(job["phase"], "ready");
+    verify_learning_management(&http, &endpoint, &admin, &alice, &job).await;
     let receipt_path = format!(
         "sessions/{}/requests/{}",
         session["id"].as_str().unwrap(),
@@ -685,4 +699,110 @@ async fn public_application_keeps_users_isolated_and_requires_current_policy_for
     );
     server.abort();
     let _ = server.await;
+}
+
+async fn verify_learning_management(
+    http: &reqwest::Client,
+    endpoint: &url::Url,
+    admin: &sqlx_postgres::PgPool,
+    actor: &zuno_types::identity::PrincipalScope,
+    root: &Value,
+) {
+    query("INSERT INTO zuno_enterprise_preview.learning_job
+        (tenant_id,principal_id,id,workspace_id,session_id,kind,status,payload,time_updated)
+        VALUES($1,$2,'learning-api','workspace',$3,'extraction','queued','{\"privateSource\":\"never-return-source\"}',1000)")
+        .bind(actor.tenant_id().as_str()).bind(actor.principal_id().as_str()).bind(root["sessionId"].as_str().unwrap())
+        .execute(admin).await.unwrap();
+    query("INSERT INTO zuno_enterprise_preview.learning_execution
+        (tenant_id,principal_id,job_id,source_job_id,phase,principal,configuration,input,input_digest,limits,context,ready_at,created_at)
+        VALUES($1,$2,'learning-api',$3,'extraction',$4,'{}','{\"privateSource\":\"never-return-source\"}',repeat('a',64),
+        '{\"totalTokens\":100000}','{\"grant\":\"never-return-grant\"}',1000,1000)")
+        .bind(actor.tenant_id().as_str()).bind(actor.principal_id().as_str()).bind(root["id"].as_str().unwrap())
+        .bind(json!(actor)).execute(admin).await.unwrap();
+    let url = endpoint.join("api/v1/learning/jobs/learning-api").unwrap();
+    for token in ["bob", "workload"] {
+        let response = http
+            .get(url.clone())
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert!(matches!(
+            response.status(),
+            StatusCode::NOT_FOUND | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ));
+    }
+    let job: Value = http
+        .get(url.clone())
+        .bearer_auth("alice")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(job["state"], "queued");
+    assert_eq!(job["budget"]["limit"], "100000");
+    assert!(!job.to_string().contains("never-return"));
+    assert!(!job.to_string().contains("configuration"));
+    let invalid = endpoint
+        .join("api/v1/workspaces/workspace/learning/jobs?beforeCreatedAtMs=1000")
+        .unwrap();
+    assert_eq!(
+        http.get(invalid)
+            .bearer_auth("alice")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let cancellation = endpoint
+        .join("api/v1/learning/jobs/learning-api/cancel")
+        .unwrap();
+    let request = json!({"requestId":"learning-stop"});
+    let cancelled: Value = http
+        .post(cancellation.clone())
+        .bearer_auth("alice")
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cancelled["job"]["state"], "cancelled");
+    let repeated: Value = http
+        .post(cancellation)
+        .bearer_auth("alice")
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cancelled, repeated);
+    let filtered = endpoint
+        .join("api/v1/workspaces/workspace/learning/jobs?state=cancelled&limit=1")
+        .unwrap();
+    let page: Value = http
+        .get(filtered)
+        .bearer_auth("alice")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    assert_eq!(page["items"][0]["id"], "learning-api");
 }

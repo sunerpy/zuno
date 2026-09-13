@@ -209,12 +209,97 @@ pub async fn verify(
     }
     let jobs:i64=query_scalar("SELECT count(*) FROM zuno_enterprise_preview.learning_execution e
         JOIN zuno_enterprise_preview.learning_job j ON j.tenant_id=e.tenant_id AND j.principal_id=e.principal_id AND j.id=e.job_id
-        WHERE e.source_job_id=$1 AND j.status='completed'").bind(source).fetch_one(admin).await.unwrap();
+        WHERE e.source_job_id=$1 AND j.status='completed'").bind(&source).fetch_one(admin).await.unwrap();
     assert_eq!(
         jobs, 2,
         "extraction and maintenance are separately settled jobs"
     );
     assert_eq!(issuer.model_requests.load(Ordering::SeqCst), before + 3);
+    let page: Value = http
+        .get(format!(
+            "{control}api/v1/workspaces/workspace/learning/jobs?limit=1"
+        ))
+        .bearer_auth(alice)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    let first = &page["items"][0];
+    assert_eq!(first["state"], "completed");
+    assert_eq!(first["sourceJobId"], source);
+    assert!(first["budget"]["charged"].is_string());
+    assert!(!page.to_string().contains("lease"));
+    assert!(!page.to_string().contains("configuration"));
+    let cursor = &page["before"];
+    let next: Value = http
+        .get(format!(
+            "{control}api/v1/workspaces/workspace/learning/jobs"
+        ))
+        .bearer_auth(alice)
+        .query(&[
+            ("limit", "1"),
+            ("beforeCreatedAtMs", cursor["createdAtMs"].as_str().unwrap()),
+            ("beforeJobId", cursor["jobId"].as_str().unwrap()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_ne!(first["id"], next["items"][0]["id"]);
+    assert_eq!(
+        http.get(format!(
+            "{control}api/v1/learning/jobs/{}",
+            first["id"].as_str().unwrap()
+        ))
+        .bearer_auth(bob)
+        .send()
+        .await
+        .unwrap()
+        .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    let history: Value = http
+        .get(format!(
+            "{control}api/v1/sessions/{}/history",
+            first["sessionId"].as_str().unwrap()
+        ))
+        .bearer_auth(alice)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let learning_items = history["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| {
+            item["record"]["item"]["activityKind"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("memory_"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        learning_items.len(),
+        2,
+        "both completed model jobs remain in durable activity"
+    );
+    for item in learning_items {
+        assert_eq!(item["record"]["item"]["state"], "completed");
+        assert_eq!(item["record"]["actions"][0]["kind"], "view_learning");
+    }
     assert!(
         !memory(
             http,

@@ -75,3 +75,10 @@ ACP bridge 不应为了跳过 HITL 而加入审批应用白名单。审批决定
 及输入版本 0；上传为原始 `application/x-tar` 字节。仅当前审批应用中的认证用户可以
 初始化，导入与首轮输入不能同时接纳。恢复接纳前可取消；开始后重试同一归档或查看状态。
 详见[项目初始化](WORKSPACES.zh.md#初始化项目)。
+
+装配 Memory 后，`GET /workspaces/{workspace}/learning/jobs` 提供作用域化学习任务分页，
+`GET /learning/jobs/{job}` 返回安全状态和精确预算，`POST /learning/jobs/{job}/cancel`
+接受 `requestId` 幂等取消。分页参数为 `limit`（1–100）、完整的
+`beforeCreatedAtMs`／`beforeJobId` 游标，以及可选 `stage`／`state`。
+取消撤销运行权但保留终态结果与迟到用量核查；两个应用前缀均遵循原认证和 BFF CSRF
+规则。详见[学习管理](MEMORY.zh.md#查询及取消学习任务)。

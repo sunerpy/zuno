@@ -150,6 +150,9 @@ impl TransactionMemory {
             .bind(new.id.as_str()).bind(new.source_job.as_str()).bind(phase(&new.input)).bind(json!(self.principal))
             .bind(json!(new.configuration)).bind(json!(new.input)).bind(input_digest).bind(json!(new.limits))
             .bind(new.context).bind(now).execute(&mut **tx).await.map_err(sql_error)?;
+        crate::learning_client::publish_in(tx, &self.principal.owner(), new.id)
+            .await
+            .map_err(app_error)?;
         Ok(())
     }
 
@@ -247,6 +250,9 @@ impl TransactionMemory {
                 .execute(&mut **tx)
                 .await
                 .map_err(sql_error)?;
+                crate::learning_client::publish_in(tx, &self.principal.owner(), job)
+                    .await
+                    .map_err(app_error)?;
                 return Ok(None);
             }
         } else if status != "queued" {
@@ -265,6 +271,9 @@ impl TransactionMemory {
                 result='{\"code\":\"learning_budget\"}',time_updated=$4 WHERE tenant_id=$1 AND principal_id=$2 AND id=$3")
                 .bind(self.principal.tenant_id().as_str()).bind(self.principal.principal_id().as_str()).bind(job.as_str()).bind(now)
                 .execute(&mut **tx).await.map_err(sql_error)?;
+            crate::learning_client::publish_in(tx, &self.principal.owner(), job)
+                .await
+                .map_err(app_error)?;
             return Ok(None);
         }
         self.require_automation(tx, Some(value.session.as_str()))
@@ -292,6 +301,9 @@ impl TransactionMemory {
             VALUES($1,$2,$3,$4,$5,$6,$7)")
             .bind(self.principal.tenant_id().as_str()).bind(self.principal.principal_id().as_str()).bind(job.as_str()).bind(epoch)
             .bind(worker.as_str()).bind(&token).bind(now).execute(&mut **tx).await.map_err(sql_error)?;
+        crate::learning_client::publish_in(tx, &self.principal.owner(), job)
+            .await
+            .map_err(app_error)?;
         Ok(Some(ClaimedLearning {
             lease: LearningExecutionLease {
                 owner: self.principal.owner(),
@@ -337,6 +349,9 @@ impl PostgresLearningRuntime {
                 WHERE tenant_id=$1 AND principal_id=$2 AND job_id=$3")
                 .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(job.as_str())
                 .execute(&mut *tx).await.map_err(sql_error)?;
+            crate::learning_client::publish_in(&mut tx, owner, job)
+                .await
+                .map_err(app_error)?;
         }
         tx.commit().await.map_err(sql_error)
     }
@@ -508,6 +523,7 @@ impl PostgresLearningRuntime {
                 WHERE tenant_id=$1 AND principal_id=$2 AND id=$3")
                 .bind(lease.owner.tenant_id.as_str()).bind(lease.owner.principal_id.as_str()).bind(lease.job_id.as_str())
                 .bind(state).bind(result).bind(now).execute(&mut **tx).await.map_err(sql_error)?;
+            crate::learning_client::publish_in(tx,&lease.owner,&lease.job_id).await.map_err(app_error)?;
             Ok(())
         })).await
     }
