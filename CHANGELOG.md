@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.38](https://github.com/sunerpy/zuno/compare/v0.10.37...v0.10.38) (2026-09-13)
+
+
+### Bug Fixes
+
+* **runtime:** 保留密封历史回放并锁定当前工具授权 ([#249](https://github.com/sunerpy/zuno/issues/249)) ([0f069d1](https://github.com/sunerpy/zuno/commit/0f069d1e6d24581ad941ab6bf681141480084330))
+
 ## [0.10.37](https://github.com/sunerpy/zuno/compare/v0.10.36...v0.10.37) (2026-09-13)
 
 
