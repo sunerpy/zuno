@@ -7,6 +7,10 @@ use zuno_application::{
         CancelLearning, LearningCancellation, LearningJobView, LearningPage, LearningPageRequest,
     },
     mcp::McpCallView,
+    shared_memory::{
+        ConfigureSharedMemory, ProposeSharedMemory, ReviewSharedMemory, SharedMemoryChange,
+        SharedMemoryPage, SharedMemorySpace,
+    },
     workflow::WorkflowRunView,
     workspace_edit::WorkspaceEditView,
     workspace_import::{BeginWorkspaceImport, WorkspaceImportView},
@@ -19,6 +23,12 @@ use zuno_application::{
     reason = "schema-only root collects public application DTOs for generated clients"
 )]
 struct ApplicationProtocol {
+    shared_memory_space: SharedMemorySpace,
+    shared_memory_page: SharedMemoryPage,
+    shared_memory_change: SharedMemoryChange,
+    configure_shared_memory: ConfigureSharedMemory,
+    propose_shared_memory: ProposeSharedMemory,
+    review_shared_memory: ReviewSharedMemory,
     workspace: WorkspaceView,
     session: SessionSummary,
     sessions: SessionPage,

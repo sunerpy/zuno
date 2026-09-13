@@ -38,6 +38,9 @@ pub struct MemoryChange {
 )]
 pub enum MemoryCommand {
     Read,
+    /// Enterprise organization namespaces. The host resolves current membership
+    /// and the user's Memory policy, never a caller-supplied owner.
+    ReadShared,
     ReadEntries {
         query: MemoryQuery,
     },
@@ -139,6 +142,10 @@ impl Default for MemoryPolicy {
     deny_unknown_fields
 )]
 pub enum MemoryReply {
+    SharedSnapshot {
+        documents: Vec<SharedMemorySnapshot>,
+        omitted_spaces: Vec<zuno_types::identity::MemorySpaceId>,
+    },
     Snapshot {
         documents: Vec<MemorySnapshot>,
     },
@@ -162,6 +169,16 @@ pub enum MemoryReply {
         evidence_ids: Vec<String>,
         retracted: usize,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SharedMemorySnapshot {
+    pub space_id: zuno_types::identity::MemorySpaceId,
+    pub title: String,
+    pub revision: u64,
+    pub content: String,
+    pub digest: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

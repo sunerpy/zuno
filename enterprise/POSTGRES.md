@@ -403,3 +403,11 @@ The exact format-23 source digest is
 The migration preserves sessions, messages, Memory, learning scan watermarks and
 file-edit rows; DDL failure rolls back the entire upgrade. MCP failure semantics
 and the independent gateway journal are documented in [MCP.md](MCP.md).
+
+## Format 25: organization Memory namespaces
+
+Shared spaces, explicit members, reviewed changes, revisions, idempotent receipts
+and audit rows commit in one PostgreSQL transaction with forced namespace RLS.
+The exact format-24 migration retains private user data and MCP records; its
+source digest is `9ec0c1656e9e6518afdaf61de00b4689d4f2d603270677c942c3ada589485078`.
+See [SHARED_MEMORY.md](SHARED_MEMORY.md) for role and recovery semantics.

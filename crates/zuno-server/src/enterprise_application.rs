@@ -1,6 +1,7 @@
 //! Client application routes. No Worker grants, checkpoints or private replay
 //! material are serialized by this module.
 mod learning;
+mod shared_memory;
 
 use crate::enterprise_browser::EnterpriseBrowser;
 use axum::{
@@ -156,6 +157,24 @@ impl EnterpriseApplication {
                 );
         }
         if self.memory.is_some() {
+            router = router
+                .route(
+                    "/workspaces/{workspace}/memory/spaces",
+                    get(shared_memory::list),
+                )
+                .route(
+                    "/memory/spaces/{space}",
+                    get(shared_memory::get).put(shared_memory::configure),
+                )
+                .route(
+                    "/memory/spaces/{space}/changes",
+                    post(shared_memory::propose),
+                )
+                .route(
+                    "/memory/spaces/{space}/changes/{change}",
+                    get(shared_memory::change),
+                )
+                .route("/memory/spaces/{space}/review", post(shared_memory::review));
             router = router.route("/workspaces/{workspace}/memory", post(memory_request));
             router = router
                 .route("/workspaces/{workspace}/learning/jobs", get(learning::list))

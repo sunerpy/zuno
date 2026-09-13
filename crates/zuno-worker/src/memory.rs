@@ -99,15 +99,50 @@ impl MemoryContextRefresher {
         let MemoryReply::Snapshot { documents } = reply else {
             return Err(TurnStateError::InvalidData.into());
         };
+        let shared = self
+            .service
+            .request(MemoryRequest {
+                request_id: RequestId::new("shared-memory-before-provider")
+                    .expect("static identity"),
+                command: MemoryCommand::ReadShared,
+            })
+            .await
+            .map_err(|error| match error {
+                MemoryServiceError::Denied => TurnStateError::Forbidden,
+                MemoryServiceError::Conflict => TurnStateError::LeaseLost,
+                MemoryServiceError::Unavailable => TurnStateError::Unavailable,
+                _ => TurnStateError::InvalidData,
+            })?;
+        let MemoryReply::SharedSnapshot {
+            documents: shared,
+            omitted_spaces,
+        } = shared
+        else {
+            return Err(TurnStateError::InvalidData.into());
+        };
+        let mut content = documents
+            .into_iter()
+            .map(|document| document.content)
+            .collect::<Vec<_>>();
+        for document in shared {
+            if zuno_orchestration::sha256_text(&document.content) != document.digest {
+                return Err(TurnStateError::InvalidData.into());
+            }
+            content.push(document.content);
+        }
+        if !omitted_spaces.is_empty() {
+            content.push(format!(
+                "Shared Memory spaces omitted from the bounded context: {}.",
+                omitted_spaces
+                    .iter()
+                    .map(|id| id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         // Empty content deliberately replaces any previous Memory rather than
         // leaving a withdrawn snapshot in a recovered checkpoint.
-        Ok(self.base.clone().with_memory(
-            documents
-                .into_iter()
-                .map(|document| document.content)
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-        ))
+        Ok(self.base.clone().with_memory(content.join("\n\n")))
     }
 }
 #[async_trait]

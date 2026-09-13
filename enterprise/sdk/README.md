@@ -66,3 +66,8 @@ Use `mcpReview(approvalId)` to retrieve the complete approved target, declaratio
 and arguments. Identity/schema validation rejects unrelated approvals and
 private execution fields. `view_mcp_call` is a typed client action; no App/UI is
 implemented by this SDK change.
+
+Shared Memory methods validate namespace, workspace and change identity while
+keeping revisions as decimal strings. Configuration and review use the same
+authenticated API/BFF transport; a client role field is never an approval grant.
+See `enterprise/SHARED_MEMORY.md` for the complete backend contract.

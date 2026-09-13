@@ -5,6 +5,20 @@ import { EnterpriseClient, EnterpriseHttpError } from "../dist/src/index.js";
 const job = { id: "job", sessionId: "session", turnId: "turn", inputId: "input", phase: "ready", inputVersion: "1", waits: [], stopRequested: false, pendingOperations: [] };
 const response = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 
+test("shared Memory keeps namespace, workspace, revision and review identity", async () => {
+  const space={id:"runbooks",workspaceId:"workspace",title:"Runbooks",enabled:true,policyRevision:"1",
+    documentRevision:"9007199254740993",entries:["reviewed"],digest:"a".repeat(64),role:"reader",characterLimit:3000};
+  const change={id:"change",spaceId:"runbooks",author:"alice",baseRevision:"1",policyRevision:"1",before:[],after:["reviewed"],
+    reason:"Record the runbook",state:"pending",stateDigest:"b".repeat(64),decidedBy:null,appliedRevision:null};
+  const client=(value)=>new EnterpriseClient({baseUrl:"https://enterprise.example/api/v1/",accessToken:async()=>"test-token",fetch:async()=>response(value)});
+  assert.equal((await client(space).sharedMemorySpace("runbooks")).documentRevision,"9007199254740993");
+  await assert.rejects(client({...space,id:"foreign"}).sharedMemorySpace("runbooks"),/identity mismatch/);
+  await assert.rejects(client({items:[{...space,workspaceId:"other"}],after:null}).sharedMemorySpaces("workspace"),/workspace mismatch/);
+  await assert.rejects(client({...change,spaceId:"foreign"}).sharedMemoryChange("runbooks","change"),/identity mismatch/);
+  await assert.rejects(client({...change,id:"different"}).reviewSharedMemory("runbooks",
+    {requestId:"review",changeId:"change",expectedState:change.stateDigest,decision:"apply"}),/identity mismatch/);
+});
+
 test("MCP review retains exact declared arguments without granting private execution authority", async () => {
   const review={approvalId:"approval",operationId:"mcp-operation",server:"server",tool:"apply",endpoint:"https://mcp.example/tool",
     definition:{name:"apply",inputSchema:{type:"object"}},arguments:{value:"reviewed"},admitted:false};

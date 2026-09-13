@@ -28,6 +28,7 @@ export type PrincipalId = string;
 export type TenantId = string;
 export type ApprovalState = "pending" | "automatic" | "approved" | "rejected" | "expired" | "invalidated";
 export type Counter = string;
+export type SharedMemoryRole = "reader" | "contributor" | "reviewer";
 export type WorkspaceId = string;
 export type InputId = string;
 export type JobPhase = "ready" | "running" | "waiting" | "paused" | "completed" | "failed" | "cancelled" | "uncertain";
@@ -60,6 +61,23 @@ export type LearningState = "queued" | "running" | "completed" | "skipped" | "fa
 export type ActivityName = string;
 export type WorkspacePath = string;
 export type MergeContentSide = "base" | "parent" | "child";
+export type SharedMemoryEdit =
+  | {
+      content: string;
+      kind: "add";
+    }
+  | {
+      content: string;
+      kind: "replace";
+      oldText: string;
+    }
+  | {
+      kind: "remove";
+      oldText: string;
+    };
+export type SharedMemoryDecision = "apply" | "reject" | "undo";
+export type MemorySpaceId = string;
+export type SharedMemoryChangeState = "pending" | "applied" | "rejected" | "undone" | "invalidated";
 export type CouncilPhase = "seats" | "stopping" | "synthesis" | "completed" | "failed" | "cancelled" | "uncertain";
 export type CouncilSeatState =
   | "pending"
@@ -114,6 +132,7 @@ export interface ApplicationProtocol {
   cancel: CancelJob;
   cancel_learning: CancelLearning;
   cancellation: CancellationReceipt;
+  configure_shared_memory: ConfigureSharedMemory;
   create_session: CreateSession;
   input_version: InputVersionView;
   job: JobView;
@@ -123,8 +142,13 @@ export interface ApplicationProtocol {
   learning_query: LearningPageRequest;
   mcp_call: McpCallView;
   merge_content: MergeContentRequest;
+  propose_shared_memory: ProposeSharedMemory;
+  review_shared_memory: ReviewSharedMemory;
   session: SessionSummary;
   sessions: SessionPage;
+  shared_memory_change: SharedMemoryChange;
+  shared_memory_page: SharedMemoryPage;
+  shared_memory_space: SharedMemorySpace;
   submit_turn: SubmitTurn;
   workflow: WorkflowRunView;
   workspace: WorkspaceView;
@@ -193,6 +217,19 @@ export interface CancellationReceipt {
   requestId: RequestId;
   stoppedJobs: JobId[];
   turnId: TurnId;
+}
+export interface ConfigureSharedMemory {
+  characterLimit: number;
+  enabled: boolean;
+  expectedRevision: Counter;
+  members: SharedMemoryMember[];
+  requestId: RequestId;
+  title: string;
+  workspaceId: WorkspaceId;
+}
+export interface SharedMemoryMember {
+  principalId: PrincipalId;
+  role: SharedMemoryRole;
 }
 export interface CreateSession {
   requestId: RequestId;
@@ -287,6 +324,18 @@ export interface MergeContentRequest {
   path: WorkspacePath;
   side: MergeContentSide;
 }
+export interface ProposeSharedMemory {
+  edits: SharedMemoryEdit[];
+  expectedRevision: Counter;
+  reason: string;
+  requestId: RequestId;
+}
+export interface ReviewSharedMemory {
+  changeId: RequestId;
+  decision: SharedMemoryDecision;
+  expectedState: string;
+  requestId: RequestId;
+}
 /**
  * A session's public summary. Filesystem locations remain backend-owned.
  */
@@ -307,6 +356,36 @@ export interface SessionPage {
 export interface SessionCursor {
   sessionId: SessionId;
   updatedAt: number;
+}
+export interface SharedMemoryChange {
+  after: string[];
+  appliedRevision?: Counter | null;
+  author: PrincipalId;
+  baseRevision: Counter;
+  before: string[];
+  decidedBy?: PrincipalId | null;
+  id: RequestId;
+  policyRevision: Counter;
+  reason: string;
+  spaceId: MemorySpaceId;
+  state: SharedMemoryChangeState;
+  stateDigest: string;
+}
+export interface SharedMemoryPage {
+  after?: MemorySpaceId | null;
+  items: SharedMemorySpace[];
+}
+export interface SharedMemorySpace {
+  characterLimit: number;
+  digest: string;
+  documentRevision: Counter;
+  enabled: boolean;
+  entries: string[];
+  id: MemorySpaceId;
+  policyRevision: Counter;
+  role: SharedMemoryRole;
+  title: string;
+  workspaceId: WorkspaceId;
 }
 export interface SubmitTurn {
   expectedInputVersion: string;

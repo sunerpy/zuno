@@ -19,6 +19,7 @@ mod runtime;
 #[cfg(test)]
 mod runtime_tests;
 mod session;
+mod shared_memory;
 #[cfg(test)]
 mod tests;
 mod turn;

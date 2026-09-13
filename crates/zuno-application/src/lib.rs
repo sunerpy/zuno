@@ -16,6 +16,7 @@ pub mod learning_api;
 pub mod live;
 pub mod mcp;
 pub mod runtime;
+pub mod shared_memory;
 pub mod workflow;
 pub mod workspace_edit;
 pub mod workspace_files;

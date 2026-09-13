@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p3-mcp-operations`.
+- Current phase branch: `codex/enterprise-p2-shared-memory`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -568,3 +568,16 @@ owner or declaration was refused. Administrator audit visibility does not permit
 answering requester-only approval. Workspace check, Clippy, formatting and all
 100 documentation/release contracts passed. Exact-archive and preview CI evidence
 remain required before publication. App/UI design and delivery remain paused.
+
+## Organization Memory spaces under validation
+
+Explicit tenant-owned spaces, membership, independent review, atomic revisions,
+undo and Worker snapshot refresh are implemented on the phase branch. Real
+PostgreSQL tests cover RLS, self-approval refusal, rollback, deduplication and
+revocation. Native two-Worker/two-gateway validation passed user opt-out/opt-in,
+revocation and continuation of the same Job after an approval wait: the next
+provider request contains no withdrawn shared notes. SDK 26 tests and generated
+contracts pass; workspace checks, Clippy and 100 documentation/release contracts
+passed. Exact-archive and preview CI validation remain required. Private-source
+sharing and automatic shared maintenance are still pending full-goal work.
+App/UI remains paused; publication remains disabled.

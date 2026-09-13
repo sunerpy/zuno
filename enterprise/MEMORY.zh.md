@@ -213,3 +213,10 @@ PostgreSQL 格式 20 保留旧数据，原有授权行的自动学习仍关闭�
 会话历史从排队到结算保留同一逻辑学习 Job，携带类型化种类、预算进度及可用操作。
 SDK 提供 `learningJobs`、`learningJob` 和 `cancelLearning`。本批交付后端及客户端
 契约；App 设计与 UI 交付仍暂停。
+
+## 明确的组织共享
+
+组织空间与个人 Global／Project 常驻范围分离。`SharedMemoryStore` 使用明确
+成员资格和独立审核，个人自动学习不会隐式公开。Worker 协议 12 在每次模型请求
+前读取有界共享快照，并遵循继承的 `useMemories`。实际 API 与限制见
+[SHARED_MEMORY.zh.md](SHARED_MEMORY.zh.md)。
