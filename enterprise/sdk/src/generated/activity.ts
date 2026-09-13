@@ -37,6 +37,10 @@ export type UiAction =
       kind: "view_workspace_edit";
     }
   | {
+      approvalId: ApprovalId;
+      kind: "view_mcp_call";
+    }
+  | {
       importId: WorkspaceImportId;
       kind: "view_workspace_import";
       sessionId: SessionId;

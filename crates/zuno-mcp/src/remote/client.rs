@@ -16,6 +16,29 @@ use super::{
 };
 
 impl RemoteClient {
+    /// Opens one Streamable HTTP session with caller-owned credentials and HTTP
+    /// policy. Never reads a process credential store, performs OAuth discovery,
+    /// refreshes tokens, or falls back to another transport.
+    ///
+    /// The host owns target validation, TLS roots, redirect policy and credential
+    /// lifetime. Create a separate connection for each security principal; MCP
+    /// session identifiers must not be shared across owners.
+    pub async fn connect_with_client(
+        server: impl Into<String>,
+        config: &McpRemote,
+        bearer: Option<zuno_auth::Secret>,
+        http: reqwest::Client,
+    ) -> Result<Self, RemoteError> {
+        super::transport::connect_with_client(
+            &server.into(),
+            config,
+            RemoteTransport::StreamableHttp,
+            bearer,
+            http,
+        )
+        .await
+    }
+
     /// Connects using the process-wide `mcp-auth.json` store.
     pub async fn connect(
         server: impl Into<String>,
@@ -100,7 +123,21 @@ impl RemoteClient {
 
     /// Lists every tool page advertised by the server.
     pub async fn list_tools(&self) -> Result<Vec<ToolDefinition>, RemoteError> {
+        self.list_tools_bounded(usize::MAX, usize::MAX).await
+    }
+
+    /// Lists complete declarations within host-selected aggregate bounds. A
+    /// partial list is never reported as the complete server catalog.
+    pub async fn list_tools_bounded(
+        &self,
+        maximum_tools: usize,
+        maximum_bytes: usize,
+    ) -> Result<Vec<ToolDefinition>, RemoteError> {
+        if maximum_tools == 0 || maximum_bytes == 0 {
+            return Err(self.protocol_error("invalid MCP catalog bounds".to_owned()));
+        }
         let mut tools = Vec::new();
+        let mut bytes = 0usize;
         let mut cursor: Option<String> = None;
         let mut seen = HashSet::new();
         for _ in 0..MAX_LIST_PAGES {
@@ -111,6 +148,15 @@ impl RemoteClient {
             let page: ListToolsResult = serde_json::from_value(value).map_err(|error| {
                 self.protocol_error(format!("invalid tools/list result: {error}"))
             })?;
+            bytes = bytes.saturating_add(
+                serde_json::to_vec(&page.tools)
+                    .map_err(|_| self.protocol_error("invalid tool declarations".to_owned()))?
+                    .len(),
+            );
+            if tools.len().saturating_add(page.tools.len()) > maximum_tools || bytes > maximum_bytes
+            {
+                return Err(self.protocol_error("MCP tool catalog exceeds host bounds".to_owned()));
+            }
             tools.extend(page.tools);
             let Some(next) = page.next_cursor else {
                 return Ok(tools);

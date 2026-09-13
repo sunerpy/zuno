@@ -5,6 +5,16 @@ import { EnterpriseClient, EnterpriseHttpError } from "../dist/src/index.js";
 const job = { id: "job", sessionId: "session", turnId: "turn", inputId: "input", phase: "ready", inputVersion: "1", waits: [], stopRequested: false, pendingOperations: [] };
 const response = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 
+test("MCP review retains exact declared arguments without granting private execution authority", async () => {
+  const review={approvalId:"approval",operationId:"mcp-operation",server:"server",tool:"apply",endpoint:"https://mcp.example/tool",
+    definition:{name:"apply",inputSchema:{type:"object"}},arguments:{value:"reviewed"},admitted:false};
+  const client=(value)=>new EnterpriseClient({baseUrl:"https://enterprise.example/api/v1/",
+    accessToken:async()=>"test-token",fetch:async()=>response(value)});
+  assert.deepEqual((await client(review).mcpReview("approval")).arguments,review.arguments);
+  await assert.rejects(client({...review,approvalId:"other"}).mcpReview("approval"),/identity mismatch/);
+  await assert.rejects(client({...review,lease:{epoch:1}}).mcpReview("approval"),/Invalid enterprise application response/);
+});
+
 test("edit review preserves exact before/after text and rejects foreign approval or private fields", async () => {
   const review = { approvalId: "approval", operationId: "edit", admitted: false,
     review: [{ path: "src/file.rs", before: "before\n", after: "after\n" }] };

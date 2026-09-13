@@ -10,7 +10,7 @@ export type {
   WorkflowRunView, NodeRunView, WorkflowState, WorkflowKind,
   CouncilView, CouncilPhase, CouncilSeatView, CouncilSeatState,
   WorkspaceMergeView, WorkspaceMergePlan, WorkspaceChange, WorkspaceEntry, WorkspacePath, MergeChoice, MergeContentSide, MergeContentRequest,
-  WorkspaceEditView, WorkspaceEditReview,
+  WorkspaceEditView, WorkspaceEditReview, McpCallView,
   BeginWorkspaceImport, WorkspaceImportView, WorkspaceImportState, WorkspaceImportId,
   LearningJobView, LearningPage, LearningPageRequest, LearningCursor,
   LearningStage, LearningState, LearningBudgetView, LearningFailureView, CancelLearning, LearningCancellation,

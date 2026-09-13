@@ -101,6 +101,36 @@ impl GatewayStateClient {
             .map_err(state_error)?;
         serde_json::from_slice(&bytes).map_err(ApplicationError::storage)
     }
+    pub async fn prepare_mcp(
+        &self,
+        admission: zuno_application::mcp::McpAdmission,
+    ) -> Result<ApprovalRecord, ApplicationError> {
+        let bytes = self
+            .control
+            .post(
+                GATEWAY_MCP_PREPARE_PATH,
+                None,
+                serde_json::to_vec(&admission).map_err(ApplicationError::storage)?,
+            )
+            .await
+            .map_err(state_error)?;
+        serde_json::from_slice(&bytes).map_err(ApplicationError::storage)
+    }
+    pub async fn mcp_cancellations(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<zuno_application::mcp::McpAdmission>, ApplicationError> {
+        let bytes = self
+            .control
+            .post(
+                GATEWAY_MCP_CANCELLATIONS_PATH,
+                None,
+                serde_json::to_vec(&limit).map_err(ApplicationError::storage)?,
+            )
+            .await
+            .map_err(state_error)?;
+        serde_json::from_slice(&bytes).map_err(ApplicationError::storage)
+    }
     pub async fn prepare_files(
         &self,
         request: zuno_application::workspace_files::GatewayFileRequest,
@@ -369,6 +399,76 @@ impl zuno_application::workspace_edit::WorkspaceEditCompletionSink for GatewaySt
         self.control
             .post(
                 GATEWAY_EDIT_COMPLETE_PATH,
+                None,
+                serde_json::to_vec(completion).map_err(ApplicationError::storage)?,
+            )
+            .await
+            .map_err(state_error)?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl zuno_application::mcp::McpOperationAuthority for GatewayStateClient {
+    async fn check_admitted_mcp(
+        &self,
+        admission: &zuno_application::mcp::McpAdmission,
+    ) -> Result<(), ApplicationError> {
+        self.control
+            .post(
+                GATEWAY_MCP_RECHECK_PATH,
+                None,
+                serde_json::to_vec(admission).map_err(ApplicationError::storage)?,
+            )
+            .await
+            .map_err(state_error)?;
+        Ok(())
+    }
+    async fn authorize_mcp(
+        &self,
+        admission: &zuno_application::mcp::McpAdmission,
+    ) -> Result<(), ApplicationError> {
+        let bytes = self
+            .control
+            .post(
+                GATEWAY_MCP_AUTHORIZE_PATH,
+                None,
+                serde_json::to_vec(admission).map_err(ApplicationError::storage)?,
+            )
+            .await
+            .map_err(state_error)?;
+        let checked: CheckedApproval =
+            serde_json::from_slice(&bytes).map_err(ApplicationError::storage)?;
+        let lease = &admission.lease;
+        if checked.lease.owner != lease.owner
+            || checked.lease.job_id != lease.job_id
+            || checked.lease.session_id != lease.session_id
+            || checked.lease.attempt_id != lease.attempt_id
+            || checked.lease.worker != lease.worker
+            || checked.lease.epoch != lease.epoch
+            || checked.lease.checkpoint_version != lease.checkpoint_version
+            || checked.lease.expires_at_ms < lease.expires_at_ms
+            || checked.binding.operation_id != admission.operation.id
+            || checked.binding.invocation_id != admission.operation.invocation_id
+            || checked.binding.arguments_sha256 != admission.arguments_digest()
+            || checked.binding.resources_sha256 != admission.resources_digest()
+            || checked.binding.effect != zuno_permission::enterprise::EffectKind::ExternalTool
+        {
+            return Err(ApplicationError::Forbidden);
+        }
+        Ok(())
+    }
+}
+#[async_trait]
+impl zuno_application::mcp::McpCompletionSink for GatewayStateClient {
+    async fn publish_mcp(
+        &self,
+        completion: &zuno_application::mcp::McpCompletion,
+    ) -> Result<(), ApplicationError> {
+        completion.validate()?;
+        self.control
+            .post(
+                GATEWAY_MCP_COMPLETE_PATH,
                 None,
                 serde_json::to_vec(completion).map_err(ApplicationError::storage)?,
             )
@@ -678,6 +778,27 @@ impl GatewayClient {
             serde_json::from_slice(&bytes).map_err(ApplicationError::storage)?;
         use zuno_application::environment::wire::GatewayCommand;
         let matches = match (&request.command, &reply) {
+            (GatewayCommand::PrepareMcp { operation }, GatewayReply::Approval(approval)) => {
+                approval.binding.operation_id == operation.id
+                    && approval.binding.invocation_id == operation.invocation_id
+                    && approval.binding.arguments_sha256
+                        == zuno_orchestration::sha256_json(&operation.arguments)
+                    && approval.binding.resources_sha256
+                        == zuno_orchestration::sha256_json(&serde_json::json!([
+                            issued.assignment.gateway_id,
+                            approval.requester.owner(),
+                            operation.environment_id,
+                            operation.binding
+                        ]))
+                    && approval.binding.effect
+                        == zuno_permission::enterprise::EffectKind::ExternalTool
+            }
+            (GatewayCommand::SubmitMcp { operation }, GatewayReply::Mcp(receipt)) => {
+                receipt.id == operation.id && receipt.request_digest == operation.digest()
+            }
+            (GatewayCommand::InspectMcp { operation_id }, GatewayReply::Mcp(receipt)) => {
+                receipt.id == *operation_id
+            }
             (GatewayCommand::PreviewEdit { operation }, GatewayReply::EditPreview(admission)) => {
                 admission.operation == **operation
                     && admission.environment.spec == issued.assignment.environment

@@ -294,3 +294,12 @@ schema、权限和 marker 同事务提交；已有单网关准备摘要保留原
 迁移保留会话、消息、Memory 和待扫描版本，注入 DDL 失败保持旧格式与原行。
 执行接纳和 attempt 同事务提交，完成、活动及等待唤醒也保持原子性；迟到回执必须来自
 原先已经接纳的网关尝试。
+
+## 格式 24：外部 MCP 回执
+
+按用户隔离的 `gateway_mcp_operation`、`gateway_mcp_attempt`、
+`gateway_mcp_cancellation` 接入原有审批和持久等待事务。结果与通知原子提交，
+过期 Worker 不能准入新调用；网关仍可提交原先获准操作的真实结果。格式 23 的
+冻结摘要为 `89f0406fe0680077c5d10ff6835523d8fe4c984b77216f94bd4bbae97ccda926`。
+迁移保留会话、消息、Memory、学习水位与文件编辑记录，DDL 失败整体回滚。
+外部调用与网关独立日志的恢复限制见 [MCP.zh.md](MCP.zh.md)。

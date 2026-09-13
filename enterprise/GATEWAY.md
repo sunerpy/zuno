@@ -48,7 +48,7 @@ operation; an earlier approval or revision cannot authorize a different operatio
 
 ## Private protocol
 
-`GatewayRequest` is protocol version 7, with bounded tagged commands:
+`GatewayRequest` is protocol version 8, with bounded tagged commands:
 
 | Command | Behavior |
 | --- | --- |
@@ -130,7 +130,7 @@ also starts a control plane, gateway and two independent Worker binaries; see
 
 The gateway supervisor also polls authenticated `internal/gateway/v1/cancellations`. This service-only path returns immutable admissions for stopped Jobs and stays valid after Worker revocation. It cannot start new operations. Docker stop and its actual terminal receipt remain separate; completed facts are preserved and unknown outcomes remain uncertain. See [control](CONTROL.md).
 
-Gateway protocol 7 routes child preparation to the target gateway and separately
+Gateway protocol 8 routes child preparation to the target gateway and separately
 identifies the authorized source, including an existing Workflow group workspace.
 Ordinary commands still require the executing session.
 
@@ -166,7 +166,7 @@ built-in reads. Other allowed applications wait for the existing authoritative
 HITL decision. This whitelist does not approve Shell or arbitrary MCP operations.
 Control endpoints are `/internal/gateway/v1/files/prepare` and `/authorize`;
 they accept only assigned gateway service identities. Both roles must support
-gateway protocol 7; the state/Worker protocol remains 11.
+gateway protocol 8; the state/Worker protocol remains 11.
 
 ## Reviewed file edits
 
@@ -193,3 +193,10 @@ cancelled Job. Worker approval/operation waits use the shared checkpoint and
 exactly-once completion-consumption path. Private protocol commands are
 `preview_edit`, `prepare_edit`, `submit_edit` and `inspect_edit`; control endpoints
 live under `/internal/gateway/v1/edit/`. App/UI remains paused.
+
+## External MCP
+
+Gateway protocol 8 supports `prepare_mcp`, `submit_mcp` and `inspect_mcp` when a
+real owner-bound `McpConnectionProvider` is configured. The separate MCP journal
+preserves uncertain outcomes and never replays a submitted external call.
+See [MCP.md](MCP.md) for configuration, approval and cancellation limits.

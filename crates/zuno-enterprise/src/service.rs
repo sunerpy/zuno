@@ -243,7 +243,7 @@ async fn gateway(
             .with_snapshot_certificate(certificate)
             .map_err(|_| invalid("invalid gateway snapshot client"))?;
     }
-    let gateway = GatewayExecutionService::connect(
+    let mut gateway = GatewayExecutionService::connect(
         options.id,
         &options.docker_socket,
         &state_directory.join("gateway.sqlite"),
@@ -252,6 +252,14 @@ async fn gateway(
     .await?
     .with_merge_parallelism(options.merge_parallelism)?
     .with_snapshot_parallelism(options.snapshot_parallelism)?;
+    if !options.mcp_connections.is_empty() {
+        let provider = crate::mcp::ConfiguredMcpConnections::new(options.mcp_connections).await?;
+        gateway = gateway.with_mcp(
+            &state_directory.join("mcp.sqlite"),
+            Arc::new(provider),
+            options.mcp_parallelism,
+        )?;
+    }
     let delivery = gateway.clone();
     let stopped = shutdown.clone();
     let supervisor = tokio::spawn(async move {
@@ -365,6 +373,7 @@ async fn control(options: ControlConfig, shutdown: InterruptSignal) -> Result<()
                 memory_bytes: environment.memory_bytes,
                 pids_limit: environment.pids_limit,
                 cpu_millis: environment.cpu_millis,
+                mcp_tools: definition.mcp_tools.clone(),
             })
         })
         .collect::<Result<Vec<_>, Error>>()?;

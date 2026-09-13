@@ -118,3 +118,11 @@ The Worker freezes the complete edit proposal, waits for approval, records tool
 handoff and then waits for the authoritative operation completion. A lost submit
 response is inspected by stable operation ID; unresolved outcomes remain uncertain.
 No Worker-held Future is needed to finish an admitted edit after process loss.
+
+## Configured MCP tools
+
+Immutable Agent definitions may carry reviewed `mcpTools`. The Worker exposes
+only those exact declarations, using typed MCP activity metadata. Preparation
+waits for human approval; submission follows the durable tool handoff and awaits
+a persisted operation result. Credentials and transport sessions stay on the
+gateway. See [MCP.md](MCP.md); completion profiles expose no MCP tools.

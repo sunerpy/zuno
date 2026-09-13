@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p3-workspace-edits`.
+- Current phase branch: `codex/enterprise-p3-mcp-operations`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -554,3 +554,17 @@ Workflow PR #218 initially exposed an arm64 stack overflow in the PostgreSQL con
 - PostgreSQL format 23 preserves exact format 22; gateway ledger format 5 preserves exact format 4, with injected migration/publication rollback tests. Native Docker verifies no pre-approval changes, COW publication and lost-ack recovery. The real Agent create/read-SHA/replace/read workflow passed two explicit reviews and foreign-review refusal.
 - PostgreSQL/HTTPS fault checks pass changed offers, approval/attempt atomicity, completion/wakeup rollback, duplicate results, forged attempts, cancellation delivery and late completion. The full five-process native run passes. SDK tests pass 24 cases; workspace check/Clippy, 100 documentation/release contracts, generated drift and fmt/diff pass locally.
 - Gateway protocol is 7; Worker protocol remains 11. English/Chinese runtime, gateway, storage, application and SDK docs are updated. UI stays paused. PR #235 passed required gates and merged only into preview at `8ce74bfe3edd51fbd8bba78bf7bd22e00ac113fc`.
+
+## Remote MCP operations
+
+Explicit owner credentials, immutable target/declaration binding, mandatory human
+approval and durable external-operation receipts are implemented on the phase
+branch. Local validation passed: 24 remote MCP tests (including three explicit
+HTTP client checks), four gateway fault tests, 25 SDK tests plus generated drift,
+PostgreSQL 24 migration preservation/rollback and authorization/wakeup faults,
+five HTTPS boundary tests, and the complete two-Worker/two-gateway process fixture.
+Both users completed an independently approved MCP call; changed target, revision,
+owner or declaration was refused. Administrator audit visibility does not permit
+answering requester-only approval. Workspace check, Clippy, formatting and all
+100 documentation/release contracts passed. Exact-archive and preview CI evidence
+remain required before publication. App/UI design and delivery remain paused.

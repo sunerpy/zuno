@@ -12,6 +12,7 @@ pub fn definition(parent: &Definition) -> Definition {
     value.workflows.clear();
     value.councils.clear();
     value.memory_learning = None;
+    value.mcp_tools.clear();
     value
 }
 

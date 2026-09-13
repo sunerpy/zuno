@@ -34,6 +34,7 @@ pub struct GatewayExecutionService {
     state: GatewayStateClient,
     merges: Arc<zuno_environment::MergeExecutor>,
     edits: Arc<zuno_environment::EditExecutor>,
+    mcp: Option<Arc<zuno_environment::mcp::McpExecutor>>,
     snapshot_exports: Arc<tokio::sync::Semaphore>,
     snapshot_imports: Arc<tokio::sync::Semaphore>,
 }
@@ -70,6 +71,15 @@ impl GatewayExecutionService {
             self.gateway.cancel_admitted_workspace_edit(&admission)?;
         }
         self.edits.advance()?;
+        if let Some(executor) = &self.mcp {
+            for admission in self.state.mcp_cancellations(limit.min(32)).await? {
+                if admission.gateway_id != self.id {
+                    return Err(ApplicationError::Forbidden);
+                }
+                executor.cancel(&admission)?;
+            }
+            executor.advance()?;
+        }
         if let Some(error) = failure {
             return Err(error);
         }
@@ -106,6 +116,7 @@ impl GatewayExecutionService {
             state,
             merges,
             edits,
+            mcp: None,
             snapshot_exports: Arc::new(tokio::sync::Semaphore::new(2)),
             snapshot_imports: Arc::new(tokio::sync::Semaphore::new(2)),
         })
@@ -116,6 +127,21 @@ impl GatewayExecutionService {
             Arc::new(self.state.clone()),
             parallelism,
         )?);
+        Ok(self)
+    }
+    pub fn with_mcp(
+        mut self,
+        path: &Path,
+        provider: Arc<dyn zuno_application::mcp::McpConnectionProvider>,
+        parallelism: u32,
+    ) -> Result<Self, ApplicationError> {
+        self.mcp = Some(Arc::new(zuno_environment::mcp::McpExecutor::open(
+            path,
+            Arc::new(self.state.clone()),
+            provider,
+            Arc::new(self.state.clone()),
+            parallelism,
+        )?));
         Ok(self)
     }
     pub fn with_snapshot_parallelism(mut self, parallelism: u32) -> Result<Self, ApplicationError> {
@@ -133,6 +159,9 @@ impl GatewayExecutionService {
     pub async fn drain_merges(&self, timeout: std::time::Duration) {
         self.merges.drain(timeout).await;
         self.edits.drain(timeout).await;
+        if let Some(executor) = &self.mcp {
+            executor.drain(timeout).await;
+        }
     }
 
     pub fn router(self) -> Router {
@@ -178,6 +207,45 @@ impl GatewayExecutionService {
             return Err(ApplicationError::Forbidden);
         }
         let reply = match request.command {
+            GatewayCommand::PrepareMcp { operation } => {
+                if self.mcp.is_none()
+                    || operation.environment_id != context.assignment.environment.id
+                {
+                    return Err(ApplicationError::Forbidden);
+                }
+                GatewayReply::Approval(Box::new(
+                    self.state
+                        .prepare_mcp(zuno_application::mcp::McpAdmission {
+                            gateway_id: self.id.clone(),
+                            lease: context.lease.clone(),
+                            operation: *operation,
+                        })
+                        .await?,
+                ))
+            }
+            GatewayCommand::SubmitMcp { operation } => {
+                if operation.environment_id != context.assignment.environment.id {
+                    return Err(ApplicationError::Forbidden);
+                }
+                let executor = self.mcp.as_ref().ok_or(ApplicationError::Forbidden)?;
+                let receipt = executor
+                    .submit(&zuno_application::mcp::McpAdmission {
+                        gateway_id: self.id.clone(),
+                        lease: context.lease.clone(),
+                        operation: *operation,
+                    })
+                    .await?;
+                executor.advance()?;
+                GatewayReply::Mcp(receipt)
+            }
+            GatewayCommand::InspectMcp { operation_id } => {
+                let executor = self.mcp.as_ref().ok_or(ApplicationError::Forbidden)?;
+                GatewayReply::Mcp(executor.receipt_for(
+                    &context.lease,
+                    &context.assignment.environment.id,
+                    &operation_id,
+                )?)
+            }
             GatewayCommand::PreviewEdit { operation } => {
                 self.environment(&context).await?;
                 GatewayReply::EditPreview(Box::new(

@@ -24,14 +24,9 @@ pub(super) async fn connect_transport(
     transport: RemoteTransport,
     bearer: Option<Secret>,
 ) -> Result<RemoteClient, RemoteError> {
-    let base_url = reqwest::Url::parse(&config.url).map_err(|error| RemoteError::Config {
-        server: server.to_owned(),
-        message: error.to_string(),
-    })?;
     let timeout = config.timeout.map_or(DEFAULT_REQUEST_TIMEOUT, |value| {
         Duration::from_millis(u64::from(value.get()))
     });
-    let headers = configured_headers(server, config)?;
     let http = zuno_network::client_builder()
         .timeout(timeout)
         .build()
@@ -40,6 +35,24 @@ pub(super) async fn connect_transport(
             transport,
             source,
         })?;
+    connect_with_client(server, config, transport, bearer, http).await
+}
+
+pub(super) async fn connect_with_client(
+    server: &str,
+    config: &McpRemote,
+    transport: RemoteTransport,
+    bearer: Option<Secret>,
+    http: reqwest::Client,
+) -> Result<RemoteClient, RemoteError> {
+    let base_url = reqwest::Url::parse(&config.url).map_err(|error| RemoteError::Config {
+        server: server.to_owned(),
+        message: error.to_string(),
+    })?;
+    let timeout = config.timeout.map_or(DEFAULT_REQUEST_TIMEOUT, |value| {
+        Duration::from_millis(u64::from(value.get()))
+    });
+    let headers = configured_headers(server, config)?;
     let legacy = if transport == RemoteTransport::Sse {
         let (endpoint, response, decoder) =
             open_legacy(server, &base_url, &http, &headers, bearer.as_ref(), timeout).await?;

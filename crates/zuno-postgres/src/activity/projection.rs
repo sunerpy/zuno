@@ -267,6 +267,35 @@ async fn enrich_invocation(
             }
         }
     }
+    let mcp=query("SELECT offer,completion FROM zuno_enterprise_preview.gateway_mcp_operation
+        WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3 AND invocation_id=$4 AND job_id=$5 AND admitted")
+        .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(session).bind(invocation.id.as_str()).bind(job)
+        .fetch_optional(&mut *connection).await.map_err(database_error)?;
+    if let Some(row) = mcp {
+        let admission: zuno_application::mcp::McpAdmission =
+            serde_json::from_value(row.try_get("offer").map_err(database_error)?)
+                .map_err(ApplicationError::storage)?;
+        admission.validate()?;
+        invocation.location = ExecutionLocation::External {
+            name: admission.operation.binding.server.clone(),
+        };
+        invocation.isolation = Isolation::Unknown;
+        if let Some(raw) = row
+            .try_get::<Option<Value>, _>("completion")
+            .map_err(database_error)?
+        {
+            let completion: zuno_application::mcp::McpCompletion =
+                serde_json::from_value(raw).map_err(ApplicationError::storage)?;
+            completion.validate()?;
+            invocation.state = match completion.receipt.state {
+                zuno_application::mcp::McpOperationState::Succeeded => InvocationState::Succeeded,
+                zuno_application::mcp::McpOperationState::Cancelled => InvocationState::Cancelled,
+                zuno_application::mcp::McpOperationState::Uncertain => InvocationState::Uncertain,
+                _ => InvocationState::Failed,
+            };
+            invocation.waiting_for = None;
+        }
+    }
     Ok(())
 }
 
@@ -355,6 +384,7 @@ pub(crate) async fn event(
             | "runtime.wait.ready"
             | "runtime.operation.completed"
             | "runtime.workspace_edit.completed"
+            | "runtime.mcp.completed"
     ) {
         refresh_parts(connection, owner, session).await?;
     }
@@ -476,6 +506,20 @@ async fn approval(
     .fetch_one(&mut *connection)
     .await
     .map_err(database_error)?;
+    let is_mcp: bool = query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM zuno_enterprise_preview.gateway_mcp_operation
+        WHERE tenant_id=$1 AND principal_id=$2 AND operation_id=$3 AND job_id=$4)",
+    )
+    .bind(owner.tenant_id.as_str())
+    .bind(owner.principal_id.as_str())
+    .bind(
+        row.try_get::<String, _>("operation_id")
+            .map_err(database_error)?,
+    )
+    .bind(row.try_get::<String, _>("job_id").map_err(database_error)?)
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(database_error)?;
     let record = ItemRecord {
         id: format!("approval:{id}"),
         parent_id: None,
@@ -496,6 +540,10 @@ async fn approval(
         // not cached as a transferable right in this immutable frame.
         actions: if is_merge {
             vec![UiAction::ViewWorkspaceMerge {
+                approval_id: ApprovalId::new(id).map_err(ApplicationError::storage)?,
+            }]
+        } else if is_mcp {
+            vec![UiAction::ViewMcpCall {
                 approval_id: ApprovalId::new(id).map_err(ApplicationError::storage)?,
             }]
         } else if is_edit {

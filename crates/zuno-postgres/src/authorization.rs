@@ -33,6 +33,33 @@ pub struct PostgresOrganizationStore {
     tenant: TenantId,
 }
 impl PostgresOrganizationStore {
+    pub async fn check_admitted_mcp(
+        &self,
+        proposal: ApprovalProposal,
+        admission: &zuno_application::mcp::McpAdmission,
+    ) -> Result<(), ApplicationError> {
+        approvals::check_execution_with_admission(
+            self,
+            &admission.lease,
+            proposal,
+            Some(approvals::GatewayAdmission::McpStart(admission)),
+        )
+        .await?;
+        Ok(())
+    }
+    pub async fn check_mcp_execution(
+        &self,
+        proposal: ApprovalProposal,
+        admission: &zuno_application::mcp::McpAdmission,
+    ) -> Result<CheckedApproval, ApplicationError> {
+        approvals::check_execution_with_admission(
+            self,
+            &admission.lease,
+            proposal,
+            Some(approvals::GatewayAdmission::Mcp(admission)),
+        )
+        .await
+    }
     pub async fn check_workspace_edit_execution(
         &self,
         proposal: ApprovalProposal,

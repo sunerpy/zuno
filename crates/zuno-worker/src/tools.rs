@@ -2,6 +2,7 @@
 //! starts only after the kernel's durable handoff and can yield an operation wait.
 mod edit;
 mod files;
+mod mcp;
 
 use crate::{WorkerClient, WorkerExecution, gateway::GatewayClient};
 use async_trait::async_trait;
@@ -63,6 +64,7 @@ pub struct GatewayToolDispatcher {
     execution: WorkerExecution,
     gateway: Arc<GatewayClient>,
     definition: ToolDefinition,
+    mcp: Vec<zuno_application::mcp::McpToolBinding>,
 }
 
 impl GatewayToolDispatcher {
@@ -76,7 +78,25 @@ impl GatewayToolDispatcher {
             execution,
             gateway,
             definition: Self::definition(),
+            mcp: Vec::new(),
         }
+    }
+    pub fn with_mcp(
+        mut self,
+        bindings: Vec<zuno_application::mcp::McpToolBinding>,
+    ) -> Result<Self, ApplicationError> {
+        let mut seen = std::collections::BTreeSet::new();
+        if bindings.len() > 64 {
+            return Err(ApplicationError::Invalid("too many MCP tools".to_owned()));
+        }
+        for binding in &bindings {
+            binding.validate()?;
+            if !seen.insert(binding.wire_name()) {
+                return Err(ApplicationError::Conflict);
+            }
+        }
+        self.mcp = bindings;
+        Ok(self)
     }
 
     pub fn definition() -> ToolDefinition {
@@ -340,9 +360,20 @@ impl ToolDispatcher for GatewayToolDispatcher {
         let mut definitions = vec![self.definition.clone()];
         definitions.extend(files::definitions());
         definitions.push(edit::definition());
+        definitions.extend(self.mcp.iter().map(mcp::definition));
         AvailableTools::new(definitions, McpToolStatus::Ready)
     }
     async fn prepare(&self, request: DispatchRequest) -> PreparedToolDispatch {
+        if let Some(binding) = self
+            .mcp
+            .iter()
+            .find(|binding| binding.wire_name() == request.call.name)
+        {
+            return self
+                .prepare_mcp(request, binding.clone())
+                .await
+                .unwrap_or_else(|result| PreparedToolDispatch::ready(*result));
+        }
         if request.call.name == edit::WORKSPACE_EDIT {
             return self
                 .prepare_edit(request)

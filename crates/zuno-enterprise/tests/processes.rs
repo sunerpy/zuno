@@ -46,6 +46,8 @@ mod executable;
 mod import;
 #[path = "processes/learning.rs"]
 mod learning;
+#[path = "processes/mcp.rs"]
+mod mcp;
 #[path = "processes/merge.rs"]
 mod merge;
 #[path = "processes/workflow.rs"]
@@ -82,6 +84,7 @@ struct Issuer {
     origin: String,
     key: KeyPair,
     model_requests: AtomicUsize,
+    mcp_calls: AtomicUsize,
     codes: std::sync::Mutex<BTreeMap<String, browser::Code>>,
 }
 impl Issuer {
@@ -180,6 +183,9 @@ async fn model(
     }
     if user.contains("EDIT-PROBE") {
         return edit::model(&body);
+    }
+    if user.contains("MCP-PROBE") {
+        return mcp::model(&body, name, &issuer);
     }
     if user.contains("COUNCIL-PROBE") {
         return council::model(&body);
@@ -435,6 +441,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
         origin: format!("https://{issuer_address}"),
         key: KeyPair::generate(KeySize::Rsa2048).unwrap(),
         model_requests: AtomicUsize::new(0),
+        mcp_calls: AtomicUsize::new(0),
         codes: Default::default(),
     });
     let routes = Router::new()
@@ -443,6 +450,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
         .route("/authorize", get(browser::authorize))
         .route("/token", post(browser::exchange))
         .route("/v1/chat/completions", post(model))
+        .route("/mcp", post(mcp::endpoint))
         .with_state(issuer.clone());
     let issuer_stopped = InterruptSignal::new();
     let issuer_task = {
@@ -620,6 +628,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
         maintenance: memory_model.reference(),
     });
     let definition_file = root.join("definition.json");
+    definition.mcp_tools = vec![mcp::binding(&format!("{}/mcp", issuer.origin))];
     write(&definition_file, serde_json::to_vec(&definition).unwrap());
     let job_key = root.join("job.key");
     write(&job_key, [4u8; 32]);
@@ -631,6 +640,23 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
         client_id: ClientId::new(identities[name]["clientId"].as_str().unwrap()).unwrap(),
     };
     let mut children = Vec::new();
+    for name in ["alice", "bob"] {
+        write(&root.join(format!("mcp-{name}.key")), format!("mcp-{name}"));
+    }
+    let mcp_connections = || {
+        ["alice", "bob"]
+            .into_iter()
+            .map(|name| zuno_enterprise::mcp::McpConnectionConfig {
+                owner: owner(name),
+                connection: zuno_types::activity::ActivityName::new("fixture").unwrap(),
+                revision: 1,
+                endpoint: format!("{}/mcp", issuer.origin),
+                access_token_file: root.join(format!("mcp-{name}.key")),
+                root_certificate: Some(fixture.root_certificate.clone()),
+                timeout_millis: 10000,
+            })
+            .collect()
+    };
     children.push(
         spawn(
             root,
@@ -706,6 +732,8 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
             root,
             "gateway",
             ServiceRole::Gateway(GatewayConfig {
+                mcp_connections: mcp_connections(),
+                mcp_parallelism: 2,
                 merge_parallelism: 2,
                 snapshot_parallelism: 2,
                 snapshot_root_certificate: Some(fixture.root_certificate.clone()),
@@ -723,6 +751,8 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
             root,
             "gateway-peer",
             ServiceRole::Gateway(GatewayConfig {
+                mcp_connections: Vec::new(),
+                mcp_parallelism: 2,
                 merge_parallelism: 2,
                 snapshot_parallelism: 2,
                 snapshot_root_certificate: Some(fixture.root_certificate.clone()),
@@ -1149,6 +1179,15 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
     )
     .await;
     edit::verify(&http, &control_url, &tokens["alice"], &tokens["bob"]).await;
+    mcp::verify(
+        &http,
+        &control_url,
+        &tokens["alice"],
+        &tokens["bob"],
+        &issuer,
+    )
+    .await;
+    mcp::verify_provider(&fixture, root, &issuer, owner("alice")).await;
     for child in &mut children {
         assert!(
             tokio::process::Command::new("kill")

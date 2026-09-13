@@ -1,6 +1,8 @@
 use super::*;
 
 pub(super) enum GatewayAdmission<'a> {
+    Mcp(&'a zuno_application::mcp::McpAdmission),
+    McpStart(&'a zuno_application::mcp::McpAdmission),
     Command(&'a zuno_application::environment::OperationAdmission),
     WorkspaceMerge(&'a zuno_application::workspace_merge::WorkspaceMergeAdmission),
     WorkspaceEdit(&'a zuno_application::workspace_edit::WorkspaceEditAdmission),
@@ -139,7 +141,12 @@ pub(super) async fn check_execution_with_admission(
     proposal.validate()?;
     store.check_tenant(&lease.owner.tenant_id)?;
     let mut tx = owner_transaction(&store.pool, &lease.owner).await?;
-    let job = verify_lease(&mut tx, lease).await?;
+    let job = match &admission {
+        Some(GatewayAdmission::McpStart(admission)) => {
+            crate::mcp::verify_start_in(&mut tx, admission).await?
+        }
+        _ => verify_lease(&mut tx, lease).await?,
+    };
     if !bound(&job, &proposal.binding) {
         return Err(ApplicationError::Conflict);
     }
@@ -209,10 +216,14 @@ pub(super) async fn check_execution_with_admission(
     }
     // The expiry copied into an incoming lease is data. Use the fenced database
     // deadline, including renewals, rather than trusting that caller field.
-    let expires: i64 = query_scalar(
+    let expires: i64 = if matches!(admission, Some(GatewayAdmission::McpStart(_))) {
+        record.expires_at_ms
+    } else {
+        query_scalar(
         "SELECT lease_expires FROM zuno_enterprise_preview.runtime_session WHERE tenant_id=$1 AND principal_id=$2 AND session_id=$3",
     ).bind(lease.owner.tenant_id.as_str()).bind(lease.owner.principal_id.as_str()).bind(lease.session_id.as_str())
-        .fetch_one(&mut *tx).await.map_err(database_error)?;
+        .fetch_one(&mut *tx).await.map_err(database_error)?
+    };
     let valid_until_ms = expires.min(record.expires_at_ms);
     if valid_until_ms <= database_time(&mut tx).await? {
         return Err(ApplicationError::LeaseLost);
@@ -227,6 +238,10 @@ pub(super) async fn check_execution_with_admission(
         valid_until_ms,
     };
     match admission {
+        Some(GatewayAdmission::McpStart(_)) => {}
+        Some(GatewayAdmission::Mcp(admission)) => {
+            crate::mcp::admit_in(&mut tx, &checked, admission).await?
+        }
         Some(GatewayAdmission::Command(admission)) => {
             crate::operation::admit_in(&mut tx, &checked, admission).await?
         }

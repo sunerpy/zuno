@@ -57,6 +57,7 @@ export type WaitTarget =
     };
 export type LearningStage = "extraction" | "maintenance";
 export type LearningState = "queued" | "running" | "completed" | "skipped" | "failed" | "cancelled" | "uncertain";
+export type ActivityName = string;
 export type WorkspacePath = string;
 export type MergeContentSide = "base" | "parent" | "child";
 export type CouncilPhase = "seats" | "stopping" | "synthesis" | "completed" | "failed" | "cancelled" | "uncertain";
@@ -120,6 +121,7 @@ export interface ApplicationProtocol {
   learning_job: LearningJobView;
   learning_jobs: LearningPage;
   learning_query: LearningPageRequest;
+  mcp_call: McpCallView;
   merge_content: MergeContentRequest;
   session: SessionSummary;
   sessions: SessionPage;
@@ -265,6 +267,20 @@ export interface LearningPageRequest {
   limit?: number;
   stage?: LearningStage | null;
   state?: LearningState | null;
+}
+/**
+ * Human review of the full frozen declaration, target and arguments. No
+ * execution lease, token or gateway credential is exposed.
+ */
+export interface McpCallView {
+  admitted: boolean;
+  approvalId: ApprovalId;
+  arguments: unknown;
+  definition: unknown;
+  endpoint: string;
+  operationId: OperationId;
+  server: ActivityName;
+  tool: ActivityName;
 }
 export interface MergeContentRequest {
   approvalId: ApprovalId;

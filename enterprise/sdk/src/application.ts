@@ -3,13 +3,13 @@ import type {
   WorkspaceView, SessionPage, SessionSummary, CreateSession, JobView,
   SubmitTurn, InputVersionView, ApprovalView, ApprovalDecision, CancelJob, CancellationReceipt, WorkflowRunView, WorkspaceMergeView, MergeContentSide, BeginWorkspaceImport, WorkspaceImportView,
   LearningJobView, LearningPage, LearningPageRequest, CancelLearning, LearningCancellation,
-  WorkspaceEditView,
+  WorkspaceEditView, McpCallView,
 } from "./generated/application.js";
 import {
   validateWorkspaceView, validateSessionPage, validateSessionSummary, validateJobView,
   validateInputVersionView, validateApprovalView, validateCancellationReceipt, validateWorkflowRunView, validateWorkspaceMergeView, validateMergeContentRequest, validateWorkspaceImportView,
   validateLearningJobView, validateLearningPage, validateLearningPageRequest, validateLearningCancellation,
-  validateWorkspaceEditView,
+  validateWorkspaceEditView, validateMcpCallView,
 } from "./generated/application-validators.mjs";
 
 function checked<T>(value: unknown, validate: (value: unknown) => unknown): T {
@@ -22,6 +22,11 @@ function id(value: string): string {
 }
 
 export class EnterpriseClient extends ActivityClient {
+  async mcpReview(approval: string, signal?: AbortSignal): Promise<McpCallView> {
+    const value=checked<McpCallView>(await this.get(new URL(`approvals/${id(approval)}/mcp`,this.base),signal),validateMcpCallView);
+    if (value.approvalId!==approval) throw new Error("MCP review identity mismatch");
+    return value;
+  }
   async editReview(approval: string, signal?: AbortSignal): Promise<WorkspaceEditView> {
     const value=checked<WorkspaceEditView>(await this.get(new URL(`approvals/${id(approval)}/edit`,this.base),signal),validateWorkspaceEditView);
     if (value.approvalId!==approval) throw new Error("Edit review identity mismatch");

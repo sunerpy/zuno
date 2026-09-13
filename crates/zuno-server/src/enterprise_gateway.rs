@@ -2,6 +2,7 @@
 mod edit;
 mod files;
 mod import;
+mod mcp;
 mod merge;
 mod transfer;
 
@@ -74,6 +75,26 @@ impl GatewayControlService {
 
     pub fn router(self) -> Router {
         Router::new()
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_MCP_RECHECK_PATH),
+                post(mcp::recheck),
+            )
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_MCP_PREPARE_PATH),
+                post(mcp::prepare),
+            )
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_MCP_AUTHORIZE_PATH),
+                post(mcp::authorize),
+            )
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_MCP_COMPLETE_PATH),
+                post(mcp::complete),
+            )
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_MCP_CANCELLATIONS_PATH),
+                post(mcp::cancellations),
+            )
             .route(
                 &format!("/{}", zuno_worker::GATEWAY_SNAPSHOT_TICKET_PATH),
                 post(transfer::ticket),
@@ -422,6 +443,11 @@ fn target(request: &GatewayRequest, context: &GatewayExecutionContext) -> Result
         return Err(Failure(StatusCode::FORBIDDEN));
     }
     match &request.command {
+        GatewayCommand::PrepareMcp { operation } | GatewayCommand::SubmitMcp { operation }
+            if operation.environment_id != context.assignment.environment.id =>
+        {
+            return Err(Failure(StatusCode::FORBIDDEN));
+        }
         GatewayCommand::PreviewEdit { operation }
             if operation.environment_id != context.assignment.environment.id =>
         {

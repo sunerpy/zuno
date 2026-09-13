@@ -7,6 +7,7 @@ mod docker;
 mod edit_executor;
 mod gateway;
 mod ledger;
+pub mod mcp;
 mod merge_executor;
 pub use edit_executor::EditExecutor;
 pub mod workspace_merge;

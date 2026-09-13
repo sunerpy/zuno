@@ -1,5 +1,7 @@
 mod remote_support;
 
+#[path = "remote/explicit_client.rs"]
+mod explicit_client;
 #[path = "remote/legacy_stream.rs"]
 mod legacy_stream;
 #[path = "remote/oauth_body.rs"]

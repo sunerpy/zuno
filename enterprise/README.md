@@ -78,6 +78,8 @@ Browser login and BFF session contracts: [English](BROWSER.md), [中文](BROWSER
 
 Authenticated gateway transport: [English](GATEWAY.md), [中文](GATEWAY.zh.md).
 
+Owner-scoped remote MCP operations: [English](MCP.md), [中文](MCP.zh.md).
+
 Durable operation results and acknowledgement: [English](OPERATION_RESULTS.md), [中文](OPERATION_RESULTS.zh.md).
 
 Enterprise Linux and personal cross-platform boundaries: [English](PLATFORMS.md), [中文](PLATFORMS.zh.md).

@@ -138,7 +138,7 @@ impl PostgresWorkspaceEditStore {
         crate::runtime::verify_lease(&mut tx, &admission.lease).await?;
         crate::operation::identity_lock(&mut tx, owner, &admission.operation.id).await?;
         let collision:bool=query_scalar("SELECT EXISTS(SELECT 1 FROM zuno_enterprise_preview.gateway_operation WHERE tenant_id=$1 AND principal_id=$2 AND operation_id=$3)
-            OR EXISTS(SELECT 1 FROM zuno_enterprise_preview.gateway_merge_operation WHERE tenant_id=$1 AND principal_id=$2 AND operation_id=$3)")
+            OR EXISTS(SELECT 1 FROM zuno_enterprise_preview.gateway_merge_operation WHERE tenant_id=$1 AND principal_id=$2 AND operation_id=$3) OR EXISTS(SELECT 1 FROM zuno_enterprise_preview.gateway_mcp_operation WHERE tenant_id=$1 AND principal_id=$2 AND operation_id=$3)")
             .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(admission.operation.id.as_str())
             .fetch_one(&mut *tx).await.map_err(database_error)?;
         if collision {

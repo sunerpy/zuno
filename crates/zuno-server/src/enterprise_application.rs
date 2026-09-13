@@ -137,6 +137,7 @@ impl EnterpriseApplication {
             .route("/approvals/{approval}", get(approval))
             .route("/approvals/{approval}/merge", get(merge_review))
             .route("/approvals/{approval}/edit", get(edit_review))
+            .route("/approvals/{approval}/mcp", get(mcp_review))
             .route("/approvals/{approval}/answer", post(answer));
         if self.workspace_gateway.is_some() {
             router = router.route("/approvals/{approval}/merge/content", get(merge_content));
@@ -300,6 +301,28 @@ async fn upload_workspace(
             )
             .await?,
     ))
+}
+
+async fn mcp_review(
+    State(service): State<EnterpriseApplication>,
+    Extension(identity): Extension<VerifiedIdentity>,
+    Path(approval): Path<ApprovalId>,
+) -> Result<Json<zuno_application::mcp::McpCallView>, Failure> {
+    let principal = service.principal(&identity).await?;
+    let (admission, admitted) = service
+        .backend
+        .mcp_for_approval(&principal, &approval)
+        .await?;
+    Ok(Json(zuno_application::mcp::McpCallView {
+        approval_id: approval,
+        operation_id: admission.operation.id,
+        server: admission.operation.binding.server,
+        tool: admission.operation.binding.tool,
+        definition: admission.operation.binding.definition,
+        endpoint: admission.operation.binding.endpoint,
+        arguments: admission.operation.arguments,
+        admitted,
+    }))
 }
 
 async fn edit_review(

@@ -6,6 +6,7 @@ use zuno_application::{
     learning_api::{
         CancelLearning, LearningCancellation, LearningJobView, LearningPage, LearningPageRequest,
     },
+    mcp::McpCallView,
     workflow::WorkflowRunView,
     workspace_edit::WorkspaceEditView,
     workspace_import::{BeginWorkspaceImport, WorkspaceImportView},
@@ -32,6 +33,7 @@ struct ApplicationProtocol {
     workflow: WorkflowRunView,
     workspace_merge: WorkspaceMergeView,
     workspace_edit: WorkspaceEditView,
+    mcp_call: McpCallView,
     merge_content: MergeContentRequest,
     begin_workspace_import: BeginWorkspaceImport,
     workspace_import: WorkspaceImportView,

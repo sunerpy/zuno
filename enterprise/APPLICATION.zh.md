@@ -86,3 +86,8 @@ ACP bridge 不应为了跳过 HITL 而加入审批应用白名单。审批决定
 `beforeCreatedAtMs`／`beforeJobId` 游标，以及可选 `stage`／`state`。
 取消撤销运行权但保留终态结果与迟到用量核查；两个应用前缀均遵循原认证和 BFF CSRF
 规则。详见[学习管理](MEMORY.zh.md#查询及取消学习任务)。
+
+MCP 审批详情使用 `GET /api/v1/approvals/{id}/mcp`，`McpCallView` 包含审核的
+地址、完整工具声明与原始参数，沿用其他审批详情的当前请求人／审批人授权。
+响应不含执行租约和凭证；`UiAction::ViewMcpCall` 与 SDK `mcpReview` 表达该
+后端交互，App/UI 实施仍暂停。

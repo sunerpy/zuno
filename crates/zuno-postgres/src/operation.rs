@@ -253,7 +253,7 @@ pub(crate) async fn admit_in(
         "SELECT EXISTS(SELECT 1 FROM zuno_enterprise_preview.gateway_merge_operation
         WHERE tenant_id=$1 AND principal_id=$2 AND operation_id=$3)
         OR EXISTS(SELECT 1 FROM zuno_enterprise_preview.gateway_edit_operation
-        WHERE tenant_id=$1 AND principal_id=$2 AND operation_id=$3)",
+        WHERE tenant_id=$1 AND principal_id=$2 AND operation_id=$3) OR EXISTS(SELECT 1 FROM zuno_enterprise_preview.gateway_mcp_operation WHERE tenant_id=$1 AND principal_id=$2 AND operation_id=$3)",
     )
     .bind(admission.lease.owner.tenant_id.as_str())
     .bind(admission.lease.owner.principal_id.as_str())

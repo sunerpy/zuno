@@ -236,6 +236,7 @@ async fn gateway_requests_are_scoped_authenticated_and_still_require_current_hum
             memory_bytes: 64 * 1024 * 1024,
             pids_limit: 32,
             cpu_millis: 500,
+            mcp_tools: Vec::new(),
         }])
         .unwrap(),
     );
