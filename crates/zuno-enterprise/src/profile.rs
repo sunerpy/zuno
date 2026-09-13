@@ -325,6 +325,13 @@ impl WorkerServiceFactory for ConfiguredWorkerFactory {
                 self.gateway.clone(),
             ));
         }
+        let skill_service = self.state.skills(execution);
+        if !completion_only {
+            dispatcher = Arc::new(zuno_worker::skills::SkillToolDispatcher::new(
+                dispatcher,
+                skill_service.clone(),
+            ));
+        }
         Ok(WorkerTurnServices {
             configuration: entry.definition.reference(),
             providers: entry.providers.clone(),
@@ -337,10 +344,15 @@ impl WorkerServiceFactory for ConfiguredWorkerFactory {
             }),
             dynamic_context: DynamicContext::default(),
             dynamic_context_refresher: (!completion_only).then(|| {
-                Arc::new(MemoryContextRefresher {
+                let memory = Arc::new(MemoryContextRefresher {
                     service: memory,
                     session_id: execution.job.session_id.to_string(),
                     base: DynamicContext::default(),
+                });
+                Arc::new(zuno_worker::skills::SkillContextRefresher {
+                    inner: memory,
+                    service: skill_service,
+                    session_id: execution.job.session_id.to_string(),
                 }) as Arc<dyn zuno_engine::r#loop::DynamicContextRefresher>
             }),
             executor_directory: "/workspace".to_owned(),

@@ -422,3 +422,13 @@ The exact format-25 source digest is
 `97894f2d63508374da797882c724f702886eb1fbbae4d5b390c12d277e498c15`.
 Migration preserves private/shared Memory and MCP state and rolls back atomically
 on DDL failure. See [SKILLS.md](SKILLS.md).
+
+## Format 27: versioned Skill library
+
+Installation bodies, original evaluation proofs, revision history and request
+receipts commit atomically under forced owner RLS. Activation and rollback use
+current authorization plus revision CAS; rollback creates an inactive revision.
+The exact format-26 source digest is
+`4897df28fc1284381212ed51dcd9e2b5c6c7c28175bdbe791c71eabfb3f7a91e`.
+Migration preserves candidates, sessions, messages and private/shared Memory; an
+injected DDL failure leaves the previous schema and rows intact. See [SKILLS.md](SKILLS.md).

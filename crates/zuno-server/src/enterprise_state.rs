@@ -1,4 +1,5 @@
 //! Authenticated Worker state routes. Public client routes use a separate DTO/API.
+mod skill;
 
 use axum::{
     Extension, Json, Router,
@@ -43,6 +44,8 @@ pub struct WorkerStateService {
     lease_duration: LeaseDuration,
     memory: Option<PostgresMemoryBackend>,
     memory_configurations: Option<Vec<zuno_application::runtime::ConfigurationRef>>,
+    skills: Option<Arc<dyn zuno_application::skill::SkillExecutionReader>>,
+    skill_configurations: Option<Vec<zuno_application::runtime::ConfigurationRef>>,
     children: Option<Arc<dyn ChildDefinitionCatalog>>,
     workflows: Option<Arc<dyn WorkflowDefinitionCatalog>>,
     councils: Option<Arc<dyn CouncilDefinitionCatalog>>,
@@ -63,6 +66,8 @@ impl WorkerStateService {
             lease_duration,
             memory: None,
             memory_configurations: None,
+            skills: None,
+            skill_configurations: None,
             children: None,
             workflows: None,
             councils: None,
@@ -72,6 +77,23 @@ impl WorkerStateService {
     pub fn with_memory(mut self, memory: PostgresMemoryBackend) -> Self {
         self.memory = Some(memory);
         self
+    }
+    pub fn with_skills(
+        mut self,
+        reader: Arc<dyn zuno_application::skill::SkillExecutionReader>,
+        configurations: Vec<zuno_application::runtime::ConfigurationRef>,
+    ) -> Result<Self, zuno_application::ApplicationError> {
+        if configurations.len() > 128 {
+            return Err(zuno_application::ApplicationError::Invalid(
+                "too many Skill profiles".to_owned(),
+            ));
+        }
+        for configuration in &configurations {
+            configuration.validate()?;
+        }
+        self.skills = Some(reader);
+        self.skill_configurations = Some(configurations);
+        Ok(self)
     }
     /// Restrict this installed Memory capability to explicit immutable profiles.
     /// Empty means no Worker profile receives Memory access.
@@ -123,6 +145,14 @@ impl WorkerStateService {
         }
         if self.children.is_some() {
             router = router.route(&format!("/{}", zuno_worker::CHILD_PATH), post(child_call));
+        }
+        if self.skills.is_some()
+            && self
+                .skill_configurations
+                .as_ref()
+                .is_some_and(|allowed| !allowed.is_empty())
+        {
+            router = router.route(&format!("/{}", zuno_worker::SKILL_PATH), post(skill::call));
         }
         if self.workflows.is_some() {
             router = router.route(

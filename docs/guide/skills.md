@@ -246,3 +246,12 @@ budgets and coverage.
 - [Workflows and commands](/config/workflows)
 - [Agents](/guide/agents)
 - [Configuration reference](/reference/configuration)
+
+## Enterprise activation
+
+The enterprise preview stores reviewed embedded Skills per owner and workspace.
+Passing evaluation does not install or activate content. Use separate installation
+and activation requests; replacement and rollback require the current revision and
+leave restored content inactive. The native `skill` tool discovers and loads only
+currently active content. Embedded documents have no resource directory. See
+[enterprise Skills](../../enterprise/SKILLS.md) for API, models and limits.

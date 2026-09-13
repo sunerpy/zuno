@@ -25,6 +25,7 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 zuno-application = { workspace = true }
+zuno-catalog = { workspace = true }
 zuno-permission = { workspace = true }
 zuno-agent = { workspace = true }
 zuno-auth = { workspace = true }

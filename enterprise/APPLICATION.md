@@ -120,3 +120,12 @@ backend and SDK capabilities do not deliver an App/UI.
 Configured Skill evaluation adds `POST jobs/{job}/skills`, `GET skills/{id}` and
 `POST skills/{id}/evaluate`; their typed `SkillApplication` provider is installed
 only when a reviewed model profile exists. See [SKILLS.md](SKILLS.md).
+
+## Installed Skills
+
+The scoped `SkillLibrary` port provides evaluated-content installation, paged
+metadata, document reads, activation and rollback. PostgreSQL supplies the provider;
+HTTP and generated SDK consumers preserve resource identity and decimal-string
+revisions. Mutations require an approved human review application. Installing or
+restoring content never activates it automatically. Route details and embedded
+resource limits are in [SKILLS.md](SKILLS.md). No App/UI is delivered.

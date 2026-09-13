@@ -13,7 +13,7 @@ platform contract is unchanged; see [platform boundaries](PLATFORMS.md).
 
 ## Claims and lifetime
 
-Internal Worker protocol 12 requires the protocol version and a bounded, nonempty
+Internal Worker protocol 13 requires the protocol version and a bounded, nonempty
 set of configuration references on every claim. The PostgreSQL claim query
 matches the exact ID, version and SHA before acquiring the session. A Worker with
 an older definition leaves incompatible work eligible for another Worker.
@@ -131,3 +131,19 @@ Learning protocol 2 supports explicitly reviewed Skill evaluations. Baseline,
 candidate and grading requests remain in the same scoped Job budget. Recorded
 cassettes never acquire the Worker's live gateway/tool executor. Profiles use
 `skillEvaluation`; see [SKILLS.md](SKILLS.md).
+
+## Active Skill documents
+
+Agent profiles refresh a bounded catalog from the Job-scoped internal state API
+before each model request, then use the native `skill` definition for list,
+search and loading. The control-plane data owner resolves reviewed embedded
+documents and rechecks activation, ownership and lease before returning output.
+Checkpoint continuation refreshes the catalog; completion profiles expose none
+of these tools. Workers need neither database credentials nor control-plane
+filesystem access. Resource packages remain unsupported by this embedded provider.
+See [SKILLS.md](SKILLS.md).
+
+Protocol 13 rejects older Workers before claiming work so they cannot silently
+omit the current Skill catalog or expose a different tool set during continuation.
+Drain and replace Worker/control-plane binaries together when upgrading this
+preview; existing checkpoint schema 4 and accumulated budgets are retained.

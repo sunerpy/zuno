@@ -1,4 +1,4 @@
-# 企业 Skill 评测
+# 企业 Skill 评测与激活
 
 Skill 评测是在现有学习 Job、Worker 租约和模型计量底座上执行的明确审核任务。
 它不会因为会话结束就自动启动，也不借用私人 Memory 自动维护授权。
@@ -53,5 +53,36 @@ SDK 提供 `proposeSkill`、`skillCandidate`、`evaluateSkill`。已有学习 Jo
 新的模型请求。目前 Worker 丢失后重启案例序列，不迁移在途 provider stream，
 仍受同一持久 Job 预算约束。
 
-评测通过不自动应用或安装 Skill。企业应用、激活及私人证据提升仍是独立实施
-工作，不注册占位 apply 端点。
+## 带版本的安装
+
+评测通过不会自动安装或激活。所有者通过获准审核应用分别执行安装、激活及
+回退，每次操作重新检查当前组织授权，绑定请求 ID 和预期版本。安装记录保留
+精确候选摘要、正文以及已完成的评测证据。
+
+| 路由 | 行为 |
+| --- | --- |
+| `POST /api/v1/skills/{candidate}/install` | 保存已评测正文；首次安装预期版本为 `0` |
+| `GET /api/v1/workspaces/{workspace}/skills` | 分页读取本人安装元数据 |
+| `GET /api/v1/installed-skills/{skill}` | 读取本人正文与当前版本 |
+| `POST /api/v1/installed-skills/{skill}/activation` | 明确激活或停用当前版本 |
+| `POST /api/v1/installed-skills/{skill}/rollback` | 将历史正文和证据恢复为新的未激活版本 |
+
+安装按所有者、工作区和经过校验的名称唯一标识。替换要求评测基线与当前正文
+一致，并通过版本 CAS。每次安装和回退都先停用，需单独激活。正文、版本历史
+及请求回执原子提交。每工作区最多安装 64 项，正文最多 32 KiB，描述最多
+1,200 UTF-8 字节。
+
+该后端使用原生**嵌入式 Skill**：正文保存于 PostgreSQL，复用 `Skills` 目录
+及 `skill` 工具。每次模型请求前刷新有界元数据索引，`list`、`search`、`load`
+复用原生身份及分页规则。加载前后检查当前所有权、租约及激活状态；来源标识
+包含安装版本，因此旧版本或已停用来源不能继续加载。已记录正文仍保留在持久
+历史中，停用影响后续发现和读取。
+
+内部状态服务不扫描控制面宿主目录。嵌入式 Skill 没有资源根目录，
+`read_resource` 明确报告此限制；资源包／工作区安装和基于证据的自动提案仍待
+后续实现。completion 配置不暴露 Skill 工具。
+
+PostgreSQL 预览格式 27 增加安装、版本与请求表，强制执行所有者 RLS。
+精确格式 26 迁移测试保留已评测候选、会话、消息及 Memory，并覆盖注入故障
+后的整体回滚。SDK 提供 `installSkill`、`installedSkills`、`installedSkill`、
+`activateSkill`、`rollbackSkill`。不包含 App/UI。

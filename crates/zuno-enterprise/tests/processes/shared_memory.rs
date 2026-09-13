@@ -165,7 +165,7 @@ async fn turn(http: &reqwest::Client, control: &str, token: &str, text: &str, ke
     let url = start(http, control, token, text, key).await;
     complete(http, &url, token).await;
 }
-async fn start(
+pub(super) async fn start(
     http: &reqwest::Client,
     control: &str,
     token: &str,
@@ -201,7 +201,7 @@ async fn start(
         .unwrap();
     format!("{control}api/v1/jobs/{}", job["id"].as_str().unwrap())
 }
-async fn complete(http: &reqwest::Client, url: &str, token: &str) {
+pub(super) async fn complete(http: &reqwest::Client, url: &str, token: &str) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let current: Value = http

@@ -99,3 +99,10 @@ SDK，不交付 App/UI。
 配置 Skill 评测后提供 `POST jobs/{job}/skills`、`GET skills/{id}`、
 `POST skills/{id}/evaluate`。仅当模型配置存在时安装真实 `SkillApplication`
 提供方，详见 [SKILLS.zh.md](SKILLS.zh.md)。
+
+## 已安装 Skill
+
+作用域 `SkillLibrary` 接口提供已评测正文安装、元数据分页、正文读取、激活和
+回退；PostgreSQL 为提供方，HTTP 与生成 SDK 保留资源身份和十进制字符串版本。
+修改要求人类主体使用获准审核应用，安装或恢复不会自动激活。路由和嵌入式
+资源限制见 [SKILLS.zh.md](SKILLS.zh.md)。不交付 App/UI。

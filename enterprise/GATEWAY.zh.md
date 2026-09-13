@@ -128,7 +128,7 @@ Docker 提供者读取分配工作区版本的已验证不可变归档，不执�
 只有 `autoReadApps` 中的应用能自动批准这些内置读取，其他允许接入的应用沿用权威 HITL
 流程。该白名单不批准 Shell 或任意 MCP 操作。控制入口为
 `/internal/gateway/v1/files/prepare`、`/authorize`，仅接受分配网关的服务身份。
-Worker 与网关须匹配网关协议 8，状态／Worker 协议为 12。
+Worker 与网关须匹配网关协议 8，状态／Worker 协议为 13。
 
 ## 人工审阅的文件修改
 

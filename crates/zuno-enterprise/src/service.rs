@@ -399,7 +399,8 @@ async fn control(options: ControlConfig, shutdown: InterruptSignal) -> Result<()
             .map_err(|_| invalid("invalid Memory service configuration"))?;
     let mut application =
         EnterpriseApplication::new(backend.clone(), options.tenant_id.clone(), active)?
-            .with_memory(memory.clone());
+            .with_memory(memory.clone())
+            .with_skill_library(Arc::new(backend.skill_library()));
     let learning_runtime = if !learning.grants().is_empty() || !learning.skills().is_empty() {
         Some(
             zuno_postgres::PostgresLearningRuntime::with_skills(
@@ -439,6 +440,14 @@ async fn control(options: ControlConfig, shutdown: InterruptSignal) -> Result<()
         lease,
     )
     .with_memory(memory.clone())
+    .with_skills(
+        Arc::new(backend.skill_library()),
+        definitions
+            .iter()
+            .filter(|definition| definition.agent.mode == config::AgentExecutionMode::Agent)
+            .map(|definition| definition.reference())
+            .collect(),
+    )?
     .with_memory_configurations(
         definitions
             .iter()

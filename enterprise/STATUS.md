@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p2-skill-runtime`.
+- Current phase branch: `codex/enterprise-p2-skill-activation`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -608,3 +608,18 @@ environment command was used by evaluation. Durable trace/grade verification,
 rollback, cross-user denial, cancellation and fake-result refusal are tested.
 SDK 27 tests, generated drift, workspace check, Clippy and 100 documentation/release contracts pass. Exact-archive and preview CI evidence remain required. Enterprise Skill installation/activation and evidence-based
 proposal automation remain outstanding; UI is paused and publication disabled.
+
+## Enterprise Skill installation under validation
+
+PR #243 merged to preview at `d77ac8b47b30770efd5c21ad181f77bc70b02d66` after
+all CI gates passed; its exact artifact executed 80 model requests. Current work
+adds owner/workspace Skill installation, explicit activation, rollback, native
+embedded catalog/tool consumption and generated SDK methods. PostgreSQL format
+27 and its exact format-26 migration passed initial preservation/rollback tests.
+Native five-role tests passed inactive discovery, scoped search/load, deactivation
+during approval waiting, same-Job continuation and inactive rollback. SDK 28 tests,
+generated drift, workspace check, Clippy and all 100 documentation/release
+contracts passed. Final PostgreSQL transaction and five HTTPS checks passed. Exact-archive/CI proof
+remains required before publication. Resource packages and evidence-based proposal automation remain open.
+All 11 deferred UI files retain their recorded hashes. App/UI is paused and
+Penpot must precede future design/development. No enterprise tag or release exists.

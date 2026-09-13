@@ -6,6 +6,7 @@ import type {
   WorkspaceEditView, McpCallView,
   SharedMemorySpace, SharedMemoryPage, SharedMemoryChange, ConfigureSharedMemory, ProposeSharedMemory, ReviewSharedMemory,
   ProposeSkill, ReviewSkillEvaluation, SkillCandidateView,
+  InstallSkill, ActivateSkill, RollbackSkill, InstalledSkillView, InstalledSkillPage, InstalledSkillDocument,
 } from "./generated/application.js";
 import {
   validateWorkspaceView, validateSessionPage, validateSessionSummary, validateJobView,
@@ -15,6 +16,7 @@ import {
   validateSharedMemorySpace, validateSharedMemoryPage, validateSharedMemoryChange,
   validateConfigureSharedMemory, validateProposeSharedMemory, validateReviewSharedMemory,
   validateProposeSkill,validateReviewSkillEvaluation,validateSkillCandidateView,
+  validateInstallSkill,validateActivateSkill,validateRollbackSkill,validateInstalledSkillView,validateInstalledSkillPage,validateInstalledSkillDocument,
 } from "./generated/application-validators.mjs";
 
 function checked<T>(value: unknown, validate: (value: unknown) => unknown): T {
@@ -27,6 +29,37 @@ function id(value: string): string {
 }
 
 export class EnterpriseClient extends ActivityClient {
+  async installSkill(candidate: string, request: InstallSkill, signal?: AbortSignal): Promise<InstalledSkillView> {
+    if (!validateInstallSkill(request)) throw new Error("Invalid Skill installation");
+    const value=checked<InstalledSkillView>(await this.get(new URL(`skills/${id(candidate)}/install`,this.base),signal,"POST",request),validateInstalledSkillView);
+    if(value.candidateId!==candidate || value.active || BigInt(value.revision)!==BigInt(request.expectedRevision)+1n) throw new Error("Skill installation identity mismatch");
+    return value;
+  }
+  async installedSkills(workspace: string, after?: string, signal?: AbortSignal): Promise<InstalledSkillPage> {
+    const url=new URL(`workspaces/${id(workspace)}/skills`,this.base);
+    if(after) url.searchParams.set("after",id(after));
+    const page=checked<InstalledSkillPage>(await this.get(url,signal),validateInstalledSkillPage);
+    if(page.items.some(value=>value.workspaceId!==workspace)) throw new Error("Skill workspace identity mismatch");
+    if(page.after && page.items.at(-1)?.id!==page.after) throw new Error("Skill cursor identity mismatch");
+    return page;
+  }
+  async installedSkill(skill: string, signal?: AbortSignal): Promise<InstalledSkillDocument> {
+    const value=checked<InstalledSkillDocument>(await this.get(new URL(`installed-skills/${id(skill)}`,this.base),signal),validateInstalledSkillDocument);
+    if(value.skill.id!==skill) throw new Error("Skill installation identity mismatch");
+    return value;
+  }
+  async activateSkill(skill: string, request: ActivateSkill, signal?: AbortSignal): Promise<InstalledSkillView> {
+    if(!validateActivateSkill(request)) throw new Error("Invalid Skill activation");
+    const value=checked<InstalledSkillView>(await this.get(new URL(`installed-skills/${id(skill)}/activation`,this.base),signal,"POST",request),validateInstalledSkillView);
+    if(value.id!==skill || value.active!==request.active || BigInt(value.revision)!==BigInt(request.expectedRevision)+1n) throw new Error("Skill activation identity mismatch");
+    return value;
+  }
+  async rollbackSkill(skill: string, request: RollbackSkill, signal?: AbortSignal): Promise<InstalledSkillView> {
+    if(!validateRollbackSkill(request)) throw new Error("Invalid Skill rollback");
+    const value=checked<InstalledSkillView>(await this.get(new URL(`installed-skills/${id(skill)}/rollback`,this.base),signal,"POST",request),validateInstalledSkillView);
+    if(value.id!==skill || value.active || BigInt(value.revision)!==BigInt(request.expectedRevision)+1n) throw new Error("Skill rollback identity mismatch");
+    return value;
+  }
   async proposeSkill(sourceJob: string, request: ProposeSkill, signal?: AbortSignal): Promise<SkillCandidateView> {
     if(!validateProposeSkill(request)) throw new Error("Invalid Skill proposal");
     const value=checked<SkillCandidateView>(await this.get(new URL(`jobs/${id(sourceJob)}/skills`,this.base),signal,"POST",request),validateSkillCandidateView);

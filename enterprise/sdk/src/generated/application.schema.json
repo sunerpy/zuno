@@ -3,6 +3,9 @@
   "title": "ApplicationProtocol",
   "type": "object",
   "properties": {
+    "activate_skill": {
+      "$ref": "#/$defs/ActivateSkill"
+    },
     "answer": {
       "$ref": "#/$defs/ApprovalDecision"
     },
@@ -29,6 +32,18 @@
     },
     "input_version": {
       "$ref": "#/$defs/InputVersionView"
+    },
+    "install_skill": {
+      "$ref": "#/$defs/InstallSkill"
+    },
+    "installed_skill": {
+      "$ref": "#/$defs/InstalledSkillView"
+    },
+    "installed_skill_document": {
+      "$ref": "#/$defs/InstalledSkillDocument"
+    },
+    "installed_skills": {
+      "$ref": "#/$defs/InstalledSkillPage"
     },
     "job": {
       "$ref": "#/$defs/JobView"
@@ -62,6 +77,9 @@
     },
     "review_skill": {
       "$ref": "#/$defs/ReviewSkillEvaluation"
+    },
+    "rollback_skill": {
+      "$ref": "#/$defs/RollbackSkill"
     },
     "session": {
       "$ref": "#/$defs/SessionSummary"
@@ -104,6 +122,12 @@
     "skill_candidate",
     "propose_skill",
     "review_skill",
+    "install_skill",
+    "activate_skill",
+    "rollback_skill",
+    "installed_skill",
+    "installed_skills",
+    "installed_skill_document",
     "shared_memory_space",
     "shared_memory_page",
     "shared_memory_change",
@@ -135,6 +159,26 @@
     "learning_cancellation"
   ],
   "$defs": {
+    "ActivateSkill": {
+      "type": "object",
+      "properties": {
+        "active": {
+          "type": "boolean"
+        },
+        "expectedRevision": {
+          "$ref": "#/$defs/Counter"
+        },
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "requestId",
+        "expectedRevision",
+        "active"
+      ]
+    },
     "ActivityName": {
       "type": "string",
       "maxLength": 256,
@@ -581,6 +625,115 @@
       "additionalProperties": false,
       "required": [
         "version"
+      ]
+    },
+    "InstallSkill": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "expectedDigest": {
+          "type": "string"
+        },
+        "expectedRevision": {
+          "$ref": "#/$defs/Counter"
+        },
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "requestId",
+        "expectedDigest",
+        "expectedRevision",
+        "description"
+      ]
+    },
+    "InstalledSkillDocument": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "skill": {
+          "$ref": "#/$defs/InstalledSkillView"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "skill",
+        "content"
+      ]
+    },
+    "InstalledSkillPage": {
+      "type": "object",
+      "properties": {
+        "after": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RequestId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/InstalledSkillView"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "items"
+      ]
+    },
+    "InstalledSkillView": {
+      "type": "object",
+      "properties": {
+        "active": {
+          "type": "boolean"
+        },
+        "candidateId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "contentDigest": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "name": {
+          "type": "string"
+        },
+        "revision": {
+          "$ref": "#/$defs/Counter"
+        },
+        "source": {
+          "type": "string"
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "workspaceId",
+        "candidateId",
+        "name",
+        "description",
+        "revision",
+        "source",
+        "contentDigest",
+        "active"
       ]
     },
     "InvocationId": {
@@ -1193,6 +1346,26 @@
       "required": [
         "requestId",
         "expectedDigest"
+      ]
+    },
+    "RollbackSkill": {
+      "type": "object",
+      "properties": {
+        "expectedRevision": {
+          "$ref": "#/$defs/Counter"
+        },
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "targetRevision": {
+          "$ref": "#/$defs/Counter"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "requestId",
+        "expectedRevision",
+        "targetRevision"
       ]
     },
     "SessionCursor": {

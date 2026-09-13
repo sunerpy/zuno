@@ -173,3 +173,10 @@ zuno debug agent explorer
 - [Workflow 与命令](/zh/config/workflows)
 - [Agent](/zh/guide/agents)
 - [配置项参考](/zh/config/reference)
+
+## 企业激活
+
+企业预览按所有者和工作区保存已审核的嵌入式 Skill。评测通过不会自动安装或
+激活，需分别提交安装及激活请求。替换和回退要求当前版本，恢复正文默认不
+激活。原生 `skill` 工具仅发现和加载当前已激活内容，嵌入式文档没有资源目录。
+API、模型和限制见 [企业 Skill](../../../enterprise/SKILLS.zh.md)。
