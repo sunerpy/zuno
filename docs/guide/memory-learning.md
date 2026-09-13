@@ -490,3 +490,9 @@ This extension point does not enable automatic Skill evaluation or change its
 model configuration: review, real paired model evaluation and application remain
 separate lifecycle steps. Enterprise remote Skill execution is still under
 implementation in the preview channel.
+
+Skill application records the complete intended file effect before writing and
+checks the resulting bytes before settlement. After interruption, the existing
+operation is reconstructed and inspected; an uncertain write is not replayed.
+The same prepared-effect interface is available to host adapters, while remote
+Skill execution remains a separate enterprise implementation step.

@@ -307,3 +307,10 @@ and retain their review, model, source-digest and uncertain-effect behavior.
 This foundation does not register enterprise Skill evaluation/application routes;
 scoped PostgreSQL settlement, remote execution and application authority remain
 part of the full implementation plan.
+
+Skill effect preparation and receipt settlement now have data-only entry points:
+`PreparedSkillEffect`, `prepare_apply`, `prepare_undo`, `pending_effect` and
+`settle_effect`. The native filesystem host consumes them with real read-back
+verification. Enterprise use still requires owner-scoped candidate storage and
+an authenticated environment operation; no remote Skill capability is advertised
+by the preparation interface alone.

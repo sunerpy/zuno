@@ -168,6 +168,15 @@ impl ProcessPluginHost {
         uncertain_after_send: bool,
     ) -> Result<Value, PluginHostError> {
         let mut slot = self.state.lock().await;
+        if interrupt.is_some_and(|interrupt| interrupt.is_set()) {
+            // No frame has been encoded or written for this call. There is no
+            // process cleanup prerequisite for proving that it was not sent.
+            return Err(PluginHostError::Cancelled {
+                package: self.package.clone(),
+                dispatched: false,
+                cleanup: None,
+            });
+        }
         let Some(state) = slot.as_mut() else {
             return Err(PluginHostError::Uncertain {
                 package: self.package.clone(),

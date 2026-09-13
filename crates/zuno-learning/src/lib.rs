@@ -23,6 +23,7 @@ mod request;
 mod retrieval;
 mod scheduler;
 mod skill;
+pub mod skill_effect;
 pub mod skill_persistence;
 mod supervisor;
 mod text;

@@ -1,10 +1,12 @@
+use crate::skill_effect::{
+    PreparedSkillEffect, SkillEffectKind, SkillFileSnapshot as FileSnapshot,
+};
 use crate::skill_persistence::{
     SkillBackendBundle, SkillCandidatePersistence, SkillEvidencePersistence, SqliteSkillBackend,
 };
 use crate::text::single_markdown_line;
 use crate::{LearningServiceError, Result, digest_text};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use similar::TextDiff;
 use std::collections::BTreeSet;
@@ -73,12 +75,6 @@ pub trait SkillSourceResolver: Send + Sync {
         &self,
         source_identity: &str,
     ) -> std::result::Result<String, LearningError>;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct FileSnapshot {
-    exists: bool,
-    content: String,
 }
 
 #[derive(Clone)]
@@ -732,7 +728,53 @@ impl SkillCandidateService {
         let source = resolver
             .read_source(&candidate.projection.target_source)
             .await?;
-        let observed_digest = digest_text(&source);
+        let before = read_snapshot(&path)?;
+        let effect = self.prepare_apply(
+            id,
+            &source,
+            before,
+            &format!("ska_{}", Uuid::now_v7().simple()),
+            now,
+        )?;
+        let after = &effect.after;
+        match write_snapshot(&path, after) {
+            Ok(()) => self.settle_effect(
+                &effect,
+                &read_snapshot(&path)?,
+                None,
+                zuno_db::message::now_millis(),
+            ),
+            Err(error) => {
+                self.settle_effect(
+                    &effect,
+                    &read_snapshot(&path)?,
+                    Some(&error.to_string()),
+                    zuno_db::message::now_millis(),
+                )?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Prepares one already reviewed/evaluated change from authoritative host
+    /// snapshots. The host must still authorize and coordinate the actual write.
+    pub fn prepare_apply(
+        &self,
+        id: &str,
+        source: &str,
+        before: FileSnapshot,
+        operation_id: &str,
+        now: i64,
+    ) -> Result<PreparedSkillEffect> {
+        before.validate()?;
+        let candidate = self.candidates.get(id)?;
+        if candidate.projection.status != SkillCandidateStatus::Approved {
+            return Err(LearningError::SkillReviewRequired {
+                candidate_id: id.to_owned(),
+            }
+            .into());
+        }
+        let observed_digest = digest_text(source);
         if observed_digest != candidate.projection.target_digest {
             self.candidates.mark_stale(
                 id,
@@ -746,7 +788,6 @@ impl SkillCandidateService {
             }
             .into());
         }
-        let before = read_snapshot(&path)?;
         if !candidate.target_writable && before.exists {
             self.candidates
                 .mark_stale(id, "project companion destination already exists", now)?;
@@ -800,28 +841,83 @@ impl SkillCandidateService {
                 content: candidate.proposed_content.clone(),
             }
         };
-        let operation_id = format!("ska_{}", Uuid::now_v7().simple());
+        let effect = PreparedSkillEffect {
+            candidate_id: id.to_owned(),
+            operation_id: operation_id.to_owned(),
+            kind: SkillEffectKind::Apply,
+            before: before.clone(),
+            after: after.clone(),
+        };
+        effect.validate()?;
         let before_json = serde_json::to_string(&before).expect("FileSnapshot is serializable");
         let after_json = serde_json::to_string(&after).expect("FileSnapshot is serializable");
         self.candidates
-            .begin_apply(id, &operation_id, &before_json, &after_json, now)?;
-        match write_snapshot(&path, &after) {
-            Ok(()) => self
-                .candidates
-                .finish_effect(
-                    id,
-                    SkillCandidateStatus::Applying,
-                    SkillCandidateStatus::Applied,
-                    None,
-                    zuno_db::message::now_millis(),
-                )
-                .map_err(Into::into),
+            .begin_apply(id, operation_id, &before_json, &after_json, now)?;
+        Ok(effect)
+    }
+
+    /// Records a truthful observation for the exact stored effect. Neither a
+    /// lost response nor a network retry authorizes writing the target again.
+    pub fn settle_effect(
+        &self,
+        effect: &PreparedSkillEffect,
+        observed: &FileSnapshot,
+        error: Option<&str>,
+        now: i64,
+    ) -> Result<SkillCandidateRecord> {
+        effect.validate()?;
+        let candidate = self.candidates.get(&effect.candidate_id)?;
+        let (before, after) = match effect.kind {
+            SkillEffectKind::Apply => (
+                decode_snapshot(candidate.before_content.as_deref(), &effect.candidate_id)?,
+                decode_snapshot(candidate.after_content.as_deref(), &effect.candidate_id)?,
+            ),
+            SkillEffectKind::Undo => (
+                decode_snapshot(candidate.after_content.as_deref(), &effect.candidate_id)?,
+                decode_snapshot(candidate.before_content.as_deref(), &effect.candidate_id)?,
+            ),
+        };
+        if candidate.apply_operation_id.as_deref() != Some(effect.operation_id.as_str())
+            || before != effect.before
+            || after != effect.after
+        {
+            return Err(invalid(
+                "skill.effect",
+                "receipt does not bind the persisted effect",
+            ));
+        }
+        let state = effect.observed_state(observed)?;
+        if candidate.projection.status == state {
+            return Ok(candidate);
+        }
+        self.candidates
+            .finish_effect(
+                &effect.candidate_id,
+                effect.expected_state(),
+                state,
+                error,
+                now,
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn undo(&self, id: &str, now: i64) -> Result<SkillCandidateRecord> {
+        let candidate = self.candidates.get(id)?;
+        let path = candidate_path(&candidate)?;
+        let _guard = lock_skill_path(&path)?;
+        let current = read_snapshot(&path)?;
+        let effect = self.prepare_undo(id, current, now)?;
+        match write_snapshot(&path, &effect.after) {
+            Ok(()) => self.settle_effect(
+                &effect,
+                &read_snapshot(&path)?,
+                None,
+                zuno_db::message::now_millis(),
+            ),
             Err(error) => {
-                let status = reconcile_snapshot(&path, &before, &after, true)?;
-                self.candidates.finish_effect(
-                    id,
-                    SkillCandidateStatus::Applying,
-                    status,
+                self.settle_effect(
+                    &effect,
+                    &read_snapshot(&path)?,
                     Some(&error.to_string()),
                     zuno_db::message::now_millis(),
                 )?;
@@ -829,8 +925,13 @@ impl SkillCandidateService {
             }
         }
     }
-
-    pub fn undo(&self, id: &str, now: i64) -> Result<SkillCandidateRecord> {
+    pub fn prepare_undo(
+        &self,
+        id: &str,
+        current: FileSnapshot,
+        now: i64,
+    ) -> Result<PreparedSkillEffect> {
+        current.validate()?;
         let candidate = self.candidates.get(id)?;
         if candidate.projection.status != SkillCandidateStatus::Applied {
             return Err(invalid(
@@ -840,9 +941,6 @@ impl SkillCandidateService {
         }
         let before = decode_snapshot(candidate.before_content.as_deref(), id)?;
         let after = decode_snapshot(candidate.after_content.as_deref(), id)?;
-        let path = candidate_path(&candidate)?;
-        let _guard = lock_skill_path(&path)?;
-        let current = read_snapshot(&path)?;
         if current != after {
             self.candidates
                 .mark_stale(id, "Skill target changed after apply", now)?;
@@ -853,30 +951,45 @@ impl SkillCandidateService {
             }
             .into());
         }
+        let effect = PreparedSkillEffect {
+            candidate_id: id.to_owned(),
+            operation_id: candidate
+                .apply_operation_id
+                .clone()
+                .ok_or_else(|| invalid("skill.effect", "missing persisted operation identity"))?,
+            kind: SkillEffectKind::Undo,
+            before: after,
+            after: before,
+        };
+        effect.validate()?;
         self.candidates.begin_undo(id, now)?;
-        match write_snapshot(&path, &before) {
-            Ok(()) => self
-                .candidates
-                .finish_effect(
-                    id,
-                    SkillCandidateStatus::Undoing,
-                    SkillCandidateStatus::Undone,
-                    None,
-                    zuno_db::message::now_millis(),
-                )
-                .map_err(Into::into),
-            Err(error) => {
-                let status = reconcile_snapshot(&path, &after, &before, false)?;
-                self.candidates.finish_effect(
-                    id,
-                    SkillCandidateStatus::Undoing,
-                    status,
-                    Some(&error.to_string()),
-                    zuno_db::message::now_millis(),
-                )?;
-                Err(error)
-            }
-        }
+        Ok(effect)
+    }
+
+    pub fn pending_effect(&self, id: &str) -> Result<Option<PreparedSkillEffect>> {
+        let candidate = self.candidates.get(id)?;
+        let kind = match candidate.projection.status {
+            SkillCandidateStatus::Applying => SkillEffectKind::Apply,
+            SkillCandidateStatus::Undoing => SkillEffectKind::Undo,
+            _ => return Ok(None),
+        };
+        let before = decode_snapshot(candidate.before_content.as_deref(), id)?;
+        let after = decode_snapshot(candidate.after_content.as_deref(), id)?;
+        let (before, after) = match kind {
+            SkillEffectKind::Apply => (before, after),
+            SkillEffectKind::Undo => (after, before),
+        };
+        let effect = PreparedSkillEffect {
+            candidate_id: id.to_owned(),
+            operation_id: candidate
+                .apply_operation_id
+                .ok_or_else(|| invalid("skill.effect", "missing persisted operation identity"))?,
+            kind,
+            before,
+            after,
+        };
+        effect.validate()?;
+        Ok(Some(effect))
     }
 
     /// Reconcile interrupted filesystem effects without replaying them.
@@ -885,12 +998,6 @@ impl SkillCandidateService {
         reconciled = reconciled.saturating_add(self.candidates.fail_interrupted_evaluations(now)?);
         let inflight = self.candidates.list_inflight()?;
         for candidate in inflight {
-            let before = decode_snapshot(
-                candidate.before_content.as_deref(),
-                &candidate.projection.id,
-            )?;
-            let after =
-                decode_snapshot(candidate.after_content.as_deref(), &candidate.projection.id)?;
             let path = candidate_path(&candidate)?;
             let _guard = match lock_skill_path(&path) {
                 Ok(guard) => guard,
@@ -902,34 +1009,13 @@ impl SkillCandidateService {
                 Err(error) => return Err(error),
             };
             let current = read_snapshot(&path)?;
-            let (expected, status) = match candidate.projection.status {
-                SkillCandidateStatus::Applying if current == after => (
-                    SkillCandidateStatus::Applying,
-                    SkillCandidateStatus::Applied,
-                ),
-                SkillCandidateStatus::Applying if current == before => {
-                    (SkillCandidateStatus::Applying, SkillCandidateStatus::Failed)
-                }
-                SkillCandidateStatus::Undoing if current == before => {
-                    (SkillCandidateStatus::Undoing, SkillCandidateStatus::Undone)
-                }
-                SkillCandidateStatus::Undoing if current == after => {
-                    (SkillCandidateStatus::Undoing, SkillCandidateStatus::Failed)
-                }
-                SkillCandidateStatus::Applying => (
-                    SkillCandidateStatus::Applying,
-                    SkillCandidateStatus::Uncertain,
-                ),
-                SkillCandidateStatus::Undoing => (
-                    SkillCandidateStatus::Undoing,
-                    SkillCandidateStatus::Uncertain,
-                ),
-                _ => continue,
+            let Some(effect) = self.pending_effect(&candidate.projection.id)? else {
+                continue;
             };
-            self.candidates.finish_effect(
-                &candidate.projection.id,
-                expected,
-                status,
+            let status = effect.observed_state(&current)?;
+            self.settle_effect(
+                &effect,
+                &current,
                 (status != SkillCandidateStatus::Applied && status != SkillCandidateStatus::Undone)
                     .then_some("reconciled from authoritative filesystem state"),
                 now,
@@ -1118,12 +1204,14 @@ fn decode_snapshot(snapshot: Option<&str>, id: &str) -> Result<FileSnapshot> {
             &format!("Skill candidate `{id}` has no effect snapshot"),
         )
     })?;
-    serde_json::from_str(snapshot).map_err(|_| {
+    let value: FileSnapshot = serde_json::from_str(snapshot).map_err(|_| {
         invalid(
             "candidate.snapshot",
             &format!("Skill candidate `{id}` has a corrupt effect snapshot"),
         )
-    })
+    })?;
+    value.validate()?;
+    Ok(value)
 }
 
 fn read_snapshot(path: &Path) -> Result<FileSnapshot> {
@@ -1185,26 +1273,6 @@ fn write_snapshot(path: &Path, snapshot: &FileSnapshot) -> Result<()> {
         }
     })?;
     Ok(())
-}
-
-fn reconcile_snapshot(
-    path: &Path,
-    before: &FileSnapshot,
-    after: &FileSnapshot,
-    applying: bool,
-) -> Result<SkillCandidateStatus> {
-    let current = read_snapshot(path)?;
-    Ok(if current == *after {
-        if applying {
-            SkillCandidateStatus::Applied
-        } else {
-            SkillCandidateStatus::Undone
-        }
-    } else if current == *before {
-        SkillCandidateStatus::Failed
-    } else {
-        SkillCandidateStatus::Uncertain
-    })
 }
 
 fn invalid(field: &str, detail: &str) -> LearningServiceError {
@@ -1473,6 +1541,80 @@ mod tests {
         assert_eq!(
             fs::read_to_string(path).expect("unchanged source"),
             "# External drift\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_effect_recovers_without_a_host_path_or_repeating_the_write() {
+        let pool = fixture();
+        let service = SkillCandidateService::new(pool.clone(), ResolvedLearningConfig::default());
+        let directory = tempfile::tempdir().unwrap();
+        let candidate = service
+            .create_companion_from_pattern("pattern-1", directory.path(), false, 4)
+            .unwrap()
+            .unwrap();
+        approve(&service, &candidate.projection.id, "").await;
+        let before = FileSnapshot {
+            exists: false,
+            content: String::new(),
+        };
+        let effect = service
+            .prepare_apply(&candidate.projection.id, "", before, "operation-stable", 20)
+            .unwrap();
+        assert!(
+            !candidate_path(&candidate).unwrap().exists(),
+            "preparation does not write files"
+        );
+        let encoded = serde_json::to_string(&effect).unwrap();
+        assert!(!encoded.contains(&directory.path().to_string_lossy().to_string()));
+        let reopened = SkillCandidateService::new(pool, ResolvedLearningConfig::default());
+        assert_eq!(
+            reopened.pending_effect(&candidate.projection.id).unwrap(),
+            Some(effect.clone())
+        );
+        let mut forged = effect.clone();
+        forged.operation_id = "unrelated".to_owned();
+        assert!(
+            reopened
+                .settle_effect(&forged, &effect.after, None, 21)
+                .is_err()
+        );
+        let applied = reopened
+            .settle_effect(&effect, &effect.after, None, 22)
+            .unwrap();
+        assert_eq!(applied.projection.status, SkillCandidateStatus::Applied);
+        assert_eq!(
+            reopened
+                .settle_effect(&effect, &effect.after, None, 23)
+                .unwrap()
+                .projection
+                .status,
+            SkillCandidateStatus::Applied
+        );
+        let undo = reopened
+            .prepare_undo(&candidate.projection.id, effect.after.clone(), 24)
+            .unwrap();
+        assert_eq!(undo.before, effect.after);
+        assert_eq!(undo.after, effect.before);
+        assert_eq!(
+            reopened.pending_effect(&candidate.projection.id).unwrap(),
+            Some(undo.clone())
+        );
+        let uncertain = FileSnapshot {
+            exists: true,
+            content: "unrecognized external edit".to_owned(),
+        };
+        assert_eq!(
+            reopened
+                .settle_effect(&undo, &uncertain, None, 25)
+                .unwrap()
+                .projection
+                .status,
+            SkillCandidateStatus::Uncertain
+        );
+        assert!(
+            !candidate_path(&candidate).unwrap().exists(),
+            "settlement only records observed facts"
         );
     }
 

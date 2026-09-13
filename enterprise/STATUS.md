@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p2-skill-evaluation-storage`.
+- Current phase branch: `codex/enterprise-p3-skill-effects`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -590,3 +590,11 @@ existing consumers are wired. All 129 evaluation/learning tests passed, includin
 replacement-persistence settlement failure. No enterprise Skill endpoint or
 backend is registered by this foundation; distributed Skill integration remains
 uncompleted plan work. UI remains paused.
+
+## Skill effect separation under validation
+
+Preparation, native execution/read-back, unfinished-effect reconstruction and
+receipt settlement now use one data-only effect contract. Recovery tests verify
+no write during preparation/settlement, exact effect matching, duplicate receipts
+and uncertain divergence. This remains a native implementation foundation; the
+enterprise authorized effect adapter and distributed evaluation are outstanding.

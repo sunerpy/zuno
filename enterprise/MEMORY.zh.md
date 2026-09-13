@@ -228,3 +228,8 @@ Skill 候选与证据通过 `SkillBackendBundle` 中的可替换持久化接口�
 消费这些接口，保留原审核、模型、来源摘要和不确定副作用行为。这项基础重构
 不注册企业 Skill 评测／应用路由，PostgreSQL 作用域结算、远程执行与应用授权
 仍属于完整实施计划的后续工作。
+
+Skill 文件效果现有数据化准备和回执入口：`PreparedSkillEffect`、`prepare_apply`、
+`prepare_undo`、`pending_effect`、`settle_effect`。本地文件宿主已使用这些入口并
+在写入后读取验证。企业使用仍需要用户作用域存储和已鉴权的环境操作，准备接口
+本身不声明远程 Skill 能力已经完成。
