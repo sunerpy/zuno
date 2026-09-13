@@ -697,8 +697,13 @@ synchronization was under CI. A separate follow-up worktree incorporates sealed
 Responses history, post-hook tool authority and provider replay fixes into the
 existing bounded engine loop. Provider-sealed history cannot be rewritten by a
 hook; preserving an old call does not authorize executing that tool now.
-The stable release baseline remains v0.10.37. Local follow-up validation passed
-357 engine/dispatch/protocol tests, 460 LLM/provider tests, 104 documentation and
-release contracts, and workspace check/Clippy. Native process and exact-artifact
-validation plus preview CI are still required. App/UI stays paused and publication
-remains disabled.
+The baseline synchronization PR #248 passed all 21 CI jobs and merged only into
+preview at `d7451c154ae55ae97ae67e3a0369cf39a70ab30b`; both Linux architectures
+executed the packaged artifact with 97 model requests and successful shutdown.
+The stable release baseline remains v0.10.37.
+
+Local follow-up validation passed 357 engine/dispatch/protocol tests, 460
+LLM/provider tests, 104 documentation and release contracts, workspace
+check/Clippy, and the real PostgreSQL/HTTPS/rootless five-role process fixture.
+Exact-artifact validation and the follow-up preview CI are still required.
+App/UI stays paused and publication remains disabled.
