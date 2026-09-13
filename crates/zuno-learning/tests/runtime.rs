@@ -1095,12 +1095,16 @@ fn pure_retrieval_and_explicit_selection_accounting_have_distinct_effects() {
     );
 }
 
-struct QueueWork(zuno_learning::ProjectLearningService);
+struct QueueWork {
+    service: zuno_learning::ProjectLearningService,
+    settled: Arc<tokio::sync::Notify>,
+}
 #[async_trait]
 impl zuno_learning::LearningWork for QueueWork {
     async fn tick(&self, cancel: tokio_util::sync::CancellationToken) {
-        if let Some(job) = self.0.claim("worker", &[]).expect("claim") {
-            self.0.execute(job, &cancel).await.expect("execute");
+        if let Some(job) = self.service.claim("worker", &[]).expect("claim") {
+            self.service.execute(job, &cancel).await.expect("execute");
+            self.settled.notify_one();
         }
     }
 }
@@ -1160,34 +1164,34 @@ async fn startup_catchup_is_idempotent_and_project_work_outlives_the_registering
         project_root: std::path::PathBuf::from("/work"),
     };
     let supervisor = zuno_learning::LearningSupervisor::default();
+    let settled = Arc::new(tokio::sync::Notify::new());
     {
         let session_owner = supervisor.clone();
         session_owner.ensure_project(
             "p".to_owned(),
-            Arc::new(QueueWork(service)),
+            Arc::new(QueueWork {
+                service,
+                settled: Arc::clone(&settled),
+            }),
             std::time::Duration::from_millis(10),
         );
     }
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            let completed: bool = pool
-                .get()
-                .expect("connection")
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM learning_job WHERE status='completed')",
-                    [],
-                    |row| row.get(0),
-                )
-                .expect("job");
-            if completed {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("project worker remains alive");
+    // The notification follows durable settlement. Concurrent SQL polling would
+    // race shared-cache table locks while the journal runs on a blocking thread.
+    tokio::time::timeout(std::time::Duration::from_secs(2), settled.notified())
+        .await
+        .expect("project worker remains alive");
     supervisor.shutdown(std::time::Duration::from_secs(1)).await;
+    let completed: u32 = pool
+        .get()
+        .expect("connection")
+        .query_row(
+            "SELECT count(*) FROM learning_job WHERE status='completed'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("durable job");
+    assert_eq!(completed, 1, "exactly one catch-up job settled");
     assert_eq!(requests.lock().expect("requests").len(), 1);
 }
 
