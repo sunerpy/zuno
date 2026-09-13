@@ -91,3 +91,7 @@ Completion 配置不获得这些工具，详见[网关读取](GATEWAY.zh.md#工�
 并携带类型化 MCP 展示语义。准备阶段等待人工审批，持久工具交接后才提交操作，
 通过原有等待关系接收结果。凭证与连接会话保留在网关，详见 [MCP.zh.md](MCP.zh.md)。
 completion profile 不提供 MCP 工具。
+
+学习协议 2 支持明确审核的 Skill 评测，基线、候选与评分请求共享同一作用域 Job
+预算。录制 cassette 不获取 Worker 的实际网关／工具执行器，配置字段为
+`skillEvaluation`，详见 [SKILLS.zh.md](SKILLS.zh.md)。

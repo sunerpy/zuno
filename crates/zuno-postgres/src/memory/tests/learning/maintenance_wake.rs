@@ -9,6 +9,9 @@ async fn record_output(
     let operation = match claimed.execution.input {
         LearningInput::Extraction(_) => "learning.extraction",
         LearningInput::Maintenance(_) => "learning.memory_consolidation",
+        LearningInput::SkillEvaluation(_) => {
+            panic!("Memory fixture cannot claim a Skill evaluation")
+        }
     };
     let mut request = prepared(claimed, id);
     request.record.operation = operation.to_owned();

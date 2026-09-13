@@ -347,6 +347,8 @@ pub struct Definition {
     pub councils: Vec<CouncilDefinition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_learning: Option<MemoryLearningDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_evaluation: Option<ConfigurationRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_tools: Vec<zuno_application::mcp::McpToolBinding>,
 }
@@ -471,6 +473,9 @@ impl Definition {
         if let Some(learning) = &self.memory_learning {
             learning.extraction.validate()?;
             learning.maintenance.validate()?;
+        }
+        if let Some(evaluation) = &self.skill_evaluation {
+            evaluation.validate()?;
         }
         if let Some(delegation) = &self.delegation
             && (delegation.targets.is_empty()

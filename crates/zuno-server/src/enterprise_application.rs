@@ -2,6 +2,7 @@
 //! material are serialized by this module.
 mod learning;
 mod shared_memory;
+mod skill;
 
 use crate::enterprise_browser::EnterpriseBrowser;
 use axum::{
@@ -53,6 +54,7 @@ pub struct EnterpriseApplication {
     tenant: TenantId,
     workspaces: Arc<BTreeMap<WorkspaceId, ApplicationWorkspace>>,
     memory: Option<PostgresMemoryBackend>,
+    skills: Option<Arc<dyn zuno_application::skill::SkillApplication>>,
     workspace_gateway: Option<Arc<crate::workspace_gateway::GatewayWorkspaceClient>>,
 }
 
@@ -87,12 +89,20 @@ impl EnterpriseApplication {
             tenant,
             workspaces: Arc::new(installed),
             memory: None,
+            skills: None,
             workspace_gateway: None,
         })
     }
 
     pub fn with_memory(mut self, memory: PostgresMemoryBackend) -> Self {
         self.memory = Some(memory);
+        self
+    }
+    pub fn with_skills(
+        mut self,
+        skills: Arc<dyn zuno_application::skill::SkillApplication>,
+    ) -> Self {
+        self.skills = Some(skills);
         self
     }
     pub fn with_workspace_gateway(
@@ -180,6 +190,12 @@ impl EnterpriseApplication {
                 .route("/workspaces/{workspace}/learning/jobs", get(learning::list))
                 .route("/learning/jobs/{job}", get(learning::get))
                 .route("/learning/jobs/{job}/cancel", post(learning::cancel));
+        }
+        if self.skills.is_some() {
+            router = router
+                .route("/jobs/{job}/skills", post(skill::propose))
+                .route("/skills/{skill}", get(skill::get))
+                .route("/skills/{skill}/evaluate", post(skill::evaluate));
         }
         router
             .layer(DefaultBodyLimit::max(

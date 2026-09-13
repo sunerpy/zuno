@@ -24,6 +24,10 @@ mod retrieval;
 mod scheduler;
 mod skill;
 pub mod skill_effect;
+mod skill_evaluation;
+pub use skill_evaluation::{
+    skill_attempt_trace, skill_request_identity, validate_skill_model_request,
+};
 pub mod skill_persistence;
 mod supervisor;
 mod text;
@@ -35,6 +39,7 @@ pub use crate::consolidation::{
     PatternConsolidator,
 };
 pub use crate::evaluator::ProviderSkillEvaluator;
+pub use crate::evaluator::{SkillGrade, decode_skill_grade};
 pub use crate::execution::{LearningAttempt, ManualReflectionGuard, run_claimed_extraction};
 pub use crate::experience::{
     ExperienceService, ExtractionPersistence, ManualExperienceRequest, MemoryHintResult,

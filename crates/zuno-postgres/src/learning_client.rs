@@ -54,6 +54,7 @@ fn view(row: &PgRow) -> Result<LearningJobView, ApplicationError> {
     {
         "extraction" => LearningStage::Extraction,
         "maintenance" => LearningStage::Maintenance,
+        "skill_evaluation" => LearningStage::SkillEvaluation,
         _ => return Err(ApplicationError::Conflict),
     };
     let raw: Option<String> = row.try_get("detail").map_err(database_error)?;
@@ -175,6 +176,7 @@ impl PostgresBackend {
         let stage = request.stage.map(|stage| match stage {
             LearningStage::Extraction => "extraction",
             LearningStage::Maintenance => "maintenance",
+            LearningStage::SkillEvaluation => "skill_evaluation",
         });
         let state = request.state.map(|state| match state {
             LearningState::Queued => "queued",
@@ -337,12 +339,14 @@ pub(crate) async fn publish_in(
                 label: match view.stage {
                     LearningStage::Extraction => "Memory extraction",
                     LearningStage::Maintenance => "Memory maintenance",
+                    LearningStage::SkillEvaluation => "Skill evaluation",
                 }
                 .to_owned(),
                 state,
                 activity_kind: Some(match view.stage {
                     LearningStage::Extraction => BackgroundKind::MemoryExtraction,
                     LearningStage::Maintenance => BackgroundKind::MemoryMaintenance,
+                    LearningStage::SkillEvaluation => BackgroundKind::SkillEvaluation,
                 }),
                 progress: Some(BackgroundProgress::Learning {
                     attempts: view.attempts,

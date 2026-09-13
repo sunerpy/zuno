@@ -5,6 +5,20 @@ import { EnterpriseClient, EnterpriseHttpError } from "../dist/src/index.js";
 const job = { id: "job", sessionId: "session", turnId: "turn", inputId: "input", phase: "ready", inputVersion: "1", waits: [], stopRequested: false, pendingOperations: [] };
 const response = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 
+test("Skill evaluation responses preserve reviewed candidate identity and bounded scores", async () => {
+  const value={id:"skill",sourceJobId:"source",name:"Skill",baselineContent:"before",proposedContent:"after",
+    cases:[{id:"case",prompt:"scenario",expected:"expected",calls:[],kind:"failure",weight:1}],
+    digest:"a".repeat(64),evaluation:{id:"model",version:1,sha256:"b".repeat(64)},state:"pending_review",jobId:null,report:null};
+  const client=(body)=>new EnterpriseClient({baseUrl:"https://enterprise.example/api/v1/",
+    accessToken:async()=>"test-token",fetch:async()=>response(body)});
+  assert.equal((await client(value).skillCandidate("skill")).state,"pending_review");
+  await assert.rejects(client({...value,id:"other"}).skillCandidate("skill"),/identity mismatch/);
+  await assert.rejects(client({...value,digest:"c".repeat(64)}).evaluateSkill("skill",{requestId:"review",expectedDigest:value.digest}),/identity mismatch/);
+  const observation={score:255,passed:true,criticalFailure:false,details:{}};
+  await assert.rejects(client({...value,report:{passed:true,baselineMetric:0,candidateMetric:255,
+    cases:[{caseId:"case",baseline:observation,candidate:observation}]}}).skillCandidate("skill"),/Invalid enterprise application response/);
+});
+
 test("shared Memory keeps namespace, workspace, revision and review identity", async () => {
   const space={id:"runbooks",workspaceId:"workspace",title:"Runbooks",enabled:true,policyRevision:"1",
     documentRevision:"9007199254740993",entries:["reviewed"],digest:"a".repeat(64),role:"reader",characterLimit:3000};

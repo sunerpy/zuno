@@ -52,6 +52,8 @@ mod mcp;
 mod merge;
 #[path = "processes/shared_memory.rs"]
 mod shared_memory;
+#[path = "processes/skill.rs"]
+mod skill;
 #[path = "processes/workflow.rs"]
 mod workflow;
 
@@ -147,6 +149,9 @@ async fn model(
     issuer.model_requests.fetch_add(1, Ordering::SeqCst);
     // Ensure two one-slot Workers can claim distinct ready sessions.
     tokio::time::sleep(Duration::from_millis(250)).await;
+    if let Some(response) = skill::model(&body) {
+        return response;
+    }
     if let Some(response) = learning::model(&body) {
         return response;
     }
@@ -636,6 +641,15 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
         maintenance: memory_model.reference(),
     });
     let definition_file = root.join("definition.json");
+    let mut skill_model = completion::definition(&definition);
+    skill_model.id = ConfigurationId::new("skill-model").unwrap();
+    skill_model.workspace = definition.workspace.clone();
+    skill_model.agent.name = "skill-model".to_owned();
+    skill_model.agent.max_steps = std::num::NonZeroU32::new(2).unwrap();
+    skill_model.budget.tokens = std::num::NonZeroU64::new(200_000).unwrap();
+    let skill_model_file = root.join("skill-model.json");
+    write(&skill_model_file, serde_json::to_vec(&skill_model).unwrap());
+    definition.skill_evaluation = Some(skill_model.reference());
     definition.mcp_tools = vec![mcp::binding(&format!("{}/mcp", issuer.origin))];
     write(&definition_file, serde_json::to_vec(&definition).unwrap());
     let job_key = root.join("job.key");
@@ -709,6 +723,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
                 },
                 definitions: vec![
                     definition_file.clone(),
+                    skill_model_file.clone(),
                     child_definition_file.clone(),
                     completion_file.clone(),
                     council_completion_file.clone(),
@@ -785,6 +800,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
                     state: state("worker"),
                     definitions: vec![
                         definition_file.clone(),
+                        skill_model_file.clone(),
                         child_definition_file.clone(),
                         completion_file.clone(),
                         council_completion_file.clone(),
@@ -1202,6 +1218,20 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
         &tokens["alice"],
         &tokens["bob"],
         &identities,
+    )
+    .await;
+    let skill_source:String=query_scalar("SELECT r.job_id FROM zuno_enterprise_preview.runtime_job r
+        JOIN zuno_enterprise_preview.session s ON s.tenant_id=r.tenant_id AND s.principal_id=r.principal_id AND s.id=r.session_id
+        WHERE r.tenant_id=$1 AND r.principal_id=$2 AND r.phase='completed' AND s.parent_id IS NULL AND s.workspace_id='workspace'
+        ORDER BY r.time_created LIMIT 1")
+        .bind(tenant.as_str()).bind(owner("alice").principal_id.as_str()).fetch_one(&admin).await.unwrap();
+    skill::verify(
+        &http,
+        &control_url,
+        &tokens["alice"],
+        &tokens["bob"],
+        &skill_source,
+        &admin,
     )
     .await;
     for child in &mut children {

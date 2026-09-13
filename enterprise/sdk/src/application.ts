@@ -5,6 +5,7 @@ import type {
   LearningJobView, LearningPage, LearningPageRequest, CancelLearning, LearningCancellation,
   WorkspaceEditView, McpCallView,
   SharedMemorySpace, SharedMemoryPage, SharedMemoryChange, ConfigureSharedMemory, ProposeSharedMemory, ReviewSharedMemory,
+  ProposeSkill, ReviewSkillEvaluation, SkillCandidateView,
 } from "./generated/application.js";
 import {
   validateWorkspaceView, validateSessionPage, validateSessionSummary, validateJobView,
@@ -13,6 +14,7 @@ import {
   validateWorkspaceEditView, validateMcpCallView,
   validateSharedMemorySpace, validateSharedMemoryPage, validateSharedMemoryChange,
   validateConfigureSharedMemory, validateProposeSharedMemory, validateReviewSharedMemory,
+  validateProposeSkill,validateReviewSkillEvaluation,validateSkillCandidateView,
 } from "./generated/application-validators.mjs";
 
 function checked<T>(value: unknown, validate: (value: unknown) => unknown): T {
@@ -25,6 +27,23 @@ function id(value: string): string {
 }
 
 export class EnterpriseClient extends ActivityClient {
+  async proposeSkill(sourceJob: string, request: ProposeSkill, signal?: AbortSignal): Promise<SkillCandidateView> {
+    if(!validateProposeSkill(request)) throw new Error("Invalid Skill proposal");
+    const value=checked<SkillCandidateView>(await this.get(new URL(`jobs/${id(sourceJob)}/skills`,this.base),signal,"POST",request),validateSkillCandidateView);
+    if(value.sourceJobId!==sourceJob) throw new Error("Skill source identity mismatch");
+    return value;
+  }
+  async skillCandidate(candidate: string, signal?: AbortSignal): Promise<SkillCandidateView> {
+    const value=checked<SkillCandidateView>(await this.get(new URL(`skills/${id(candidate)}`,this.base),signal),validateSkillCandidateView);
+    if(value.id!==candidate) throw new Error("Skill candidate identity mismatch");
+    return value;
+  }
+  async evaluateSkill(candidate: string, request: ReviewSkillEvaluation, signal?: AbortSignal): Promise<SkillCandidateView> {
+    if(!validateReviewSkillEvaluation(request)) throw new Error("Invalid Skill evaluation review");
+    const value=checked<SkillCandidateView>(await this.get(new URL(`skills/${id(candidate)}/evaluate`,this.base),signal,"POST",request),validateSkillCandidateView);
+    if(value.id!==candidate || value.digest!==request.expectedDigest) throw new Error("Skill review identity mismatch");
+    return value;
+  }
   async sharedMemorySpaces(workspace: string, after?: string, signal?: AbortSignal): Promise<SharedMemoryPage> {
     const url=new URL(`workspaces/${id(workspace)}/memory/spaces`,this.base);
     if (after) url.searchParams.set("after",id(after));

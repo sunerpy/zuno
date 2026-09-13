@@ -233,3 +233,7 @@ Skill 文件效果现有数据化准备和回执入口：`PreparedSkillEffect`�
 `prepare_undo`、`pending_effect`、`settle_effect`。本地文件宿主已使用这些入口并
 在写入后读取验证。企业使用仍需要用户作用域存储和已鉴权的环境操作，准备接口
 本身不声明远程 Skill 能力已经完成。
+
+企业明确审核的 Skill 评测已接入共用学习 Job 底座，使用按用途区分的授权，
+不借用私人自动 Memory 同意。详见 [SKILLS.zh.md](SKILLS.zh.md)。私人证据提升、
+共享自动维护和企业 Skill 安装仍是独立后续工作。

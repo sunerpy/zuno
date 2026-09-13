@@ -108,7 +108,7 @@ async fn setup(
 }
 
 pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool) {
-    learning::exercise(backend, admin).await;
+    Box::pin(learning::exercise(backend, admin)).await;
     let alice = principal("alice");
     let bob = principal("bob");
     let workspace = WorkspaceId::new("memory-workspace").unwrap();

@@ -256,7 +256,7 @@ export type ApprovalStatus = "pending" | "approved" | "rejected" | "expired" | "
 export type PlanStepStatus = "pending" | "in_progress" | "completed" | "superseded";
 export type WorkState =
   "pending" | "active" | "waiting" | "paused" | "completed" | "failed" | "cancelled" | "uncertain";
-export type BackgroundKind = "memory_extraction" | "memory_maintenance";
+export type BackgroundKind = "memory_extraction" | "memory_maintenance" | "skill_evaluation";
 export type BackgroundProgress = {
   attempts: Counter;
   chargedTokens: Counter;

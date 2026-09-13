@@ -54,8 +54,14 @@
     "propose_shared_memory": {
       "$ref": "#/$defs/ProposeSharedMemory"
     },
+    "propose_skill": {
+      "$ref": "#/$defs/ProposeSkill"
+    },
     "review_shared_memory": {
       "$ref": "#/$defs/ReviewSharedMemory"
+    },
+    "review_skill": {
+      "$ref": "#/$defs/ReviewSkillEvaluation"
     },
     "session": {
       "$ref": "#/$defs/SessionSummary"
@@ -71,6 +77,9 @@
     },
     "shared_memory_space": {
       "$ref": "#/$defs/SharedMemorySpace"
+    },
+    "skill_candidate": {
+      "$ref": "#/$defs/SkillCandidateView"
     },
     "submit_turn": {
       "$ref": "#/$defs/SubmitTurn"
@@ -92,6 +101,9 @@
     }
   },
   "required": [
+    "skill_candidate",
+    "propose_skill",
+    "review_skill",
     "shared_memory_space",
     "shared_memory_page",
     "shared_memory_change",
@@ -341,6 +353,34 @@
         "turnId",
         "stoppedJobs",
         "pendingOperations"
+      ]
+    },
+    "ConfigurationId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "ConfigurationRef": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/ConfigurationId"
+        },
+        "sha256": {
+          "type": "string"
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "version",
+        "sha256"
       ]
     },
     "ConfigureSharedMemory": {
@@ -878,7 +918,8 @@
       "type": "string",
       "enum": [
         "extraction",
-        "maintenance"
+        "maintenance",
+        "skill_evaluation"
       ]
     },
     "LearningState": {
@@ -1077,6 +1118,37 @@
         "reason"
       ]
     },
+    "ProposeSkill": {
+      "type": "object",
+      "properties": {
+        "baselineContent": {
+          "type": "string"
+        },
+        "cases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SkillEvaluationCase"
+          }
+        },
+        "name": {
+          "type": "string"
+        },
+        "proposedContent": {
+          "type": "string"
+        },
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "requestId",
+        "name",
+        "baselineContent",
+        "proposedContent",
+        "cases"
+      ]
+    },
     "RequestId": {
       "type": "string",
       "maxLength": 128,
@@ -1105,6 +1177,22 @@
         "changeId",
         "expectedState",
         "decision"
+      ]
+    },
+    "ReviewSkillEvaluation": {
+      "type": "object",
+      "properties": {
+        "expectedDigest": {
+          "type": "string"
+        },
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "requestId",
+        "expectedDigest"
       ]
     },
     "SessionCursor": {
@@ -1444,6 +1532,224 @@
         "digest",
         "role",
         "characterLimit"
+      ]
+    },
+    "SkillCandidateView": {
+      "type": "object",
+      "properties": {
+        "baselineContent": {
+          "type": "string"
+        },
+        "cases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SkillEvaluationCase"
+          }
+        },
+        "digest": {
+          "type": "string"
+        },
+        "evaluation": {
+          "$ref": "#/$defs/ConfigurationRef"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "jobId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "proposedContent": {
+          "type": "string"
+        },
+        "report": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SkillEvaluationReport"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sourceJobId": {
+          "$ref": "#/$defs/JobId"
+        },
+        "state": {
+          "$ref": "#/$defs/SkillEvaluationState"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "sourceJobId",
+        "name",
+        "baselineContent",
+        "proposedContent",
+        "cases",
+        "digest",
+        "evaluation",
+        "state"
+      ]
+    },
+    "SkillCaseKind": {
+      "type": "string",
+      "enum": [
+        "failure",
+        "protection",
+        "general"
+      ]
+    },
+    "SkillCaseObservation": {
+      "type": "object",
+      "properties": {
+        "criticalFailure": {
+          "type": "boolean"
+        },
+        "details": true,
+        "passed": {
+          "type": "boolean"
+        },
+        "score": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 100,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "score",
+        "passed",
+        "criticalFailure",
+        "details"
+      ]
+    },
+    "SkillCaseResult": {
+      "type": "object",
+      "properties": {
+        "baseline": {
+          "$ref": "#/$defs/SkillCaseObservation"
+        },
+        "candidate": {
+          "$ref": "#/$defs/SkillCaseObservation"
+        },
+        "caseId": {
+          "$ref": "#/$defs/RequestId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "caseId",
+        "baseline",
+        "candidate"
+      ]
+    },
+    "SkillEvaluationCase": {
+      "type": "object",
+      "properties": {
+        "calls": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SkillRecordedCall"
+          }
+        },
+        "expected": {
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "kind": {
+          "$ref": "#/$defs/SkillCaseKind"
+        },
+        "prompt": {
+          "type": "string"
+        },
+        "weight": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "prompt",
+        "expected",
+        "calls",
+        "kind",
+        "weight"
+      ]
+    },
+    "SkillEvaluationReport": {
+      "type": "object",
+      "properties": {
+        "baselineMetric": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "candidateMetric": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "cases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SkillCaseResult"
+          }
+        },
+        "passed": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "passed",
+        "baselineMetric",
+        "candidateMetric",
+        "cases"
+      ]
+    },
+    "SkillEvaluationState": {
+      "type": "string",
+      "enum": [
+        "pending_review",
+        "evaluating",
+        "passed",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "SkillRecordedCall": {
+      "type": "object",
+      "properties": {
+        "arguments": true,
+        "isError": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "output": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "arguments",
+        "output",
+        "isError"
       ]
     },
     "SubmitTurn": {

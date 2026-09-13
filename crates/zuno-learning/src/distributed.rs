@@ -9,6 +9,7 @@ use zuno_types::identity::{JobId, PrincipalScope, SessionId, WorkspaceId};
 pub enum LearningPhase {
     Extraction,
     Maintenance,
+    SkillEvaluation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +22,7 @@ pub enum LearningPhase {
 pub enum LearningInput {
     Extraction(crate::ExtractionRequest),
     Maintenance(crate::MemoryConsolidationRequest),
+    SkillEvaluation(SkillEvaluationInput),
 }
 
 impl LearningInput {
@@ -28,12 +30,14 @@ impl LearningInput {
         match self {
             Self::Extraction(_) => LearningPhase::Extraction,
             Self::Maintenance(_) => LearningPhase::Maintenance,
+            Self::SkillEvaluation(_) => LearningPhase::SkillEvaluation,
         }
     }
     pub fn session(&self) -> &str {
         match self {
             Self::Extraction(input) => &input.session_id,
             Self::Maintenance(input) => &input.session_id,
+            Self::SkillEvaluation(input) => &input.session_id,
         }
     }
 }
@@ -48,6 +52,7 @@ impl LearningInput {
 pub enum LearningOutput {
     Extraction(crate::LearningExtraction),
     Maintenance(crate::MemoryConsolidation),
+    SkillEvaluation(zuno_application::skill::SkillEvaluationReport),
 }
 impl LearningOutput {
     pub fn decode(phase: LearningPhase, text: &str) -> Result<Self, serde_json::Error> {
@@ -55,6 +60,7 @@ impl LearningOutput {
         match phase {
             LearningPhase::Extraction => serde_json::from_str(text).map(Self::Extraction),
             LearningPhase::Maintenance => serde_json::from_str(text).map(Self::Maintenance),
+            LearningPhase::SkillEvaluation => serde_json::from_str(text).map(Self::SkillEvaluation),
         }
     }
 }
@@ -98,6 +104,45 @@ pub struct MemoryLearningGrant {
     pub maintenance_limits: LearningExecutionLimits,
     pub extraction_model: crate::LearningModelIdentity,
     pub maintenance_model: crate::LearningModelIdentity,
+}
+
+#[derive(Debug, Clone)]
+pub struct SkillLearningGrant {
+    pub source: ConfigurationRef,
+    pub evaluation: ConfigurationRef,
+    pub workspace: WorkspaceId,
+    pub limits: LearningExecutionLimits,
+    pub model: crate::LearningModelIdentity,
+    pub maximum_steps: u32,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SkillEvaluationInput {
+    pub session_id: String,
+    pub candidate_id: zuno_types::identity::RequestId,
+    pub baseline_content: String,
+    pub proposed_content: String,
+    pub cases: Vec<zuno_application::skill::SkillEvaluationCase>,
+    pub maximum_steps: u32,
+}
+impl SkillEvaluationInput {
+    pub fn validate(&self) -> Result<(), zuno_application::ApplicationError> {
+        zuno_types::identity::SessionId::new(&self.session_id)
+            .map_err(zuno_application::ApplicationError::storage)?;
+        if !(1..=8).contains(&self.maximum_steps) {
+            return Err(zuno_application::ApplicationError::Invalid(
+                "invalid Skill evaluation step bound".to_owned(),
+            ));
+        }
+        zuno_application::skill::ProposeSkill {
+            request_id: self.candidate_id.clone(),
+            name: "evaluation".to_owned(),
+            baseline_content: self.baseline_content.clone(),
+            proposed_content: self.proposed_content.clone(),
+            cases: self.cases.clone(),
+        }
+        .validate()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

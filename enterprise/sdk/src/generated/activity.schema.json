@@ -48,7 +48,8 @@
       "type": "string",
       "enum": [
         "memory_extraction",
-        "memory_maintenance"
+        "memory_maintenance",
+        "skill_evaluation"
       ]
     },
     "BackgroundProgress": {

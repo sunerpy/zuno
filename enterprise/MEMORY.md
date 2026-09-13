@@ -314,3 +314,8 @@ Skill effect preparation and receipt settlement now have data-only entry points:
 verification. Enterprise use still requires owner-scoped candidate storage and
 an authenticated environment operation; no remote Skill capability is advertised
 by the preparation interface alone.
+
+Reviewed enterprise Skill evaluation is now implemented on the shared learning
+Job runtime, using purpose-specific authorization rather than private automatic
+Memory consent. See [SKILLS.md](SKILLS.md). Private evidence promotion, shared
+automatic maintenance and enterprise Skill installation remain separate work.

@@ -19,6 +19,7 @@ zuno-eval = { workspace = true }
 zuno-memory = { workspace = true }
 zuno-llm = { workspace = true }
 zuno-observability = { workspace = true }
+zuno-orchestration = { workspace = true }
 zuno-types = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }

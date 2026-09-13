@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p3-skill-effects`.
+- Current phase branch: `codex/enterprise-p2-skill-runtime`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -598,3 +598,13 @@ receipt settlement now use one data-only effect contract. Recovery tests verify
 no write during preparation/settlement, exact effect matching, duplicate receipts
 and uncertain divergence. This remains a native implementation foundation; the
 enterprise authorized effect adapter and distributed evaluation are outstanding.
+
+## Enterprise Skill evaluation
+
+Private candidates, explicit review, immutable completion profiles, scoped
+learning Jobs and real paired model/cassette/grading requests are wired. Native
+process validation passed with private automatic Memory disabled; no live
+environment command was used by evaluation. Durable trace/grade verification,
+rollback, cross-user denial, cancellation and fake-result refusal are tested.
+SDK 27 tests, generated drift, workspace check, Clippy and 100 documentation/release contracts pass. Exact-archive and preview CI evidence remain required. Enterprise Skill installation/activation and evidence-based
+proposal automation remain outstanding; UI is paused and publication disabled.

@@ -496,3 +496,9 @@ checks the resulting bytes before settlement. After interruption, the existing
 operation is reconstructed and inspected; an uncertain write is not replayed.
 The same prepared-effect interface is available to host adapters, while remote
 Skill execution remains a separate enterprise implementation step.
+
+Enterprise Skill evaluation can be approved independently from automatic private
+Memory learning. An installed completion profile selects the actual model and
+budgets; proposing a candidate alone performs no model work. Paired attempts use
+recorded tools and a separate model grading request. Passing evaluation does not
+install a Skill. The preview API and limits are in `enterprise/SKILLS.md`.

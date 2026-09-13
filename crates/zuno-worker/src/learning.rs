@@ -167,7 +167,7 @@ impl crate::runtime::WorkerAuxiliary for LearningWorker {
             LEARNING_CLAIM_PATH,
             None,
             &LearningClaimRequest {
-                version: 1,
+                version: 2,
                 worker: worker.clone(),
                 configurations: self.configurations.clone(),
             },
@@ -290,6 +290,10 @@ async fn run_learning(
                 .consolidate_memory(input.clone())
                 .await
                 .map(LearningOutput::Maintenance),
+            LearningInput::SkillEvaluation(input) => model
+                .evaluate_skill(input)
+                .await
+                .map(LearningOutput::SkillEvaluation),
         }
     };
     let (lease, grant) = execution.current()?;

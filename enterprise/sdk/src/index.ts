@@ -13,6 +13,7 @@ export type {
   WorkspaceEditView, WorkspaceEditReview, McpCallView,
   SharedMemorySpace, SharedMemoryPage, SharedMemoryChange, SharedMemoryRole, SharedMemoryDecision,
   ConfigureSharedMemory, ProposeSharedMemory, ReviewSharedMemory, SharedMemoryEdit, SharedMemoryMember,
+  ProposeSkill, ReviewSkillEvaluation, SkillCandidateView, SkillEvaluationReport, SkillEvaluationCase,
   BeginWorkspaceImport, WorkspaceImportView, WorkspaceImportState, WorkspaceImportId,
   LearningJobView, LearningPage, LearningPageRequest, LearningCursor,
   LearningStage, LearningState, LearningBudgetView, LearningFailureView, CancelLearning, LearningCancellation,

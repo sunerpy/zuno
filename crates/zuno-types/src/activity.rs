@@ -392,6 +392,7 @@ pub enum WorkState {
 pub enum BackgroundKind {
     MemoryExtraction,
     MemoryMaintenance,
+    SkillEvaluation,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(

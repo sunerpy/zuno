@@ -93,7 +93,7 @@ async fn claim(
     Json(request): Json<LearningClaimRequest>,
 ) -> Result<Json<Option<IssuedLearning>>, Failure> {
     let worker = service.worker(&headers).await?;
-    if request.version != 1 {
+    if request.version != 2 {
         return Err(Failure(StatusCode::BAD_REQUEST));
     }
     let Some(claimed) = service

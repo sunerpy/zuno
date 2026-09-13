@@ -12,6 +12,7 @@ use zuno_types::{
 pub enum LearningStage {
     Extraction,
     Maintenance,
+    SkillEvaluation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
