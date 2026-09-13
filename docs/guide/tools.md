@@ -25,7 +25,7 @@ The default model-visible surface is deliberately small:
 | `webfetch` | Retrieve one URL | Read-only |
 | `web_search` | Batch web search | Read-only |
 | `skill` | Discover and load reusable instructions | Read-only |
-| `question` | Ask a structured Plan clarification, or register required input during ordinary Work | User-mediated |
+| `question` | Ask a structured clarification; wait in Plan, return immediately in Work/Goal | User-mediated |
 | `question_async` | Publish optional questions and continue independent work | User-mediated |
 | `plan_exit` | Request approval of the exact current Plan and saved Work identity | User-mediated; Plan only |
 
@@ -74,22 +74,28 @@ See [Agent orchestration](/orchestration) for scope, configuration, and recovery
 
 Questions have stable request/item IDs and a revision. TUI, HTTP, and ACP use the
 same `QuestionPort`: publish, list/get, respond, and wait are separate operations.
-`question_async` returns a receipt immediately. A pending optional question does
-not prevent independent work or a final summary. `question` can wait for the first
-response; choosing **Defer** releases that wait without answering the question.
-Partial answers preserve completed items and leave the others pending.
+In Plan, `question` waits for the first response; choosing **Defer** releases that
+tool wait without answering the question. In ordinary Work and active Goal execution,
+the same `question` tool publishes an optional clarification and returns a receipt
+immediately. It does not create a session wait or pause the Goal. `question_async`
+also returns immediately, including in Plan. Pending optional questions do not
+prevent independent work or a final summary; the agent continues within existing
+authorization using available evidence and stated assumptions. Partial answers
+preserve completed items and leave the others pending.
 
 Actual answers enter the durable inbox exactly once, not both the tool result and
 a later callback. Responses carry `commandId` and `expectedRevision`; repeating
 the same command is idempotent, while stale revisions and changed command bodies
 are rejected. `question_async` is governed by the `question` permission key.
-No answer, highlighted option, timeout, cancellation, or Defer action is consent.
+No answer, highlighted option, saved draft, timeout, cancellation, skip, or Defer
+action is consent. A skipped question does not require another clarification loop.
 
-Ordinary Work can register required input even without a Goal. Its session waits
-for that exact request; unrelated callbacks cannot resume it. Goal-owned
-`goal_request_input` uses the same service and atomically records both the Goal
-pause and session wait. Delegated children report blockers to their parent and
-cannot contact the user through these tools.
+Required input is an explicit control, separate from optional clarification.
+Goal-owned `goal_request_input` binds the observed Goal revision and atomically
+records both the Goal pause and session wait. Only a real answer to that exact
+request can satisfy it; skipping, deferring, or unrelated callbacks cannot.
+Delegated children report blockers to their parent and cannot contact the user
+through these tools.
 
 `plan_exit` publishes a deferred, closed approval request. Only an explicit
 approve action can authorize Work, and only for the displayed Plan revision,
@@ -168,18 +174,17 @@ committed database first. In explicit Plan mode, a successful Plan mutation chan
 one-time Required instruction to Maintain. A missing or failed refresher pauses the turn
 rather than knowingly sending a stale developer-priority snapshot.
 
-Before successful delivery, a durable reconciliation driver checks Plan, Todo,
-Job, Goal, tool-result, and verification state. Ordinary sessions holding
-authorized durable work continue from a `Recovery` token. The driver hashes
-authoritative revisions into a progress fingerprint; three consecutive identical
-fingerprints pause with typed `no_progress` instead of manufacturing a human
-confirmation request. Only durably recorded work counts: a Work-mode session that
-records no Plan, Todo, or Job finishes on its first answer.
+After a provider final, the durable reconciliation driver respects exact waits
+and protected gates. An ordinary final ends its cycle even if Plan/Todo work is
+unfinished; it never marks that work complete or buys another model turn merely
+to reconcile it. An active owned Goal retains continuation and a persisted progress
+fingerprint; three consecutive identical observations pause with typed `no_progress`.
+Tool-result followups and explicit foreground waits remain inside the logical turn.
 
 The built-in read-only `plan` Agent has one typed handoff exception: a completed planning
 answer leaves the current Plan and Todos, with their existing statuses, as execution work
-for a later Start Work turn and does not spend reconciliation continuations. An active
-Job still blocks the handoff.
+for a later Start Work turn and does not spend reconciliation continuations.
+Retained Jobs remain observable and do not authorize Work by themselves.
 
 See [History and Notes continuity](/config/continuity) for complete enable/disable,
 profile-overlay, permission, revision, and restart guidance.

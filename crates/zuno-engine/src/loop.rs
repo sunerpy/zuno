@@ -4012,8 +4012,15 @@ async fn inject_live_inputs(
         return Ok(InjectedLiveInputs::default());
     };
     let delivery = live.guard.take_soft_interrupts_at_safe_point();
+    let mut batch = crate::input_delivery::prepare(
+        context.connection,
+        &request.session_id,
+        &request.turn_id,
+        delivery.messages,
+    )?;
     let mut injected = InjectedLiveInputs::default();
-    for message in delivery.messages {
+    let mut consumed = std::collections::BTreeSet::new();
+    for message in batch.messages {
         let claimed = if let Some(input_id) = message.input_id.as_deref() {
             let promoted = match message.revision {
                 Some(revision) => {
@@ -4043,6 +4050,7 @@ async fn inject_live_inputs(
             continue;
         }
         if let Some(input_id) = message.input_id.as_ref() {
+            consumed.insert(input_id.clone());
             events
                 .send(TurnEvent::InputConsumed {
                     input_id: input_id.clone(),
@@ -4054,6 +4062,23 @@ async fn inject_live_inputs(
         }
         injected.count = injected.count.saturating_add(1);
         injected.skip_remaining_tools |= message.urgent;
+    }
+    batch
+        .receipt
+        .inputs
+        .retain(|input| consumed.contains(&input.input_id));
+    if !batch.receipt.inputs.is_empty() {
+        append_with_connection(
+            context.connection,
+            &request.session_id,
+            NewSessionEvent::new(
+                "session.input.delivery_batch",
+                json!({"batch":batch.receipt,"state":"recorded","time":now_millis()})
+                    .as_object()
+                    .expect("object")
+                    .clone(),
+            )?,
+        )?;
     }
     Ok(injected)
 }
@@ -7636,6 +7661,14 @@ fn append_provider_request_terminal(
             ..
         } = error
         {
+            properties.insert(
+                "phase".to_owned(),
+                Value::String(
+                    zuno_error::ProviderDiagnosticPhase::RequestBudget
+                        .as_str()
+                        .to_owned(),
+                ),
+            );
             properties.insert(
                 "recoveryElapsedMs".to_owned(),
                 Value::from(u64::try_from(recovery_elapsed.as_millis()).unwrap_or(u64::MAX)),

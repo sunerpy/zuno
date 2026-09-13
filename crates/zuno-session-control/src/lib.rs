@@ -8,9 +8,12 @@
 mod goal_resume;
 mod input_gate;
 mod question;
+pub mod repair;
 mod turn_boundary;
+mod turn_failure;
 pub use goal_resume::GoalResumeOutcome;
 pub use question::QuestionService;
+pub use turn_failure::{SessionFailureDisposition, TurnFailureScope};
 
 use std::sync::Arc;
 

@@ -501,6 +501,67 @@ fn fresh_user_cycle_resets_old_no_progress_but_not_its_evidence() {
     );
 }
 
+#[tokio::test]
+async fn independent_new_input_does_not_inherit_an_ordinary_question_wait() {
+    use zuno_tool::question::QuestionPort as _;
+    use zuno_types::question::{
+        QuestionMode, QuestionOrigin, QuestionPrompt, QuestionPurpose, QuestionSpec, QuestionState,
+    };
+    let fixture = Fixture::new();
+    let old = activate(&fixture, "old-question-input", 10);
+    let questions = zuno_session_control::QuestionService::new(fixture.pool.clone());
+    let opened = questions
+        .open(QuestionSpec {
+            origin: QuestionOrigin {
+                session_id: SESSION.to_owned(),
+                message_id: None,
+                call_id: None,
+                turn_id: Some("old-question-turn".to_owned()),
+                goal_id: None,
+            },
+            mode: QuestionMode::Blocking,
+            purpose: QuestionPurpose::RequiredInput,
+            questions: vec![
+                QuestionPrompt::new("Which environment?", "Environment", vec![]).into_request(),
+            ],
+            expected_goal_revision: None,
+            plan: None,
+        })
+        .await
+        .unwrap();
+    let next = activate(&fixture, "independent-status-input", 20);
+    assert_ne!(old.cycle_id, next.cycle_id);
+    assert_eq!(
+        fixture
+            .control
+            .state(SESSION)
+            .unwrap()
+            .unwrap()
+            .scheduling
+            .unwrap()
+            .readiness,
+        SessionReadiness::Ready
+    );
+    assert_eq!(
+        questions
+            .get(SESSION, &opened.question.id)
+            .await
+            .unwrap()
+            .state,
+        QuestionState::Pending
+    );
+    let connection = fixture.pool.get().unwrap();
+    let previous = zuno_db::session_work_cycle::read_in(&connection, SESSION, &old.cycle_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        previous.scheduling.unwrap().readiness,
+        SessionReadiness::WaitingHuman {
+            request_id: opened.question.id
+        }
+    );
+}
+
 #[test]
 fn explicit_goal_resume_recovers_original_report_cycle_after_independent_query() {
     let fixture = Fixture::new();

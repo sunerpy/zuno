@@ -8074,6 +8074,7 @@ version = "0.10.36"
 dependencies = [
  "async-trait",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",

@@ -2,15 +2,24 @@ use zuno_db::session::Store;
 
 use crate::command::{SessionArgs, SessionCommand};
 
+#[path = "session_repair.rs"]
+mod repair;
+
 pub(super) fn execute(args: &SessionArgs) -> Result<(), String> {
-    let pool = open_store()?;
-    match args
+    let command = args
         .command
         .as_ref()
-        .ok_or("session subcommand is required")?
-    {
+        .ok_or("session subcommand is required")?;
+    // Repair owns a dedicated connection. In particular, inspection must not
+    // pass through the usual opener's migration and WAL checkpoint.
+    if let SessionCommand::Repair(args) = command {
+        return repair::run(args);
+    }
+    let pool = open_store()?;
+    match command {
         SessionCommand::List(args) => super::session_list::run(&pool, args),
         SessionCommand::Prune(args) => super::session_prune::run(&pool, args),
+        SessionCommand::Repair(_) => unreachable!("repair uses its dedicated connection"),
         SessionCommand::Delete {
             session_id,
             keep_derived_experiences,

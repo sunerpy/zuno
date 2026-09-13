@@ -6,6 +6,7 @@ mod file_titles;
 mod goal_resume;
 mod provider_retry;
 mod resume_lifecycle;
+mod work_recovery;
 
 /// Every model response remains gated, including a request restarted by steering.
 struct AcceptedTurnResponder {

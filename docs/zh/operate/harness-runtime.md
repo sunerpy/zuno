@@ -51,26 +51,52 @@ Unicode 字符；嵌套错误不借用同名顶层说明，新增提示不复制
 须经过正常校验与授权。
 字段名超过 128 字节时不附加提示，不改变原始参数校验或自动截断字段名。
 
+运行时提示默认让 `shell`、`task` 和编排在前台执行；只有父级确实有独立工作可并行推进时
+才显式后台执行。workflow／Council 内部并行不等于父级后台化，`bg` 只使用返回的执行句柄
+或输出路径。评审保留稳定 finding ID、证据和处置，修复后复查变更与受影响路径，不设固定
+评审轮数上限。这些是提示词指导，不增加工具硬门禁。
+
 ### 提问、批准与会话调度
 
 `QuestionPort` 将发布、查询、回答、等待分离；`QuestionService` 在同一事务中维护请求
 revision、稳定问题项 ID、部分回答、幂等命令回执、inbox 和匹配的 Goal/会话状态。
-`question_async` 只发布可选问题，不妨碍继续工作或总结；`question` 可以等待首次响应，
-“稍后”保留 pending。无 Goal 的普通 Work 也可以登记真正的人工等待。
-TUI 用 Ctrl+S 选择稍后，`/questions` 重开待答项。高亮、空输入、取消都不是批准。
+Work／Goal 的可选问题使用 deferred 投递，`question_async` 同样不阻碍继续执行或最终回复。
+普通 Work 真正需要用户作出阻塞性选择时，用一个清楚的纯文本 final 问题结束当前回合，
+在回答前不执行受影响的动作，也不制造持久暂停。Plan 保留同步澄清，必需的 Goal 输入仍
+使用 `goal_request_input` 的类型化门禁。旧 pending 表单或未完成 Plan 本身既不授权
+续跑，也不禁止新输入；等待权威是 runtime execution wait reference。
+TUI 用 Ctrl+S 选择稍后；`/questions` 列出可回答表单和已关闭但仍待投递的状态行，只重开
+可回答表单。高亮、空输入、取消都不是批准。
+
+`QuestionView.delivery` 从关联输入回执派生，不是第二份持久 question 状态：
+
+| 阶段 | 含义 |
+| --- | --- |
+| `WaitingAnswer`（`waiting_answer`） | 表单仍为 pending，可以继续回答。 |
+| `AnsweredPendingDelivery`（`answered_pending_delivery`） | 表单已关闭，但关联输入尚未全部应用，或提前批准的 Plan 仍待来源回合交接。 |
+| `Applied`（`applied`） | 已关闭表单的关联输入已有应用证据，且没有剩余未应用条目。 |
+
+「Keep paused」等已结束且不产生模型输入的控制，`delivery` 为 `None`，序列化时省略，
+不是 `WaitingAnswer`，不会重开问题。提前批准的 Plan 若仍待交接，即使控制输入尚未
+准入，也保持 `AnsweredPendingDelivery`。
+
+`pendingInputs`、`appliedInputs`、最新输入回执状态及 `appliedAt` 区分回答已保存和实际
+应用。已关闭表单可以作为投递状态继续列出，不会因此重开 modal。应用也不等于 provider
+成功响应或任务完成。
 
 `plan_exit` 只发布精确绑定 Plan、review、Agent/模型身份的批准请求。用户提前批准时，
 必须等来源 Plan 回合正常交接后才排入 Work；过期或中断的批准不生效。
 
 普通会话和 Goal 共用 `session_execution_state.scheduling`：可执行、等待指定人工请求、
-等待指定外部来源/周期、暂停、完成。未完成不等于可执行；未归属的 Plan 或 blocked Todo
-不会自动产生下一轮模型请求。当前周期已接纳、已获 Work 授权的 `in_progress` 步骤可以
-直接表示可执行工作，不要求重复创建 Todo。关联的未完成 Todo 仍须满足归属与依赖条件，
-未结算子任务也不能被 Plan 状态绕过。按步骤状态判断，不按数组位置或“下一步”文本猜测；
-仅影响后续独立步骤的决定不阻塞当前步骤。真实等待须通过原生控制落库。
-参考 Codex `9ba1d9eb5b` 的 `core/src/tools/handlers/plan_spec.rs` 当前步骤表示，
-接入 Zuno 自身的持久周期与收尾服务，不声称 Codex 会自动续跑所有未完成 Plan。
-三次相同进度指纹仍以 `no_progress` 暂停。升级不解除旧暂停。
+等待指定外部来源／周期、暂停、完成。无门禁的普通 provider final 返回 `Finish` 并结束当前
+cycle，即使 Plan／Todo 尚未完成或仍可执行，也不单凭这些状态再启动模型请求，更不把步骤
+自动标成完成。前台工具等待与真实工具续跑由宿主在 final 对账之前处理。已有类型化等待和
+受保护暂停优先；只有当前 cycle 拥有的 active Goal 返回 `ContinueGoal`，并保留连续三次
+相同进度指纹触发 `no_progress` 的规则。
+这参考 Codex `9ba1d9eb5b` 的 `core/src/session/turn.rs:475`：续步依据模型后续工作与
+待投递输入，再处理 stop hooks；`core/src/tools/handlers/plan.rs:93` 只发布 Plan 更新事件，
+Goal 另由 `ext/goal/src/runtime.rs:399` 决定续跑。Zuno 的持久状态与控制接口是原生实现，
+不声称兼容 Codex。
 暂停期间 callback 仍能入库，但不能重置无进展计数或解除暂停。
 真实用户输入在提升、消费的同一事务中绑定 `session_work_cycle`，忙时仅排队不会改写当前回合。
 普通停止记录旧输入／回合并关闭其周期，下一条消息无需 `/resume`。新请求不继承旧 Plan
@@ -78,20 +104,18 @@ TUI 用 Ctrl+S 选择稍后，`/questions` 重开待答项。高亮、空输入�
 `in_progress` 都不是承接。受保护的等待、审批、认证、预算和未知副作用门禁保留。
 `/resume` 不能绕过待答条件、Plan 授权，也不能把未知副作用登记为已核验。
 
-旧普通暂停仅在真实用户输入提升时，且没有失败桥接、原始周期及原生事件／时间证据充分的
-情况下自动识别。后续正常回复本身不能证明暂停来源。既有 v0.10.32 failed 桥接未保留
-完整前序暂停来源：后来一个 scheduling 值相同的未知暂停，可能在桥接覆盖 `timeUpdated`
-后无法区分。因此匹配这些值不能证明来源连续，这些桥接和未知暂停仍保留门禁；
-普通 Work 恢复需要显式 `/resume`，且既有授权和安全审计全部保留。
-证据缺失、已裁剪、版本未知、改变或超出窗口时也保持暂停。审计不会扫描任意历史取消，
-不会重置或重放旧 failed 回执，不绕过 Goal 或人工请求授权，也不授权
-Automatic／Recovery 唤醒或旧 callback。
+启动、重连、新输入和升级不会自动解锁旧暂停或阻塞。后续正常回复或相似错误文字不能证明
+旧门禁来源；既有 failed 桥接保持 failed，证据缺失、被裁剪、改变或来源未知时继续保留
+门禁。普通 `/resume` 仍执行全部授权和安全检查。下文的显式 `session repair` 仅处理
+证据完整的那一条旧误阻塞输入，不是通用暂停重置或重放工具。
 
 终态 `bg output`、`bg wait`、callback 使用同一消费回执，并保留来源工作周期。
 格式 15 在一个原子前向迁移中升级受支持的 5–14 格式，保留用户原数据，最后更新格式标记。
 在既有输入回执、Context 快照和 Goal 恢复选择之上，新增 `session_work_cycle`、
 `goal_turn_observation`、`goal_cycle_failure`、`goal_turn_audit`；
 迁移不调用模型、不批量晋升历史证据，也不恢复暂停 Goal。
+本次普通 final、问题投递与有界修复行为保持格式 15 及其 schema 不变，不增加自动旧状态
+解锁或迁移。
 
 边界参考本地 Codex `9ba1d9eb5bbbd87ba2fc528d91ad239eea975ee9` 的
 `protocol/src/turn_input.rs:178`：`TurnInputSubmission::Started` 与 `Steered`
@@ -244,6 +268,16 @@ TUI 保存请求前基线及当前请求的可替换用量快照。分批事件�
 
 用户提示词、steering 以及子 Agent 报告在执行前进入持久 FIFO 收件箱。`reportDelivery: nextStep` 必须完成子结果结算、准许父级输入并唤醒父级，且不存在轮询竞态。
 
+恢复后的 provider 请求发送前，引擎在安全点按 admission sequence 扫描符合条件的持久
+输入，即使进程内唤醒通知已丢失或被取走也一样。已保存回答、已结算报告和合法 steering
+不会仅因恢复控制先唤醒宿主而被跳过；明确排到下一回合的普通输入仍留在原队列。选择时
+校验 cycle／turn 归属、唤醒资格与输入 revision，不会把不支持的客户端载荷降成纯文本或删除。
+
+`InputDeliveryBatch` 记录本次安全点实际消费的 session、turn、cycle，以及每条输入的
+ID、准入序号和预期 revision。`session.input.delivery_batch.1` 的状态是 `recorded`，
+它证明消费，不是第二套输入生命周期，也不证明应用。实际 post-hook provider dispatch
+对应的输入回执才建立 `applied`；批次或唤醒都不证明 provider 成功。
+
 `InputAdmissionReceipt` 分开记录 admitted、recorded、applied 与 completed/failed/cancelled。
 写入历史不代表模型已处理；实际 post-hook 请求建立应用事实，逻辑执行结束才结算完成。
 同周期恢复显式交接 owner，其他 turn 不能完成这条输入。可选客户端消息 ID 按会话幂等，
@@ -269,6 +303,37 @@ TUI 保存请求前基线及当前请求的可替换用量快照。分批事件�
 不会重新准入或重复插入原文。真实 turn 绑定前 gate 仍可观察；绑定后由正常应用、
 完成路径推进。此路径不会重置 `failed`、`cancelled`、`applied`、`completed` 回执，
 也不会授权旧周期 callback。
+
+### 单条旧误阻塞输入的显式修复
+
+命令使用当前配置指向的既有数据库和确切的 session／input ID。默认只读检查，不创建或
+迁移数据库；将 `N` 替换为检查返回的正整数 `expectedRevision`：
+
+```sh
+zuno session repair SESSION --input INPUT --dry-run
+zuno session repair SESSION --input INPUT --apply --expected-revision N
+```
+
+`--apply` 与 `--dry-run` 互斥，`--expected-revision` 只能和 `--apply` 一起使用。
+应用必须离线并独占数据库：关闭所有持有该库的 ACP、TUI、server 和其他 Zuno 进程，
+包括空闲连接。CLI 除原生恢复租约外还要求 SQLite exclusive locking，并在写事务中
+重新验证完整证据。
+
+只接受格式 15 中已 `consumed`、回执仍为 `recorded`、从未绑定或应用到 provider turn
+的真实用户输入。有界原生事件必须证明确切旧误阻塞及其 cycle、turn、provider failure
+和输入来源链。revision 改变、证据缺失或有歧义、并发工作、真实门禁和未知工具结果都
+失败关闭；已完成 Goal 或看似空闲的客户端不能代替证明。
+
+成功应用写入 `session.repair.legacy_false_blocked_applied.1` 并准入一个审计过的恢复
+控制。原输入保持 consumed，只转交未应用 anchor，不重排队、不再次插入原文；真实 turn
+绑定之前仍保留原 gate。它不重放工具、不修改 Goal、不重置终态回执，也不迁移格式。
+成功返回 `control_queued`，只证明审计过的控制已排队，不证明输入已应用或 provider
+成功。仅当同一个控制仍为 `queued`，且完整证据与执行快照均未改变时，重复调用才以
+`already_queued` 幂等返回，不重复写入或准入。控制已推进或原输入已绑定／应用后，
+修复拒绝重投；后续原生执行及其输入回执才是权威。
+修复命令本身不会启动 provider 请求。
+
+### 恢复与客户端观察
 
 标准 ACP prompt 等待关联结果，其中包括已保存的执行门禁：门禁返回 `-32005`，
 error data 携带 `admission: "accepted"`、`reason: "executionGated"`、
@@ -380,17 +445,14 @@ Goal/Plan/Todo/Job 上下文，Plan mutation 还会把一次性的 Required 指�
 持久化并投影；换工具、失败/阻塞/中断、写入路径、continuation 或状态变化都会重置序列。
 恢复策略是 Pause，活跃 Goal 记录 `no_progress`，不会自动重复同一付费读取。
 
-机器执行阶段单独持久化为 `DriverPhase`，不进入用户可见 Plan。阶段包括 `idle`、
-`executing`、`reconciling`、`waiting_retry`、`waiting_background`、`paused`
-与 `terminal`。最终回复前，`PlanReconciliationDriver` 只检查 Plan、Todo、Job、Goal、
-后台观察器、工具结果与验证记录：
-没有记录任何持久工作的会话在第一次回复后直接结束；已授权 Work 从 durable
-`Recovery` token 继续。driver 把权威 revision 哈希为 progress fingerprint，连续三次
-相同才以 typed `no_progress` 暂停，不制造通用人工确认。Work 模式的 `Optional` 决策不是已记录工作；没有产生任何 Plan、Todo 或 Job 的
-请求视为已结算，不会为不存在的状态额外续跑。进程重启会继续原对账 cycle，不解析模型
-自然语言判断“已经完成”。
+机器执行阶段单独持久化为 `DriverPhase`，不进入用户可见 Plan，旧 `reconciling`
+事件仍可读取。`PlanReconciliationDriver` 在真正的 provider final 后对账：普通 Work
+返回 `Finish`，保留未完成或仍可执行的 Plan／Todo 步骤；宿主此前已处理前台等待和工具
+续步。真实等待与保护门禁优先，只有 active owned Goal 返回 `ContinueGoal`。
+Goal 的 progress fingerprint 与计数跨重启保留，连续三次相同仍暂停为 `no_progress`；
+普通 final 不因 Plan 状态触发这个重试循环，也不制造通用人工确认或持久暂停。
 
-若未完成的持久工作仍依赖一个运行中的 `backgroundPurpose: "remoteObserver"`，driver
+若宿主为运行中的观察器记录了确切外部执行等待，driver
 进入 `waiting_background`，结束当前回合，不轮询，也不创建通用人工问题。活跃 Goal 在观察器仍运行时不会立即再次自动续跑；已有后台
 完成 watcher 会在进程结算后把终态报告写入 inbox 并唤醒会话，后续回合重新查询远端权威状态，
 再恢复普通对账。
@@ -509,6 +571,15 @@ session 级联删除，并进入 session export/import、sanitize 与 prune。TU
 ## 持久 Goal 恢复
 
 活跃的 Goal 会持续推进，直到它完成、被显式暂停或阻塞、达到预算上限，或遇到类型化的永久失败。
+
+失败归属在执行前冻结为 `TurnFailureScope`：cycle、可选 turn 和可选 Goal ID。结算事务
+重新核对这个确切组合及未停止的周期；迟到失败不能接管新用户周期或被替换的 Goal。
+既有类型化等待、受保护暂停和未知工具结果优先保留。
+
+普通周期耗尽有界 provider 重试次数或恢复窗口后，可恢复失败只关闭该周期，保留失败
+回执，不阻塞无关的新输入，也不改写残留 Goal。只有失败周期确切拥有且仍 active 的 Goal
+才为同类失败保存退避重试。真正的 `turn_budget`、认证、审批、未知副作用或永久阻塞仍
+保留对应门禁；provider 重试窗口耗尽不等于可以解除这些保护。
 
 中断保持 Goal 暂停。宿主参考 Codex 的 Goal 菜单，提供 Resume goal / Keep paused：
 跳过不授权。Zuno 用 `QuestionPort` 保存选择，通过 `GoalResumeRequest` 绑定 Goal ID/revision 和已有输入 ID；

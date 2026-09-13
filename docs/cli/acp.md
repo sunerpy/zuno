@@ -184,6 +184,42 @@ observes the original durable input. Withdrawal cannot cancel an unrelated
 Agent-to-client RPC. `-32800` reports request withdrawal, not rollback of tool
 effects; use the durable receipt to observe execution.
 
+## Ordinary completion and question delivery
+
+A genuine ordinary provider final ends the current cycle even when Plan/Todo
+steps remain unfinished or runnable, unless a typed wait or protected gate takes
+precedence. The Plan projection keeps their actual
+status; an `end_turn` is not evidence that every step completed. Foreground tool
+waits and real follow-up are handled before final reconciliation. Only the
+current cycle's active owned Goal authorizes Goal continuation.
+
+Work/Goal optional questions stay deferred. In ordinary Work, a required user
+choice that blocks progress is one clear plain-text final question ending the
+turn, without a synthetic persistent pause. Required Goal input and Plan approval
+retain their typed controls and identity/revision checks. Older pending forms and
+unfinished Plans alone neither authorize continuation nor prevent new input:
+the runtime execution wait reference is the authority.
+
+`QuestionView.delivery` is derived from input receipts, with phases
+`WaitingAnswer` (`waiting_answer`), `AnsweredPendingDelivery`
+(`answered_pending_delivery`) and `Applied` (`applied`). Question lists may include
+closed forms whose associated inputs still await application; display those as
+delivery status without reopening the form. The pending/applied counts and last
+input receipt distinguish answer acceptance from model application. Neither a
+closed form nor an applied input proves a successful provider response.
+
+Settled controls that create no model input, such as Keep paused, have
+`delivery: None` (omitted in serialization), not `WaitingAnswer`; do not reopen
+them. Early Plan approval still awaiting handoff remains
+`AnsweredPendingDelivery`, even before its control input is admitted.
+
+Failure settlement uses the frozen cycle/turn/Goal scope. Exhausting bounded
+provider retries or their recovery deadline closes only the failed ordinary
+cycle; it cannot block a later independent input or mutate an unrelated Goal.
+Recoverable failures schedule backoff only for the exact active owned Goal.
+Typed approval, required-input, authentication, turn-budget, uncertainty and
+permanent-block gates remain effective.
+
 ## Saved input and execution gates
 
 An input can be consumed into history while native execution is still gated.
@@ -191,7 +227,15 @@ Its `InputAdmissionReceipt` remains `recorded`, with an optional `executionGate`
 `appliedAt`, `completedAt`, and `turnId` are absent. The gate does not turn that
 saved, unapplied input into a `failed` receipt or prove that sampling started.
 
-For this case, `session/prompt` returns JSON-RPC error `-32005`. Its `error.data`
+Before a resumed provider request, the engine scans the durable FIFO for eligible
+answers, reports and steering even without a live wake hint. Resume controls do
+not skip earlier eligible answers; explicitly queued next-turn prompts remain
+queued. `InputDeliveryBatch` and `session.input.delivery_batch.1` record actual
+consumption, not application. The input receipt at post-hook provider dispatch
+establishes application, and the eventual execution outcome establishes completion.
+
+For a saved input that is execution-gated, `session/prompt` returns JSON-RPC
+error `-32005`. Its `error.data`
 contains `admission: "accepted"`, `reason: "executionGated"`,
 `recoveryRequired: true`, and the authoritative `receipt`. The message is
 already saved: do not resend it as a new input. Reconnecting and retrying the
@@ -233,13 +277,44 @@ This recovery does not change ordinary Stop: the next new message can run
 normally. An interrupted Goal still requires its explicit Goal recovery control,
 and old-cycle callbacks cannot revive stopped work.
 
-Automatic recognition of an old ordinary stop requires no failed bridge and
-sufficient evidence from the original cycle, native events, and timing.
-Existing v0.10.32 failed bridges lack complete preceding pause provenance;
-they and unknown pauses stay gated. Ordinary Work recovery requires explicit
-`/resume`, subject to all the checks above. It does not reopen old `failed`
-receipts. The reconnect and recovery behavior above applies to new gated inputs
-whose receipts remain `recorded`.
+Reconnect, ordinary input and upgrades do not automatically unlock legacy pauses
+or false blocks. Existing failed bridges remain failed, and unknown provenance
+remains gated. Ordinary `/resume` retains the checks above. Database format 15 is
+unchanged; no new migration or automatic legacy rewrite implements this behavior.
+
+### Offline repair of one proven false block
+
+The standalone command targets the configured existing database. Use exact
+session/input IDs and replace `N` with the positive `expectedRevision` from the
+read-only inspection:
+
+```sh
+zuno session repair SESSION --input INPUT --dry-run
+zuno session repair SESSION --input INPUT --apply --expected-revision N
+```
+
+Inspection is the default. `--apply` conflicts with `--dry-run` and requires
+`--expected-revision`; that revision is the execution revision, not a question or
+input revision. Before apply, close every ACP/TUI/server and other process holding
+the database, including idle connections. Apply requires SQLite exclusive access
+and the native recovery lease, then rechecks the complete proof atomically.
+
+Only an exact, provably false-blocked real user input that is already `consumed`,
+has a `recorded` receipt and was never applied/bound to a provider turn is eligible.
+Ambiguous or missing native evidence, stale revisions, competing work, real
+protected gates and uncertain effects are refused. Old `failed`, `cancelled`,
+`applied` or `completed` receipts are not reopened.
+
+Apply queues one audited recovery control and preserves the original consumed
+input and its visible gate until real execution binds it. It does not requeue or
+reinsert that input, replay tools, change a Goal, create a database or migrate
+format 15. Success returns `control_queued`, which proves control admission rather
+than provider application or success. A repeat returns `already_queued` only while
+the exact control is still `queued` and the complete evidence and execution
+snapshot remain unchanged; it performs no new write or admission. Once the control
+advances or the original input is bound/applied, repair rejects resubmission.
+Follow the later native control/input receipts.
+The repair command itself does not start a provider request.
 
 ## Goal continuation
 

@@ -72,6 +72,12 @@ pub trait QuestionPort: Send + Sync {
 
     async fn pending(&self, session_id: &str) -> QuestionResult<Vec<QuestionView>>;
 
+    /// Status lists may include answered forms still awaiting model application.
+    /// Presentation loops use `pending` and must not reopen these closed forms.
+    async fn visible(&self, session_id: &str) -> QuestionResult<Vec<QuestionView>> {
+        self.pending(session_id).await
+    }
+
     async fn wait_for_change(
         &self,
         session_id: &str,

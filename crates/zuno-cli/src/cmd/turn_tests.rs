@@ -1,5 +1,7 @@
 //! What both surfaces must be able to trust about the shared composition root.
 
+#[path = "turn/tests/failure_scope_tests.rs"]
+mod failure_scope_tests;
 #[path = "turn/tests/plan_execution_tests.rs"]
 mod plan_execution_tests;
 #[path = "turn/tests/provider_resolution_tests.rs"]
@@ -2281,10 +2283,10 @@ async fn plan_handoff_finishes_one_host_turn_and_preserves_future_work() {
 }
 
 #[tokio::test]
-async fn ordinary_build_still_runs_reconciliation_until_durable_work_settles() {
+async fn ordinary_build_final_preserves_unfinished_plan_and_todos() {
     let (_directory, mut host, driver, work) =
         scripted_reconciliation_host("build", ScriptedTurnBehavior::SettleWorkOnSecondTurn).await;
-    seed_scripted_plan(&work, &host.session_id, true);
+    let before = seed_scripted_plan(&work, &host.session_id, true);
     let guard = host
         .runs
         .begin_turn(host.session_id.clone())
@@ -2309,22 +2311,13 @@ async fn ordinary_build_still_runs_reconciliation_until_durable_work_settles() {
     ));
     assert_eq!(
         driver.calls(),
-        2,
-        "runnable Todo work receives one reconciliation turn before settlement"
+        1,
+        "a runnable Todo does not override an ordinary final"
     );
     let snapshot = work.snapshot(&host.session_id).expect("settled work state");
-    assert_eq!(snapshot.items.len(), 1);
     assert_eq!(
-        snapshot.items[0].status,
-        zuno_tools::WorkItemStatus::Completed
-    );
-    assert!(
-        snapshot
-            .plan
-            .expect("settled Plan")
-            .steps
-            .iter()
-            .all(|step| step.status.is_terminal())
+        snapshot, before,
+        "finishing a turn never fabricates Plan/Todo completion"
     );
     let phase = host
         .plan_reconciliation
@@ -2332,8 +2325,8 @@ async fn ordinary_build_still_runs_reconciliation_until_durable_work_settles() {
         .expect("read driver phase")
         .expect("driver phase exists");
     assert_eq!(phase.phase, zuno_engine::plan_driver::DriverPhase::Terminal);
-    assert_eq!(phase.reason.as_deref(), Some("durable_work_settled"));
-    assert_eq!(phase.reconciliation_attempt, 1);
+    assert_eq!(phase.reason.as_deref(), Some("ordinary_final"));
+    assert_eq!(phase.reconciliation_attempt, 0);
     host.shutdown().await.expect("shutdown scripted build host");
 }
 
@@ -6648,7 +6641,7 @@ fn interaction_tools_follow_plan_goal_and_subagent_boundaries() {
     assert!(
         work.iter()
             .any(|tool| tool == zuno_tools::question::WIRE_ID),
-        "ordinary Work may durably wait for required input without a Goal"
+        "ordinary Work may ask optional questions without suspending the session"
     );
     assert!(
         work.iter()
@@ -6672,7 +6665,7 @@ fn interaction_tools_follow_plan_goal_and_subagent_boundaries() {
     let goal = interaction_tool_ids(zuno_goal::InteractionPolicy::GoalAutonomous, true);
     assert!(
         goal.iter()
-            .all(|tool| tool != zuno_tools::question::WIRE_ID)
+            .any(|tool| tool == zuno_tools::question::WIRE_ID)
     );
     assert!(
         goal.iter()
@@ -7887,7 +7880,7 @@ fn durable_work_context_projects_plan_todos_jobs_reports_and_prior_receipt_from_
     )
     .expect("decode durable work context");
 
-    assert_eq!(snapshot["schemaVersion"], 4);
+    assert_eq!(snapshot["schemaVersion"], 5);
     assert_eq!(snapshot["plan"]["id"], "plan_durable");
     assert_eq!(snapshot["plan"]["revision"], 2);
     assert_eq!(snapshot["todos"][0]["id"], "todo_durable");
@@ -8326,6 +8319,7 @@ fn report_host_open_preserves_a_paused_goal_until_work_explicitly_starts() {
 fn the_turn_end_charges_usage_no_request_accounted_for() {
     let charged = |session: i64, goal: i64| GoalUsage {
         ownership: GoalUsageOwnership::Legacy,
+        accounting_goal_id: None,
         tokens: session,
         confirmed_known: true,
         estimated_pending_prompt_tokens: None,
@@ -8410,6 +8404,7 @@ fn accounting_is_unknown_only_where_the_session_could_not_measure_the_spend() {
         |confirmed: i64, pending: Option<u64>, request_seq: i64, failed: u64, known: bool| {
             GoalUsage {
                 ownership: GoalUsageOwnership::Legacy,
+                accounting_goal_id: None,
                 tokens: confirmed,
                 confirmed_known: known,
                 estimated_pending_prompt_tokens: pending,

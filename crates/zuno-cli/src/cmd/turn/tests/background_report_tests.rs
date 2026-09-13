@@ -243,7 +243,7 @@ async fn independent_report_batch_with_completed_goal_invokes_provider_once() {
 }
 
 #[tokio::test]
-async fn completed_foreground_background_report_with_historical_goal_continues_same_cycle_once() {
+async fn legacy_unstopped_background_report_with_historical_goal_continues_same_cycle_once() {
     let (_directory, mut host, provider, work) = mock_provider_host(
         "build",
         vec![
@@ -272,10 +272,13 @@ async fn completed_foreground_background_report_with_historical_goal_continues_s
         .unwrap()
         .unwrap();
     assert_eq!(cycle.goal_id, None);
-    assert_eq!(cycle.stopped, None);
+    assert!(
+        cycle.stopped.is_some(),
+        "new ordinary finals close their cycle"
+    );
 
-    // Restore the anonymized, observed callback boundary after a finished
-    // foreground turn: Idle/Ready, a bound Plan, and explicit Goal independence.
+    // Restore the legacy v0.10.36 callback boundary after a finished foreground
+    // turn: no stop marker, Idle/Ready, a bound Plan and explicit Goal independence.
     // This is a durable-state fixture, not a replay of an external CI observer.
     let plan = seed_scripted_plan(&work, &host.session_id, false)
         .plan
@@ -303,6 +306,7 @@ async fn completed_foreground_background_report_with_historical_goal_continues_s
         },
     ]);
     cycle.plan_id = Some(plan.id.clone());
+    cycle.stopped = None;
     host.database
         .transaction(|tx| {
             zuno_db::session_work_cycle::save_in(tx, &cycle, zuno_db::message::now_millis())
@@ -349,7 +353,10 @@ async fn completed_foreground_background_report_with_historical_goal_continues_s
         .unwrap();
     assert_eq!(current.goal_id, None);
     assert_eq!(current.plan_id.as_deref(), Some(plan.id.as_str()));
-    assert_eq!(current.stopped, None);
+    assert!(
+        current.stopped.is_some(),
+        "the callback's new final also closes its cycle"
+    );
     assert_eq!(
         serde_json::to_value(host.goal_store.goal(&host.session_id).unwrap()).unwrap(),
         serde_json::to_value(historical).unwrap()

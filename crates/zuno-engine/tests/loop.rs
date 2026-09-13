@@ -2413,6 +2413,10 @@ async fn runtime_policy_is_rendered_from_the_post_hook_tool_subset() {
         definitions: vec![
             definition("apply_patch"),
             definition("task"),
+            definition("shell"),
+            definition("bg"),
+            definition("workflow"),
+            definition("council_run"),
             definition("plan_update"),
         ],
     };
@@ -2453,10 +2457,19 @@ async fn runtime_policy_is_rendered_from_the_post_hook_tool_subset() {
     assert!(runtime.contains("Todo is optional, not a mirror"));
     assert!(runtime.contains("exact current revision from `runtime.work_state`"));
     assert!(!runtime.contains("call `plan_get`"));
-    assert!(runtime.contains("Durable Goal, Plan, Todo"));
+    assert!(runtime.contains("An active owned Goal controls continuation"));
+    assert!(runtime.contains("An ordinary final ends its cycle"));
+    assert!(runtime.contains("without changing unfinished Plan/Todo status"));
+    assert!(runtime.contains("one clear final plain-text question"));
+    assert!(runtime.contains("do not synthesize a persistent pause"));
+    assert!(runtime.contains("Keep optional questions deferred"));
+    assert!(runtime.contains("the runtime execution wait reference is authoritative"));
     assert!(!runtime.contains("explorer"));
     assert!(!runtime.contains("editing surface"));
     assert!(!runtime.contains("Delegate only"));
+    assert!(!runtime.contains("Use foreground execution by default"));
+    assert!(!runtime.contains("Internal parallelism"));
+    assert!(!runtime.contains("Use `bg`"));
 
     let trace: String = connection
         .query_row(
@@ -2570,7 +2583,7 @@ async fn loop_routes_dynamic_goal_and_memory_outside_user_history() {
         requests[0]
             .developer_context
             .iter()
-            .any(|context| context.contains("Durable Goal, Plan, Todo"))
+            .any(|context| context.contains("An active owned Goal controls continuation"))
     );
     let dynamic_text_leaked = requests[0].messages.iter().any(|message| {
         message.content.iter().any(|block| {

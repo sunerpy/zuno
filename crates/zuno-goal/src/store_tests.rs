@@ -1134,6 +1134,121 @@ fn negative_deltas_are_clamped_rather_than_persisted() {
 }
 
 #[test]
+fn frozen_goal_usage_leaves_a_replacement_unchanged() {
+    let fixture = Fixture::in_memory();
+    let first = fixture
+        .store
+        .create_goal(SESSION, "original accounting owner", Some(BUDGET))
+        .expect("create original goal");
+    let replacement = fixture
+        .store
+        .replace_goal_as_system(SESSION, "replacement must not inherit spend", Some(BUDGET))
+        .expect("replace goal");
+    assert_ne!(first.goal_id, replacement.goal_id);
+    let retry = fixture
+        .store
+        .schedule_retry(
+            SESSION,
+            GoalRetryReason::ProviderTransient,
+            None,
+            GoalRetryPolicy::default(),
+            10,
+            0,
+        )
+        .expect("schedule replacement retry");
+    let history = fixture.store.history(SESSION).expect("read history");
+
+    let result = fixture
+        .store
+        .record_usage_for_goal(SESSION, &first.goal_id, OVERSPEND, 30, false)
+        .expect("settle original goal spend");
+
+    assert_eq!(
+        fixture.goal(SESSION),
+        replacement,
+        "a delayed G1 charge must not change G2's counters, status or timestamps"
+    );
+    assert!(result.is_none(), "the frozen owner is no longer current");
+    assert_eq!(fixture.store.retry_state(SESSION).unwrap(), retry);
+    assert_eq!(fixture.store.history(SESSION).unwrap(), history);
+}
+
+#[test]
+fn frozen_goal_usage_preserves_accounting_and_the_active_budget_flip() {
+    let fixture = Fixture::in_memory();
+    let created = fixture
+        .store
+        .create_goal(SESSION, "charge the captured owner", Some(BUDGET))
+        .expect("create goal");
+    let under = fixture
+        .store
+        .record_usage_for_goal(SESSION, &created.goal_id, BUDGET - 1, 5, false)
+        .expect("record usage")
+        .expect("same goal");
+    assert_eq!(under.goal_id, created.goal_id);
+    assert_eq!(under.revision, created.revision);
+    assert_eq!(under.status, GoalStatus::Active);
+    assert_eq!(fixture.raw_counters(SESSION), (BUDGET - 1, 5));
+    assert!(!under.usage_known);
+
+    let clamped = fixture
+        .store
+        .record_usage_for_goal(SESSION, &created.goal_id, -10, -5, true)
+        .expect("clamp negative spend")
+        .expect("same goal");
+    assert_eq!(fixture.raw_counters(SESSION), (BUDGET - 1, 5));
+    assert_eq!(clamped.revision, under.revision);
+    assert!(!clamped.usage_known, "unknown accounting remains sticky");
+
+    let exhausted = fixture
+        .store
+        .record_usage_for_goal(SESSION, &created.goal_id, 1, 5, true)
+        .expect("record budget boundary")
+        .expect("same goal");
+    assert_eq!(exhausted.goal_id, created.goal_id);
+    assert_eq!(exhausted.status, GoalStatus::BudgetLimited);
+    assert_eq!(exhausted.revision, created.revision + 1);
+    assert_eq!(fixture.raw_status(SESSION), "budget_limited");
+    assert_eq!(fixture.raw_counters(SESSION), (BUDGET, 10));
+    assert!(!exhausted.usage_known);
+}
+
+#[test]
+fn frozen_goal_usage_keeps_late_spend_without_relabeling_paused_or_complete_goals() {
+    for status in [GoalStatus::Paused, GoalStatus::Complete] {
+        let fixture = Fixture::in_memory();
+        let created = fixture
+            .store
+            .create_goal(SESSION, "retain the actual owner's cost", Some(BUDGET))
+            .expect("create goal");
+        if status == GoalStatus::Paused {
+            fixture
+                .store
+                .set_status_as_system(SESSION, SystemStatus::Paused)
+                .expect("pause goal");
+        } else {
+            fixture
+                .store
+                .update_status_as_model(SESSION, ModelStatus::Complete)
+                .expect("complete goal");
+        }
+        let before = fixture.goal(SESSION);
+
+        let accounted = fixture
+            .store
+            .record_usage_for_goal(SESSION, &created.goal_id, OVERSPEND, 30, true)
+            .expect("record captured owner's late cost")
+            .expect("same goal");
+
+        assert_eq!(accounted.goal_id, created.goal_id);
+        assert_eq!(accounted.status, status);
+        assert_eq!(accounted.revision, before.revision);
+        assert_eq!(fixture.raw_status(SESSION), status.as_str());
+        assert_eq!(fixture.raw_counters(SESSION), (OVERSPEND, 30));
+    }
+}
+
+#[test]
 fn unknown_accounting_is_sticky_and_a_charge_is_not_a_revision() {
     let fixture = Fixture::in_memory();
     fixture

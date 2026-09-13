@@ -22,6 +22,8 @@ mod goal_resume;
 mod input_gate;
 #[path = "control/questions.rs"]
 mod questions;
+#[path = "control/repair.rs"]
+mod repair;
 #[path = "control/turn_boundaries.rs"]
 mod turn_boundaries;
 

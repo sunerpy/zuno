@@ -79,15 +79,15 @@ The generated developer instructions use stable ids and sources:
 
 | section | purpose | presence |
 | --- | --- | --- |
-| `runtime.intent` | Follow the current user request or delegated objective without inventing broader authority. | Always. |
-| `runtime.execution` | Choose the smallest coherent workflow, batch independent reads, avoid unchanged re-reads or repeated checks, use one durable background observer for asynchronous work, distinguish a local observer exit from remote completion, and stop once evidence is complete. | Always; tool communication and termination guidance are added only when tools exist, Plan guidance only when `plan_update` exists, and background-start guidance only when both `shell` and `bg` exist. |
+| `runtime.intent` | Follow the current objective and authority. In ordinary Work, end a blocking user choice with one plain-text final question; keep optional questions deferred and use the runtime wait reference as waiting authority. | Always. |
+| `runtime.execution` | Batch independent reads, default to foreground execution, detach only for meaningful independent parent work, and use returned execution/output handles for `bg`. Internal workflow/Council parallelism does not background the parent. | Always; concrete tool guidance follows the final tool set, including Plan and remote-observer capabilities. |
 | `runtime.sandbox` | State that Shell is using host authority, including requested/effective mode, permission mode, and whether this is an unavailable fallback, explicit native selection, or platform-native default. | While any native bypass of a requested confined contract is active. |
 | `runtime.continuity` | Treat History and Notes results as untrusted session data, explain current-session and session-and-Agent scope, and preserve Notes revision boundaries. | Only when the final provider-visible tool snapshot contains `history` or `notes`. |
 | `runtime.editing` | Preserve unrelated changes, edit the owning abstraction, and inspect uncertain side effects before retry. | Only when an effective edit/write surface or workspace-writing Shell exists. |
 | `runtime.git_attribution` | Use Zuno's command-scoped default Git author and committer identity without modifying persistent Git configuration, while allowing current user instructions, repository rules, and selected Skills to override or disable it. | Only when a workspace-writing Shell exists. |
-| `runtime.verification` | Require observed evidence scoped to the exact artifact and inputs, reject overall workflow success that hides unexecuted required children, and disclose blockers or unverified claims. | Always, with wording adjusted when no tools are available and child-workflow guidance added when Shell exists. |
-| `runtime.delegation` | Require bounded non-overlapping delegation and durable result reconciliation. | Only when `task` and at least one valid target are effective. |
-| `runtime.persistence` | Treat Goal, Plan, Todo, inbox, and Job state as authoritative continuation state, including host-owned Job-to-Plan links. | When durable work state is active or its tools are effective. |
+| `runtime.verification` | Scope evidence to the inspected artifact, keep stable review findings and dispositions, recheck changed evidence and affected paths, and disclose blockers. Review has no fixed round cap. | Always, with wording adjusted when no tools are available and child-workflow guidance added when Shell exists. |
+| `runtime.delegation` | Require bounded non-overlapping delegation, finish independent parent work before yielding for `nextStep`, and reconcile durable results. | Only when `task` and at least one valid target are effective. |
+| `runtime.persistence` | Let an active owned Goal continue; let ordinary finals end their cycle without changing unfinished Plan/Todo status. Preserve typed waits, protected pauses and Job-to-Plan evidence. | When durable work state is active or its tools are effective. |
 
 Each section is recorded with source `zuno-runtime:<section-id>`, exact content,
 estimated tokens, and a SHA-256 digest. A prompt cannot describe an editor,
@@ -111,17 +111,19 @@ value. An existing Plan remains authoritative and is updated on material transit
 
 Remote delivery guidance is split along the same ownership boundary. The
 `github-delivery` Skill carries GitHub-, Actions-, artifact-, and release-specific
-method only when relevant. The runtime owns the generic safety contract: a Shell
-command that only observes remote work uses `background: true` with
-`backgroundPurpose: "remoteObserver"`. Its durable terminal report wakes the
+method only when relevant. The runtime defaults to foreground execution when the
+parent needs the result next. `backgroundPurpose: "remoteObserver"` describes
+the command's purpose in either mode; it does not imply `background: true`.
+Explicit background execution requires meaningful independent parent work.
+For a background observer, its durable terminal report wakes the
 session, but does not prove the remote workflow or release succeeded. The
 resumed turn must inspect the retained output and re-query authoritative remote
 state by a stable run, attempt, ref, or release identifier. Required child jobs
 that were skipped, cancelled, missing, or never expanded are not execution
 evidence unless an explicit repository policy marks them optional.
 
-If durable Plan, Todo, or Job work remains while that remote observer is still
-running, reconciliation records `waiting_background` and ends the current turn
+When the host records an exact external execution wait for that observer,
+reconciliation records `waiting_background` and ends the current turn
 without polling or creating a generic human request. An active Goal is not auto-driven again while
 the observer remains live. The existing process-owned completion watcher admits
 the terminal report and wakes the session, which then refreshes authoritative
@@ -226,43 +228,35 @@ run, the engine passes the committed connection to a host-owned
 and a Plan mutation replaces the one-time Required instruction with Maintain.
 
 Machine execution state does not leak into the visible Plan. The
-`PlanReconciliationDriver` persists `idle`, `executing`, `reconciling`,
-`waiting_retry`, `waiting_background`, `paused`, and `terminal` phase
-events in the existing session event log. Before a successful answer is
-delivered it evaluates only typed Plan, Todo, Job, Goal, background-observer,
-tool-result, and verification state:
+`PlanReconciliationDriver` uses the existing phase event log, including legacy
+`reconciling` projections. Reconciliation runs after a genuine provider final;
+foreground execution waits and tool-result continuation are driven by the host
+before this boundary:
 
-- a session that recorded no durable work finishes on its first answer;
-- terminal Plan state with no active Todo or Job may finish;
+- ungated ordinary Work returns `Finish` even when Plan/Todo steps are unfinished or
+  runnable. It completes the cycle without marking those steps complete or
+  generating another provider request solely to reconcile them;
 - a completed answer from the built-in read-only `plan` Agent is a typed
   planning handoff: its current Plan and Todos remain durable for Start Work
   and do not trigger execution reconciliation. A matching Plan-authorization
   wait permits the source turn to finish its summary without authorizing Work;
 - a live background execution or required child Job can register an exact
   external source/cycle wait without consuming reconciliation attempts;
-- an active Goal owns the next durable continuation;
-- authorized ordinary Work continues from a durable `Recovery` token only when
-  the host proves executable Todo/dependency work or the current cycle's adopted,
-  authorized `in_progress` Plan step. No duplicate Todo is required. Linked
-  unfinished Todos retain their owner/dependency gates; an unsettled child
-  result cannot be bypassed by the coarser Plan status. An unowned Plan or
-  blocked Todo alone produces `no_executable_work`, not another provider call;
-- the driver hashes authoritative Plan, Todo, Job, and Goal revisions into a
-  progress fingerprint; three consecutive identical fingerprints pause with
-  typed `no_progress`;
-- no reconciliation branch manufactures a generic human confirmation request.
+- existing typed human/external waits and protected pauses take precedence over
+  ordinary completion and Goal continuation;
+- only an active Goal owned by the current cycle returns `ContinueGoal`. Its
+  authoritative progress fingerprint survives restart; three consecutive
+  identical observations still pause with typed `no_progress`;
+- no reconciliation branch manufactures a question or a persistent pause merely
+  because an ordinary final left Plan/Todo work unfinished.
 
-The step is selected by typed status, not array position or assistant promises
-about "next steps". A decision needed only by a later independent step does not
-block the current authorized work. Required waits must be recorded through native
-controls. Existing pauses are not cleared on upgrade. Codex `9ba1d9eb5b`'s
-`core/src/tools/handlers/plan_spec.rs` likewise represents the current step with
-`in_progress`; Zuno adapts that representation to its own durable cycle and
-reconciliation service, not a claim that Codex auto-runs every unfinished Plan.
-
-Unreconciled work means durably recorded work. A Work-mode `Optional` decision
-is not recorded work, so a request that creates no Plan, Todo, or Job settles
-rather than being driven again.
+In Work and Goal execution, optional questions remain deferred. A genuine
+required choice in ordinary Work ends the current turn with one clear plain-text
+final question before the affected action; it does not create a synthetic
+persistent pause. Required Goal input and Plan approval still use their typed
+native controls. Retained older forms and unfinished Plans neither authorize
+automatic continuation nor forbid new input. The runtime execution wait
+reference, rather than form visibility or assistant prose, establishes a wait.
 
 A process restart preserves the execution fingerprint and unchanged-progress
 count; a callback cannot reset them. `session_execution_state.scheduling` owns the
@@ -282,24 +276,23 @@ never parsed as evidence that work completed or as a substitute for a typed wait
 `plan_update` prevents the model from creating or mutating a new strategic Plan;
 existing Plans remain durable, projected, and recoverable.
 
-Automatic recognition of a legacy ordinary pause runs only while promoting real
-user input, with no failed bridge and sufficient evidence from the original
-cycle, native events, and their timing. Successful follow-up replies alone do not prove pause
-origin. Existing v0.10.32 failed bridges did not retain complete preceding pause
-provenance: a bridge can overwrite `timeUpdated` after a later unknown pause with
-the same scheduling values. Matching those values cannot establish continuity.
-These bridges and unknown pauses remain gated; ordinary Work recovery requires
-explicit `/resume` and all existing authorization and safety checks.
-Missing, pruned, unknown-version, changed or out-of-window evidence also leaves
-the pause intact. The audit does not scan arbitrary historical cancellations,
-reset or replay old failed receipts, bypass Goal or human-request authority, or
-authorize Automatic/Recovery wakes and old callbacks.
+Startup, reconnect, new input and upgrades do not automatically unlock legacy
+paused or blocked state. A successful later reply or a matching rendered error
+does not prove the origin of an old gate. Existing failed bridges stay failed;
+missing, pruned, changed or unknown provenance remains gated. Normal `/resume`
+retains all authorization and safety checks. The separately requested, bounded
+`session repair` operation described below can repair only its exact proven
+legacy false-block case; it is not a general pause reset or replay facility.
 
 The boundary follows local Codex `9ba1d9eb5bbbd87ba2fc528d91ad239eea975ee9`:
 `protocol/src/turn_input.rs:178` states that `TurnInputSubmission::Started` and
 `Steered` acknowledge admission for turn processing, without waiting for hooks,
 model-context updates, rollout persistence, or sampling.
 `core/src/session/turn_input.rs` separately classifies User/Automatic/Recovery;
+`core/src/session/turn.rs:475` derives follow-up from model work and pending input,
+then evaluates stop hooks. `core/src/tools/handlers/plan.rs:93` publishes a Plan
+update event; unfinished checklist entries do not themselves keep that turn
+running. `ext/goal/src/runtime.rs:399` owns the separate active-Goal continuation.
 `core/src/tasks/mod.rs` cancels active task work, while the TUI Goal menu handles
 explicit Goal resume separately. The Goal tool/spec were also
 checked at `eaa8b6d91701d6cabe464141facc677e5915fbfc`. Zuno's durable cycle ledger,
@@ -310,6 +303,8 @@ Format 15 atomically upgrades supported formats 5–14, preserving published sta
 and updating the marker last. It adds `session_work_cycle`, `goal_turn_observation`,
 `goal_cycle_failure` and `goal_turn_audit`; old unbound observations remain
 historical, and migration does not infer user consent or resume a Goal.
+The ordinary-final, question-delivery and bounded-repair changes keep format 15
+and its schema unchanged. They add no automatic legacy unlock or migration.
 
 ACP mirrors this state through a session-owned projection pump subscribed to
 `TurnHost::work_state_changes()`. A wake causes an authoritative Plan read and a
@@ -1357,6 +1352,21 @@ guide, [resident Memory](design/memory-learning.md), and the
 
 Every model-visible external input is admitted to the session event log and durable inbox in one SQLite transaction before execution is attempted. The inbox is the source of truth across active turns, idle sessions, process restarts, and competing drivers.
 
+Before a resumed provider request, the engine scans eligible durable inputs at a
+safe point in admission-sequence order, even if the in-process wake notification
+was lost or already drained. Saved answers, settled reports and eligible steering
+cannot be overtaken merely because a resume control woke the host. Ordinary
+inputs explicitly queued for the next turn stay in that lane. Selection checks
+cycle/turn ownership, wake eligibility and input revision; it does not flatten
+unsupported client payloads or discard them.
+
+`InputDeliveryBatch` records the inputs actually consumed at that safe point:
+session, turn, cycle and each input's ID, admission sequence and expected revision.
+The `session.input.delivery_batch.1` event reports `state: "recorded"`. This is
+consumption evidence, not a second input lifecycle or proof of application.
+Only the corresponding input receipt at actual post-hook provider dispatch
+establishes `applied`; neither a wake nor a batch proves provider success.
+
 Format 14 adds a native `InputAdmissionReceipt` alongside each input. `admitted`,
 `recorded`, `applied`, and terminal `completed`/`failed`/`cancelled` are separate
 facts: recording a background report is not provider application. The actual
@@ -1393,6 +1403,45 @@ insert the original text. The gate stays observable until a real turn binds
 the input, after which the ordinary application/completion path owns progress.
 This path never resets a `failed`, `cancelled`, `applied`, or `completed` receipt
 and never authorizes an old-cycle callback.
+
+### Explicit repair of a legacy false block
+
+Use the configured existing database and exact session/input IDs. Inspection is
+the default and opens the database read-only; it neither creates nor migrates it.
+Replace `N` with the positive `expectedRevision` returned by inspection:
+
+```sh
+zuno session repair SESSION --input INPUT --dry-run
+zuno session repair SESSION --input INPUT --apply --expected-revision N
+```
+
+`--apply` and `--dry-run` conflict; `--expected-revision` requires `--apply`.
+Apply requires offline, exclusive access: close every ACP, TUI, server and other
+Zuno process holding this database, including idle connections. The standalone
+CLI uses SQLite exclusive locking in addition to the native recovery lease and
+rechecks the complete proof under the writer transaction.
+
+Eligibility requires an existing format-15 database and one real user input that
+is `consumed`, has a `recorded` receipt, and has never been bound/applied to a
+provider turn. Bounded native events must prove the exact legacy false block and
+its cycle, turn, provider failure and input lineage. Changed revisions, missing
+or ambiguous evidence, competing work, real gates and uncertain tool outcomes
+fail closed. A completed Goal or an idle-looking client is not sufficient proof.
+
+Successful apply writes `session.repair.legacy_false_blocked_applied.1` and admits
+one audited recovery control. It keeps the original input consumed, transfers
+its unapplied anchor without requeueing or reinserting its text, and preserves
+its gate until a real turn binds it. It does not replay tools, change any Goal,
+reset terminal receipts, or perform a format migration. Successful apply returns
+`control_queued`, which proves only that the audited control was queued, not input
+application or provider success. A repeat returns `already_queued` without another
+write or admission only while that exact control remains `queued` and its complete
+evidence and execution snapshot are unchanged. Once the control advances or the
+original input is bound/applied, repair rejects resubmission. Later native
+execution and its receipts remain authoritative.
+The repair command itself does not start a provider request.
+
+### Admission and client observation
 
 Standard ACP prompt requests observe the receipt until an associated outcome,
 including a saved execution gate. A gate returns `-32005` with
@@ -1602,8 +1651,10 @@ numbered choices, and a numbered `Other` input. They support Up/Down and `j/k`
 within a question, Left/Right and `h/l` across questions, number-key selection,
 Enter, Space for multi-select, and mouse selection. Per-question cursors and
 custom drafts survive navigation. Merely highlighting a choice does not select
-it. Ctrl+S defers a question, preserving partial answers; `/questions` reopens the
-pending set. Deferral, cancellation and an empty submission never fabricate an answer.
+it. Ctrl+S defers a question, preserving partial answers. `/questions` lists
+actionable forms and closed forms with inputs awaiting delivery; only actionable
+forms reopen for answers. Deferral, cancellation and an empty submission never
+fabricate an answer.
 
 `runtime.work_state` version 4 includes current work ownership, the session scheduling gate and bounded
 pending-question summaries, including early approvals awaiting handoff. They are
@@ -1613,17 +1664,38 @@ do not manufacture answers or repeat answer content already delivered by inbox.
 `QuestionPort` is shared by tools, TUI, HTTP and ACP. `QuestionService` commits
 the request definition, revision, keyed partial answers, command receipt, FIFO
 input and matching session/Goal transition together. `question_async` publishes
-optional input without parking a tool; `question` may wait until answered or
-deferred. Both return receipts, while response content is delivered only through
-the inbox. `goal_request_input` uses the same provider and returns
+optional input without parking a tool. Work/Goal optional `question` calls use
+deferred delivery; synchronous clarification belongs to Plan mode. These calls
+return receipts, while response content is delivered only through the inbox.
+`goal_request_input` remains the typed required-Goal gate and returns
 `TurnOutcome::WaitingForHuman`. Requests outlive their originating turn and
 client connection. Permission requests remain a distinct kind; closing a
 question never supplies a permission approval.
 
+`QuestionView.delivery` is derived from associated input receipts; it is not a
+second persisted question state:
+
+| Phase | Meaning |
+| --- | --- |
+| `WaitingAnswer` (`waiting_answer`) | The form is still pending and accepts an answer. |
+| `AnsweredPendingDelivery` (`answered_pending_delivery`) | The form is closed but associated inputs still lack `appliedAt`, or an early Plan approval awaits its source-turn handoff. |
+| `Applied` (`applied`) | The closed form's associated inputs have application evidence and none remain unapplied. |
+
+Settled controls that create no model input, such as Keep paused, have
+`delivery: None` (the field is omitted in serialization), not `WaitingAnswer`.
+They do not reopen a question. An early Plan approval still awaiting handoff
+retains `AnsweredPendingDelivery` even before its control input is admitted.
+
+The projection includes pending/applied counts and the latest input receipt
+coordinates. Closing a form does not prove model delivery; application does not
+prove a successful provider response. Lists retain closed forms awaiting input
+delivery as status rows without changing their state or reopening a modal.
+
 Interaction registration depends on an actual QuestionPort consumer, not a
 client-name or experimental Plan flag. Plan supports synchronous clarification
-and deferred `plan_exit`; ordinary Work can register required human input even
-without a Goal. Root turns support optional `question_async`; delegated children
+and deferred `plan_exit`; ordinary Work uses a plain-text final question for a
+blocking user choice, without synthesizing a persistent wait. Root turns support
+deferred optional questions in Work/Goal; delegated children
 report blockers to their parent. A headless host without the consumer advertises
 none of these tools. `question_async` shares the `question` permission key.
 
@@ -1984,6 +2056,20 @@ a fresh snapshot, retry rollback restores the baseline, and durable session rest
 clears the provisional accumulator.
 
 ## Durable goal recovery
+
+Failure ownership is frozen before execution as `TurnFailureScope`: cycle,
+optional turn and optional Goal ID. Settlement rechecks that exact tuple and the
+unstopped cycle in one transaction. A late failure cannot acquire a replacement
+Goal or a newer user cycle. Existing protected waits/pauses and uncertain tool
+outcomes take precedence.
+
+After bounded provider retries or their recovery deadline are exhausted, a
+recoverable failure in an ordinary cycle closes only that cycle. Its failed
+receipt remains evidence, but it does not block an unrelated new input or mutate
+a retained Goal. The same failure schedules durable backoff only for the exact
+active Goal owned by the failed cycle. A genuine typed `turn_budget` stop,
+authentication failure, approval wait, uncertainty or permanent block retains
+its native gate; provider retry exhaustion is not a reason to clear those gates.
 
 An active goal uses two recovery layers. The provider request layer retries a bounded sequence in place and rolls back unpublished partial output before another request. Its recovery window starts only after the original request returns its first retryable failure. The original request remains governed by transport and stream-idle limits and does not consume that window, while rollback, locally jittered backoff, and every replacement attempt must finish before the resulting absolute deadline; expiry cancels an active replay and persists its attempt as a typed deadline failure. Before every wait Zuno commits a `provider_retry_backoff` checkpoint with the request id, turn id, failed and next attempt, typed reason, selected delay, and wait deadline. Its in-place backoff is interruptible by both hard cancellation and durable live steering; waking it does not replay the stale provider request. After a process restart, Zuno waits out any remaining checkpoint deadline and starts a new turn and provider request instead of attempting to revive the old transport. If the bounded sequence still ends in a recoverable error, the goal controller writes a `goal_retry` row before waiting and starts a fresh agent turn when its persisted deadline arrives. There is no cross-turn retry-count ceiling for recoverable failures: the delay grows exponentially, reaches the configured cap, and the goal remains active until it completes, is paused, reaches its token budget, or encounters a permanent failure.
 

@@ -22,7 +22,7 @@
 | `webfetch` | 获取一个 URL | 只读 |
 | `web_search` | 批量网络搜索 | 只读 |
 | `skill` | 发现并加载可复用指令 | 只读 |
-| `question` | Plan 结构化澄清，或普通 Work 的必要人工输入 | 用户中介型 |
+| `question` | 结构化澄清；Plan 等待首次响应，Work/Goal 立即返回 | 用户中介型 |
 | `question_async` | 发布非阻塞问题，继续独立工作 | 用户中介型 |
 | `plan_exit` | 请求批准精确的 Plan 与已保存的 Work 执行身份 | 用户中介型；仅 Plan |
 
@@ -59,18 +59,21 @@ Provider 请求及重试时间与任务总耗时是两项度量；失败任务�
 ## 持久问题与等待
 
 问题具有稳定的请求 ID、问题项 ID 和 revision。TUI、HTTP、ACP 共用 `QuestionPort`，
-发布、查询、回答与等待是不同操作。`question_async` 立即返回回执；可选问题未回答时，
-Agent 仍可继续独立工作或给出总结。`question` 可以等待首次响应；选择“稍后”会解除工具等待，
-但不会把问题标记为已回答。部分回答会保存已填内容，其余问题仍为 pending。
+发布、查询、回答与等待是不同操作。Plan 中的 `question` 等待首次响应；选择“稍后”
+会解除工具等待，但不会把问题标记为已回答。普通 Work 与活跃 Goal 使用同名的 `question`
+发布可选澄清后立即返回回执，不登记会话等待，也不暂停 Goal。`question_async` 在 Plan
+中也立即返回。可选问题未回答时，Agent 仍可依据已有证据和明确说明的假设，在现有授权
+范围内继续独立工作或给出总结。部分回答会保存已确认内容，其余问题仍为 pending。
 
 真实回答只通过持久 inbox 进入模型一次，不会同时出现在工具结果和后续 callback 中。
 响应携带 `commandId` 与 `expectedRevision`：相同命令幂等重试，旧 revision 或同 ID 不同
-内容被拒绝。`question_async` 由 `question` 权限键管理。未输入、光标高亮、超时、取消、
-“稍后”均不是批准。
+内容被拒绝。`question_async` 由 `question` 权限键管理。未输入、光标高亮、保存草稿、
+超时、取消、跳过和“稍后”均不是批准。跳过问题不要求 Agent 再次进入澄清循环。
 
-没有 Goal 的普通 Work 也能登记必要人工输入。会话只等待该请求的有效回答，无关 callback
-不能恢复它。Goal 的 `goal_request_input` 使用同一服务，在一个事务中记录 Goal 暂停和
-会话等待。被委派的 child 向 parent 报告阻碍，不直接向用户提问。
+必要输入由显式控制处理，与可选澄清分开。Goal 的 `goal_request_input` 绑定已观察到的
+Goal revision，在一个事务中记录 Goal 暂停和会话等待。只有对该精确请求的真实回答
+才能满足等待条件，跳过、稍后处理或无关 callback 都不能满足。被委派的 child 向 parent
+报告阻碍，不直接向用户提问。
 
 `plan_exit` 发布非阻塞的封闭批准请求。只有明确的 approve 操作才能授权所展示的 Plan
 revision、Agent/模型身份及 review 状态。提前批准要等来源 Plan 回合正常交接后才生效；
@@ -131,18 +134,19 @@ provider 请求。真实 mutation 会改变指纹并重置计数。
 Plan mutation 会把一次性的 Required 指令切换成 Maintain。刷新器缺失或失败时回合会
 暂停，而不是明知上下文过期仍发送 developer 优先级快照。
 
-成功交付前，durable reconciliation driver 会检查 Plan、Todo、Job、Goal、工具结果与
-验证记录。已授权的持久工作使用 `Recovery` token 续跑；driver 会把权威 revision
-哈希为 progress fingerprint，连续三次相同才以 typed `no_progress` 暂停，不再制造
-通用人工确认。只有实际写入持久状态的工作才算未对账：Work 模式中没有记录任何 Plan、Todo 或 Job 的会话在第一次回复后就结束。
+模型 final 后，durable reconciliation driver 保留确切等待和受保护门禁。
+普通 final 结束当前周期，即使 Plan/Todo 尚未完成，也不会将其伪造为完成，
+或仅为对账再调用一次模型。只有当前周期拥有的活跃 Goal 保留自主续跑与持久进度指纹；
+连续三次相同观察仍会触发 typed `no_progress`。工具结果跟进和显式前台等待仍在逻辑回合内继续。
 
 内置只读 `plan` Agent 有一条例外的带类型交接语义：规划回答完成后，当前 Plan
 与 Todo 会保留各自已有状态，作为后续 Start Work 回合的执行工作，不消耗对账
-续轮；活动 Job 仍会阻止交接。
+续轮；保留的 Job 可继续检查，但它本身不是 Work 授权。
 
-后台完成默认通过 callback 主动唤醒父会话。只有当前步骤同步依赖结果时才使用
-`bg wait`；单次最长 60 秒。同步 wait 与 callback 竞争同一个 durable completion
-owner，因此只有一条路径能够启动 continuation turn。
+串行依赖结果时默认前台等待；仅当父会话有独立并行工作时显式后台化。
+后台完成通过 callback 唤醒仍符合条件的原周期，不能复活已停止周期。
+`bg wait` 的单次观察最长 60 秒，超时不是远端失败，也不自动分离后台。
+同步读取与 callback 共用 durable completion owner，结果只消费一次。
 
 完整的开启/关闭、profile 覆盖、权限、revision 与重启说明见
 [History 与 Notes 连续性配置](/zh/config/continuity)。
