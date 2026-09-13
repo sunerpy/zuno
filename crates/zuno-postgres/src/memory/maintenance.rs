@@ -26,7 +26,7 @@ impl TransactionMemory {
         if session.is_some() && session != source_session.as_deref() {
             return Err(Error::Denied);
         }
-        self.require_generation(tx, source_session.as_deref())
+        self.require_automation(tx, source_session.as_deref())
             .await?;
         row.try_get("payload").map_err(sql_error)
     }
@@ -174,13 +174,9 @@ impl TransactionMemory {
                         candidate_id: inserted.record.id(),
                         operation: ResidentMemoryOperation::Apply,
                         now: input.now,
-                        authority: if retraction {
-                            ResidentMemoryAuthority::Host
-                        } else {
-                            ResidentMemoryAuthority::Learning {
-                                job_id: input.job_id,
-                                lease: input.lease,
-                            }
+                        authority: ResidentMemoryAuthority::Learning {
+                            job_id: input.job_id,
+                            lease: input.lease,
                         },
                     },
                 )

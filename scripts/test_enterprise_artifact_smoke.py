@@ -61,11 +61,11 @@ class ArtifactTests(unittest.TestCase):
             "version": "0.10.32-preview.1", "modelRequests": 40,
             "roles": ["control", "gateway", "gateway-peer", "worker-a", "worker-b"],
             **{name: True for name in ["userIsolation", "humanApproval", "workflow",
-                                      "council", "workspaceMerge", "contentReview", "workspaceTransfer", "shutdown"]},
+                                      "council", "workspaceMerge", "contentReview", "workspaceTransfer", "automaticMemory", "shutdown"]},
         }
         smoke.validate_proof(proof, "a" * 64, proof["version"])
         for changes in [{"binarySha256": "b" * 64}, {"roles": ["control"]},
-                        {"contentReview": False}, {"workspaceTransfer": False}, {"modelRequests": 0}]:
+                        {"contentReview": False}, {"workspaceTransfer": False}, {"automaticMemory": False}, {"modelRequests": 0}]:
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 smoke.validate_proof({**proof, **changes}, "a" * 64, proof["version"])
 

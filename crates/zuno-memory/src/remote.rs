@@ -76,6 +76,13 @@ pub enum MemoryCommand {
         use_memories: bool,
         generate_private: bool,
     },
+    /// Independent permission for background extraction and maintenance. This
+    /// is a user decision, never part of a model's foreground write permission.
+    SetAutomation {
+        session_id: Option<SessionId>,
+        expected_revision: u64,
+        enabled: bool,
+    },
     RecordEvidence {
         origin: MemoryEvidenceOrigin,
         excerpt: String,
@@ -109,6 +116,8 @@ pub struct MemoryPolicy {
     pub revision: u64,
     pub use_memories: bool,
     pub generate_private: bool,
+    #[serde(default)]
+    pub automatic_private: bool,
 }
 
 impl Default for MemoryPolicy {
@@ -117,6 +126,7 @@ impl Default for MemoryPolicy {
             revision: 0,
             use_memories: true,
             generate_private: false,
+            automatic_private: false,
         }
     }
 }

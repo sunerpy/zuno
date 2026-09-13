@@ -189,7 +189,11 @@ impl TransactionMemory {
             return Ok(None);
         }
         if for_write {
-            self.require_generation(tx, Some(&source.session)).await?;
+            if self.automation_session.is_some() {
+                self.require_automation(tx, Some(&source.session)).await?;
+            } else {
+                self.require_generation(tx, Some(&source.session)).await?;
+            }
         }
         Ok(Some(source))
     }

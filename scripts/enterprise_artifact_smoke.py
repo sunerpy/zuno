@@ -76,7 +76,7 @@ def validate_proof(proof: dict, binary_sha: str, version: str) -> None:
     require(type(proof.get("modelRequests")) is int and proof["modelRequests"] > 0,
             "artifact did not execute the model fixture")
     for capability in ["userIsolation", "humanApproval", "workflow", "council",
-                       "workspaceMerge", "contentReview", "workspaceTransfer", "shutdown"]:
+                       "workspaceMerge", "contentReview", "workspaceTransfer", "automaticMemory", "shutdown"]:
         require(proof.get(capability) is True, f"native proof lacks {capability}")
 
 

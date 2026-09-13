@@ -3,6 +3,7 @@
 pub mod child;
 pub mod council;
 pub mod gateway;
+pub mod learning;
 pub mod live;
 pub mod memory;
 #[cfg(test)]

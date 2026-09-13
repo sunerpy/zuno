@@ -187,3 +187,30 @@ from the public client. The selected deployment is pinned for initialization and
 subsequent imported-session admission. Clients provide an uncompressed tar with a
 `workspace/` root and use the typed import API before submitting the first turn.
 PAX/GNU extension metadata is capped at 64 KiB per header; sparse entries are rejected.
+
+## Private automatic Memory models
+
+Create completion definitions for extraction and maintenance, with no environment,
+delegation, workflows, councils or nested `memoryLearning`. Keep their logical
+workspace equal to the source Agent's workspace. Learning profiles accept
+128–8192 output tokens, 1–600 seconds of execution time and at most 10 million
+Job tokens. A practical starting profile uses 100000 Job tokens, 512 output tokens
+and 300 seconds. Use `zuno-enterprise --definition-ref /absolute/model.json` to
+obtain each exact reference, then add them to the source definition:
+
+```json
+{
+  "memoryLearning": {
+    "extraction": {"id": "memory-model", "version": 1, "sha256": "<exact definition digest>"},
+    "maintenance": {"id": "memory-model", "version": 1, "sha256": "<exact definition digest>"}
+  }
+}
+```
+
+This is a template, not a complete configuration. Install the source and both
+model definitions in the control plane and compatible Workers. Model credentials
+stay in Worker bindings; configuring profiles does not grant user consent. The
+user must explicitly enable `generatePrivate` and then `set_automation` through
+an approved application. Existing consent remains non-automatic after migration.
+Learning uses spare capacity in the normal Worker pool and participates in drain.
+See [private Memory](MEMORY.md#automatic-private-learning) for quotas and recovery.

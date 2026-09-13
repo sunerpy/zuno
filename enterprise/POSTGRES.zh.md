@@ -251,3 +251,17 @@ message／part、等待 Job 和输入回执。BFF 与 Worker 的网络验证使�
 `d7fc4601474c99b0d759cd26c5818b891af72d4e6e751fc9edd4c90614e02e14`，
 测试迁移成功和注入失败回滚时会话、消息、Memory、Job 及导入记录的保留。
 schema、权限和 marker 同事务提交；已有单网关准备摘要保留原序列化表示。
+
+## 格式 20：私有学习执行
+
+自动学习授权独立保存 `automatic_private`、授权主体和启用水位；旧策略原值保留，
+不会获得自动权限。`learning_execution`、`learning_execution_attempt`、
+`learning_model_request`、`learning_experience` 复用原有作用域化 `learning_job`
+身份及强制所有者 RLS，保存固定输入／配置、租约 epoch、期限、token 预留／计量、
+来源证据和回执。
+
+模型请求不在数据库事务中等待，准入、预留和请求回执同事务提交。用量回执去重结算，
+允许核对真实迟到事实；Memory 应用另行要求当前租约和授权。维护的候选、证据、版本、
+任务和水位保持原子边界。精确格式 19 fixture 来源摘要为
+`c7697391f1025e4fc0b7f6c959d0329fdffb44181bb6bdb18661bcc2c328e037`，
+验证成功迁移及注入回滚中的会话、消息、Memory、Job 和旧授权保留；不操作个人数据库。

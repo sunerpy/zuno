@@ -6,6 +6,7 @@
 //! always pass explicit review, offline evaluation, and source-digest CAS.
 
 mod consolidation;
+pub mod distributed;
 mod evaluator;
 mod execution;
 mod experience;

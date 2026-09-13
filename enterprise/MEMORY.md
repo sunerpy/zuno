@@ -142,17 +142,65 @@ consent, lease fencing, evidence revalidation and maintenance settlement.
 gateway and two Workers: private reads/updates, prompt refresh, consent revocation
 while awaiting command approval, checkpoint continuation and isolated execution.
 
-Background extraction scheduling, organization-shared Memory, learning-management
-UI and the complete P6 fault matrix remain separate work. The maintenance storage
-contract is implemented; it does not advertise an automatic enterprise extraction
-producer or bypass independent Skill evaluation/application review.
+Automatic private extraction and independent maintenance are described below.
+Organization-shared Memory, learning-management clients and the complete P6 fault
+matrix remain separate work. Skill evaluation and application retain independent
+review requirements.
 
 The shared learning model runner now accepts an asynchronous
 `LearningModelJournal`. Typed request/outcome records and normalized usage can be
 handled by the data owner instead of requiring a local Worker database. The local
-SQLite adapter and its consumers are implemented; enterprise scheduling,
-learning authorization, budget settlement and the remote journal still require
-their complete provider/consumer path before automatic producers are registered.
+SQLite adapter remains the personal implementation; enterprise Workers use the
+authenticated remote journal with scoped scheduling, consent, leases and budget
+settlement. Only definitions with a complete configured learning path mount it.
 
 See [中文](MEMORY.zh.md), [PostgreSQL](POSTGRES.md), [application API](APPLICATION.md)
 and [deployment](DEPLOYMENT.md).
+
+## Automatic private learning
+
+Automatic learning requires a separate explicit `set_automation` command with
+`sessionId`, `expectedRevision` and `enabled`. `automaticPrivate` defaults to false
+and is independent of foreground `generatePrivate`. Only a user in a trusted
+approval application can enable it. Disabling generation also disables automation;
+queued and running learning work is fenced. Current organization, application and
+session consent are checked at claim, model admission and Memory settlement.
+
+The operator configures a source definition's `memoryLearning` with exact
+`extraction` and `maintenance` configuration references. Both targets must be
+installed completion profiles in the same logical workspace. They have no tools,
+execution environment, delegation or recursively scheduled learning. Workers use
+their configured native provider/credential bindings. A user does not supply a
+model credential through the Memory API.
+
+Only completed root Jobs admitted after the current automation opt-in are
+scheduled. Input and authoritative successful command evidence are frozen,
+bounded and redacted before extraction. Extraction stores validated experiences,
+source references and raw hints. A separately leased maintenance Job reads the
+current private documents and correction signals, proposes bounded changes and
+commits candidates, evidence, revisions, Job settlement and watermark atomically.
+High-confidence supported changes may apply; other candidates remain reviewable.
+User-owned entries and explicitly retired content remain protected.
+
+Normal Agent work takes priority when a Worker polls. Learning uses the same
+bounded Worker slots, continues lease renewal during model I/O, and drains under
+the existing Worker shutdown deadline. The control plane handles state only.
+Learning grants have a separate signing purpose and cannot execute foreground
+Jobs or gateway operations. Model request/outcome journals are scoped and durable;
+late authenticated outcomes can reconcile an existing reservation without restoring
+execution authority or applying Memory.
+
+Each logical learning Job retains its deadline, attempt counter and token charges
+across Worker replacement. A request reserves one third of the configured Job
+token allowance; complete measured usage settles that reservation. Unknown or
+incomplete usage retains the reservation as a conservative charge. Positive
+persisted retry delays honor the longer provider delay. A stored valid model result
+is returned on takeover so completion can proceed without another model call.
+
+PostgreSQL format 20 preserves existing data and leaves automatic learning disabled
+for all previous consent rows. Source format 19 is frozen at
+`c7697391f1025e4fc0b7f6c959d0329fdffb44181bb6bdb18661bcc2c328e037`.
+The native process fixture covers opt-in, separate extraction/maintenance,
+private recall, cross-user isolation and opt-out. Shared organization Memory,
+learning management clients and full operational acceptance remain pending; UI
+design and implementation stay deferred to Penpot.

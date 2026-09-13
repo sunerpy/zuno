@@ -341,6 +341,14 @@ pub struct Definition {
     pub workflows: Vec<zuno_orchestration::WorkflowTemplateDescriptor>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub councils: Vec<CouncilDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_learning: Option<MemoryLearningDefinition>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemoryLearningDefinition {
+    pub extraction: ConfigurationRef,
+    pub maintenance: ConfigurationRef,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -438,6 +446,10 @@ impl Definition {
     pub fn validate(&self) -> Result<(), Error> {
         self.reference().validate()?;
         self.selection().validate()?;
+        if let Some(learning) = &self.memory_learning {
+            learning.extraction.validate()?;
+            learning.maintenance.validate()?;
+        }
         if let Some(delegation) = &self.delegation
             && (delegation.targets.is_empty()
                 || delegation.targets.len() > 64
@@ -470,7 +482,8 @@ impl Definition {
             (AgentExecutionMode::Completion, None)
                 if self.delegation.is_none()
                     && self.workflows.is_empty()
-                    && self.councils.is_empty() => {}
+                    && self.councils.is_empty()
+                    && self.memory_learning.is_none() => {}
             (AgentExecutionMode::Agent, Some(environment)) => {
                 https_endpoint(&environment.endpoint)?;
                 zuno_application::environment::EnvironmentSpec {

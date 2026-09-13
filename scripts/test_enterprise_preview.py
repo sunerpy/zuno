@@ -89,7 +89,7 @@ class PreviewTests(unittest.TestCase):
                 "roles": ["control", "gateway", "gateway-peer", "worker-a", "worker-b"], "modelRequests": 42,
                 "runId": "42", "runAttempt": "1",
                 **{name: True for name in ["userIsolation", "humanApproval", "workflow",
-                                          "council", "workspaceMerge", "contentReview", "workspaceTransfer", "shutdown"]},
+                                          "council", "workspaceMerge", "contentReview", "workspaceTransfer", "automaticMemory", "shutdown"]},
             }
             (dist / preview.smoke_name(self.manifest, target)).write_text(json.dumps(evidence))
         return dist, "refs/heads/" + preview.BRANCH, sha

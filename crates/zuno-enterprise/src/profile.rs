@@ -114,6 +114,7 @@ pub struct ConfiguredWorkerFactory {
     children: crate::children::ConfiguredChildren,
     workflows: crate::workflows::ConfiguredWorkflows,
     councils: crate::councils::ConfiguredCouncils,
+    learning: crate::learning::ConfiguredLearning,
     live_interval: Option<Duration>,
 }
 impl ConfiguredWorkerFactory {
@@ -127,6 +128,7 @@ impl ConfiguredWorkerFactory {
         let children = crate::children::ConfiguredChildren::new(&definitions)?;
         let workflows = crate::workflows::ConfiguredWorkflows::new(&definitions, &children)?;
         let councils = crate::councils::ConfiguredCouncils::new(&definitions, &children)?;
+        let learning = crate::learning::ConfiguredLearning::new(&definitions)?;
         let mut installed = Vec::new();
         for definition in definitions {
             definition.validate()?;
@@ -171,6 +173,7 @@ impl ConfiguredWorkerFactory {
             children,
             workflows,
             councils,
+            learning,
             live_interval: None,
         })
     }
@@ -180,6 +183,61 @@ impl ConfiguredWorkerFactory {
         }
         self.live_interval = milliseconds.map(Duration::from_millis);
         Ok(self)
+    }
+}
+
+#[async_trait]
+impl zuno_worker::learning::LearningModelFactory for ConfiguredWorkerFactory {
+    fn learning_configurations(&self) -> Vec<ConfigurationRef> {
+        self.learning.configurations()
+    }
+    async fn learning_model(
+        &self,
+        execution: &zuno_learning::distributed::LearningExecution,
+        journal: Arc<dyn zuno_learning::LearningModelJournal>,
+    ) -> Result<zuno_learning::LearningModelClient, WorkerError> {
+        let entry = self
+            .installed
+            .iter()
+            .find(|entry| entry.definition.reference() == execution.configuration)
+            .ok_or(WorkerError::Configuration)?;
+        if entry.definition.agent.mode != config::AgentExecutionMode::Completion
+            || entry.definition.workspace.id != execution.workspace
+            || !self
+                .learning
+                .configurations()
+                .contains(&execution.configuration)
+        {
+            return Err(WorkerError::Configuration);
+        }
+        execution
+            .limits
+            .validate()
+            .map_err(|_| WorkerError::Configuration)?;
+        let resolved = &entry.resolver.model;
+        let provider = entry
+            .providers
+            .resolve(resolved.provider.clone())
+            .map_err(|_| WorkerError::Configuration)?;
+        Ok(zuno_learning::LearningModelClient {
+            model: zuno_learning::LearningModel {
+                provider_id: resolved.catalog_provider_id.clone(),
+                model_id: resolved.catalog_model_id.clone(),
+                wire_id: resolved.model_id.clone(),
+                surface: resolved.surface,
+                parameters: resolved.reasoning_options.clone(),
+                headers: resolved.provider.headers.clone(),
+                sampling_params: true,
+            },
+            provider,
+            journal,
+            limits: zuno_config::ResolvedLearningConfig {
+                execution_max_input_bytes: execution.limits.maximum_input_bytes,
+                execution_max_output_tokens: execution.limits.maximum_output_tokens,
+                execution_timeout_ms: execution.limits.duration_ms,
+                ..Default::default()
+            },
+        })
     }
 }
 #[async_trait]

@@ -147,3 +147,17 @@ fixture 默认采用 `release` profile，本地驱动检查可用 `--profile dev
 公开客户端不能指定存储路径或 Docker endpoint；初始化及导入后会话接纳固定所选部署。
 客户端在首轮输入前通过类型化导入 API 提供带 `workspace/` 根目录的未压缩 tar。
 每个 PAX／GNU 扩展头最多 64 KiB，拒绝 sparse 条目。
+
+## 私有自动 Memory 模型
+
+为提炼和维护准备 completion 定义，不配置执行环境、委派、Workflow、Council 或嵌套
+`memoryLearning`，逻辑工作区与来源 Agent 一致。学习模型配置允许 128–8192 输出 token、
+1–600 秒执行时间及最多一千万任务 token；可从十万任务 token、512 输出 token、300 秒
+开始。用 `zuno-enterprise --definition-ref /absolute/model.json` 得到确切引用，配置
+到来源定义的 `memoryLearning.extraction`、`memoryLearning.maintenance`。两者可复用
+同一 completion 定义。模型定义变更后同步更新引用摘要和来源定义版本。
+
+控制面和兼容 Worker 安装来源与学习模型定义，模型凭证只在 Worker 绑定中。部署模型
+不代表用户授权；用户需在认可的审批应用中显式开启 `generatePrivate`，再提交
+`set_automation`。旧授权升级后不会自动扩大。学习使用普通 Worker 池的空余容量并
+参与排空，配额及恢复见[私有 Memory](MEMORY.zh.md#私有自动学习)。

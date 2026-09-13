@@ -188,7 +188,16 @@ async fn worker(options: WorkerConfig, shutdown: InterruptSignal) -> Result<(), 
             .await?
             .with_live_interval(options.live_millis)?,
         );
-        let worker = WorkerRuntime::new(
+        use zuno_worker::learning::LearningModelFactory;
+        let learning = if factory.learning_configurations().is_empty() {
+            None
+        } else {
+            Some(Arc::new(zuno_worker::learning::LearningWorker::new(
+                state.clone(),
+                factory.clone(),
+            )?))
+        };
+        let mut worker = WorkerRuntime::new(
             state,
             identity,
             factory,
@@ -200,6 +209,9 @@ async fn worker(options: WorkerConfig, shutdown: InterruptSignal) -> Result<(), 
                 drain_timeout: Duration::from_secs(options.drain_seconds),
             },
         )?;
+        if let Some(learning) = learning {
+            worker = worker.with_auxiliary(learning);
+        }
         worker.run(shutdown).await?;
         Ok::<_, Error>(())
     }
@@ -325,6 +337,7 @@ async fn control(options: ControlConfig, shutdown: InterruptSignal) -> Result<()
         .map_err(|_| invalid("invalid gateway signing keys"))?,
     );
     let definitions = config::definitions(&options.definitions).await?;
+    let learning = crate::learning::ConfiguredLearning::new(&definitions)?;
     let children = Arc::new(crate::children::ConfiguredChildren::new(&definitions)?);
     let workflows = Arc::new(crate::workflows::ConfiguredWorkflows::new(
         &definitions,
@@ -395,7 +408,7 @@ async fn control(options: ControlConfig, shutdown: InterruptSignal) -> Result<()
         options.tenant_id.clone(),
         lease,
     )
-    .with_memory(memory)
+    .with_memory(memory.clone())
     .with_memory_configurations(
         definitions
             .iter()
@@ -416,6 +429,23 @@ async fn control(options: ControlConfig, shutdown: InterruptSignal) -> Result<()
         .clone()
         .api_router(users.clone())
         .merge(worker_state.router());
+    if !learning.grants().is_empty() {
+        routes = routes.merge(
+            zuno_server::enterprise_learning::LearningStateService::new(
+                zuno_postgres::PostgresLearningRuntime::new(
+                    memory,
+                    options.tenant_id.clone(),
+                    learning.grants().to_vec(),
+                )
+                .map_err(|_| invalid("invalid learning runtime"))?,
+                workers.clone(),
+                grants.clone(),
+                options.tenant_id.clone(),
+                lease.milliseconds(),
+            )
+            .router(),
+        );
+    }
     if has_environments {
         routes = routes.merge(
             GatewayControlService::new(

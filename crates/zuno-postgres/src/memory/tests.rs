@@ -1,4 +1,5 @@
 mod evidence;
+mod learning;
 
 use super::*;
 use sqlx_core::raw_sql::raw_sql;
@@ -107,6 +108,7 @@ async fn setup(
 }
 
 pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool) {
+    learning::exercise(backend, admin).await;
     let alice = principal("alice");
     let bob = principal("bob");
     let workspace = WorkspaceId::new("memory-workspace").unwrap();

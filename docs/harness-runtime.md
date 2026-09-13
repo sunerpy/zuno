@@ -3036,3 +3036,13 @@ a lease or replay an external command. Separate bounded export/import pools
 avoid reciprocal transfer deadlocks. PostgreSQL format 19 and gateway protocol 5
 carry this private contract; public activity and Worker checkpoint schemas stay
 unchanged. See the preview workspace and gateway guides.
+
+Enterprise private learning now composes an explicit automation consent, fixed
+completion model profiles, a scoped PostgreSQL scheduler and a Worker auxiliary
+consumer. Closed source Jobs become bounded extraction requests; separate
+maintenance leases settle Memory through the shared service. The model journal
+reserves budget before provider contact and records normalized usage afterwards.
+Valid cached outcomes can be consumed after takeover without another model call;
+consent revocation fences queued/running work while retaining truthful late facts.
+Learning cannot gain foreground or gateway authority. See the preview Memory,
+Worker and deployment guides; App/UI work remains deferred to Penpot.

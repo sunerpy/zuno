@@ -336,3 +336,21 @@ uses source digest
 tests preserve sessions, messages, Memory, Jobs and imports across migration and
 injected rollback. Schema, grants and marker commit together. Existing
 same-gateway preparation digests retain their original serialization.
+
+## Format 20: private learning execution
+
+Private automatic consent has its own `automatic_private`, consent actor and
+activation watermark. Existing policies retain their values and gain no automatic
+authority. `learning_execution`, `learning_execution_attempt`,
+`learning_model_request` and `learning_experience` share the existing scoped
+`learning_job` identity and forced owner RLS. They retain frozen inputs/configuration,
+lease epochs, deadlines, token reservations/usage, source evidence and receipts.
+
+Models run outside database transactions. Admission, reservation and request
+receipt commit together. Completion settles usage once, including legitimate
+late facts; Memory application separately requires a current lease and consent.
+Maintenance candidate/evidence/revision/Job/watermark commits remain atomic.
+The exact format-19 fixture uses source digest
+`c7697391f1025e4fc0b7f6c959d0329fdffb44181bb6bdb18661bcc2c328e037`
+and verifies preserved sessions, messages, Memory, Jobs and prior consent through
+success and injected rollback. Preview migration does not touch personal data.

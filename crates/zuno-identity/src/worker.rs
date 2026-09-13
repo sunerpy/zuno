@@ -1,5 +1,8 @@
 //! Workload authentication and short-lived, lease-bound Worker grants.
 
+mod learning;
+pub use learning::{LearningGrantToken, VerifiedLearningGrant};
+
 use crate::{AccessTokenVerifier, IdentityError, VerifiedIdentity, VerifiedIdentityKind};
 use aws_lc_rs::hmac;
 use base64::Engine as _;
@@ -424,5 +427,59 @@ mod tests {
         lease.owner.tenant_id = TenantId::new("other").unwrap();
         assert!(grants().issue(&worker, &lease, 1000).is_err());
         assert!(JobGrantToken::try_from("secret with whitespace".to_owned()).is_err());
+    }
+
+    #[test]
+    fn learning_grants_cannot_execute_foreground_jobs_or_change_scope() {
+        let service = worker("client");
+        let normal = lease();
+        let lease = zuno_application::learning::LearningExecutionLease {
+            owner: normal.owner.clone(),
+            job_id: normal.job_id.clone(),
+            worker: normal.worker.clone(),
+            token: "a".repeat(64),
+            epoch: 1,
+            expires_at_ms: 5000,
+        };
+        let authority = grants();
+        let learning = authority.issue_learning(&service, &lease, 1000).unwrap();
+        assert_eq!(
+            authority
+                .verify_learning(&service, &learning, 2000)
+                .unwrap()
+                .lease(),
+            &lease
+        );
+        assert!(
+            authority
+                .verify(
+                    &service,
+                    &JobGrantToken::try_from(learning.expose().to_owned()).unwrap(),
+                    2000
+                )
+                .is_err()
+        );
+        let ordinary = authority.issue(&service, &normal, 1000).unwrap();
+        assert!(
+            authority
+                .verify_learning(
+                    &service,
+                    &LearningGrantToken::try_from(ordinary.expose().to_owned()).unwrap(),
+                    2000
+                )
+                .is_err()
+        );
+        assert!(
+            authority
+                .verify_learning(&worker("other-client"), &learning, 2000)
+                .is_err()
+        );
+        assert!(
+            authority
+                .verify_learning(&service, &learning, 6000)
+                .is_err()
+        );
+        assert!(!format!("{lease:?}").contains(&lease.token));
+        assert!(!format!("{learning:?}").contains(learning.expose()));
     }
 }

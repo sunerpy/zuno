@@ -26,6 +26,8 @@ pub mod enterprise_browser;
 #[cfg(feature = "enterprise")]
 pub mod enterprise_gateway;
 #[cfg(feature = "enterprise")]
+pub mod enterprise_learning;
+#[cfg(feature = "enterprise")]
 pub mod enterprise_state;
 mod event;
 mod events;
