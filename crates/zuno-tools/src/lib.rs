@@ -266,6 +266,7 @@ pub mod plan_exit;
 pub mod product_agent;
 pub mod question;
 pub mod registry;
+pub mod task_context;
 pub mod task_report;
 pub mod work_state;
 pub mod workflow;

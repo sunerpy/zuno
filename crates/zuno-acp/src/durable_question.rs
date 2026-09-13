@@ -12,8 +12,9 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use zuno_tool::question::{QuestionError, QuestionPort, QuestionResult};
 use zuno_types::question::{
-    PlanQuestionDecision, QuestionAction, QuestionAnswers, QuestionCommand, QuestionItem,
-    QuestionPurpose, QuestionReceipt, QuestionRequest, QuestionView,
+    PlanQuestionDecision, QuestionAction, QuestionAnswers, QuestionAutoDeferState, QuestionCommand,
+    QuestionItem, QuestionMode, QuestionPurpose, QuestionReceipt, QuestionRequest, QuestionState,
+    QuestionView,
 };
 
 use crate::{AcpSessionRoute, ClientConnection, RoutedSession};
@@ -72,7 +73,8 @@ impl AcpQuestionPresenter {
     /// # Errors
     ///
     /// Invalid snapshots/responses and port failures are returned as
-    /// [`QuestionError`]. CAS conflicts are not retried against a newer revision.
+    /// [`QuestionError`]. A still-displayed ordinary form may follow the exact
+    /// native auto-defer transition once. Other CAS conflicts are never rebased.
     pub async fn present(&self, view: QuestionView) -> QuestionResult<Option<QuestionReceipt>> {
         if view.state.is_terminal() {
             return Ok(None);
@@ -89,6 +91,10 @@ impl AcpQuestionPresenter {
             "questionRevision": view.revision,
             "questionPurpose": view.purpose,
         });
+        if let Some(timer) = &view.auto_defer {
+            metadata["autoDefer"] = serde_json::to_value(timer)
+                .map_err(|error| invalid(format!("invalid question deadline: {error}")))?;
+        }
         if let Some(child) = routed.child_session_id() {
             metadata["childSessionId"] = json!(child);
         }
@@ -119,14 +125,81 @@ impl AcpQuestionPresenter {
         };
         let action = response_action(&view, &fields, &response)?;
         let command = response_command(&view, action)?;
-        self.port
-            .apply(&view.origin.session_id, &view.id, command)
+        match self
+            .port
+            .apply(&view.origin.session_id, &view.id, command.clone())
             .await
-            .map(Some)
+        {
+            Ok(receipt) => Ok(Some(receipt)),
+            Err(error) => self
+                .apply_after_auto_defer(&view, command, error)
+                .await
+                .map(Some),
+        }
+    }
+
+    async fn apply_after_auto_defer(
+        &self,
+        displayed: &QuestionView,
+        mut command: QuestionCommand,
+        original_error: QuestionError,
+    ) -> QuestionResult<QuestionReceipt> {
+        if displayed.purpose != QuestionPurpose::Clarification
+            || displayed.mode != QuestionMode::Deferred
+            || displayed.state != QuestionState::Pending
+            || displayed
+                .auto_defer
+                .as_ref()
+                .is_none_or(|timer| timer.state != QuestionAutoDeferState::Armed)
+        {
+            return Err(original_error);
+        }
+        let Some(next_revision) = displayed.revision.checked_add(1) else {
+            return Err(original_error);
+        };
+        match &original_error {
+            QuestionError::Conflict {
+                request_id,
+                expected,
+                actual,
+            } if request_id == &displayed.id
+                && *expected == displayed.revision
+                && *actual == next_revision =>
+            {
+                let current = self
+                    .port
+                    .get(&displayed.origin.session_id, &displayed.id)
+                    .await?;
+                if !current.is_auto_defer_successor_of(displayed) {
+                    return Err(original_error);
+                }
+            }
+            QuestionError::CommandConflict { command_id } if command_id == &command.command_id => {
+                // A prior adapted submission may have committed before its ACK
+                // was lost. CommandConflict proves this immutable key exists.
+                // Retrying its exact adapted revision is receipt lookup only:
+                // the port either returns that receipt or another conflict,
+                // never admits different content under an existing command ID.
+            }
+            _ => return Err(original_error),
+        }
+        // Preserve the original response key and action. Only the verified
+        // timeout revision changes; concurrent user edits still fail this CAS.
+        command.expected_revision = next_revision;
+        self.port
+            .apply(&displayed.origin.session_id, &displayed.id, command)
+            .await
     }
 }
 
 fn validate_view(view: &QuestionView) -> QuestionResult<()> {
+    if view.auto_defer.is_some()
+        && (view.purpose != QuestionPurpose::Clarification || view.mode != QuestionMode::Deferred)
+    {
+        return Err(invalid(
+            "only ordinary deferred questions may have an auto-defer deadline",
+        ));
+    }
     if view.id.trim().is_empty() || view.origin.session_id.trim().is_empty() || view.revision < 1 {
         return Err(invalid(
             "a persisted question requires an ID, session and positive revision",

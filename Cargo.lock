@@ -7521,6 +7521,7 @@ dependencies = [
 name = "zuno-error"
 version = "0.10.38"
 dependencies = [
+ "serde",
  "serde_json",
  "thiserror 2.0.19",
  "walkdir",

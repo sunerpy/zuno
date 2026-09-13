@@ -133,7 +133,17 @@ conflicts with `--dry-run`, and requires exclusive offline database access.
 | `--expected-revision <N>` | Positive execution revision required with `--apply` |
 
 Only a consumed, recorded, never-applied ordinary user input whose structured event
-chain proves the legacy retry-to-blocked defect is eligible. Active execution,
+chain proves the legacy retry-to-blocked defect, or HTTP 400
+`reasoning_replay_context_mismatch` from its audited recovery request inherited
+as a session block, is eligible. The latter requires the prior repair proof,
+matching native failure settlement and exact
+request/cycle provenance; a status code or rendered error alone is not proof.
+If further inputs inherited that same gate without executing, repair accepts up
+to 16 verified intermediate inputs. Every link must contain only the consecutive
+native admission, promotion, cycle, consumption, gate and receipt events. The
+report lists `inheritedInputIds`; they remain retained and are not requeued.
+Only the explicitly selected latest input is recovered, never deduplicated by text.
+Active execution,
 uncertain outcomes, real approval/Plan/authentication/budget/Goal gates, changed
 evidence, and ambiguous history are rejected. Close all Zuno hosts holding this
 database and back it up before applying; the command cannot waive these guards.

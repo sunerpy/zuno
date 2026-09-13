@@ -3336,6 +3336,18 @@ fn permanent_provider_failure_blocks_the_goal_with_a_typed_reason() {
 }
 
 #[test]
+fn uncertain_outcome_budget_stop_is_not_mislabelled_as_spent_turn_budget() {
+    let failure = TurnFailure::Engine(TurnError::BudgetLimited {
+        kind: zuno_engine::budget::BudgetStopKind::UncertainSideEffect,
+        detail: "one exact call needs inspection".to_owned(),
+    });
+    assert_eq!(
+        failure.goal_failure(),
+        GoalTerminalFailure::Pause(zuno_goal::GoalPauseReason::UncertainSideEffect)
+    );
+}
+
+#[test]
 fn a_contended_durable_write_retries_the_goal_instead_of_blocking_it() {
     // Before this, every failure on the plan-driver, human-request, and
     // retry-context paths reached the goal layer as a rendered string, so write

@@ -13,9 +13,10 @@ use zuno_error::DbError;
 use zuno_tool::question::{QuestionError, QuestionResult};
 use zuno_types::goal_resume::GoalResumeRequest;
 use zuno_types::question::{
-    PlanAuthorizationState, PlanQuestionBinding, PlanQuestionDecision, QuestionAction,
-    QuestionAnswers, QuestionCommand, QuestionItem, QuestionMode, QuestionOrigin, QuestionPurpose,
-    QuestionReceipt, QuestionRequest, QuestionSpec, QuestionState, QuestionView,
+    PlanAuthorizationState, PlanQuestionBinding, PlanQuestionDecision, QUESTION_AUTO_DEFER_MS,
+    QuestionAction, QuestionAnswers, QuestionAutoDefer, QuestionAutoDeferState, QuestionCommand,
+    QuestionItem, QuestionMode, QuestionOrigin, QuestionPurpose, QuestionReceipt, QuestionRequest,
+    QuestionSpec, QuestionState, QuestionView,
 };
 
 use crate::event_log::{NewSessionEvent, append_in};
@@ -25,7 +26,8 @@ use crate::{Pool, open};
 
 const TABLE: &str = "question_interaction";
 
-/// The definition stays stable while response, mode, and consent state advance.
+/// Origin, items, and bindings stay stable. The native timer and Plan handoff
+/// advance without changing those sources or manufacturing user input.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Definition {
@@ -38,6 +40,10 @@ struct Definition {
     handoff_completed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     goal_resume: Option<GoalResumeRequest>,
+    /// New native publications only. Legacy metadata is never guessed into a
+    /// timer, and an originally blocking question never acquires one on defer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_defer: Option<QuestionAutoDefer>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +127,12 @@ pub fn create_in(
         plan: spec.plan.clone(),
         initial_mode: spec.mode,
         handoff_completed: false,
+        auto_defer: (spec.purpose == QuestionPurpose::Clarification
+            && spec.mode == QuestionMode::Deferred)
+            .then_some(QuestionAutoDefer {
+                deadline_at: now.saturating_add(QUESTION_AUTO_DEFER_MS),
+                state: QuestionAutoDeferState::Armed,
+            }),
         goal_resume: if spec.purpose == QuestionPurpose::GoalResume {
             Some(GoalResumeRequest {
                 session_id: spec.origin.session_id.clone(),
@@ -264,6 +276,7 @@ pub fn backfill_legacy_in(tx: &Transaction<'_>) -> Result<(), DbError> {
             initial_mode: QuestionMode::Blocking,
             handoff_completed: false,
             goal_resume: None,
+            auto_defer: None,
         };
         insert_definition_in(tx, &id, purpose, QuestionMode::Blocking, &definition)?;
     }
@@ -308,6 +321,14 @@ pub fn get_in(
         return Err(corrupt("question definition and durable owner disagree").into());
     }
     let purpose: QuestionPurpose = decode_enum(purpose)?;
+    if definition.auto_defer.is_some()
+        && (purpose != QuestionPurpose::Clarification
+            || definition.initial_mode != QuestionMode::Deferred)
+    {
+        return Err(
+            corrupt("only originally deferred clarifications have auto-defer timers").into(),
+        );
+    }
     if (purpose == QuestionPurpose::PlanAuthorization) != definition.plan.is_some() {
         return Err(corrupt("question purpose and Plan binding disagree").into());
     }
@@ -342,6 +363,7 @@ pub fn get_in(
         questions: definition.questions,
         answers,
         draft_answers,
+        auto_defer: definition.auto_defer,
         plan: definition.plan,
         decision: decision.map(decode_enum).transpose()?,
         authorization: authorization.map(decode_enum).transpose()?,
@@ -457,6 +479,116 @@ pub fn pending_in(connection: &Connection, session_id: &str) -> QuestionResult<V
     ids.into_iter()
         .map(|id| get_in(connection, session_id, &id))
         .collect()
+}
+
+/// Presentation authority comes from durable ancestry, never a receipt's owner.
+/// Only question-owning descendants need projection; always retain the root
+/// even before its lazily materialized session has published a question.
+pub fn presentation_sessions_in(
+    connection: &Connection,
+    root: &str,
+) -> QuestionResult<Vec<String>> {
+    let mut statement = connection
+        .prepare(
+            "WITH RECURSIVE scope(id) AS (
+           SELECT ?1 UNION SELECT s.id FROM session s JOIN scope p ON s.parent_id=p.id)
+         SELECT ?1 AS id UNION
+         SELECT DISTINCT h.session_id FROM human_request h
+         JOIN question_interaction q ON q.request_id=h.id
+         WHERE h.session_id IN (SELECT id FROM scope) ORDER BY id",
+        )
+        .map_err(open::map_error)?;
+    statement
+        .query_map([root], |row| row.get(0))
+        .map_err(open::map_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(open::map_error)
+        .map_err(Into::into)
+}
+
+/// Advance at most one bounded batch of native deadlines. No response input is
+/// admitted and no Goal/Plan/execution wait is changed by this transition.
+///
+/// All hosts and restart paths use the same persisted deadline. The write lock
+/// and revision predicate serialize timeout against answers and interactions.
+pub fn auto_defer_due_in(
+    tx: &Transaction<'_>,
+    session_id: Option<&str>,
+    now: i64,
+) -> QuestionResult<Vec<QuestionReceipt>> {
+    let ids = {
+        let mut statement = tx
+            .prepare(
+                "WITH RECURSIVE scope(id) AS (
+                   SELECT ?1 UNION SELECT s.id FROM session s JOIN scope p ON s.parent_id=p.id)
+                 SELECT h.session_id,h.id FROM human_request h
+             JOIN question_interaction q ON q.request_id=h.id
+             WHERE h.state='pending' AND q.purpose='clarification' AND q.mode='deferred'
+               AND (?1 IS NULL OR h.session_id IN (SELECT id FROM scope))
+               AND json_extract(q.definition,'$.autoDefer.state')='armed'
+               AND json_extract(q.definition,'$.autoDefer.deadlineAt')<=?2
+             ORDER BY json_extract(q.definition,'$.autoDefer.deadlineAt'),h.id LIMIT 128",
+            )
+            .map_err(open::map_error)?;
+        statement
+            .query_map(params![session_id, now], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(open::map_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(open::map_error)?
+    };
+    let mut receipts = Vec::new();
+    for (session_id, id) in ids {
+        let view = get_in(tx, &session_id, &id)?;
+        let Some(mut timer) = view.auto_defer.clone().filter(|timer| {
+            timer.state == QuestionAutoDeferState::Armed && timer.deadline_at <= now
+        }) else {
+            continue;
+        };
+        let revision = view
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| corrupt("question revision exhausted"))?;
+        let changed = tx
+            .execute(
+                "UPDATE human_request SET revision=?1,time_updated=?2
+             WHERE id=?3 AND session_id=?4 AND state='pending' AND revision=?5",
+                params![revision, now, id, session_id, view.revision],
+            )
+            .map_err(open::map_error)?;
+        if changed != 1 {
+            return Err(QuestionError::Conflict {
+                request_id: id,
+                expected: view.revision,
+                actual: get_in(tx, &session_id, &view.id)?.revision,
+            });
+        }
+        timer.state = QuestionAutoDeferState::Deferred;
+        set_auto_defer_in(tx, &id, &timer)?;
+        let question = get_in(tx, &session_id, &id)?;
+        record_event(tx, "question.auto_deferred", &question)?;
+        receipts.push(QuestionReceipt {
+            question,
+            input_id: None,
+            duplicate: false,
+        });
+    }
+    Ok(receipts)
+}
+
+fn set_auto_defer_in(
+    tx: &Transaction<'_>,
+    request_id: &str,
+    timer: &QuestionAutoDefer,
+) -> Result<(), DbError> {
+    tx.execute(
+        "UPDATE question_interaction SET definition=json_set(definition,'$.autoDefer',json(?1))
+         WHERE request_id=?2",
+        params![encode(timer)?, request_id],
+    )
+    .map_err(open::map_error)?;
+    Ok(())
 }
 
 /// Native Goal consent is bound in the immutable question definition.
@@ -581,6 +713,14 @@ pub fn apply_in(
     let mut risk_reason = None;
     let mut admit_response = false;
     match &command.action {
+        QuestionAction::Snooze => {
+            if view.auto_defer.is_none() {
+                return Err(QuestionError::Rejected {
+                    code: "question_timer_unavailable",
+                    detail: "only ordinary deferred questions have an interaction timer".to_owned(),
+                });
+            }
+        }
         QuestionAction::Answer { answers } => {
             view.validate_answers(answers)?;
             admit_response = view.purpose != QuestionPurpose::GoalResume
@@ -632,13 +772,27 @@ pub fn apply_in(
             admit_response = *decision == PlanQuestionDecision::Decline;
         }
     }
+    if let Some(timer) = &mut view.auto_defer
+        && timer.state == QuestionAutoDeferState::Armed
+    {
+        // Every authenticated answer, draft save, or interaction disarms the
+        // timer. Highlighted options and unsent drafts remain unsubmitted.
+        timer.state = QuestionAutoDeferState::Snoozed;
+    }
     // Submitting a partial answer, or deferring, releases only the synchronous
     // waiter. Remaining items stay pending and answerable.
     view.mode = QuestionMode::Deferred;
     let expected = view.revision;
-    view.revision = expected
-        .checked_add(1)
-        .ok_or_else(|| corrupt("question revision exhausted"))?;
+    // Interaction changes no form values, just like native Plan handoff
+    // bookkeeping. Keep the displayed answer revision usable while a client
+    // is typing. Its command still checks CAS and has its own durable receipt.
+    view.revision = if matches!(command.action, QuestionAction::Snooze) {
+        expected
+    } else {
+        expected
+            .checked_add(1)
+            .ok_or_else(|| corrupt("question revision exhausted"))?
+    };
     view.time_updated = now;
     let response = json!({
         "answersById": view.answers,
@@ -683,6 +837,9 @@ pub fn apply_in(
         ],
     )
     .map_err(open::map_error)?;
+    if let Some(timer) = &view.auto_defer {
+        set_auto_defer_in(tx, request_id, timer)?;
+    }
     let input = if admit_response {
         Some(admit_response_in(tx, &view, command, now)?)
     } else {
@@ -754,7 +911,8 @@ fn admit_response_in(
             decision: PlanQuestionDecision::Decline,
             ..
         } => "declined",
-        QuestionAction::Answer { .. }
+        QuestionAction::Snooze
+        | QuestionAction::Answer { .. }
         | QuestionAction::Defer { .. }
         | QuestionAction::PlanDecision {
             decision: PlanQuestionDecision::Approve,

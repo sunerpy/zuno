@@ -85,6 +85,91 @@ fn receipt(fixture: &Fixture) -> InputAdmissionReceipt {
         .expect("input receipt")
 }
 
+#[test]
+fn legacy_blocked_gate_names_its_typed_goal_uncertainty_without_resuming() {
+    let fixture = Fixture::new();
+    let paused = paused_input_before_defer(&fixture);
+    let goal = fixture
+        .goals
+        .create_goal(SESSION, "Remote work", None)
+        .unwrap();
+    fixture
+        .goals
+        .pause_with_reason(SESSION, zuno_goal::GoalPauseReason::UncertainSideEffect)
+        .unwrap();
+    SessionExecutionStore::new(Arc::clone(&fixture.pool))
+        .set_scheduling(
+            SESSION,
+            paused.revision,
+            SessionScheduling {
+                readiness: SessionReadiness::Paused {
+                    reason: SessionPauseReason::Blocked,
+                },
+                ..SessionScheduling::default()
+            },
+            30,
+        )
+        .unwrap();
+    let before = fixture.control.state(SESSION).unwrap();
+    let goal_before = fixture.goals.goal(SESSION).unwrap();
+    fixture
+        .control
+        .defer_input_at_execution_gate(SESSION, INPUT, 31)
+        .unwrap();
+    let retained = receipt(&fixture);
+    let gate = retained.execution_gate.unwrap();
+    assert_eq!(gate.reason, InputGateReason::UncertainSideEffect);
+    assert_eq!(gate.recovery, InputGateRecovery::InspectOutcome);
+    assert_eq!(gate.source_id.as_deref(), Some(goal.goal_id.as_str()));
+    assert_eq!(retained.state, InputReceiptState::Recorded);
+    assert!(retained.applied_at.is_none() && retained.turn_id.is_none());
+    assert_eq!(fixture.control.state(SESSION).unwrap(), before);
+    assert_eq!(fixture.goals.goal(SESSION).unwrap(), goal_before);
+}
+
+#[test]
+fn goal_uncertainty_does_not_replace_authentication_or_budget_gate_diagnostics() {
+    for (reason, recovery) in [
+        (
+            SessionPauseReason::Authentication,
+            InputGateRecovery::Reauthenticate,
+        ),
+        (
+            SessionPauseReason::TurnBudget,
+            InputGateRecovery::ReviewBudget,
+        ),
+    ] {
+        let fixture = Fixture::new();
+        let paused = paused_input_before_defer(&fixture);
+        fixture
+            .goals
+            .create_goal(SESSION, "Remote work", None)
+            .unwrap();
+        fixture
+            .goals
+            .pause_with_reason(SESSION, zuno_goal::GoalPauseReason::UncertainSideEffect)
+            .unwrap();
+        SessionExecutionStore::new(Arc::clone(&fixture.pool))
+            .set_scheduling(
+                SESSION,
+                paused.revision,
+                SessionScheduling {
+                    readiness: SessionReadiness::Paused { reason },
+                    ..SessionScheduling::default()
+                },
+                30,
+            )
+            .unwrap();
+        let before = fixture.control.state(SESSION).unwrap();
+        fixture
+            .control
+            .defer_input_at_execution_gate(SESSION, INPUT, 31)
+            .unwrap();
+        assert_eq!(receipt(&fixture).execution_gate.unwrap().recovery, recovery);
+        assert_eq!(fixture.control.state(SESSION).unwrap(), before);
+    }
+}
+
 fn late_defer_preserves_receipt(fixture: &Fixture, at_ms: i64) {
     let before = receipt(fixture);
     // A stale owner may decline to attach a gate. It must not mutate the

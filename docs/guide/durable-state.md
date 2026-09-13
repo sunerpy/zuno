@@ -582,6 +582,14 @@ form or an unfinished Plan.
 
 `QuestionView.delivery` is a derived view of the associated input receipts:
 
+Deferred clarification forms additionally expose `autoDefer` with `deadlineAt`
+and `armed|snoozed|deferred`. The native service, not a client guess, owns the
+120-second deadline. Expiry leaves the question unanswered and creates no inbox
+entry; late answers still use its stable ID. Interacting users can snooze without
+selecting an answer. Only an exact auto-defer successor may rebase an in-flight
+form response; other stale revisions remain conflicts. Required and approval
+forms never inherit this timer.
+
 | Phase | Meaning |
 | --- | --- |
 | `WaitingAnswer` (`waiting_answer`) | The form is pending and still accepts an answer. |
@@ -824,6 +832,25 @@ all evidence and execution state are unchanged. Once the control advances or the
 original input is bound/applied, repair rejects resubmission.
 Missing evidence and real protected gates remain blocked. See
 [bounded repair](/harness-runtime#explicit-repair-of-a-legacy-false-block).
+
+## Long-task context is not execution authority
+
+`task_context` stores bounded snapshots in versioned session events. Each
+snapshot retains user-source IDs/digests, revision, objective, constraints and
+reported delivery/safety evidence. Sources exclude compaction markers and
+automatic reports; digests cover all stored user-input parts, including attachment
+references. Check-definition revisions require explicit user sources and reset
+status/evidence. Context updates are atomic and idempotent by
+tool invocation; no database format change or new permission is implied.
+`runtime.task_context` refreshes before model requests, flags newer user input
+and stale sources, and distinguishes current work from a completed historical
+task. A status query does not acquire an old task's execution authority.
+
+Routine implementation choices remain with the implementation owner. Completion
+requires successful required delivery checks, not merely proof that a failed
+release stayed private. Context status does not override Plan/Goal ownership,
+human waits, budgets, authentication or uncertainty, and never makes an
+unfinished task automatically runnable.
 
 ## Jobs
 

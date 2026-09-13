@@ -1,4 +1,4 @@
-//! Explicit, bounded repair of one legacy ordinary-input false block.
+//! Explicit, bounded repair of a proven legacy ordinary-input false block.
 //!
 //! Only native v1 event provenance is authority here. Rendered errors, a completed
 //! Goal, and the absence of an active turn are never repair authorization. The
@@ -29,6 +29,9 @@ use zuno_types::execution::{
     CollaborationMode, ContinuationToken, InputTriggerKind, SessionExecutionPhase,
     SessionExecutionState, SessionPauseReason, SessionReadiness, SessionScheduling,
 };
+
+mod gate_chain;
+mod request_rejection;
 
 const MAX_EVENTS: usize = 512;
 const MAX_EVENT_BYTES: usize = 262_144;
@@ -89,6 +92,10 @@ pub struct SessionRepairEvidence {
     pub input_cycle_sequence: i64,
     pub gate_sequence: i64,
     pub receipt_sequence: i64,
+    /// Earlier gate-only inputs, oldest first. These remain retained history;
+    /// only the explicit request's latest input is authorized for recovery.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inherited_input_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -640,7 +647,9 @@ fn window(connection: &Connection, session: &str, first: i64, last: i64) -> Resu
            WHEN type IN ('session.work_cycle.started.1','session.input.admitted.1',
              'session.input.promoted.1','session.input.consumed.1','session.input.receipt.1',
              'session.input.execution_gate.1','session.turn.started.1',
-             'session.provider.request.1','session.provider.attempt.1','session.driver.phase.1')
+             'session.provider.request.1','session.provider.attempt.1','session.driver.phase.1',
+             'session.work_cycle.authorized.1','session.input.execution_recovered.1',
+             'session.repair.legacy_false_blocked_applied.1','session.turn.failure_settled.1')
            THEN CASE WHEN length(CAST(data AS BLOB))<=?3 THEN data END ELSE '{}' END
          FROM event WHERE aggregate_id=?1 AND seq>=?2 AND seq<=?5 ORDER BY seq LIMIT ?4",
         )
@@ -711,6 +720,26 @@ fn independent_cycle(
 }
 
 fn prove_in(
+    connection: &Connection,
+    state: &SessionExecutionState,
+    input: &SessionInput,
+    receipt: &InputAdmissionReceipt,
+    through_sequence: i64,
+) -> Result<SessionRepairEvidence> {
+    if let Some(evidence) =
+        gate_chain::prove_in(connection, state, input, receipt, through_sequence)?
+    {
+        return Ok(evidence);
+    }
+    if let Some(evidence) =
+        request_rejection::prove_in(connection, state, input, receipt, through_sequence)?
+    {
+        return Ok(evidence);
+    }
+    prove_legacy_in(connection, state, input, receipt, through_sequence)
+}
+
+fn prove_legacy_in(
     connection: &Connection,
     state: &SessionExecutionState,
     input: &SessionInput,
@@ -1016,6 +1045,7 @@ fn prove_in(
         input_cycle_sequence: started.sequence,
         gate_sequence: gate.sequence,
         receipt_sequence: recorded.sequence,
+        inherited_input_ids: Vec::new(),
     })
 }
 

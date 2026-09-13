@@ -46,7 +46,22 @@ pub(crate) fn defer_input_in(
     let Some(mut gate) = execution_gate(state) else {
         return Ok(false);
     };
-    if gate.recovery == InputGateRecovery::ResumeWork && state.mode == CollaborationMode::Plan {
+    if gate.reason == InputGateReason::Blocked
+        && let Some(goal) = GoalStore::goal_in(tx, session_id)?
+        && goal.status == zuno_goal::GoalStatus::Paused
+        && let Some(pause) = GoalStore::pause_state_in(tx, session_id)?
+        && pause.goal_id == goal.goal_id
+        && pause.reason == zuno_goal::GoalPauseReason::UncertainSideEffect
+    {
+        // Older hosts recorded unsafe retry signals as generic Blocked while
+        // the Goal retained the typed cause. Enrich only the diagnostic: do not
+        // clear/rewrite execution, infer a successful inspection, or resume Goal.
+        gate.reason = InputGateReason::UncertainSideEffect;
+        gate.recovery = InputGateRecovery::InspectOutcome;
+        gate.source_id = Some(goal.goal_id);
+    } else if gate.recovery == InputGateRecovery::ResumeWork
+        && state.mode == CollaborationMode::Plan
+    {
         gate.recovery = InputGateRecovery::StartWork;
     } else if gate.recovery == InputGateRecovery::ResumeWork
         && let Some(goal) = GoalStore::goal_in(tx, session_id)?

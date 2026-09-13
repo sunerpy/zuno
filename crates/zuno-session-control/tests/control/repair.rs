@@ -20,6 +20,9 @@ const OLD: &str = "msg_failed_fixture";
 const INPUT: &str = "msg_saved_fixture";
 const TURN: &str = "turn_failed_fixture";
 const REQUEST: &str = "request_failed_fixture";
+
+#[path = "repair_request_rejection.rs"]
+mod request_rejection;
 const FORMAT_14: &str = concat!(
     include_str!("../../../zuno-db/tests/fixtures/format-7.sql"),
     include_str!("../../../zuno-db/tests/fixtures/format-8.sql"),

@@ -12,6 +12,18 @@ pub(super) struct ReceiptCycle {
 }
 
 impl ReceiptCycle {
+    /// The native discussion service already bound the input atomically with
+    /// its claim. Adopt that ownership without a second binding transaction.
+    pub(super) fn from_bound_turn(
+        database: std::sync::Arc<zuno_db::Pool>,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Self {
+        let mut cycle = Self::new(database, session_id);
+        cycle.current_turn = Some(turn_id.to_owned());
+        cycle
+    }
+
     pub(super) fn new(database: std::sync::Arc<zuno_db::Pool>, session_id: &str) -> Self {
         Self {
             store: InputReceiptStore::new(database.clone()),

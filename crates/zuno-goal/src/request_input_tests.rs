@@ -57,6 +57,7 @@ impl QuestionPort for RecordingPort {
                     .collect(),
                 answers: self.answers.clone(),
                 draft_answers: Default::default(),
+                auto_defer: None,
                 plan: spec.plan,
                 decision: None,
                 authorization: None,

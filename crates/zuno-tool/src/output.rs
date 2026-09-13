@@ -118,6 +118,7 @@ impl ToolProgressObservation {
 pub enum ToolDynamicContextRefresh {
     WorkPlan,
     WorkItems,
+    TaskContext,
 }
 
 /// How the host should proceed after this successful tool result is persisted.

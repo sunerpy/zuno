@@ -1447,6 +1447,7 @@ pub struct TurnContext<'a> {
     attachments: Option<Arc<zuno_attachment::AttachmentStore>>,
     dynamic_context_refresher: Option<&'a dyn DynamicContextRefresher>,
     tool_concurrency: ToolConcurrencyLimit,
+    tools_enabled: bool,
     run_registry: Option<SessionRunRegistry>,
 }
 
@@ -1476,6 +1477,7 @@ impl<'a> TurnContext<'a> {
             attachments: None,
             dynamic_context_refresher: None,
             tool_concurrency: ToolConcurrencyLimit::SERIAL,
+            tools_enabled: true,
             run_registry: None,
         }
     }
@@ -1523,6 +1525,16 @@ impl<'a> TurnContext<'a> {
     #[must_use]
     pub fn with_tool_concurrency(mut self, limit: ToolConcurrencyLimit) -> Self {
         self.tool_concurrency = limit;
+        self
+    }
+
+    /// Disable all current tool declarations and execution for this entire turn.
+    ///
+    /// Historical tool calls and sealed provider replay remain intact. Hooks cannot
+    /// restore tool authority, and an attempted call ends the turn without dispatch.
+    #[must_use]
+    pub fn with_tools_disabled(mut self) -> Self {
+        self.tools_enabled = false;
         self
     }
 
@@ -2550,6 +2562,15 @@ async fn run_turn_in_span(
         sealed_history
             .validate_request(&completion, "prepare_request")
             .map_err(TurnError::Hook)?;
+        // Apply the turn's execution boundary only after hooks and historical replay
+        // projection. Withholding current declarations must not downgrade historical
+        // tool calls or invalidate provider-sealed capsules.
+        let locked_tools = if context.tools_enabled {
+            locked_tools
+        } else {
+            completion.tools.clear();
+            Arc::from([])
+        };
         let context_epoch = session_context_epoch(context.connection, &request.session_id)?;
         let context_reset = {
             let mut usage = context_usage.lock().expect("context usage lock");
@@ -2834,6 +2855,7 @@ async fn run_turn_in_span(
         let provider_interrupt = context.interrupt.clone();
         let retry_interrupt = context.interrupt.clone();
         let retry_soft_interrupt = soft_interrupt.clone();
+        let tools_enabled = context.tools_enabled;
         let attempt = {
             let attempt_connection = Arc::new(Mutex::new(&mut *context.connection));
             retry_provider_with_wake_observed(
@@ -2938,6 +2960,20 @@ async fn run_turn_in_span(
                                     .apply(step, &event);
                                 if let Err(error) = apply {
                                     return Ok(Err(error));
+                                }
+                                if !tools_enabled
+                                    && let StreamEvent::ToolUseStart { name, .. } = &event
+                                {
+                                    // Keep the attempted call in the accumulator so the
+                                    // failure checkpoint closes it as never dispatched.
+                                    // Returning the inner error bypasses provider retry
+                                    // and stops before any dispatcher preparation.
+                                    return Ok(Err(TurnError::Provider(ProviderError::Protocol {
+                                        code: zuno_error::ProviderProtocolFailure::InvalidUpstreamToolCall,
+                                        source: Some(std::io::Error::other(format!(
+                                            "tool `{name}` was requested while tools are disabled for this turn"
+                                        )).into()),
+                                    })));
                                 }
                                 let context_update = match persist_context_frame(
                                     &usage_connection,
@@ -3926,8 +3962,9 @@ fn merge_dynamic_context_refresh(
     match (current, next) {
         (Some(ToolDynamicContextRefresh::WorkPlan), _)
         | (_, ToolDynamicContextRefresh::WorkPlan) => ToolDynamicContextRefresh::WorkPlan,
-        (Some(ToolDynamicContextRefresh::WorkItems), ToolDynamicContextRefresh::WorkItems)
-        | (None, ToolDynamicContextRefresh::WorkItems) => ToolDynamicContextRefresh::WorkItems,
+        (Some(ToolDynamicContextRefresh::WorkItems), _)
+        | (_, ToolDynamicContextRefresh::WorkItems) => ToolDynamicContextRefresh::WorkItems,
+        (_, ToolDynamicContextRefresh::TaskContext) => ToolDynamicContextRefresh::TaskContext,
     }
 }
 
@@ -7201,26 +7238,29 @@ fn request_input_ids(
         *after_counts.entry(fingerprint).or_default() += 1;
     }
     let mut ids = Vec::new();
-    for (id, fingerprint) in provenance {
+    for (message_id, fingerprint) in provenance {
         let represented = same_order
             || (before_counts.get(fingerprint.as_str()) == Some(&1)
                 && after_counts.get(fingerprint.as_str()) == Some(&1));
         if !represented {
             continue;
         }
-        if let Some(receipt) = zuno_db::input_receipt::get_in(connection, &request.session_id, id)?
+        let Some(input) =
+            zuno_db::inbox::input_for_message_in(connection, &request.session_id, message_id)?
+        else {
+            continue;
+        };
+        if let Some(receipt) =
+            zuno_db::input_receipt::get_in(connection, &request.session_id, &input.id)?
             && (receipt.state.is_terminal()
                 || receipt.state == zuno_types::admission::InputReceiptState::Applied)
         {
             continue;
         }
-        let Some(input) = read_in(connection, &request.session_id, id)? else {
-            continue;
-        };
         if input.state != zuno_db::inbox::SubmissionState::Consumed {
             continue;
         }
-        ids.push(id.clone());
+        ids.push(input.id);
     }
     ids.sort();
     ids.dedup();

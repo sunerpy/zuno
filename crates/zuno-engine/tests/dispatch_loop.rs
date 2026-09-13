@@ -14,8 +14,8 @@ use zuno_engine::dispatch::ToolRegistryDispatcher;
 use zuno_engine::interrupt::InterruptSignal;
 use zuno_engine::r#loop::{
     AgentModelResolver, DynamicContextRefresher, ResolvedAgent, ResolvedModel, RunTurnRequest,
-    ToolBlockKind, ToolConcurrencyLimit, ToolFailureRecovery, TurnContext, TurnError, TurnEvent,
-    TurnOutcome, TurnRecovery, event_channel, run_turn,
+    ToolBlockKind, ToolConcurrencyLimit, TurnContext, TurnError, TurnEvent, TurnOutcome,
+    TurnRecovery, event_channel, run_turn,
 };
 use zuno_error::{ProviderError, ToolError};
 use zuno_llm::cache::{DynamicContext, McpToolStatus};
@@ -27,7 +27,7 @@ use zuno_permission::{PermissionAction, Rule};
 use zuno_tool::{
     AllowAll, METADATA_HUMAN_REQUEST_ID_KEY, QuestionResultPresentation, QuestionResultStatus,
     Tool, ToolConcurrencyPolicy, ToolContext, ToolContinuation, ToolDynamicContextRefresh,
-    ToolEffect, ToolOutput, ToolProgressObservation, ToolReplayPolicy, ToolResultPresentation,
+    ToolEffect, ToolOutput, ToolProgressObservation, ToolResultPresentation,
 };
 
 const SESSION_ID: &str = "ses_dispatch_loop";
@@ -1483,14 +1483,16 @@ async fn dispatch_loop_reports_a_tool_timeout_without_replaying_the_call() {
         panic!("turn was interrupted");
     };
     assert_eq!(steps, 2);
-    assert_eq!(
-        unresolved_tool_failures,
-        vec![ToolFailureRecovery {
-            tool: "fragile".to_owned(),
-            replay_policy: ToolReplayPolicy::Never,
-            retry_after: None,
-        }]
+    assert!(
+        unresolved_tool_failures.is_empty(),
+        "a non-replayable timeout creates an inspection obligation, not a retry plan"
     );
+    let pending = MessageStore::new(&connection)
+        .pending_uncertain_tool_calls(SESSION_ID, 0)
+        .expect("durable timeout obligation");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].call_id, "call-timeout");
+    assert_eq!(pending[0].tool, "fragile");
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,

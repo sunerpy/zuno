@@ -69,6 +69,167 @@ fn count(fixture: &Fixture, table: &str) -> i64 {
 }
 
 #[tokio::test]
+async fn child_model_clarifications_return_to_parent_without_creating_a_human_request() {
+    let fixture = Fixture::new();
+    const CHILD: &str = "ses_question_child";
+    fixture
+        .pool
+        .transaction(|tx| {
+            session::create(
+                tx,
+                &session::SessionCreate::new(
+                    CHILD,
+                    "child",
+                    "project",
+                    "/workspace",
+                    "/workspace",
+                    "Child",
+                    "zuno",
+                )
+                .with_parent(SESSION)
+                .at(2),
+            )
+            .map(|_| ())
+        })
+        .expect("child");
+    let permission_store =
+        zuno_db::human_request::HumanRequestStore::new(Arc::clone(&fixture.pool));
+    let permission = permission_store
+        .create(zuno_db::human_request::NewHumanRequest {
+            id: "child-native-permission".to_owned(),
+            session_id: CHILD.to_owned(),
+            goal_id: None,
+            kind: zuno_db::human_request::HumanRequestKind::Permission,
+            payload: serde_json::json!({"permission": "read", "patterns": ["/workspace/file"]}),
+            message_id: Some("message_native".to_owned()),
+            call_id: Some("call_native".to_owned()),
+            time_created: 3,
+        })
+        .expect("native child permission");
+    let service = QuestionService::new(Arc::clone(&fixture.pool));
+    let before = count(&fixture, "human_request");
+    for mode in [QuestionMode::Blocking, QuestionMode::Deferred] {
+        let mut child = spec(QuestionPurpose::Clarification);
+        child.origin.session_id = CHILD.to_owned();
+        child.mode = mode;
+        let error = service
+            .open(child)
+            .await
+            .expect_err("model child must ask its parent");
+        assert!(matches!(
+            error,
+            QuestionError::Rejected {
+                code: "root_question_required",
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("parent"));
+    }
+    assert_eq!(count(&fixture, "human_request"), before);
+    assert_eq!(count(&fixture, "session_input"), 0);
+    let root = service
+        .open(spec(QuestionPurpose::Clarification))
+        .await
+        .expect("root clarification");
+    assert_eq!(root.question.origin.session_id, SESSION);
+
+    // These controls are produced by trusted native code, not the child's
+    // model-facing question tool. Keep their original child session routing.
+    let mut required = spec(QuestionPurpose::RequiredInput);
+    required.origin.session_id = CHILD.to_owned();
+    required.origin.call_id = Some("native_external_input".to_owned());
+    let native = service
+        .open(required)
+        .await
+        .expect("native child required input");
+    assert_eq!(native.question.origin.session_id, CHILD);
+    assert!(native.question.auto_defer.is_none());
+    assert_eq!(
+        permission_store.get(&permission.id).expect("permission"),
+        Some(permission),
+        "ordinary model questions must not replace or resolve child permission controls",
+    );
+}
+
+#[tokio::test]
+async fn unattended_ordinary_question_is_deferred_after_restart_without_answer_or_input() {
+    let fixture = Fixture::new();
+    // Publish into the durable store as an earlier host, without constructing a
+    // live timer. The next host must use the saved deadline, not restart it.
+    let opened = fixture
+        .pool
+        .try_transaction(|tx| {
+            zuno_db::question::create_in(
+                tx,
+                "que_old_optional",
+                &spec(QuestionPurpose::Clarification),
+                1,
+            )
+        })
+        .expect("open previous host's question");
+    let events_before = count(&fixture, "event");
+    let service = QuestionService::new(Arc::clone(&fixture.pool));
+    let restored = service
+        .get(SESSION, &opened.question.id)
+        .await
+        .expect("restore");
+    let wire = serde_json::to_value(&restored).expect("wire snapshot");
+    assert_eq!(wire["autoDefer"]["state"], "deferred");
+    assert_eq!(wire["autoDefer"]["deadlineAt"], 120_001);
+    assert_eq!(restored.state, QuestionState::Pending);
+    assert_eq!(restored.mode, QuestionMode::Deferred);
+    assert!(restored.answers.is_empty());
+    assert!(restored.draft_answers.is_empty());
+    assert_eq!(count(&fixture, "session_input"), 0);
+    assert_eq!(count(&fixture, "event"), events_before + 1);
+    assert_eq!(
+        service.get(SESSION, &restored.id).await.expect("retry"),
+        restored,
+        "a second reconciliation must not create another revision or event"
+    );
+}
+
+#[tokio::test]
+async fn ordinary_timeout_never_pauses_resumes_or_wakes_goal_work() {
+    let fixture = Fixture::new();
+    let goal = fixture
+        .goals
+        .create_goal(SESSION, "Deliver", None)
+        .expect("goal");
+    let service = QuestionService::new(Arc::clone(&fixture.pool));
+    let opened = service
+        .open(spec(QuestionPurpose::Clarification))
+        .await
+        .expect("question");
+    let before = fixture.control.state(SESSION).expect("execution snapshot");
+    let mut changes = service.subscribe();
+    let due = opened.question.time_created + zuno_types::question::QUESTION_AUTO_DEFER_MS;
+    assert_eq!(
+        service
+            .reconcile_auto_defer_at(Some(SESSION), due - 1)
+            .await
+            .expect("grace"),
+        0
+    );
+    assert_eq!(
+        service
+            .reconcile_auto_defer_at(Some(SESSION), due)
+            .await
+            .expect("timeout"),
+        1
+    );
+    let changed = changes.try_recv().expect("presentation receipt");
+    assert!(changed.question.is_auto_deferred());
+    assert!(changed.input_id.is_none());
+    assert_eq!(
+        fixture.goals.goal(SESSION).expect("goal").expect("goal"),
+        goal
+    );
+    assert_eq!(fixture.control.state(SESSION).expect("execution"), before);
+    assert_eq!(count(&fixture, "session_input"), 0);
+}
+
+#[tokio::test]
 async fn ordinary_required_input_waits_without_goal_and_defer_does_not_resume() {
     let fixture = Fixture::new();
     let service = QuestionService::new(Arc::clone(&fixture.pool));
@@ -76,6 +237,14 @@ async fn ordinary_required_input_waits_without_goal_and_defer_does_not_resume() 
         .open(spec(QuestionPurpose::RequiredInput))
         .await
         .expect("open");
+    assert!(opened.question.auto_defer.is_none());
+    assert_eq!(
+        service
+            .reconcile_auto_defer_at(Some(SESSION), opened.question.time_created + 1_000_000)
+            .await
+            .expect("required input never times out"),
+        0
+    );
     let state = fixture
         .control
         .state(SESSION)

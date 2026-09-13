@@ -145,6 +145,7 @@ impl QuestionPort for ScriptedAnswers {
                 .collect(),
             answers: Default::default(),
             draft_answers: Default::default(),
+            auto_defer: None,
             plan: spec.plan,
             decision: None,
             authorization: None,
@@ -338,6 +339,15 @@ impl TypedTool for QuestionTool {
             .orchestration_snapshot()
             .is_some_and(|snapshot| snapshot.owner.parent_session_id.is_some())
         {
+            if self.purpose == QuestionPurpose::Clarification {
+                return Err(question_error(
+                    self.id(),
+                    QuestionError::Rejected {
+                        code: "root_question_required",
+                        detail: "Only the root agent may ask ordinary user questions. Return the required decision and evidence to the parent agent instead.".to_owned(),
+                    },
+                ));
+            }
             return Err(ToolError::Denied {
                 tool: self.id().to_owned(),
                 denial: None,
@@ -425,6 +435,9 @@ pub(crate) fn question_receipt_output(view: &QuestionView, elapsed: Duration) ->
         }
         QuestionState::Pending if view.purpose == QuestionPurpose::PlanAuthorization => {
             "The Plan confirmation is pending. Continue the planning summary; do not begin Work without explicit approval."
+        }
+        QuestionState::Pending if view.is_auto_deferred() => {
+            "The ordinary question was automatically deferred without an answer. Continue authorized independent work; the user can answer later. Deferral is not consent."
         }
         QuestionState::Pending => {
             "The question remains open. Continue independent work and state assumptions. The reply will arrive as new input."

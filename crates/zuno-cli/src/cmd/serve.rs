@@ -792,6 +792,7 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
             ServerServices::new(DEFAULT_EVENT_SUBSCRIBER_CAPACITY).with_requests(requests.clone());
         let questions =
             Arc::new(QuestionService::new(Arc::clone(&pool)).with_runs(services.runs.clone()));
+        let _question_deadlines = questions.start_auto_defer_driver();
         let question_changes = questions.subscribe();
         let question_port: Arc<dyn QuestionPort> = questions;
         // Connected once for the server's lifetime, not per request: every host this

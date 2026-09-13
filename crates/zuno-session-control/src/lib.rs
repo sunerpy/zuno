@@ -5,12 +5,14 @@
 //! bound review revision, updates Goal state, freezes the execution identity,
 //! and admits the control input before any of those facts become visible.
 
+mod discussion;
 mod goal_resume;
 mod input_gate;
 mod question;
 pub mod repair;
 mod turn_boundary;
 mod turn_failure;
+pub use discussion::DiscussionAdmission;
 pub use goal_resume::GoalResumeOutcome;
 pub use question::QuestionService;
 pub use turn_failure::{SessionFailureDisposition, TurnFailureScope};

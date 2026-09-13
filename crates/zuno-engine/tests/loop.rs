@@ -2420,6 +2420,7 @@ async fn runtime_policy_is_rendered_from_the_post_hook_tool_subset() {
             definition("workflow"),
             definition("council_run"),
             definition("plan_update"),
+            definition("task_context"),
         ],
     };
     let interrupt = InterruptSignal::new();
@@ -2460,15 +2461,17 @@ async fn runtime_policy_is_rendered_from_the_post_hook_tool_subset() {
     assert!(runtime.contains("exact current revision from `runtime.work_state`"));
     assert!(!runtime.contains("call `plan_get`"));
     assert!(runtime.contains("An active owned Goal controls continuation"));
-    assert!(runtime.contains("An ordinary final ends its cycle"));
-    assert!(runtime.contains("without changing unfinished Plan/Todo status"));
-    assert!(runtime.contains("one clear final plain-text question"));
+    assert!(runtime.contains("Ordinary finals end cycles, not unfinished Plan/Todo status"));
+    assert!(runtime.contains("Own routine technical choices"));
+    assert!(runtime.contains("multiple viable options are not a missing user decision"));
+    assert!(runtime.contains("continue other authorized work"));
     assert!(runtime.contains("do not synthesize a persistent pause"));
-    assert!(runtime.contains("Keep optional questions deferred"));
+    assert!(runtime.contains("Optional questions may remain unanswered; skipping is not approval"));
     assert!(runtime.contains("the runtime execution wait reference is authoritative"));
     assert!(!runtime.contains("explorer"));
     assert!(!runtime.contains("editing surface"));
-    assert!(!runtime.contains("Delegate only"));
+    assert!(!runtime.contains("Delegate when bounded"));
+    assert!(!runtime.contains("`task_context`"));
     assert!(!runtime.contains("Use foreground execution by default"));
     assert!(!runtime.contains("Internal parallelism"));
     assert!(!runtime.contains("Use `bg`"));
@@ -8355,6 +8358,661 @@ impl TurnBudgetPolicy for ObligationGate {
             "{} tool call(s) await inspection",
             pending.len()
         )))
+    }
+}
+
+struct TimeoutThenSuccessTool {
+    calls: Mutex<Vec<String>>,
+}
+
+struct RestoreCurrentToolsHook(ToolSchema);
+
+#[tokio::test]
+async fn host_message_receipts_use_input_identity_and_preserve_application_guards() {
+    use zuno_types::admission::{InputReceiptState, InputStopReason};
+
+    let mut connection = seeded();
+    for (index, (message_id, input_id, consumed)) in [
+        ("msg_completed", "inp_completed", true),
+        ("msg_applied", "inp_applied", true),
+        ("msg_promoted", "inp_promoted", false),
+        ("msg_cli_discussion", "inp_msg_cli_discussion", true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let created = 10 + i64::try_from(index).unwrap();
+        // Identical text must not merge independent identities or settle another receipt.
+        put_user(&connection, message_id, created, "the same discussion");
+        let tx = connection.transaction().unwrap();
+        zuno_db::inbox::admit_and_promote_in(
+            &tx,
+            NewSessionInput::new(
+                input_id,
+                SESSION_ID,
+                json!({
+                    "message": {
+                        "id": message_id, "sessionID": SESSION_ID, "role": "user",
+                        "time": {"created": created}, "agent": "build",
+                        "model": {"providerID": "fake", "modelID": "fake-model"}
+                    },
+                    "parts": [{"type": "text", "text": "the same discussion"}]
+                }),
+                InputDelivery::Queue,
+                created,
+            ),
+        )
+        .unwrap();
+        if consumed {
+            zuno_db::inbox::mark_consumed_in(&tx, SESSION_ID, input_id)
+                .unwrap()
+                .unwrap();
+        }
+        if matches!(input_id, "inp_completed" | "inp_applied") {
+            zuno_db::input_receipt::mark_applied_in(
+                &tx,
+                SESSION_ID,
+                &[input_id.to_owned()],
+                input_id,
+                created,
+            )
+            .unwrap();
+        }
+        if input_id == "inp_completed" {
+            zuno_db::input_receipt::finish_turn_in(
+                &tx,
+                SESSION_ID,
+                input_id,
+                Some(InputStopReason::EndTurn),
+                None,
+                created,
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let guarded = ["inp_completed", "inp_applied", "inp_promoted"].map(|id| {
+        zuno_db::input_receipt::get_in(&connection, SESSION_ID, id)
+            .unwrap()
+            .unwrap()
+    });
+    let provider = Arc::new(FakeProvider::new(vec![ScriptedResponse::complete(vec![
+        StreamEvent::TextDelta("An inspection is still required.".to_owned()),
+        StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::Stop),
+        },
+    ])]));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+    let (outcome, _) = tokio::join!(
+        run_turn(
+            request("turn-host-receipt"),
+            TurnContext::new(
+                &mut connection,
+                &providers,
+                &resolver,
+                &dispatcher,
+                &interrupt
+            )
+            .with_tools_disabled(),
+            sender,
+        ),
+        collect_events(receiver),
+    );
+    outcome.expect("native discussion completes");
+    let receipt = zuno_db::input_receipt::get_in(&connection, SESSION_ID, "inp_msg_cli_discussion")
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.state, InputReceiptState::Applied);
+    assert_eq!(receipt.turn_id.as_deref(), Some("turn-host-receipt"));
+    assert!(
+        zuno_db::input_receipt::get_in(&connection, SESSION_ID, "msg_cli_discussion",)
+            .unwrap()
+            .is_none(),
+        "a transcript id must not become a second receipt id"
+    );
+    for (id, before) in ["inp_completed", "inp_applied", "inp_promoted"]
+        .into_iter()
+        .zip(guarded)
+    {
+        assert_eq!(
+            zuno_db::input_receipt::get_in(&connection, SESSION_ID, id)
+                .unwrap()
+                .unwrap(),
+            before,
+            "terminal, applied and unconsumed inputs must retain their original receipts"
+        );
+    }
+    assert_eq!(
+        zuno_db::inbox::read_in(&connection, SESSION_ID, "inp_promoted")
+            .unwrap()
+            .unwrap()
+            .state,
+        SubmissionState::Promoted
+    );
+    assert_eq!(
+        zuno_db::inbox::read_in(&connection, SESSION_ID, "inp_msg_cli_discussion")
+            .unwrap()
+            .unwrap()
+            .state,
+        SubmissionState::Consumed
+    );
+    let ids: String = connection
+        .query_row(
+            "SELECT json_extract(data, '$.inputIDs') FROM event \
+         WHERE aggregate_id=?1 AND type='session.provider.request.1' \
+           AND json_extract(data, '$.status')='started' ORDER BY seq DESC LIMIT 1",
+            [SESSION_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&ids).unwrap(),
+        json!(["inp_msg_cli_discussion"])
+    );
+    assert_eq!(provider.requests().len(), 1);
+    assert!(dispatcher.calls().is_empty());
+}
+
+#[async_trait]
+impl TurnHooks for RestoreCurrentToolsHook {
+    async fn prepare_request(
+        &self,
+        _input: zuno_engine::hooks::RequestHookInput<'_>,
+        request: &mut CompletionRequest,
+    ) -> Result<(), String> {
+        request.tools.clear();
+        request.tools.push(self.0.clone());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn tools_disabled_text_preserves_uncertainty_and_sealed_history_after_hooks() {
+    for encrypted in [false, true] {
+        for disabled in [false, true] {
+            let mut connection = seeded();
+            put_user(&connection, "msg_original", 10, "perform the operation");
+            put_assistant_text(&connection, "msg_prior", 20, "msg_original", "Trying it.");
+            let dispatcher = FakeDispatcher::default();
+            let definition = dispatcher.available_tools().definitions.remove(0);
+            let raw = "{ \"text\": \"original operation\" }";
+            let store = MessageStore::new(&connection);
+            let tool = PartRecord::from_json(
+                json!({
+                    "id": "prt_uncertain_history", "sessionID": SESSION_ID,
+                    "messageID": "msg_prior", "type": "tool",
+                    "callID": "call-original", "tool": "echo",
+                    "toolSchemaIdentity": definition.schema_identity(),
+                    "state": {
+                        "status": "error", "outcome": "uncertain",
+                        "input": {"text": "original operation"}, "raw": raw,
+                        "error": "The operation lost its outcome.",
+                        "uncertain": {
+                            "callID": "call-original", "tool": "echo",
+                            "cause": "lost_outcome", "appliedPaths": [],
+                            "observedAtMs": 21
+                        }
+                    }
+                }),
+                21,
+            )
+            .expect("historical tool fixture");
+            store
+                .put_part_at(&tool, 21)
+                .expect("persist historical tool");
+            if encrypted {
+                let capsule = PartRecord::from_json(
+                    json!({
+                        "id": "prt_prior_capsule", "sessionID": SESSION_ID,
+                        "messageID": "msg_prior", "type": "reasoning",
+                        "metadata": {"providerReasoning": {
+                            "id": "rs_discussion", "encryptedContent": "kr1_discussion_fixture",
+                            "summary": ["Original reasoning."], "status": "completed"
+                        }}
+                    }),
+                    19,
+                )
+                .expect("historical sealed capsule");
+                store.put_part_at(&capsule, 19).expect("persist capsule");
+            }
+            put_user(&connection, "msg_discussion", 30, "explain what happened");
+            let history = store.hydrate_session(SESSION_ID).expect("original history");
+            let expected = zuno_engine::r#loop::project_history_owned_with_system_messages(
+                &[],
+                history.clone(),
+            );
+            let pending = store.pending_uncertain_tool_calls(SESSION_ID, 0).unwrap();
+            let provider = Arc::new(FakeProvider::new(vec![ScriptedResponse::complete(vec![
+                StreamEvent::TextDelta("An inspection is still required.".to_owned()),
+                StreamEvent::MessageEnd {
+                    stop_reason: Some(FinishReason::Stop),
+                },
+            ])]));
+            let providers = registry(&provider);
+            let resolver: &dyn AgentModelResolver = if encrypted {
+                &EncryptedReplayResolver
+            } else {
+                &FakeResolver
+            };
+            let interrupt = InterruptSignal::new();
+            let context = TurnContext::new(
+                &mut connection,
+                &providers,
+                resolver,
+                &dispatcher,
+                &interrupt,
+            )
+            .with_hooks(Arc::new(RestoreCurrentToolsHook(ToolSchema {
+                name: definition.id,
+                description: definition.description,
+                parameters: definition.parameters,
+            })));
+            let context = if disabled {
+                context.with_tools_disabled()
+            } else {
+                context
+            };
+            let (sender, receiver) = event_channel();
+            let (outcome, _) = tokio::join!(
+                run_turn(request("turn-discussion"), context, sender),
+                collect_events(receiver),
+            );
+            assert!(
+                matches!(outcome, Ok(TurnOutcome::Completed { steps: 1, .. })),
+                "{outcome:?}"
+            );
+            let requests = provider.requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                requests[0].tools.is_empty(),
+                disabled,
+                "the final hook cannot restore tools"
+            );
+            assert_eq!(
+                requests[0]
+                    .messages
+                    .iter()
+                    .filter(|message| message.role != Role::System)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                expected,
+                "current tool authority must not rewrite historical calls or sealed capsules"
+            );
+            assert!(dispatcher.calls().is_empty());
+            let store = MessageStore::new(&connection);
+            assert_eq!(
+                store.pending_uncertain_tool_calls(SESSION_ID, 0).unwrap(),
+                pending
+            );
+            let persisted = store.hydrate_session(SESSION_ID).unwrap();
+            assert_eq!(&persisted[..history.len()], history.as_slice());
+        }
+    }
+}
+
+struct ObservedRegistryDispatcher {
+    inner: zuno_engine::dispatch::ToolRegistryDispatcher,
+    invoked: AtomicBool,
+}
+
+#[async_trait]
+impl ToolDispatcher for ObservedRegistryDispatcher {
+    fn available_tools(&self) -> AvailableTools {
+        self.inner.available_tools()
+    }
+
+    fn concurrency_policy(&self, request: &DispatchRequest) -> zuno_tool::ToolConcurrencyPolicy {
+        self.invoked.store(true, Ordering::SeqCst);
+        self.inner.concurrency_policy(request)
+    }
+
+    async fn prepare(&self, request: DispatchRequest) -> PreparedToolDispatch {
+        self.invoked.store(true, Ordering::SeqCst);
+        self.inner.prepare(request).await
+    }
+}
+
+#[tokio::test]
+async fn tools_disabled_rejects_registered_calls_before_dispatch_without_retry() {
+    for complete_call in [true, false] {
+        let mut connection = seeded();
+        put_user(
+            &connection,
+            "msg_discussion",
+            10,
+            "only discuss the operation",
+        );
+        let tool = Arc::new(TimeoutThenSuccessTool {
+            calls: Mutex::new(Vec::new()),
+        });
+        let dispatcher = ObservedRegistryDispatcher {
+            inner: zuno_engine::dispatch::ToolRegistryDispatcher::new(
+                vec![tool.clone()],
+                Vec::new(),
+                Arc::new(zuno_tool::DenyAll),
+                zuno_engine::dispatch::AuthorizationPolicy::AllowAll,
+                McpToolStatus::Ready,
+            ),
+            invoked: AtomicBool::new(false),
+        };
+        let mut events = vec![StreamEvent::ToolUseStart {
+            id: "call-forbidden".to_owned(),
+            name: "fragile".to_owned(),
+        }];
+        if complete_call {
+            events.extend([
+                StreamEvent::ToolInputDelta {
+                    id: "call-forbidden".to_owned(),
+                    delta: r#"{"timeout":false}"#.to_owned(),
+                },
+                StreamEvent::ToolUseEnd {
+                    id: "call-forbidden".to_owned(),
+                },
+                StreamEvent::MessageEnd {
+                    stop_reason: Some(FinishReason::ToolCalls),
+                },
+            ]);
+        }
+        let provider = Arc::new(FakeProvider::new(vec![
+            if complete_call {
+                ScriptedResponse::complete(events)
+            } else {
+                ScriptedResponse::hanging(events)
+            },
+            ScriptedResponse::complete(vec![
+                StreamEvent::TextDelta("unexpected retry".to_owned()),
+                StreamEvent::MessageEnd {
+                    stop_reason: Some(FinishReason::Stop),
+                },
+            ]),
+        ]));
+        let providers = registry(&provider);
+        let interrupt = InterruptSignal::new();
+        let (sender, receiver) = event_channel();
+        let (outcome, events) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                run_turn(
+                    request("turn-forbidden-call"),
+                    TurnContext::new(
+                        &mut connection,
+                        &providers,
+                        &FakeResolver,
+                        &dispatcher,
+                        &interrupt
+                    )
+                    .with_tools_disabled(),
+                    sender,
+                ),
+                collect_events(receiver),
+            )
+        })
+        .await
+        .expect("reject at ToolUseStart even if the stream never finishes");
+        let error = outcome.expect_err("tools-disabled turns must reject the attempted call");
+        assert!(
+            matches!(
+                &error,
+                TurnError::Provider(ProviderError::Protocol {
+                    code: ProviderProtocolFailure::InvalidUpstreamToolCall,
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
+        assert_eq!(error.recovery(), TurnRecovery::Fail);
+        assert_eq!(provider.requests().len(), 1, "no provider or tool retry");
+        assert!(
+            !dispatcher.invoked.load(Ordering::SeqCst),
+            "the dispatcher boundary was crossed"
+        );
+        assert!(
+            tool.calls.lock().unwrap().is_empty(),
+            "the registered tool ran"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, TurnEvent::ToolDispatchStarted { .. }))
+        );
+        let store = MessageStore::new(&connection);
+        assert!(
+            store
+                .pending_uncertain_tool_calls(SESSION_ID, 0)
+                .unwrap()
+                .is_empty()
+        );
+        let rejected = store
+            .hydrate_session(SESSION_ID)
+            .unwrap()
+            .into_iter()
+            .flat_map(|message| message.parts)
+            .find(|part| part.kind == PartKind::Tool && part.data["callID"] == "call-forbidden")
+            .expect("the rejected attempt remains durable");
+        assert_eq!(rejected.data["state"]["status"], "error");
+        assert_eq!(rejected.data["state"]["metadata"]["synthetic"], true);
+        assert!(rejected.data["state"].get("outcome").is_none());
+    }
+}
+
+#[async_trait]
+impl zuno_tool::Tool for TimeoutThenSuccessTool {
+    fn id(&self) -> &str {
+        "fragile"
+    }
+
+    fn description(&self) -> &str {
+        "Return a typed timeout or a successful result for a separate invocation."
+    }
+
+    fn raw_parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "timeout": { "type": "boolean" } },
+            "required": ["timeout"],
+            "additionalProperties": false
+        })
+    }
+
+    fn replay_policy(&self) -> zuno_tool::ToolReplayPolicy {
+        zuno_tool::ToolReplayPolicy::Never
+    }
+
+    async fn execute(
+        &self,
+        args: Value,
+        ctx: zuno_tool::ToolContext,
+    ) -> Result<ToolOutput, zuno_error::ToolError> {
+        self.calls
+            .lock()
+            .expect("tool calls lock")
+            .push(ctx.call_id);
+        if args["timeout"] == true {
+            Err(zuno_error::ToolError::Timeout {
+                tool: self.id().to_owned(),
+                elapsed: Duration::from_secs(30),
+            })
+        } else {
+            Ok(ToolOutput::text(self.id(), "separate call completed"))
+        }
+    }
+}
+
+/// A later success for the same tool cannot settle an earlier call's lost outcome.
+/// Both calls are already admitted in one provider response; the next request and a
+/// fresh turn must each consult the committed obligation before reaching the provider.
+#[tokio::test]
+async fn non_replayable_timeout_obligation_survives_same_name_success_and_restart() {
+    let pool = seeded_shared_pool_with_goal_schema();
+    let tool = Arc::new(TimeoutThenSuccessTool {
+        calls: Mutex::new(Vec::new()),
+    });
+    let mut recorded_timeout = None;
+
+    for restarting in [false, true] {
+        // Recreate the connection, dispatcher and gate: none may rely on turn-local state.
+        let mut connection = pool.open_connection().expect("open turn connection");
+        if !restarting {
+            put_user(
+                &connection,
+                "msg_timeout_user",
+                10,
+                "run two distinct operations",
+            );
+        }
+        let mut responses = Vec::new();
+        if !restarting {
+            let mut events = Vec::new();
+            for (id, timeout) in [("call-timeout", true), ("call-success", false)] {
+                events.extend([
+                    StreamEvent::ToolUseStart {
+                        id: id.to_owned(),
+                        name: "fragile".to_owned(),
+                    },
+                    StreamEvent::ToolInputDelta {
+                        id: id.to_owned(),
+                        delta: json!({ "timeout": timeout }).to_string(),
+                    },
+                    StreamEvent::ToolUseEnd { id: id.to_owned() },
+                ]);
+            }
+            events.push(StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::ToolCalls),
+            });
+            responses.push(ScriptedResponse::complete(events));
+        }
+        responses.push(ScriptedResponse::complete(vec![
+            StreamEvent::TextDelta("unexpected continuation".to_owned()),
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::Stop),
+            },
+        ]));
+        let provider = Arc::new(FakeProvider::new(responses));
+        let providers = registry(&provider);
+        let resolver = FakeResolver;
+        let dispatcher = zuno_engine::dispatch::ToolRegistryDispatcher::new(
+            vec![tool.clone()],
+            vec![zuno_permission::Rule {
+                source: None,
+                permission: "*".to_owned(),
+                pattern: "*".to_owned(),
+                action: zuno_permission::PermissionAction::Allow,
+            }],
+            Arc::new(AllowEverything),
+            zuno_engine::dispatch::AuthorizationPolicy::Standard,
+            McpToolStatus::Ready,
+        );
+        let gate = Arc::new(ObligationGate {
+            pool: Arc::clone(&pool),
+            consulted: Mutex::new(Vec::new()),
+        });
+        let interrupt = InterruptSignal::new();
+        let (sender, receiver) = event_channel();
+        let turn = run_turn(
+            request(if restarting {
+                "turn-timeout-restart"
+            } else {
+                "turn-timeout"
+            }),
+            TurnContext::new(
+                &mut connection,
+                &providers,
+                &resolver,
+                &dispatcher,
+                &interrupt,
+            )
+            .with_budget_policy(Arc::clone(&gate) as Arc<dyn TurnBudgetPolicy>),
+            sender,
+        );
+        let (outcome, events) = tokio::join!(turn, collect_events(receiver));
+
+        let error = outcome.expect_err("the timeout must require authoritative inspection");
+        assert!(
+            matches!(
+                &error,
+                TurnError::BudgetLimited {
+                    kind: BudgetStopKind::UncertainSideEffect,
+                    detail,
+                } if detail == "1 tool call(s) await inspection"
+            ),
+            "restarting={restarting}: {error:?}"
+        );
+        assert_eq!(error.recovery(), TurnRecovery::Pause);
+        assert_eq!(provider.requests().len(), if restarting { 0 } else { 1 });
+        assert_eq!(
+            gate.consulted.lock().expect("gate lock").as_slice(),
+            if restarting { &[1][..] } else { &[0, 1][..] }
+        );
+        assert_eq!(
+            tool.calls.lock().expect("tool calls lock").as_slice(),
+            ["call-timeout", "call-success"],
+            "the distinct successful call must run without replaying the failed invocation"
+        );
+        assert!(events.contains(&TurnEvent::Notice {
+            audience: zuno_engine::r#loop::NoticeAudience::User,
+            severity: NoticeSeverity::Warning,
+            code: "budget.uncertain_side_effect".to_owned(),
+            detail: "1 tool call(s) await inspection".to_owned(),
+        }));
+
+        let store = MessageStore::new(&connection);
+        let pending = store
+            .pending_uncertain_tool_calls(SESSION_ID, 0)
+            .expect("read durable inspection obligations");
+        let [obligation] = pending.as_slice() else {
+            panic!("the earlier timeout must remain the only obligation: {pending:#?}");
+        };
+        assert_eq!(obligation.call_id, "call-timeout");
+        assert_eq!(obligation.tool, "fragile");
+        assert_eq!(obligation.cause, UncertainCause::LostOutcome);
+        assert!(obligation.applied_paths.is_empty());
+        assert!(obligation.observed_at_ms > 0);
+
+        let timeout = store
+            .part(&obligation.part_id)
+            .expect("read timeout result");
+        assert_eq!(timeout.message_id, obligation.message_id);
+        assert_eq!(timeout.data["callID"], "call-timeout");
+        assert_eq!(timeout.data["tool"], "fragile");
+        assert_eq!(timeout.data["state"]["status"], "error");
+        assert_eq!(timeout.data["state"]["input"], json!({ "timeout": true }));
+        assert_eq!(timeout.data["state"]["outcome"], "uncertain");
+        assert_eq!(
+            timeout.data["state"]["uncertain"],
+            json!({
+                "tool": "fragile",
+                "callID": "call-timeout",
+                "appliedPaths": [],
+                "cause": "lost_outcome",
+                "observedAtMs": obligation.observed_at_ms,
+            }),
+            "the durable evidence must identify this invocation and stay unreconciled"
+        );
+        if let Some(previous) = recorded_timeout.replace(timeout.data) {
+            assert_eq!(
+                recorded_timeout.as_ref(),
+                Some(&previous),
+                "a new turn must preserve the original result and observation timestamp"
+            );
+        }
+        let successful = store
+            .hydrate_session(SESSION_ID)
+            .expect("hydrate persisted results")
+            .into_iter()
+            .flat_map(|message| message.parts)
+            .find(|part| part.kind == PartKind::Tool && part.data["callID"] == "call-success")
+            .expect("the later same-name success must be persisted");
+        assert_ne!(successful.id, obligation.part_id);
+        assert_eq!(successful.data["tool"], "fragile");
+        assert_eq!(successful.data["state"]["status"], "completed");
+        assert_eq!(
+            successful.data["state"]["output"],
+            "separate call completed"
+        );
+        assert!(successful.data["state"].get("uncertain").is_none());
     }
 }
 

@@ -13,8 +13,10 @@ publish.workspace = true
 # dependency added here is a dependency added to all 33. `serde_json` earns its
 # place because config, MCP, LSP and the database all decode JSON and a concrete
 # `serde_json::Error` in `#[source]` position preserves line/column and
-# `Error::classify()`, which a boxed source would erase.
+# `Error::classify()`, which a boxed source would erase. `serde` preserves the
+# typed request-rejection class in durable failure records without rendered text.
 [dependencies]
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 

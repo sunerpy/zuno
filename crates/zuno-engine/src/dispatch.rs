@@ -1117,14 +1117,28 @@ fn tool_error_result(
         }
         return error_result(tool, message);
     }
-    match replay_policy {
-        ToolReplayPolicy::Safe => message.push_str(
-            "\n\nRecovery: this tool explicitly permits replay after backoff. Do not retry it in a tight loop; the active goal will schedule another turn.",
-        ),
-        ToolReplayPolicy::Never => message.push_str(
+    if replay_policy == ToolReplayPolicy::Never {
+        message.push_str(
             "\n\nRecovery: this tool may have produced a side effect before its result was lost. Do not replay the call until authoritative external state proves it did not complete.",
-        ),
+        );
+        // Text alone is not an inspection obligation. Persist the same typed
+        // outcome as a lost mutation response; do not put a Never call in the
+        // retry queue, where a later same-name success could erase the debt.
+        let output = ToolOutput::text(format!("{tool} uncertain"), message)
+            .with_metadata("outcome", "uncertain")
+            .with_metadata("uncertain", true)
+            .with_presentation(ToolResultPresentation::UncertainMutation(
+                UncertainMutationPresentation::new(Vec::new()),
+            ));
+        return ToolDispatchResult::error(output).with_uncertain_outcome(UncertainOutcome {
+            tool: tool.to_owned(),
+            applied_paths: Vec::new(),
+            cause: zuno_error::UncertainCause::LostOutcome,
+        });
     }
+    message.push_str(
+        "\n\nRecovery: this tool explicitly permits replay after backoff. Do not retry it in a tight loop; the active goal will schedule another turn.",
+    );
     ToolDispatchResult::retryable_error(
         ToolOutput::text(format!("{tool} error"), message),
         crate::r#loop::ToolFailureRecovery {
@@ -1329,12 +1343,18 @@ mod tests {
 
         let result = tool_error_result("shell", ToolReplayPolicy::Never, &error);
 
+        assert!(
+            result.recovery.is_none(),
+            "a non-replayable timeout is not a retry plan"
+        );
         assert_eq!(
-            result
-                .recovery
-                .as_ref()
-                .map(|recovery| recovery.replay_policy),
-            Some(ToolReplayPolicy::Never)
+            result.uncertain,
+            Some(UncertainOutcome {
+                tool: "shell".to_owned(),
+                applied_paths: Vec::new(),
+                cause: zuno_error::UncertainCause::LostOutcome,
+            }),
+            "the same uncertainty shown to the model must be durable and inspectable"
         );
         assert!(
             result

@@ -34,6 +34,26 @@ Durable work state adds `plan_get`, `plan_update`, `todo_get`, `todo_update`, an
 updates apply automatically unless a review policy is explicitly configured, and
 `council_run` when the active agent can reach it.
 
+`task_context` preserves one meaningful long task's objective, interpretation of
+authorized actions, prohibitions, user-source IDs/digests, decision owner and
+delivery/safety checks. `get` reads; `update` patches the current revision;
+`replace` explicitly starts a new task. New contexts require `objective`,
+`task_kind: delivery|inspection` and `source_message_ids`. The generic tool
+`intent` field is only a UI label, not the task kind. Omitted update fields retain
+their values, and prohibitions/checks merge: "do not announce" does not erase
+the previously authorized repair. Passed safety checks cannot complete a delivery
+task without passed delivery checks and evidence references.
+Check definitions stay fixed during ordinary updates. Explicit `revise_checks: true`
+requires user sources and resets the changed check to pending with no old evidence.
+Source digests cover all stored user-input parts, including attachment references;
+runtime-generated reports and compaction markers cannot be authorization sources.
+
+This is bounded application-owned context (`ManagedContext`), not a permission
+grant, Goal resume or scheduler wake. Explicit permission rules still apply;
+child agents return decisions to their parent instead of rewriting root context.
+Source changes are reported as stale/historical; current user instructions win.
+Skip this tool for self-contained questions and one-step work.
+
 ## Task, workflow, and Council outcomes
 
 `task` requires top-level `agent`, `objective`, `deliverable`, `instructions`,
@@ -89,6 +109,16 @@ the same command is idempotent, while stale revisions and changed command bodies
 are rejected. `question_async` is governed by the `question` permission key.
 No answer, highlighted option, saved draft, timeout, cancellation, skip, or Defer
 action is consent. A skipped question does not require another clarification loop.
+
+Ordinary deferred clarifications receive a native 120-second auto-defer deadline:
+60 seconds of grace and a final 60-second countdown. Timeout defers the ordinary form
+without answering or closing it, choosing the highlighted option, or creating a
+model input. The stable question remains available for a later answer. User
+interaction sends `Snooze` and preserves drafts. The deadline survives restart;
+duplicate timers and timeout/answer races use the same transaction/revision rules.
+Blocking questions, required input, Plan approval and Goal resume do not auto-defer.
+Model-authored child clarifications are returned to the parent; native permission
+and required-input routing retain their existing controls.
 
 Required input is an explicit control, separate from optional clarification.
 Goal-owned `goal_request_input` binds the observed Goal revision and atomically

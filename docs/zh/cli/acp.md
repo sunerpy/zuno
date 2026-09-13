@@ -165,6 +165,12 @@ Work／Goal 的可选问题保持 deferred。普通 Work 真正被用户选择�
 身份／revision 检查。旧 pending 表单和未完成 Plan 本身既不授权续跑，也不禁止新输入；
 runtime execution wait reference 才是等待权威。
 
+普通 deferred 澄清通过 `_meta.zuno.autoDefer` 提供 `deadlineAt` 和
+`state`（`armed`、`snoozed`、`deferred`）。120 秒到期时原生服务延后表单，不选择选项、
+不提交答案，也不停止 Agent。仍可迟答；适配器只允许跨越精确的自动延后 revision，
+不能覆盖其他答案或草稿。阻塞问题、必需输入、Plan 批准和 Goal 恢复不会自动解决；
+不回答从不构成授权。
+
 `QuestionView.delivery` 从输入回执派生，阶段为 `WaitingAnswer`（`waiting_answer`）、
 `AnsweredPendingDelivery`（`answered_pending_delivery`）和 `Applied`（`applied`）。
 问题列表可以保留已关闭、但关联输入尚未全部应用的表单，作为投递状态展示，不重开表单。
@@ -249,6 +255,18 @@ ACP、TUI、server 及其他进程，包括空闲连接。应用要求 SQLite �
 从未应用或绑定到 provider turn。原生证据不完整或有歧义、revision 过期、并发工作、
 真实保护门禁及未知副作用都会被拒绝。旧 `failed`、`cancelled`、`applied` 或
 `completed` 回执不会重开。
+
+并非每个 `blocked` 都属于同一种缺陷。Goal 的 `uncertain_side_effect` 暂停可能意味着
+MCP 写入已改变远程状态但随后超时。若能读取这项类型化旧暂停，新门禁诊断会指出
+`inspect_outcome` 并携带 Goal 身份，但不会清除安全门禁。`/inspect-outcome` 会列出已记录
+的未决调用；旧会话缺少调用记录时明确返回 `legacyUncertaintyWithoutCallRecords`。
+原生文件检查器不能核验 Penpot、浏览器或其他远程状态，重启或 `session repair` 也不能
+代替这种核验。
+
+未知结果门禁保留时，新用户消息仍可获得纯文字讨论答复。Zuno 会显示
+`discussion.tools_disabled` 提示；引擎禁用全部工具执行，包括模型自行编造或 hook
+重新加入的调用。这不恢复 Goal。重新打开会话后，最新那条已保存、从未应用的用户咨询
+可经同一原生通路处理一次，不要重复发送。认证、审批和预算等其他门禁不会被绕过。
 
 应用只排入一个审计过的恢复控制，保留原 consumed 输入和真实执行绑定前仍可见的 gate。
 它不重排队或重插入原输入、不重放工具、不修改 Goal、不创建数据库，也不迁移格式 15。

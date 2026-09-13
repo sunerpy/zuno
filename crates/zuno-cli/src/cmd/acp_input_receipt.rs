@@ -375,8 +375,12 @@ impl AcpSession {
         if self.closed.load(Ordering::Acquire) || self.control.status() == SessionStatus::Busy {
             return Ok(());
         }
-        let Some((input, _)) =
-            durable_questions::next_input(handles.admission.inbox(), &self.id, drive.scope())?
+        let Some((input, _)) = durable_questions::next_input(
+            handles.admission.inbox(),
+            &self.id,
+            drive.scope(),
+            &handles.session_control,
+        )?
         else {
             return Ok(());
         };

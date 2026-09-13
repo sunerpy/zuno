@@ -2054,11 +2054,13 @@ pub fn work_state_tools_with_observer(
 }
 
 fn work_state_tools_from_store(store: WorkStateStore) -> Vec<Arc<dyn Tool>> {
+    let task_context = crate::task_context::TaskContextTool::new(store.pool.clone());
     vec![
         erase(PlanGetTool::new(store.clone())),
         erase(PlanUpdateTool::new(store.clone())),
         erase(TodoGetTool::new(store.clone())),
         erase(TodoUpdateTool::new(store)),
+        erase(task_context),
     ]
 }
 

@@ -1025,6 +1025,7 @@ struct SessionResources {
 #[derive(Clone)]
 struct SessionDurableHandles {
     admission: SessionInputAdmission,
+    session_control: zuno_session_control::SessionControlService,
     work_changes: tokio::sync::watch::Receiver<u64>,
     attachments: Arc<zuno_attachment::AttachmentStore>,
     slash: SlashCatalog,
@@ -1035,6 +1036,7 @@ impl SessionDurableHandles {
     fn from_resources(resources: &SessionResources, runs: &SessionRunRegistry) -> Self {
         Self {
             admission: SessionInputAdmission::new(resources.host.session_inbox(), runs.clone()),
+            session_control: resources.host.session_control_service(),
             work_changes: resources.host.work_state_changes(),
             attachments: resources.host.attachment_store(),
             slash: resources.slash_catalog.clone(),
@@ -3106,8 +3108,12 @@ impl AcpSession {
             let resources = self.resources.lock().await;
             let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
             let inbox = resources.host.session_inbox();
-            let Some((input, drivable)) =
-                durable_questions::next_input(&inbox, resources.host.session_id(), scope)?
+            let Some((input, drivable)) = durable_questions::next_input(
+                &inbox,
+                resources.host.session_id(),
+                scope,
+                &resources.host.session_control_service(),
+            )?
             else {
                 return Ok(None);
             };
@@ -3238,6 +3244,52 @@ impl AcpSession {
         Ok(next)
     }
 
+    /// The native host owns policy and the exact claim. ACP only publishes its
+    /// normal turn events for a saved user question that was previously gated.
+    async fn drive_pending_discussion(
+        &self,
+        client: &zuno_acp::ClientConnection,
+        guard: &SessionRunGuard,
+    ) -> Result<Option<(Result<(), zuno_acp::RpcError>, ProjectedTurn)>, zuno_acp::RpcError> {
+        let (input_id, context_size) = {
+            let resources = self.resources.lock().await;
+            let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
+            let Some(id) = resources
+                .host
+                .pending_discussion_input()
+                .map_err(zuno_acp::RpcError::internal)?
+            else {
+                return Ok(None);
+            };
+            (id, resources.configuration.context_size)
+        };
+        let publication = self.publications.begin(Some(&input_id));
+        let (events, receiver) = event_channel();
+        let drive = async {
+            let mut resources = self.resources.lock().await;
+            let resources = resources.as_mut().ok_or_else(|| self.closed_error())?;
+            resources
+                .host
+                .drive_pending_discussion_with_guard(guard, events)
+                .await
+                .map_err(zuno_acp::RpcError::internal)
+        };
+        let projection = project_turn(
+            &self.id,
+            context_size,
+            receiver,
+            client.clone(),
+            &publication,
+        );
+        let (driven, projected) = tokio::join!(drive, projection);
+        if matches!(driven, Ok(false)) {
+            return Ok(None);
+        }
+        let projected = projected?;
+        self.flush_turn_publications(client).await?;
+        Ok(Some((driven.map(|_| ()), projected)))
+    }
+
     /// Whether a prompt this surface admitted is still waiting in the inbox.
     async fn has_queued_prompt(&self) -> Result<bool, zuno_acp::RpcError> {
         let resources = self.resources.lock().await;
@@ -3246,6 +3298,7 @@ impl AcpSession {
             &resources.host.session_inbox(),
             resources.host.session_id(),
             DurableInputScope::Prompts,
+            &resources.host.session_control_service(),
         )?
         .is_some())
     }

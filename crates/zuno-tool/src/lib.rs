@@ -195,6 +195,9 @@ pub enum ToolEffect {
     /// arbitrary files, install Skills or change execution permissions. Memory
     /// generation policy and explicit permission rules still apply.
     ManagedMemory,
+    /// Bounded, session-owned task understanding with user-source provenance.
+    /// This cannot grant permissions, change execution gates or mutate workspace files.
+    ManagedContext,
     /// Filesystem, process, durable-state, remote, or otherwise uncertain mutation.
     #[default]
     SideEffecting,

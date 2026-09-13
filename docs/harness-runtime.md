@@ -94,6 +94,41 @@ estimated tokens, and a SHA-256 digest. A prompt cannot describe an editor,
 delegation target, or durable-state tool that was removed by role policy,
 allowlists, permission visibility, a provider capability, or a request hook.
 
+Implementation Agents own ordinary technical choices within the user's task,
+including repairing their own defects, completing artifact wiring, and fixing
+failed acceptance checks. Multiple possible implementations do not by themselves
+require a question. Explicit inspection-only/no-code instructions still apply.
+Children escalate cross-module choices to their parent; the parent asks the user
+only for missing user-owned information, a changed objective, additional external
+impact, or a change to protection/authority. Passing a negative safety check is
+not evidence that the requested delivery works.
+
+The native `task_context` tool retains a bounded interpretation of a long task:
+objective, delivery/inspection intent, action summaries, prohibitions, real user
+message sources, decision owner, blockers, and separate delivery/safety checks.
+`session.task_context.updated.1` stores revision-checked, idempotent snapshots.
+Updates preserve omitted fields and merge constraints/checks; a different task
+requires explicit replacement. Revising a check definition requires an explicit,
+source-linked revision that resets its status and evidence. User sources bind
+metadata and all stored input-part digests, including attachment references;
+changed or missing sources make the projection historical-only. The prompt
+refreshes `runtime.task_context` after updates and restores it on restart.
+This is assistant-maintained understanding, not a permission grant, certified
+evidence, Goal resume, or scheduling wake. Delivery completion requires a passed
+delivery check as well as all other recorded checks, each with evidence references.
+An ordinary final still ends its cycle: task context does not manufacture
+automatic continuation from unfinished work.
+
+Design reference: Codex `9ba1d9eb5bbbd87ba2fc528d91ad239eea975ee9`,
+`core/gpt_5_2_prompt.md` (end-to-end task ownership),
+`core/src/tools/handlers/request_user_input.rs` (root-only questions and Plan
+blocking), and `tui/src/bottom_pane/request_user_input/mod.rs` (60-second grace
+plus 60-second countdown, interaction snooze, and empty auto-resolution).
+These paths are relative to `codex-rs/`. Zuno adapts those boundaries to its native
+QuestionPort and durable events. `task_context`, source digests, and delivery
+check validation are Zuno-specific integration, not tools claimed to exist in
+Codex; they never replace native authorization or execution gates.
+
 `runtime.execution` also derives a concise fallback rule from the final tool
 snapshot for built-in and custom Agents. It forbids repeating an unchanged
 rate-limited or transiently failing call. When `tool_search` is visible it may
@@ -1480,6 +1515,32 @@ and never authorizes an old-cycle callback.
 
 ### Explicit repair of a legacy false block
 
+The typed HTTP 400 `reasoning_replay_context_mismatch` rejection ends an
+independent ordinary work cycle, not permission to admit the next user input.
+It remains a non-retryable failure: Zuno does not alter replay capsules, resend
+the rejected request automatically, or revive a stopped cycle for a late report.
+An owned active Goal still records its own blocked failure. Authentication,
+unknown permanent errors, protocol/configuration failures, budget, approval and
+uncertain-side-effect gates retain their existing owners and protections.
+This follows the user/automatic/recovery boundary in Codex
+`9ba1d9eb5bbbd87ba2fc528d91ad239eea975ee9`,
+`codex-rs/core/src/session/turn_input.rs`; it is not a generic HTTP-400 retry rule.
+
+Old persisted blocks are not cleared by installing a binary. In addition to the
+legacy retry-exhaustion case, the bounded repair can prove this exact
+request-rejection chain following an audited native legacy repair/recovery cycle. It
+requires the matching native failure settlement and request diagnostic, and
+recovers only a *new*, recorded, never-bound input. The previous failed input
+and its terminal receipt are never reset, even if its `appliedAt` is absent.
+Repeated gate-only user admissions may add at most 16 verified links. The proof
+walks their cycle ownership and strictly consecutive six-event admission chains,
+requires never-bound receipts and successive execution revisions, and then
+revalidates the original rejected recovery. Intermediate cycles may differ from
+their creation record only by the inherited scheduling snapshot archived by the
+next proven admission. Any intervening execution, control, unknown event version,
+changed wait or missing provenance fails closed. Only the selected latest input
+is rebound; earlier inputs remain intact and are listed as `inheritedInputIds`.
+
 Use the configured existing database and exact session/input IDs. Inspection is
 the default and opens the database read-only; it neither creates nor migrates it.
 Replace `N` with the positive `expectedRevision` returned by inspection:
@@ -1745,6 +1806,23 @@ return receipts, while response content is delivered only through the inbox.
 `TurnOutcome::WaitingForHuman`. Requests outlive their originating turn and
 client connection. Permission requests remain a distinct kind; closing a
 question never supplies a permission approval.
+
+An originally deferred ordinary clarification has a durable 120-second
+auto-defer deadline. The native deadline driver is owned by the TUI, ACP, or HTTP
+host lifetime; reads also reconcile overdue requests after reconnect/restart.
+Expiry records `question.auto_deferred` and updates `QuestionView.autoDefer`
+(`deadlineAt`, `state: armed|snoozed|deferred`), without creating an answer or
+inbox input. The form remains available for a later answer. TUI interaction
+snoozes automatic dismissal; a highlighted option is never selected by timeout.
+Blocking clarifications, required input, Plan authorization, and Goal resume
+have no such timer. Old requests without deadline metadata remain unchanged.
+ACP may rebase an in-flight late answer only over the exact auto-defer successor
+of the displayed revision, not over a changed draft, answer, or authorization.
+Question presentation stays within the bound session and its descendants; a
+receipt cannot add another root to that scope. TUI and HTTP event forwarding
+reconcile durable state as well as local notifications, so another service's
+deadline commit is not missed. HTTP SSE includes `question.auto_deferred` in
+live delivery and bounded catch-up, retaining the original event identity.
 
 `QuestionView.delivery` is derived from associated input receipts; it is not a
 second persisted question state:
@@ -2254,6 +2332,36 @@ Recovery is selected from typed errors, never rendered messages:
   Report-delivery aliases do not authorize tool calls. Legacy calls without a native
   witness, shell and remote actions fail closed. Inspection preserves the original
   uncertain outcome and never authorizes replay or automatic Goal/session resume.
+  This includes typed timeout, network-timeout and transient failures returned by
+  a non-replayable tool, including remote MCP calls: they create a per-call
+  `lost_outcome` obligation, not a retry entry. A later success for the same tool
+  name cannot settle an earlier call. Explicitly replay-safe tools retain backoff.
+  An uncertainty stop returned through the budget interface retains
+  `uncertain_side_effect`; it is not a spent `turn_budget`.
+  For older Goals paused for uncertainty but lacking structured call records,
+  `/inspect-outcome` reports `goalPause` and
+  `legacyUncertaintyWithoutCallRecords: true`. An empty `pending` list is not
+  evidence of a safe outcome. Newly recorded input-gate diagnostics can use that
+  typed Goal pause to explain a legacy generic `blocked` gate, without changing
+  the execution gate, resuming the Goal, or rewriting existing frozen receipts.
+  A genuine new user message behind an uncertainty pause can instead receive a
+  **tool-disabled discussion turn**. `SessionControlService` validates the input,
+  gate revision, independent cycle, Goal status and other guards, then atomically
+  binds that input to one turn and records `session.discussion.started.1`.
+  It never changes the paused execution state or Goal. The engine strips current
+  tools after request hooks while retaining historical calls and sealed replay;
+  an attempted tool call fails before dispatcher preparation. The host skips
+  work preludes, requested-skill loading, Plan reconciliation and automatic Goal
+  continuation, and keeps the normal model/turn budget policy. This permits
+  explanation and proposals, not file, browser, MCP or delegated execution.
+  Authentication, pending approvals, Plan authorization, exhausted/unknown Goal
+  budgets and explicit turn-budget gates remain blocking.
+  ACP's native input pump can claim the latest already-consumed, never-bound user
+  question on reopen. It does not re-admit text or rerun failed/applied inputs.
+  The usual provider-applied/completed receipt reflects the discussion answer,
+  not resolution of the earlier uncertainty. Ordinary host input identities and
+  transcript message identities are resolved through their persisted mapping,
+  never by text deduplication or an assumed identifier prefix.
 - A turn stopped by its own budget policy pauses with `turn_budget`. The allowance
   belongs to one turn, so the Goal keeps whatever token budget remains, but execution
   does not resume automatically: the next turn would spend the same allowance the same

@@ -243,21 +243,29 @@ impl Store {
         Ok(self.snapshot(session_id, after)?.events)
     }
 
-    /// Reconstruct question notification coverage after a live receiver lagged.
-    pub(super) fn question_sessions(&self) -> Result<Vec<String>, EventStreamError> {
+    /// Bounded discovery from native owners, not repeated scans of provider/token
+    /// history. These rows also discover auto-deferred requests committed by a
+    /// different service instance, with no receipt on our local channel.
+    pub(super) fn question_sessions_page(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, EventStreamError> {
         self.ensure_initialized()?;
         Ok(self.read(|transaction| {
             let mut statement = transaction
                 .prepare(
-                    "SELECT DISTINCT aggregate_id FROM event \
-                 WHERE type LIKE 'question.opened.%' \
-                    OR type LIKE 'question.updated.%' \
-                    OR type LIKE 'question.authorization.%' \
-                 ORDER BY aggregate_id",
+                    "SELECT DISTINCT h.session_id FROM human_request h \
+                     JOIN question_interaction q ON q.request_id=h.id \
+                     WHERE (?1 IS NULL OR h.session_id>?1) \
+                     ORDER BY h.session_id LIMIT ?2",
                 )
                 .map_err(open::map_error)?;
             statement
-                .query_map([], |row| row.get(0))
+                .query_map(
+                    rusqlite::params![after, i64::try_from(limit.min(128)).unwrap_or(128)],
+                    |row| row.get(0),
+                )
                 .map_err(open::map_error)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(open::map_error)

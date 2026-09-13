@@ -440,6 +440,11 @@ Work／Goal 的可选问题使用 deferred 投递，不阻塞继续执行或最�
 回答和模型可见的 FIFO 输入一起提交，原生 Goal／Plan 控制仍校验各自的身份和门禁。
 `QuestionView.delivery` 从关联输入回执派生，不是第二份持久 question 状态：
 
+普通 deferred 澄清还带 `autoDefer`：`deadlineAt` 与 `armed|snoozed|deferred`。
+120 秒期限由原生服务持久化；到期不产生答案或 inbox 输入，原问题仍可迟答。交互
+可以 Snooze 并保留草稿。只有确切的自动延后后继版本允许在途表单回答刷新 revision，
+其他版本冲突仍然拒绝。必需输入、审批和阻塞式问题没有这项计时器。
+
 | 阶段 | 含义 |
 | --- | --- |
 | `WaitingAnswer`（`waiting_answer`） | 表单仍为 pending，可以继续回答。 |
@@ -601,6 +606,19 @@ zuno session repair SESSION --input INPUT --apply --expected-revision N
 `already_queued` 幂等返回。控制已推进或原输入已绑定／应用后，修复拒绝重投。
 缺失证据和真实保护门禁仍失败关闭。详见
 [有界修复](/zh/operate/harness-runtime#单条旧误阻塞输入的显式修复)。
+
+## 长任务上下文不授予执行权限
+
+`task_context` 通过带版本的会话事件保存有界快照：用户来源 ID／摘要、revision、
+原始目标、约束、决策归属及已报告的交付／安全证据。来源排除压缩标记和自动报告，
+摘要覆盖全部持久用户输入部分（含附件引用）；验收定义修订须显式关联用户来源并重置
+状态和证据。更新是原子的，并按工具调用幂等；
+不会改变数据库格式、授予权限或恢复 Goal。`runtime.task_context` 在模型请求前刷新，
+标出更晚的用户输入和失效来源；查询进展不会自动接管旧任务。
+
+实施者负责常规技术选择。只有负向保护生效不能说明交付成功；完成交付上下文要求交付
+检查通过且全部验收项有证据。上下文状态不会覆盖 Plan／Goal 归属、真实等待、预算、
+认证或未知副作用，也不会仅因“尚未完成”就让任务自动续跑。
 
 ## Job
 

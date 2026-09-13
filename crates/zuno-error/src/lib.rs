@@ -104,7 +104,7 @@ pub use crate::mcp::McpError;
 pub use crate::plugin::PluginError;
 pub use crate::provider::{
     ProviderDiagnostic, ProviderDiagnosticPhase, ProviderError, ProviderProtocolFailure,
-    ProviderStreamFailure,
+    ProviderRequestRejection, ProviderStreamFailure,
 };
 pub use crate::recovery::{Recoverable, Recovery};
 pub use crate::source::BoxSource;

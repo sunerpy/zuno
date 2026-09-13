@@ -185,6 +185,159 @@ fn native_question(session_id: &str) -> QuestionSpec {
     }
 }
 
+async fn assert_auto_defer_event_forwarded(from_another_service: bool) {
+    let (pool, events) = event_service(32);
+    let session_id = "ses_auto_defer_event";
+    create_session(&pool, session_id);
+    let local = QuestionService::new(Arc::clone(&pool));
+    let view = local
+        .open(native_question(session_id))
+        .await
+        .expect("question")
+        .question;
+    let opened = events
+        .replay(session_id, None)
+        .await
+        .expect("history")
+        .pop()
+        .expect("opened");
+    let changes = local.subscribe();
+    let forwarder = tokio::spawn({
+        let events = events.clone();
+        async move { events.forward_question_events(changes).await }
+    });
+    let app = event_app(events.clone());
+    let mut stream = open_stream(&app, session_id, Some(opened.cursor())).await;
+    let other = QuestionService::new(Arc::clone(&pool));
+    let writer = if from_another_service { &other } else { &local };
+    writer
+        .reconcile_auto_defer_at(Some(session_id), view.time_created + 120_000)
+        .await
+        .expect("timeout committed");
+    let due = events
+        .replay(session_id, None)
+        .await
+        .expect("history")
+        .pop()
+        .expect("due");
+    assert_eq!(due.event_type(), "question.auto_deferred");
+    let frame = tokio::time::timeout(Duration::from_secs(3), next_frame(&mut stream))
+        .await
+        .expect("SSE receives native deadline even without a local receipt");
+    let (cursor, payload) = decode_frame(&frame);
+    assert_eq!(payload["type"], "question.auto_deferred");
+    assert_eq!(payload["id"], due.id());
+    assert_eq!(cursor.as_ref(), Some(due.cursor()));
+    assert_eq!(
+        payload["data"]["question"]["autoDefer"]["state"],
+        "deferred"
+    );
+    assert_eq!(payload["data"]["question"]["answers"], json!({}));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1150), next_frame(&mut stream))
+            .await
+            .is_err(),
+        "durable catch-up must not announce the same transition again"
+    );
+    assert!(
+        zuno_db::inbox::SessionInbox::new(pool)
+            .pending(session_id)
+            .expect("inbox")
+            .is_empty()
+    );
+    drop(local);
+    tokio::time::timeout(Duration::from_secs(2), forwarder)
+        .await
+        .expect("forwarder exits")
+        .expect("join")
+        .expect("forwarding");
+}
+
+#[tokio::test]
+async fn auto_defer_event_is_forwarded_live() {
+    assert_auto_defer_event_forwarded(false).await;
+}
+
+#[tokio::test]
+async fn auto_defer_event_is_caught_up_without_a_process_local_notification() {
+    assert_auto_defer_event_forwarded(true).await;
+}
+
+#[tokio::test]
+async fn auto_defer_catch_up_crosses_owner_and_event_page_boundaries() {
+    let (pool, events) = event_service(256);
+    let local = QuestionService::new(Arc::clone(&pool));
+    let other = QuestionService::new(Arc::clone(&pool));
+    let mut last = None;
+    // The target sorts past the first 32-owner discovery page.
+    for index in 0..33 {
+        let id = format!("ses_page_{index:02}");
+        create_session(&pool, &id);
+        last = Some(
+            other
+                .open(native_question(&id))
+                .await
+                .expect("question")
+                .question,
+        );
+    }
+    let view = last.expect("last owner");
+    let owner = &view.origin.session_id;
+    // More than 128 unrelated events must not hide the subsequent deadline or
+    // be published again by the question-only forwarder.
+    pool.transaction(|tx| {
+        for ordinal in 0..140 {
+            zuno_db::event_log::append_in(
+                tx,
+                owner,
+                zuno_db::event_log::NewSessionEvent::new(
+                    "unrelated.event",
+                    json!({"ordinal": ordinal})
+                        .as_object()
+                        .expect("object")
+                        .clone(),
+                )?,
+            )?;
+        }
+        Ok(())
+    })
+    .expect("event backlog");
+    let previous = events
+        .replay(owner, None)
+        .await
+        .expect("history")
+        .pop()
+        .expect("boundary");
+    let app = event_app(events.clone());
+    let mut stream = open_stream(&app, owner, Some(previous.cursor())).await;
+    let changes = local.subscribe();
+    let forwarder = tokio::spawn({
+        let events = events.clone();
+        async move { events.forward_question_events(changes).await }
+    });
+    other
+        .reconcile_auto_defer_at(Some(owner), view.time_created + 120_000)
+        .await
+        .expect("foreign service deadline");
+    let frame = tokio::time::timeout(Duration::from_secs(4), next_frame(&mut stream))
+        .await
+        .expect("both bounded pages are reconciled");
+    let (_, payload) = decode_frame(&frame);
+    assert_eq!(payload["type"], "question.auto_deferred");
+    assert_eq!(payload["data"]["question"]["origin"]["sessionId"], *owner);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1150), next_frame(&mut stream))
+            .await
+            .is_err()
+    );
+    drop(local);
+    tokio::time::timeout(Duration::from_secs(2), forwarder)
+        .await
+        .expect("stop")
+        .expect("join")
+        .expect("forward");
+}
+
 #[tokio::test]
 async fn question_notifications_forward_committed_events_without_reappending() {
     let (pool, events) = event_service(16);
