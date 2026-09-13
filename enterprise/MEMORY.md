@@ -297,3 +297,13 @@ Organization-owned spaces are separate from private Global/Project residency.
 automatic learning is not silently published. Worker protocol 12 reloads bounded
 shared snapshots before each model request and honors inherited `useMemories`.
 See [SHARED_MEMORY.md](SHARED_MEMORY.md) for the real API and limitations.
+
+## Skill backend foundation
+
+Skill candidates and evidence now use injectable persistence ports through one
+`SkillBackendBundle`; paired evaluation uses `EvaluationPersistence`. SQLite
+remains the implemented provider. Native Skill commands consume these interfaces
+and retain their review, model, source-digest and uncertain-effect behavior.
+This foundation does not register enterprise Skill evaluation/application routes;
+scoped PostgreSQL settlement, remote execution and application authority remain
+part of the full implementation plan.

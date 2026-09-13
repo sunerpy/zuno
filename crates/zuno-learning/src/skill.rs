@@ -1,3 +1,6 @@
+use crate::skill_persistence::{
+    SkillBackendBundle, SkillCandidatePersistence, SkillEvidencePersistence, SqliteSkillBackend,
+};
 use crate::text::single_markdown_line;
 use crate::{LearningServiceError, Result, digest_text};
 use async_trait::async_trait;
@@ -12,9 +15,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 use zuno_config::ResolvedLearningConfig;
 use zuno_db::evaluation::{EvaluationCaseKind, NewEvaluationCase, NewEvaluationSuite};
-use zuno_db::experience::{ExperienceRecord, ExperienceStore};
-use zuno_db::learning_pattern::{LearningPatternRecord, LearningPatternStore, PatternScope};
-use zuno_db::skill_candidate::{NewSkillCandidate, SkillCandidateRecord, SkillCandidateStore};
+use zuno_db::experience::ExperienceRecord;
+use zuno_db::learning_pattern::{LearningPatternRecord, PatternScope};
+use zuno_db::skill_candidate::{NewSkillCandidate, SkillCandidateRecord};
 use zuno_error::LearningError;
 use zuno_eval::{
     AttemptSnapshot, CandidateEvaluationRequest, EvaluationDecision, EvaluationService,
@@ -80,17 +83,14 @@ struct FileSnapshot {
 
 #[derive(Clone)]
 pub struct SkillCandidateService {
-    candidates: SkillCandidateStore,
-    patterns: LearningPatternStore,
-    experiences: ExperienceStore,
+    candidates: Arc<dyn SkillCandidatePersistence>,
+    evidence: Arc<dyn SkillEvidencePersistence>,
     evaluation: EvaluationService,
     config: ResolvedLearningConfig,
-    jobs: zuno_db::learning_job::LearningJobStore,
-    sources: zuno_db::learning_source::LearningSourceStore,
 }
 
 struct EvaluationGuard {
-    store: SkillCandidateStore,
+    store: Arc<dyn SkillCandidatePersistence>,
     id: String,
     token: String,
     settled: bool,
@@ -112,13 +112,15 @@ impl Drop for EvaluationGuard {
 impl SkillCandidateService {
     #[must_use]
     pub fn new(pool: Arc<zuno_db::Pool>, config: ResolvedLearningConfig) -> Self {
+        Self::with_backend(&SqliteSkillBackend::new(pool), config)
+    }
+
+    #[must_use]
+    pub fn with_backend(backend: &dyn SkillBackendBundle, config: ResolvedLearningConfig) -> Self {
         Self {
-            candidates: SkillCandidateStore::new(pool.clone()),
-            patterns: LearningPatternStore::new(pool.clone()),
-            experiences: ExperienceStore::new(pool.clone()),
-            evaluation: EvaluationService::new(Arc::clone(&pool)),
-            jobs: zuno_db::learning_job::LearningJobStore::new(Arc::clone(&pool)),
-            sources: zuno_db::learning_source::LearningSourceStore::new(pool),
+            candidates: backend.candidates(),
+            evidence: backend.evidence(),
+            evaluation: EvaluationService::with_persistence(backend.evaluation()),
             config,
         }
     }
@@ -127,7 +129,7 @@ impl SkillCandidateService {
         &self,
         request: SkillCandidateRequest,
     ) -> Result<SkillCandidateRecord> {
-        let pattern = self.patterns.get(&request.pattern_id)?;
+        let pattern = self.evidence.pattern(&request.pattern_id)?;
         self.create_from_pattern_record(PatternCandidateRequest {
             pattern,
             target_project_id: None,
@@ -262,8 +264,8 @@ impl SkillCandidateService {
             time_created,
         })?;
         if pattern.projection.status == LearningPatternStatus::Pending {
-            self.patterns
-                .promote(&pattern.projection.id, time_created)?;
+            self.evidence
+                .promote_pattern(&pattern.projection.id, time_created)?;
         }
         Ok(candidate)
     }
@@ -278,7 +280,7 @@ impl SkillCandidateService {
         explicit_promotion: bool,
         now: i64,
     ) -> Result<Option<SkillCandidateRecord>> {
-        let pattern = self.patterns.get(pattern_id)?;
+        let pattern = self.evidence.pattern(pattern_id)?;
         let project_id = pattern.projection.project_id.clone().ok_or_else(|| {
             invalid(
                 "pattern.project_id",
@@ -304,7 +306,7 @@ impl SkillCandidateService {
         explicit_promotion: bool,
         now: i64,
     ) -> Result<Option<SkillCandidateRecord>> {
-        let pattern = self.patterns.get(pattern_id)?;
+        let pattern = self.evidence.pattern(pattern_id)?;
         self.create_companion_from_pattern_record(
             pattern,
             target_project_id,
@@ -385,7 +387,7 @@ impl SkillCandidateService {
         let mut project_ids = BTreeSet::new();
         let mut experience_ids = BTreeSet::new();
         for source_pattern_id in &pattern.evidence_ids {
-            let source = self.patterns.get(source_pattern_id)?;
+            let source = self.evidence.pattern(source_pattern_id)?;
             if source.scope != PatternScope::Project
                 || source.projection.status != LearningPatternStatus::Promoted
             {
@@ -492,7 +494,7 @@ impl SkillCandidateService {
             .collect::<BTreeSet<_>>();
         let mut cases = Vec::new();
         for (index, evidence_id) in candidate.evidence_ids.iter().enumerate() {
-            let experience = self.experiences.get(evidence_id).map_err(|error| {
+            let experience = self.evidence.experience(evidence_id).map_err(|error| {
                 LearningError::InvalidRequest {
                     field: "candidate.evidence_ids".to_owned(),
                     detail: format!(
@@ -533,8 +535,8 @@ impl SkillCandidateService {
         }
 
         let protection = self
-            .experiences
-            .list_for_project(&candidate.projection.project_id, 100)?
+            .evidence
+            .experiences_for_project(&candidate.projection.project_id, 100)?
             .into_iter()
             .filter(|record| {
                 record.projection.kind.promotable() && !evidence_ids.contains(&record.projection.id)
@@ -592,7 +594,7 @@ impl SkillCandidateService {
         let Some(job_id) = &experience.extraction_job_id else {
             return Ok(Vec::new());
         };
-        let job = self.jobs.get(job_id)?;
+        let job = self.evidence.job(job_id)?;
         let Some(payload) = job.payload else {
             return Ok(Vec::new());
         };
@@ -607,7 +609,7 @@ impl SkillCandidateService {
         let mut sources = Vec::new();
         for source in request.sources {
             if self
-                .sources
+                .evidence
                 .source_is_current(&request.session_id, &source)?
             {
                 sources.push(source);
@@ -1216,7 +1218,9 @@ fn invalid(field: &str, detail: &str) -> LearningServiceError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zuno_db::experience::{ExperienceEvidenceKind, NewExperience, NewExperienceEvidence};
+    use zuno_db::experience::{
+        ExperienceEvidenceKind, ExperienceStore, NewExperience, NewExperienceEvidence,
+    };
     use zuno_db::learning_pattern::{LearningPatternStore, NewLearningPattern, PatternScope};
     use zuno_db::migration;
     use zuno_error::BoxSource;

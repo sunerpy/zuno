@@ -3106,3 +3106,18 @@ content, revision and current namespace policy to independent review. Worker
 protocol 12 refreshes shared content before provider admission; membership or
 consent revocation removes earlier shared prompt content. Private automatic
 learning remains private. See `enterprise/SHARED_MEMORY.md` in the preview archive.
+
+### Skill persistence composition
+
+`SkillCandidateService` obtains candidates, evidence and evaluation persistence
+from one `SkillBackendBundle`. `SqliteSkillBackend` keeps those stores on the same
+pool; host-specific providers can bind ownership without changing Skill review
+or evaluation policy. `EvaluationService` uses `EvaluationPersistence`; run
+results and terminal state retain one atomic settlement. A failed settlement
+cannot return an approved evaluation decision.
+
+The evaluator remains an async, real model consumer. Baseline and candidate use
+the same immutable attempt snapshot and recorded tool cassettes. No new evaluator
+model is selected by these persistence constructors. Filesystem application and
+reconciliation still belong to the local Skill host; a distributed Skill backend
+is not registered by these interfaces alone.

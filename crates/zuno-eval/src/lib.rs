@@ -11,12 +11,14 @@ use std::sync::Arc;
 use uuid::Uuid;
 use zuno_db::evaluation::{
     EvaluationCaseKind, EvaluationCaseRecord, EvaluationResultRecord, EvaluationRunRecord,
-    EvaluationRunSettlement, EvaluationRunStatus, EvaluationStore, EvaluationSuiteRecord,
-    NewEvaluationResult, NewEvaluationRun, NewEvaluationSuite,
+    EvaluationRunSettlement, EvaluationRunStatus, EvaluationSuiteRecord, NewEvaluationResult,
+    NewEvaluationRun, NewEvaluationSuite,
 };
 use zuno_error::{BoxSource, DbError};
 mod cassette;
+pub mod persistence;
 pub use cassette::{CassetteDispatcher, CassetteResult, RecordedCall};
+use persistence::{EvaluationPersistence, SqliteEvaluationPersistence};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttemptSnapshot {
@@ -99,11 +101,11 @@ pub enum EvaluationError {
 
 #[derive(Clone)]
 pub struct EvaluationService {
-    store: EvaluationStore,
+    store: Arc<dyn EvaluationPersistence>,
 }
 
 struct RunGuard {
-    store: EvaluationStore,
+    store: Arc<dyn EvaluationPersistence>,
     id: String,
     settled: bool,
 }
@@ -124,8 +126,15 @@ impl EvaluationService {
     #[must_use]
     pub fn new(pool: Arc<zuno_db::Pool>) -> Self {
         Self {
-            store: EvaluationStore::new(pool),
+            store: Arc::new(SqliteEvaluationPersistence::new(pool)),
         }
+    }
+
+    /// Host-bound persistence owns namespace authorization and transaction
+    /// coordination. The paired evaluation algorithm is shared by every host.
+    #[must_use]
+    pub fn with_persistence(store: Arc<dyn EvaluationPersistence>) -> Self {
+        Self { store }
     }
 
     pub async fn evaluate_candidate(
@@ -353,7 +362,7 @@ async fn evaluate_one(
 mod tests {
     use super::*;
     use std::sync::Mutex;
-    use zuno_db::evaluation::{NewEvaluationCase, NewEvaluationSuite};
+    use zuno_db::evaluation::{EvaluationStore, NewEvaluationCase, NewEvaluationSuite};
     use zuno_db::migration;
     use zuno_paths::DbLocation;
 
@@ -383,6 +392,15 @@ mod tests {
 
     #[tokio::test]
     async fn baseline_and_candidate_share_one_snapshot_and_only_receive_cassettes() {
+        exercise(false).await;
+    }
+
+    #[tokio::test]
+    async fn replacement_persistence_failure_cannot_return_an_approved_decision() {
+        exercise(true).await;
+    }
+
+    async fn exercise(fail_settlement: bool) {
         let pool = Arc::new(zuno_db::Pool::open(&DbLocation::Memory).expect("pool"));
         {
             let mut connection = pool.get().expect("connection");
@@ -424,7 +442,13 @@ mod tests {
             temperature_millis: 0,
             seed: 7,
         };
-        let decision = EvaluationService::new(pool)
+        let persistence: Arc<dyn EvaluationPersistence> = if fail_settlement {
+            Arc::new(RefuseSettlement(SqliteEvaluationPersistence::new(pool)))
+        } else {
+            Arc::new(SqliteEvaluationPersistence::new(pool))
+        };
+        let service = EvaluationService::with_persistence(persistence);
+        let decision = service
             .evaluate_candidate(
                 CandidateEvaluationRequest {
                     timeout_ms: 120_000,
@@ -438,14 +462,67 @@ mod tests {
                 },
                 &evaluator,
             )
-            .await
-            .expect("evaluation");
-        assert!(decision.passed);
+            .await;
+        if fail_settlement {
+            assert!(matches!(
+                decision,
+                Err(EvaluationError::Db(DbError::Conflict { .. }))
+            ));
+        } else {
+            assert!(decision.expect("evaluation").passed);
+        }
         let requests = evaluator.requests.lock().expect("requests");
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].attempt, attempt);
         assert_eq!(requests[1].attempt, attempt);
         assert_eq!(requests[0].tool_cassette, json!({"recorded": true}));
         assert_eq!(requests[1].tool_cassette, json!({"recorded": true}));
+    }
+
+    struct RefuseSettlement(SqliteEvaluationPersistence);
+    impl EvaluationPersistence for RefuseSettlement {
+        fn ensure_suite(
+            &self,
+            suite: NewEvaluationSuite,
+        ) -> Result<EvaluationSuiteRecord, DbError> {
+            self.0.ensure_suite(suite)
+        }
+        fn suite(&self, id: &str) -> Result<EvaluationSuiteRecord, DbError> {
+            self.0.suite(id)
+        }
+        fn cases(&self, id: &str) -> Result<Vec<EvaluationCaseRecord>, DbError> {
+            self.0.cases(id)
+        }
+        fn start_run(&self, run: NewEvaluationRun) -> Result<EvaluationRunRecord, DbError> {
+            self.0.start_run(run)
+        }
+        fn settle_run(
+            &self,
+            id: &str,
+            _: EvaluationRunSettlement<'_>,
+        ) -> Result<EvaluationRunRecord, DbError> {
+            Err(DbError::Conflict {
+                table: "evaluation_run".to_owned(),
+                id: id.to_owned(),
+                detail: "injected settlement refusal".to_owned(),
+            })
+        }
+        fn fail_running(
+            &self,
+            id: &str,
+            error: &str,
+            now: i64,
+        ) -> Result<EvaluationRunRecord, DbError> {
+            self.0.fail_running(id, error, now)
+        }
+        fn run(&self, id: &str) -> Result<EvaluationRunRecord, DbError> {
+            self.0.run(id)
+        }
+        fn results(&self, id: &str) -> Result<Vec<EvaluationResultRecord>, DbError> {
+            self.0.results(id)
+        }
+        fn reconcile_running(&self, now: i64) -> Result<usize, DbError> {
+            self.0.reconcile_running(now)
+        }
     }
 }

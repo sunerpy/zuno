@@ -483,3 +483,10 @@ while project rules are only ever loaded by the one repository that pays for the
 - [Sessions and turns](/guide/sessions)
 - [Resident Memory design](/design/memory-learning)
 - [User learning flywheel design](/design/user-learning-flywheel)
+
+Skill storage adapters use `SkillBackendBundle` to keep candidates, source
+evidence and evaluation persistence coordinated. The default remains SQLite.
+This extension point does not enable automatic Skill evaluation or change its
+model configuration: review, real paired model evaluation and application remain
+separate lifecycle steps. Enterprise remote Skill execution is still under
+implementation in the preview channel.
