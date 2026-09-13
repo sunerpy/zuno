@@ -166,7 +166,7 @@ built-in reads. Other allowed applications wait for the existing authoritative
 HITL decision. This whitelist does not approve Shell or arbitrary MCP operations.
 Control endpoints are `/internal/gateway/v1/files/prepare` and `/authorize`;
 they accept only assigned gateway service identities. Both roles must support
-gateway protocol 8; the state/Worker protocol is 12.
+gateway protocol 8; the state/Worker protocol is 13.
 
 ## Reviewed file edits
 

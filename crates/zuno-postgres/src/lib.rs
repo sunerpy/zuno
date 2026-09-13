@@ -20,6 +20,7 @@ mod runtime;
 mod runtime_tests;
 mod session;
 mod shared_memory;
+mod skill_library;
 #[cfg(test)]
 mod tests;
 mod turn;

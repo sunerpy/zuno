@@ -14,6 +14,7 @@ export type {
   SharedMemorySpace, SharedMemoryPage, SharedMemoryChange, SharedMemoryRole, SharedMemoryDecision,
   ConfigureSharedMemory, ProposeSharedMemory, ReviewSharedMemory, SharedMemoryEdit, SharedMemoryMember,
   ProposeSkill, ReviewSkillEvaluation, SkillCandidateView, SkillEvaluationReport, SkillEvaluationCase,
+  InstallSkill, ActivateSkill, RollbackSkill, InstalledSkillView, InstalledSkillPage, InstalledSkillDocument,
   BeginWorkspaceImport, WorkspaceImportView, WorkspaceImportState, WorkspaceImportId,
   LearningJobView, LearningPage, LearningPageRequest, LearningCursor,
   LearningStage, LearningState, LearningBudgetView, LearningFailureView, CancelLearning, LearningCancellation,

@@ -1,6 +1,11 @@
 use super::*;
+#[path = "skill/installation.rs"]
+mod installation;
 
 pub fn model(body: &Value) -> Option<Response> {
+    if let Some(response) = installation::model(body) {
+        return Some(response);
+    }
     let messages = body["messages"].as_array()?;
     let system = messages
         .iter()
@@ -179,4 +184,5 @@ pub async fn verify(
         requests, 5,
         "baseline attempt/grade and candidate recorded-tool attempt/final/grade"
     );
+    installation::verify(http, control, alice, bob, &candidate).await;
 }

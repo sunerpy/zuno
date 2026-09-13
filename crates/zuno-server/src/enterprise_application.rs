@@ -55,6 +55,7 @@ pub struct EnterpriseApplication {
     workspaces: Arc<BTreeMap<WorkspaceId, ApplicationWorkspace>>,
     memory: Option<PostgresMemoryBackend>,
     skills: Option<Arc<dyn zuno_application::skill::SkillApplication>>,
+    skill_library: Option<Arc<dyn zuno_application::skill::SkillLibrary>>,
     workspace_gateway: Option<Arc<crate::workspace_gateway::GatewayWorkspaceClient>>,
 }
 
@@ -90,6 +91,7 @@ impl EnterpriseApplication {
             workspaces: Arc::new(installed),
             memory: None,
             skills: None,
+            skill_library: None,
             workspace_gateway: None,
         })
     }
@@ -103,6 +105,13 @@ impl EnterpriseApplication {
         skills: Arc<dyn zuno_application::skill::SkillApplication>,
     ) -> Self {
         self.skills = Some(skills);
+        self
+    }
+    pub fn with_skill_library(
+        mut self,
+        library: Arc<dyn zuno_application::skill::SkillLibrary>,
+    ) -> Self {
+        self.skill_library = Some(library);
         self
     }
     pub fn with_workspace_gateway(
@@ -196,6 +205,17 @@ impl EnterpriseApplication {
                 .route("/jobs/{job}/skills", post(skill::propose))
                 .route("/skills/{skill}", get(skill::get))
                 .route("/skills/{skill}/evaluate", post(skill::evaluate));
+        }
+        if self.skill_library.is_some() {
+            router = router
+                .route("/skills/{skill}/install", post(skill::install))
+                .route("/workspaces/{workspace}/skills", get(skill::installed))
+                .route("/installed-skills/{skill}", get(skill::document))
+                .route(
+                    "/installed-skills/{skill}/activation",
+                    post(skill::activate),
+                )
+                .route("/installed-skills/{skill}/rollback", post(skill::rollback));
         }
         router
             .layer(DefaultBodyLimit::max(

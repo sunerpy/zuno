@@ -9,6 +9,7 @@ pub mod memory;
 #[cfg(test)]
 mod presentation_tests;
 pub mod runtime;
+pub mod skills;
 pub mod tools;
 pub mod workflow;
 pub mod workspace_merge;
@@ -36,6 +37,7 @@ pub const RENEW_PATH: &str = "internal/worker/v1/renew";
 pub const STATE_PATH: &str = "internal/worker/v1/state";
 pub const LIVE_PATH: &str = "internal/worker/v1/live";
 pub const MEMORY_PATH: &str = "internal/worker/v1/memory";
+pub const SKILL_PATH: &str = "internal/worker/v1/skills";
 pub const CHILD_PATH: &str = "internal/worker/v1/children";
 pub const WORKFLOW_PATH: &str = "internal/worker/v1/workflows";
 pub const COUNCIL_PATH: &str = "internal/worker/v1/councils";

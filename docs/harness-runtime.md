@@ -3157,3 +3157,15 @@ actual trace from durable model outcomes, verifies grade inputs and outputs, and
 recomputes final policy/metrics. PostgreSQL 26 and learning protocol 2 carry this
 state; Worker state protocol remains 12. Evaluation success does not install a
 Skill. See `enterprise/SKILLS.md` in the preview archive.
+
+### Enterprise Skill activation
+
+`SkillLibrary` separates reviewed-content installation from activation and rollback.
+Its PostgreSQL provider commits revision history and idempotent receipts together.
+The Worker uses `SkillExecutionReader` through its scoped state API and wraps the
+native embedded catalog/tool; each provider request refreshes active metadata.
+Loading rechecks current authority and activation, including after checkpoint
+continuation. Original evaluated body/proof binding survives revision rollback,
+which always creates an inactive revision. This backend supplies embedded bodies,
+not host-directory discovery or resource-package execution. See
+[enterprise Skills](../enterprise/SKILLS.md).

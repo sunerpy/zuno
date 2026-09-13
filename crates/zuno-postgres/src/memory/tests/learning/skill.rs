@@ -1,5 +1,6 @@
 use super::*;
 use zuno_application::skill::*;
+mod library;
 
 pub(super) async fn exercise(backend: &PostgresBackend, admin: &PgPool) {
     let actor = principal("skill-owner");
@@ -213,4 +214,8 @@ pub(super) async fn exercise(backend: &PostgresBackend, admin: &PgPool) {
         zuno_application::learning_api::LearningState::Cancelled,
         "old accounting and cancellation remain durable"
     );
+    Box::pin(library::exercise(
+        backend, admin, &runtime, &actor, &other, &candidate, &repeated,
+    ))
+    .await;
 }

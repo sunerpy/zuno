@@ -1,7 +1,8 @@
 /* Generated from zuno-application/api.rs. Do not edit. */
 
-export type ApprovalAnswer = "approve" | "reject";
+export type Counter = string;
 export type RequestId = string;
+export type ApprovalAnswer = "approve" | "reject";
 export type ApprovalAudience = "requester" | "designatedApprover";
 /**
  * Execution semantics supplied by a registered handler, never a UI hint or
@@ -27,7 +28,6 @@ export type ApprovalId = string;
 export type PrincipalId = string;
 export type TenantId = string;
 export type ApprovalState = "pending" | "automatic" | "approved" | "rejected" | "expired" | "invalidated";
-export type Counter = string;
 export type SharedMemoryRole = "reader" | "contributor" | "reviewer";
 export type WorkspaceId = string;
 export type InputId = string;
@@ -129,6 +129,7 @@ export type WorkspaceEntry =
 export type MergeChoice = "parent" | "child" | "conflict";
 
 export interface ApplicationProtocol {
+  activate_skill: ActivateSkill;
   answer: ApprovalDecision;
   approval: ApprovalView;
   begin_workspace_import: BeginWorkspaceImport;
@@ -138,6 +139,10 @@ export interface ApplicationProtocol {
   configure_shared_memory: ConfigureSharedMemory;
   create_session: CreateSession;
   input_version: InputVersionView;
+  install_skill: InstallSkill;
+  installed_skill: InstalledSkillView;
+  installed_skill_document: InstalledSkillDocument;
+  installed_skills: InstalledSkillPage;
   job: JobView;
   learning_cancellation: LearningCancellation;
   learning_job: LearningJobView;
@@ -149,6 +154,7 @@ export interface ApplicationProtocol {
   propose_skill: ProposeSkill;
   review_shared_memory: ReviewSharedMemory;
   review_skill: ReviewSkillEvaluation;
+  rollback_skill: RollbackSkill;
   session: SessionSummary;
   sessions: SessionPage;
   shared_memory_change: SharedMemoryChange;
@@ -161,6 +167,11 @@ export interface ApplicationProtocol {
   workspace_edit: WorkspaceEditView;
   workspace_import: WorkspaceImportView;
   workspace_merge: WorkspaceMergeView;
+}
+export interface ActivateSkill {
+  active: boolean;
+  expectedRevision: Counter;
+  requestId: RequestId;
 }
 export interface ApprovalDecision {
   answer: ApprovalAnswer;
@@ -244,6 +255,31 @@ export interface CreateSession {
 }
 export interface InputVersionView {
   version: string;
+}
+export interface InstallSkill {
+  description: string;
+  expectedDigest: string;
+  expectedRevision: Counter;
+  requestId: RequestId;
+}
+export interface InstalledSkillView {
+  active: boolean;
+  candidateId: RequestId;
+  contentDigest: string;
+  description: string;
+  id: RequestId;
+  name: string;
+  revision: Counter;
+  source: string;
+  workspaceId: WorkspaceId;
+}
+export interface InstalledSkillDocument {
+  content: string;
+  skill: InstalledSkillView;
+}
+export interface InstalledSkillPage {
+  after?: RequestId | null;
+  items: InstalledSkillView[];
 }
 export interface JobView {
   id: JobId;
@@ -366,6 +402,11 @@ export interface ReviewSharedMemory {
 export interface ReviewSkillEvaluation {
   expectedDigest: string;
   requestId: RequestId;
+}
+export interface RollbackSkill {
+  expectedRevision: Counter;
+  requestId: RequestId;
+  targetRevision: Counter;
 }
 /**
  * A session's public summary. Filesystem locations remain backend-owned.

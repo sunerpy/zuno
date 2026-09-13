@@ -987,3 +987,12 @@ Tool 角色，确保各 provider 适配器能正确续接。
 数据端校验案例、角色、模型、工具 Schema，从持久模型结果重建实际轨迹，核查
 评分输入与输出，并重新计算策略结果。PostgreSQL 26、学习协议 2 承载该状态，
 Worker 状态协议保持 12。评测成功不会安装 Skill，详见预览产物 `enterprise/SKILLS.zh.md`。
+
+### 企业 Skill 激活
+
+`SkillLibrary` 分离已审核正文的安装、激活和回退。PostgreSQL 提供方原子提交
+版本历史和幂等回执。Worker 通过作用域状态 API 使用 `SkillExecutionReader`，
+复用原生嵌入式目录／工具，每次模型请求刷新已激活元数据。加载检查当前授权
+和激活状态，检查点接续后同样生效。回退保留原评测正文及证据绑定，生成新的
+未激活版本。此后端提供嵌入式正文，不扫描宿主目录或执行资源包。详见
+[企业 Skill](../../../enterprise/SKILLS.zh.md)。

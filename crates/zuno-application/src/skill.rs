@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zuno_types::identity::PrincipalScope;
 use zuno_types::identity::{JobId, RequestId};
+use zuno_types::{activity::Counter, identity::WorkspaceId};
 
 #[async_trait]
 pub trait SkillApplication: Send + Sync {
@@ -27,6 +28,116 @@ pub trait SkillApplication: Send + Sync {
         id: &RequestId,
         request: ReviewSkillEvaluation,
     ) -> Result<SkillCandidateView, ApplicationError>;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstallSkill {
+    pub request_id: RequestId,
+    pub expected_digest: String,
+    pub expected_revision: Counter,
+    pub description: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ActivateSkill {
+    pub request_id: RequestId,
+    pub expected_revision: Counter,
+    pub active: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RollbackSkill {
+    pub request_id: RequestId,
+    pub expected_revision: Counter,
+    pub target_revision: Counter,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstalledSkillView {
+    pub id: RequestId,
+    pub workspace_id: WorkspaceId,
+    pub candidate_id: RequestId,
+    pub name: String,
+    pub description: String,
+    pub revision: Counter,
+    pub source: String,
+    pub content_digest: String,
+    pub active: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstalledSkillPage {
+    pub items: Vec<InstalledSkillView>,
+    pub after: Option<RequestId>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstalledSkillDocument {
+    pub skill: InstalledSkillView,
+    pub content: String,
+}
+#[async_trait]
+pub trait SkillLibrary: Send + Sync {
+    async fn install(
+        &self,
+        actor: &PrincipalScope,
+        candidate: &RequestId,
+        request: InstallSkill,
+    ) -> Result<InstalledSkillView, ApplicationError>;
+    async fn activate(
+        &self,
+        actor: &PrincipalScope,
+        id: &RequestId,
+        request: ActivateSkill,
+    ) -> Result<InstalledSkillView, ApplicationError>;
+    async fn rollback(
+        &self,
+        actor: &PrincipalScope,
+        id: &RequestId,
+        request: RollbackSkill,
+    ) -> Result<InstalledSkillView, ApplicationError>;
+    async fn list(
+        &self,
+        actor: &PrincipalScope,
+        workspace: &WorkspaceId,
+        after: Option<&RequestId>,
+        limit: crate::PageSize,
+    ) -> Result<InstalledSkillPage, ApplicationError>;
+    async fn document(
+        &self,
+        actor: &PrincipalScope,
+        id: &RequestId,
+    ) -> Result<InstalledSkillDocument, ApplicationError>;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SkillExecutionRequest {
+    Catalog,
+    Invoke {
+        invocation_id: zuno_types::identity::InvocationId,
+        arguments: Value,
+    },
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SkillExecutionReply {
+    Catalog {
+        revision_digest: String,
+        index: String,
+    },
+    Output {
+        output: Box<zuno_tool::ToolOutput>,
+        is_error: bool,
+    },
+}
+#[async_trait]
+pub trait SkillExecutionReader: Send + Sync {
+    async fn active_documents(
+        &self,
+        lease: &crate::runtime::ExecutionLease,
+    ) -> Result<Vec<InstalledSkillDocument>, ApplicationError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

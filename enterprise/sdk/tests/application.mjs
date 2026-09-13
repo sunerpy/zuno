@@ -5,6 +5,20 @@ import { EnterpriseClient, EnterpriseHttpError } from "../dist/src/index.js";
 const job = { id: "job", sessionId: "session", turnId: "turn", inputId: "input", phase: "ready", inputVersion: "1", waits: [], stopRequested: false, pendingOperations: [] };
 const response = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 
+test("Skill activation preserves owner resource identity and exact revision without exposing a lease", async () => {
+  const value={id:"installed",workspaceId:"workspace",candidateId:"candidate",name:"proof",description:"Read proof",
+    revision:"9007199254740993",source:"enterprise-skill://installed/9007199254740993",contentDigest:"a".repeat(64),active:true};
+  const client=body=>new EnterpriseClient({baseUrl:"https://enterprise.example/api/v1/",accessToken:async()=>"test-token",fetch:async()=>response(body)});
+  const request={requestId:"activate",expectedRevision:"9007199254740992",active:true};
+  assert.equal((await client(value).activateSkill("installed",request)).revision,value.revision);
+  await assert.rejects(client({...value,id:"foreign"}).activateSkill("installed",request),/identity mismatch/);
+  await assert.rejects(client({...value,revision:request.expectedRevision}).activateSkill("installed",request),/identity mismatch/);
+  await assert.rejects(client({...value,lease:"internal"}).activateSkill("installed",request),/Invalid enterprise application response/);
+  await assert.rejects(client(value).rollbackSkill("installed",{requestId:"rollback",expectedRevision:request.expectedRevision,targetRevision:"1"}),/identity mismatch/);
+  await assert.rejects(client({items:[value],after:"foreign"}).installedSkills("workspace"),/cursor identity mismatch/);
+  await assert.rejects(client({items:[{...value,workspaceId:"foreign"}],after:null}).installedSkills("workspace"),/workspace identity mismatch/);
+});
+
 test("Skill evaluation responses preserve reviewed candidate identity and bounded scores", async () => {
   const value={id:"skill",sourceJobId:"source",name:"Skill",baselineContent:"before",proposedContent:"after",
     cases:[{id:"case",prompt:"scenario",expected:"expected",calls:[],kind:"failure",weight:1}],

@@ -1,4 +1,4 @@
-# Enterprise Skill evaluation
+# Enterprise Skill evaluation and activation
 
 Skill evaluation is explicitly reviewed work on the existing learning Job,
 Worker lease and model-accounting framework. It does not start simply because a
@@ -69,6 +69,45 @@ model requests. Evaluation currently restarts a case sequence after a lost
 Worker rather than migrating an in-flight provider stream; the same persisted
 Job budget still applies.
 
-Passing evaluation does not apply or install a Skill. Enterprise application,
-activation and private-evidence promotion remain separate implementation work;
-no placeholder apply endpoint is registered.
+## Versioned installation
+
+Passing evaluation never installs or activates a Skill automatically. The owner
+must use an approved review application for each installation, activation or
+rollback. These operations recheck current organization authorization and use
+request IDs plus expected revisions. Each installation retains its exact
+candidate digest, body and completed evaluation proof.
+
+| Route | Behavior |
+| --- | --- |
+| `POST /api/v1/skills/{candidate}/install` | Store evaluated content; new installations use expected revision `0` |
+| `GET /api/v1/workspaces/{workspace}/skills` | Page owned installation metadata |
+| `GET /api/v1/installed-skills/{skill}` | Read owned content and its current revision |
+| `POST /api/v1/installed-skills/{skill}/activation` | Explicitly activate or deactivate the current revision |
+| `POST /api/v1/installed-skills/{skill}/rollback` | Restore a prior body and proof as a new, inactive revision |
+
+Installation is keyed by owner, workspace and validated name. Replacing content
+requires the evaluated baseline to match the installed body and its current
+revision. Every installation or rollback is inactive until separately activated.
+Revision history, request receipts and content commit atomically. Up to 64 Skills
+may be installed per workspace; each body is limited to 32 KiB. Descriptions are
+bounded to 1,200 UTF-8 bytes.
+
+This provider implements native **embedded Skills**. It stores bodies in
+PostgreSQL and supplies the existing `Skills` catalog and `skill` tool. Workers
+receive a bounded metadata index before each model request; `list`, `search` and
+`load` use native identity and pagination rules. Loading checks current ownership,
+lease and activation before and after materialization. A source locator includes
+the installation revision, so replaced or deactivated sources cannot be loaded.
+Previously logged content remains part of durable history; deactivation changes
+future discovery and reads.
+
+The internal state service does not scan control-plane host directories.
+Embedded Skills have no resource root: `read_resource` reports that limitation,
+and package resources/workspace installation and evidence-based proposal
+automation remain separate work. Completion profiles expose no Skill tool.
+
+PostgreSQL preview format 27 adds installation, revision and request tables with
+forced owner RLS. Its exact format-26 fixture preserves evaluated candidates,
+sessions, messages and Memory, including rollback on injected migration failure.
+SDK methods are `installSkill`, `installedSkills`, `installedSkill`,
+`activateSkill` and `rollbackSkill`. No App/UI is included.
