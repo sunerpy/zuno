@@ -2,7 +2,11 @@
 
 有三种持久结构在跟踪工作，它们回答不同的问题。Goal 是工作为什么继续。Plan 是它如何分阶段。Todo 是某个阶段下面有哪些具体条目。
 
-三者都存在 SQLite 里，这正是关键：控制续跑的是持久状态，不是散文。「接下来我要跑测试」这样的文字不是进展。真正让一个会话继续工作的，是一个仍然活跃的 goal、一个仍在进行中的 plan 步骤，或者一个报告尚未被消费的 job。
+三者都存在 SQLite 中。当前周期拥有的 active Goal 授权续跑；Plan 和 Todo 记录工作及证据。
+没有类型化等待或保护门禁时，真正的普通 provider final 会结束当前 cycle，即使步骤仍未
+完成或可执行，也不改变它们的
+状态。真实工具／外部等待和保护门禁继续有效；「接下来我要跑测试」或旧的 `in_progress`
+步骤本身都不会生成下一轮模型请求。
 
 ## 三个层次
 
@@ -35,11 +39,18 @@ Goal 是续跑的授权来源。一个活跃的 goal 会持续下去，直到它
 }
 ```
 
-对可恢复失败没有跨回合的重试次数上限：延迟指数增长、达到上限，而 goal 保持活跃。重试记录绑定到确切的 goal id，并保存尝试次数、带类型的原因、选定的延迟、调度时间和下次可执行时间，因此重新打开会话会重建这段等待。
+失败处理使用执行前冻结的 cycle、turn 和 Goal 身份。迟到失败不能阻塞新的周期，也不能
+修改已被替换或无关的 Goal。普通周期耗尽有界 provider 重试次数或恢复窗口后，只关闭该
+失败周期，新独立输入不继承这次失败；相同的可恢复失败只有属于确切 active owned Goal
+时才调度持久重试。既有审批、必需输入、认证、`turn_budget`、blocked 和未知副作用门禁保留。
+
+对可恢复的 Goal 失败没有跨回合重试次数上限：延迟指数增长、达到上限，而 Goal 保持活跃。
+重试记录绑定确切 Goal ID，保存尝试次数、类型化原因、延迟、调度时间和下次可执行时间，
+重新打开会话会重建这段等待。
 
 已排队的用户输入优先于自动回合，长时间等待会按 `poll_interval_ms` 切分，以便交互界面能及时察觉输入。
 
-恢复方式由带类型的错误决定：
+对于当前周期拥有的 active Goal，恢复方式由带类型的错误决定：
 
 | 类别 | 结果 |
 | --- | --- |
@@ -355,7 +366,7 @@ Goal 的 `token_budget` 在回合内的每一次 provider request 前后执行�
 
 | 条件 | 结果 |
 | --- | --- |
-| 额度已用尽 | 回合停止，Goal 以 `turn_budget` 暂停 |
+| Goal token 预算已用尽 | Goal 进入 `budget_limited`；与单回合额度耗尽后的 `turn_budget` 暂停不同 |
 | provider 未上报用量 | 回合停止；你亲自设下的预算如果数不清，就无法被遵守 |
 | 只剩最后十分之一额度 | 先请求压缩，然后继续 |
 | 读取或记账 Goal 时数据库繁忙 | 回合结束，Goal 调度一次 `database_busy` 重试 |
@@ -418,6 +429,31 @@ Goal 或请求途中恢复 Goal 不会追溯接管先前用量。属于 Goal 的
 `budget_limited` 是例外，仅约束继续该 Goal 的工作，不能跨过已耗尽的预算；独立请求不会
 恢复旧 Goal，也不修改它的预算或状态。宿主回合与会话限制仍约束独立请求。
 
+### 人工请求与回答投递
+
+Work／Goal 的可选问题使用 deferred 投递，不阻塞继续执行或最终回复。旧 pending 表单
+本身不禁止新输入，也不授权自动续跑。普通 Work 真正需要一个阻塞性用户选择时，在受影响
+动作之前用一个清楚的纯文本 final 问题结束当前回合，不制造持久暂停。必需的 Goal 输入仍
+走 `goal_request_input`；Plan 保留同步澄清及绑定精确 revision 的批准门禁。
+真正的等待依据 runtime execution wait reference，不依据表单可见性或未完成 Plan。
+
+回答和模型可见的 FIFO 输入一起提交，原生 Goal／Plan 控制仍校验各自的身份和门禁。
+`QuestionView.delivery` 从关联输入回执派生，不是第二份持久 question 状态：
+
+| 阶段 | 含义 |
+| --- | --- |
+| `WaitingAnswer`（`waiting_answer`） | 表单仍为 pending，可以继续回答。 |
+| `AnsweredPendingDelivery`（`answered_pending_delivery`） | 已关闭表单仍有未应用输入，或提前批准的 Plan 仍在等待交接。 |
+| `Applied`（`applied`） | 已关闭表单已有应用证据，且没有剩余未应用输入。 |
+
+「Keep paused」等已结束且不产生模型输入的控制，`delivery` 为 `None`，序列化时省略，
+不是 `WaitingAnswer`，也不重开表单。提前批准的 Plan 若仍待交接，即使控制输入尚未
+生成，也保持 `AnsweredPendingDelivery`。
+
+问题列表保留已关闭但仍待投递的状态行，不会重开表单。pending／applied 计数、最新输入
+状态及 `appliedAt` 区分「答案已保存」与「应用到 provider 请求」；应用仍不证明 provider
+成功或任务完成。
+
 ## Plan
 
 Plan 承载阶段、它们的依赖顺序，以及它们的验收状态。它存在的意义是：让进展可见性、中断恢复和验证能够在重启或上下文压缩之后存活。
@@ -447,11 +483,11 @@ Plan 承载阶段、它们的依赖顺序，以及它们的验收状态。它存
 
 Plan 模式在提示词之下强制执行其只读的一面：一层默认拒绝的覆盖层允许检查、只读搜索与 LSP、`shell` 与 `bg`、提问、Skill 以及类型化的 Goal/Plan/Todo 操作，同时拒绝文件修改、委派、`job` 与 `execute`。Plan 模式是一条“不得修改”的边界，而不是一条“没有 shell”的边界：运行时会把任何只读角色强制为 `SandboxMode::ReadOnly`，因此命令可以取证，但改不了工作树。`/plan` 与 `/start-plan` 都是幂等进入 Plan；切换 Agent 只更新以后使用的 Work Agent。回到 Work 必须显式执行 `/start-work`，要求当前 Plan revision 已写入 handoff-ready 记录；若绑定 review，则默认还要求 Ready，除非用户持久化接受 Draft 风险的原因。
 
-默认宿主通过类型化 Planning service 负责协作模式约束、active 状态与最终对账；模型负责
-Work 模式是否需要 Plan 的判断，并通过操作式 `plan_update` 创建战略步骤。禁用该工具会
+默认宿主通过类型化 Planning service 负责协作模式约束、active 状态与最终对账。普通 final
+返回 `Finish`，不会把未完成 Plan／Todo 标成完成，也不因它们存在就再续跑。前台工具等待
+和真实续步在这之前处理，active owned Goal 的续跑与无进展检查保留。模型负责 Work 模式
+是否需要 Plan 的判断，并通过操作式 `plan_update` 创建战略步骤。禁用该工具会
 阻止新的模型修改；已有 Plan 的持久化、客户端投影与重启恢复仍然保留。
-
-普通的非 Goal Work 不会获得同步 `question` 工具。它会根据证据采用可逆且安全的默认值继续执行；只有当一个无法查明的选择会实质改变结果、且不存在安全默认值时，Agent 才会在相关副作用发生前结束当前回合，并直接提出一个简短问题。Plan 继续保留结构化提问，用于形成决策完整的计划。
 
 有副作用的工具丢失响应，就是一次不确定结局。Goal 以 `uncertain_side_effect` 暂停，要求
 检查权威状态，绝不机械重放那次调用；只有显式标记为只读或幂等的工具才可以使用安全重试。
@@ -534,6 +570,12 @@ Todo 条目是某个 plan 步骤之下的具体工作。它们携带稳定 id、
 
 压缩改变的是 provider 对话边界。它不会删除 Goal、Plan、Todo、Job、inbox、事件日志或提示词收据状态。
 
+恢复后的 provider 请求发送前，安全点按持久 FIFO 顺序选取合法回答、已结算报告和
+steering，即使唤醒通知缺失也一样。恢复控制不能跳过更早的合法回答；明确留给下一回合的
+普通输入仍排队。`InputDeliveryBatch` 和 `session.input.delivery_batch.1` 记录实际消费
+的输入及其身份和 revision，不证明应用；实际 post-hook provider dispatch 对应的输入
+回执才建立应用事实。
+
 相反，每一次相关的 provider 请求都会从 SQLite 重新生成一个有界的
 `runtime.work_state` 开发者分段：当前的 plan revision 与步骤、Todo 身份与依赖、
 活跃或不确定的 job、仍关联到未完成 Plan 步骤的终态 job、报告尚未被消费的终态
@@ -543,6 +585,22 @@ job、待处理报告的身份，以及最近一条先前提示词收据的 id�
 每个集合上限 64 条，渲染出的分段上限 16 KiB。冗长文本会先以 UTF-8 安全的方式缩短，之后才整条省略尾部条目，被省略的数量始终显式给出，身份字段一律保留。如果连身份字段都装不下，组装会失败即拒绝，因为一个静默丢掉了身份的工作状态分段，比没有这个分段更糟。
 
 转录回退是另一种移动转录边界的操作，它对 inbox 遵守同一条规则：提交回退会丢弃暂存边界之后的转录行，但永远不会删除 inbox 行。所有 `queued`、`steering`、`promoted` 的输入原本都指向已被丢弃的尾部，因此每条都经常规取消迁移退役，并各记一条 `session.input.cancelled`；已消费的输入是不可变历史，不受影响。提交随后追加一条 `session.reverted` 事件，记录边界、被删除的行数与被退役的输入 id，被丢弃的尾部因此仍可从持久日志重建。完整字段见运行时参考中的[持久输入](/zh/operate/harness-runtime#持久输入)。
+
+旧暂停不会因重启、新输入或迁移自动解锁，数据库格式 15 保持不变。对于证据完整的单条
+旧误阻塞，可检查已 consumed、回执仍为 `recorded` 且从未应用的真实用户输入：
+
+```sh
+zuno session repair SESSION --input INPUT --dry-run
+zuno session repair SESSION --input INPUT --apply --expected-revision N
+```
+
+将 `N` 替换为检查返回的正整数 `expectedRevision`。应用需要离线、独占既有数据库，
+并重新校验完整原生证据；成功只准入一个审计过的恢复控制，不重排队原输入、不重放工具、
+不修改 Goal，也不迁移数据库。成功返回 `control_queued`，不证明输入已应用或 provider
+成功。仅在同一控制仍为 `queued`，且全部证据与执行状态不变时，重复调用才以
+`already_queued` 幂等返回。控制已推进或原输入已绑定／应用后，修复拒绝重投。
+缺失证据和真实保护门禁仍失败关闭。详见
+[有界修复](/zh/operate/harness-runtime#单条旧误阻塞输入的显式修复)。
 
 ## Job
 
@@ -554,22 +612,22 @@ job、待处理报告的身份，以及最近一条先前提示词收据的 id�
 写入 Job 的 `workContext`。只要该步骤尚未结束，已完成或失败的子任务证据在压缩和重启
 之后仍会对模型可见，避免同一失败调查在没有新假设时被重复委派。
 
-对于长时间运行的 CI watcher 或发布命令，应只启动一个后台执行，让其持久终态报告恢复
-会话；仅在需要具体证据时使用 `bg output`，不要叠加 watcher 或手写轮询循环。
+下一步依赖 CI 或发布结果时默认前台执行；只有父级确实有独立工作时才显式后台运行。
+选用后台 Shell 观察器时设置 `backgroundPurpose: "remoteObserver"`，由持久终态报告
+唤醒合法周期，再读取返回句柄的输出并按稳定 ID 查询远端权威状态。不要叠加 watcher 或
+手写轮询，也不能把观察器退出当作远端成功。
 
-若该观察器仍在运行且持久工作尚未结束，对账 driver 会持久化
-`waiting_background`，不轮询，也不创建通用人工问题。
-只有在观察器仍存活时才抑制活跃 Goal 的自动续跑；它的终态报告负责持久唤醒会话，但终态
-本身不是远端成功证据。
+确切的 runtime 外部等待引用才使 driver 持久化 `waiting_background`，未完成工作本身
+不建立等待。匹配完成结果满足该等待；active Goal 再遵循其余门禁续跑，普通 final 则结束
+本周期，不通过轮询或制造人工问题继续。
 
-自动报告唤醒不能越过 Goal 生命周期状态。Goal 处于 paused、blocked、complete、
-cancelled 或其他非 active 状态时，宿主仍会把每条 promoted 报告提交为独立的持久 user
-message，并结清对应 inbox 行，但不会启动 provider 回合。之后显式恢复 Goal 时，会从这些
-消息继续。这样既不丢后台报告，也不会让子任务绕过认证、权限、人工输入、Plan 模式或
-`uncertain_side_effect` 暂停。报告专用宿主会先原样读取生命周期状态，不会在判断前调用
-Start Work，因此仅仅打开宿主也不能消费一个本可恢复的暂停。
+自动报告唤醒遵循冻结的工作周期归属。该周期拥有的 Goal 非 active 时，可以记录和消费
+报告，但不能据此启动 provider 请求。明确无 Goal 的普通周期不受无关残留 Goal 阻止；
+旧数据缺少归属则不能推定独立。已停止周期和真实认证、权限、人工输入、Plan 模式或未知
+副作用门禁保留。记录报告不等于应用，也不恢复 Goal；打开报告宿主不授予 Start Work 权限。
 
-在还有活跃 job 或未被消费的报告时，不要完成父级。报告投递见[编排](/zh/guide/orchestration)。
+必需的 Job 证据尚未结算时，不得宣称 Job 或关联 Plan 步骤完成；这不要求普通 final 后
+再启动一轮模型请求。报告投递见[编排](/zh/guide/orchestration)。
 
 ## 参见
 

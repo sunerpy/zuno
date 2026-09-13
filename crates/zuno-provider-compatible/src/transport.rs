@@ -20,10 +20,10 @@ use std::time::Duration;
 
 use futures::{Stream, StreamExt};
 use serde_json::Value;
-use zuno_error::ProviderError;
+use zuno_error::{ProviderDiagnosticPhase, ProviderError};
 use zuno_llm::sse::{MAX_PROVIDER_WAIT, StreamIdleTimeout};
 
-use zuno_llm::http::{RequestDeadlines, read_error_body};
+use zuno_llm::http::{HttpTimeoutError, RequestDeadlines, TimeoutPhase, read_error_body};
 
 use crate::stream::retry_after;
 use crate::wire::ErrorEnvelope;
@@ -149,23 +149,49 @@ impl Transport for ReqwestTransport {
             for (name, value) in &request.headers {
                 builder = builder.header(name, value);
             }
+            let credentials = request
+                .headers
+                .values()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let endpoint = diagnostic_endpoint(&request.url, &credentials);
             let response = deadlines
                 .headers(&provider, builder.send())
-                .await?
-                .map_err(ProviderError::transient)?;
+                .await
+                .and_then(|response| {
+                    response.map_err(|error| {
+                        let phase = if error.is_builder() {
+                            ProviderDiagnosticPhase::Unknown
+                        } else {
+                            ProviderDiagnosticPhase::ResponseHeaders
+                        };
+                        ProviderError::transient(error.without_url()).with_diagnostic_phase(phase)
+                    })
+                })
+                .map_err(|error| {
+                    with_endpoint_context(capture_timeout_phase(error), endpoint.as_deref())
+                        .redacted(&credentials)
+                })?;
 
             let status = response.status();
+            let request_id = [
+                "x-request-id",
+                "request-id",
+                "x-amzn-requestid",
+                "x-ms-request-id",
+            ]
+            .iter()
+            .find_map(|name| {
+                response
+                    .headers()
+                    .get(*name)
+                    .and_then(|value| value.to_str().ok())
+            })
+            .map(|value| {
+                let value = ProviderError::sanitize_diagnostic(value, &credentials);
+                value[..value.floor_char_boundary(value.len().min(256))].to_owned()
+            });
             if !status.is_success() {
-                let request_id = [
-                    "x-request-id",
-                    "request-id",
-                    "x-amzn-requestid",
-                    "x-ms-request-id",
-                ]
-                .iter()
-                .find_map(|name| response.headers().get(*name))
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
                 let header = response
                     .headers()
                     .get(reqwest::header::RETRY_AFTER)
@@ -176,7 +202,18 @@ impl Transport for ReqwestTransport {
                 // characters that could be mistaken for the vendor's own text.
                 let bytes = deadlines
                     .body(&provider, read_error_body(&provider, response))
-                    .await??
+                    .await
+                    .and_then(std::convert::identity)
+                    .map_err(|error| {
+                        with_endpoint_context(capture_timeout_phase(error), endpoint.as_deref())
+                            .with_http_diagnostic(
+                                status.as_u16(),
+                                None,
+                                request_id.as_deref(),
+                                None,
+                                &credentials,
+                            )
+                    })?
                     .into_bytes();
                 let text = std::str::from_utf8(&bytes).ok().map(str::to_owned);
                 let body = text
@@ -199,12 +236,7 @@ impl Transport for ReqwestTransport {
                     .and_then(|wire| wire.get("message"))
                     .and_then(Value::as_str)
                     .or(text.as_deref());
-                let credentials = request
-                    .headers
-                    .values()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>();
-                return Err(
+                return Err(with_endpoint_context(
                     classify_response(&provider, status.as_u16(), header, text.as_deref())
                         .with_http_diagnostic(
                             status.as_u16(),
@@ -213,25 +245,108 @@ impl Transport for ReqwestTransport {
                             reason,
                             &credentials,
                         ),
-                );
+                    endpoint.as_deref(),
+                ));
             }
 
             let body = Box::pin(response.bytes_stream());
-            let chunks =
-                futures::stream::unfold(Some((body, provider, deadlines)), |state| async move {
-                    let (mut body, provider, deadlines) = state?;
-                    match deadlines.chunk(&provider, body.next()).await {
-                        Ok(Some(Ok(bytes))) => {
-                            Some((Ok(bytes.to_vec()), Some((body, provider, deadlines))))
-                        }
-                        Ok(Some(Err(error))) => Some((Err(ProviderError::transient(error)), None)),
+            let chunks = futures::stream::unfold(
+                Some((body, provider, deadlines, request_id, endpoint)),
+                move |state| async move {
+                    let (mut body, provider, deadlines, request_id, endpoint) = state?;
+                    let next = deadlines
+                        .chunk(&provider, body.next())
+                        .await
+                        .map_err(capture_timeout_phase)
+                        .and_then(|next| {
+                            next.transpose()
+                                .map_err(|error| ProviderError::transient(error.without_url()))
+                        });
+                    match next {
+                        Ok(Some(bytes)) => Some((
+                            Ok(bytes.to_vec()),
+                            Some((body, provider, deadlines, request_id, endpoint)),
+                        )),
                         Ok(None) => None,
-                        Err(error) => Some((Err(error), None)),
+                        Err(error) => Some((
+                            Err(with_endpoint_context(error, endpoint.as_deref())
+                                .with_http_diagnostic(
+                                    status.as_u16(),
+                                    None,
+                                    request_id.as_deref(),
+                                    None,
+                                    &[],
+                                )),
+                            None,
+                        )),
                     }
-                });
+                },
+            );
             Ok(Box::pin(chunks) as ChunkStream)
         })
     }
+}
+
+/// Retain an actionable HTTP endpoint without userinfo, query or fragment data.
+/// Invalid/unsupported URLs have no trusted endpoint projection.
+fn diagnostic_endpoint(raw: &str, credentials: &[&str]) -> Option<String> {
+    let url = reqwest::Url::parse(raw).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return None;
+    }
+    let endpoint = zuno_network::DiagnosticEndpoint::from_url(&url);
+    let endpoint = ProviderError::sanitize_diagnostic(endpoint.as_str(), credentials);
+    Some(endpoint[..endpoint.floor_char_boundary(endpoint.len().min(1_024))].to_owned())
+}
+
+fn with_endpoint_context(mut error: ProviderError, endpoint: Option<&str>) -> ProviderError {
+    let Some(endpoint) = endpoint else {
+        return error;
+    };
+    match &mut error {
+        ProviderError::Transient { source, .. }
+        | ProviderError::Fatal { source, .. }
+        | ProviderError::Auth { source, .. }
+        | ProviderError::Stream { source, .. }
+        | ProviderError::Protocol { source, .. } => {
+            *source = Some(Box::new(EndpointContext {
+                endpoint: endpoint.to_owned(),
+                source: source.take(),
+            }));
+        }
+        _ => {}
+    }
+    error
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("request to {endpoint} failed")]
+struct EndpointContext {
+    endpoint: String,
+    #[source]
+    source: Option<zuno_error::BoxSource>,
+}
+
+/// Read the local deadline's typed phase before transport redaction drops it.
+/// Wire codes or timeout-like prose cannot identify an upstream execution stage.
+pub(crate) fn capture_timeout_phase(error: ProviderError) -> ProviderError {
+    use std::error::Error as _;
+    let mut source = error.source();
+    for _ in 0..8 {
+        let Some(cause) = source else { break };
+        if let Some(timeout) = cause.downcast_ref::<HttpTimeoutError>() {
+            let phase = match timeout.phase() {
+                TimeoutPhase::WholeRequest => ProviderDiagnosticPhase::RequestBudget,
+                TimeoutPhase::ResponseHeaders => ProviderDiagnosticPhase::ResponseHeaders,
+                TimeoutPhase::ResponseChunk => ProviderDiagnosticPhase::StreamIdle,
+                // A bounded complete-body read is not a stream idle wait.
+                TimeoutPhase::ResponseBody => ProviderDiagnosticPhase::Unknown,
+            };
+            return error.with_diagnostic_phase(phase);
+        }
+        source = cause.source();
+    }
+    error
 }
 
 /// Classify a non-2xx response into the typed taxonomy.
@@ -382,6 +497,7 @@ mod tests {
                 .write_all(
                     b"HTTP/1.1 200 OK\r\n\
                       Content-Type: text/event-stream\r\n\
+                      X-Request-ID: req-stream-fixture\r\n\
                       Transfer-Encoding: chunked\r\n\
                       Connection: close\r\n\
                       \r\n",
@@ -515,6 +631,7 @@ mod tests {
         assert_eq!(error.recovery(), Recovery::Fail);
         let diagnostic = error.diagnostic_fields();
         assert_eq!(diagnostic["status"], 400);
+        assert_eq!(diagnostic["phase"], "unknown");
         assert_eq!(diagnostic["code"], "unsupported_parameter");
         assert_eq!(diagnostic["requestID"], "req_diagnostic_fixture");
         assert!(
@@ -525,6 +642,105 @@ mod tests {
         );
         assert!(!diagnostic.to_string().contains("fixture-credential-value"));
         assert!(!error.diagnostic().contains("fixture-credential-value"));
+    }
+
+    #[tokio::test]
+    async fn an_invalid_request_does_not_claim_a_response_headers_wait() {
+        let transport = ReqwestTransport::new("invalid-request-fixture");
+        let result = transport
+            .send(HttpRequest {
+                url: "invalid-url?api_key=fixture-secret".to_owned(),
+                headers: BTreeMap::new(),
+                body: serde_json::json!({}),
+                timeouts: HttpTimeouts::default(),
+            })
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("an invalid URL cannot produce response headers"),
+        };
+        let fields = error.diagnostic_fields();
+        assert_eq!(fields["phase"], "unknown");
+        assert!(fields["status"].is_null());
+        assert!(fields["requestID"].is_null());
+        assert!(!error.diagnostic().contains("fixture-secret"));
+    }
+
+    #[tokio::test]
+    async fn endpoint_diagnostics_keep_host_path_and_placeholders_without_secrets() {
+        let transport = ReqwestTransport::new("endpoint-fixture");
+        let cases = [
+            (
+                "http://fixture-user:fixture-password@127.0.0.1:1/v1/responses?api_key=query-secret#fragment-secret",
+                "http://127.0.0.1:1/v1/responses",
+                ProviderDiagnosticPhase::ResponseHeaders,
+            ),
+            (
+                "http://fixture-user:fixture-password@${PROBE_HOST}/v1/responses?api_key=query-secret#fragment-secret",
+                "http://${probe_host}/v1/responses",
+                ProviderDiagnosticPhase::Unknown,
+            ),
+        ];
+        for (url, endpoint, phase) in cases {
+            let result = transport
+                .send(HttpRequest {
+                    url: url.to_owned(),
+                    headers: BTreeMap::from([(
+                        "authorization".to_owned(),
+                        "Bearer header-secret".to_owned(),
+                    )]),
+                    body: serde_json::json!({"token":"body-secret"}),
+                    timeouts: HttpTimeouts::new(None, Some(Duration::from_secs(2)), None),
+                })
+                .await;
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("the fixture cannot produce response headers"),
+            };
+            assert_eq!(error.recovery(), Recovery::Retry { after: None });
+            let snapshot = error.redacted(&["header-secret"]).diagnostic_snapshot();
+            let fields = snapshot.fields();
+            assert_eq!(snapshot.phase(), phase);
+            assert!(
+                fields["reason"].as_str().unwrap().contains(endpoint),
+                "the safe endpoint must survive provider redaction: {fields}"
+            );
+            assert!(fields["status"].is_null());
+            assert!(fields["requestID"].is_null());
+            for secret in [
+                "fixture-user",
+                "fixture-password",
+                "query-secret",
+                "fragment-secret",
+                "header-secret",
+                "body-secret",
+            ] {
+                assert!(!fields.to_string().contains(secret), "{fields}");
+                assert!(!snapshot.to_string().contains(secret));
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_projection_is_bounded_and_rejects_opaque_urls() {
+        let raw = format!(
+            "https://fixture-user:fixture-password@gateway.invalid/v1/path-secret/{}?signature=query-secret#fragment-secret",
+            "中".repeat(2_000)
+        );
+        let endpoint = diagnostic_endpoint(&raw, &["path-secret"]).expect("HTTP endpoint");
+        assert!(endpoint.starts_with("https://gateway.invalid/v1/"));
+        assert!(endpoint.len() <= 1_024);
+        for secret in [
+            "fixture-user",
+            "fixture-password",
+            "path-secret",
+            "query-secret",
+            "fragment-secret",
+        ] {
+            assert!(!endpoint.contains(secret), "{endpoint}");
+        }
+        assert!(diagnostic_endpoint("data:text/plain,body-secret", &[]).is_none());
+        assert!(diagnostic_endpoint("invalid-url?api_key=query-secret", &[]).is_none());
     }
 
     #[tokio::test]
@@ -545,6 +761,7 @@ mod tests {
                 .write_all(
                     b"HTTP/1.1 400 Bad Request\r\n\
                       Content-Type: application/json\r\n\
+                      X-Request-ID: req-truncated-fixture\r\n\
                       Content-Length: 128\r\n\
                       Connection: close\r\n\
                       \r\n\
@@ -581,6 +798,14 @@ mod tests {
         assert!(
             cause.contains("body") || cause.contains("connection"),
             "unexpected body read cause: {cause}"
+        );
+        let diagnostic = error.redacted(&[]).diagnostic_fields();
+        assert_eq!(diagnostic["phase"], "unknown");
+        assert_eq!(diagnostic["status"], 400);
+        assert_eq!(diagnostic["requestID"], "req-truncated-fixture");
+        assert!(
+            diagnostic["code"].is_null(),
+            "an incomplete body is not authoritative"
         );
     }
 
@@ -623,6 +848,14 @@ mod tests {
         let cause = error.source().expect("idle timeout cause").to_string();
         assert!(cause.contains("idle timeout"), "{cause}");
         assert!(cause.contains("stalled-fixture"), "{cause}");
+        let snapshot = error.redacted(&[]).diagnostic_snapshot();
+        assert_eq!(
+            snapshot.fields()["phase"],
+            "stream_idle",
+            "a locally observed idle deadline must survive redaction and source drop"
+        );
+        assert_eq!(snapshot.fields()["status"], 200);
+        assert_eq!(snapshot.fields()["requestID"], "req-stream-fixture");
 
         server.abort();
         let _ = server.await;
@@ -663,6 +896,14 @@ mod tests {
         let cause = error.source().expect("whole timeout cause").to_string();
         assert!(cause.contains("whole request"), "{cause}");
         assert!(cause.contains("150ms"), "{cause}");
+        let snapshot = error.redacted(&[]).diagnostic_snapshot();
+        assert_eq!(
+            snapshot.fields()["phase"],
+            "request_budget",
+            "the whole-request deadline must remain distinct from stream idleness"
+        );
+        assert_eq!(snapshot.fields()["status"], 200);
+        assert_eq!(snapshot.fields()["requestID"], "req-stream-fixture");
 
         server.abort();
         let _ = server.await;
@@ -706,6 +947,14 @@ mod tests {
         let cause = error.source().expect("header timeout cause").to_string();
         assert!(cause.contains("response headers"), "{cause}");
         assert!(cause.contains("75ms"), "{cause}");
+        let snapshot = error.redacted(&[]).diagnostic_snapshot();
+        assert_eq!(
+            snapshot.fields()["phase"],
+            "response_headers",
+            "the wait for response headers must remain observable after redaction"
+        );
+        assert!(snapshot.fields()["status"].is_null());
+        assert!(snapshot.fields()["requestID"].is_null());
 
         server.abort();
         let _ = server.await;

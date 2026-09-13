@@ -409,11 +409,12 @@ pub(crate) fn assemble(
         && selection.manifest.contains(BuiltinSlot::Question)
         && let Some(port) = selection.question.clone()
     {
-        let tool = if selection.interaction_policy == zuno_goal::InteractionPolicy::WorkAutonomous {
-            QuestionTool::required(port)
-        } else {
-            QuestionTool::new(port)
-        };
+        let tool =
+            if selection.interaction_policy == zuno_goal::InteractionPolicy::PlanClarification {
+                QuestionTool::new(port)
+            } else {
+                QuestionTool::for_work(port)
+            };
         builder
             .register_builtin(BuiltinSlot::Question, erase(tool))
             .map_err(|error| error.to_string())?;

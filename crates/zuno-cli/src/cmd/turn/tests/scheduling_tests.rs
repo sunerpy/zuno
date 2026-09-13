@@ -1,6 +1,8 @@
 //! Real TurnHost/default-driver regressions with deterministic provider streams.
 //! Every database and workspace belongs to the fixture; no network provider runs.
 
+#[path = "answer_delivery_tests.rs"]
+mod answer_delivery_tests;
 #[path = "background_report_tests.rs"]
 mod background_report_tests;
 
@@ -105,7 +107,10 @@ async fn mock_provider_host(
 ) {
     let directory = tempfile::tempdir().expect("isolated workspace");
     let session_id = format!("ses_scheduling_{}", Uuid::now_v7().simple());
-    let config = zuno_config::schema::Config::default();
+    let config = zuno_config::schema::Config {
+        memory: Some(zuno_config::schema::MemoryConfig::Enabled(false)),
+        ..Default::default()
+    };
     let mut entry = agent(agent_name);
     entry.tools = Some(vec![
         zuno_tools::plan_exit::WIRE_ID.to_owned(),
@@ -809,7 +814,7 @@ async fn new_user_query_does_not_adopt_an_old_unfinished_plan() {
 }
 
 #[tokio::test]
-async fn ordinary_plan_with_blocked_todo_without_goal_pauses_after_one_provider_response() {
+async fn ordinary_plan_with_blocked_todo_finishes_without_locking_new_input() {
     let (_directory, mut host, provider, work) = mock_provider_host(
         "build",
         vec![
@@ -864,16 +869,10 @@ async fn ordinary_plan_with_blocked_todo_without_goal_pauses_after_one_provider_
     assert_eq!(before_query.plan.as_ref().unwrap().revision, 2);
     let paused = execution(&host);
     assert_eq!(paused.mode, CollaborationMode::Work);
-    assert_eq!(paused.phase, SessionExecutionPhase::Paused);
+    assert_eq!(paused.phase, SessionExecutionPhase::Completed);
     let progress = paused.scheduling.as_ref().expect("scheduling");
-    assert_eq!(
-        progress.readiness,
-        SessionReadiness::Paused {
-            reason: SessionPauseReason::NoExecutableWork
-        }
-    );
-    assert_eq!(progress.unchanged_progress_count, 1);
-    assert!(progress.progress_fingerprint.is_some());
+    assert_eq!(progress.readiness, SessionReadiness::Completed);
+    assert_eq!(progress.unchanged_progress_count, 0);
     let phase = host
         .plan_reconciliation
         .projection(&host.session_id)
@@ -1134,7 +1133,7 @@ async fn goalless_pending_question_survives_durable_context_rebuild_without_assi
     assert!(!rendered.contains("FREEFORM_RISK_MUST_NOT_ENTER_BOUNDED_CONTEXT"));
     let snapshot: Value = serde_json::from_str(rendered.lines().last().expect("snapshot JSON"))
         .expect("typed context");
-    assert_eq!(snapshot["schemaVersion"], 4);
+    assert_eq!(snapshot["schemaVersion"], 5);
     assert_eq!(snapshot["execution"]["mode"], "work");
     assert_eq!(snapshot["execution"]["phase"], "waiting");
     assert_eq!(snapshot["execution"]["cycleId"], "question-context-cycle");

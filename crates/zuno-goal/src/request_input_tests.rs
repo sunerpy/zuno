@@ -60,6 +60,7 @@ impl QuestionPort for RecordingPort {
                 plan: spec.plan,
                 decision: None,
                 authorization: None,
+                delivery: None,
                 time_created: 100,
                 time_updated: 200,
             },

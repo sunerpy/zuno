@@ -1,6 +1,6 @@
 //! Adopted Work Plan steps are execution facts, not assistant-text predictions.
 use super::*;
-use zuno_types::execution::{SessionPauseReason, SessionReadiness, SessionScheduling};
+use zuno_types::execution::{SessionReadiness, SessionScheduling};
 
 async fn owned_plan(
     behavior: ScriptedTurnBehavior,
@@ -82,14 +82,14 @@ async fn adopted_in_progress_plan_is_executable_without_duplicate_todos() {
 }
 
 #[tokio::test]
-async fn adopted_plan_continues_to_settlement_without_another_user_input() {
+async fn adopted_plan_does_not_override_an_ordinary_final() {
     let (_directory, mut host, driver, work) =
         owned_plan(ScriptedTurnBehavior::SettleWorkOnSecondTurn).await;
     execute(&mut host).await;
     assert_eq!(
         driver.calls(),
-        2,
-        "do not pause after announcing the next owned step"
+        1,
+        "an ordinary final is not an authorization to purchase another model turn"
     );
     assert!(
         work.plan(&host.session_id)
@@ -97,27 +97,25 @@ async fn adopted_plan_continues_to_settlement_without_another_user_input() {
             .unwrap()
             .steps
             .iter()
-            .all(|step| step.status.is_terminal())
+            .any(|step| !step.status.is_terminal())
     );
     host.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn unchanged_adopted_plan_still_stops_at_the_no_progress_limit() {
+async fn unchanged_ordinary_plan_finishes_without_a_persistent_no_progress_gate() {
     let (_directory, mut host, driver, _) = owned_plan(ScriptedTurnBehavior::PreserveWork).await;
     execute(&mut host).await;
-    assert_eq!(driver.calls(), 3);
+    assert_eq!(driver.calls(), 1);
     let state = host
         .session_control
         .state(&host.session_id)
         .unwrap()
         .unwrap();
-    assert!(matches!(
+    assert_eq!(
         state.scheduling.unwrap().readiness,
-        SessionReadiness::Paused {
-            reason: SessionPauseReason::NoProgress
-        }
-    ));
+        SessionReadiness::Completed
+    );
     host.shutdown().await.unwrap();
 }
 

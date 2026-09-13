@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use serde_json::{Map, Value};
-use zuno_error::ProviderError;
+use zuno_error::{ProviderDiagnosticPhase, ProviderError};
 use zuno_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Declined, FactoryOutcome, Provider,
     ProviderStream, ReasoningReplayPolicy, Spec, StreamEvent, ToolSchema, Unavailable, generation,
@@ -35,7 +35,7 @@ use crate::quirks::Quirks;
 use crate::request::{RequestBody, Sampling};
 use crate::stream::SurfaceTranslator;
 use crate::surface::endpoint_path;
-use crate::transport::{HttpRequest, HttpTimeouts, Transport};
+use crate::transport::{HttpRequest, HttpTimeouts, Transport, capture_timeout_phase};
 
 /// The `provider.*.options` key carrying provider-wide capabilities.
 pub const CAPABILITIES_OPTION: &str = "capabilities";
@@ -446,7 +446,8 @@ impl Provider for CompatibleProvider {
             .flatten()
             .map(move |event| {
                 event.map_err(|error| {
-                    error.redacted(&secrets.iter().map(String::as_str).collect::<Vec<_>>())
+                    capture_timeout_phase(error)
+                        .redacted(&secrets.iter().map(String::as_str).collect::<Vec<_>>())
                 })
             }),
         )
@@ -566,7 +567,12 @@ fn translate(
                 .wait(&state.provider, &state.model, state.chunks.next())
                 .await;
             let chunk = match next {
-                Err(timeout) => return Some((Err(timeout), None)),
+                Err(timeout) => {
+                    return Some((
+                        Err(timeout.with_diagnostic_phase(ProviderDiagnosticPhase::StreamIdle)),
+                        None,
+                    ));
+                }
                 Ok(Some(Err(error))) => return Some((Err(error), None)),
                 Ok(Some(Ok(bytes))) => Some(bytes),
                 Ok(None) => None,

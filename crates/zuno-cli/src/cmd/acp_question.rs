@@ -56,7 +56,7 @@ pub(super) async fn list(port: &dyn QuestionPort, params: &Value) -> Result<Valu
         .map_err(|error| RpcError::invalid_params(error.to_string()))?;
     require_id(&params.session_id, "sessionId")?;
     let questions = port
-        .pending(&params.session_id)
+        .visible(&params.session_id)
         .await
         .map_err(question_error)?;
     Ok(json!({"questions": questions}))

@@ -204,13 +204,45 @@ impl QuestionService {
 
     /// Abort or failure can revoke an unapplied approval, never create authority.
     pub async fn interrupt_plan_turn(&self, session_id: &str, turn_id: &str) -> QuestionResult<()> {
+        self.interrupt_plan_turn_scoped(session_id, turn_id, None)
+            .await
+    }
+
+    /// Failure cleanup is fenced again inside its own transaction. A control
+    /// that wins after failure settlement keeps its newer approvals untouched.
+    pub async fn interrupt_plan_turn_for_cycle(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        cycle_id: &str,
+    ) -> QuestionResult<()> {
+        self.interrupt_plan_turn_scoped(session_id, turn_id, Some(cycle_id))
+            .await
+    }
+
+    async fn interrupt_plan_turn_scoped(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        expected_cycle: Option<&str>,
+    ) -> QuestionResult<()> {
         let pool = Arc::clone(&self.pool);
         let session_id = session_id.to_owned();
         let turn_id = turn_id.to_owned();
+        let expected_cycle = expected_cycle.map(str::to_owned);
         let changed = blocking(move || {
             pool.try_transaction(|tx| {
                 let cycle_id = zuno_db::session_execution::read_in(tx, &session_id)?
                     .and_then(|state| state.cycle_id);
+                if let Some(expected) = expected_cycle.as_deref() {
+                    let current = zuno_db::session_work_cycle::current_in(tx, &session_id)?;
+                    if cycle_id.as_deref() != Some(expected)
+                        || current.as_ref().is_none_or(|current|
+                            !turn_id.is_empty() && current.active_turn_id.as_deref() != Some(&turn_id))
+                    {
+                        return Ok(Vec::new());
+                    }
+                }
                 let mut statement = tx
                     .prepare(
                         "SELECT h.id FROM human_request h \
@@ -484,6 +516,7 @@ impl QuestionPort for QuestionService {
                         SessionControlService::apply_plan_question_in(tx, &receipt.question, now)?;
                     question::record_receipt_in(tx, &command.command_id, &receipt)?;
                 }
+                receipt.question.delivery = question::delivery_in(tx, &receipt.question)?;
                 Ok(receipt)
             })
         })
@@ -503,6 +536,16 @@ impl QuestionPort for QuestionService {
         let store = self.store.clone();
         let session_id = session_id.to_owned();
         blocking(move || store.pending(&session_id)).await
+    }
+
+    async fn visible(&self, session_id: &str) -> QuestionResult<Vec<QuestionView>> {
+        let pool = Arc::clone(&self.pool);
+        let session_id = session_id.to_owned();
+        blocking(move || {
+            let connection = pool.get()?;
+            question::visible_in(&connection, &session_id)
+        })
+        .await
     }
 
     async fn wait_for_change(

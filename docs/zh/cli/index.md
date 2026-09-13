@@ -42,7 +42,7 @@ Windows 上嵌套的 `zuno` 会按配置而不是按外层命令行解析约束�
 
 | 命令 | 用途 |
 | --- | --- |
-| [`zuno session`](/zh/cli/session) | 列出、按期清理与删除持久 session。 |
+| [`zuno session`](/zh/cli/session) | 列出、按期清理、删除持久 session，以及检查受保护的历史恢复。 |
 | [`zuno agent`](/zh/cli/agent) | 列出当前配置链解析出的 Agent。 |
 | [`zuno db`](/zh/cli/db) | 对本地 session 数据库执行查询。 |
 | [`zuno export`](/zh/cli/export) | 把配置、Skill、扩展与 Agent 写入一个可移植 bundle。 |

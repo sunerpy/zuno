@@ -153,13 +153,46 @@ T1 的 session-only 通知如果在 T2 运行时到达，可能取消 T2。需�
 仍只观察原持久输入。撤回不能取消无关的 Agent 到客户端 RPC。`-32800` 表示请求撤回，
 不表示工具副作用已回滚；应通过持久回执观察执行结果。
 
+## 普通 final 与问题投递
+
+没有类型化等待或保护门禁时，真正的普通 provider final 会结束当前 cycle，即使
+Plan／Todo 步骤未完成或仍可执行。
+Plan 投影保留实际状态；`end_turn` 不证明所有步骤完成。前台工具等待和真实续步在 final
+对账之前处理，只有当前周期拥有的 active Goal 才授权 Goal 续跑。
+
+Work／Goal 的可选问题保持 deferred。普通 Work 真正被用户选择阻塞时，用一个清楚的
+纯文本 final 问题结束回合，不制造持久暂停。必需 Goal 输入与 Plan 批准保留类型化控制及
+身份／revision 检查。旧 pending 表单和未完成 Plan 本身既不授权续跑，也不禁止新输入；
+runtime execution wait reference 才是等待权威。
+
+`QuestionView.delivery` 从输入回执派生，阶段为 `WaitingAnswer`（`waiting_answer`）、
+`AnsweredPendingDelivery`（`answered_pending_delivery`）和 `Applied`（`applied`）。
+问题列表可以保留已关闭、但关联输入尚未全部应用的表单，作为投递状态展示，不重开表单。
+pending／applied 计数与最新输入回执区分回答已接受和应用到模型请求；表单关闭或输入应用
+都不证明 provider 已成功响应。
+
+「Keep paused」等已结束且不产生模型输入的控制，`delivery` 为 `None`，序列化时省略，
+不是 `WaitingAnswer`，不应重开。提前批准的 Plan 若仍待交接，即使控制输入尚未准入，
+也保持 `AnsweredPendingDelivery`。
+
+失败按冻结的 cycle／turn／Goal 归属结算。耗尽有界 provider 重试次数或恢复窗口，只关闭
+失败的普通周期，不阻塞之后的独立输入，也不改写无关 Goal。只有确切 active owned Goal
+才为可恢复失败安排退避。类型化审批、必需输入、认证、单回合预算、未知副作用和永久阻塞
+门禁仍然有效。
+
 ## 已保存输入与执行门禁
 
 输入可以已经消费并写入历史，但原生执行仍被门禁阻止。此时 `InputAdmissionReceipt`
 保持 `recorded`，附带可选 `executionGate`，`appliedAt`、`completedAt`、`turnId`
 均缺省。门禁不会把这条已保存但未应用的输入改为 `failed`，也不证明模型已开始采样。
 
-这种情况下，`session/prompt` 返回 JSON-RPC error `-32005`，其 `error.data` 包含
+恢复后的 provider 请求发送前，引擎即使没有进程内通知，也会扫描持久 FIFO 中合法的
+回答、报告和 steering。恢复控制不能跳过更早的合法回答；明确排在下一回合的普通输入
+仍排队。`InputDeliveryBatch` 与 `session.input.delivery_batch.1` 记录实际消费，不代表
+应用。post-hook provider dispatch 的输入回执建立应用事实，后续执行结果才结算完成。
+
+对于已保存但受执行门禁阻止的输入，`session/prompt` 返回 JSON-RPC error `-32005`，
+其 `error.data` 包含
 `admission: "accepted"`、`reason: "executionGated"`、`recoveryRequired: true`
 和权威 `receipt`。消息已经保存，不要作为新输入重发。重连后以相同
 `_meta.zuno.messageId` 重试，只会观察原回执。
@@ -193,10 +226,37 @@ gated 且未应用 anchor 绑定到新周期，不会重复插入原文。直到
 这不改变普通 Stop 的边界：下一条新消息可正常运行。中断 Goal 仍需显式 Goal 恢复控制，
 旧周期 callback 也不能复活已停止的工作。
 
-自动识别旧普通停止要求没有失败桥接，且原始周期、原生事件及时间证据充分。
-既有 v0.10.32 failed 桥接缺少完整的前序暂停来源；这些桥接和未知暂停仍保留门禁。
-普通 Work 恢复需要显式 `/resume`，并通过上述全部审计，不会重开旧 `failed` 回执。
-上文的重连与恢复行为适用于本补丁中回执保持 `recorded` 的新 gated 输入。
+重连、普通输入和升级不会自动解锁旧暂停或误阻塞。既有 failed 桥接保持 failed，
+来源未知的门禁仍保留；普通 `/resume` 继续执行上述检查。数据库格式 15 不变，
+本次行为不增加迁移或自动改写旧状态。
+
+### 离线修复单条已证实的误阻塞
+
+独立 CLI 使用当前配置指向的既有数据库。提供确切 session／input ID，并将 `N` 替换为
+只读检查返回的正整数 `expectedRevision`：
+
+```sh
+zuno session repair SESSION --input INPUT --dry-run
+zuno session repair SESSION --input INPUT --apply --expected-revision N
+```
+
+默认只检查。`--apply` 与 `--dry-run` 互斥，且必须提供 `--expected-revision`；
+这里是执行状态 revision，不是 question 或 input revision。应用前关闭所有持有数据库的
+ACP、TUI、server 及其他进程，包括空闲连接。应用要求 SQLite 独占访问和原生恢复租约，
+随后在一个事务中重新验证完整证据。
+
+只接受确切可证为误阻塞的真实用户输入：它已 `consumed`，回执为 `recorded`，
+从未应用或绑定到 provider turn。原生证据不完整或有歧义、revision 过期、并发工作、
+真实保护门禁及未知副作用都会被拒绝。旧 `failed`、`cancelled`、`applied` 或
+`completed` 回执不会重开。
+
+应用只排入一个审计过的恢复控制，保留原 consumed 输入和真实执行绑定前仍可见的 gate。
+它不重排队或重插入原输入、不重放工具、不修改 Goal、不创建数据库，也不迁移格式 15。
+成功返回 `control_queued`，只证明控制已准入，不证明输入已应用或 provider 成功。
+仅当确切的控制仍为 `queued`，且完整证据与执行快照未变时，重复调用才以
+`already_queued` 幂等返回，不重复写入或准入。控制已推进或原输入已绑定／应用后，
+修复拒绝重投；之后仍需观察原生控制与输入回执。
+修复命令本身不会启动 provider 请求。
 
 ## Goal 续跑
 

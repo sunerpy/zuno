@@ -1,12 +1,12 @@
 //! Durable machine phase and Plan reconciliation decisions.
 //!
 //! User-visible Plan steps describe strategic outcomes. This driver records the
-//! machine-owned execution phase separately, then decides from typed durable
-//! state whether a host may finish, should recover, must wait for background
-//! completion, or should pause after durable evidence of no progress. An
-//! merely unfinished Plan or blocked Todo is not executable work. The host supplies
-//! runnable-work evidence; session scheduling gates precede both ordinary and
-//! Goal continuation, without interpreting assistant prose.
+//! machine-owned execution phase separately after a genuine provider final.
+//! Ordinary cycles finish without changing Plan/Todo status, including unfinished
+//! or runnable work. The host drives foreground waits and tool follow-up before
+//! reconciliation. Typed waits and protected pauses precede completion; only an
+//! active owned Goal continues, with durable no-progress enforcement. None of
+//! these decisions interpret assistant prose.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -92,7 +92,7 @@ pub struct PlanReconciliationInput {
     /// stable execution/job ID and origin cycle, not a completion receipt key
     /// containing a terminal timestamp. Only an `External` reference is valid.
     pub background_wait: Option<SessionWaitReference>,
-    /// A durable Goal remains active and owns continuation.
+    /// The host verified that this cycle owns an active durable Goal.
     pub goal_active: bool,
     /// A read-only Plan Agent completed its planning turn and is handing the
     /// durable Plan/Todos to a later Start Work turn.
@@ -113,13 +113,10 @@ impl PlanReconciliationInput {
 /// Host action selected from durable Plan/Todo/Job/Goal state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanReconciliationDecision {
+    /// Finish this cycle without marking unfinished Plan/Todo steps complete.
     Finish,
+    /// Continue execution for the host-verified active Goal.
     ContinueGoal,
-    /// Recover authorized ordinary work. `attempt` is the current consecutive
-    /// unchanged-progress observation and resets when the fingerprint changes.
-    ContinueOrdinary {
-        attempt: u8,
-    },
 }
 
 /// Detailed reconciliation outcome used by the execution-state controller.
@@ -329,16 +326,43 @@ impl PlanReconciliationDriver {
         })
     }
 
-    /// Reconcile durable state with explicit execution authorization and a
-    /// stable fingerprint of runnable Todo/dependency/queued-work progress.
+    /// Compose a captured Goal failure's retry phase with its native transaction,
+    /// so a later control cannot lend its cycle to the earlier failure.
+    pub fn waiting_retry_in(
+        transaction: &Transaction<'_>,
+        session_id: &str,
+        cycle_id: &str,
+        reason: &str,
+    ) -> Result<bool, DbError> {
+        let state = execution_in(transaction, session_id)?;
+        if execution_cycle(&state) != Some(cycle_id) || scheduling_outcome(&state).is_some() {
+            return Ok(false);
+        }
+        let progress = progress_in(transaction, &state)?;
+        record_in(
+            transaction,
+            session_id,
+            cycle_id,
+            DriverPhase::WaitingRetry,
+            Some(reason),
+            progress.as_ref(),
+            None,
+        )?;
+        Ok(true)
+    }
+
+    /// Reconcile a genuine provider final with explicit execution authorization
+    /// and a stable fingerprint of Todo/dependency/queued-work progress.
     ///
     /// `progress_fingerprint` should be derived from authoritative durable
-    /// revisions or content digests. The driver hashes it with the typed input,
-    /// persists only the bounded digest, and pauses after three consecutive
-    /// identical observations. The streak belongs to the session, not a cycle.
-    /// Wait/pause eligibility, progress and the driver event are handled in one
-    /// transaction. Unfinished work without host-verified runnable evidence
-    /// causes a `NoExecutableWork` pause, never ordinary recovery.
+    /// revisions or content digests. For an active owned Goal, the driver hashes
+    /// it with the typed input, persists only the bounded digest, and pauses after
+    /// three consecutive identical observations. The streak belongs to the
+    /// session, not a cycle. Ordinary final completion preserves existing progress
+    /// and Plan/Todo status, even when work remains runnable or unfinished.
+    /// Wait/pause eligibility, progress and the driver event commit together.
+    /// Foreground attention waits and tool follow-up belong to the host and must
+    /// not be passed here as provider finals.
     pub fn reconcile_with_progress(
         &self,
         session_id: &str,
@@ -417,34 +441,32 @@ impl PlanReconciliationDriver {
                 return Ok(PlanReconciliationOutcome::Waiting { wait: wait.clone() });
             }
             if !input.goal_active {
-                let finished_reason = if !input.executable_work && input.settled() {
-                    Some("durable_work_settled")
+                let reason = if !input.executable_work && input.settled() {
+                    "durable_work_settled"
                 } else if !work_authorized || state.mode != CollaborationMode::Work {
-                    Some("work_not_authorized")
+                    "work_not_authorized"
                 } else {
-                    None
+                    "ordinary_final"
                 };
-                if let Some(reason) = finished_reason {
-                    persist_progress_in(
-                        transaction,
-                        &state,
-                        prior_progress.as_ref(),
-                        SessionReadiness::Completed,
-                        at_ms,
-                    )?;
-                    record_in(
-                        transaction,
-                        session_id,
-                        cycle_id,
-                        DriverPhase::Terminal,
-                        Some(reason),
-                        prior_progress.as_ref(),
-                        None,
-                    )?;
-                    return Ok(PlanReconciliationOutcome::Decision(
-                        PlanReconciliationDecision::Finish,
-                    ));
-                }
+                persist_progress_in(
+                    transaction,
+                    &state,
+                    prior_progress.as_ref(),
+                    SessionReadiness::Completed,
+                    at_ms,
+                )?;
+                record_in(
+                    transaction,
+                    session_id,
+                    cycle_id,
+                    DriverPhase::Terminal,
+                    Some(reason),
+                    prior_progress.as_ref(),
+                    None,
+                )?;
+                return Ok(PlanReconciliationOutcome::Decision(
+                    PlanReconciliationDecision::Finish,
+                ));
             }
             let fingerprint = stable_progress_fingerprint(input, progress_fingerprint);
             let unchanged_count = prior_progress.as_ref().map_or(1, |previous| {
@@ -458,13 +480,8 @@ impl PlanReconciliationDriver {
                 fingerprint,
                 unchanged_count,
             };
-            let pause_reason = if !input.goal_active && !input.executable_work {
-                Some(PlanPauseReason::NoExecutableWork)
-            } else if unchanged_count >= NO_PROGRESS_STREAK_LIMIT {
-                Some(PlanPauseReason::NoProgress)
-            } else {
-                None
-            };
+            let pause_reason = (unchanged_count >= NO_PROGRESS_STREAK_LIMIT)
+                .then_some(PlanPauseReason::NoProgress);
             let readiness = pause_reason.map_or(SessionReadiness::Ready, |reason| {
                 SessionReadiness::Paused { reason }
             });
@@ -481,31 +498,18 @@ impl PlanReconciliationDriver {
                 )?;
                 return Ok(PlanReconciliationOutcome::Paused { reason });
             }
-            let (phase, reason, decision) = if input.goal_active {
-                (
-                    DriverPhase::Executing,
-                    "active_goal_owns_continuation",
-                    PlanReconciliationDecision::ContinueGoal,
-                )
-            } else {
-                (
-                    DriverPhase::Reconciling,
-                    "authorized_work_recovery",
-                    PlanReconciliationDecision::ContinueOrdinary {
-                        attempt: bounded_attempt(unchanged_count),
-                    },
-                )
-            };
             record_in(
                 transaction,
                 session_id,
                 cycle_id,
-                phase,
-                Some(reason),
+                DriverPhase::Executing,
+                Some("active_goal_owns_continuation"),
                 Some(&progress),
                 None,
             )?;
-            Ok(PlanReconciliationOutcome::Decision(decision))
+            Ok(PlanReconciliationOutcome::Decision(
+                PlanReconciliationDecision::ContinueGoal,
+            ))
         })
     }
 
@@ -910,18 +914,30 @@ mod tests {
         }
     }
 
+    pub(super) fn active_goal() -> PlanReconciliationInput {
+        PlanReconciliationInput {
+            goal_active: true,
+            ..unfinished()
+        }
+    }
+
     #[test]
-    fn changing_progress_survives_a_driver_restart_without_requesting_human_input() {
+    fn active_goal_progress_survives_a_driver_restart_without_requesting_human_input() {
         let pool = pool();
         let first = PlanReconciliationDriver::new(Arc::clone(&pool));
         assert_eq!(first.begin("ses", "cycle").expect("begin"), "cycle");
         assert_eq!(
             first
-                .reconcile_with_progress("ses", "cycle", &unfinished(), true, "plan-revision-1", 10)
+                .reconcile_with_progress(
+                    "ses",
+                    "cycle",
+                    &active_goal(),
+                    true,
+                    "plan-revision-1",
+                    10
+                )
                 .expect("first"),
-            PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueOrdinary {
-                attempt: 1
-            })
+            PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueGoal)
         );
 
         let restarted = PlanReconciliationDriver::new(pool);
@@ -935,46 +951,66 @@ mod tests {
         );
         assert_eq!(
             restarted
-                .reconcile_with_progress("ses", "cycle", &unfinished(), true, "plan-revision-2", 30)
+                .reconcile_with_progress(
+                    "ses",
+                    "cycle",
+                    &active_goal(),
+                    true,
+                    "plan-revision-2",
+                    30
+                )
                 .expect("second"),
-            PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueOrdinary {
-                attempt: 1
-            }),
+            PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueGoal),
             "authoritative progress resets the no-progress streak"
         );
         assert_eq!(
             restarted
-                .reconcile_with_progress("ses", "cycle", &unfinished(), true, "plan-revision-3", 40)
+                .reconcile_with_progress(
+                    "ses",
+                    "cycle",
+                    &active_goal(),
+                    true,
+                    "plan-revision-3",
+                    40
+                )
                 .expect("third"),
-            PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueOrdinary {
-                attempt: 1
-            })
+            PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueGoal)
         );
         let projection = restarted.projection("ses").expect("projection").unwrap();
-        assert_eq!(projection.phase, DriverPhase::Reconciling);
+        assert_eq!(projection.phase, DriverPhase::Executing);
         assert_eq!(projection.unchanged_progress_count, 1);
         assert_eq!(projection.pause_reason, None);
     }
 
     #[test]
-    fn third_identical_fingerprint_returns_a_durable_typed_no_progress_pause() {
+    fn active_goal_third_identical_fingerprint_returns_a_durable_typed_no_progress_pause() {
         let pool = pool();
         let first = PlanReconciliationDriver::new(Arc::clone(&pool));
         assert_eq!(
             first
-                .reconcile_with_progress("ses", "cycle", &unfinished(), true, "plan-revision-1", 10)
+                .reconcile_with_progress(
+                    "ses",
+                    "cycle",
+                    &active_goal(),
+                    true,
+                    "plan-revision-1",
+                    10
+                )
                 .expect("first"),
-            PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueOrdinary {
-                attempt: 1
-            })
+            PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueGoal)
         );
         assert_eq!(
             first
-                .reconcile_with_progress("ses", "cycle", &unfinished(), true, "plan-revision-1", 20)
+                .reconcile_with_progress(
+                    "ses",
+                    "cycle",
+                    &active_goal(),
+                    true,
+                    "plan-revision-1",
+                    20
+                )
                 .expect("second"),
-            PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueOrdinary {
-                attempt: 2
-            })
+            PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueGoal)
         );
 
         let restarted = PlanReconciliationDriver::new(pool);
@@ -988,7 +1024,14 @@ mod tests {
         );
         assert_eq!(
             restarted
-                .reconcile_with_progress("ses", "cycle", &unfinished(), true, "plan-revision-1", 30)
+                .reconcile_with_progress(
+                    "ses",
+                    "cycle",
+                    &active_goal(),
+                    true,
+                    "plan-revision-1",
+                    30
+                )
                 .expect("third after restart"),
             PlanReconciliationOutcome::Paused {
                 reason: PlanPauseReason::NoProgress
@@ -1124,7 +1167,7 @@ mod tests {
     }
 
     #[test]
-    fn a_runnable_todo_enters_authorized_recovery() {
+    fn an_ordinary_final_finishes_with_a_runnable_todo() {
         // The host separately verifies runnable work; the active-Todo bit by
         // itself would also be true for a blocked Todo.
         let driver = PlanReconciliationDriver::new(pool());
@@ -1134,8 +1177,8 @@ mod tests {
 
         assert_eq!(
             decision(&driver, "ses", "cycle", &only_a_todo),
-            PlanReconciliationDecision::ContinueOrdinary { attempt: 1 },
-            "a verified runnable Todo is executable work"
+            PlanReconciliationDecision::Finish,
+            "a runnable Todo does not require another turn after an ordinary final"
         );
     }
 
@@ -1193,8 +1236,8 @@ mod tests {
         );
         assert_eq!(
             decision(&driver, "ses", "cycle", &input),
-            PlanReconciliationDecision::ContinueOrdinary { attempt: 1 },
-            "once the observer settles, the ordinary durable-work policy resumes"
+            PlanReconciliationDecision::Finish,
+            "an ordinary final finishes after the matching observer completion"
         );
     }
 

@@ -1,4 +1,4 @@
-use super::tests::{pool, unfinished};
+use super::tests::{active_goal, pool, unfinished};
 use super::*;
 use zuno_types::execution::{ContinuationToken, SessionScheduling, TurnExecutionIdentity};
 
@@ -89,15 +89,112 @@ fn external(source_id: &str, cycle_id: &str) -> SessionWaitReference {
     }
 }
 
+fn assert_ordinary_final_preserves_unfinished_work(executable_work: bool) {
+    let pool = pool();
+    let before = authorized(&pool);
+    let steps = r#"[{"id":"verify","title":"Verify result","status":"in_progress"},{"id":"deliver","title":"Deliver result","status":"pending"}]"#;
+    {
+        let connection = pool.get().expect("connection");
+        connection
+            .execute(
+                "INSERT INTO work_plan
+                 (session_id,id,revision,title,steps,time_created,time_updated)
+                 VALUES ('ses','plan-1',4,'Unfinished work',?1,1,2)",
+                [steps],
+            )
+            .expect("unfinished Plan");
+        connection
+            .execute(
+                "INSERT INTO work_item
+                 (id,session_id,plan_step_id,subject,description,status,priority,
+                  dependencies,revision,time_created,time_updated)
+                 VALUES ('todo-1','ses','verify','Verify result','Await evidence',
+                         ?1,'medium','[]',2,1,2)",
+                [if executable_work {
+                    "in_progress"
+                } else {
+                    "blocked"
+                }],
+            )
+            .expect("unfinished Todo");
+    }
+    let driver = PlanReconciliationDriver::new(Arc::clone(&pool));
+    driver.begin("ses", "origin-cycle").expect("ordinary turn");
+    let mut input = unfinished();
+    input.active_todo = true;
+    input.executable_work = executable_work;
+
+    assert_eq!(
+        reconcile(&driver, &input, "provider-final-with-unfinished-work", 10),
+        PlanReconciliationOutcome::Decision(PlanReconciliationDecision::Finish),
+        "a genuine ordinary final must not create another model turn from Plan/Todo state"
+    );
+    let completed = state(&pool);
+    assert_authority(&before, &completed);
+    assert_eq!(completed.phase, SessionExecutionPhase::Completed);
+    assert_eq!(
+        completed.scheduling.as_ref().expect("scheduling").readiness,
+        SessionReadiness::Completed
+    );
+    assert_eq!(phase(&driver).phase, DriverPhase::Terminal);
+    assert_eq!(phase(&driver).unchanged_progress_count, 0);
+    for wake in [SessionWakeSignal::Automatic, SessionWakeSignal::Recovery] {
+        assert_eq!(
+            driver
+                .begin_with_wake("ses", "synthetic-follow-up", &wake, 11)
+                .expect("late wake"),
+            None
+        );
+    }
+    let connection = pool.get().expect("connection");
+    let plan: (String, i64, i64) = connection
+        .query_row(
+            "SELECT steps,revision,time_updated FROM work_plan WHERE session_id='ses'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("Plan remains");
+    assert_eq!(plan, (steps.to_owned(), 4, 2));
+    let todo: (String, i64, i64) = connection
+        .query_row(
+            "SELECT status,revision,time_updated FROM work_item WHERE id='todo-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("Todo remains");
+    assert_eq!(
+        todo,
+        (
+            if executable_work {
+                "in_progress"
+            } else {
+                "blocked"
+            }
+            .to_owned(),
+            2,
+            2,
+        )
+    );
+}
+
+#[test]
+fn ordinary_final_finishes_with_runnable_plan_and_todo_without_completing_steps() {
+    assert_ordinary_final_preserves_unfinished_work(true);
+}
+
+#[test]
+fn ordinary_final_finishes_with_blocked_plan_and_todo_without_completing_steps() {
+    assert_ordinary_final_preserves_unfinished_work(false);
+}
+
 fn no_progress_pause(driver: &PlanReconciliationDriver) {
-    let input = unfinished();
+    let input = active_goal();
     for attempt in 1..=2 {
         assert_eq!(
             reconcile(driver, &input, "runnable-revision-1", i64::from(attempt)),
-            PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueOrdinary {
-                attempt
-            })
+            PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueGoal)
         );
+        assert_eq!(phase(driver).unchanged_progress_count, attempt);
     }
     assert_eq!(
         reconcile(driver, &input, "runnable-revision-1", 3),
@@ -108,7 +205,7 @@ fn no_progress_pause(driver: &PlanReconciliationDriver) {
 }
 
 #[test]
-fn no_goal_plan_only_and_blocked_todo_do_not_authorize_automatic_recovery() {
+fn ordinary_final_with_plan_only_or_blocked_todo_does_not_authorize_automatic_recovery() {
     for blocked_todo_only in [false, true] {
         let pool = pool();
         let before = authorized(&pool);
@@ -119,22 +216,18 @@ fn no_goal_plan_only_and_blocked_todo_do_not_authorize_automatic_recovery() {
         input.active_todo = blocked_todo_only;
         assert_eq!(
             reconcile(&driver, &input, "remaining-work", 10),
-            PlanReconciliationOutcome::Paused {
-                reason: PlanPauseReason::NoExecutableWork
-            }
+            PlanReconciliationOutcome::Decision(PlanReconciliationDecision::Finish)
         );
-        let paused = state(&pool);
-        assert_authority(&before, &paused);
-        assert_eq!(paused.phase, SessionExecutionPhase::Paused);
+        let completed = state(&pool);
+        assert_authority(&before, &completed);
+        assert_eq!(completed.phase, SessionExecutionPhase::Completed);
         assert_eq!(
-            paused.scheduling.as_ref().expect("scheduling").readiness,
-            SessionReadiness::Paused {
-                reason: PlanPauseReason::NoExecutableWork
-            }
+            completed.scheduling.as_ref().expect("scheduling").readiness,
+            SessionReadiness::Completed
         );
-        assert_eq!(phase(&driver).unchanged_progress_count, 1);
+        assert_eq!(phase(&driver).unchanged_progress_count, 0);
         assert_eq!(
-            paused
+            completed
                 .scheduling
                 .as_ref()
                 .expect("scheduling")
@@ -160,7 +253,7 @@ fn no_goal_plan_only_and_blocked_todo_do_not_authorize_automatic_recovery() {
 }
 
 #[test]
-fn authorized_queued_work_can_run_without_a_plan_todo_or_job() {
+fn ordinary_final_does_not_synthesize_continuation_for_authorized_queued_work() {
     let pool = pool();
     authorized(&pool);
     let driver = PlanReconciliationDriver::new(pool);
@@ -169,10 +262,38 @@ fn authorized_queued_work_can_run_without_a_plan_todo_or_job() {
     assert!(input.executable_work && !input.active_todo && !input.active_job);
     assert_eq!(
         reconcile(&driver, &input, "authorized-queue-revision-1", 10),
-        PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueOrdinary {
-            attempt: 1
-        })
+        PlanReconciliationOutcome::Decision(PlanReconciliationDecision::Finish)
     );
+}
+
+#[test]
+fn ordinary_final_and_active_goal_preserve_every_existing_typed_pause() {
+    for reason in [
+        PlanPauseReason::NoProgress,
+        PlanPauseReason::NoExecutableWork,
+        PlanPauseReason::User,
+        PlanPauseReason::Authentication,
+        PlanPauseReason::TurnBudget,
+        PlanPauseReason::UncertainSideEffect,
+        PlanPauseReason::Blocked,
+    ] {
+        let pool = pool();
+        let before = authorized(&pool);
+        let paused = pool
+            .transaction(|tx| {
+                session_execution::set_paused_in(tx, "ses", before.revision, reason, 10)
+            })
+            .expect("host pause");
+        let driver = PlanReconciliationDriver::new(Arc::clone(&pool));
+        for input in [unfinished(), active_goal()] {
+            assert_eq!(
+                reconcile(&driver, &input, "new-progress-cannot-clear-a-gate", 20),
+                PlanReconciliationOutcome::Paused { reason }
+            );
+            assert_eq!(state(&pool), paused);
+            assert_eq!(phase(&driver).pause_reason, Some(reason));
+        }
+    }
 }
 
 #[test]
@@ -248,15 +369,13 @@ fn paused_callback_recovery_and_user_query_preserve_the_durable_cycle_and_streak
 }
 
 #[test]
-fn callback_and_even_new_user_cycle_ids_alone_never_reset_session_progress() {
+fn callback_and_even_new_user_cycle_ids_alone_never_reset_active_goal_progress() {
     let pool = pool();
     authorized(&pool);
     let driver = PlanReconciliationDriver::new(Arc::clone(&pool));
     assert_eq!(
-        reconcile(&driver, &unfinished(), "same-runnable-state", 10),
-        PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueOrdinary {
-            attempt: 1
-        })
+        reconcile(&driver, &active_goal(), "same-runnable-state", 10),
+        PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueGoal)
     );
     assert_eq!(
         driver
@@ -270,15 +389,13 @@ fn callback_and_even_new_user_cycle_ids_alone_never_reset_session_progress() {
             .reconcile_with_progress(
                 "ses",
                 "caller-generated-new-cycle",
-                &unfinished(),
+                &active_goal(),
                 true,
                 "same-runnable-state",
                 12
             )
             .expect("same runnable state"),
-        PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueOrdinary {
-            attempt: 2
-        })
+        PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueGoal)
     );
     assert_eq!(phase(&driver).cycle_id, "origin-cycle");
     assert_eq!(
@@ -287,7 +404,7 @@ fn callback_and_even_new_user_cycle_ids_alone_never_reset_session_progress() {
     );
     assert_eq!(phase(&driver).unchanged_progress_count, 2);
     assert_eq!(
-        reconcile(&driver, &unfinished(), "same-runnable-state", 13),
+        reconcile(&driver, &active_goal(), "same-runnable-state", 13),
         PlanReconciliationOutcome::Paused {
             reason: PlanPauseReason::NoProgress
         }
@@ -302,31 +419,39 @@ fn callback_and_even_new_user_cycle_ids_alone_never_reset_session_progress() {
 }
 
 #[test]
-fn runnable_content_change_resets_streak_but_loss_of_runnable_work_pauses() {
+fn active_goal_progress_resets_on_changed_evidence_and_still_bounds_non_runnable_work() {
     let pool = pool();
     authorized(&pool);
     let driver = PlanReconciliationDriver::new(Arc::clone(&pool));
-    let input = unfinished();
+    let input = active_goal();
     reconcile(&driver, &input, "runnable-revision-1", 10);
     reconcile(&driver, &input, "runnable-revision-1", 11);
     assert_eq!(
         reconcile(&driver, &input, "runnable-revision-2", 12),
-        PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueOrdinary {
-            attempt: 1
-        })
+        PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueGoal)
     );
     let previous = state(&pool).scheduling.expect("progress");
     let mut blocked = input;
     blocked.executable_work = false;
     assert_eq!(
         reconcile(&driver, &blocked, "runnable-revision-2", 13),
-        PlanReconciliationOutcome::Paused {
-            reason: PlanPauseReason::NoExecutableWork
-        }
+        PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueGoal),
+        "an active Goal can continue without a runnable Plan/Todo"
     );
     let current = state(&pool).scheduling.expect("progress");
     assert_ne!(current.progress_fingerprint, previous.progress_fingerprint);
     assert_eq!(current.unchanged_progress_count, 1);
+    assert_eq!(
+        reconcile(&driver, &blocked, "runnable-revision-2", 14),
+        PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueGoal)
+    );
+    assert_eq!(
+        reconcile(&driver, &blocked, "runnable-revision-2", 15),
+        PlanReconciliationOutcome::Paused {
+            reason: PlanPauseReason::NoProgress
+        },
+        "the active Goal still pauses when the same non-runnable state makes no progress"
+    );
 }
 
 #[test]
@@ -359,9 +484,7 @@ fn explicit_resume_lifts_the_pause_without_fabricating_progress_or_new_authority
         );
         assert_eq!(phase(&driver).unchanged_progress_count, 3);
         let expected = if changed {
-            PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueOrdinary {
-                attempt: 1,
-            })
+            PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueGoal)
         } else {
             PlanReconciliationOutcome::Paused {
                 reason: PlanPauseReason::NoProgress,
@@ -370,7 +493,7 @@ fn explicit_resume_lifts_the_pause_without_fabricating_progress_or_new_authority
         assert_eq!(
             reconcile(
                 &driver,
-                &unfinished(),
+                &active_goal(),
                 if changed {
                     "runnable-revision-2"
                 } else {
@@ -388,7 +511,7 @@ fn ordinary_required_question_waits_and_only_its_matching_answer_resumes() {
     let pool = pool();
     let before = authorized(&pool);
     let driver = PlanReconciliationDriver::new(Arc::clone(&pool));
-    reconcile(&driver, &unfinished(), "runnable-revision-1", 10);
+    driver.begin("ses", "origin-cycle").expect("ordinary turn");
     let waiting = wait(&pool, human("required-request"));
     let mut input = unfinished();
     for goal_active in [false, true] {
@@ -441,7 +564,7 @@ fn ordinary_required_question_waits_and_only_its_matching_answer_resumes() {
         state(&pool).scheduling.expect("scheduling").readiness,
         SessionReadiness::Ready
     );
-    assert_eq!(phase(&driver).unchanged_progress_count, 1);
+    assert_eq!(phase(&driver).unchanged_progress_count, 0);
 }
 
 #[test]
@@ -638,7 +761,7 @@ fn completed_new_human_input_starts_a_bound_background_cycle_but_paused_status_d
             let pool = pool();
             authorized(&pool);
             let driver = PlanReconciliationDriver::new(Arc::clone(&pool));
-            reconcile(&driver, &unfinished(), "old-runnable-work", 10);
+            driver.begin("ses", "origin-cycle").expect("ordinary turn");
             let mut finished = unfinished();
             finished.plan_terminal = true;
             finished.executable_work = false;
@@ -681,7 +804,7 @@ fn completed_new_human_input_starts_a_bound_background_cycle_but_paused_status_d
                     .expect("completed progress")
                     .progress_fingerprint
             );
-            assert_eq!(scheduling.unchanged_progress_count, 1);
+            assert_eq!(scheduling.unchanged_progress_count, 0);
             assert_eq!(phase(&driver).cycle_id, "new-human-cycle");
 
             let mut new_work = unfinished();
@@ -710,18 +833,26 @@ fn completed_new_human_input_starts_a_bound_background_cycle_but_paused_status_d
             new_work.background_wait = None;
             assert_eq!(
                 reconcile(&driver, &new_work, "new-runnable-work", 25),
-                PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueOrdinary {
-                    attempt: 1
-                }),
-                "session admission must not claim that a Goal owns continuation"
+                PlanReconciliationOutcome::Decision(PlanReconciliationDecision::Finish),
+                "an ordinary final after the real wait does not create Goal continuation"
             );
             assert_eq!(phase(&driver).cycle_id, "new-human-cycle");
 
-            new_work.executable_work = false;
+            let completed = state(&pool);
+            pool.transaction(|tx| {
+                session_execution::set_paused_in(
+                    tx,
+                    "ses",
+                    completed.revision,
+                    PlanPauseReason::Blocked,
+                    26,
+                )
+            })
+            .expect("host records a protected block");
             assert_eq!(
                 reconcile(&driver, &new_work, "blocked-new-work", 26),
                 PlanReconciliationOutcome::Paused {
-                    reason: PlanPauseReason::NoExecutableWork
+                    reason: PlanPauseReason::Blocked
                 }
             );
             let paused = state(&pool);
@@ -744,12 +875,12 @@ fn completed_new_human_input_starts_a_bound_background_cycle_but_paused_status_d
 }
 
 #[test]
-fn progress_pause_and_resume_roll_back_when_the_driver_event_cannot_commit() {
+fn active_goal_progress_pause_and_resume_roll_back_when_the_driver_event_cannot_commit() {
     let pool = pool();
     authorized(&pool);
     let driver = PlanReconciliationDriver::new(Arc::clone(&pool));
-    reconcile(&driver, &unfinished(), "runnable-revision-1", 10);
-    reconcile(&driver, &unfinished(), "runnable-revision-1", 11);
+    reconcile(&driver, &active_goal(), "runnable-revision-1", 10);
+    reconcile(&driver, &active_goal(), "runnable-revision-1", 11);
     let before = state(&pool);
     let projection = phase(&driver);
     pool.get()
@@ -765,7 +896,7 @@ fn progress_pause_and_resume_roll_back_when_the_driver_event_cannot_commit() {
             .reconcile_with_progress(
                 "ses",
                 "origin-cycle",
-                &unfinished(),
+                &active_goal(),
                 true,
                 "runnable-revision-1",
                 12
@@ -778,7 +909,7 @@ fn progress_pause_and_resume_roll_back_when_the_driver_event_cannot_commit() {
         .expect("connection")
         .execute_batch("DROP TRIGGER reject_driver_event;")
         .expect("remove test failure");
-    reconcile(&driver, &unfinished(), "runnable-revision-1", 13);
+    reconcile(&driver, &active_goal(), "runnable-revision-1", 13);
     let paused = state(&pool);
     let projection = phase(&driver);
     pool.get()
@@ -807,7 +938,7 @@ fn progress_pause_and_resume_roll_back_when_the_driver_event_cannot_commit() {
 fn a_legacy_callback_cycle_cannot_erase_prior_progress_on_first_admission() {
     let pool = pool();
     authorized(&pool);
-    let input = unfinished();
+    let input = active_goal();
     let fingerprint = stable_progress_fingerprint(&input, "runnable-revision-1");
     pool.transaction(|tx| {
         let mut current = execution_in(tx, "ses")?;
@@ -890,13 +1021,14 @@ fn a_missing_execution_state_never_manufactures_work_authority_or_a_retry_cycle(
 }
 
 #[test]
-fn ordinary_finish_persists_completed_and_suppresses_late_unrelated_callbacks() {
+fn ordinary_finish_preserves_prior_goal_progress_and_suppresses_late_unrelated_callbacks() {
     let pool = pool();
     let before = authorized(&pool);
     let driver = PlanReconciliationDriver::new(Arc::clone(&pool));
-    let mut input = unfinished();
+    let mut input = active_goal();
     reconcile(&driver, &input, "runnable-revision-1", 10);
     let progress = state(&pool).scheduling.expect("progress");
+    input.goal_active = false;
     input.plan_terminal = true;
     input.executable_work = false;
     assert_eq!(
@@ -940,11 +1072,11 @@ fn ordinary_finish_persists_completed_and_suppresses_late_unrelated_callbacks() 
 }
 
 #[test]
-fn host_background_wait_uses_stable_execution_identity_and_keeps_no_progress_trace() {
+fn active_goal_background_wait_uses_stable_execution_identity_and_keeps_no_progress_trace() {
     let pool = pool();
     let before = authorized(&pool);
     let driver = PlanReconciliationDriver::new(Arc::clone(&pool));
-    let mut input = unfinished();
+    let mut input = active_goal();
     reconcile(&driver, &input, "same-runnable-state", 10);
     reconcile(&driver, &input, "same-runnable-state", 11);
     let prior = state(&pool).scheduling.expect("progress");
@@ -1034,16 +1166,14 @@ fn invalid_background_wait_does_not_mutate_scheduling_or_append_an_event() {
 }
 
 #[test]
-fn completed_state_and_terminal_event_commit_together() {
+fn ordinary_final_and_terminal_event_commit_together() {
     let pool = pool();
     authorized(&pool);
     let driver = PlanReconciliationDriver::new(Arc::clone(&pool));
-    let mut input = unfinished();
-    reconcile(&driver, &input, "runnable-revision-1", 10);
+    let input = unfinished();
+    driver.begin("ses", "origin-cycle").expect("ordinary turn");
     let before = state(&pool);
     let projection = phase(&driver);
-    input.executable_work = false;
-    input.plan_terminal = true;
     pool.get()
         .expect("connection")
         .execute_batch(
@@ -1124,9 +1254,7 @@ fn authoritative_cycle_survives_plan_handoff_and_new_work_control_admission() {
                     21,
                 )
                 .expect("reconcile authorized Work"),
-            PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueOrdinary {
-                attempt: 1
-            })
+            PlanReconciliationOutcome::Decision(PlanReconciliationDecision::Finish)
         );
         assert_eq!(
             state(&pool).cycle_id.as_deref(),
@@ -1145,7 +1273,7 @@ fn authoritative_cycle_is_bound_with_existing_continuation_before_begin_event() 
     let pool = pool();
     authorized(&pool);
     let driver = PlanReconciliationDriver::new(Arc::clone(&pool));
-    reconcile(&driver, &unfinished(), "same-runnable-state", 10);
+    reconcile(&driver, &active_goal(), "same-runnable-state", 10);
     let before = state(&pool);
     pool.get()
         .expect("connection")
@@ -1187,11 +1315,10 @@ fn authoritative_cycle_is_bound_with_existing_continuation_before_begin_event() 
     );
     assert_eq!(phase(&driver).cycle_id, "new-user-cycle");
     assert_eq!(
-        reconcile(&driver, &unfinished(), "same-runnable-state", 21),
-        PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueOrdinary {
-            attempt: 2
-        })
+        reconcile(&driver, &active_goal(), "same-runnable-state", 21),
+        PlanReconciliationOutcome::Decision(PlanReconciliationDecision::ContinueGoal)
     );
+    assert_eq!(phase(&driver).unchanged_progress_count, 2);
     assert_eq!(state(&pool).cycle_id.as_deref(), Some("new-user-cycle"));
     assert_eq!(phase(&driver).cycle_id, "new-user-cycle");
 }
@@ -1232,7 +1359,7 @@ fn user_cycle_binding_rolls_back_with_a_failed_begin_event() {
     let pool = pool();
     authorized(&pool);
     let driver = PlanReconciliationDriver::new(Arc::clone(&pool));
-    reconcile(&driver, &unfinished(), "runnable-state", 10);
+    driver.begin("ses", "origin-cycle").expect("ordinary turn");
     let before = state(&pool);
     let projection = phase(&driver);
     pool.get()

@@ -300,42 +300,31 @@ fn harness_guide_documents_the_native_extension_contract() {
 }
 
 #[test]
-fn reconciliation_docs_pin_durable_work_as_the_only_unreconciled_work() {
+fn reconciliation_docs_pin_ordinary_final_and_owned_goal_boundaries() {
     contains_all(
         "docs/harness-runtime.md",
         &[
-            "a session that recorded no durable work finishes on its first answer",
-            "authorized ordinary Work continues from a durable `Recovery` token",
-            "three consecutive identical fingerprints pause",
-            "Unreconciled work means durably recorded work.",
-            "A Work-mode `Optional` decision",
-            "creates no Plan, Todo, or Job settles",
+            "ordinary Work returns `Finish`",
+            "only an active Goal owned by the current cycle returns `ContinueGoal`",
+            "no_progress",
+            "genuine provider final",
         ],
     );
     contains_all(
         "docs/zh/operate/harness-runtime.md",
-        &[
-            "没有记录任何持久工作的会话在第一次回复后直接结束",
-            "已授权 Work 从 durable",
-            "连续三次",
-            "Work 模式的 `Optional` 决策不是已记录工作",
-        ],
+        &["`Finish`", "`ContinueGoal`", "`no_progress`"],
     );
     contains_all(
         "docs/guide/tools.md",
         &[
-            "authorized durable work continue from a `Recovery` token",
+            "ordinary final ends its cycle",
+            "active owned Goal",
             "three consecutive identical",
-            "records no Plan, Todo, or Job finishes on its first answer",
         ],
     );
     contains_all(
         "docs/zh/guide/tools.md",
-        &[
-            "已授权的持久工作使用 `Recovery` token 续跑",
-            "连续三次相同",
-            "没有记录任何 Plan、Todo 或 Job 的会话在第一次回复后就结束",
-        ],
+        &["普通 final 结束当前周期", "活跃 Goal", "连续三次相同"],
     );
     contains_all(
         "docs/guide/durable-state.md",
@@ -3486,8 +3475,9 @@ fn recovery_input_and_bedrock_docs_pin_the_new_boundaries() {
         "docs/guide/durable-state.md",
         &[
             "report-only host",
-            "without calling Start Work first",
-            "cannot consume a resumable pause",
+            "does not grant",
+            "Start Work authority",
+            "not apply it or resume a Goal",
         ],
     );
 }

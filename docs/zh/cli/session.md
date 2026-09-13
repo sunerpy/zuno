@@ -2,7 +2,7 @@
 
 Session 是持久的。每一条提示、工具结果和可能改变模型请求的报告都会写入本地存储，这意味着
 存储会不断增长，最终需要检视与清理。`zuno session` 就是这个面：它列出已有内容、按年龄清理，
-并删除某个确切的 session。
+删除某个确切的 session，并检查有明确证据的历史执行门禁缺陷。
 
 默认情况下列表的范围限定在当前 checkout，并且只显示根 session。由委派产生的子 session
 在你主动要求之前是隐藏的。
@@ -32,6 +32,7 @@ zuno session [OPTIONS] <COMMAND>
 | [`list`](#zuno-session-list) | |
 | [`prune`](#zuno-session-prune) | |
 | [`delete`](#zuno-session-delete) | |
+| [`repair`](#zuno-session-repair) | 检查或修复一条有明确证据的历史误阻塞 |
 | `help` | 打印本消息或给定子命令的帮助 |
 
 ### zuno session list
@@ -111,6 +112,34 @@ zuno session delete [OPTIONS] <SESSION_ID>
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
 | `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | 随平台解析 |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
+
+### zuno session repair
+
+```sh
+zuno session repair <SESSION_ID> --input <INPUT_ID> --dry-run
+zuno session repair <SESSION_ID> --input <INPUT_ID> --apply --expected-revision <N>
+```
+
+默认只检查：只读打开已有的 format-15 数据库，不迁移、不调用模型。`--apply` 必须提供
+刚检查的**执行状态 revision**，不能与 `--dry-run` 同用，并且需要独占、离线访问数据库。
+
+| 选项 | 含义 |
+| --- | --- |
+| `--input <INPUT_ID>` | 要检查的确切已保存输入 |
+| `--dry-run` | 只检查，也是默认行为 |
+| `--apply` | 重新核验后执行有界原生修复 |
+| `--expected-revision <N>` | 与 `--apply` 一起使用的正数执行状态 revision |
+
+仅当普通用户输入已经 consumed、回执仍为 recorded 且从未 applied，并且结构化事件链
+证明它继承了旧版「可重试错误被误写为 blocked」缺陷时，才允许修复。活跃执行、未知结果、
+真实审批／Plan／认证／预算／Goal 门禁、变化的证据或无法证明的历史均会被拒绝。
+应用前应关闭占用该数据库的全部 Zuno 宿主并备份数据库，不只是目标会话；
+此命令不能绕过这些检查。
+
+成功应用仅排入一个携带原输入 ID 的审计恢复控制，不把 consumed 用户行重新入队，
+不重放失败工具，不恢复旧 Goal，也不声称模型已经处理。通过正常原生客户端重新打开会话
+后处理该控制；查看原输入的回执，不要重复发送文本。
+所有权与恢复约定见[持久状态](/zh/guide/durable-state)。
 
 ## 示例
 

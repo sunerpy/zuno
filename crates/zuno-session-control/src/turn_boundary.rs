@@ -137,20 +137,27 @@ impl SessionControlService {
                 detail: "user promotion has no durable input".to_owned(),
             }
         })?;
+        let answer = zuno_db::inbox::DurableInputKind::classify(&input.prompt)
+            == Some(zuno_db::inbox::DurableInputKind::HumanRequestAnswer)
+            && matches!(
+                zuno_db::session_wake::signal_in(tx, &input)?,
+                Some(zuno_types::execution::SessionWakeSignal::UserAnswer { .. })
+            );
         if input.state != zuno_db::inbox::SubmissionState::Promoted
             || !matches!(
                 input.trigger_kind,
                 InputTriggerKind::User | InputTriggerKind::Legacy
             )
-            || !matches!(
-                zuno_db::inbox::DurableInputKind::classify(&input.prompt),
-                Some(
-                    zuno_db::inbox::DurableInputKind::User
-                        | zuno_db::inbox::DurableInputKind::TuiPrompt
-                        | zuno_db::inbox::DurableInputKind::AcpPrompt
-                        | zuno_db::inbox::DurableInputKind::HostMessage
-                )
-            )
+            || (!answer
+                && !matches!(
+                    zuno_db::inbox::DurableInputKind::classify(&input.prompt),
+                    Some(
+                        zuno_db::inbox::DurableInputKind::User
+                            | zuno_db::inbox::DurableInputKind::TuiPrompt
+                            | zuno_db::inbox::DurableInputKind::AcpPrompt
+                            | zuno_db::inbox::DurableInputKind::HostMessage
+                    )
+                ))
         {
             return Err(SessionControlError::CorruptState {
                 session_id: session_id.to_owned(),
@@ -172,12 +179,38 @@ impl SessionControlService {
         let uncertain = !zuno_db::message::MessageStore::new(tx)
             .pending_uncertain_tool_calls(session_id, 0)?
             .is_empty();
+        let ordinary_question_wait = if state.mode == CollaborationMode::Work
+            && let Some(SessionReadiness::WaitingHuman { request_id }) =
+                state.scheduling.as_ref().map(|s| &s.readiness)
+        {
+            // Retain the old form and its owning cycle. It is not an approval,
+            // Goal wait or a prohibition on independent user requests.
+            match zuno_db::question::get_in(tx, session_id, request_id) {
+                Ok(question) => {
+                    question.origin.goal_id.is_none()
+                        && matches!(
+                            question.purpose,
+                            zuno_types::question::QuestionPurpose::RequiredInput
+                                | zuno_types::question::QuestionPurpose::Clarification
+                        )
+                }
+                Err(zuno_tool::question::QuestionError::NotFound { .. }) => false,
+                Err(error) => {
+                    return Err(SessionControlError::CorruptState {
+                        session_id: session_id.to_owned(),
+                        detail: error.to_string(),
+                    });
+                }
+            }
+        } else {
+            false
+        };
         let protected =
             state
                 .scheduling
                 .as_ref()
                 .is_some_and(|scheduling| match scheduling.readiness {
-                    SessionReadiness::WaitingHuman { .. } => true,
+                    SessionReadiness::WaitingHuman { .. } => !ordinary_question_wait,
                     SessionReadiness::Paused { reason } => match reason {
                         SessionPauseReason::User => !proven_cancel,
                         SessionPauseReason::Authentication
@@ -339,72 +372,82 @@ impl SessionControlService {
         at_ms: i64,
     ) -> Result<(), SessionControlError> {
         self.pool.try_transaction(|tx| {
-            let Some(mut cycle) = session_work_cycle::read_in(tx, session_id, cycle_id)? else {
-                return Ok(());
-            };
-            if cycle.stopped.is_some() {
-                return Ok(());
-            }
-            if turn_id.is_some_and(|turn_id| cycle.active_turn_id.as_deref() != Some(turn_id)) {
-                // A late terminal callback from T1 cannot stop T2, including
-                // same-cycle foreground continuation and compaction recovery.
-                return Ok(());
-            }
-            use rusqlite::OptionalExtension as _;
-            let input_id = tx
-                .query_row(
+            Self::stop_cycle_in(tx, session_id, cycle_id, turn_id, user_cancelled, at_ms)
+        })
+    }
+
+    pub(crate) fn stop_cycle_in(
+        tx: &zuno_db::Transaction<'_>,
+        session_id: &str,
+        cycle_id: &str,
+        turn_id: Option<&str>,
+        user_cancelled: bool,
+        at_ms: i64,
+    ) -> Result<(), SessionControlError> {
+        let Some(mut cycle) = session_work_cycle::read_in(tx, session_id, cycle_id)? else {
+            return Ok(());
+        };
+        if cycle.stopped.is_some() {
+            return Ok(());
+        }
+        if turn_id.is_some_and(|turn_id| cycle.active_turn_id.as_deref() != Some(turn_id)) {
+            // A late terminal callback from T1 cannot stop T2, including
+            // same-cycle foreground continuation and compaction recovery.
+            return Ok(());
+        }
+        use rusqlite::OptionalExtension as _;
+        let input_id = tx
+            .query_row(
                 "SELECT i.id FROM session_input i JOIN session_input_receipt r ON r.input_id=i.id \
                  WHERE i.session_id=?1 AND i.cycle_id=?2 \
                    AND (r.turn_id=?3 OR (?3 IS NULL AND r.turn_id IS NULL)) \
                  ORDER BY i.admitted_seq DESC LIMIT 1",
                 rusqlite::params![session_id, cycle_id, turn_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(open::map_error)?;
-            cycle.stopped = Some(CycleStop {
-                turn_id: turn_id.map(str::to_owned),
-                input_id,
-                user_cancelled,
-                at_ms,
-            });
-            let current = read_in(tx, session_id)?;
-            if let Some(state) = current.filter(|state| state.cycle_id.as_deref() == Some(cycle_id))
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(open::map_error)?;
+        cycle.stopped = Some(CycleStop {
+            turn_id: turn_id.map(str::to_owned),
+            input_id,
+            user_cancelled,
+            at_ms,
+        });
+        let current = read_in(tx, session_id)?;
+        if let Some(state) = current.filter(|state| state.cycle_id.as_deref() == Some(cycle_id)) {
+            cycle.scheduling = state.scheduling.clone();
+            // Preserve real barriers. Otherwise stopping this cycle closes it,
+            // not the conversation; automatic wake rejects Completed.
+            if state
+                .scheduling
+                .as_ref()
+                .is_none_or(|s| s.readiness == SessionReadiness::Ready)
             {
-                cycle.scheduling = state.scheduling.clone();
-                // Preserve real barriers. Otherwise stopping this cycle closes it,
-                // not the conversation; automatic wake rejects Completed.
-                if state
-                    .scheduling
-                    .as_ref()
-                    .is_none_or(|s| s.readiness == SessionReadiness::Ready)
-                {
-                    zuno_db::session_execution::set_scheduling_in(
-                        tx,
-                        session_id,
-                        state.revision,
-                        SessionScheduling {
-                            readiness: SessionReadiness::Completed,
-                            ..Default::default()
-                        },
-                        at_ms,
-                    )?;
-                }
+                zuno_db::session_execution::set_scheduling_in(
+                    tx,
+                    session_id,
+                    state.revision,
+                    SessionScheduling {
+                        readiness: SessionReadiness::Completed,
+                        ..Default::default()
+                    },
+                    at_ms,
+                )?;
             }
-            session_work_cycle::save_in(tx, &cycle, at_ms)?;
-            zuno_db::event_log::append_in(
-                tx,
-                session_id,
-                zuno_db::event_log::NewSessionEvent::new(
-                    "session.work_cycle.stopped",
-                    json!({"cycle":cycle,"time":at_ms})
-                        .as_object()
-                        .expect("object")
-                        .clone(),
-                )?,
-            )?;
-            Ok(())
-        })
+        }
+        session_work_cycle::save_in(tx, &cycle, at_ms)?;
+        zuno_db::event_log::append_in(
+            tx,
+            session_id,
+            zuno_db::event_log::NewSessionEvent::new(
+                "session.work_cycle.stopped",
+                json!({"cycle":cycle,"time":at_ms})
+                    .as_object()
+                    .expect("object")
+                    .clone(),
+            )?,
+        )?;
+        Ok(())
     }
 }
 

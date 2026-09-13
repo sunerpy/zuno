@@ -303,7 +303,7 @@ impl QuestionBroker {
         };
         let mut pending = Vec::new();
         for session in sessions {
-            match service.pending(session).await {
+            match service.visible(session).await {
                 Ok(questions) => pending.extend(questions),
                 Err(error) => {
                     self.publish(PresenterUpdate::Error(format!(
@@ -345,6 +345,10 @@ impl QuestionPort for QuestionBroker {
 
     async fn pending(&self, session_id: &str) -> QuestionResult<Vec<QuestionView>> {
         self.service()?.pending(session_id).await
+    }
+
+    async fn visible(&self, session_id: &str) -> QuestionResult<Vec<QuestionView>> {
+        self.service()?.visible(session_id).await
     }
 
     async fn wait_for_change(
@@ -608,9 +612,10 @@ impl QuestionBridge {
     fn open_question(&mut self, view: QuestionView) {
         if view.state != QuestionState::Pending {
             self.toasts.push(Toast::info(format!(
-                "question {} is already {}",
+                "question {}: {} · {}",
                 view.id,
                 view.state.as_str(),
+                question_delivery_label(&view),
             )));
             return;
         }
@@ -695,19 +700,20 @@ impl QuestionBridge {
                         .map_or("Question", |item| { item.question.header.as_str() }),
                 ))
                 .described(format!(
-                    "{} · {} · {answered}/{} answered · {drafted} draft · revision {} · {}",
+                    "{} · {} · {answered}/{} answered · {drafted} draft · revision {} · {} · {}",
                     question.purpose.as_str(),
                     question.mode.as_str(),
                     question.questions.len(),
                     question.revision,
                     question.origin.session_id,
+                    question_delivery_label(question),
                 ))
                 .valued(question.id.clone())
             })
             .collect();
         let dialog = SelectDialog::new(
             QUESTIONS_DIALOG_ID,
-            format!("Questions ({} pending)", self.pending.len()),
+            format!("Questions ({} entries)", self.pending.len()),
             self.context.clone(),
             items,
         );
@@ -739,7 +745,7 @@ impl QuestionBridge {
                 PresenterUpdate::Pending(pending) => {
                     if pending.len() != self.pending.len() {
                         self.toasts.push(Toast::info(format!(
-                            "{} pending question(s) · /questions to reopen",
+                            "{} question/status entries · /questions to inspect",
                             pending.len(),
                         )));
                     }
@@ -796,8 +802,9 @@ impl QuestionBridge {
                     .pending
                     .iter()
                     .find(|view| {
-                        (view.mode == QuestionMode::Blocking
-                            || view.purpose == QuestionPurpose::GoalResume)
+                        view.state == QuestionState::Pending
+                            && (view.mode == QuestionMode::Blocking
+                                || view.purpose == QuestionPurpose::GoalResume)
                             && !self.seen.contains(&view.id)
                     })
                     .cloned()
@@ -814,6 +821,18 @@ impl QuestionBridge {
         } else {
             EventResult::IGNORED
         }
+    }
+}
+
+fn question_delivery_label(view: &QuestionView) -> &'static str {
+    use zuno_types::question::QuestionDeliveryPhase;
+    match view.delivery.as_ref().map(|delivery| delivery.phase) {
+        Some(QuestionDeliveryPhase::WaitingAnswer) => "waiting for answer",
+        Some(QuestionDeliveryPhase::AnsweredPendingDelivery) => {
+            "answer saved; pending model delivery"
+        }
+        Some(QuestionDeliveryPhase::Applied) => "answer applied to model request",
+        None => "delivery unknown",
     }
 }
 

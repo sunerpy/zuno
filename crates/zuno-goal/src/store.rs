@@ -2214,36 +2214,58 @@ impl GoalStore {
         scheduled_at_ms: i64,
         entropy: u64,
     ) -> Result<Option<GoalRetryState>, GoalError> {
-        let state = self.pool.transaction(|tx| {
-            let goal_id = tx
-                .query_row(
-                    "SELECT goal_id FROM goal WHERE session_id = ?1 AND status = 'active'",
-                    params![session_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(zuno_db::map_error)?;
-            let Some(goal_id) = goal_id else {
-                return Ok(None);
-            };
-            let previous = tx
-                .query_row(
-                    "SELECT attempt FROM goal_retry \
+        self.pool.try_transaction(|tx| {
+            Self::schedule_retry_in(
+                tx,
+                session_id,
+                reason,
+                retry_after,
+                policy,
+                scheduled_at_ms,
+                entropy,
+            )
+        })
+    }
+
+    /// Compose a retry with its native work-cycle settlement in one transaction.
+    pub fn schedule_retry_in(
+        tx: &Transaction<'_>,
+        session_id: &str,
+        reason: GoalRetryReason,
+        retry_after: Option<std::time::Duration>,
+        policy: GoalRetryPolicy,
+        scheduled_at_ms: i64,
+        entropy: u64,
+    ) -> Result<Option<GoalRetryState>, GoalError> {
+        let goal_id = tx
+            .query_row(
+                "SELECT goal_id FROM goal WHERE session_id = ?1 AND status = 'active'",
+                params![session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(zuno_db::map_error)?;
+        let Some(goal_id) = goal_id else {
+            return Ok(None);
+        };
+        let previous = tx
+            .query_row(
+                "SELECT attempt FROM goal_retry \
                      WHERE session_id = ?1 AND goal_id = ?2",
-                    params![session_id, goal_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()
-                .map_err(zuno_db::map_error)?;
-            let attempt = previous
-                .and_then(|value| u32::try_from(value).ok())
-                .unwrap_or_default()
-                .saturating_add(1);
-            let delay = policy.delay(attempt, retry_after, entropy);
-            let delay_ms = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX);
-            let retry_at_ms = scheduled_at_ms.saturating_add(delay_ms);
-            tx.execute(
-                "INSERT INTO goal_retry (
+                params![session_id, goal_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(zuno_db::map_error)?;
+        let attempt = previous
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or_default()
+            .saturating_add(1);
+        let delay = policy.delay(attempt, retry_after, entropy);
+        let delay_ms = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX);
+        let retry_at_ms = scheduled_at_ms.saturating_add(delay_ms);
+        tx.execute(
+            "INSERT INTO goal_retry (
                     session_id, goal_id, attempt, reason, delay_ms,
                     retry_at_ms, scheduled_at_ms
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -2254,28 +2276,91 @@ impl GoalStore {
                     delay_ms = excluded.delay_ms,
                     retry_at_ms = excluded.retry_at_ms,
                     scheduled_at_ms = excluded.scheduled_at_ms",
-                params![
-                    session_id,
-                    goal_id,
-                    i64::from(attempt),
-                    reason.as_str(),
-                    delay_ms,
-                    retry_at_ms,
-                    scheduled_at_ms,
-                ],
-            )
-            .map_err(zuno_db::map_error)?;
-            Ok(Some(GoalRetryState {
-                session_id: session_id.to_owned(),
+            params![
+                session_id,
                 goal_id,
-                attempt,
-                reason,
+                i64::from(attempt),
+                reason.as_str(),
                 delay_ms,
                 retry_at_ms,
                 scheduled_at_ms,
-            }))
-        })?;
-        Ok(state)
+            ],
+        )
+        .map_err(zuno_db::map_error)?;
+        Ok(Some(GoalRetryState {
+            session_id: session_id.to_owned(),
+            goal_id,
+            attempt,
+            reason,
+            delay_ms,
+            retry_at_ms,
+            scheduled_at_ms,
+        }))
+    }
+
+    /// The caller holds the writer transaction and validates frozen cycle/turn
+    /// ownership. Recheck the exact Goal here; an old failure cannot affect a
+    /// paused, completed or replacement Goal.
+    pub fn settle_failure_in(
+        tx: &Transaction<'_>,
+        session_id: &str,
+        goal_id: &str,
+        failure: crate::GoalTerminalFailure,
+        policy: GoalRetryPolicy,
+        at_ms: i64,
+        entropy: u64,
+    ) -> Result<crate::GoalFailureDisposition, GoalError> {
+        use crate::{GoalFailureDisposition as Disposition, GoalTerminalFailure as Failure};
+        let Some(goal) = Self::goal_in(tx, session_id)?
+            .filter(|goal| goal.goal_id == goal_id && goal.status == GoalStatus::Active)
+        else {
+            return Ok(Disposition::NoActiveGoal);
+        };
+        match failure {
+            Failure::Retry {
+                reason,
+                retry_after,
+            } => {
+                Self::schedule_retry_in(tx, session_id, reason, retry_after, policy, at_ms, entropy)
+                    .map(|retry| {
+                        retry.map_or(Disposition::NoActiveGoal, Disposition::RetryScheduled)
+                    })
+            }
+            Failure::Pause(reason) => {
+                let paused = update_system_status_in(
+                    tx,
+                    session_id,
+                    SystemStatus::Paused,
+                    Some(goal.revision),
+                    at_ms,
+                )?;
+                if let Some(paused) = &paused {
+                    if paused.status == GoalStatus::Paused {
+                        upsert_pause_in(tx, paused, reason, None, at_ms)?;
+                    } else {
+                        tx.execute("DELETE FROM goal_pause WHERE session_id=?1", [session_id])
+                            .map_err(zuno_db::map_error)?;
+                    }
+                    clear_failure_and_retry_state(tx, session_id)?;
+                }
+                Ok(paused.map_or(Disposition::NoActiveGoal, Disposition::Paused))
+            }
+            Failure::Block(reason) => {
+                let mut statement = tx
+                    .prepare(BLOCK_ACTIVE_WITH_REASON)
+                    .map_err(zuno_db::map_error)?;
+                let blocked = read_optional(
+                    &mut statement,
+                    params![reason.rendered(), at_ms, session_id],
+                )?;
+                if blocked.is_some() {
+                    clear_failure_and_retry_state(tx, session_id)?;
+                    tx.execute("DELETE FROM goal_pause WHERE session_id=?1", [session_id])
+                        .map_err(zuno_db::map_error)?;
+                }
+                Ok(blocked.map_or(Disposition::NoActiveGoal, Disposition::Blocked))
+            }
+        }
     }
 
     /// Read the pending automatic retry for a session.
@@ -2689,6 +2774,44 @@ impl GoalStore {
                 session_id,
                 token_delta,
                 time_delta_seconds,
+                accounting_known,
+                now_ms,
+            )
+        })
+    }
+
+    /// Add spend only to the Goal instance captured by the caller.
+    ///
+    /// The identity check and [`Self::record_usage`]'s accounting statement share
+    /// the same `IMMEDIATE` writer transaction, so a replacement cannot interleave
+    /// between them. Returns `None` without mutation if the Goal is absent or its
+    /// ID no longer matches. Matching paused/completed Goals still receive their
+    /// spend; only an active Goal may flip to `budget_limited`.
+    ///
+    /// This does not infer ownership or a midturn accounting baseline. Callers
+    /// supply only spend attributable to `expected_goal_id`.
+    ///
+    /// # Errors
+    ///
+    /// [`GoalError::Db`] on a statement failure.
+    pub fn record_usage_for_goal(
+        &self,
+        session_id: &str,
+        expected_goal_id: &str,
+        token_delta: i64,
+        time_delta_seconds: i64,
+        accounting_known: bool,
+    ) -> Result<Option<Goal>, GoalError> {
+        let now_ms = now_ms()?;
+        self.pool.try_transaction(|tx| {
+            if goal_by_id_in(tx, session_id, expected_goal_id)?.is_none() {
+                return Ok(None);
+            }
+            record_usage_in(
+                tx,
+                session_id,
+                token_delta.max(0),
+                time_delta_seconds.max(0),
                 accounting_known,
                 now_ms,
             )

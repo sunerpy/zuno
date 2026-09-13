@@ -123,6 +123,7 @@ fn view() -> QuestionView {
         plan: None,
         decision: None,
         authorization: None,
+        delivery: None,
         time_created: 100,
         time_updated: 200,
     }

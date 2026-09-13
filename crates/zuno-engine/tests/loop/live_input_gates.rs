@@ -100,6 +100,19 @@ async fn drive_message(
     message: SoftInterruptMessage,
     turn_id: &str,
 ) -> (Vec<TurnEvent>, Vec<CompletionRequest>) {
+    // The production host freezes this actual turn before invoking the engine.
+    // Gate tests must not accidentally fail because the fixture still names an
+    // earlier turn instead of exercising its intended Goal/input boundary.
+    pool.transaction(|tx| {
+        if let Some(mut scope) = zuno_db::session_work_cycle::current_in(tx, SESSION_ID)?
+            && scope.stopped.is_none()
+        {
+            scope.active_turn_id = Some(turn_id.to_owned());
+            zuno_db::session_work_cycle::save_in(tx, &scope, 20)?;
+        }
+        Ok(())
+    })
+    .unwrap();
     let runs = SessionRunRegistry::new();
     let guard = runs.begin_turn(SESSION_ID).expect("live lease");
     runs.queue_soft_interrupt(SESSION_ID, message)

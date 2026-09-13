@@ -213,6 +213,25 @@ pub struct InputAdmissionReceipt {
     pub time_updated: i64,
 }
 
+/// A native safe-point selection, not another input lifecycle. Application is
+/// still proven exclusively by the input receipt at provider dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InputDeliveryBatch {
+    pub session_id: String,
+    pub turn_id: String,
+    pub cycle_id: Option<String>,
+    pub inputs: Vec<InputDeliveryReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InputDeliveryReference {
+    pub input_id: String,
+    pub admitted_sequence: i64,
+    pub expected_revision: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
