@@ -35,6 +35,8 @@ export type ApprovalId = string;
 export type ApprovalState = "pending" | "automatic" | "approved" | "rejected" | "expired" | "invalidated";
 export type SharedMemoryRole = "reader" | "contributor" | "reviewer";
 export type WorkspaceId = string;
+export type SharedEvidenceKind = "user_statement" | "successful_operation";
+export type MemorySpaceId = string;
 export type InputId = string;
 export type JobPhase = "ready" | "running" | "waiting" | "paused" | "completed" | "failed" | "cancelled" | "uncertain";
 /**
@@ -82,7 +84,6 @@ export type SharedMemoryEdit =
     };
 export type SkillCaseKind = "failure" | "protection" | "general";
 export type SharedMemoryDecision = "apply" | "reject" | "undo";
-export type MemorySpaceId = string;
 export type SharedMemoryChangeState = "pending" | "applied" | "rejected" | "undone" | "invalidated";
 export type ConfigurationId = string;
 export type SkillEvaluationState = "pending_review" | "evaluating" | "passed" | "failed" | "cancelled";
@@ -144,6 +145,8 @@ export interface ApplicationProtocol {
   cancellation: CancellationReceipt;
   configure_shared_memory: ConfigureSharedMemory;
   create_session: CreateSession;
+  evidence_grant: SharedEvidenceGrant;
+  evidence_page: SharedEvidencePage;
   input_version: InputVersionView;
   install_skill: InstallSkill;
   installed_skill: InstalledSkillView;
@@ -160,9 +163,11 @@ export interface ApplicationProtocol {
   propose_skill: ProposeSkill;
   review_shared_memory: ReviewSharedMemory;
   review_skill: ReviewSkillEvaluation;
+  revoke_evidence: RevokeSharedEvidence;
   rollback_skill: RollbackSkill;
   session: SessionSummary;
   sessions: SessionPage;
+  share_evidence: ShareMemoryEvidence;
   shared_memory_change: SharedMemoryChange;
   shared_memory_page: SharedMemoryPage;
   shared_memory_space: SharedMemorySpace;
@@ -266,6 +271,21 @@ export interface CreateSession {
   requestId: RequestId;
   title: string;
   workspaceId: WorkspaceId;
+}
+export interface SharedEvidenceGrant {
+  active: boolean;
+  author: PrincipalId;
+  current: boolean;
+  evidenceDigest: string;
+  excerpt: string;
+  id: RequestId;
+  kind: SharedEvidenceKind;
+  revision: Counter;
+  spaceId: MemorySpaceId;
+}
+export interface SharedEvidencePage {
+  after?: RequestId | null;
+  items: SharedEvidenceGrant[];
 }
 export interface InputVersionView {
   version: string;
@@ -382,9 +402,14 @@ export interface MergeContentRequest {
 }
 export interface ProposeSharedMemory {
   edits: SharedMemoryEdit[];
+  evidence?: SharedEvidenceBinding[];
   expectedRevision: Counter;
   reason: string;
   requestId: RequestId;
+}
+export interface SharedEvidenceBinding {
+  content: string;
+  grants: RequestId[];
 }
 export interface ProposeSkill {
   baselineContent: string;
@@ -417,6 +442,10 @@ export interface ReviewSkillEvaluation {
   expectedDigest: string;
   requestId: RequestId;
 }
+export interface RevokeSharedEvidence {
+  expectedRevision: Counter;
+  requestId: RequestId;
+}
 export interface RollbackSkill {
   expectedRevision: Counter;
   requestId: RequestId;
@@ -443,6 +472,11 @@ export interface SessionCursor {
   sessionId: SessionId;
   updatedAt: number;
 }
+export interface ShareMemoryEvidence {
+  evidenceId: string;
+  expectedDigest: string;
+  requestId: RequestId;
+}
 export interface SharedMemoryChange {
   after: string[];
   appliedRevision?: Counter | null;
@@ -450,12 +484,17 @@ export interface SharedMemoryChange {
   baseRevision: Counter;
   before: string[];
   decidedBy?: PrincipalId | null;
+  evidence?: SharedEvidenceTransition | null;
   id: RequestId;
   policyRevision: Counter;
   reason: string;
   spaceId: MemorySpaceId;
   state: SharedMemoryChangeState;
   stateDigest: string;
+}
+export interface SharedEvidenceTransition {
+  after: SharedEvidenceBinding[];
+  before: SharedEvidenceBinding[];
 }
 export interface SharedMemoryPage {
   after?: MemorySpaceId | null;
@@ -470,6 +509,10 @@ export interface SharedMemorySpace {
   id: MemorySpaceId;
   policyRevision: Counter;
   role: SharedMemoryRole;
+  /**
+   * Reviewed entries retained for history but not eligible for current recall.
+   */
+  suppressed?: string[];
   title: string;
   workspaceId: WorkspaceId;
 }

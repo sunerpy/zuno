@@ -131,3 +131,8 @@ restoring content never activates it automatically. Route details and embedded
 resource limits are in [SKILLS.md](SKILLS.md). No App/UI is delivered.
 
 The authenticated `GET /api/v1/identity` returns only `ActorView` owner, kind and client coordinates. Remote bridges pin these coordinates when refreshing credentials. See [ACP.md](ACP.md).
+
+Shared evidence routes grant, list and revoke explicitly shared private excerpts
+through `SharedEvidenceStore`. Reviewed proposals bind entries to source grants;
+`SharedMemorySpace.suppressed` distinguishes retained history from current recall.
+See [shared evidence](SHARED_MEMORY.md#explicit-private-evidence-sharing).

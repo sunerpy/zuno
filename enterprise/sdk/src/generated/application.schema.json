@@ -33,6 +33,12 @@
     "create_session": {
       "$ref": "#/$defs/CreateSession"
     },
+    "evidence_grant": {
+      "$ref": "#/$defs/SharedEvidenceGrant"
+    },
+    "evidence_page": {
+      "$ref": "#/$defs/SharedEvidencePage"
+    },
     "input_version": {
       "$ref": "#/$defs/InputVersionView"
     },
@@ -81,6 +87,9 @@
     "review_skill": {
       "$ref": "#/$defs/ReviewSkillEvaluation"
     },
+    "revoke_evidence": {
+      "$ref": "#/$defs/RevokeSharedEvidence"
+    },
     "rollback_skill": {
       "$ref": "#/$defs/RollbackSkill"
     },
@@ -89,6 +98,9 @@
     },
     "sessions": {
       "$ref": "#/$defs/SessionPage"
+    },
+    "share_evidence": {
+      "$ref": "#/$defs/ShareMemoryEvidence"
     },
     "shared_memory_change": {
       "$ref": "#/$defs/SharedMemoryChange"
@@ -138,6 +150,10 @@
     "configure_shared_memory",
     "propose_shared_memory",
     "review_shared_memory",
+    "share_evidence",
+    "revoke_evidence",
+    "evidence_grant",
+    "evidence_page",
     "workspace",
     "session",
     "sessions",
@@ -1300,6 +1316,12 @@
             "$ref": "#/$defs/SharedMemoryEdit"
           }
         },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SharedEvidenceBinding"
+          }
+        },
         "expectedRevision": {
           "$ref": "#/$defs/Counter"
         },
@@ -1393,6 +1415,22 @@
       "required": [
         "requestId",
         "expectedDigest"
+      ]
+    },
+    "RevokeSharedEvidence": {
+      "type": "object",
+      "properties": {
+        "expectedRevision": {
+          "$ref": "#/$defs/Counter"
+        },
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "requestId",
+        "expectedRevision"
       ]
     },
     "RollbackSkill": {
@@ -1501,6 +1539,143 @@
         "updatedAt"
       ]
     },
+    "ShareMemoryEvidence": {
+      "type": "object",
+      "properties": {
+        "evidenceId": {
+          "type": "string"
+        },
+        "expectedDigest": {
+          "type": "string"
+        },
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "requestId",
+        "evidenceId",
+        "expectedDigest"
+      ]
+    },
+    "SharedEvidenceBinding": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "grants": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RequestId"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "content",
+        "grants"
+      ]
+    },
+    "SharedEvidenceGrant": {
+      "type": "object",
+      "properties": {
+        "active": {
+          "type": "boolean"
+        },
+        "author": {
+          "$ref": "#/$defs/PrincipalId"
+        },
+        "current": {
+          "type": "boolean"
+        },
+        "evidenceDigest": {
+          "type": "string"
+        },
+        "excerpt": {
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "kind": {
+          "$ref": "#/$defs/SharedEvidenceKind"
+        },
+        "revision": {
+          "$ref": "#/$defs/Counter"
+        },
+        "spaceId": {
+          "$ref": "#/$defs/MemorySpaceId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "spaceId",
+        "author",
+        "revision",
+        "kind",
+        "excerpt",
+        "evidenceDigest",
+        "active",
+        "current"
+      ]
+    },
+    "SharedEvidenceKind": {
+      "type": "string",
+      "enum": [
+        "user_statement",
+        "successful_operation"
+      ]
+    },
+    "SharedEvidencePage": {
+      "type": "object",
+      "properties": {
+        "after": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RequestId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SharedEvidenceGrant"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "items"
+      ]
+    },
+    "SharedEvidenceTransition": {
+      "type": "object",
+      "properties": {
+        "after": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SharedEvidenceBinding"
+          }
+        },
+        "before": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SharedEvidenceBinding"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "before",
+        "after"
+      ]
+    },
     "SharedMemoryChange": {
       "type": "object",
       "properties": {
@@ -1536,6 +1711,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/PrincipalId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "evidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SharedEvidenceTransition"
             },
             {
               "type": "null"
@@ -1732,6 +1917,13 @@
         },
         "role": {
           "$ref": "#/$defs/SharedMemoryRole"
+        },
+        "suppressed": {
+          "description": "Reviewed entries retained for history but not eligible for current recall.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "title": {
           "type": "string"

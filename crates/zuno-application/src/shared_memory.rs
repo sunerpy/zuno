@@ -71,6 +71,82 @@ pub struct SharedMemorySpace {
     pub digest: String,
     pub role: SharedMemoryRole,
     pub character_limit: u32,
+    /// Reviewed entries retained for history but not eligible for current recall.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suppressed: Vec<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SharedEvidenceBinding {
+    pub content: String,
+    pub grants: Vec<RequestId>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SharedEvidenceTransition {
+    pub before: Vec<SharedEvidenceBinding>,
+    pub after: Vec<SharedEvidenceBinding>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShareMemoryEvidence {
+    pub request_id: RequestId,
+    pub evidence_id: String,
+    pub expected_digest: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RevokeSharedEvidence {
+    pub request_id: RequestId,
+    pub expected_revision: Counter,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedEvidenceKind {
+    UserStatement,
+    SuccessfulOperation,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SharedEvidenceGrant {
+    pub id: RequestId,
+    pub space_id: MemorySpaceId,
+    pub author: PrincipalId,
+    pub revision: Counter,
+    pub kind: SharedEvidenceKind,
+    pub excerpt: String,
+    pub evidence_digest: String,
+    pub active: bool,
+    pub current: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SharedEvidencePage {
+    pub items: Vec<SharedEvidenceGrant>,
+    pub after: Option<RequestId>,
+}
+#[async_trait]
+pub trait SharedEvidenceStore: Send + Sync {
+    async fn share(
+        &self,
+        actor: &PrincipalScope,
+        space: &MemorySpaceId,
+        request: ShareMemoryEvidence,
+    ) -> Result<SharedEvidenceGrant, ApplicationError>;
+    async fn revoke(
+        &self,
+        actor: &PrincipalScope,
+        space: &MemorySpaceId,
+        id: &RequestId,
+        request: RevokeSharedEvidence,
+    ) -> Result<SharedEvidenceGrant, ApplicationError>;
+    async fn list(
+        &self,
+        actor: &PrincipalScope,
+        space: &MemorySpaceId,
+        after: Option<&RequestId>,
+        limit: PageSize,
+    ) -> Result<SharedEvidencePage, ApplicationError>;
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(
@@ -91,11 +167,17 @@ pub struct ProposeSharedMemory {
     pub expected_revision: Counter,
     pub edits: Vec<SharedMemoryEdit>,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<SharedEvidenceBinding>,
 }
 impl ProposeSharedMemory {
     pub fn validate(&self) -> Result<(), ApplicationError> {
         if self.edits.is_empty()
             || self.edits.len() > 32
+            || self.evidence.len() > 32
+            || self.evidence.iter().any(|binding| {
+                binding.grants.is_empty() || binding.grants.len() > 16 || binding.content.is_empty()
+            })
             || self.reason.trim().is_empty()
             || self.reason.len() > 2048
             || self.reason.contains('\0')
@@ -135,6 +217,8 @@ pub struct SharedMemoryChange {
     pub state_digest: String,
     pub decided_by: Option<PrincipalId>,
     pub applied_revision: Option<Counter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<SharedEvidenceTransition>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]

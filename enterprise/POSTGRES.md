@@ -432,3 +432,16 @@ The exact format-26 source digest is
 `4897df28fc1284381212ed51dcd9e2b5c6c7c28175bdbe791c71eabfb3f7a91e`.
 Migration preserves candidates, sessions, messages and private/shared Memory; an
 injected DDL failure leaves the previous schema and rows intact. See [SKILLS.md](SKILLS.md).
+
+## Format 28: explicitly shared evidence
+
+`shared_memory_evidence`, `shared_memory_support` and
+`shared_memory_evidence_audit` preserve bounded source grants, per-entry support
+and withdrawal audit. Namespace reads and source-owner writes have separate RLS
+rules; a departed author retains the ability to revoke their own grant. The
+application only switches transaction ownership after selecting an authorized
+grant, then returns a validity bit and already shared excerpt, never private
+source locators. Content/support/review and revoke/audit/receipt are atomic.
+The exact format-27 source digest is
+`c87cff03b870109f419207512120352792ba605b1979f94be93284f194dd8f31`; injected DDL
+failure preserves the old marker, sessions, messages, Memory and Skill rows.

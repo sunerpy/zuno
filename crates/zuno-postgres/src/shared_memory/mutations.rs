@@ -190,6 +190,8 @@ impl PostgresSharedMemoryStore {
             &operations,
         )
         .map_err(|_| invalid())?;
+        let evidence =
+            support::prepare(&mut tx, principal, id, &current.entries, &after, &request).await?;
         let mut value = SharedMemoryChange {
             id: RequestId::new(format!(
                 "smc_{}",
@@ -207,6 +209,7 @@ impl PostgresSharedMemoryStore {
             state_digest: String::new(),
             decided_by: None,
             applied_revision: None,
+            evidence,
         };
         value.state_digest = change_digest(&value);
         query(
@@ -293,6 +296,14 @@ impl PostgresSharedMemoryStore {
             _ => return Err(ApplicationError::Conflict),
         };
         if let Some(entries) = entries {
+            support::settle(
+                &mut tx,
+                principal,
+                id,
+                &value,
+                state == SharedMemoryChangeState::Undone,
+            )
+            .await?;
             let next = current
                 .document_revision
                 .0

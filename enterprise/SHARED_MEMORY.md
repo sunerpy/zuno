@@ -65,3 +65,41 @@ require explicit sharing authorization, source invalidation and review integrati
 Shared Memory grants do not grant access to the author's private sessions,
 credentials, attachments or private learning records. Disabling a space stops
 recall but preserves its history for authorized administration.
+
+## Explicit private evidence sharing
+
+`SharedEvidenceStore` grants access to one bounded, verified excerpt, not the
+author's private session. `POST /api/v1/memory/spaces/{space}/evidence` requires
+the source owner in an approved human review application, a contributor/reviewer
+role, the evidence ID and its exact digest. The private source must still exist
+and match. Grants expose the excerpt and whether it is a user statement or a
+successful operation; private session/input/operation locators are not returned.
+`GET` on the same route pages the authorized grants.
+
+`POST /api/v1/memory/spaces/{space}/evidence/{grant}/revoke` binds the author's
+request ID and expected grant revision. Withdrawal and its audit/request receipt
+commit together, including after the author leaves the space. A revoked grant is
+never reactivated by retry; sharing again requires a new explicit request.
+
+A proposal may bind exact after-state entries to grant IDs using `evidence`.
+Grant capture and organization approval are separate decisions. The change digest
+also covers the complete before/after support mapping. Applying and undoing
+content commit its support and revision atomically. Undo may restore old support,
+but cannot restore the authority or source that support depended on.
+
+Public documents retain reviewed entries and list currently `suppressed` text.
+Model recall omits an entry when none of its independent supporting grants remains
+valid. Source forgetting, changed source bytes, withdrawn sharing, departed
+authors and current organization authorization affect the next recall immediately;
+a background maintenance run is not required. Existing manual notes and explicit
+independently reviewed manual restoration do not inherit withdrawn evidence.
+Previously shared excerpts and review history remain auditable to authorized
+readers; revocation stops their reuse as active evidence.
+
+A space allows at most 1,024 grants. One changed entry may reference up to 16 grants
+and one proposal up to 32 evidence bindings. Each excerpt is at most 2,048 bytes.
+The SDK provides `shareMemoryEvidence`, `sharedMemoryEvidence` and
+`revokeSharedEvidence`. PostgreSQL preview format 28 adds forced-RLS grants, support
+and owner audit tables; the format-27 migration retains Skill installations and
+all earlier durable state. Automatic shared model maintenance remains separate
+work; private automatic extraction does not silently publish evidence.

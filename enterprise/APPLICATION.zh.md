@@ -108,3 +108,7 @@ SDK，不交付 App/UI。
 资源限制见 [SKILLS.zh.md](SKILLS.zh.md)。不交付 App/UI。
 
 已鉴权的 `GET /api/v1/identity` 仅返回 `ActorView` 所有者、主体类型和调用应用。远程桥接在刷新凭证时固定这些身份坐标，详见 [ACP.zh.md](ACP.zh.md)。
+
+共享证据路由通过 `SharedEvidenceStore` 明确授权、分页读取及撤回私人摘录。
+共享提案绑定条目与来源授权，`SharedMemorySpace.suppressed` 区分保留历史和当前
+召回。详见 [共享证据](SHARED_MEMORY.zh.md#明确授权私人证据共享)。

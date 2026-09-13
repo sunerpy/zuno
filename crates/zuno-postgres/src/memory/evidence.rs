@@ -3,104 +3,112 @@ use zuno_application::environment::{OperationCompletion, OperationPhase};
 use zuno_db::memory_evidence::MemoryEvidenceReference;
 use zuno_memory::remote::MemoryEvidenceOrigin;
 
-pub(super) struct Source {
+pub(crate) struct Source {
     pub digest: String,
     pub text: String,
     pub session: String,
     pub user_authored: bool,
 }
 
+pub(crate) async fn source_in(
+    tx: &mut Transaction<'_, Postgres>,
+    owner: &zuno_types::identity::PrincipalKey,
+    origin: &MemoryEvidenceOrigin,
+    workspace: &str,
+) -> Result<Option<Source>, Error> {
+    let result = match origin {
+        MemoryEvidenceOrigin::UserInput {
+            session_id,
+            input_id,
+        } => {
+            let row = query("SELECT i.prompt FROM zuno_enterprise_preview.input i
+                    JOIN zuno_enterprise_preview.session s ON s.tenant_id=i.tenant_id AND s.principal_id=i.principal_id AND s.id=i.session_id
+                    WHERE i.tenant_id=$1 AND i.principal_id=$2 AND i.session_id=$3 AND i.id=$4 AND s.workspace_id=$5 FOR SHARE OF i")
+                    .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str())
+                    .bind(session_id.as_str()).bind(input_id.as_str()).bind(workspace)
+                    .fetch_optional(&mut **tx).await.map_err(sql_error)?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            let prompt: Value = row.try_get("prompt").map_err(sql_error)?;
+            if prompt["kind"] != "user" {
+                return Ok(None);
+            }
+            let Some(text) = prompt.pointer("/prompt/text").and_then(Value::as_str) else {
+                return Ok(None);
+            };
+            Source {
+                digest: zuno_orchestration::sha256_json(&prompt),
+                text: text.to_owned(),
+                session: session_id.to_string(),
+                user_authored: true,
+            }
+        }
+        MemoryEvidenceOrigin::Operation { operation_id } => {
+            let row = query("SELECT o.completion,o.completion_digest,o.session_id,o.job_id FROM zuno_enterprise_preview.gateway_operation o
+                    JOIN zuno_enterprise_preview.session s ON s.tenant_id=o.tenant_id AND s.principal_id=o.principal_id AND s.id=o.session_id
+                    WHERE o.tenant_id=$1 AND o.principal_id=$2 AND o.operation_id=$3 AND s.workspace_id=$4 FOR SHARE OF o")
+                    .bind(owner.tenant_id.as_str()).bind(owner.principal_id.as_str()).bind(operation_id.as_str())
+                    .bind(workspace).fetch_optional(&mut **tx).await.map_err(sql_error)?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            let Some(raw) = row
+                .try_get::<Option<Value>, _>("completion")
+                .map_err(sql_error)?
+            else {
+                return Ok(None);
+            };
+            let completion: OperationCompletion =
+                serde_json::from_value(raw.clone()).map_err(decode_error)?;
+            completion.validate().map_err(app_error)?;
+            let digest = zuno_orchestration::sha256_json(&raw);
+            if row
+                .try_get::<Option<String>, _>("completion_digest")
+                .map_err(sql_error)?
+                .as_deref()
+                != Some(&digest)
+                || completion.lease.owner != *owner
+                || completion.lease.job_id.as_str()
+                    != row.try_get::<String, _>("job_id").map_err(sql_error)?
+                || completion.lease.session_id.as_str()
+                    != row.try_get::<String, _>("session_id").map_err(sql_error)?
+                || completion.operation.id != *operation_id
+                || completion.receipt.phase != OperationPhase::Completed
+                || completion.receipt.exit_code != Some(0)
+                || completion.receipt.cancellation_requested
+                || completion.output_truncated
+            {
+                return Ok(None);
+            }
+            // Keep chunk boundaries; joining unrelated stdout/stderr fragments
+            // must not manufacture an excerpt which never existed.
+            let text = completion
+                .output
+                .iter()
+                .map(|chunk| std::str::from_utf8(&chunk.bytes))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(decode_error)?
+                .join("\n");
+            Source {
+                digest,
+                text,
+                session: row.try_get("session_id").map_err(sql_error)?,
+                user_authored: false,
+            }
+        }
+    };
+    Ok(Some(result))
+}
+
 impl TransactionMemory {
-    /// No cached "verified" flag substitutes for these durable source facts.
     pub(super) async fn source(
         &self,
         tx: &mut Tx,
         origin: &MemoryEvidenceOrigin,
         workspace: &str,
     ) -> Result<Option<Source>, Error> {
-        let result = match origin {
-            MemoryEvidenceOrigin::UserInput {
-                session_id,
-                input_id,
-            } => {
-                let row = query("SELECT i.prompt FROM zuno_enterprise_preview.input i
-                    JOIN zuno_enterprise_preview.session s ON s.tenant_id=i.tenant_id AND s.principal_id=i.principal_id AND s.id=i.session_id
-                    WHERE i.tenant_id=$1 AND i.principal_id=$2 AND i.session_id=$3 AND i.id=$4 AND s.workspace_id=$5 FOR SHARE OF i")
-                    .bind(self.principal.tenant_id().as_str()).bind(self.principal.principal_id().as_str())
-                    .bind(session_id.as_str()).bind(input_id.as_str()).bind(workspace)
-                    .fetch_optional(&mut **tx).await.map_err(sql_error)?;
-                let Some(row) = row else {
-                    return Ok(None);
-                };
-                let prompt: Value = row.try_get("prompt").map_err(sql_error)?;
-                if prompt["kind"] != "user" {
-                    return Ok(None);
-                }
-                let Some(text) = prompt.pointer("/prompt/text").and_then(Value::as_str) else {
-                    return Ok(None);
-                };
-                Source {
-                    digest: zuno_orchestration::sha256_json(&prompt),
-                    text: text.to_owned(),
-                    session: session_id.to_string(),
-                    user_authored: true,
-                }
-            }
-            MemoryEvidenceOrigin::Operation { operation_id } => {
-                let row = query("SELECT o.completion,o.completion_digest,o.session_id,o.job_id FROM zuno_enterprise_preview.gateway_operation o
-                    JOIN zuno_enterprise_preview.session s ON s.tenant_id=o.tenant_id AND s.principal_id=o.principal_id AND s.id=o.session_id
-                    WHERE o.tenant_id=$1 AND o.principal_id=$2 AND o.operation_id=$3 AND s.workspace_id=$4 FOR SHARE OF o")
-                    .bind(self.principal.tenant_id().as_str()).bind(self.principal.principal_id().as_str()).bind(operation_id.as_str())
-                    .bind(workspace).fetch_optional(&mut **tx).await.map_err(sql_error)?;
-                let Some(row) = row else {
-                    return Ok(None);
-                };
-                let Some(raw) = row
-                    .try_get::<Option<Value>, _>("completion")
-                    .map_err(sql_error)?
-                else {
-                    return Ok(None);
-                };
-                let completion: OperationCompletion =
-                    serde_json::from_value(raw.clone()).map_err(decode_error)?;
-                completion.validate().map_err(app_error)?;
-                let digest = zuno_orchestration::sha256_json(&raw);
-                if row
-                    .try_get::<Option<String>, _>("completion_digest")
-                    .map_err(sql_error)?
-                    .as_deref()
-                    != Some(&digest)
-                    || completion.lease.owner != self.principal.owner()
-                    || completion.lease.job_id.as_str()
-                        != row.try_get::<String, _>("job_id").map_err(sql_error)?
-                    || completion.lease.session_id.as_str()
-                        != row.try_get::<String, _>("session_id").map_err(sql_error)?
-                    || completion.operation.id != *operation_id
-                    || completion.receipt.phase != OperationPhase::Completed
-                    || completion.receipt.exit_code != Some(0)
-                    || completion.receipt.cancellation_requested
-                    || completion.output_truncated
-                {
-                    return Ok(None);
-                }
-                // Keep chunk boundaries; joining unrelated stdout/stderr fragments
-                // must not manufacture an excerpt which never existed.
-                let text = completion
-                    .output
-                    .iter()
-                    .map(|chunk| std::str::from_utf8(&chunk.bytes))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(decode_error)?
-                    .join("\n");
-                Source {
-                    digest,
-                    text,
-                    session: row.try_get("session_id").map_err(sql_error)?,
-                    user_authored: false,
-                }
-            }
-        };
-        Ok(Some(result))
+        source_in(tx, &self.principal.owner(), origin, workspace).await
     }
 
     pub(super) async fn record_evidence(
