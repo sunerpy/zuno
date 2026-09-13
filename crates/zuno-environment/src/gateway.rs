@@ -1,3 +1,4 @@
+mod files;
 mod import;
 mod merge;
 mod metadata;
@@ -31,6 +32,7 @@ pub struct DockerGateway {
     authority: Arc<dyn OperationAuthority>,
     controls: Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>,
     snapshots: PathBuf,
+    file_reads: Arc<tokio::sync::Semaphore>,
 }
 impl DockerGateway {
     /// A trusted data-owner cancellation for an immutable admitted operation.
@@ -208,6 +210,7 @@ impl DockerGateway {
             authority,
             controls: Mutex::new(BTreeMap::new()),
             snapshots,
+            file_reads: Arc::new(tokio::sync::Semaphore::new(4)),
         })
     }
 

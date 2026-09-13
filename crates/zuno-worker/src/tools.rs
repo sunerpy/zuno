@@ -1,5 +1,6 @@
 //! Durable gateway tools. Preparation can wait for approval; actual submission
 //! starts only after the kernel's durable handoff and can yield an operation wait.
+mod files;
 
 use crate::{WorkerClient, WorkerExecution, gateway::GatewayClient};
 use async_trait::async_trait;
@@ -335,9 +336,17 @@ fn uncertain(operation: &CommandOperation) -> ToolDispatchOutcome {
 #[async_trait]
 impl ToolDispatcher for GatewayToolDispatcher {
     fn available_tools(&self) -> AvailableTools {
-        AvailableTools::new(vec![self.definition.clone()], McpToolStatus::Ready)
+        let mut definitions = vec![self.definition.clone()];
+        definitions.extend(files::definitions());
+        AvailableTools::new(definitions, McpToolStatus::Ready)
     }
     async fn prepare(&self, request: DispatchRequest) -> PreparedToolDispatch {
+        if request.call.name != ENVIRONMENT_COMMAND {
+            return self
+                .prepare_files(request)
+                .await
+                .unwrap_or_else(|result| PreparedToolDispatch::ready(*result));
+        }
         self.prepare_command(request)
             .await
             .unwrap_or_else(|result| PreparedToolDispatch::ready(*result))

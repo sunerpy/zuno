@@ -238,6 +238,51 @@ async fn model(
         assert!(body.to_string().contains(&format!("CHILD-VERIFIED-{name}")));
         json!({"role":"assistant","content":"Completed the approved operation."})
     } else if has_tool("native-command") {
+        if !has_tool("native-file-read") {
+            return model_response(
+                json!({"role":"assistant","tool_calls":[{
+                    "index":0,"id":"native-file-read","type":"function","function":{
+                        "name":"workspace_read","arguments":json!({"path":"native-once","offset":"0","maximumBytes":4096}).to_string()
+                    }
+                }]}),
+                false,
+            );
+        }
+        assert!(
+            messages.iter().any(|message| message["role"] == "tool"
+                && message["tool_call_id"] == "native-file-read"
+                && message["content"].to_string().contains("once")),
+            "workspace read result: {:?}",
+            messages
+                .iter()
+                .find(|message| message["tool_call_id"] == "native-file-read")
+        );
+        if !has_tool("native-file-list") {
+            return model_response(
+                json!({"role":"assistant","tool_calls":[{
+                    "index":0,"id":"native-file-list","type":"function","function":{
+                        "name":"workspace_list","arguments":json!({"path":".","limit":10}).to_string()
+                    }
+                }]}),
+                false,
+            );
+        }
+        assert!(messages.iter().any(|message| message["role"] == "tool"
+            && message["tool_call_id"] == "native-file-list"
+            && message["content"].to_string().contains("native-once")));
+        if !has_tool("native-file-search") {
+            return model_response(
+                json!({"role":"assistant","tool_calls":[{
+                    "index":0,"id":"native-file-search","type":"function","function":{
+                        "name":"workspace_search","arguments":json!({"path":".","text":"once","limit":10}).to_string()
+                    }
+                }]}),
+                false,
+            );
+        }
+        assert!(messages.iter().any(|message| message["role"] == "tool"
+            && message["tool_call_id"] == "native-file-search"
+            && message["content"].to_string().contains("native-once")));
         json!({"role":"assistant","tool_calls":[{
             "index":0,"id":"native-child","type":"function","function":{
                 "name":"task","arguments":json!({
@@ -970,7 +1015,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(approved.len(), 4);
-    assert_eq!(issuer.model_requests.load(Ordering::SeqCst), 14);
+    assert_eq!(issuer.model_requests.load(Ordering::SeqCst), 20);
     let attempts:i64=query_scalar("SELECT count(DISTINCT worker_id) FROM zuno_enterprise_preview.runtime_attempt WHERE tenant_id=$1")
         .bind(tenant.as_str()).fetch_one(&admin).await.unwrap();
     assert_eq!(attempts, 2, "both independent Workers must participate");
@@ -983,7 +1028,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
     let browser_enabled = std::env::var_os("ZUNO_ENTERPRISE_WEB_DIST").is_some();
     if browser_enabled {
         browser::verify(root, &control_url).await;
-        assert_eq!(issuer.model_requests.load(Ordering::SeqCst), 16);
+        assert_eq!(issuer.model_requests.load(Ordering::SeqCst), 22);
         let browser_operations:i64=query_scalar("SELECT count(*) FROM zuno_enterprise_preview.gateway_operation WHERE tenant_id=$1 AND completion IS NOT NULL")
             .bind(tenant.as_str()).fetch_one(&admin).await.unwrap();
         assert_eq!(
@@ -994,7 +1039,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
     workflow::verify(&http, &control_url, &tokens["alice"], &tokens["bob"]).await;
     assert_eq!(
         issuer.model_requests.load(Ordering::SeqCst),
-        if browser_enabled { 25 } else { 23 }
+        if browser_enabled { 31 } else { 29 }
     );
     let final_operations:i64=query_scalar("SELECT count(*) FROM zuno_enterprise_preview.gateway_operation WHERE tenant_id=$1 AND completion IS NOT NULL")
         .bind(tenant.as_str()).fetch_one(&admin).await.unwrap();
@@ -1002,7 +1047,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
     completion::verify(&http, &control_url, &tokens["alice"]).await;
     assert_eq!(
         issuer.model_requests.load(Ordering::SeqCst),
-        if browser_enabled { 26 } else { 24 }
+        if browser_enabled { 32 } else { 30 }
     );
     let after_completion: i64 = query_scalar(
         "SELECT count(*) FROM zuno_enterprise_preview.gateway_operation WHERE tenant_id=$1",
@@ -1018,7 +1063,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
     council::verify(&http, &control_url, &tokens["alice"], &tokens["bob"]).await;
     assert_eq!(
         issuer.model_requests.load(Ordering::SeqCst),
-        if browser_enabled { 34 } else { 32 }
+        if browser_enabled { 40 } else { 38 }
     );
     let council_operations: i64 = query_scalar(
         "SELECT count(*) FROM zuno_enterprise_preview.gateway_operation WHERE tenant_id=$1",
@@ -1035,7 +1080,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
     merge::verify(&http, &control_url, &tokens["alice"], &tokens["bob"]).await;
     assert_eq!(
         issuer.model_requests.load(Ordering::SeqCst),
-        if browser_enabled { 42 } else { 40 }
+        if browser_enabled { 48 } else { 46 }
     );
     let merged:i64=query_scalar("SELECT count(*) FROM zuno_enterprise_preview.gateway_merge_operation WHERE tenant_id=$1 AND completion IS NOT NULL")
         .bind(tenant.as_str()).fetch_one(&admin).await.unwrap();
@@ -1046,7 +1091,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
     import::verify(&http, &control_url, &tokens["alice"], &tokens["bob"]).await;
     assert_eq!(
         issuer.model_requests.load(Ordering::SeqCst),
-        if browser_enabled { 44 } else { 42 }
+        if browser_enabled { 50 } else { 48 }
     );
     let transfers: Vec<Value> = query_scalar(
         "SELECT jsonb_build_object('source',source_gateway_id,'target',target_gateway_id,

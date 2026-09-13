@@ -70,6 +70,21 @@ pub struct GatewayStateClient {
     snapshots: reqwest::Client,
 }
 impl GatewayStateClient {
+    pub async fn prepare_files(
+        &self,
+        request: zuno_application::workspace_files::GatewayFileRequest,
+    ) -> Result<ApprovalRecord, ApplicationError> {
+        let bytes = self
+            .control
+            .post(
+                GATEWAY_FILES_PREPARE_PATH,
+                None,
+                serde_json::to_vec(&request).map_err(ApplicationError::storage)?,
+            )
+            .await
+            .map_err(state_error)?;
+        serde_json::from_slice(&bytes).map_err(ApplicationError::storage)
+    }
     pub async fn import_context(
         &self,
         ticket: &zuno_identity::gateway::GatewayImportTicket,
@@ -272,6 +287,58 @@ impl GatewayStateClient {
             )
             .await
             .map_err(state_error)?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl zuno_application::workspace_files::WorkspaceFileAuthority for GatewayStateClient {
+    async fn authorize_files(
+        &self,
+        lease: &ExecutionLease,
+        environment: &Environment,
+        operation: &zuno_application::workspace_files::WorkspaceFileOperation,
+    ) -> Result<(), ApplicationError> {
+        let request = zuno_application::workspace_files::GatewayFileRequest {
+            lease: lease.clone(),
+            environment: environment.clone(),
+            operation: operation.clone(),
+        };
+        let bytes = self
+            .control
+            .post(
+                GATEWAY_FILES_AUTHORIZE_PATH,
+                None,
+                serde_json::to_vec(&request).map_err(ApplicationError::storage)?,
+            )
+            .await
+            .map_err(state_error)?;
+        let checked: CheckedApproval =
+            serde_json::from_slice(&bytes).map_err(ApplicationError::storage)?;
+        if checked.lease.owner != lease.owner
+            || checked.lease.job_id != lease.job_id
+            || checked.lease.session_id != lease.session_id
+            || checked.lease.attempt_id != lease.attempt_id
+            || checked.lease.worker != lease.worker
+            || checked.lease.epoch != lease.epoch
+            || checked.lease.checkpoint_version != lease.checkpoint_version
+            || checked.lease.expires_at_ms < lease.expires_at_ms
+            || checked.binding.operation_id != operation.id
+            || checked.binding.invocation_id != operation.invocation_id
+            || checked.binding.job_id != lease.job_id
+            || checked.binding.session_id != lease.session_id
+            || checked.binding.effect != operation.query.effect()
+            || checked.binding.arguments_sha256
+                != zuno_orchestration::sha256_json(&serde_json::json!(operation.query))
+            || checked.binding.resources_sha256
+                != zuno_orchestration::sha256_json(&serde_json::json!([
+                    environment.owner,
+                    environment.spec,
+                    environment.revision
+                ]))
+        {
+            return Err(ApplicationError::Forbidden);
+        }
         Ok(())
     }
 }
@@ -568,6 +635,17 @@ impl GatewayClient {
             (GatewayCommand::PrepareCommand { operation }, GatewayReply::Approval(approval)) => {
                 approval.binding.operation_id == operation.id
                     && approval.binding.invocation_id == operation.invocation_id
+            }
+            (GatewayCommand::PrepareFiles { operation }, GatewayReply::Approval(approval)) => {
+                approval.binding.operation_id == operation.id
+                    && approval.binding.invocation_id == operation.invocation_id
+                    && approval.binding.effect == operation.query.effect()
+                    && approval.binding.arguments_sha256
+                        == zuno_orchestration::sha256_json(&serde_json::json!(operation.query))
+            }
+            (GatewayCommand::QueryFiles { operation }, GatewayReply::Files(receipt)) => {
+                receipt.validate_for(operation).is_ok()
+                    && receipt.snapshot.environment_id == issued.assignment.environment.id
             }
             (GatewayCommand::SubmitCommand { operation }, GatewayReply::Operation(receipt)) => {
                 receipt.id == operation.id

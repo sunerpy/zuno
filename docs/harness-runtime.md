@@ -3057,7 +3057,7 @@ the target verifies bytes before its existing atomic fork publication. Merge
 imports the completed child's snapshot back to the parent gateway, retaining the
 original lineage, manifest and human approval. Receiving a snapshot cannot renew
 a lease or replay an external command. Separate bounded export/import pools
-avoid reciprocal transfer deadlocks. PostgreSQL format 19 and gateway protocol 5
+avoid reciprocal transfer deadlocks. PostgreSQL format 19 and gateway protocol 6
 carry this private contract; public activity and Worker checkpoint schemas stay
 unchanged. See the preview workspace and gateway guides.
 
@@ -3070,3 +3070,12 @@ Valid cached outcomes can be consumed after takeover without another model call;
 consent revocation fences queued/running work while retaining truthful late facts.
 Learning cannot gain foreground or gateway authority. See the preview Memory,
 Worker and deployment guides; App/UI work remains deferred to Penpot.
+
+Enterprise file reads use the `WorkspaceFileReader` / `WorkspaceFileAuthority`
+ports and typed read/list/literal-search queries. The gateway reads verified
+immutable environment snapshots, not Worker host paths, and checks current
+approval before and after the scan. `workspace_read`, `workspace_list` and
+`workspace_search` use the shared durable tool handoff and approval waits.
+Application read whitelists are separate from command/MCP authority. Lease
+renewal may extend the deadline but cannot change owner, Job, session, attempt,
+Worker, epoch or checkpoint identity. Gateway protocol 6 carries this boundary.

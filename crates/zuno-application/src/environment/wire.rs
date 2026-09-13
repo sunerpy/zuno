@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{ApplicationError, authorization::ApprovalRecord, runtime::ExecutionLease};
 
-pub const GATEWAY_PROTOCOL_VERSION: u32 = 5;
+pub const GATEWAY_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_GATEWAY_FRAME_BYTES: usize = 1024 * 1024;
 
 /// A data-owner response, never a caller-selected deployment.
@@ -54,6 +54,12 @@ pub struct GatewayOperationRequest {
 pub enum GatewayCommand {
     Acquire,
     Get,
+    PrepareFiles {
+        operation: crate::workspace_files::WorkspaceFileOperation,
+    },
+    QueryFiles {
+        operation: crate::workspace_files::WorkspaceFileOperation,
+    },
     PrepareChildWorkspace {
         child_job_id: JobId,
     },
@@ -90,6 +96,9 @@ pub enum GatewayCommand {
 impl GatewayCommand {
     pub fn validate(&self) -> Result<(), ApplicationError> {
         match self {
+            Self::PrepareFiles { operation } | Self::QueryFiles { operation } => {
+                operation.validate()
+            }
             Self::PrepareWorkspaceMerge { operation }
             | Self::SubmitWorkspaceMerge { operation } => operation.validate(),
             Self::PrepareCommand { operation } | Self::SubmitCommand { operation } => {
@@ -178,6 +187,7 @@ impl GatewayRequest {
 )]
 pub enum GatewayReply {
     Environment(Environment),
+    Files(crate::workspace_files::WorkspaceFileReceipt),
     Approval(Box<ApprovalRecord>),
     Operation(OperationReceipt),
     Output(OutputPage),
