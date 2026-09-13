@@ -50,6 +50,8 @@ mod learning;
 mod mcp;
 #[path = "processes/merge.rs"]
 mod merge;
+#[path = "processes/shared_memory.rs"]
+mod shared_memory;
 #[path = "processes/workflow.rs"]
 mod workflow;
 
@@ -186,6 +188,12 @@ async fn model(
     }
     if user.contains("MCP-PROBE") {
         return mcp::model(&body, name, &issuer);
+    }
+    if user.contains("SHARED-EXPECTED")
+        || user.contains("SHARED-REVOKED")
+        || user.contains("SHARED-CHECKPOINT")
+    {
+        return shared_memory::model(&body, &user);
     }
     if user.contains("COUNCIL-PROBE") {
         return council::model(&body);
@@ -1188,6 +1196,14 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
     )
     .await;
     mcp::verify_provider(&fixture, root, &issuer, owner("alice")).await;
+    shared_memory::verify(
+        &http,
+        &control_url,
+        &tokens["alice"],
+        &tokens["bob"],
+        &identities,
+    )
+    .await;
     for child in &mut children {
         assert!(
             tokio::process::Command::new("kill")

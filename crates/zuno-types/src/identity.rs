@@ -103,6 +103,7 @@ macro_rules! identity_id {
     };
 }
 
+identity_id!(MemorySpaceId, "An organization-owned Memory namespace.");
 identity_id!(
     TenantId,
     "An organization namespace; never inferred from a directory."

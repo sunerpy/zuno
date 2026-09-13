@@ -4,12 +4,15 @@ import type {
   SubmitTurn, InputVersionView, ApprovalView, ApprovalDecision, CancelJob, CancellationReceipt, WorkflowRunView, WorkspaceMergeView, MergeContentSide, BeginWorkspaceImport, WorkspaceImportView,
   LearningJobView, LearningPage, LearningPageRequest, CancelLearning, LearningCancellation,
   WorkspaceEditView, McpCallView,
+  SharedMemorySpace, SharedMemoryPage, SharedMemoryChange, ConfigureSharedMemory, ProposeSharedMemory, ReviewSharedMemory,
 } from "./generated/application.js";
 import {
   validateWorkspaceView, validateSessionPage, validateSessionSummary, validateJobView,
   validateInputVersionView, validateApprovalView, validateCancellationReceipt, validateWorkflowRunView, validateWorkspaceMergeView, validateMergeContentRequest, validateWorkspaceImportView,
   validateLearningJobView, validateLearningPage, validateLearningPageRequest, validateLearningCancellation,
   validateWorkspaceEditView, validateMcpCallView,
+  validateSharedMemorySpace, validateSharedMemoryPage, validateSharedMemoryChange,
+  validateConfigureSharedMemory, validateProposeSharedMemory, validateReviewSharedMemory,
 } from "./generated/application-validators.mjs";
 
 function checked<T>(value: unknown, validate: (value: unknown) => unknown): T {
@@ -22,6 +25,42 @@ function id(value: string): string {
 }
 
 export class EnterpriseClient extends ActivityClient {
+  async sharedMemorySpaces(workspace: string, after?: string, signal?: AbortSignal): Promise<SharedMemoryPage> {
+    const url=new URL(`workspaces/${id(workspace)}/memory/spaces`,this.base);
+    if (after) url.searchParams.set("after",id(after));
+    const page=checked<SharedMemoryPage>(await this.get(url,signal),validateSharedMemoryPage);
+    if (page.items.some(space=>space.workspaceId!==workspace)) throw new Error("Shared Memory workspace mismatch");
+    if (page.after && page.items.at(-1)?.id!==page.after) throw new Error("Shared Memory cursor mismatch");
+    return page;
+  }
+  async sharedMemorySpace(space: string, signal?: AbortSignal): Promise<SharedMemorySpace> {
+    const value=checked<SharedMemorySpace>(await this.get(new URL(`memory/spaces/${id(space)}`,this.base),signal),validateSharedMemorySpace);
+    if(value.id!==space) throw new Error("Shared Memory identity mismatch");
+    return value;
+  }
+  async configureSharedMemory(space: string, request: ConfigureSharedMemory, signal?: AbortSignal): Promise<SharedMemorySpace> {
+    if(!validateConfigureSharedMemory(request)) throw new Error("Invalid shared Memory configuration");
+    const value=checked<SharedMemorySpace>(await this.get(new URL(`memory/spaces/${id(space)}`,this.base),signal,"PUT",request),validateSharedMemorySpace);
+    if(value.id!==space || value.workspaceId!==request.workspaceId) throw new Error("Shared Memory identity mismatch");
+    return value;
+  }
+  async proposeSharedMemory(space: string, request: ProposeSharedMemory, signal?: AbortSignal): Promise<SharedMemoryChange> {
+    if(!validateProposeSharedMemory(request)) throw new Error("Invalid shared Memory proposal");
+    const value=checked<SharedMemoryChange>(await this.get(new URL(`memory/spaces/${id(space)}/changes`,this.base),signal,"POST",request),validateSharedMemoryChange);
+    if(value.spaceId!==space) throw new Error("Shared Memory proposal identity mismatch");
+    return value;
+  }
+  async sharedMemoryChange(space: string, change: string, signal?: AbortSignal): Promise<SharedMemoryChange> {
+    const value=checked<SharedMemoryChange>(await this.get(new URL(`memory/spaces/${id(space)}/changes/${id(change)}`,this.base),signal),validateSharedMemoryChange);
+    if(value.spaceId!==space || value.id!==change) throw new Error("Shared Memory proposal identity mismatch");
+    return value;
+  }
+  async reviewSharedMemory(space: string, request: ReviewSharedMemory, signal?: AbortSignal): Promise<SharedMemoryChange> {
+    if(!validateReviewSharedMemory(request)) throw new Error("Invalid shared Memory review");
+    const value=checked<SharedMemoryChange>(await this.get(new URL(`memory/spaces/${id(space)}/review`,this.base),signal,"POST",request),validateSharedMemoryChange);
+    if(value.spaceId!==space || value.id!==request.changeId) throw new Error("Shared Memory review identity mismatch");
+    return value;
+  }
   async mcpReview(approval: string, signal?: AbortSignal): Promise<McpCallView> {
     const value=checked<McpCallView>(await this.get(new URL(`approvals/${id(approval)}/mcp`,this.base),signal),validateMcpCallView);
     if (value.approvalId!==approval) throw new Error("MCP review identity mismatch");

@@ -303,3 +303,10 @@ schema、权限和 marker 同事务提交；已有单网关准备摘要保留原
 冻结摘要为 `89f0406fe0680077c5d10ff6835523d8fe4c984b77216f94bd4bbae97ccda926`。
 迁移保留会话、消息、Memory、学习水位与文件编辑记录，DDL 失败整体回滚。
 外部调用与网关独立日志的恢复限制见 [MCP.zh.md](MCP.zh.md)。
+
+## 格式 25：组织 Memory 命名空间
+
+共享空间、成员、审核候选、版本、幂等回执和审计使用同一 PostgreSQL 事务及强制
+命名空间 RLS。精确格式 24 升级保留个人数据和 MCP 记录，源摘要为
+`9ec0c1656e9e6518afdaf61de00b4689d4f2d603270677c942c3ada589485078`。
+权限与恢复语义见 [SHARED_MEMORY.zh.md](SHARED_MEMORY.zh.md)。

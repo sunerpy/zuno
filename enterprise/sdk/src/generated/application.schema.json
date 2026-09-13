@@ -21,6 +21,9 @@
     "cancellation": {
       "$ref": "#/$defs/CancellationReceipt"
     },
+    "configure_shared_memory": {
+      "$ref": "#/$defs/ConfigureSharedMemory"
+    },
     "create_session": {
       "$ref": "#/$defs/CreateSession"
     },
@@ -48,11 +51,26 @@
     "merge_content": {
       "$ref": "#/$defs/MergeContentRequest"
     },
+    "propose_shared_memory": {
+      "$ref": "#/$defs/ProposeSharedMemory"
+    },
+    "review_shared_memory": {
+      "$ref": "#/$defs/ReviewSharedMemory"
+    },
     "session": {
       "$ref": "#/$defs/SessionSummary"
     },
     "sessions": {
       "$ref": "#/$defs/SessionPage"
+    },
+    "shared_memory_change": {
+      "$ref": "#/$defs/SharedMemoryChange"
+    },
+    "shared_memory_page": {
+      "$ref": "#/$defs/SharedMemoryPage"
+    },
+    "shared_memory_space": {
+      "$ref": "#/$defs/SharedMemorySpace"
     },
     "submit_turn": {
       "$ref": "#/$defs/SubmitTurn"
@@ -74,6 +92,12 @@
     }
   },
   "required": [
+    "shared_memory_space",
+    "shared_memory_page",
+    "shared_memory_change",
+    "configure_shared_memory",
+    "propose_shared_memory",
+    "review_shared_memory",
     "workspace",
     "session",
     "sessions",
@@ -317,6 +341,47 @@
         "turnId",
         "stoppedJobs",
         "pendingOperations"
+      ]
+    },
+    "ConfigureSharedMemory": {
+      "type": "object",
+      "properties": {
+        "characterLimit": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "expectedRevision": {
+          "$ref": "#/$defs/Counter"
+        },
+        "members": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SharedMemoryMember"
+          }
+        },
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "title": {
+          "type": "string"
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "requestId",
+        "expectedRevision",
+        "title",
+        "workspaceId",
+        "enabled",
+        "members",
+        "characterLimit"
       ]
     },
     "CouncilPhase": {
@@ -865,6 +930,12 @@
         "admitted"
       ]
     },
+    "MemorySpaceId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
     "MergeChoice": {
       "type": "string",
       "enum": [
@@ -979,11 +1050,62 @@
         "principalId"
       ]
     },
+    "ProposeSharedMemory": {
+      "type": "object",
+      "properties": {
+        "edits": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SharedMemoryEdit"
+          }
+        },
+        "expectedRevision": {
+          "$ref": "#/$defs/Counter"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "requestId",
+        "expectedRevision",
+        "edits",
+        "reason"
+      ]
+    },
     "RequestId": {
       "type": "string",
       "maxLength": 128,
       "minLength": 1,
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "ReviewSharedMemory": {
+      "type": "object",
+      "properties": {
+        "changeId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "decision": {
+          "$ref": "#/$defs/SharedMemoryDecision"
+        },
+        "expectedState": {
+          "type": "string"
+        },
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "requestId",
+        "changeId",
+        "expectedState",
+        "decision"
+      ]
     },
     "SessionCursor": {
       "description": "Both ordering keys are needed when sessions have equal timestamps.",
@@ -1069,6 +1191,259 @@
         "title",
         "createdAt",
         "updatedAt"
+      ]
+    },
+    "SharedMemoryChange": {
+      "type": "object",
+      "properties": {
+        "after": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "appliedRevision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Counter"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "author": {
+          "$ref": "#/$defs/PrincipalId"
+        },
+        "baseRevision": {
+          "$ref": "#/$defs/Counter"
+        },
+        "before": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "decidedBy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PrincipalId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "policyRevision": {
+          "$ref": "#/$defs/Counter"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "spaceId": {
+          "$ref": "#/$defs/MemorySpaceId"
+        },
+        "state": {
+          "$ref": "#/$defs/SharedMemoryChangeState"
+        },
+        "stateDigest": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "spaceId",
+        "author",
+        "baseRevision",
+        "policyRevision",
+        "before",
+        "after",
+        "reason",
+        "state",
+        "stateDigest"
+      ]
+    },
+    "SharedMemoryChangeState": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "applied",
+        "rejected",
+        "undone",
+        "invalidated"
+      ]
+    },
+    "SharedMemoryDecision": {
+      "type": "string",
+      "enum": [
+        "apply",
+        "reject",
+        "undo"
+      ]
+    },
+    "SharedMemoryEdit": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "content": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "add"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "content"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "content": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "replace"
+            },
+            "oldText": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "oldText",
+            "content"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "remove"
+            },
+            "oldText": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "oldText"
+          ]
+        }
+      ]
+    },
+    "SharedMemoryMember": {
+      "type": "object",
+      "properties": {
+        "principalId": {
+          "$ref": "#/$defs/PrincipalId"
+        },
+        "role": {
+          "$ref": "#/$defs/SharedMemoryRole"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "principalId",
+        "role"
+      ]
+    },
+    "SharedMemoryPage": {
+      "type": "object",
+      "properties": {
+        "after": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemorySpaceId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SharedMemorySpace"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "items"
+      ]
+    },
+    "SharedMemoryRole": {
+      "type": "string",
+      "enum": [
+        "reader",
+        "contributor",
+        "reviewer"
+      ]
+    },
+    "SharedMemorySpace": {
+      "type": "object",
+      "properties": {
+        "characterLimit": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "digest": {
+          "type": "string"
+        },
+        "documentRevision": {
+          "$ref": "#/$defs/Counter"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "id": {
+          "$ref": "#/$defs/MemorySpaceId"
+        },
+        "policyRevision": {
+          "$ref": "#/$defs/Counter"
+        },
+        "role": {
+          "$ref": "#/$defs/SharedMemoryRole"
+        },
+        "title": {
+          "type": "string"
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "workspaceId",
+        "title",
+        "enabled",
+        "policyRevision",
+        "documentRevision",
+        "entries",
+        "digest",
+        "role",
+        "characterLimit"
       ]
     },
     "SubmitTurn": {

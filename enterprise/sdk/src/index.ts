@@ -11,6 +11,8 @@ export type {
   CouncilView, CouncilPhase, CouncilSeatView, CouncilSeatState,
   WorkspaceMergeView, WorkspaceMergePlan, WorkspaceChange, WorkspaceEntry, WorkspacePath, MergeChoice, MergeContentSide, MergeContentRequest,
   WorkspaceEditView, WorkspaceEditReview, McpCallView,
+  SharedMemorySpace, SharedMemoryPage, SharedMemoryChange, SharedMemoryRole, SharedMemoryDecision,
+  ConfigureSharedMemory, ProposeSharedMemory, ReviewSharedMemory, SharedMemoryEdit, SharedMemoryMember,
   BeginWorkspaceImport, WorkspaceImportView, WorkspaceImportState, WorkspaceImportId,
   LearningJobView, LearningPage, LearningPageRequest, LearningCursor,
   LearningStage, LearningState, LearningBudgetView, LearningFailureView, CancelLearning, LearningCancellation,

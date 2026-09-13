@@ -325,6 +325,7 @@ impl TransactionMemory {
         let mutating = !matches!(
             request.command,
             MemoryCommand::Read
+                | MemoryCommand::ReadShared
                 | MemoryCommand::ReadEntries { .. }
                 | MemoryCommand::Candidates
                 | MemoryCommand::Candidate { .. }
@@ -342,6 +343,7 @@ impl TransactionMemory {
             && !matches!(
                 request.command,
                 MemoryCommand::Read
+                    | MemoryCommand::ReadShared
                     | MemoryCommand::ReadEntries { .. }
                     | MemoryCommand::Propose { .. }
             )
@@ -433,6 +435,23 @@ impl TransactionMemory {
     fn dispatch(self: &Arc<Self>, command: MemoryCommand) -> Result<MemoryReply, Error> {
         let service = self.service()?;
         let candidate = match command {
+            MemoryCommand::ReadShared => {
+                if let Some(lease) = &self.lease
+                    && !self.execute(async |tx| {
+                        self.use_enabled(tx, Some(lease.session_id.as_str())).await
+                    })?
+                {
+                    return Ok(MemoryReply::SharedSnapshot {
+                        documents: Vec::new(),
+                        omitted_spaces: Vec::new(),
+                    });
+                }
+                return self.execute(async |tx| {
+                    crate::shared_memory::snapshots(tx, &self.principal, &self.workspace)
+                        .await
+                        .map_err(app_error)
+                });
+            }
             MemoryCommand::Read => {
                 if let Some(lease) = &self.lease {
                     let enabled = self.execute(async |tx| {

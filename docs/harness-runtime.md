@@ -3097,3 +3097,12 @@ restart or lost outcome preserves uncertainty and never repeats a side effect.
 Human approval includes the exact HTTPS target, declaration, arguments and
 assignment revision. Details are in the preview archive `enterprise/MCP.md`;
 this change does not implement an App/UI.
+
+### Organization Memory spaces
+
+`SharedMemoryStore` keeps tenant-owned namespaces separate from private resident
+Memory. Mutations reuse the resident entry validator and bind complete before/after
+content, revision and current namespace policy to independent review. Worker
+protocol 12 refreshes shared content before provider admission; membership or
+consent revocation removes earlier shared prompt content. Private automatic
+learning remains private. See `enterprise/SHARED_MEMORY.md` in the preview archive.

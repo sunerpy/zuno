@@ -943,3 +943,10 @@ Worker 辅助消费者装配。已结束来源 Job 生成有界提炼请求，�
 `tools/call`；重启或响应丢失保留不确定状态，不重复副作用。人工审批绑定
 精确 HTTPS 地址、声明、参数和分配版本，详见预览产物中的 `enterprise/MCP.zh.md`。
 本变更不实施 App/UI。
+
+### 组织 Memory 空间
+
+`SharedMemoryStore` 将租户所属空间与个人常驻 Memory 分离。变更复用条目校验，
+并将完整前后内容、版本和当前空间权限绑定至独立审核。Worker 协议 12 在模型请求
+前刷新共享内容，成员资格或使用授权撤销后不保留旧共享提示词。个人自动学习仍为
+个人数据，详见预览归档中的 `enterprise/SHARED_MEMORY.zh.md`。

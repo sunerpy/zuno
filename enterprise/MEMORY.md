@@ -289,3 +289,11 @@ Session history includes the same logical learning Job from queueing through
 settlement, with typed kind, budget progress and supported actions. Public SDK
 methods are `learningJobs`, `learningJob` and `cancelLearning`. This provides
 backend/client contracts; App design and UI delivery remain paused.
+
+## Explicit organization sharing
+
+Organization-owned spaces are separate from private Global/Project residency.
+`SharedMemoryStore` requires explicit membership and independent review; private
+automatic learning is not silently published. Worker protocol 12 reloads bounded
+shared snapshots before each model request and honors inherited `useMemories`.
+See [SHARED_MEMORY.md](SHARED_MEMORY.md) for the real API and limitations.

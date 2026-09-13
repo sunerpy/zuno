@@ -6,6 +6,8 @@ mod lifecycle;
 #[path = "authorization_tests/mcp_results.rs"]
 mod mcp_results;
 mod operation_results;
+#[path = "authorization_tests/shared_memory.rs"]
+mod shared_memory;
 mod waiting;
 
 use crate::{
@@ -170,6 +172,7 @@ fn answer(id: &ApprovalId, key: &str) -> AnswerApproval {
     }
 }
 pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator: &PgPool) {
+    Box::pin(shared_memory::exercise(backend, admin, migrator)).await;
     Box::pin(edit_results::exercise(backend, admin, migrator)).await;
     Box::pin(mcp_results::exercise(backend, admin, migrator)).await;
     lifecycle::exercise(backend, admin, migrator).await;

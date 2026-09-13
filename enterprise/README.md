@@ -92,6 +92,8 @@ Executable roles and deployment templates: [English](DEPLOYMENT.md), [中文](DE
 
 Scoped private Memory, consent and source validity: [English](MEMORY.md), [中文](MEMORY.zh.md).
 
+Organization Memory spaces and independent review: [English](SHARED_MEMORY.md), [中文](SHARED_MEMORY.zh.md).
+
 Native child admission, pending results and completion: [English](CHILDREN.md), [中文](CHILDREN.zh.md).
 
 Child workspace forks and executable target configuration: [English](WORKSPACES.md), [中文](WORKSPACES.zh.md).

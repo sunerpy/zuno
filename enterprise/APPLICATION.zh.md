@@ -91,3 +91,7 @@ MCP 审批详情使用 `GET /api/v1/approvals/{id}/mcp`，`McpCallView` 包含�
 地址、完整工具声明与原始参数，沿用其他审批详情的当前请求人／审批人授权。
 响应不含执行租约和凭证；`UiAction::ViewMcpCall` 与 SDK `mcpReview` 表达该
 后端交互，App/UI 实施仍暂停。
+
+组织 Memory 空间使用类型化存储接口和 [SHARED_MEMORY.zh.md](SHARED_MEMORY.zh.md)
+所列路由。配置要求组织管理员，内容发布要求独立空间审核者。本轮仅交付后端和
+SDK，不交付 App/UI。

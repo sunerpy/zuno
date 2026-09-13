@@ -111,3 +111,8 @@ contains the reviewed endpoint, full tool declaration and exact arguments, with
 the same current requester/approver authorization as other approval details.
 It contains no execution lease or credentials. `UiAction::ViewMcpCall` and SDK
 `mcpReview` describe this backend interaction; App/UI implementation is paused.
+
+Organization Memory spaces use the typed shared Memory store and routes documented
+in [SHARED_MEMORY.md](SHARED_MEMORY.md). Configuration requires an organization
+administrator; publication requires an independent namespace reviewer. These
+backend and SDK capabilities do not deliver an App/UI.

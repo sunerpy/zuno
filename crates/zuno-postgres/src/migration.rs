@@ -7,7 +7,7 @@ use zuno_application::ApplicationError;
 use crate::database_error;
 
 pub const PREVIEW_SCHEMA: &str = "zuno_enterprise_preview";
-pub(crate) const FORMAT: i32 = 24;
+pub(crate) const FORMAT: i32 = 25;
 const TABLES: &[&str] = &["workspace", "session", "request_receipt", "input", "event"];
 const RUNTIME_TABLES: &[&str] = &[
     "agent_job",
@@ -51,6 +51,7 @@ const LEARNING_CONTROL_DDL: &str = include_str!("schema_learning_control.sql");
 const LEARNING_SOURCES_DDL: &str = include_str!("schema_learning_sources.sql");
 const EDIT_DDL: &str = include_str!("schema_edit.sql");
 const MCP_DDL: &str = include_str!("schema_mcp.sql");
+const SHARED_MEMORY_DDL: &str = include_str!("schema_shared_memory.sql");
 const LEARNING_TABLES: &[&str] = &[
     "learning_execution",
     "learning_execution_attempt",
@@ -184,9 +185,11 @@ fn source_digest(version: i32) -> String {
         ))
     } else if version == 23 {
         "89f0406fe0680077c5d10ff6835523d8fe4c984b77216f94bd4bbae97ccda926".to_owned()
+    } else if version == 24 {
+        "9ec0c1656e9e6518afdaf61de00b4689d4f2d603270677c942c3ada589485078".to_owned()
     } else {
         zuno_orchestration::sha256_text(&format!(
-            "{FORMAT}\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{WAIT_DDL}\n{CONTEXT_DDL}\n{BROWSER_DDL}\n{OPERATION_DDL}\n{MEMORY_DDL}\n{CHILD_DDL}\n{CHILD_WORKSPACE_DDL}\n{CONTROL_DDL}\n{ACTIVITY_DDL}\n{LIVE_DDL}\n{WORKFLOW_DDL}\n{COUNCIL_DDL}\n{MERGE_DDL}\n{IMPORT_DDL}\n{TRANSFER_DDL}\n{LEARNING_DDL}\n{LEARNING_CONTROL_DDL}\n{LEARNING_SOURCES_DDL}\n{EDIT_DDL}\n{MCP_DDL}\n{POLICY}\n{TENANT_POLICY}"
+            "{FORMAT}\n{DDL}\n{RUNTIME_DDL}\n{AUTHORIZATION_DDL}\n{TURN_DDL}\n{WAIT_DDL}\n{CONTEXT_DDL}\n{BROWSER_DDL}\n{OPERATION_DDL}\n{MEMORY_DDL}\n{CHILD_DDL}\n{CHILD_WORKSPACE_DDL}\n{CONTROL_DDL}\n{ACTIVITY_DDL}\n{LIVE_DDL}\n{WORKFLOW_DDL}\n{COUNCIL_DDL}\n{MERGE_DDL}\n{IMPORT_DDL}\n{TRANSFER_DDL}\n{LEARNING_DDL}\n{LEARNING_CONTROL_DDL}\n{LEARNING_SOURCES_DDL}\n{EDIT_DDL}\n{MCP_DDL}\n{SHARED_MEMORY_DDL}\n{POLICY}\n{TENANT_POLICY}"
         ))
     }
 }
@@ -325,7 +328,10 @@ pub async fn migrate(admin: &PgPool, runtime_role: &str) -> Result<(), Applicati
                 if version < 23 {
                     install_edits(&mut tx).await?;
                 }
-                install_mcp(&mut tx).await?;
+                if version < 24 {
+                    install_mcp(&mut tx).await?;
+                }
+                install_shared_memory(&mut tx).await?;
                 if version < 13 {
                     crate::activity::backfill(&mut tx).await?;
                 }
@@ -397,6 +403,7 @@ pub async fn migrate(admin: &PgPool, runtime_role: &str) -> Result<(), Applicati
     install_learning_sources(&mut tx).await?;
     install_edits(&mut tx).await?;
     install_mcp(&mut tx).await?;
+    install_shared_memory(&mut tx).await?;
     crate::activity::backfill(&mut tx).await?;
     sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
         "REVOKE ALL ON SCHEMA {PREVIEW_SCHEMA} FROM PUBLIC;
@@ -626,6 +633,17 @@ async fn grant_runtime(connection: &mut PgConnection, role: &str) -> Result<(), 
                 "gateway_edit_operation",
                 "gateway_edit_attempt",
                 "gateway_edit_cancellation",
+            ]
+            .iter(),
+        )
+        .chain(
+            [
+                "shared_memory_space",
+                "shared_memory_member",
+                "shared_memory_change",
+                "shared_memory_revision",
+                "shared_memory_request",
+                "shared_memory_audit",
             ]
             .iter(),
         )
@@ -1902,6 +1920,73 @@ pub(crate) async fn install_format_twenty_three_fixture(
     let manifest = schema_manifest(&mut tx).await?;
     sqlx_core::query::query("UPDATE zuno_enterprise_preview.schema_format SET version=23,source_digest=$1,manifest=$2 WHERE singleton=1")
         .bind("89f0406fe0680077c5d10ff6835523d8fe4c984b77216f94bd4bbae97ccda926")
+        .bind(manifest).execute(&mut *tx).await.map_err(database_error)?;
+    tx.commit().await.map_err(database_error)
+}
+
+async fn install_shared_memory(connection: &mut PgConnection) -> Result<(), ApplicationError> {
+    sqlx_core::raw_sql::raw_sql(SHARED_MEMORY_DDL)
+        .execute(&mut *connection)
+        .await
+        .map_err(database_error)?;
+    let admin = "EXISTS(SELECT 1 FROM zuno_enterprise_preview.organization_member a WHERE a.tenant_id=current_setting('zuno.tenant_id',true) AND a.principal_id=current_setting('zuno.principal_id',true) AND a.active AND a.role='administrator')";
+    for table in [
+        "shared_memory_space",
+        "shared_memory_member",
+        "shared_memory_change",
+        "shared_memory_revision",
+        "shared_memory_request",
+        "shared_memory_audit",
+    ] {
+        let policy = match table {
+            "shared_memory_space" => format!(
+                "tenant_id=current_setting('zuno.tenant_id',true) AND ({admin} OR (enabled AND EXISTS(SELECT 1 FROM zuno_enterprise_preview.shared_memory_member m WHERE m.tenant_id=shared_memory_space.tenant_id AND m.space_id=shared_memory_space.id AND m.principal_id=current_setting('zuno.principal_id',true))))"
+            ),
+            "shared_memory_member" => format!(
+                "tenant_id=current_setting('zuno.tenant_id',true) AND (principal_id=current_setting('zuno.principal_id',true) OR {admin})"
+            ),
+            "shared_memory_request" => POLICY.to_owned(),
+            _ => format!(
+                "tenant_id=current_setting('zuno.tenant_id',true) AND EXISTS(SELECT 1 FROM zuno_enterprise_preview.shared_memory_space s WHERE s.tenant_id={table}.tenant_id AND s.id={table}.space_id)"
+            ),
+        };
+        sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
+            "ALTER TABLE {PREVIEW_SCHEMA}.{table} ENABLE ROW LEVEL SECURITY;
+             ALTER TABLE {PREVIEW_SCHEMA}.{table} FORCE ROW LEVEL SECURITY;
+             CREATE POLICY namespace_scope ON {PREVIEW_SCHEMA}.{table} USING ({policy}) WITH CHECK ({policy});
+             REVOKE ALL ON {PREVIEW_SCHEMA}.{table} FROM PUBLIC;"
+        ))).execute(&mut *connection).await.map_err(database_error)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn install_format_twenty_four_fixture(
+    pool: &PgPool,
+    role: &str,
+) -> Result<(), ApplicationError> {
+    install_format_twenty_three_fixture(pool, role).await?;
+    let mut tx = pool.begin().await.map_err(database_error)?;
+    sqlx_core::raw_sql::raw_sql(include_str!("fixtures/format24-mcp.sql"))
+        .execute(&mut *tx)
+        .await
+        .map_err(database_error)?;
+    for table in [
+        "gateway_mcp_operation",
+        "gateway_mcp_attempt",
+        "gateway_mcp_cancellation",
+    ] {
+        sqlx_core::raw_sql::raw_sql(AssertSqlSafe(format!(
+            "ALTER TABLE {PREVIEW_SCHEMA}.{table} ENABLE ROW LEVEL SECURITY;
+             ALTER TABLE {PREVIEW_SCHEMA}.{table} FORCE ROW LEVEL SECURITY;
+             CREATE POLICY owner_scope ON {PREVIEW_SCHEMA}.{table} USING ({POLICY}) WITH CHECK ({POLICY});
+             REVOKE ALL ON {PREVIEW_SCHEMA}.{table} FROM PUBLIC;
+             GRANT SELECT,INSERT,UPDATE,DELETE ON {PREVIEW_SCHEMA}.{table} TO \"{role}\";"
+        ))).execute(&mut *tx).await.map_err(database_error)?;
+    }
+    let manifest = schema_manifest(&mut tx).await?;
+    sqlx_core::query::query("UPDATE zuno_enterprise_preview.schema_format SET version=24,source_digest=$1,manifest=$2 WHERE singleton=1")
+        .bind("9ec0c1656e9e6518afdaf61de00b4689d4f2d603270677c942c3ada589485078")
         .bind(manifest).execute(&mut *tx).await.map_err(database_error)?;
     tx.commit().await.map_err(database_error)
 }
