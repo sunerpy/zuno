@@ -72,3 +72,10 @@ Docker runner 另外验证真实控制面、网关与两个独立 Worker 可执�
 `journal`、`complete`、`stop` 及独立的 `x-zuno-learning-grant`。学习票据不能转换为
 前台或网关权限；仅回执验证可保存真实迟到终态，不能发起请求或应用 Memory。隔离模型
 帮助器不获得数据库凭证、工具派发器或本地 Memory 文件。
+
+## 工作区文件查询
+
+装配网关的 Agent 配置注册 `workspace_read`、`workspace_list`、`workspace_search`
+及类型化文件活动。Worker 验证声明、主体、调用、审批绑定和返回快照／查询身份。
+准备阶段可以进入既有审批等待，执行发生在持久工具交接之后，数据始终留在企业执行环境。
+Completion 配置不获得这些工具，详见[网关读取](GATEWAY.zh.md#工作区只读操作)。

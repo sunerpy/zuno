@@ -1,4 +1,5 @@
 //! Data-owner endpoints for gateway delegation and current operation approval.
+mod files;
 mod import;
 mod merge;
 mod transfer;
@@ -103,6 +104,14 @@ impl GatewayControlService {
             .route(&format!("/{GATEWAY_TICKET_PATH}"), post(issue_ticket))
             .route(&format!("/{GATEWAY_RESOLVE_PATH}"), post(resolve))
             .route(&format!("/{GATEWAY_PREPARE_PATH}"), post(prepare))
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_FILES_PREPARE_PATH),
+                post(files::prepare),
+            )
+            .route(
+                &format!("/{}", zuno_worker::GATEWAY_FILES_AUTHORIZE_PATH),
+                post(files::authorize),
+            )
             .route(&format!("/{GATEWAY_AUTHORIZE_PATH}"), post(authorize))
             .route(&format!("/{GATEWAY_COMPLETION_PATH}"), post(completion))
             .route(
@@ -385,6 +394,12 @@ fn target(request: &GatewayRequest, context: &GatewayExecutionContext) -> Result
     }
     if let GatewayCommand::PrepareCommand { operation }
     | GatewayCommand::SubmitCommand { operation } = &request.command
+        && operation.environment_id != context.assignment.environment.id
+    {
+        return Err(Failure(StatusCode::FORBIDDEN));
+    }
+    if let GatewayCommand::PrepareFiles { operation } | GatewayCommand::QueryFiles { operation } =
+        &request.command
         && operation.environment_id != context.assignment.environment.id
     {
         return Err(Failure(StatusCode::FORBIDDEN));

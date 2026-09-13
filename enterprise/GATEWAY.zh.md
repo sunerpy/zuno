@@ -35,12 +35,14 @@
 
 ## 私有协议
 
-`GatewayRequest` 为版本 5，使用有界的 tagged enum：
+`GatewayRequest` 为版本 6，使用有界的 tagged enum：
 
 | 命令 | 行为 |
 | --- | --- |
 | `acquire` | 获取数据所有者分配的会话环境 |
 | `get` | 读取并验证该环境 |
+| `prepare_files` | 将类型化读取／目录／字面量搜索绑定到当前组织审批 |
+| `query_files` | 使用当前租约读取已批准的不可变工作区版本 |
 | `prepare_child_workspace` | 仅准备控制面解析的暂存子任务工作区 |
 | `prepare_command` | 解析环境并取得持久审批 |
 | `submit_command` | 重新检查租约与审批后提交 |
@@ -100,7 +102,7 @@ socket 会使该 gate 失败。可以通过 `ZUNO_ROOTLESS_DOCKER_SOCKET` 指定
 
 网关 supervisor 通过独立服务认证轮询 `internal/gateway/v1/cancellations`，领取已停止 Job 的不可变操作接纳记录。该入口在 Worker 撤权后仍有效，只允许停止原操作；完成事实保持原样，不确定状态继续核查。见[控制](CONTROL.zh.md)。
 
-网关协议 5 将子工作区准备路由至目标网关，单独标识经过授权的来源，包括已经存在的
+网关协议 6 将子工作区准备路由至目标网关，单独标识经过授权的来源，包括已经存在的
 Workflow 协调工作区。普通命令仍要求执行会话一致。
 
 快照交换使用 `/internal/execution/v1/snapshot` 及独立的
@@ -108,3 +110,22 @@ Workflow 协调工作区。普通命令仍要求执行会话一致。
 `ticket`、`resolve`、`complete`、`fact`，分别绑定路由、当前授权及不可变来源回执。
 JSON 帧仍限制为 1 MiB，只有经过认证的归档正文使用独立的 512 MiB 上限。
 源网关服务令牌不发送给对端，详见[工作区传输](WORKSPACES.zh.md#网关间传输)。
+
+## 工作区只读操作
+
+`WorkspaceFileReader` 与 `WorkspaceFileAuthority` 分离数据访问和审批。
+Docker 提供者读取分配工作区版本的已验证不可变归档，不执行调用方命令，也不将文件
+解压到网关宿主路径。同一版本复用快照，网关重启后仍能读取。读取前后都检查当前租约与
+审批，缓存命中也不例外；修改操作参数不能复用旧批准。
+
+`workspace_read` 使用逻辑相对 `path`、十进制字节 `offset`（默认 `"0"`）及
+`maximumBytes`（1–65536），返回 UTF-8 窗口和精确下一偏移。二进制与链接只返回元数据，
+不跟随符号链接。`workspace_list` 分页列出直接子项，使用 `after` 和 1–200 的 `limit`，
+元数据总量不超过 64 KiB。`workspace_search` 执行区分大小写的字面量搜索，最多 100 个
+匹配、扫描 8 MiB、单文件 256 KiB、展示 64 KiB；统计跳过的二进制／大文件，长行截取
+仍包含匹配文本。现有快照的 512 MiB／50,000 项上限继续生效。
+
+只有 `autoReadApps` 中的应用能自动批准这些内置读取，其他允许接入的应用沿用权威 HITL
+流程。该白名单不批准 Shell 或任意 MCP 操作。控制入口为
+`/internal/gateway/v1/files/prepare`、`/authorize`，仅接受分配网关的服务身份。
+Worker 与网关须匹配网关协议 6；本批不交付文件修改或 App UI。

@@ -102,3 +102,12 @@ grants cannot be exchanged for foreground or gateway authority. Receipt-only
 verification can retain a truthful late outcome but cannot launch a request or
 apply Memory. No database credential, tool dispatcher or local Memory file is
 provided to the isolated model helper.
+
+## Workspace file queries
+
+Gateway-equipped Agent profiles install `workspace_read`, `workspace_list` and
+`workspace_search` with typed file activity. The Worker verifies the declaration,
+principal, invocation, approval binding and returned snapshot/query identity.
+Preparation may yield the existing approval wait; execution starts after durable
+tool handoff and remains in the enterprise environment. Completion profiles expose
+none of these tools. See [gateway reads](GATEWAY.md#workspace-read-operations).

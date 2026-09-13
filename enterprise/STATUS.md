@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p2-memory-late-sources`.
+- Current phase branch: `codex/enterprise-p3-workspace-reads`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -538,3 +538,11 @@ Workflow PR #218 initially exposed an arm64 stack overflow in the PostgreSQL con
 - The real process regression first failed because a late quiet completion was never ingested. The five-process loop now passes: root completion and initial extraction, later human approval of the quiet command, then an extraction containing only that new receipt and separate maintenance. It completes 55 model requests.
 - PostgreSQL/HTTPS pass injected source-claim rollback, competing schedulers, cancellation/deduplication and a new completion version arriving during acknowledgement. Workspace check/Clippy, 100 documentation/release contracts and fmt/diff pass locally. Original traversal and input bounds remain explicit; UI stays paused.
 - PR #232 passed required checks and merged only into preview at `d1f1cdd63d5e8d89104c34aa4503cd03b6c5caee`. PR #233 is separate; no preview version/tag or Release is enabled.
+
+## Authorized workspace reads
+
+- `WorkspaceFileReader` / `WorkspaceFileAuthority` have typed read/list/literal-search contracts, a Docker snapshot provider, authenticated gateway/control handlers and real Worker consumers. `workspace_read`, `workspace_list` and `workspace_search` carry typed file activity; completion profiles retain no tools.
+- The gateway reads verified immutable revision archives without host extraction or caller commands. Reads are bounded, links are not followed, binary data remains metadata, long-line snippets retain the match, and snapshot replay survives writes/restart while still requiring current authority. Approval binds parameters/resources; automatic reads require the configured application whitelist, other applications use existing HITL.
+- Provider and HTTPS tests pass snapshot replay, paging/search, binary/link behavior, owner isolation, revoked access, changed-argument refusal, automatic/HITL policy and cancelled execution. A real Worker failure exposed an overly strict lease equality check; the fix preserves all execution identity fields while allowing deadline extension and has an explicit renewal regression.
+- Both real user sessions complete all three file calls with the original command-approval count. The complete five-process fixture passes with 61 model requests. Application tests, workspace check/Clippy, 100 documentation/release contracts and fmt/diff pass. Gateway protocol is 6, Worker protocol stays 11, PostgreSQL stays 22 and ledger stays 4.
+- English/Chinese gateway, Worker, workspace, Workflow and runtime documentation is updated. App/UI remains paused and excluded. PR #233 passed its required checks and merged only into preview at `fd9921edae0c0b2a8380cb56c50a2aaae7dd6ef0`; PR #234 is separate.

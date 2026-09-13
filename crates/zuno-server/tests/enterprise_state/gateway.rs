@@ -14,6 +14,8 @@ use zuno_server::{
 };
 use zuno_worker::gateway::{GatewayClient, GatewayStateClient};
 
+#[path = "gateway/files.rs"]
+mod files;
 #[path = "gateway_root.rs"]
 mod root;
 #[path = "gateway/workspace.rs"]
@@ -127,7 +129,7 @@ async fn gateway_requests_are_scoped_authenticated_and_still_require_current_hum
         &OrganizationPolicy {
             tenant_id: tenant.clone(),
             revision: NonZeroU64::MIN,
-            allowed_apps: [app.clone()].into(),
+            allowed_apps: [app.clone(), ClientId::new("unlisted-read").unwrap()].into(),
             auto_read_apps: [app.clone()].into(),
             approval_apps: [app].into(),
             approval_lifetime_seconds: 300,
@@ -524,6 +526,90 @@ async fn gateway_requests_are_scoped_authenticated_and_still_require_current_hum
         else {
             panic!("environment")
         };
+        let file = zuno_application::workspace_files::WorkspaceFileOperation {
+            id: OperationId::new("file-read").unwrap(),
+            invocation_id: InvocationId::new("file-read").unwrap(),
+            environment_id: current.spec.id.clone(),
+            expected_revision: current.revision,
+            query: zuno_application::workspace_files::WorkspaceFileQuery::Read {
+                path: zuno_application::workspace_merge::WorkspacePath::new("once").unwrap(),
+                offset: zuno_types::activity::Counter(0),
+                maximum_bytes: 4096,
+            },
+        };
+        let GatewayReply::Approval(file_approval) = reply(
+            &worker,
+            &execution,
+            &client,
+            GatewayCommand::PrepareFiles {
+                operation: file.clone(),
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("file approval");
+        };
+        assert_eq!(
+            file_approval.state,
+            ApprovalState::Automatic,
+            "only the configured application whitelist permits automatic reads"
+        );
+        let original_lease = execution.lease().unwrap();
+        worker.renew(&execution).await.unwrap();
+        zuno_application::workspace_files::WorkspaceFileAuthority::authorize_files(
+            &state,
+            &original_lease,
+            &current,
+            &file,
+        )
+        .await
+        .unwrap();
+        let GatewayReply::Files(read) = reply(
+            &worker,
+            &execution,
+            &client,
+            GatewayCommand::QueryFiles {
+                operation: file.clone(),
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("read");
+        };
+        read.validate_for(&file).unwrap();
+        assert!(
+            matches!(read.result,zuno_application::workspace_files::WorkspaceFileResult::Read{text:Some(ref text),..} if text=="ran\n")
+        );
+        let mut changed = file.clone();
+        changed.query = zuno_application::workspace_files::WorkspaceFileQuery::Read {
+            path: zuno_application::workspace_merge::WorkspacePath::new("other").unwrap(),
+            offset: zuno_types::activity::Counter(0),
+            maximum_bytes: 4096,
+        };
+        assert!(
+            reply(
+                &worker,
+                &execution,
+                &client,
+                GatewayCommand::QueryFiles { operation: changed }
+            )
+            .await
+            .is_err(),
+            "an approved operation ID cannot authorize changed file arguments"
+        );
+        let mut foreign = file.clone();
+        foreign.environment_id = EnvironmentId::new("foreign").unwrap();
+        assert!(
+            reply(
+                &worker,
+                &execution,
+                &client,
+                GatewayCommand::QueryFiles { operation: foreign }
+            )
+            .await
+            .is_err()
+        );
+        files::human_read(&backend, &actor, &configuration, &worker, &client).await;
         let verification = CommandOperation {
             id: OperationId::new("verify").unwrap(),
             invocation_id: InvocationId::new("verify").unwrap(),

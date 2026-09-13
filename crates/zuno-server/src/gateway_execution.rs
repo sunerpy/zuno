@@ -11,6 +11,7 @@ use axum::{
     routing::post,
 };
 use std::{path::Path, sync::Arc};
+use zuno_application::workspace_files::WorkspaceFileReader;
 use zuno_application::{
     ApplicationError,
     environment::{
@@ -162,6 +163,20 @@ impl GatewayExecutionService {
             return Err(ApplicationError::Forbidden);
         }
         let reply = match request.command {
+            GatewayCommand::PrepareFiles { operation } => GatewayReply::Approval(Box::new(
+                self.state
+                    .prepare_files(zuno_application::workspace_files::GatewayFileRequest {
+                        lease: context.lease.clone(),
+                        environment: self.environment(&context).await?,
+                        operation,
+                    })
+                    .await?,
+            )),
+            GatewayCommand::QueryFiles { operation } => GatewayReply::Files(
+                self.gateway
+                    .query_files(&context.lease, &operation, &self.state)
+                    .await?,
+            ),
             GatewayCommand::PreviewWorkspaceMerge {
                 id,
                 invocation_id,

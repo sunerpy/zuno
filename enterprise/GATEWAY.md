@@ -48,12 +48,14 @@ operation; an earlier approval or revision cannot authorize a different operatio
 
 ## Private protocol
 
-`GatewayRequest` is protocol version 5, with bounded tagged commands:
+`GatewayRequest` is protocol version 6, with bounded tagged commands:
 
 | Command | Behavior |
 | --- | --- |
 | `acquire` | Acquire the data-owner-selected session environment |
 | `get` | Read and validate that environment |
+| `prepare_files` | Bind a typed read/list/literal-search query to current organization approval |
+| `query_files` | Read the approved immutable workspace revision under a current lease |
 | `prepare_child_workspace` | Prepare only the server-resolved staged child workspace |
 | `prepare_command` | Resolve the environment and obtain its durable approval |
 | `submit_command` | Submit after fresh lease and approval checks |
@@ -128,7 +130,7 @@ also starts a control plane, gateway and two independent Worker binaries; see
 
 The gateway supervisor also polls authenticated `internal/gateway/v1/cancellations`. This service-only path returns immutable admissions for stopped Jobs and stays valid after Worker revocation. It cannot start new operations. Docker stop and its actual terminal receipt remain separate; completed facts are preserved and unknown outcomes remain uncertain. See [control](CONTROL.md).
 
-Gateway protocol 5 routes child preparation to the target gateway and separately
+Gateway protocol 6 routes child preparation to the target gateway and separately
 identifies the authorized source, including an existing Workflow group workspace.
 Ordinary commands still require the executing session.
 
@@ -139,3 +141,29 @@ authorization and the immutable source receipt. The 1 MiB JSON frame bound still
 applies; only the authenticated archive body uses the separate 512 MiB limit.
 The source's service token is never sent to its peer.
 See [workspace transfer](WORKSPACES.md#transfer-between-gateways).
+
+## Workspace read operations
+
+`WorkspaceFileReader` and `WorkspaceFileAuthority` separate data access from
+approval. The Docker provider reads a verified immutable archive of the assigned
+environment revision; it does not run caller-provided commands or extract files
+onto the gateway host. Snapshots are reused for a revision and survive gateway
+restart. The current lease and approval are checked before and after reading,
+including cache hits. Changed operation arguments cannot reuse an old approval.
+
+`workspace_read` accepts a logical relative `path`, decimal byte `offset` (default
+`"0"`) and `maximumBytes` (1–65536). It returns a UTF-8 window and exact next byte
+offset; binary files and links return metadata, and symbolic links are not
+followed. `workspace_list` pages immediate children with `after` and `limit`
+(1–200), bounded to 64 KiB of entry metadata. `workspace_search` matches literal,
+case-sensitive `text` within a logical path, with at most 100 matches, 8 MiB scanned,
+256 KiB per file and 64 KiB rendered text. Binary/large files are counted as skipped;
+long-line previews retain the matched text. All paths remain inside the logical
+workspace and the existing 512 MiB/50,000-entry snapshot limits apply.
+
+Only applications in `autoReadApps` can receive automatic approval for these
+built-in reads. Other allowed applications wait for the existing authoritative
+HITL decision. This whitelist does not approve Shell or arbitrary MCP operations.
+Control endpoints are `/internal/gateway/v1/files/prepare` and `/authorize`;
+they accept only assigned gateway service identities. Both roles must support
+gateway protocol 6; the state/Worker protocol remains 11. This batch provides no file mutation or App UI.
