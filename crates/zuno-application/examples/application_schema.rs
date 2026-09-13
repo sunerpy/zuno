@@ -1,7 +1,10 @@
 use schemars::{JsonSchema, schema_for};
 use zuno_application::{
     CreateSession, SessionPage, SessionSummary,
-    api::{ApprovalDecision, ApprovalView, InputVersionView, JobView, SubmitTurn, WorkspaceView},
+    api::{
+        ActorView, ApprovalDecision, ApprovalView, InputVersionView, JobView, SubmitTurn,
+        WorkspaceView,
+    },
     control::{CancelJob, CancellationReceipt},
     learning_api::{
         CancelLearning, LearningCancellation, LearningJobView, LearningPage, LearningPageRequest,
@@ -27,6 +30,7 @@ use zuno_application::{
     reason = "schema-only root collects public application DTOs for generated clients"
 )]
 struct ApplicationProtocol {
+    actor: ActorView,
     skill_candidate: SkillCandidateView,
     propose_skill: ProposeSkill,
     review_skill: ReviewSkillEvaluation,

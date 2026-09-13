@@ -129,3 +129,5 @@ HTTP and generated SDK consumers preserve resource identity and decimal-string
 revisions. Mutations require an approved human review application. Installing or
 restoring content never activates it automatically. Route details and embedded
 resource limits are in [SKILLS.md](SKILLS.md). No App/UI is delivered.
+
+The authenticated `GET /api/v1/identity` returns only `ActorView` owner, kind and client coordinates. Remote bridges pin these coordinates when refreshing credentials. See [ACP.md](ACP.md).

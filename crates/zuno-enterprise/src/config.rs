@@ -68,6 +68,23 @@ pub enum ServiceRole {
     ControlPlane(Box<ControlConfig>),
     Migrate(MigrationConfig),
     Identity(IdentityConfig),
+    AcpBridge(AcpBridgeConfig),
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AcpBridgeConfig {
+    pub api: StateClientConfig,
+    pub workspace_id: WorkspaceId,
+    /// Editor-side logical cwd. Files and processes remain on the remote service.
+    pub local_directory: PathBuf,
+    #[serde(default = "bridge_sessions")]
+    pub max_sessions: u32,
+    #[serde(default = "poll")]
+    pub poll_millis: u64,
+}
+fn bridge_sessions() -> u32 {
+    32
 }
 
 #[derive(Clone, Serialize, Deserialize)]

@@ -5,6 +5,13 @@ import { EnterpriseClient, EnterpriseHttpError } from "../dist/src/index.js";
 const job = { id: "job", sessionId: "session", turnId: "turn", inputId: "input", phase: "ready", inputVersion: "1", waits: [], stopRequested: false, pendingOperations: [] };
 const response = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 
+test("public identity contains only validated actor coordinates",async()=>{
+  const actor={owner:{tenantId:"tenant",principalId:"alice"},kind:"user",clientId:"web"};
+  const client=value=>new EnterpriseClient({baseUrl:"https://enterprise.example/api/v1/",accessToken:async()=>"token",fetch:async()=>response(value)});
+  assert.deepEqual(await client(actor).identity(),actor);
+  await assert.rejects(client({...actor,accessToken:"private"}).identity(),/Invalid enterprise application response/);
+});
+
 test("Skill activation preserves owner resource identity and exact revision without exposing a lease", async () => {
   const value={id:"installed",workspaceId:"workspace",candidateId:"candidate",name:"proof",description:"Read proof",
     revision:"9007199254740993",source:"enterprise-skill://installed/9007199254740993",contentDigest:"a".repeat(64),active:true};

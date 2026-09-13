@@ -32,6 +32,8 @@ use zuno_enterprise::config::*;
 use zuno_postgres::PostgresOptions;
 use zuno_types::identity::*;
 
+#[path = "processes/acp.rs"]
+mod acp;
 #[path = "processes/browser.rs"]
 mod browser;
 #[path = "processes/completion.rs"]
@@ -184,6 +186,9 @@ async fn model(
             json!({"role":"assistant","content":"COMPLETION-VERIFIED"}),
             true,
         );
+    }
+    if user.contains("ACP-PROBE") {
+        return acp::model(&body);
     }
     if user.contains("WORKFLOW-PROBE") {
         return workflow::model(&body);
@@ -1234,6 +1239,7 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
         &admin,
     )
     .await;
+    acp::verify(&http, &control_url, &tokens, &fixture, root).await;
     for child in &mut children {
         assert!(
             tokio::process::Command::new("kill")

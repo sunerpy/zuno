@@ -1,6 +1,6 @@
 import { ActivityClient } from "./client.js";
 import type {
-  WorkspaceView, SessionPage, SessionSummary, CreateSession, JobView,
+  ActorView, WorkspaceView, SessionPage, SessionSummary, CreateSession, JobView,
   SubmitTurn, InputVersionView, ApprovalView, ApprovalDecision, CancelJob, CancellationReceipt, WorkflowRunView, WorkspaceMergeView, MergeContentSide, BeginWorkspaceImport, WorkspaceImportView,
   LearningJobView, LearningPage, LearningPageRequest, CancelLearning, LearningCancellation,
   WorkspaceEditView, McpCallView,
@@ -9,7 +9,7 @@ import type {
   InstallSkill, ActivateSkill, RollbackSkill, InstalledSkillView, InstalledSkillPage, InstalledSkillDocument,
 } from "./generated/application.js";
 import {
-  validateWorkspaceView, validateSessionPage, validateSessionSummary, validateJobView,
+  validateActorView, validateWorkspaceView, validateSessionPage, validateSessionSummary, validateJobView,
   validateInputVersionView, validateApprovalView, validateCancellationReceipt, validateWorkflowRunView, validateWorkspaceMergeView, validateMergeContentRequest, validateWorkspaceImportView,
   validateLearningJobView, validateLearningPage, validateLearningPageRequest, validateLearningCancellation,
   validateWorkspaceEditView, validateMcpCallView,
@@ -29,6 +29,9 @@ function id(value: string): string {
 }
 
 export class EnterpriseClient extends ActivityClient {
+  async identity(signal?: AbortSignal): Promise<ActorView> {
+    return checked<ActorView>(await this.get(new URL("identity",this.base),signal),validateActorView);
+  }
   async installSkill(candidate: string, request: InstallSkill, signal?: AbortSignal): Promise<InstalledSkillView> {
     if (!validateInstallSkill(request)) throw new Error("Invalid Skill installation");
     const value=checked<InstalledSkillView>(await this.get(new URL(`skills/${id(candidate)}/install`,this.base),signal,"POST",request),validateInstalledSkillView);

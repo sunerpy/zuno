@@ -3169,3 +3169,5 @@ continuation. Original evaluated body/proof binding survives revision rollback,
 which always creates an inactive revision. This backend supplies embedded bodies,
 not host-directory discovery or resource-package execution. See
 [enterprise Skills](../enterprise/SKILLS.md).
+
+Enterprise `acp_bridge` consumes public activity and application APIs. It owns connection/session observers, not Agent execution. Explicit request withdrawal is visible before admission through the native ACP transport; accepted admission outlives a detached observer. Persistent Job cancellation and approval authority remain on the control plane. See [enterprise ACP](../enterprise/ACP.md).

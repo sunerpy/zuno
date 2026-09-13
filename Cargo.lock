@@ -7801,6 +7801,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "zuno-acp",
  "zuno-application",
  "zuno-auth",
  "zuno-config",

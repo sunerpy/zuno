@@ -8,8 +8,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zuno_permission::enterprise::ApprovalAudience;
 use zuno_types::identity::{
-    ApprovalId, InputId, JobId, PrincipalKey, RequestId, SessionId, TurnId, WorkspaceId,
+    ApprovalId, ClientId, InputId, JobId, PrincipalKey, PrincipalKind, RequestId, SessionId,
+    TurnId, WorkspaceId,
 };
+/// Public authenticated actor coordinates. No bearer token or service grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ActorView {
+    pub owner: PrincipalKey,
+    pub kind: PrincipalKind,
+    pub client_id: Option<ClientId>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkspaceView {

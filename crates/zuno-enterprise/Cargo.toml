@@ -30,6 +30,7 @@ tracing = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 zuno-application = { workspace = true }
+zuno-acp = { workspace = true }
 zuno-auth = { workspace = true }
 zuno-config = { workspace = true }
 zuno-engine = { workspace = true }

@@ -1134,6 +1134,7 @@ async fn a_closed_writer_leaves_no_command_or_pending_rpc() {
         next_id: Arc::new(AtomicU64::new(1)),
         deferred: None,
         scoped_requests: None,
+        withdrawn: None,
     };
     let view = view();
     let port = port_for(&view);
