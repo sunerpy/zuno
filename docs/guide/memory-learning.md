@@ -245,6 +245,13 @@ Increasing one limit does not bypass the others. The serialized request is bound
 by `max_input_bytes` (default `131072`), and model work has a total `timeout_ms`
 (default `120000`); a JSON repair shares the original deadline.
 
+Source selection subtracts the actual serialized instruction/schema/parameter
+envelope and bounds the remaining JSON string escaping. It no longer reserves a
+fixed 16 KiB before considering source data, so a small valid input allowance can
+retain short evidence. Native structured-output settings and model parameters
+participate in this calculation. Every complete request, including a repair,
+still passes the full serialized-byte check before journaling or provider contact.
+
 A provider-level `maxTokens: 0` means no additional configured limit; it does not
 disable the learning output ceiling. Native requests lower that ceiling to the
 selected API's output-limit field. If the endpoint rejects bounded output for

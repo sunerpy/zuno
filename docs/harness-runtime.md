@@ -1462,6 +1462,10 @@ admission within its execution deadline; outcome receipt I/O is separately bound
 to at most 30 seconds. Journal failure cannot become successful extraction or
 trigger an inline replay. Combined provider/journal failure preserves typed
 recovery and the longer retry deadline.
+Pure request preparation owns parameter normalization and the JSON instruction/
+schema envelope for both selection and admission. The remaining source allowance
+accounts for JSON string escaping, rather than a fixed 16 KiB deduction.
+The full serialized request remains the final byte-bound authority, including repairs.
 Learning outcome usage retains partial reports and discarded provider-attempt
 costs, normalizes cache buckets once, keeps reasoning inside output and marks
 incomplete reports as unaccounted. The port permits a data-owner state adapter;

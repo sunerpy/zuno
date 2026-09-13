@@ -51,6 +51,17 @@ impl PostgresLearningRuntime {
             grant.maintenance.validate().map_err(app_error)?;
             grant.extraction_limits.validate().map_err(app_error)?;
             grant.maintenance_limits.validate().map_err(app_error)?;
+            for (phase, limits) in [
+                (LearningPhase::Extraction, &grant.extraction_limits),
+                (LearningPhase::Maintenance, &grant.maintenance_limits),
+            ] {
+                zuno_learning::learning_input_budget(
+                    phase,
+                    limits.maximum_input_bytes,
+                    limits.maximum_output_tokens,
+                )
+                .map_err(|error| invalid(&error.diagnostic()))?;
+            }
             if grants[..index]
                 .iter()
                 .any(|prior| prior.source == grant.source)
@@ -304,7 +315,14 @@ impl TransactionMemory {
             sources,
             sources_truncated: truncated,
         }
-        .bounded((grant.extraction_limits.maximum_input_bytes as usize).saturating_sub(16384))
+        .bounded(
+            zuno_learning::learning_input_budget(
+                LearningPhase::Extraction,
+                grant.extraction_limits.maximum_input_bytes,
+                grant.extraction_limits.maximum_output_tokens,
+            )
+            .map_err(|error| invalid(&error.diagnostic()))?,
+        )
         .map_err(|_| invalid("learning source exceeds the configured model input limit"))?;
         frozen.retain(|f| {
             request

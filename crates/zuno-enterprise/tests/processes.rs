@@ -558,6 +558,8 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
     memory_model.id = ConfigurationId::new("memory-model").unwrap();
     memory_model.agent.name = "memory-model".to_owned();
     memory_model.workspace = definition.workspace.clone();
+    memory_model.model.max_output_tokens = std::num::NonZeroU32::new(512).unwrap();
+    memory_model.budget.tokens = std::num::NonZeroU64::new(3 * (8192 + 512 + 1024)).unwrap();
     let memory_model_file = root.join("memory-model.json");
     write(
         &memory_model_file,

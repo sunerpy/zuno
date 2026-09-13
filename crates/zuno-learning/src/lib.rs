@@ -19,6 +19,7 @@ mod memory;
 mod model;
 mod pattern;
 mod projection;
+mod request;
 mod retrieval;
 mod scheduler;
 mod skill;
@@ -57,6 +58,7 @@ pub use crate::memory::{
 pub use crate::model::{LEARNING_EXTRACTOR_VERSION, LearningModel, LearningModelClient};
 pub use crate::pattern::PatternMiner;
 pub use crate::projection::LearningProjectionService;
+pub use crate::request::learning_input_budget;
 pub use crate::retrieval::{ExperienceRetriever, RetrievedExperiences};
 pub use crate::scheduler::{CompletedTaskSignals, LearningScheduleOutcome, LearningScheduler};
 pub use crate::skill::{

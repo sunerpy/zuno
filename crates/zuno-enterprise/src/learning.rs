@@ -5,7 +5,7 @@ use crate::{
     invalid,
 };
 use zuno_application::runtime::ConfigurationRef;
-use zuno_learning::distributed::{LearningExecutionLimits, MemoryLearningGrant};
+use zuno_learning::distributed::{LearningExecutionLimits, LearningPhase, MemoryLearningGrant};
 
 #[derive(Clone)]
 pub struct ConfiguredLearning {
@@ -32,7 +32,10 @@ impl ConfiguredLearning {
             target.validate()?;
             Ok(target)
         }
-        fn limits(definition: &Definition) -> Result<LearningExecutionLimits, Error> {
+        fn limits(
+            definition: &Definition,
+            phase: LearningPhase,
+        ) -> Result<LearningExecutionLimits, Error> {
             let maximum_output_tokens = definition.model.max_output_tokens.get();
             let request_tokens = definition.budget.tokens.get() / 3;
             let input = request_tokens
@@ -55,6 +58,12 @@ impl ConfiguredLearning {
                     .saturating_mul(1000),
             };
             limits.validate()?;
+            zuno_learning::learning_input_budget(
+                phase,
+                limits.maximum_input_bytes,
+                limits.maximum_output_tokens,
+            )
+            .map_err(|error| invalid(&error.diagnostic()))?;
             Ok(limits)
         }
         let mut grants = Vec::new();
@@ -75,8 +84,8 @@ impl ConfiguredLearning {
                 extraction: extraction.reference(),
                 maintenance: maintenance.reference(),
                 workspace: source.workspace.id.clone(),
-                extraction_limits: limits(extraction)?,
-                maintenance_limits: limits(maintenance)?,
+                extraction_limits: limits(extraction, LearningPhase::Extraction)?,
+                maintenance_limits: limits(maintenance, LearningPhase::Maintenance)?,
                 extraction_model: identity(extraction),
                 maintenance_model: identity(maintenance),
             });

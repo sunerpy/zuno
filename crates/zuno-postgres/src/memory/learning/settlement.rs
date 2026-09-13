@@ -292,12 +292,17 @@ impl TransactionMemory {
                     "source_invalidated":view.suppressed.contains(text)})).collect::<Vec<_>>(),
             })).collect(), experiences:Vec::new(),user_changes:signals,correction:None,
         };
+        let input_budget = zuno_learning::learning_input_budget(
+            LearningPhase::Maintenance,
+            extraction.maintenance_limits.maximum_input_bytes,
+            extraction.maintenance_limits.maximum_output_tokens,
+        )
+        .map_err(|error| invalid(&error.diagnostic()))?;
+        let has_evidence = !references.is_empty();
+        let mut oversized = false;
         loop {
             request.experiences = experiences.clone();
-            if serde_json::to_vec(&request).map_err(decode_error)?.len()
-                <= (extraction.maintenance_limits.maximum_input_bytes as usize)
-                    .saturating_sub(16384)
-            {
+            if serde_json::to_vec(&request).map_err(decode_error)?.len() <= input_budget {
                 break;
             }
             if !request.user_changes.is_empty() {
@@ -306,9 +311,8 @@ impl TransactionMemory {
                 experiences.pop();
                 references.pop();
             } else {
-                return Err(invalid(
-                    "current Memory cannot fit the maintenance model profile",
-                ));
+                oversized = true;
+                break;
             }
         }
         let suppressed = views
@@ -316,7 +320,7 @@ impl TransactionMemory {
             .filter(|view| !view.suppressed.is_empty())
             .map(|view| json!([view.document.scope, view.suppressed]))
             .collect::<Vec<_>>();
-        if references.is_empty() && suppressed.is_empty() {
+        if references.is_empty() && suppressed.is_empty() && !(oversized && has_evidence) {
             return Ok(false);
         }
         let digest = zuno_orchestration::sha256_json(&json!([
@@ -380,10 +384,30 @@ impl TransactionMemory {
             let exists:bool=query_scalar("SELECT EXISTS(SELECT 1 FROM zuno_enterprise_preview.learning_job WHERE tenant_id=$1 AND principal_id=$2 AND id=$3)")
                 .bind(self.principal.tenant_id().as_str()).bind(self.principal.principal_id().as_str()).bind(id.as_str())
                 .fetch_one(&mut **tx).await.map_err(sql_error)?;
-            if !exists {self.insert_execution(tx,NewExecution {
-                id:&id,source_job:&source_job,session:&job.session,configuration:&extraction.maintenance,
-                input:LearningInput::Maintenance(request),limits:&extraction.maintenance_limits,context:json!(context),
-            }).await?;}
+            if !exists {
+                let input = if oversized {
+                    // Retain the failure's coordinates and batch fingerprint,
+                    // without copying an oversized private snapshot.
+                    LearningInput::Maintenance(MemoryConsolidationRequest {
+                        project_id: request.project_id, session_id: request.session_id,
+                        scopes: Vec::new(), experiences: Vec::new(), user_changes: Vec::new(), correction: None,
+                    })
+                } else { LearningInput::Maintenance(request) };
+                self.insert_execution(tx,NewExecution {
+                    id:&id,source_job:&source_job,session:&job.session,configuration:&extraction.maintenance,
+                    input,limits:&extraction.maintenance_limits,
+                    context:if oversized {json!({"batch":context.batch,"views":[],"references":[]})} else {json!(context)},
+                }).await?;
+                if oversized {
+                    let now=database_time(tx).await.map_err(app_error)?;
+                    query("UPDATE zuno_enterprise_preview.learning_job SET status='failed',
+                        result='{\"code\":\"learning_input_budget\",\"detail\":\"Current Memory exceeds the selected maintenance model input allowance.\"}',
+                        time_updated=$4 WHERE tenant_id=$1 AND principal_id=$2 AND id=$3")
+                        .bind(self.principal.tenant_id().as_str()).bind(self.principal.principal_id().as_str())
+                        .bind(id.as_str()).bind(now).execute(&mut **tx).await.map_err(sql_error)?;
+                    crate::learning_client::publish_in(tx,&self.principal.owner(),&id).await.map_err(app_error)?;
+                }
+            }
             Ok(!exists)
         })
     }

@@ -31,7 +31,7 @@ async fn record_output(
     }
 }
 
-async fn complete_output(
+pub(super) async fn complete_output(
     runtime: &PostgresLearningRuntime,
     claimed: &ClaimedLearning,
     id: &str,
@@ -41,7 +41,7 @@ async fn complete_output(
     Box::pin(runtime.complete(completion)).await.unwrap();
 }
 
-async fn manual_note(human: &PostgresMemoryService, id: &str, text: &str) {
+pub(super) async fn manual_note(human: &PostgresMemoryService, id: &str, text: &str) {
     let staged = candidate(human.request(request(id, change(text))).await.unwrap());
     human
         .request(request(
@@ -55,7 +55,7 @@ async fn manual_note(human: &PostgresMemoryService, id: &str, text: &str) {
         .unwrap();
 }
 
-async fn claim(
+pub(super) async fn claim(
     runtime: &PostgresLearningRuntime,
     binding: &MemoryLearningGrant,
 ) -> ClaimedLearning {
