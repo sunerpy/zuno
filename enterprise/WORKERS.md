@@ -13,7 +13,7 @@ platform contract is unchanged; see [platform boundaries](PLATFORMS.md).
 
 ## Claims and lifetime
 
-Internal Worker protocol 13 requires the protocol version and a bounded, nonempty
+Internal Worker protocol 14 requires the protocol version and a bounded, nonempty
 set of configuration references on every claim. The PostgreSQL claim query
 matches the exact ID, version and SHA before acquiring the session. A Worker with
 an older definition leaves incompatible work eligible for another Worker.
@@ -147,3 +147,15 @@ Protocol 13 rejects older Workers before claiming work so they cannot silently
 omit the current Skill catalog or expose a different tool set during continuation.
 Drain and replace Worker/control-plane binaries together when upgrading this
 preview; existing checkpoint schema 4 and accumulated budgets are retained.
+
+Worker protocol 14 returns whether the data owner actually consumed an input.
+The SQLite adapter rechecks stable v0.10.37 live-input gates atomically with
+history and consumption; rejected claims stay pending. PostgreSQL currently
+accepts only the Job's assigned primary input and rejects native live claims.
+A remote live-steering producer/gate is not registered by this synchronization.
+
+A Job can be cancelled between its database claim and grant delivery. A claim
+conflict makes the Worker wait for its next scheduled poll; it neither executes
+that stale Job nor terminates the service. Authentication, authorization and
+protocol failures still stop claiming. SIGTERM interrupts outstanding claims and
+drains already admitted work within the configured deadline.

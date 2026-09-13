@@ -19,7 +19,7 @@ capabilities.
 ## Workspace
 
 - Integration branch: `codex/enterprise-preview`.
-- Current phase branch: `codex/enterprise-p6-admission-quotas`.
+- Current synchronization branch: `codex/enterprise-sync-v01037`.
 - The primary checkout and pre-existing worktrees remain owner-controlled.
 
 ## Validation
@@ -642,3 +642,50 @@ open. UI is paused; no enterprise publication is enabled.
 ## Admission quotas under validation
 
 A persisted quota port now covers user root sessions/Jobs, children, active execution leases and learning queue/leases. Learning has a separate fair dispatch clock. Quota rejection preserves input CAS and existing receipts; follow-up maintenance can defer without rolling back completed extraction. Real transaction, fairness, waiting-capacity and native API checks passed. Quota rejection preserved input CAS, and deferred maintenance resumed after queue capacity returned. Memory/Learning 218 tests, SDK 31 tests and generated drift, workspace check, Clippy and 100 documentation/release contracts passed. Exact-archive and preview CI validation remain required. UI remains paused and publication disabled.
+
+## Stable v0.10.37 synchronization in progress
+
+The isolated sync worktree incorporates stable main
+`4762790adaab0a9af8c93152c1b6136446e4dbc8`. Core SQLite format 15 remains separate
+from preview overlay 1. SQLite live-input gates execute through the persistence
+port; Worker protocol 14 reports whether consumption committed. PostgreSQL
+continues accepting only the assigned primary input and rejects native live
+claims. A transport acknowledgement does not authorize further model work.
+
+Local validation passed 223 SQLite tests including 54 migration fixtures, 373
+engine tests, 144 ACP tests, 750 host tests, 343 Goal tests plus its integration
+test, 82 session-control contracts, 31 SDK tests and generated-contract drift
+checks. The additional state/protocol tests verify refused consumption. Final
+workspace compilation and Clippy passed; the isolated PostgreSQL transaction
+suite, five HTTPS contracts and rootless Docker five-role process fixture passed.
+All 104 documentation/release contracts passed. The packaged artifact and
+preview CI remain required.
+The foreground-wait regression now observes durable process registration before
+sampling; it no longer assumes startup completes within 150 milliseconds.
+The repair fixture checks that admitting one recovery control increments only
+the corresponding preview input CAS while preserving leases and other state.
+
+ADK Go v2.4.0 source and official MCP docs were reviewed; adoption decisions are
+in [ADK-REFERENCE.md](ADK-REFERENCE.md) and [ADK-REFERENCE.zh.md](ADK-REFERENCE.zh.md).
+These are source-review conclusions, not ADK runtime validation. Shared service
+conformance, versioned Skill resources/artifacts and operational recovery remain
+implementation work. App/UI is paused; publication remains disabled.
+
+The first synchronization CI run found an arm64 stack overflow in the monolithic
+PostgreSQL test future. Independent kernel/wait/approval/learning fixtures now use
+boxed boundaries; learning suites no longer retain an unrelated runtime case's
+poll frame. Non-inlined entries keep future construction out of the outer
+coordinator frame. This changes test execution only; production
+behavior, schemas and public documentation contracts are unchanged. Native
+arm64 confirmation is required before merging the synchronization PR.
+
+The second CI run passed both PostgreSQL architectures but found a nonzero
+service exit during the amd64 process fixture's final shutdown. Claim conflicts
+caused by cancellation are now treated as a lost individual claim, while service
+authorization and protocol failures remain terminal. HTTPS regression covers
+409 followed by another poll and the distinct 403 refusal. Shutdown assertions
+now identify the role, exit result and bounded log tail. The updated native
+five-role fixture passed SIGTERM drain, as did workspace check/Clippy and all
+104 documentation/release contracts. The original CI exit did not record its
+role or status, so attribution to the reproduced claim race remains an inference;
+the next exact-head CI run must pass before merging.

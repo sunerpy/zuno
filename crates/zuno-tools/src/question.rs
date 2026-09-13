@@ -23,13 +23,17 @@ use zuno_types::question::{
     QuestionSpec, QuestionState, QuestionView,
 };
 
-/// The id the model calls. Registry key and wire id agree (`registry.ts:218`).
+/// The id the model calls in both Plan and Work, independent of waiting mode.
 pub const WIRE_ID: &str = "question";
 pub const ASYNC_WIRE_ID: &str = "question_async";
 pub const ASYNC_DESCRIPTION: &str = include_str!("description/question-async.txt");
 
-/// The description the model reads, verbatim from `tool/question.txt`.
+/// The description for a blocking Plan clarification.
 pub const DESCRIPTION: &str = include_str!("description/question.txt");
+/// Deferred clarification text for the same wire tool in Work/Goal mode.
+pub const WORK_DESCRIPTION: &str = include_str!("description/question-work.txt");
+/// Explicit required-input variant retained for typed native compositions.
+pub const REQUIRED_DESCRIPTION: &str = include_str!("description/question-required.txt");
 
 pub use zuno_types::question::{QuestionOption, QuestionPrompt, QuestionRequest};
 
@@ -144,6 +148,7 @@ impl QuestionPort for ScriptedAnswers {
             plan: spec.plan,
             decision: None,
             authorization: None,
+            delivery: None,
             time_created: 0,
             time_updated: 0,
         };
@@ -234,34 +239,58 @@ pub struct QuestionParams {
 /// Publishes questions and returns a receipt; answers are delivered by the inbox.
 pub struct QuestionTool {
     port: Arc<dyn QuestionPort>,
+    wire_id: &'static str,
+    description: &'static str,
     mode: QuestionMode,
     purpose: QuestionPurpose,
 }
 
 impl QuestionTool {
-    /// The tool, asking through `asker`.
+    /// A Plan clarification that waits for the first response.
     #[must_use]
     pub fn new(port: Arc<dyn QuestionPort>) -> Self {
         Self {
             port,
+            wire_id: WIRE_ID,
+            description: DESCRIPTION,
             mode: QuestionMode::Blocking,
             purpose: QuestionPurpose::Clarification,
         }
     }
 
+    /// Optional Work/Goal clarification using `question` without waiting or pausing.
     #[must_use]
-    pub fn asynchronous(port: Arc<dyn QuestionPort>) -> Self {
+    pub fn for_work(port: Arc<dyn QuestionPort>) -> Self {
         Self {
             port,
+            wire_id: WIRE_ID,
+            description: WORK_DESCRIPTION,
             mode: QuestionMode::Deferred,
             purpose: QuestionPurpose::Clarification,
         }
     }
 
+    /// Optional clarification under the distinct `question_async` wire id.
+    #[must_use]
+    pub fn asynchronous(port: Arc<dyn QuestionPort>) -> Self {
+        Self {
+            port,
+            wire_id: ASYNC_WIRE_ID,
+            description: ASYNC_DESCRIPTION,
+            mode: QuestionMode::Deferred,
+            purpose: QuestionPurpose::Clarification,
+        }
+    }
+
+    /// Explicit required input; an unanswered request keeps execution waiting.
+    ///
+    /// Goal-owned required input uses `goal_request_input` to bind its revision.
     #[must_use]
     pub fn required(port: Arc<dyn QuestionPort>) -> Self {
         Self {
             port,
+            wire_id: WIRE_ID,
+            description: REQUIRED_DESCRIPTION,
             mode: QuestionMode::Blocking,
             purpose: QuestionPurpose::RequiredInput,
         }
@@ -293,19 +322,11 @@ impl TypedTool for QuestionTool {
     type Params = QuestionParams;
 
     fn id(&self) -> &str {
-        if self.mode == QuestionMode::Deferred {
-            ASYNC_WIRE_ID
-        } else {
-            WIRE_ID
-        }
+        self.wire_id
     }
 
     fn description(&self) -> &str {
-        if self.mode == QuestionMode::Deferred {
-            ASYNC_DESCRIPTION
-        } else {
-            DESCRIPTION
-        }
+        self.description
     }
 
     fn effect(&self, _args: &serde_json::Value) -> ToolEffect {
@@ -551,6 +572,24 @@ mod tests {
     // --- asking ---
 
     #[tokio::test]
+    async fn work_question_without_an_answer_keeps_execution_runnable() {
+        let tool = erase(QuestionTool::for_work(Arc::new(ScriptedAnswers::default())));
+        let output = tool
+            .invoke(one_question(), context())
+            .await
+            .expect("question receipt without a human answer");
+
+        assert_eq!(
+            output.continuation,
+            zuno_tool::ToolContinuation::Continue,
+            "an optional Work clarification must not suspend execution"
+        );
+        assert_eq!(tool.id(), "question");
+        assert_eq!(output.metadata["questionPurpose"], "clarification");
+        assert!(!output.metadata.contains_key("answers"));
+    }
+
+    #[tokio::test]
     async fn the_question_reaches_the_asker_with_the_call_coordinates() {
         let asker = Arc::new(ScriptedAnswers::selecting("Postgres"));
         let output = tool(Arc::clone(&asker) as Arc<dyn QuestionPort>)
@@ -694,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn description_explains_required_deferred_and_receipt_semantics() {
+    fn plan_description_explains_clarification_deferral_and_receipt_semantics() {
         assert!(DESCRIPTION.contains("question_async"));
         assert!(DESCRIPTION.contains("Tool results are receipts"));
         assert!(

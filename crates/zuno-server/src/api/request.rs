@@ -80,7 +80,7 @@ pub async fn question_requests(
     .map_err(worker_error)??;
     let mut pending = Vec::new();
     for session in sessions {
-        pending.extend(questions.pending(&session.id).await?);
+        pending.extend(questions.visible(&session.id).await?);
     }
     pending.sort_by(|left, right| {
         left.time_created
@@ -98,7 +98,7 @@ pub async fn session_questions(
     let Path(session_id) = path.map_err(|_| invalid_question("question path is invalid"))?;
     validate_question_id(&session_id, "ses")?;
     require_question_session(state, &session_id).await?;
-    Ok(Json(Data::new(questions.pending(&session_id).await?)))
+    Ok(Json(Data::new(questions.visible(&session_id).await?)))
 }
 
 pub async fn session_permission_requests(

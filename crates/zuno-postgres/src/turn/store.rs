@@ -427,7 +427,12 @@ impl TurnPersistence for PostgresTurnPersistence {
         &self,
         scope: &TurnStateScope,
         mut input: InputMaterialization,
-    ) -> Result<(), TurnError> {
+    ) -> Result<bool, TurnError> {
+        // This adapter currently consumes only the Job's assigned primary input.
+        // Native live claims require their own durable enterprise producer/gate.
+        if input.live.is_some() {
+            return Err(TurnStateError::InvalidData.into());
+        }
         let (mut tx, job) = self.transaction(scope).await?;
         let id = input
             .input_id
@@ -537,7 +542,8 @@ impl TurnPersistence for PostgresTurnPersistence {
             )?,
         )
         .await?;
-        self.commit_transaction(tx).await
+        self.commit_transaction(tx).await?;
+        Ok(true)
     }
 
     async fn schedule_backoff(

@@ -107,7 +107,15 @@ async fn setup(
         .id
 }
 
-pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool) {
+#[inline(never)]
+pub(crate) fn exercise<'a>(
+    backend: &'a PostgresBackend,
+    admin: &'a PgPool,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
+    Box::pin(exercise_contracts(backend, admin))
+}
+
+async fn exercise_contracts(backend: &PostgresBackend, admin: &PgPool) {
     Box::pin(learning::exercise(backend, admin)).await;
     let alice = principal("alice");
     let bob = principal("bob");

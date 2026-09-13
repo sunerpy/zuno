@@ -100,6 +100,9 @@ use super::turn::{
 use crate::command::{CliSandboxBackend, TuiArgs};
 use crate::environment::StartupEnvironment;
 
+#[path = "tui_cancellation.rs"]
+mod cancellation;
+
 /// How many prompts may wait for durable admission.
 ///
 /// This is not the session queue: accepted inputs are copied into `SessionInbox`.
@@ -122,9 +125,8 @@ const EDIT_SIGNAL_CHANNEL_CAPACITY: usize = 1;
 
 /// How many cancellation requests may be queued.
 ///
-/// One, because aborting a turn is idempotent: a second request for the same turn
-/// would abort nothing new, and a full channel is what makes the screen fall through
-/// to shutdown rather than swallow the key.
+/// A screen action emits at most one request. The cancellation component drains
+/// it synchronously within that event, using the target captured before dispatch.
 const CANCEL_CHANNEL_CAPACITY: usize = 1;
 
 /// How many picker choices may be queued.
@@ -928,6 +930,8 @@ fn execute_once(
     let question_worker = Arc::clone(&question_broker);
     let bridge = PermissionBridge::new(context.clone(), broker, dialogs)
         .with_question(QuestionBridge::new(context, question_broker));
+    let bridge =
+        cancellation::CancellationBridge::new(Box::new(bridge), control.clone(), cancel_receiver);
     let root = KeyDispatcher::new(keymap, scopes(), Box::new(bridge))
         .with_paste_burst(terminal_sender.clone());
 
@@ -1047,12 +1051,7 @@ fn execute_once(
             report_sender,
             worker_shutdown_source.clone(),
         ));
-        let shutdown_control = control.clone();
-        let mut cancels = tokio::spawn(forward_cancellations(
-            control,
-            cancel_receiver,
-            worker_shutdown_source.clone(),
-        ));
+        let shutdown_control = control;
         let mut history = tokio::spawn(record_prompt_history(
             history_path,
             history_receiver,
@@ -1075,7 +1074,7 @@ fn execute_once(
         // the worker-shutdown timeout.
         drop(app);
         let _stopping = worker_shutdown.send(true);
-        let _aborted = shutdown_control.abort(HardInterruptRequest::new(
+        let _aborted = shutdown_control.abort_active(HardInterruptRequest::new(
             HardInterruptSource::Lifecycle,
             HardInterruptReason::Shutdown,
         ));
@@ -1084,7 +1083,6 @@ fn execute_once(
         let (
             editor_shutdown,
             input_shutdown,
-            cancellation_shutdown,
             history_shutdown,
             turn_shutdown,
             background_shutdown,
@@ -1096,7 +1094,6 @@ fn execute_once(
         ) = tokio::join!(
             await_worker("external editor", &mut editor),
             await_worker("terminal input", &mut input),
-            await_worker("cancellation forwarder", &mut cancels),
             await_worker("prompt history", &mut history),
             await_turn_driver(&mut turns),
             await_worker("background projection", &mut background),
@@ -1111,7 +1108,6 @@ fn execute_once(
             [
                 editor_shutdown,
                 input_shutdown,
-                cancellation_shutdown,
                 history_shutdown,
                 turn_shutdown,
                 background_shutdown,
@@ -2044,50 +2040,6 @@ fn mcp_enabled(server: &zuno_config::schema::mcp::McpServerConfig) -> bool {
         McpServerConfig::Local(local) => local.enabled.unwrap_or(true),
         McpServerConfig::Remote(remote) => remote.enabled.unwrap_or(true),
         McpServerConfig::Toggle(toggle) => toggle.enabled,
-    }
-}
-
-/// Abort the live turn each time the screen asks, until the screen stops asking.
-///
-/// A task rather than a call inside the component handler for the reason the turn
-/// driver is one: the render loop is the only consumer of the events an aborted turn
-/// produces, so it must not be the thing waiting on the abort. The registry retains an
-/// interrupt that arrives during the guard handoff, so an accepted follow-up turn cannot
-/// escape a cancellation merely because the previous guard dropped first.
-async fn forward_cancellations(
-    control: zuno_engine::status::SessionControl,
-    mut cancels: mpsc::Receiver<HardInterruptRequest>,
-    mut shutdown: watch::Receiver<bool>,
-) {
-    loop {
-        tokio::select! {
-            biased;
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    cancels.close();
-                    return;
-                }
-            }
-            cancellation = cancels.recv() => {
-                let Some(request) = cancellation else {
-                    return;
-                };
-                match control.abort(request) {
-                    zuno_engine::status::AbortDisposition::Active => tracing::info!(
-                        target: "zuno::tui::cancellation",
-                        session_id = %control.session_id(),
-                        disposition = "active",
-                        "TUI interrupt request fired for the active turn"
-                    ),
-                    zuno_engine::status::AbortDisposition::ArmedNext => tracing::info!(
-                        target: "zuno::tui::cancellation",
-                        session_id = %control.session_id(),
-                        disposition = "armed_next",
-                        "TUI interrupt request was retained across the turn handoff"
-                    ),
-                }
-            }
-        }
     }
 }
 
@@ -3297,6 +3249,7 @@ fn queued_submission_display(submission: &PromptSubmission) -> (String, bool) {
                 HostCommand::Undo => "/undo".to_owned(),
                 HostCommand::Redo => "/redo".to_owned(),
                 HostCommand::Goal(arguments) => format!("/goal {arguments}"),
+                HostCommand::InspectOutcome(arguments) => format!("/inspect-outcome {arguments}"),
                 HostCommand::Learn(arguments) => format!("/learn {arguments}"),
                 HostCommand::Reflect(arguments) => format!("/reflect {arguments}"),
                 HostCommand::Questions(arguments) => format!("/questions {arguments}"),
@@ -5160,7 +5113,7 @@ async fn restore_snapshot(
         HostCommand::Learn(_) | HostCommand::Reflect(_) => {
             return Err("learning commands must be handled by the turn host".to_owned());
         }
-        HostCommand::Questions(_) | HostCommand::Resume(_) => {
+        HostCommand::Questions(_) | HostCommand::Resume(_) | HostCommand::InspectOutcome(_) => {
             return Err("question and resume controls do not restore snapshots".to_owned());
         }
         HostCommand::Preset(_) => {
@@ -5223,6 +5176,10 @@ async fn execute_host_command(
             .map_err(|error| error.to_string()),
         HostCommand::Goal(arguments) => host
             .execute_session_command(SessionCommand::Goal, &arguments, events.clone())
+            .await
+            .map_err(|error| error.to_string()),
+        HostCommand::InspectOutcome(arguments) => host
+            .execute_session_command(SessionCommand::InspectOutcome, &arguments, events.clone())
             .await
             .map_err(|error| error.to_string()),
         HostCommand::Learn(arguments) => host
@@ -5635,76 +5592,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn cancellation_forwarder_fires_the_active_sessions_interrupt_signal() {
-        let registry = SessionRunRegistry::new();
-        let guard = registry
-            .begin_turn("ses_cancel_from_tui")
-            .expect("the fixture owns the only live turn");
-        let signal = guard.interrupt_signal().clone();
-        let control = registry.control("ses_cancel_from_tui");
-        let (requests, receiver) = mpsc::channel(1);
-        let (shutdown, shutdown_source) = watch::channel(false);
-        let worker = tokio::spawn(forward_cancellations(control, receiver, shutdown_source));
-
-        requests
-            .send(HardInterruptRequest::new(
-                HardInterruptSource::Tui,
-                HardInterruptReason::UserCancel,
-            ))
-            .await
-            .expect("the cancellation bridge is listening");
-        tokio::time::timeout(Duration::from_secs(1), signal.notified())
-            .await
-            .expect("the cancellation bridge never fired the turn signal");
-        assert!(signal.is_set(), "the turn signal remained clear");
-        assert_eq!(
-            guard.interrupt_request(),
-            Some(HardInterruptRequest::new(
-                HardInterruptSource::Tui,
-                HardInterruptReason::UserCancel,
-            ))
-        );
-
-        shutdown.send(true).expect("the worker observes shutdown");
-        worker.await.expect("the cancellation bridge exits cleanly");
-    }
-
-    #[tokio::test]
-    async fn cancellation_forwarder_retains_an_interrupt_across_the_turn_handoff() {
-        let registry = SessionRunRegistry::new();
-        let control = registry.control("ses_cancel_handoff");
-        let (requests, receiver) = mpsc::channel(1);
-        let (shutdown, shutdown_source) = watch::channel(false);
-        let worker = tokio::spawn(forward_cancellations(control, receiver, shutdown_source));
-
-        requests
-            .send(HardInterruptRequest::new(
-                HardInterruptSource::Tui,
-                HardInterruptReason::Exit,
-            ))
-            .await
-            .expect("the cancellation bridge is listening");
-        tokio::task::yield_now().await;
-        let guard = registry
-            .begin_turn("ses_cancel_handoff")
-            .expect("the admitted follow-up acquires its guard");
-        tokio::time::timeout(Duration::from_secs(1), guard.interrupt_signal().notified())
-            .await
-            .expect("the handoff interrupt never reached the accepted follow-up");
-        assert!(guard.interrupt_signal().is_set());
-        assert_eq!(
-            guard.interrupt_request(),
-            Some(HardInterruptRequest::new(
-                HardInterruptSource::Tui,
-                HardInterruptReason::Exit,
-            ))
-        );
-
-        shutdown.send(true).expect("the worker observes shutdown");
-        worker.await.expect("the cancellation bridge exits cleanly");
-    }
-
     #[test]
     fn tui_host_continuity_keeps_cancellation_bound_to_replacement_hosts() {
         let continuity = TuiHostContinuity::new(
@@ -5720,12 +5607,15 @@ mod tests {
             .begin_turn("ses_rebuilt")
             .expect("the replacement host owns the live turn");
 
-        assert_eq!(
-            control.abort(HardInterruptRequest::new(
-                HardInterruptSource::Tui,
-                HardInterruptReason::UserCancel,
-            )),
-            zuno_engine::status::AbortDisposition::Active,
+        let target = control.cancel_target().expect("replacement host target");
+        assert!(
+            control.abort_target(
+                &target,
+                HardInterruptRequest::new(
+                    HardInterruptSource::Tui,
+                    HardInterruptReason::UserCancel,
+                )
+            ),
             "a control created before host replacement targeted an abandoned registry"
         );
         assert!(

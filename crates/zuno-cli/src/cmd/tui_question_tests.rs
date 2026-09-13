@@ -684,7 +684,7 @@ async fn partial_defer_reopens_stored_answers_after_the_surface_disconnects() {
     let worker = tokio::spawn(Arc::clone(&recovered).run(stopping));
     let mut recovered_bridge = bridge(&recovered);
     recovered.show_questions("list").expect("list handler");
-    wait_for_frame(&mut recovered_bridge, &mut wake, "Questions (1 pending)").await;
+    wait_for_frame(&mut recovered_bridge, &mut wake, "Questions (1 entries)").await;
     apply_action(&mut recovered_bridge, "dialog.select.submit");
     wait_for_frame(
         &mut recovered_bridge,
@@ -748,7 +748,7 @@ async fn a_deferred_question_does_not_open_a_modal_until_requested() {
     let (shutdown, stopping) = watch::channel(false);
     let worker = tokio::spawn(Arc::clone(&broker).run(stopping));
     let mut bridge = bridge(&broker);
-    wait_for_frame(&mut bridge, &mut wake, "1 pending question(s)").await;
+    wait_for_frame(&mut bridge, &mut wake, "1 question/status entries").await;
     assert!(!rendered_text(&mut bridge).contains("Optional detail"));
     broker
         .show_questions(&format!("open {}", view.id))
@@ -804,6 +804,7 @@ fn plan_view(review_gate: zuno_review::PlanReviewGate) -> QuestionView {
         }),
         decision: None,
         authorization: None,
+        delivery: None,
         time_created: 1,
         time_updated: 1,
     }

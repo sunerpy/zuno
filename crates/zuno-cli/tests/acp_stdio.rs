@@ -2714,7 +2714,7 @@ async fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
         .as_array()
         .expect("available commands")
         .iter()
-        .take(9)
+        .take(10)
         .map(|command| command["name"].as_str().expect("command name"))
         .collect::<Vec<_>>();
     assert_eq!(
@@ -2722,6 +2722,7 @@ async fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
         [
             "compact",
             "goal",
+            "inspect-outcome",
             "learn",
             "plan",
             "questions",
@@ -6421,7 +6422,17 @@ fn acp_load_replays_durable_content_tools_plan_and_usage() {
         .find(|update| update["sessionUpdate"] == "tool_call_update")
         .expect("completed tool replay");
     let content = completed["content"].as_array().expect("tool content");
-    assert_eq!(completed["title"], "Editing files");
+    assert_eq!(completed["title"], "Editing lib.rs");
+    assert!(
+        completed["locations"].as_array().is_some_and(|locations| {
+            locations.iter().any(|location| {
+                location["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("/src/lib.rs"))
+            })
+        }),
+        "Zed receives the filename and its standard location: {completed}"
+    );
     assert_eq!(completed["kind"], "edit");
     assert!(
         content.iter().all(|item| {
@@ -7084,6 +7095,17 @@ async fn acp_session_steer_targets_one_live_turn_and_returns_a_success_shape() {
     assert_eq!(
         initialized["_meta"]["zuno"]["steering"]["method"],
         "session/steer"
+    );
+    assert_eq!(
+        initialized["_meta"]["zuno"]["cancellation"],
+        json!({
+            "version": 1,
+            "method": "session/cancel",
+            "expectedTurnIdPath": "_meta.zuno.expectedTurnId",
+            "turnIdSource": "session/update._meta.zuno.turnId",
+            "legacySessionIdOnly": "currentTargetAtDispatch",
+            "armsNextTurn": false,
+        })
     );
     let created = request(
         &mut stdin,

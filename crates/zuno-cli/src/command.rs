@@ -390,6 +390,8 @@ pub struct SessionArgs {
 pub enum SessionCommand {
     List(SessionListArgs),
     Prune(SessionPruneArgs),
+    /// Inspect or explicitly repair one proven legacy false-blocked input.
+    Repair(SessionRepairArgs),
     Delete {
         session_id: String,
         /// Keep Experience records and detach them from the deleted session.
@@ -399,6 +401,23 @@ pub enum SessionCommand {
         #[arg(long, conflicts_with = "keep_derived_experiences")]
         cleanup_derived_experiences: bool,
     },
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct SessionRepairArgs {
+    #[arg(value_name = "SESSION")]
+    pub session_id: String,
+    #[arg(long, value_name = "ID")]
+    pub input: String,
+    /// Inspect only (the default); never migrate or modify the database.
+    #[arg(long, conflicts_with = "apply")]
+    pub dry_run: bool,
+    /// Admit one guarded resume control after rechecking the complete proof.
+    #[arg(long, requires = "expected_revision")]
+    pub apply: bool,
+    /// Exact execution revision reported by dry-run.
+    #[arg(long, requires = "apply", value_name = "N", value_parser = clap::value_parser!(i64).range(1..))]
+    pub expected_revision: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]

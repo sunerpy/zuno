@@ -4,12 +4,14 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use zuno_db::message::MessageWithParts;
+use zuno_db::message::{MessageRecord, MessageWithParts, PartRecord};
 use zuno_engine::state::remote::{RemoteTurnPersistence, StateTransport};
 use zuno_engine::state::wire::{
     StateCommand, StateReply, StateRequest, StateResponse, StoredMessage, WORKER_PROTOCOL_VERSION,
 };
-use zuno_engine::state::{TurnPersistence, TurnStateError, TurnStateScope};
+use zuno_engine::state::{
+    InputMaterialization, LiveInputGate, TurnPersistence, TurnStateError, TurnStateScope,
+};
 use zuno_types::identity::{PrincipalScope, SessionId};
 
 fn scope() -> TurnStateScope {
@@ -119,5 +121,69 @@ async fn an_ambiguous_write_is_not_repeated_by_the_remote_provider() {
     )
     .unwrap();
     assert!(remote.touch(&scope()).await.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+struct RefusedInput(Arc<AtomicUsize>);
+
+#[async_trait]
+impl StateTransport for RefusedInput {
+    async fn exchange(&self, request: StateRequest) -> Result<StateResponse, TurnStateError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        let request = StateRequest::decode(&request.encode()?)?;
+        let StateCommand::ConsumeInput(input) = request.command else {
+            panic!("expected input consumption");
+        };
+        assert_eq!(input.input_id.as_str(), "input");
+        assert_eq!(input.turn_id.as_ref().unwrap().as_str(), "turn");
+        let gate = input.live.expect("live claim crosses the state API");
+        assert_eq!(gate.revision, Some(3));
+        assert_eq!(
+            gate.source,
+            zuno_engine::interrupt::SoftInterruptSource::User
+        );
+        let response = StateResponse::new(Ok(StateReply::Boolean(false)));
+        StateResponse::decode(&response.encode()?)
+    }
+}
+
+#[tokio::test]
+async fn a_refused_live_input_remains_unconsumed_across_the_worker_protocol() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let remote = RemoteTurnPersistence::new(
+        Arc::new(RefusedInput(Arc::clone(&calls))),
+        scope(),
+        "/worker/workspace".to_owned(),
+    )
+    .unwrap();
+    let consumed = remote
+        .consume_input(
+            &scope(),
+            InputMaterialization {
+                live: Some(LiveInputGate {
+                    revision: Some(3),
+                    source: zuno_engine::interrupt::SoftInterruptSource::User,
+                }),
+                input_id: Some("input".to_owned()),
+                turn_id: Some("turn".to_owned()),
+                message: MessageRecord::from_json(json!({
+                    "id":"input","sessionID":"session","role":"user","time":{"created":1},
+                }))
+                .unwrap(),
+                parts: vec![
+                    PartRecord::from_json(
+                        json!({
+                            "id":"part","sessionID":"session","messageID":"input",
+                            "type":"text","text":"Wait for authorization",
+                        }),
+                        1,
+                    )
+                    .unwrap(),
+                ],
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!consumed, "a successful transport is not input admission");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }

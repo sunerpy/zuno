@@ -368,7 +368,30 @@ pub struct QuestionView {
     pub decision: Option<PlanQuestionDecision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorization: Option<PlanAuthorizationState>,
+    /// Derived from input receipts, never a second persisted question state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<QuestionDeliverySnapshot>,
     pub time_created: i64,
+    pub time_updated: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionDeliveryPhase {
+    WaitingAnswer,
+    AnsweredPendingDelivery,
+    Applied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct QuestionDeliverySnapshot {
+    pub phase: QuestionDeliveryPhase,
+    pub pending_inputs: u64,
+    pub applied_inputs: u64,
+    pub last_input_id: Option<String>,
+    pub last_input_state: Option<crate::admission::InputReceiptState>,
+    pub applied_at: Option<i64>,
     pub time_updated: i64,
 }
 
@@ -561,6 +584,7 @@ mod tests {
             plan: None,
             decision: None,
             authorization: None,
+            delivery: None,
             time_created: 1,
             time_updated: 1,
         }

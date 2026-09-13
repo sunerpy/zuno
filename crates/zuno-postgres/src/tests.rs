@@ -364,9 +364,9 @@ async fn run_postgres_contracts() {
         &backend, &admin, &migrator,
     ))
     .await;
-    Box::pin(crate::turn_tests::exercise(&backend, &admin, &migrator)).await;
+    crate::turn_tests::exercise(&backend, &admin, &migrator).await;
     Box::pin(crate::browser_tests::exercise(&backend, &admin)).await;
-    Box::pin(crate::memory::tests::exercise(&backend, &admin)).await;
+    crate::memory::tests::exercise(&backend, &admin).await;
     format_two_upgrade(&fixture, &admin).await;
     format_three_upgrade(&fixture, &admin).await;
     format_four_upgrade(&fixture, &admin).await;

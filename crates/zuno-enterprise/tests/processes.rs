@@ -1254,14 +1254,22 @@ async fn independent_control_gateway_and_two_workers_complete_isolated_approved_
                 .success()
         );
     }
-    for child in &mut children {
+    for (index, child) in children.iter_mut().enumerate() {
+        let name = ["control", "gateway", "gateway-peer", "worker-a", "worker-b"][index];
+        let result = tokio::time::timeout(Duration::from_secs(35), child.wait()).await;
         assert!(
-            tokio::time::timeout(Duration::from_secs(35), child.wait())
-                .await
-                .unwrap()
-                .unwrap()
-                .success(),
-            "service did not drain successfully on SIGTERM"
+            matches!(&result, Ok(Ok(status)) if status.success()),
+            "service {name} did not drain successfully on SIGTERM: {result:?}; log: {}",
+            std::fs::read_to_string(root.join(format!("{name}.log")))
+                .unwrap_or_default()
+                .lines()
+                .rev()
+                .take(24)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
     issuer_stopped.fire();

@@ -15,7 +15,7 @@ use zuno_db::message::{MessageRecord, MessageWithParts, PartRecord};
 use zuno_db::provider_backoff::ProviderBackoffCheckpoint;
 use zuno_types::identity::{InputId, SessionId, TurnId};
 
-pub const WORKER_PROTOCOL_VERSION: u32 = 13;
+pub const WORKER_PROTOCOL_VERSION: u32 = 14;
 pub const MAX_WORKER_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -162,6 +162,7 @@ impl TryFrom<ProviderRequestWrite> for super::ProviderRequestCommit {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InputWrite {
+    pub live: Option<super::LiveInputGate>,
     pub input_id: InputId,
     pub turn_id: Option<TurnId>,
     pub message: StoredMessage,
@@ -172,6 +173,7 @@ impl TryFrom<InputMaterialization> for InputWrite {
         let input_id = InputId::new(value.input_id.ok_or(TurnStateError::InvalidData)?)
             .map_err(|_| TurnStateError::InvalidData)?;
         Ok(Self {
+            live: value.live,
             input_id,
             turn_id: value
                 .turn_id
@@ -194,6 +196,7 @@ impl TryFrom<InputWrite> for InputMaterialization {
             return Err(TurnStateError::InvalidData);
         }
         Ok(Self {
+            live: value.live,
             input_id: Some(value.input_id.to_string()),
             turn_id: value.turn_id.map(String::from),
             message: message.info,
@@ -535,12 +538,11 @@ pub async fn execute(
                 .await?;
             StateReply::Done
         }
-        StateCommand::ConsumeInput(input) => {
+        StateCommand::ConsumeInput(input) => StateReply::Boolean(
             provider
                 .consume_input(scope, InputMaterialization::try_from(input)?)
-                .await?;
-            StateReply::Done
-        }
+                .await?,
+        ),
         StateCommand::ScheduleBackoff(checkpoint) => {
             provider.schedule_backoff(scope, checkpoint).await?;
             StateReply::Done

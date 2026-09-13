@@ -1,4 +1,5 @@
 use super::*;
+use axum::{Json, response::IntoResponse};
 use futures::StreamExt as _;
 use std::sync::atomic::AtomicBool;
 use zuno_engine::{
@@ -274,8 +275,31 @@ async fn worker_runtimes_renew_and_resume_shared_kernel_without_replaying_input_
     let failure_count = rejected_renewals.clone();
     let blocked_claim = Arc::new(tokio::sync::Notify::new());
     let blocked_notice = blocked_claim.clone();
+    let claim_conflicts = Arc::new(AtomicUsize::new(0));
+    let conflict_count = claim_conflicts.clone();
+    let after_conflict = Arc::new(tokio::sync::Notify::new());
+    let conflict_notice = after_conflict.clone();
     let router = service
         .router()
+        .route(
+            "/racing/internal/worker/v1/claim",
+            post(move || {
+                let count = conflict_count.clone();
+                let notice = conflict_notice.clone();
+                async move {
+                    if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        StatusCode::CONFLICT.into_response()
+                    } else {
+                        notice.notify_one();
+                        Json(serde_json::Value::Null).into_response()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/denied/internal/worker/v1/claim",
+            post(|| async { StatusCode::FORBIDDEN }),
+        )
         .route(
             "/blocked/internal/worker/v1/claim",
             post(move || {
@@ -503,6 +527,18 @@ async fn worker_runtimes_renew_and_resume_shared_kernel_without_replaying_input_
         Some(certificate.clone()),
     )
     .unwrap();
+    let racing_client = WorkerClient::new(
+        endpoint.join("racing/").unwrap(),
+        Arc::new(Token("worker-token")),
+        Some(certificate.clone()),
+    )
+    .unwrap();
+    let denied_client = WorkerClient::new(
+        endpoint.join("denied/").unwrap(),
+        Arc::new(Token("worker-token")),
+        Some(certificate.clone()),
+    )
+    .unwrap();
     let client =
         WorkerClient::new(endpoint, Arc::new(Token("worker-token")), Some(certificate)).unwrap();
     let first = WorkerRuntime::new(
@@ -667,6 +703,42 @@ async fn worker_runtimes_renew_and_resume_shared_kernel_without_replaying_input_
         JobPhase::Running,
         "loss of authority must not manufacture a terminal outcome"
     );
+    let after_race = InterruptSignal::new();
+    let racing = WorkerRuntime::new(
+        racing_client,
+        WorkerInstanceId::new("racing").unwrap(),
+        factory.clone(),
+        observer.clone(),
+        settings,
+    )
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let (result, ()) = tokio::join!(racing.run(after_race.clone()), async {
+            after_conflict.notified().await;
+            after_race.fire();
+        });
+        result.expect("a cancelled claim must not terminate the Worker service");
+    })
+    .await
+    .expect("claim conflict must yield to the next bounded poll");
+    assert!(claim_conflicts.load(Ordering::SeqCst) >= 2);
+    let denied = WorkerRuntime::new(
+        denied_client,
+        WorkerInstanceId::new("denied").unwrap(),
+        factory.clone(),
+        observer.clone(),
+        settings,
+    )
+    .unwrap();
+    assert!(matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            denied.run(InterruptSignal::new())
+        )
+        .await
+        .unwrap(),
+        Err(WorkerError::LeaseLost)
+    ));
     let draining = InterruptSignal::new();
     let stopped = WorkerRuntime::new(
         blocked_client,

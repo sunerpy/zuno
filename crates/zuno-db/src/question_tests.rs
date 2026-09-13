@@ -135,6 +135,83 @@ fn input_prompt(pool: &Pool, receipt: &QuestionReceipt) -> Value {
 }
 
 #[test]
+fn answer_delivery_is_derived_from_provider_application_not_form_completion() {
+    use zuno_types::question::QuestionDeliveryPhase as Phase;
+    let (pool, store) = fixture();
+    let opened = create(&pool, &spec());
+    assert_eq!(
+        opened.delivery.as_ref().unwrap().phase,
+        Phase::WaitingAnswer
+    );
+    let receipt = store
+        .apply(
+            SESSION,
+            &opened.id,
+            &command(
+                "submit-both",
+                opened.revision,
+                QuestionAction::Answer {
+                    answers: draft(&[("q1", &["test"]), ("q2", &["terminal"])]),
+                },
+            ),
+            20,
+        )
+        .unwrap();
+    let id = receipt.input_id.unwrap();
+    let stored: String = pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT receipt FROM question_action_receipt WHERE request_id=?1",
+            [&opened.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        serde_json::from_str::<Value>(&stored).unwrap()["question"]
+            .get("delivery")
+            .is_none(),
+        "derived delivery must not alter the format-15 action receipt shape"
+    );
+    assert_eq!(
+        receipt.question.delivery.as_ref().unwrap().phase,
+        Phase::AnsweredPendingDelivery
+    );
+    assert!(store.pending(SESSION).unwrap().is_empty());
+    assert_eq!(visible_in(&pool.get().unwrap(), SESSION).unwrap().len(), 1);
+    let inbox = crate::inbox::SessionInbox::new(pool.clone());
+    inbox.promote_id(SESSION, &id).unwrap().unwrap();
+    pool.transaction(|tx| {
+        crate::inbox::mark_consumed_in(tx, SESSION, &id)?;
+        crate::input_receipt::bind_turn_in(tx, SESSION, std::slice::from_ref(&id), "turn", 30)?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        store
+            .get(SESSION, &opened.id)
+            .unwrap()
+            .delivery
+            .unwrap()
+            .phase,
+        Phase::AnsweredPendingDelivery
+    );
+    pool.transaction(|tx| {
+        crate::input_receipt::mark_applied_in(tx, SESSION, std::slice::from_ref(&id), "turn", 40)
+    })
+    .unwrap();
+    let applied = store.get(SESSION, &opened.id).unwrap().delivery.unwrap();
+    assert_eq!(applied.phase, Phase::Applied);
+    assert_eq!(applied.applied_at, Some(40));
+    assert_eq!(applied.pending_inputs, 0);
+    assert!(
+        visible_in(&pool.get().unwrap(), SESSION)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn full_draft_survives_reopen_and_only_explicit_answer_keys_are_committed() {
     let directory = tempfile::tempdir().expect("directory");
     let location = DbLocation::File(directory.path().join("questions.db"));

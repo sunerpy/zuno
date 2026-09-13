@@ -22,12 +22,13 @@ impl ReceiptCycle {
     }
 
     pub(super) fn control_inputs(&self, cycle_id: &str) -> Result<Vec<String>, TurnFailure> {
+        // Audited recovery can attach its never-applied anchor to the new
+        // control cycle. Bind both identities without re-admitting the user text.
         let connection = self.database.get().map_err(TurnFailure::Database)?;
         let mut query = connection
             .prepare(
                 "SELECT i.id FROM session_input i JOIN session_input_receipt r ON r.input_id=i.id
              WHERE i.session_id=?1 AND i.cycle_id=?2 AND i.state='consumed'
-               AND json_extract(i.prompt,'$.kind')='sessionControl'
                AND r.state='recorded' AND r.turn_id IS NULL ORDER BY i.admitted_seq",
             )
             .map_err(zuno_db::map_error)

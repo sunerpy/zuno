@@ -188,6 +188,14 @@ the parent is an exact allowlist and applies to workflow nodes as well as direct
 delegation, so a workflow cannot route around a narrowed contract. See
 [Custom agents](/config/custom-agents).
 
+Workflow dependencies require successful node outcomes. Completed model requests
+or tools remain useful diagnostic evidence when a node later fails, but do not
+satisfy `dependsOn`. Inspect the durable job and child session before starting
+replacement work; terminal failed work is not automatically replayed.
+The built-in Council's 600-second total and 540-second shared seat phase are
+specific to `balanced-review`; they are not timeout fields on workflow nodes or
+ordinary `task` calls. See [Council budgets and outcomes](/orchestration#council).
+
 ## See also
 
 - [Authoring Skills](/config/authoring-skills)

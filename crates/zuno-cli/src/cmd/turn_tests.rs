@@ -1,5 +1,11 @@
 //! What both surfaces must be able to trust about the shared composition root.
 
+#[path = "turn/tests/failure_scope_tests.rs"]
+mod failure_scope_tests;
+#[path = "turn/tests/plan_execution_tests.rs"]
+mod plan_execution_tests;
+#[path = "turn/tests/provider_resolution_tests.rs"]
+mod provider_resolution_tests;
 #[path = "turn/tests/scheduling_tests.rs"]
 mod scheduling_tests;
 
@@ -211,9 +217,8 @@ fn traced_resolver(prompt: &str) -> Resolver {
         max_steps: None,
         requested_provider: "provider".to_owned(),
         requested_model: "model".to_owned(),
-        wire_model: "model".to_owned(),
-        spec: Spec::new(COMPATIBLE_PROVIDER),
-        reasoning_options: serde_json::Map::new(),
+        model: EngineModel::new(Spec::new(COMPATIBLE_PROVIDER), "model", ApiSurface::Default)
+            .with_catalog_identity("provider", "model"),
         orchestration_seed: None,
     }
 }
@@ -1305,16 +1310,16 @@ fn a_batched_report_turn_persists_every_report_before_its_single_provider_call()
     let persisted = body
         .find("self.persist_promoted_user_input(&message, &parts)?;")
         .expect("promoted report persistence call");
-    let goal_gate = body
-        .find("report_deferred_by_goal_state")
-        .expect("paused and terminal Goals defer automatic report continuation");
+    let cycle_gate = body
+        .find("report_deferred_by_execution_state")
+        .expect("the current cycle's native authority gates automatic report continuation");
     let provider = body
         .find("self.drive_prepared_with_start(")
         .expect("accounted turn call");
 
     assert!(
-        each_report < persisted && persisted < goal_gate && goal_gate < provider,
-        "a batch must persist every durable report, then honour Goal lifecycle state, before \
+        each_report < persisted && persisted < cycle_gate && cycle_gate < provider,
+        "a batch must persist every durable report, then honour current cycle authority, before \
          entering the provider"
     );
 }
@@ -1876,7 +1881,7 @@ impl AgentDriver for ScriptedTurnDriver {
                     },
                 )
                 .expect("settle scripted Plan");
-                let changes = work
+                let changes: Vec<_> = work
                     .snapshot(&request.session_id)
                     .expect("scripted work")
                     .items
@@ -1896,8 +1901,10 @@ impl AgentDriver for ScriptedTurnDriver {
                         owner: item.owner,
                     })
                     .collect();
-                work.update_items(&request.session_id, changes)
-                    .expect("settle scripted runnable Todos");
+                if !changes.is_empty() {
+                    work.update_items(&request.session_id, changes)
+                        .expect("settle scripted runnable Todos");
+                }
             }
             Ok(TurnOutcome::Completed {
                 assistant_message_id: format!("msg_scripted_{call}"),
@@ -1995,7 +2002,7 @@ async fn scripted_reconciliation_host(
             ApiSurface::Chat,
         )
     };
-    plan.resolver.spec = model().provider;
+    plan.resolver.model.provider = model().provider;
     plan.internals.title.model = model();
     plan.internals.compaction.model = model();
     plan.internals.summary.model = model();
@@ -2290,10 +2297,10 @@ async fn plan_handoff_finishes_one_host_turn_and_preserves_future_work() {
 }
 
 #[tokio::test]
-async fn ordinary_build_still_runs_reconciliation_until_durable_work_settles() {
+async fn ordinary_build_final_preserves_unfinished_plan_and_todos() {
     let (_directory, mut host, driver, work) =
         scripted_reconciliation_host("build", ScriptedTurnBehavior::SettleWorkOnSecondTurn).await;
-    seed_scripted_plan(&work, &host.session_id, true);
+    let before = seed_scripted_plan(&work, &host.session_id, true);
     let guard = host
         .runs
         .begin_turn(host.session_id.clone())
@@ -2318,22 +2325,13 @@ async fn ordinary_build_still_runs_reconciliation_until_durable_work_settles() {
     ));
     assert_eq!(
         driver.calls(),
-        2,
-        "runnable Todo work receives one reconciliation turn before settlement"
+        1,
+        "a runnable Todo does not override an ordinary final"
     );
     let snapshot = work.snapshot(&host.session_id).expect("settled work state");
-    assert_eq!(snapshot.items.len(), 1);
     assert_eq!(
-        snapshot.items[0].status,
-        zuno_tools::WorkItemStatus::Completed
-    );
-    assert!(
-        snapshot
-            .plan
-            .expect("settled Plan")
-            .steps
-            .iter()
-            .all(|step| step.status.is_terminal())
+        snapshot, before,
+        "finishing a turn never fabricates Plan/Todo completion"
     );
     let phase = host
         .plan_reconciliation
@@ -2341,8 +2339,8 @@ async fn ordinary_build_still_runs_reconciliation_until_durable_work_settles() {
         .expect("read driver phase")
         .expect("driver phase exists");
     assert_eq!(phase.phase, zuno_engine::plan_driver::DriverPhase::Terminal);
-    assert_eq!(phase.reason.as_deref(), Some("durable_work_settled"));
-    assert_eq!(phase.reconciliation_attempt, 1);
+    assert_eq!(phase.reason.as_deref(), Some("ordinary_final"));
+    assert_eq!(phase.reconciliation_attempt, 0);
     host.shutdown().await.expect("shutdown scripted build host");
 }
 
@@ -2761,9 +2759,12 @@ fn plan_for(
             max_steps: None,
             requested_provider: "provider".to_owned(),
             requested_model: "model".to_owned(),
-            wire_model: "model".to_owned(),
-            spec: Spec::new(COMPATIBLE_PROVIDER).with_surface(ApiSurface::Chat),
-            reasoning_options: serde_json::Map::new(),
+            model: EngineModel::new(
+                Spec::new(COMPATIBLE_PROVIDER).with_surface(ApiSurface::Chat),
+                "model",
+                ApiSurface::Chat,
+            )
+            .with_catalog_identity("provider", "model"),
             orchestration_seed: None,
         },
         catalog_models: Vec::new(),
@@ -6654,7 +6655,7 @@ fn interaction_tools_follow_plan_goal_and_subagent_boundaries() {
     assert!(
         work.iter()
             .any(|tool| tool == zuno_tools::question::WIRE_ID),
-        "ordinary Work may durably wait for required input without a Goal"
+        "ordinary Work may ask optional questions without suspending the session"
     );
     assert!(
         work.iter()
@@ -6678,7 +6679,7 @@ fn interaction_tools_follow_plan_goal_and_subagent_boundaries() {
     let goal = interaction_tool_ids(zuno_goal::InteractionPolicy::GoalAutonomous, true);
     assert!(
         goal.iter()
-            .all(|tool| tool != zuno_tools::question::WIRE_ID)
+            .any(|tool| tool == zuno_tools::question::WIRE_ID)
     );
     assert!(
         goal.iter()
@@ -7893,7 +7894,7 @@ fn durable_work_context_projects_plan_todos_jobs_reports_and_prior_receipt_from_
     )
     .expect("decode durable work context");
 
-    assert_eq!(snapshot["schemaVersion"], 3);
+    assert_eq!(snapshot["schemaVersion"], 5);
     assert_eq!(snapshot["plan"]["id"], "plan_durable");
     assert_eq!(snapshot["plan"]["revision"], 2);
     assert_eq!(snapshot["todos"][0]["id"], "todo_durable");
@@ -7927,6 +7928,7 @@ fn durable_work_context_projects_plan_todos_jobs_reports_and_prior_receipt_from_
 #[test]
 fn durable_work_context_has_a_deterministic_total_prompt_budget() {
     let snapshot = DurableWorkContextSnapshot {
+        work_scope: None,
         schema_version: DURABLE_WORK_CONTEXT_SCHEMA_VERSION,
         execution: None,
         questions: Vec::new(),
@@ -8330,6 +8332,8 @@ fn report_host_open_preserves_a_paused_goal_until_work_explicitly_starts() {
 #[test]
 fn the_turn_end_charges_usage_no_request_accounted_for() {
     let charged = |session: i64, goal: i64| GoalUsage {
+        ownership: GoalUsageOwnership::Legacy,
+        accounting_goal_id: None,
         tokens: session,
         confirmed_known: true,
         estimated_pending_prompt_tokens: None,
@@ -8413,6 +8417,8 @@ fn accounting_is_unknown_only_where_the_session_could_not_measure_the_spend() {
     let usage =
         |confirmed: i64, pending: Option<u64>, request_seq: i64, failed: u64, known: bool| {
             GoalUsage {
+                ownership: GoalUsageOwnership::Legacy,
+                accounting_goal_id: None,
                 tokens: confirmed,
                 confirmed_known: known,
                 estimated_pending_prompt_tokens: pending,
@@ -8631,7 +8637,13 @@ fn every_turn_error() -> Vec<TurnError> {
             attempt: 2,
             recovery_elapsed: std::time::Duration::from_secs(180),
             total_elapsed: std::time::Duration::from_secs(490),
-            last_provider_error_code: Some("upstream_stream_error"),
+            last_failure: Box::new(
+                ProviderError::Stream {
+                    code: zuno_error::ProviderStreamFailure::UpstreamStreamError,
+                    source: None,
+                }
+                .diagnostic_snapshot(),
+            ),
         },
         TurnError::Cache(zuno_llm::cache::CacheViolation::StaticPrefixChanged { turn: 2 }),
         TurnError::Attachment(zuno_attachment::AttachmentError::StoreUnavailable),
@@ -8995,9 +9007,8 @@ async fn run_compatible_turn(
         max_steps: None,
         requested_provider: "provider".to_owned(),
         requested_model: "model".to_owned(),
-        wire_model: "model".to_owned(),
-        reasoning_options: serde_json::Map::new(),
-        spec,
+        model: EngineModel::new(spec, "model", ApiSurface::Chat)
+            .with_catalog_identity("provider", "model"),
         orchestration_seed: None,
     };
     let mut connection =
@@ -12362,39 +12373,37 @@ fn an_unknown_explicit_variant_is_rejected_before_the_provider_request() {
     assert!(error.contains("low"), "{error}");
 }
 
-#[test]
-fn the_generation_controls_are_wired_into_the_turns_own_resolution() {
-    let turn = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join("cmd")
-            .join("turn.rs"),
-    )
-    .expect("turn.rs is readable");
-
-    assert!(
-        turn.contains("spec: with_agent_options(")
-            && turn.contains("model_spec(&catalog, catalog_model, env)?")
-            && turn.contains("catalog_model.capabilities.temperature"),
-        "`TurnPlan::resolve` no longer overlays the agent's options onto the resolved \
-         spec under the selected model's capabilities, so `temperature`, `top_p` and \
-         `options` are parsed, listed, and dropped — the defect this pair of tests \
-         exists to catch. A behavioural test alone cannot see it, because it calls \
-         the helper the turn stopped calling."
-    );
-    assert!(
-        turn.contains("let definition = agent.definition();")
-            && turn.contains("let effort = turn_effort(")
-            && turn.contains("routed_variant,"),
-        "`TurnPlan::resolve` no longer carries the resolved profile's agent definition \
-         into `turn_effort`, so an agent configured with a `variant` can run at the \
-         provider's default"
-    );
-    assert!(
-        turn.contains("generation::MAX_TOKENS, json!(output_ceiling(model))"),
-        "`model_spec` no longer defaults the output cap from the catalog, so every \
-         request runs uncapped"
-    );
+#[tokio::test]
+async fn the_generation_controls_are_wired_into_the_turns_own_resolution() {
+    for output_override in [None, Some(4096)] {
+        let mut provider = resume_provider("zzz", true);
+        provider["models"]["zzz-model"]["temperature"] = json!(true);
+        let mut options = json!({});
+        if let Some(limit) = output_override {
+            options["maxTokens"] = json!(limit);
+        }
+        let fixture = ResumeFixture::new(resume_config(json!({
+            "default_agent": "build",
+            "model": "zzz/zzz-model",
+            "provider": {"zzz": provider},
+            "agents": {"build": {
+                "model": "zzz/zzz-model", "variant": "high",
+                "temperature": 0.42, "top_p": 0.76, "options": options
+            }}
+        })));
+        let plan = fixture.resolve(fixture.options(SessionChoice::New)).await;
+        let model = plan
+            .resolver
+            .resolve_model(&plan.provider_id, &plan.model_id)
+            .unwrap();
+        assert_eq!(model.provider.options[generation::TEMPERATURE], json!(0.42));
+        assert_eq!(model.provider.options[generation::TOP_P], json!(0.76));
+        assert_eq!(
+            model.provider.options[generation::MAX_TOKENS],
+            json!(output_override.unwrap_or(10_000))
+        );
+        assert_eq!(model.reasoning_options["reasoningEffort"], "high");
+    }
 }
 
 mod learning_runtime {

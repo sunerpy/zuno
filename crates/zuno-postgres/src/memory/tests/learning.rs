@@ -155,6 +155,16 @@ fn finished(claimed: &ClaimedLearning, id: &str) -> LearningJournalRequest {
 pub(super) async fn exercise(backend: &PostgresBackend, admin: &PgPool) {
     Box::pin(quota::exercise(backend, admin)).await;
     Box::pin(skill::exercise(backend, admin)).await;
+    Box::pin(runtime_contracts(backend, admin)).await;
+    Box::pin(maintenance_wake::exercise(backend, admin)).await;
+    Box::pin(input_limits::exercise(backend, admin)).await;
+    Box::pin(child_evidence::exercise(backend, admin)).await;
+    Box::pin(source_claims::exercise(backend, admin)).await;
+}
+
+// Finish each independent suite before polling another large fixture. Keeping
+// them inside this runtime test retains its poll frame throughout nested work.
+async fn runtime_contracts(backend: &PostgresBackend, admin: &PgPool) {
     let actor = principal("learning-runtime");
     let workspace = WorkspaceId::new("learning-workspace").unwrap();
     setup(backend, admin, &actor, &workspace).await;
@@ -599,8 +609,4 @@ pub(super) async fn exercise(backend: &PostgresBackend, admin: &PgPool) {
         state, "skipped",
         "a truthful late model receipt cannot restore revoked automation"
     );
-    Box::pin(maintenance_wake::exercise(backend, admin)).await;
-    Box::pin(input_limits::exercise(backend, admin)).await;
-    Box::pin(child_evidence::exercise(backend, admin)).await;
-    Box::pin(source_claims::exercise(backend, admin)).await;
 }

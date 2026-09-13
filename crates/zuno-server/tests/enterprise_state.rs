@@ -513,6 +513,7 @@ async fn authenticated_workers_resume_the_kernel_over_https_without_database_cre
     );
     let model = first.input.model.as_ref().unwrap();
     state.consume_input(&scope,InputMaterialization {
+                    live: None,
                 turn_id: None,
         input_id:Some(first.input.id.to_string()),
         message:MessageRecord::from_json(json!({

@@ -111,9 +111,20 @@ fn usage() -> StreamEvent {
     }
 }
 
-pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator: &PgPool) {
-    waits::exercise(backend, admin, migrator).await;
-    approval_wait::exercise(backend, admin, migrator).await;
+#[inline(never)]
+pub(crate) fn exercise<'a>(
+    backend: &'a PostgresBackend,
+    admin: &'a PgPool,
+    migrator: &'a PgPool,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
+    Box::pin(exercise_contracts(backend, admin, migrator))
+}
+
+async fn exercise_contracts(backend: &PostgresBackend, admin: &PgPool, migrator: &PgPool) {
+    // Keep independent contract state off the nested test executor's stack.
+    // Each branch includes the complete resumable engine and provider fixture.
+    Box::pin(waits::exercise(backend, admin, migrator)).await;
+    Box::pin(approval_wait::exercise(backend, admin, migrator)).await;
     let actor = PrincipalScope::new(
         TenantId::new("turn-contract").unwrap(),
         PrincipalId::new("alice").unwrap(),
@@ -228,31 +239,39 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
     );
     raw_sql("DROP TRIGGER zuno_expire_during_write ON zuno_enterprise_preview.message; DROP FUNCTION public.zuno_expire_during_write()")
         .execute(admin).await.unwrap();
-    state
-        .consume_input(
-            &scope,
-            InputMaterialization {
-                turn_id: None,
-                input_id: Some(job.input_id.to_string()),
-                message: MessageRecord::from_json(json!({
-                    "id":job.input_id,"sessionID":session.id,"role":"user","time":{"created":0},
-                    "agent":"build","model":{"providerID":"turn-test","modelID":"model"},
-                }))
-                .unwrap(),
-                parts: vec![
-                    PartRecord::from_json(
-                        json!({
-                            "id":"root-input-part","sessionID":session.id,"messageID":job.input_id,
-                            "type":"text","text":"Inspect the fixture",
-                        }),
-                        0,
-                    )
-                    .unwrap(),
-                ],
-            },
-        )
-        .await
-        .unwrap();
+    let input = InputMaterialization {
+        live: None,
+        turn_id: None,
+        input_id: Some(job.input_id.to_string()),
+        message: MessageRecord::from_json(json!({
+            "id":job.input_id,"sessionID":session.id,"role":"user","time":{"created":0},
+            "agent":"build","model":{"providerID":"turn-test","modelID":"model"},
+        }))
+        .unwrap(),
+        parts: vec![
+            PartRecord::from_json(
+                json!({
+                    "id":"root-input-part","sessionID":session.id,"messageID":job.input_id,
+                    "type":"text","text":"Inspect the fixture",
+                }),
+                0,
+            )
+            .unwrap(),
+        ],
+    };
+    let mut unsupported_live_input = input.clone();
+    unsupported_live_input.live = Some(zuno_engine::state::LiveInputGate {
+        revision: Some(1),
+        source: zuno_engine::interrupt::SoftInterruptSource::User,
+    });
+    assert!(
+        state
+            .consume_input(&scope, unsupported_live_input)
+            .await
+            .is_err()
+    );
+    assert!(state.history(&scope).await.unwrap().is_empty());
+    assert!(state.consume_input(&scope, input).await.unwrap());
     let script = Arc::new(Script {
         replies: Mutex::new(VecDeque::from([
             vec![
@@ -308,7 +327,7 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
     let interrupt = InterruptSignal::new();
     let (sender, mut receiver) = event_channel();
     let (outcome, _) = tokio::join!(
-        advance_turn(
+        Box::pin(advance_turn(
             request(),
             TurnContext::from_persistence(
                 Arc::new(state.clone()),
@@ -319,7 +338,7 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
             )
             .with_principal_scope(actor.clone()),
             sender
-        ),
+        )),
         async { while receiver.recv().await.is_some() {} },
     );
     assert!(
@@ -392,7 +411,7 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
         .unwrap();
     let (sender, mut receiver) = event_channel();
     let (outcome, _) = tokio::join!(
-        advance_turn(
+        Box::pin(advance_turn(
             request().resume(reference),
             TurnContext::from_persistence(
                 Arc::new(next.clone()),
@@ -403,7 +422,7 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
             )
             .with_principal_scope(actor.clone()),
             sender
-        ),
+        )),
         async { while receiver.recv().await.is_some() {} },
     );
     assert!(
@@ -466,6 +485,7 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
         .turn_state(third.lease.clone(), "/workspace".to_owned())
         .unwrap();
     failed_state.consume_input(&scope,InputMaterialization {
+                    live: None,
                 turn_id: None,
         input_id:Some(next_job.input_id.to_string()),
         message:MessageRecord::from_json(json!({
@@ -608,7 +628,7 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
     .unwrap();
     let (sender, mut receiver) = event_channel();
     let (failed, _) = tokio::join!(
-        advance_turn(
+        Box::pin(advance_turn(
             failed_request.clone(),
             TurnContext::from_persistence(
                 Arc::new(failed_state.clone()),
@@ -619,7 +639,7 @@ pub(crate) async fn exercise(backend: &PostgresBackend, admin: &PgPool, migrator
             )
             .with_principal_scope(actor.clone()),
             sender
-        ),
+        )),
         async { while receiver.recv().await.is_some() {} },
     );
     assert!(failed.is_err());

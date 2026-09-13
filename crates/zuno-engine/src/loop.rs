@@ -36,7 +36,8 @@ use zuno_db::message::{
     created_after, now_millis,
 };
 use zuno_db::{Connection, open};
-use zuno_error::{DbError, ProviderError, UncertainCause};
+use zuno_error::{DbError, ProviderDiagnostic, ProviderError, UncertainCause};
+
 use zuno_llm::cache::{CacheViolation, DynamicContext, McpToolStatus, PreparedTurn, PromptCache};
 use zuno_llm::catalog::resolved::ModelCost;
 use zuno_llm::event::{
@@ -757,13 +758,13 @@ pub enum TurnError {
     PromptAssembly(#[from] PromptAssemblyError),
     #[error(
         "provider retry deadline exceeded on attempt {attempt} after {recovery_elapsed:?} \
-         recovery ({total_elapsed:?} total; last provider code {last_provider_error_code:?})"
+         recovery ({total_elapsed:?} total; last provider failure: {last_failure})"
     )]
     ProviderRetryDeadlineExceeded {
         attempt: u32,
         recovery_elapsed: Duration,
         total_elapsed: Duration,
-        last_provider_error_code: Option<&'static str>,
+        last_failure: Box<ProviderDiagnostic>,
     },
     #[error(transparent)]
     Cache(#[from] CacheViolation),
@@ -3262,12 +3263,12 @@ async fn run_turn_in_span(
                         attempt,
                         recovery_elapsed,
                         total_elapsed,
-                        last_provider_error_code,
+                        last_failure,
                     } => Err(TurnError::ProviderRetryDeadlineExceeded {
                         attempt,
                         recovery_elapsed,
                         total_elapsed,
-                        last_provider_error_code,
+                        last_failure,
                     }),
                     // The peer named a delay the same-request deadline cannot hold. The
                     // turn ends on the peer's own typed error so the goal controller
@@ -3954,8 +3955,15 @@ async fn inject_live_inputs(
         request.session_id.clone(),
     );
     let delivery = live.guard.take_soft_interrupts_at_safe_point();
+    let mut batch = crate::input_delivery::prepare(
+        live.inbox,
+        &request.session_id,
+        &request.turn_id,
+        delivery.messages,
+    )?;
     let mut injected = InjectedLiveInputs::default();
-    for message in delivery.messages {
+    let mut consumed = std::collections::BTreeSet::new();
+    for mut message in batch.messages {
         if let Some(input_id) = message.input_id.as_deref() {
             let promoted = match message.revision {
                 Some(revision) => {
@@ -3964,19 +3972,24 @@ async fn inject_live_inputs(
                 }
                 None => live.inbox.promote_id(&request.session_id, input_id)?,
             };
-            if promoted.is_none() {
+            let Some(promoted) = promoted else {
                 continue;
-            }
+            };
+            message.revision = Some(promoted.revision);
         }
-        persist_live_input(
+        if !persist_live_input(
             &store,
             request,
             requested,
             &message,
             context.attachments.as_deref(),
         )
-        .await?;
+        .await?
+        {
+            continue;
+        }
         if let Some(input_id) = message.input_id.as_ref() {
+            consumed.insert(input_id.clone());
             events
                 .send(TurnEvent::InputConsumed {
                     input_id: input_id.clone(),
@@ -3989,6 +4002,24 @@ async fn inject_live_inputs(
         injected.count = injected.count.saturating_add(1);
         injected.skip_remaining_tools |= message.urgent;
     }
+    batch
+        .receipt
+        .inputs
+        .retain(|input| consumed.contains(&input.input_id));
+    if !batch.receipt.inputs.is_empty() {
+        store
+            .append(
+                NewSessionEvent::new(
+                    "session.input.delivery_batch",
+                    json!({"batch":batch.receipt,"state":"recorded","time":now_millis()})
+                        .as_object()
+                        .expect("object")
+                        .clone(),
+                )?,
+                ProviderEventUpdate::None,
+            )
+            .await?;
+    }
     Ok(injected)
 }
 
@@ -3998,7 +4029,7 @@ async fn persist_live_input(
     requested: &RequestedTurn,
     input: &SoftInterruptMessage,
     attachments: Option<&zuno_attachment::AttachmentStore>,
-) -> Result<(), TurnError> {
+) -> Result<bool, TurnError> {
     // The provider assigns the durable time inside the consumption transaction.
     let created = 0;
     let message_id = input
@@ -4077,6 +4108,10 @@ async fn persist_live_input(
         .consume_input(
             &store.scope,
             crate::state::InputMaterialization {
+                live: Some(crate::state::LiveInputGate {
+                    revision: input.revision,
+                    source: input.source,
+                }),
                 turn_id: Some(request.turn_id.clone()),
                 input_id: input.input_id.clone(),
                 message,
@@ -6903,7 +6938,7 @@ impl crate::retry::ProviderAttemptObserver<Result<ProviderStreamExit, TurnError>
                     max,
                     recovery_elapsed,
                     total_elapsed,
-                    last_provider_error_code,
+                    last_failure,
                 } => {
                     append_provider_attempt_deadline(
                         self.store,
@@ -6916,7 +6951,7 @@ impl crate::retry::ProviderAttemptObserver<Result<ProviderStreamExit, TurnError>
                         generated_output,
                         recovery_elapsed,
                         total_elapsed,
-                        last_provider_error_code,
+                        last_failure,
                     )
                     .await
                 }
@@ -7145,7 +7180,7 @@ async fn append_provider_attempt_deadline(
     generated_output: bool,
     recovery_elapsed: Duration,
     total_elapsed: Duration,
-    last_provider_error_code: Option<&'static str>,
+    last_failure: &ProviderDiagnostic,
 ) -> Result<(), TurnError> {
     let mut properties = provider_attempt_properties(request, attempt);
     properties.insert("status".to_owned(), Value::String("failed".to_owned()));
@@ -7167,7 +7202,8 @@ async fn append_provider_attempt_deadline(
         "totalElapsedMs".to_owned(),
         Value::from(u64::try_from(total_elapsed.as_millis()).unwrap_or(u64::MAX)),
     );
-    if let Some(code) = last_provider_error_code {
+    properties.insert("lastProviderFailure".to_owned(), last_failure.fields());
+    if let Some(code) = last_failure.code() {
         properties.insert(
             "lastProviderErrorCode".to_owned(),
             Value::String(code.to_owned()),
@@ -7297,16 +7333,18 @@ fn append_turn_origin_properties(properties: &mut Map<String, Value>, start: &Tu
 
 fn insert_provider_attempt_error(properties: &mut Map<String, Value>, error: &ProviderError) {
     let (kind, status) = provider_error_metadata(error);
+    let diagnostic = error.diagnostic_snapshot();
+    properties.insert("providerDiagnostic".to_owned(), diagnostic.fields());
     properties.insert("errorKind".to_owned(), Value::String(kind.to_owned()));
     properties.insert("retryable".to_owned(), Value::Bool(error.is_retryable()));
     properties.insert(
         "partialOutputRetryPermitted".to_owned(),
         Value::Bool(error.permits_partial_output_retry()),
     );
-    if let Some(status) = status {
+    if let Some(status) = diagnostic.status().or(status) {
         properties.insert("httpStatus".to_owned(), Value::from(status));
     }
-    if let Some(code) = error.structured_code() {
+    if let Some(code) = diagnostic.code() {
         properties.insert(
             "providerErrorCode".to_owned(),
             Value::String(code.to_owned()),
@@ -7509,10 +7547,18 @@ async fn append_provider_request_terminal(
         if let TurnError::ProviderRetryDeadlineExceeded {
             recovery_elapsed,
             total_elapsed,
-            last_provider_error_code,
+            last_failure,
             ..
         } = error
         {
+            properties.insert(
+                "phase".to_owned(),
+                Value::String(
+                    zuno_error::ProviderDiagnosticPhase::RequestBudget
+                        .as_str()
+                        .to_owned(),
+                ),
+            );
             properties.insert(
                 "recoveryElapsedMs".to_owned(),
                 Value::from(u64::try_from(recovery_elapsed.as_millis()).unwrap_or(u64::MAX)),
@@ -7521,12 +7567,19 @@ async fn append_provider_request_terminal(
                 "totalElapsedMs".to_owned(),
                 Value::from(u64::try_from(total_elapsed.as_millis()).unwrap_or(u64::MAX)),
             );
-            if let Some(code) = last_provider_error_code {
+            properties.insert("lastProviderFailure".to_owned(), last_failure.fields());
+            if let Some(code) = last_failure.code() {
                 properties.insert(
                     "lastProviderErrorCode".to_owned(),
-                    Value::String((*code).to_owned()),
+                    Value::String(code.to_owned()),
                 );
             }
+        }
+        if let TurnError::Provider(provider) = error {
+            properties.insert(
+                "providerDiagnostic".to_owned(),
+                provider.diagnostic_fields(),
+            );
         }
     }
     store

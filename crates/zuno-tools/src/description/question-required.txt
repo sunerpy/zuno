@@ -1,0 +1,9 @@
+Request explicit required human input through the host's required-input control.
+This question waits for the first response and keeps execution waiting until all
+required items have real answers. Defer, a partial or empty answer, a saved draft,
+cancellation, expiry, and delivery failure do not satisfy the required-input gate.
+
+Tool results are receipts. Actual answers enter the durable session inbox once.
+Do not infer an answer or authorization from a missing response. Goal-owned required
+input must use goal_request_input with the observed Goal revision. Use plan_exit
+for authorization of the exact Plan for Work.

@@ -316,9 +316,14 @@ impl TurnPersistence for RemoteTurnPersistence {
         &self,
         scope: &TurnStateScope,
         input: InputMaterialization,
-    ) -> Result<(), TurnError> {
-        self.done(scope, StateCommand::ConsumeInput(input.try_into()?))
-            .await
+    ) -> Result<bool, TurnError> {
+        match self
+            .call(scope, StateCommand::ConsumeInput(input.try_into()?))
+            .await?
+        {
+            StateReply::Boolean(value) => Ok(value),
+            _ => Err(TurnStateError::InvalidData.into()),
+        }
     }
     async fn schedule_backoff(
         &self,

@@ -7,8 +7,8 @@ and ACP clients.
 
 ## Delivery status
 
-The preview originally started from Zuno v0.10.29 and now incorporates v0.10.31 at
-`5619205d60aef572e484646dd9ab0563e1ef8066`. Enterprise features are not advertised
+The preview originally started from Zuno v0.10.29 and now incorporates v0.10.37 at
+`4762790adaab0a9af8c93152c1b6136446e4dbc8`. Enterprise features are not advertised
 until their provider, consumer, entry point, and acceptance tests are present.
 See [STATUS.md](STATUS.md) for completed work and remaining gates.
 
@@ -115,3 +115,5 @@ are excluded; these archives do not update the stable documentation site.
 Remote ACP bridge and durable recovery: [English](ACP.md), [中文](ACP.zh.md).
 
 Admission quotas and fair scheduling: [English](QUOTAS.md), [中文](QUOTAS.zh.md).
+
+ADK reference decisions and main synchronization: [English](ADK-REFERENCE.md), [中文](ADK-REFERENCE.zh.md).

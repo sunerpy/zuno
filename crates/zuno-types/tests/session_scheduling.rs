@@ -100,6 +100,7 @@ fn every_pause_reason_requires_explicit_resume_and_keeps_query_admission() {
         SessionPauseReason::User,
         SessionPauseReason::Authentication,
         SessionPauseReason::TurnBudget,
+        SessionPauseReason::UncertainSideEffect,
         SessionPauseReason::Blocked,
     ] {
         let readiness = SessionReadiness::Paused { reason };

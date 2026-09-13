@@ -1,0 +1,16 @@
+Ask an optional clarification during Work or active Goal execution when the answer
+materially improves the outcome and cannot be discovered from available evidence.
+The question is durable and this tool returns a receipt immediately, without waiting
+for a human or pausing Work/Goal execution. Continue independent work and state any
+assumptions; the user may answer later or skip the question.
+
+Usage notes:
+- Prefer one concise question and ask no more than three at once
+- Provide 2-3 mutually exclusive options; set `multiple: true` only when combinations are meaningful
+- Put a recommended option first and suffix its label with "(Recommended)"
+- A "Type your own answer" option is added automatically; do not include "Other" or catch-all options
+- Tool results are receipts. Actual answers arrive through the durable session inbox once
+- Skipping, deferring, saved drafts, partial or empty answers, cancellation, and silence never authorize an action
+- Do not repeat a question solely because it was skipped; continue within existing authorization using available evidence and stated assumptions
+- Use goal_request_input for required Goal input, bound to the observed Goal revision
+- Use plan_exit to request authorization of the exact Plan for Work

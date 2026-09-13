@@ -3,10 +3,13 @@
 Three durable structures track work, and they answer different questions. Goal is why the
 work continues. Plan is how it is staged. Todo is what concrete items sit under a stage.
 
-All three live in SQLite, which is the point: durable state, not prose, controls
-continuation. Text such as "next I will run the tests" is not progress. A goal that is
-still active, a plan step still in progress, or a job whose report has not been consumed
-is what keeps a session working.
+All three live in SQLite. An active Goal owned by the current cycle authorizes
+continuation; a Plan or Todo describes work and evidence. After a genuine ordinary
+provider final, the cycle finishes even if steps remain unfinished or runnable,
+unless a typed wait or protected gate takes precedence.
+Their status stays unchanged. Real tool/external waits and protected gates remain
+authoritative; neither "next I will run the tests" nor an old `in_progress` step
+creates another model turn.
 
 ## The three layers
 
@@ -60,7 +63,15 @@ second Goal wait, not a two second local retry.
 }
 ```
 
-There is no cross-turn retry ceiling for recoverable failures: the delay grows
+Failure handling uses the cycle, turn and Goal identity captured before execution.
+A late failure cannot block a newer cycle or mutate a replacement or unrelated
+Goal. Exhausting bounded provider retries or their recovery deadline closes only
+the failed ordinary cycle; the next independent input does not inherit that
+failure. For the exact active owned Goal, a recoverable failure schedules durable
+retry instead. Existing approval, required-input, authentication, `turn_budget`,
+blocked-state and uncertain-effect gates are preserved.
+
+There is no cross-turn retry ceiling for recoverable Goal failures: the delay grows
 exponentially, reaches the cap, and the goal stays active. The retry row is tied to the
 exact goal id and stores the attempt, typed reason, selected delay, schedule time, and next
 eligible time, so reopening the session reconstructs the wait.
@@ -68,7 +79,7 @@ eligible time, so reopening the session reconstructs the wait.
 Queued user input has priority over an automatic turn, and long waits are split by
 `poll_interval_ms` so an interactive surface notices input promptly.
 
-Recovery is selected from typed errors:
+For a failure owned by an active Goal, recovery is selected from typed errors:
 
 | Class | Outcome |
 | --- | --- |
@@ -160,16 +171,35 @@ A pause is only actionable if it names what to look at. `/goal show` reports
 the call reported having applied, the typed cause, and when it was observed.
 `/goal resume` and the optional Resume goal choice do not attest an inspection:
 they preserve the inspection obligation and reject generic recovery while it is
-unresolved. Inspect the authoritative state and settle the relevant domain's
-reconciliation before resuming. `/goal pause` and `/goal cancel` retire nothing,
-because neither claims an inspection happened.
+unresolved. `/resume` likewise never writes an inspection marker or clears the
+authentication or turn-budget gates.
+
+`/inspect-outcome` lists pending part IDs. `/inspect-outcome <part-id> [part-id ...]`
+reads the actual current file state for 1–16 native `write`, `edit`, or `apply_patch`
+calls with a durable `native.filesystem.intent` witness. It works without a model,
+including on a stopped cycle, and keeps the native session lease until settlement.
+The receipt records file presence, content hashes, metadata, exact original calls and
+observation time. Paths are workspace-bound and handle-anchored; links, unsupported
+operations, missing native provenance and stale call records fail closed.
+
+Limits are 64 targets, 8 MiB per file, 32 MiB total, and a 30-second read deadline.
+The original outcome remains `uncertain`; inspection neither claims success nor
+resumes work or authorizes replay. After a successful inspection, explicitly use
+`/resume` or `/goal resume`; their other gates still apply. Legacy calls without
+a native witness, shell operations and remote actions require their own
+target-aware inspection integration. A successful command or a claim of manual
+checking is not such evidence. The existing `job_reconcile`
+tool handles background Job records, not these pending tool-call obligations.
+`/goal pause` and `/goal cancel` retire nothing, because neither claims an inspection
+happened.
 
 ### Success criteria and evidence
 
-A goal that changes the workspace cannot be completed on assertion alone. "The tests pass"
-in prose is a claim about the workspace, and the whole reason a goal exists is that claims
-made mid-run are the ones most likely to be wrong. So a change goal carries success
-criteria, and each one closes only against a recorded exit status.
+Declared success criteria remain evidence-gated. Prose such as "the tests pass" does
+not satisfy a declared check. A user-created Goal may intentionally have no checklist:
+when both its declaration and criterion ledger are empty, changing files does not
+retroactively invent a checklist or make completion impossible. Pending work, ownership,
+uncertain outcomes and the existing capability audit still apply.
 
 `goal_propose` requires `success_criteria`, a list of concrete checks: a proposal that names
 none is refused, and criteria cannot be added afterwards. Each becomes a row with a short id
@@ -228,10 +258,10 @@ predates the last write each produce a different sentence, and the stale case pr
 timestamps so the mismatch is visible. Completing with criteria still open reports which
 ids are unproven.
 
-A goal that only answers a question is not gated on a checklist: it has nothing to verify.
-The first tool call that writes a file turns a question goal into a change goal, so the gate
-applies to the run that turned out to modify the workspace even though it did not start out
-planning to. One thing is audited on every completion the run itself reports, checklist or
+A file write changes the Goal's kind, not its original acceptance contract. A nonempty
+declaration with missing or inconsistent ledger rows fails closed; it is not a
+criteria-less Goal. Existing checklist evidence and freshness checks remain intact.
+One thing is audited on every completion the run itself reports, checklist or
 not: a capability claim it recorded and never verified (see below). Your own
 `/goal complete` on a goal with no checklist is not refused over such a claim — the claim
 is the model's record, and there is no command that clears one — but the run cannot carry
@@ -241,6 +271,22 @@ CLI, so a goal whose checklist is still open is finished by the run or cancelled
 
 The rendered goal document lists the criteria with their state, so a human reads the same
 gate the model is held to.
+
+The model cannot complete a paused Goal from an independent request or relabel the
+pause as blocked to bypass it. The native `/goal complete` command can close a
+legitimate legacy Goal after its remaining audits pass, preserving its identity,
+history, budget and usage; cancelling and recreating it is unnecessary just because
+the original checklist was empty.
+
+### Blocking observations
+
+Report a concrete blocking condition when discovered. `goal_update` returns `staged`,
+the actual Goal status and the count of matching **completed engine turns**; staging
+does not mean the Goal is already blocked. The host applies the three-turn threshold.
+The model does not first wait three turns and then ask the host to count three more.
+Observation, count, status, history and settlement receipt commit atomically. Replaying
+the same Goal/cycle/turn receipt does not count again or consume a newer observation.
+An explicit resume starts a fresh streak; unbound legacy observations do not count.
 
 ### Capability claims
 
@@ -430,7 +476,7 @@ afterwards.
 
 | Condition | Outcome |
 | --- | --- |
-| Allowance spent | The turn stops and the Goal pauses with `turn_budget` |
+| Goal token budget spent | The Goal ends as `budget_limited`; this is distinct from a per-turn allowance stopping with `turn_budget` |
 | Provider reported no usage | The turn stops; a budget you set that cannot be counted cannot be honoured |
 | Only the last tenth of the allowance is left | Compaction is requested, then the turn continues |
 | The database is busy while the goal is read or charged | The turn ends and the Goal schedules a `database_busy` retry |
@@ -496,37 +542,61 @@ charge it against, and a default enforced from an in-memory turn total would res
 and never bind.
 
 Nor is a session whose goal has finished. A budget bounds work towards an objective, so a goal
-that is complete, paused, blocked, cancelled or out of provider usage does not stop a turn. Its
-counter keeps rising through the conversation that follows, the default is large enough that a
-long session would cross it, and the stop would end turns no goal governs and pause a goal the
-model had completed. The response is still charged to the goal, because the tokens were spent
-against it. `budget_limited` is the exception: that status is a spent ceiling, and a turn must
-not resume through it.
+that does not own the current native work scope does not stop a turn or receive its usage.
+Independent input is still counted in session totals; it does not charge or pause a goal the
+model had completed. Ownership is frozen for each provider request and checked at turn-end
+accounting, so a Goal replacement or mid-request resume cannot retroactively claim that spend.
+A final Goal-owned response is still charged to the goal that owned the request.
+`budget_limited` is the exception for continuing that Goal: its own work cannot cross its
+spent ceiling. An independent request neither resumes that Goal nor changes its budget or status.
+Host turn and session limits still apply to the independent request.
 
 ### Human requests and autonomy
 
-An active Goal is autonomous by default and does not receive the ordinary synchronous
-`question` tool. When a missing fact or decision truly blocks the objective,
+Work and Goal optional questions use deferred delivery: they may collect an answer
+without parking execution or preventing a final response. A retained older form
+does not, by itself, forbid new input or authorize another turn. When a missing
+fact or decision truly blocks the active Goal,
 `goal_request_input` atomically creates a `human_request` row and pauses the exact Goal with
 `human_input`. Permission waits use the same store with kind `permission`. The turn ends as
 `WaitingForHuman`; it is not held open by a process-local receiver.
 
-TUI, HTTP, and ACP list and answer the same rows. An answer transaction settles the request
-and admits its model-visible response to the durable FIFO inbox together. Goal resumption is
-a later idempotent step, so a crash after the answer commit cannot lose the response or
-duplicate it. On restart, clients re-present pending requests from SQLite. Their in-process
-channels only wake already-running consumers. Every reply a client actually gives is a
+TUI, HTTP, and ACP list and answer the same rows. The answer and its model-visible
+FIFO input are committed together. Native Goal/Plan controls still validate their
+bound identities and gates before authorizing execution. On restart, clients read
+the same durable requests and receipts; in-process channels only accelerate delivery.
+Every reply a client actually gives is a
 settlement, including a withdrawal. Because Goal resumption accepts only an answered
 request, a dismissed, expired, or unreadable reply is stored as a settled request whose
 response records no answers and names the `outcome` that ended it; the response, not the
 state column, is where the record says whether a human answered. A dialog that never
 reached a client is not settled at all and stays pending for another surface.
 
-Ordinary non-Goal Work likewise does not receive the synchronous question tool. It uses
-evidence-backed reversible defaults and continues. If an undiscoverable choice has no safe
-default and materially changes the result, the Agent finishes the turn with one direct
-question before performing the affected side effect. Plan retains structured question
-forms for decision-complete planning.
+Ordinary Work uses evidence-backed reversible defaults where available. If a
+required user choice actually blocks progress, the Agent ends the current turn
+with one clear plain-text final question before the affected action. This creates
+no synthetic persistent pause. Plan retains structured clarification and its exact
+revision-bound approval gate; required Goal input retains `goal_request_input`.
+The runtime execution wait reference is waiting authority, not the presence of a
+form or an unfinished Plan.
+
+`QuestionView.delivery` is a derived view of the associated input receipts:
+
+| Phase | Meaning |
+| --- | --- |
+| `WaitingAnswer` (`waiting_answer`) | The form is pending and still accepts an answer. |
+| `AnsweredPendingDelivery` (`answered_pending_delivery`) | The closed form has unapplied inputs, or an early Plan approval still awaits handoff. |
+| `Applied` (`applied`) | The closed form has application evidence with no remaining unapplied inputs. |
+
+Settled controls such as Keep paused that create no model input have
+`delivery: None`, omitted in serialization. They are not `WaitingAnswer` and do
+not reopen a form. An early Plan approval awaiting handoff remains
+`AnsweredPendingDelivery` even before its control input exists.
+
+Question lists retain closed forms awaiting delivery as status entries without
+reopening them. Pending/applied counts, the latest input state and `appliedAt`
+distinguish a saved answer from application to a provider request. Application
+still does not prove provider success or completion.
 
 A side-effecting tool whose response is lost has an uncertain outcome. The Goal pauses with
 `uncertain_side_effect`, requires authoritative-state inspection, and never mechanically
@@ -542,7 +612,10 @@ result model-visible, so the record exists before anything about the Goal is dec
 ordering is what makes recovery survive a crash: a process that died between the tool write
 and the pause row leaves the pause missing and the obligation intact, and the next
 continuation reads the obligation and pauses again. `state.uncertain.reconciledAtMs` stays
-absent until an explicit recovery action retires the call.
+absent on pending calls; generic resume never writes it. `/inspect-outcome` retains
+fresh authoritative observations bound to the exact original native file calls
+before marking them inspected. Inspection does not establish that the original
+operation succeeded or authorize its automatic replay.
 
 Not every unanswered tool row earns that obligation, and the difference is durable rather
 than inferred. A checkpointed call carries `state.dispatchTracked` from the moment it is
@@ -644,7 +717,11 @@ Plan revision to have a handoff-ready record, and any bound review to be Ready u
 user explicitly persists a Draft-risk reason.
 
 The default host owns collaboration-mode enforcement, active-state reconciliation, and
-final reconciliation through typed planning services; the model owns the Work-mode
+final reconciliation through typed planning services. Ordinary final reconciliation
+returns `Finish` without completing unfinished Plan/Todo steps or continuing solely
+because they exist. Foreground tool waits and real continuation are handled before
+that boundary; active owned Goals keep their continuation and no-progress checks.
+The model owns the Work-mode
 decision and strategic step creation through operation-based `plan_update`. Disabling that
 tool prevents new model mutations, while existing Plan persistence, client projection, and
 restart recovery remain intact.
@@ -671,8 +748,9 @@ Automatic completion and recovery use their own durable triggers rather than syn
 messages. `session_input.source_key` deduplicates producer delivery;
 `completion_delivery` gives synchronous wait and callback one consumption owner; and
 `session_execution_state.context_epoch` advances after compaction. A background callback
-therefore wakes an idle Work session automatically, remains read-only in Plan mode, and cannot
-start a duplicate turn after `bg wait` already consumed the same terminal result.
+can wake an eligible idle Work cycle, subject to its exact wait and ownership.
+It remains read-only in Plan mode and cannot start a duplicate turn after
+`bg wait` already consumed the same terminal result.
 
 ## Todo
 
@@ -695,6 +773,14 @@ batch adds dependent items, assign explicit stable ids before referencing them.
 
 Compaction changes the provider transcript boundary. It does not delete Goal, Plan, Todo,
 Job, inbox, event log, or prompt receipt state.
+
+Before a resumed provider request, a durable FIFO scan selects eligible saved
+answers, settled reports and steering at the safe point, even when wake hints are
+missing. A resume control cannot skip earlier eligible answers; ordinary inputs
+explicitly queued for a later turn stay queued. `InputDeliveryBatch` and
+`session.input.delivery_batch.1` record the inputs actually consumed, with their
+identities and revisions. They do not establish application: the input receipt at
+actual post-hook provider dispatch does that.
 
 Instead, every relevant provider request regenerates a bounded `runtime.work_state`
 developer section from SQLite: the current plan revision and steps, Todo identities and
@@ -719,6 +805,26 @@ input ids, so the discarded tail stays reconstructable from the durable log. The
 payload is listed under [Durable inputs](/harness-runtime#durable-inputs) in the runtime
 reference.
 
+Legacy pauses are not automatically unlocked by restart, new input or migration.
+Database format 15 is unchanged. For an exact proven legacy false block, inspect
+one already consumed input whose receipt is `recorded` and has never been applied:
+
+```sh
+zuno session repair SESSION --input INPUT --dry-run
+zuno session repair SESSION --input INPUT --apply --expected-revision N
+```
+
+Use the inspection's positive `expectedRevision` for `N`. Apply requires offline,
+exclusive access to the existing database and revalidates the complete native
+proof. It admits an audited recovery control without requeueing the original
+input, replaying tools, changing a Goal or migrating storage. Success returns
+`control_queued`, not proof of input application or provider success. A repeat is
+idempotent as `already_queued` only while the same control is still `queued` and
+all evidence and execution state are unchanged. Once the control advances or the
+original input is bound/applied, repair rejects resubmission.
+Missing evidence and real protected gates remain blocked. See
+[bounded repair](/harness-runtime#explicit-repair-of-a-legacy-false-block).
+
 ## Jobs
 
 Background delegation produces durable jobs, and their lifecycle is part of this state.
@@ -733,7 +839,8 @@ model-visible while that step is unfinished, including after compaction or resta
 keeps a failed investigation from disappearing and being delegated again without a changed
 hypothesis.
 
-Do not complete a parent while active jobs or unconsumed reports remain. See
+Do not report a Job or its linked Plan step complete while required job evidence
+is unsettled. This does not force another ordinary turn after a final. See
 [Orchestration](/orchestration) for report delivery.
 
 Durable background commands keep their authoritative process state and output
@@ -752,31 +859,31 @@ pending inbox scan, so the recovered report can wake an idle parent without a
 new user prompt. A consumed, cancelled, or failed input is terminal and is
 never synthesized again.
 
-An automatic report wake does not override Goal lifecycle state. If the Goal is
-paused, blocked, complete, cancelled, or otherwise non-active, the wake still
-commits every promoted report as its own durable user message and consumes the
-inbox rows, but it does not start a provider turn. Resuming an active-capable
-Goal later continues from those messages. This keeps report delivery durable
-without letting a background child bypass an authentication, permission,
-human-input, plan-mode, or uncertain-side-effect pause. The report-only host
-reads that lifecycle state without calling Start Work first, so merely opening
-the host cannot consume a resumable pause.
+An automatic report wake follows its frozen work-cycle ownership. If that cycle
+owns a paused or otherwise non-active Goal, reports may be recorded and consumed
+without a provider request. An explicit ordinary cycle with no Goal is not blocked
+by an unrelated retained Goal; missing legacy ownership is not proof of
+independence. Stopped cycles and real authentication, permission, human-input,
+Plan-mode or uncertain-effect gates remain effective. Recording a report does
+not apply it or resume a Goal, and opening a report-only host does not grant
+Start Work authority.
 
-For a long-running CI watcher or release observer, start one background Shell
-execution with `backgroundPurpose: "remoteObserver"` and let its durable terminal
-report resume the session. Prose such as "the task is still running; I will wait"
+Use foreground execution when the next useful action depends on a CI or release
+result. Choose explicit background only when the parent has meaningful independent
+work. A chosen background Shell observer uses `backgroundPurpose: "remoteObserver"`
+and its durable terminal report can wake the eligible cycle.
+Prose such as "the task is still running; I will wait"
 does not create continuation state. The observer's process exit is only a wake
 signal: use `bg output`, then re-query the remote workflow or release by stable
 run/attempt, ref, or release id. Do not launch overlapping watchers or hand-written
 poll loops, and do not treat an overall green run as proof that skipped, cancelled,
 missing, or unexpanded required jobs executed.
 
-If durable work remains while that observer is running, the reconciliation
-driver persists `waiting_background` without polling or creating a generic
-human request. Active
-Goal auto-continuation is suppressed only while the observer remains live. Its
-terminal report is the durable wake that resumes the session; it is not remote
-success evidence.
+An exact runtime external-wait reference makes reconciliation persist
+`waiting_background`; unfinished work alone does not. The matching completion
+satisfies that wait without polling or a synthetic human question. Active Goal
+continuation then follows its remaining gates, while an ordinary final finishes
+its cycle. The observer's terminal report is not remote success evidence.
 
 ## See also
 

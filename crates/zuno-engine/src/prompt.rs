@@ -100,6 +100,9 @@ pub struct PromptSemantics {
 }
 
 /// Host-owned policy facts rendered only after the provider-step tool snapshot is final.
+///
+/// Foreground/background choices and review discipline are model guidance, not
+/// additional runtime gates. Tool availability controls which guidance is emitted.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimePromptPolicy {
     delegation_targets: Option<Vec<String>>,
@@ -165,7 +168,8 @@ impl RuntimePromptPolicy {
             .any(has);
 
         let mut execution = String::from(
-            "Use the smallest workflow. Batch reads; do not re-read or recheck unchanged state.",
+            "Use the smallest workflow. Batch independent reads; avoid repeated checks without \
+             new evidence.",
         );
         if !tools.is_empty() {
             execution.push_str(
@@ -180,9 +184,26 @@ impl RuntimePromptPolicy {
         }
         if has("tool_search") {
             execution.push_str(
-                " Use `tool_search` and its service catalog before claiming a tool absent; \
+                " Discover deferred tools with `tool_search` and its service catalog; \
                  resource or extension listing is not tool discovery.",
             );
+        }
+        if has("shell") || can_delegate || has("workflow") || has("council_run") {
+            execution.push_str(
+                " Use foreground execution by default. Choose explicit background only when the \
+                 parent has meaningful independent work to do in parallel.",
+            );
+        }
+        let orchestration_tools = ["workflow", "council_run"]
+            .into_iter()
+            .filter(|tool| has(tool))
+            .map(|tool| format!("`{tool}`"))
+            .collect::<Vec<_>>();
+        if !orchestration_tools.is_empty() {
+            execution.push_str(&format!(
+                " Internal parallelism in {} does not background the parent.",
+                orchestration_tools.join(", ")
+            ));
         }
         if has("shell") {
             execution.push_str(
@@ -207,12 +228,16 @@ impl RuntimePromptPolicy {
                 );
             }
         }
+        if has("bg") {
+            execution.push_str(
+                " Use `bg` only for returned execution handles or output paths, never task/session IDs.",
+            );
+        }
         if has("bg") && has("shell") {
             execution.push_str(
-                " Use one durable background process for async work; prose that you are waiting is \
-                 not state. Start a remote observer with Shell `background: true` and \
+                " For an explicit remote observer, use Shell `background: true` and \
                  `backgroundPurpose: remoteObserver`; terminal status only wakes this session. \
-                 Inspect `bg`, then re-query authoritative remote state by stable ID or ref before \
+                 On wake, re-query authoritative remote state by stable ID or ref before \
                  completion. Never overlap watchers or poll loops.",
             );
         }
@@ -223,7 +248,11 @@ impl RuntimePromptPolicy {
                 "Follow the current user or delegated objective; re-evaluate on new input. \
                  Never infer authority for a materially different action or add ceremony to \
                  isolated work. Treat an explicit user- or delegation-supplied scope as closed: \
-                 leave it only when required evidence is unavailable inside; explain the expansion.",
+                 leave it only when required evidence is unavailable inside; explain the expansion. \
+                 In Work, when a required user choice blocks progress, end the turn with one clear \
+                 final plain-text question; do not synthesize a persistent pause. Keep optional \
+                 questions deferred. Retained older forms or unfinished Plans neither authorize \
+                 continuation nor forbid new input; the runtime execution wait reference is authoritative.",
             ),
             RuntimePromptSection::new("runtime.execution", execution),
         ];
@@ -295,10 +324,17 @@ impl RuntimePromptPolicy {
             "Do not declare completion from intent or plausibility. Report the evidence you \
                  could inspect, identify what remains unverified, and state any blocker explicitly."
         } else {
-            "Verify behavior and recovery, not intent, patches, narrow checks or peer claims. \
-                 Evidence applies only to the exact artifact and inputs inspected; changed \
-                 inputs need a new Plan gate and verification. State blockers."
+            "Verify behavior and recovery. Evidence applies only to the exact artifact and inputs \
+                 inspected; peer claims or narrow checks alone are insufficient. State blockers."
         });
+        if !tools.is_empty() {
+            verification.push_str(
+                " For authorized review/fix cycles: Keep stable finding IDs with evidence and \
+                 disposition. After fixes, review the delta and affected paths. Reopen findings \
+                 only for changed code or new evidence. Stop when findings are resolved or \
+                 explicitly deferred and required checks pass.",
+            );
+        }
         if has("shell") {
             verification.push_str(
                 " For CI, overall success does not prove skipped, cancelled, or absent required \
@@ -319,8 +355,8 @@ impl RuntimePromptPolicy {
             let mut content = format!(
                 "Delegate only when bounded specialization or safe parallelism has clear value.{} \
                  Give each child one objective, deliverable, scope, constraints, dependencies, \
-                 and success evidence. Do not duplicate live work. After dispatching background \
-                 work with nextStep delivery, yield to the host. Do not call job or run sleep \
+                 and success evidence. Do not duplicate live work. Complete independent parent \
+                 work before yielding for nextStep delivery. Do not call job or run sleep \
                  commands to wait; the host admits each report and wakes this session exactly \
                  once. Reconcile the durable result before reuse.",
                 targets.as_deref().unwrap_or_default()
@@ -334,10 +370,10 @@ impl RuntimePromptPolicy {
         if has_durable_state {
             sections.push(RuntimePromptSection::new(
                 "runtime.persistence",
-                "Durable Goal, Plan, Todo, inbox, and job state—not prose—controls continuation. \
-                 Continue until terminal and never replay an uncertain effect. Reconcile a Job's \
-                 durable result before completing its host-linked Plan step; linked terminal \
-                 evidence remains visible while that step is open.",
+                "An active owned Goal controls continuation. An ordinary final ends its cycle \
+                 without changing unfinished Plan/Todo status. Preserve typed waits and protected \
+                 pauses; never replay an uncertain effect. Reconcile a Job's durable result before \
+                 completing its host-linked Plan step.",
             ));
         }
         sections
@@ -1048,6 +1084,8 @@ mod tests {
                 "plan_get",
                 "plan_update",
                 "task",
+                "workflow",
+                "council_run",
                 "goal_get",
                 "job",
             ],
@@ -1178,7 +1216,9 @@ mod tests {
             .map(|section| section.content().len().div_ceil(4))
             .sum::<usize>();
         assert!(
-            estimated_tokens <= 900,
+            // Covers foreground orchestration, review deltas and ordinary final
+            // choices together, including both workflow and council guidance.
+            estimated_tokens <= 1_100,
             "runtime policy consumed {estimated_tokens} estimated tokens"
         );
 
@@ -1327,7 +1367,7 @@ mod tests {
     }
 
     #[test]
-    fn next_step_delegation_yields_to_the_host_instead_of_polling_or_sleeping() {
+    fn foreground_policy_background_delegation_finishes_independent_work_before_yielding() {
         let policy = RuntimePromptPolicy::new(Some(vec!["explorer".to_owned()]), None, false);
         let sections = policy.sections(["task", "job"], true);
         let delegation = sections
@@ -1335,9 +1375,11 @@ mod tests {
             .find(|section| section.id() == "runtime.delegation")
             .expect("delegation section");
 
-        assert!(delegation.content().contains(
-            "After dispatching background work with nextStep delivery, yield to the host"
-        ));
+        assert!(
+            delegation
+                .content()
+                .contains("Complete independent parent work before yielding for nextStep delivery")
+        );
         assert!(
             delegation
                 .content()
@@ -1348,6 +1390,102 @@ mod tests {
                 .content()
                 .contains("the host admits each report and wakes this session exactly once")
         );
+    }
+
+    #[test]
+    fn foreground_policy_tracks_task_shell_and_orchestration_tool_availability() {
+        let policy = RuntimePromptPolicy::default();
+        for tool in ["task", "shell", "workflow", "council_run"] {
+            let sections = policy.sections([tool], false);
+            let execution = sections
+                .iter()
+                .find(|section| section.id() == "runtime.execution")
+                .expect("execution section");
+            assert!(
+                execution
+                    .content()
+                    .contains("Use foreground execution by default"),
+                "{tool} must default to foreground execution"
+            );
+            assert!(
+                execution.content().contains(
+                    "Choose explicit background only when the parent has meaningful independent work"
+                ),
+                "{tool} must justify background execution with independent parent work"
+            );
+            if matches!(tool, "workflow" | "council_run") {
+                assert!(execution.content().contains(&format!(
+                    "Internal parallelism in `{tool}` does not background the parent"
+                )));
+            }
+        }
+        let no_delegation = RuntimePromptPolicy::new(Some(Vec::new()), None, false);
+        for sections in [
+            policy.sections(["read"], false),
+            no_delegation.sections(["task"], false),
+        ] {
+            assert!(
+                sections
+                    .iter()
+                    .all(|section| !section.content().contains("Use foreground execution"))
+            );
+        }
+
+        let sections = policy.sections(["bg"], false);
+        let execution = sections
+            .iter()
+            .find(|section| section.id() == "runtime.execution")
+            .expect("bg guidance");
+        assert!(execution.content().contains(
+            "Use `bg` only for returned execution handles or output paths, never task/session IDs"
+        ));
+        assert!(!execution.content().contains("background: true"));
+    }
+
+    #[test]
+    fn review_policy_preserves_findings_and_rechecks_only_evidence_deltas() {
+        let sections = RuntimePromptPolicy::default().sections(["read", "shell"], false);
+        let verification = sections
+            .iter()
+            .find(|section| section.id() == "runtime.verification")
+            .expect("verification section");
+        for guidance in [
+            "Keep stable finding IDs with evidence and disposition",
+            "After fixes, review the delta and affected paths",
+            "Reopen findings only for changed code or new evidence",
+            "Stop when findings are resolved or explicitly deferred and required checks pass",
+        ] {
+            assert!(
+                verification.content().contains(guidance),
+                "missing review policy: {guidance}"
+            );
+        }
+        assert!(!verification.content().contains("new Plan gate"));
+        assert!(!verification.content().contains("review round"));
+    }
+
+    #[test]
+    fn ordinary_final_policy_distinguishes_required_choices_from_deferred_forms_and_real_waits() {
+        for tools in [Vec::new(), vec!["question", "plan_get", "plan_update"]] {
+            let sections = RuntimePromptPolicy::default().sections(tools, false);
+            let intent = sections
+                .iter()
+                .find(|section| section.id() == "runtime.intent")
+                .expect("intent applies even without question tools");
+            for guidance in [
+                "In Work, when a required user choice blocks progress",
+                "end the turn with one clear final plain-text question",
+                "do not synthesize a persistent pause",
+                "Keep optional questions deferred",
+                "Retained older forms or unfinished Plans neither authorize continuation nor forbid new input",
+                "the runtime execution wait reference is authoritative",
+            ] {
+                assert!(
+                    intent.content().contains(guidance),
+                    "missing ordinary-final policy: {guidance}"
+                );
+            }
+        }
     }
 
     #[test]

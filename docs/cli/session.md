@@ -3,7 +3,7 @@
 Sessions are durable. Every prompt, tool result, and report that could change a model
 request is written to the local store, which means the store grows and eventually needs
 inspection and cleanup. `zuno session` is that surface: it lists what exists, prunes by
-age, and deletes an exact session.
+age, deletes an exact session, and inspects narrowly provable legacy execution blocks.
 
 By default listing is scoped to the current checkout and shows only root sessions.
 Child sessions created by delegation are hidden until you ask for them.
@@ -33,6 +33,7 @@ zuno session [OPTIONS] <COMMAND>
 | [`list`](#zuno-session-list) | |
 | [`prune`](#zuno-session-prune) | |
 | [`delete`](#zuno-session-delete) | |
+| [`repair`](#zuno-session-repair) | Inspect or repair one provable legacy false block |
 | `help` | Print this message or the help of the given subcommand(s) |
 
 ### zuno session list
@@ -112,6 +113,36 @@ the Experience records derived from it, so the command refuses to guess.
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
 | `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | platform-dependent |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
+
+### zuno session repair
+
+```sh
+zuno session repair <SESSION_ID> --input <INPUT_ID> --dry-run
+zuno session repair <SESSION_ID> --input <INPUT_ID> --apply --expected-revision <N>
+```
+
+Inspection is the default. It opens an existing format-15 database read-only, without
+migration or model execution. `--apply` requires the inspected **execution revision**,
+conflicts with `--dry-run`, and requires exclusive offline database access.
+
+| Option | Meaning |
+| --- | --- |
+| `--input <INPUT_ID>` | Exact previously recorded input to inspect |
+| `--dry-run` | Inspect only; this is also the default |
+| `--apply` | Revalidate and apply the bounded native repair |
+| `--expected-revision <N>` | Positive execution revision required with `--apply` |
+
+Only a consumed, recorded, never-applied ordinary user input whose structured event
+chain proves the legacy retry-to-blocked defect is eligible. Active execution,
+uncertain outcomes, real approval/Plan/authentication/budget/Goal gates, changed
+evidence, and ambiguous history are rejected. Close all Zuno hosts holding this
+database and back it up before applying; the command cannot waive these guards.
+
+A successful apply queues one audited recovery control carrying the existing input
+ID. It does not requeue the consumed user row, replay failed tools, resume an old
+Goal, or prove provider application. Reopen the session through its normal native
+client to process that control; inspect its input receipt instead of resending text.
+See [durable state](/guide/durable-state) for the ownership and recovery contract.
 
 ## Examples
 

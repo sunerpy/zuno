@@ -103,19 +103,22 @@ pub struct GoalPauseState {
 pub enum InteractionPolicy {
     /// A Plan turn may ask ordinary clarifying questions.
     PlanClarification,
-    /// Non-Goal work may register required input when no safe default exists.
+    /// Work may ask optional clarifications without suspending execution.
     WorkAutonomous,
-    /// Active Goal work may only create a durable Goal request and yield.
+    /// Goals may ask optional clarifications; required input uses a durable Goal request.
     GoalAutonomous,
     /// A child agent reports blockers to its parent instead of contacting a user.
     SubagentReportOnly,
 }
 
 impl InteractionPolicy {
-    /// Whether the ordinary synchronous `question` tool may be registered.
+    /// Whether `question` may be registered: blocking in Plan, deferred in Work/Goal.
     #[must_use]
     pub const fn allows_question(self) -> bool {
-        matches!(self, Self::PlanClarification | Self::WorkAutonomous)
+        matches!(
+            self,
+            Self::PlanClarification | Self::WorkAutonomous | Self::GoalAutonomous
+        )
     }
 
     /// Optional clarification may outlive the current turn on every root host.
@@ -146,13 +149,31 @@ mod tests {
     }
 
     #[test]
-    fn only_autonomous_goals_get_the_durable_request_tool() {
-        assert!(InteractionPolicy::GoalAutonomous.allows_goal_request_input());
-        assert!(!InteractionPolicy::GoalAutonomous.allows_question());
-        assert!(InteractionPolicy::PlanClarification.allows_question());
-        assert!(InteractionPolicy::WorkAutonomous.allows_question());
-        assert!(!InteractionPolicy::SubagentReportOnly.allows_question());
-        assert!(InteractionPolicy::GoalAutonomous.allows_async_question());
-        assert!(!InteractionPolicy::SubagentReportOnly.allows_async_question());
+    fn root_turns_allow_optional_clarification_while_children_report_to_their_parent() {
+        for (policy, expected) in [
+            (InteractionPolicy::PlanClarification, true),
+            (InteractionPolicy::WorkAutonomous, true),
+            (InteractionPolicy::GoalAutonomous, true),
+            (InteractionPolicy::SubagentReportOnly, false),
+        ] {
+            assert_eq!(policy.allows_question(), expected, "{policy:?}: question");
+            assert_eq!(
+                policy.allows_async_question(),
+                expected,
+                "{policy:?}: question_async"
+            );
+        }
+    }
+
+    #[test]
+    fn only_autonomous_goals_get_the_durable_required_input_tool() {
+        for (policy, expected) in [
+            (InteractionPolicy::PlanClarification, false),
+            (InteractionPolicy::WorkAutonomous, false),
+            (InteractionPolicy::GoalAutonomous, true),
+            (InteractionPolicy::SubagentReportOnly, false),
+        ] {
+            assert_eq!(policy.allows_goal_request_input(), expected, "{policy:?}");
+        }
     }
 }

@@ -15,7 +15,7 @@ use zuno_config::schema::provider::{
     DEFAULT_PROVIDER_RETRY_MAX_ATTEMPTS, DEFAULT_PROVIDER_RETRY_MAX_DELAY_MS,
     DEFAULT_PROVIDER_RETRY_RECOVERY_WINDOW_MS, ProviderRetryConfig,
 };
-use zuno_error::ProviderError;
+use zuno_error::{ProviderDiagnostic, ProviderError};
 use zuno_llm::event::StreamEvent;
 
 /// Bounds repeated compaction when a conversation still exceeds the context
@@ -281,13 +281,13 @@ where
     },
     #[error(
         "provider retry deadline exceeded on attempt {attempt} after {recovery_elapsed:?} \
-         recovery ({total_elapsed:?} total; last provider code {last_provider_error_code:?})"
+         recovery ({total_elapsed:?} total; last provider failure: {last_failure})"
     )]
     DeadlineExceeded {
         attempt: u32,
         recovery_elapsed: Duration,
         total_elapsed: Duration,
-        last_provider_error_code: Option<&'static str>,
+        last_failure: Box<ProviderDiagnostic>,
     },
     /// The peer asked for a longer delay than the recovery deadline had left.
     ///
@@ -330,7 +330,7 @@ pub enum ProviderAttemptObservation<'a, T> {
         max: u32,
         recovery_elapsed: Duration,
         total_elapsed: Duration,
-        last_provider_error_code: Option<&'static str>,
+        last_failure: &'a ProviderDiagnostic,
     },
     /// Rollback was emitted and this exact deadline must commit before sleeping.
     BackoffScheduled {
@@ -591,7 +591,7 @@ where
     let total_started = tokio::time::Instant::now();
     let mut recovery_started: Option<tokio::time::Instant> = None;
     let mut deadline: Option<tokio::time::Instant> = None;
-    let mut last_provider_error_code = None;
+    let mut last_failure: Option<ProviderDiagnostic> = None;
     let mut attempt = 1_u32;
 
     loop {
@@ -603,6 +603,9 @@ where
         // Check before constructing/polling the provider future: a ready future
         // may otherwise win an already-expired timeout.
         if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            let last_failure = last_failure
+                .clone()
+                .expect("recovery deadline follows a provider failure");
             let recovery_elapsed = recovery_started
                 .expect("a replacement attempt has a recovery start")
                 .elapsed();
@@ -613,7 +616,7 @@ where
                     max,
                     recovery_elapsed,
                     total_elapsed,
-                    last_provider_error_code,
+                    last_failure: &last_failure,
                 })
                 .await
                 .map_err(|source| ProviderRetryObservedError::Observation { source })?;
@@ -621,7 +624,7 @@ where
                 attempt,
                 recovery_elapsed,
                 total_elapsed,
-                last_provider_error_code,
+                last_failure: Box::new(last_failure),
             }
             .into());
         }
@@ -630,6 +633,9 @@ where
             Some(deadline) => match tokio::time::timeout_at(deadline, operation(attempt)).await {
                 Ok(result) => result,
                 Err(_) => {
+                    let last_failure = last_failure
+                        .clone()
+                        .expect("a recovery deadline follows a provider failure");
                     let recovery_elapsed = recovery_started
                         .expect("a replacement attempt has a recovery start")
                         .elapsed();
@@ -640,15 +646,16 @@ where
                             max,
                             recovery_elapsed,
                             total_elapsed,
-                            last_provider_error_code,
+                            last_failure: &last_failure,
                         })
                         .await
                         .map_err(|source| ProviderRetryObservedError::Observation { source })?;
+
                     return Err(ProviderRetryError::DeadlineExceeded {
                         attempt,
                         recovery_elapsed,
                         total_elapsed,
-                        last_provider_error_code,
+                        last_failure: Box::new(last_failure),
                     }
                     .into());
                 }
@@ -675,7 +682,8 @@ where
                 .into());
             }
             Err(error) => {
-                last_provider_error_code = error.structured_code();
+                let diagnostic = error.diagnostic_snapshot();
+                last_failure = Some(diagnostic.clone());
                 let recovery_started =
                     *recovery_started.get_or_insert_with(tokio::time::Instant::now);
                 let deadline = *deadline.get_or_insert(recovery_started + policy.recovery_window());
@@ -694,7 +702,7 @@ where
                             attempt,
                             recovery_elapsed,
                             total_elapsed: total_started.elapsed(),
-                            last_provider_error_code,
+                            last_failure: Box::new(diagnostic),
                         },
                     }
                     .into());
@@ -712,7 +720,7 @@ where
                         attempt,
                         recovery_elapsed: recovery_started.elapsed(),
                         total_elapsed: total_started.elapsed(),
-                        last_provider_error_code,
+                        last_failure: Box::new(diagnostic.clone()),
                     })
                 })?
                 .map_err(|source| {
@@ -742,7 +750,7 @@ where
                         attempt,
                         recovery_elapsed: recovery_started.elapsed(),
                         total_elapsed: total_started.elapsed(),
-                        last_provider_error_code,
+                        last_failure: Box::new(diagnostic.clone()),
                     })
                 })?;
                 if let RetryDelay::Woken(output) = delay {
