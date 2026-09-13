@@ -501,6 +501,7 @@ fn sampling_params_are_stripped_by_declared_capability() {
             prompt_cache: false,
             attachments: false,
             sampling_params: true,
+            default_surface: ApiSurface::Chat,
         },
         "the provider-level default stays permissive; only the model narrows"
     );

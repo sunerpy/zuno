@@ -793,16 +793,23 @@ model did not receive. `allow_all` affects HITL prompting, not capability constr
 `prepare_request` hooks run after the registry snapshot is locked. They may remove or
 reorder tool schemas, but the engine rejects any added, replaced, or duplicated schema
 before provider dispatch. The durable Attempt therefore records the exact post-hook set
-without allowing the hook seam to widen registered authority. If a hook removes a schema
-that retained history still references, the request does not fail locally: the historical
-call becomes an inert assistant record and its result becomes explicitly untrusted user
-data for this request only. Current-turn calls remain native until their result
-continuation settles. Historical `ToolUse`/`ToolResult` blocks have a separate locked
-sequence and role snapshot: hooks may still edit prose, but cannot add, remove, replace,
-duplicate, reorder, split, insert another message inside a native call/result pair, or
-re-role native tool protocol history. Stored identity failures and post-hook declaration
-removals are combined before one occurrence-ordered fallback projection, so a mixed
-parallel batch keeps its durable result order.
+without allowing the hook seam to widen registered authority. Engine tool dispatch uses
+that same `prepare_request`-narrowed snapshot, not the wider pre-hook registry. If a hook removes a schema
+that retained history still references, ordinary Responses requests keep the historical
+call and result unchanged; explicitly encrypted-replay requests use the same preservation
+policy. Other protocols retain the declaration-aware fallback described below instead
+of treating declaration removal itself as a hook error. Current-turn calls remain native
+until their result continuation settles. Historical `ToolUse`/`ToolResult` blocks have a
+separate locked sequence and role snapshot: hooks cannot add, remove, replace, duplicate,
+reorder, split, insert another message inside a native call/result pair, or re-role native
+tool protocol history. A separate sealed-history guard also protects assistant content,
+item order, and input boundaries bound to encrypted reasoning, using the shared Responses
+maximal assistant-group boundaries. Adjacent unsealed assistant content within such a
+group is protected too; ordinary unsealed prose outside protected groups retains the
+existing hook behavior. Where
+declaration fallback applies, stored identity failures and post-hook declaration removals
+are combined before one occurrence-ordered projection, so a mixed parallel batch keeps
+its durable result order.
 
 Root MCP exposure is resolved after permission, allowlist and parent-schema filtering.
 `mcp_tool_exposure` defaults to `auto`: small whole services are direct within count/byte
@@ -838,10 +845,40 @@ and does not treat configuration or extension/resource listing as tool discovery
 `customize-zuno` explicitly excludes ordinary use of already-configured services.
 
 Every new tool part records the exact provider-visible schema identity beside the call.
-Before a request, retained history from earlier turns is checked against the current
+Historical input and current executable tool declarations are separate contracts. For
+ordinary Agent requests, native history preservation applies when the effective surface
+is Responses or the resolved options explicitly set `reasoningReplay: "encrypted"`.
+Surface precedence is explicit `ResolvedModel.surface` > adapter-resolved
+`Capabilities.default_surface` > `Spec.surface`. With no explicit model surface,
+the Spec is a fallback only when the adapter still reports `Default` (unknown);
+it cannot override an already resolved adapter surface. If all remain `Default`,
+the surface stays unknown rather than being guessed. Without a model override,
+fixed compatible profiles ignore conflicting Spec declarations: `xai` stays Responses
+with `Spec.surface = Chat`, while `openrouter` stays Chat with
+`Spec.surface = Responses`. OpenAI resolves to Responses even when both model and
+Spec surfaces are `Default`.
+The `Provider` trait still has three methods; this uses declared capabilities and adds
+no user configuration. Retained tool
+calls and results preserve their original content, call ids, raw argument strings, order,
+and boundaries even if a tool is now unavailable, permission-hidden, removed by a hook,
+or structurally changed. They are neither converted into inert text nor removed by
+`AuthoritativeState` history policy. The Responses rule also applies when
+`reasoningReplay` is `off`; it does not enable sealed-reasoning replay.
+
+Preserving history does not expand the current request's tool list, restore a missing
+implementation, or authorize execution. New calls still pass the current locked tool
+snapshot, schema validation, permission rules, and risk gates; replaying a historical
+call/result pair does not dispatch it again. This boundary follows Codex
+`9ba1d9eb5bbbd87ba2fc528d91ad239eea975ee9`: `core/src/client_common.rs:19/56`
+separates `input` from `tools`, `protocol/src/models.rs:1034/1068` preserves sealed
+reasoning and raw arguments, and `core/src/client.rs:315/1335` checks incremental
+request consistency. These are design references, not a claim of provider acceptance.
+
+For ordinary requests outside that preservation policy, the existing declaration
+fallback remains: retained history from earlier turns is checked against current
 post-hook definitions. Current-turn tool continuations always keep their native pair so
-an unknown or refused call can receive its protocol-complete result. For earlier turns, a
-matching replay schema preserves native tool-use/result protocol. Replay hashes remove
+an unknown or refused call can receive its protocol-complete result. For earlier turns,
+a matching replay schema preserves native tool-use/result protocol. Replay hashes remove
 annotation-only JSON Schema keys such as descriptions, titles, examples, comments, and
 defaults while retaining required fields, types, enums, and every other value constraint.
 Normalization follows schema and subschema positions only: property/definition names and
@@ -860,14 +897,18 @@ For released rows without an identity, Zuno first recovers the exact hashes from
 immutable provider-request Attempt keyed by the assistant message; if that proof is
 absent, the call is downgraded even when a same-named tool is currently active. This
 closes the `missing_tool_declaration` failure mode without silently binding an old call
-to a new schema. Tool-free internal compaction applies the same rule more broadly:
-tool calls and results enter the summarizer as bounded inert JSON text, never as native
-function protocol without declarations.
+to a new schema. Tool-free internal compaction has its own tool-independent projection,
+separate from ordinary Agent replay: tool calls and results enter the summarizer as
+bounded inert JSON text, never as native function protocol without declarations, and
+sealed reasoning is excluded.
 
-Goal, Plan, and Todo state tools use `AuthoritativeState` history policy. When one of
-their old declarations is incompatible, its historical call/result pair is omitted
-instead of converted into model-visible prose; the current typed state comes from
-`runtime.work_state`. Generic tools retain exact-declaration fallback behavior. Replay
+Within the declaration-fallback path, Goal, Plan, and Todo state tools use
+`AuthoritativeState` history policy. When one of their old declarations is incompatible,
+its historical call/result pair is omitted instead of converted into model-visible prose.
+This omission does not apply to ordinary Responses or explicitly encrypted-replay
+requests. Current typed state still comes from `runtime.work_state`; preserving an old
+state-tool result neither replaces that current state nor reactivates a Goal. Generic
+tools outside the preservation policy retain exact-declaration fallback behavior. Replay
 repair notices have diagnostic audience: they are de-duplicated per session, context
 epoch, tool, and stored/current identity, written to structured logs, and excluded from
 ACP thought chunks, TUI conversation rows, and HTTP event history.
@@ -1171,11 +1212,11 @@ validation refuses the routing that provably cannot carry a sealed item, per
 provider and per model, and accepts what already resolves to Responses.
 
 The default is `off`, which sends neither `include` nor any sealed item, including
-envelopes the same session stored while the option was `encrypted`. It is not a
-claim that the request bytes match earlier releases: the ordering fix below
-applies to every Responses provider regardless of the option, so a turn whose text
-preceded a tool call now sends the text item first. Each replayed tool call also
-carries the provider's own `arguments` bytes rather than a re-serialization,
+envelopes the same session stored while the option was `encrypted`. Native historical
+tool replay and assistant-item ordering apply to every Responses provider regardless
+of this option: a turn whose text preceded a tool call sends the text item first.
+Each replayed tool call also carries the provider's own `arguments` bytes rather than
+a re-serialization,
 because the endpoint fingerprints the string it sent, and a sealed item whose step
 produced no following output is withheld rather than sent alone, counted as
 withheld rather than as a replay.
@@ -1189,6 +1230,39 @@ writes text, calls a tool, reasons again, and calls a second tool replays as tha
 same sequence, each envelope immediately before the output it explains. That is
 what a sealing endpoint validates: a reordered or summary-only replay is refused
 on the wire.
+
+A small, dedicated sealed-history guard reuses the shared Responses maximal
+assistant-group boundaries to protect bound output, item order, and input boundaries
+across request hooks. A hook cannot inject or alter adjacent unsealed assistant content
+inside a protected group; unsealed ordinary prose outside it retains the existing behavior.
+Changing tool availability is not a reason to rewrite that output, omit an old state-tool
+call, or move its boundary while keeping the old envelope. Once eligible sealed replay
+is assembled, the guard also pins the request's model and surface across hooks and
+rejects request-parameter overrides of `input`, `messages`, or `model` before dispatch.
+The guard and the history-preservation policy do not add a user option or a database
+migration, and do not mutate the original durable history. Existing provider/model,
+age, `off`, and ambiguous-group withholding rules remain unchanged.
+
+If `text_complete` rewrites freshly completed provider-sealed output, Zuno restores
+the original text and returns a Hook error. The mismatched text is not persisted,
+and the error is not automatically retried. The sealed-history guard uses hash-only
+snapshots and never prints capsule contents.
+
+An endpoint rejection such as Kiro's `400 reasoning_replay_context_mismatch` is not
+made retryable by this policy. There is no new blind 400 retry, global removal of
+reasoning, or relaxation of the provider's account, conversation, model, and output
+binding checks. Kiro Provider v3.1.1 retains those checks; an existing valid Zuno
+Responses configuration requires no new setting for this fix. Runtime acceptance
+and recovery of a previously failed input must be verified separately.
+
+Kiro v3.1.1 rejects preserved historical calls omitted from the current tool list
+with `missing_tool_declaration`. Use Kiro's v3.1.2 historical-tool-scope fix for
+that case: it separates historical validation from current tool authorization
+without a new Zuno setting. Namespace/custom history without a provable original
+alias binding still fails with `missing_historical_tool_binding`; neither side
+guesses that identity. Do not re-advertise denied tools or remove sealed reasoning
+to bypass either restriction. Verify reduced-tool replay against the actual
+endpoint before reporting a previously failed session as recovered.
 
 An automatic Goal continuation is also a new provider turn, even when no new user
 message exists. Zuno persists the prompt-receipt reference on the first assistant

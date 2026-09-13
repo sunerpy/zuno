@@ -103,6 +103,8 @@ pub type ProviderStream<'a> =
 ///   for a text-only model.
 /// - `sampling_params` — several reasoning models *reject* `temperature` and
 ///   `top_p`; todo 30 strips them, and needs to know when.
+/// - `default_surface` — history projection must know when an unresolved request
+///   will use Responses without duplicating a provider's routing rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Capabilities {
     /// The provider can emit reasoning alongside its answer.
@@ -115,6 +117,12 @@ pub struct Capabilities {
     pub attachments: bool,
     /// The provider accepts sampling parameters such as `temperature`.
     pub sampling_params: bool,
+    /// The static wire surface used when the request selects [`ApiSurface::Default`].
+    ///
+    /// Declared by the constructed provider, not by model capability overrides.
+    /// [`ApiSurface::Default`] means no static default is declared: callers must
+    /// not guess a protocol, including when routing depends on the model id.
+    pub default_surface: ApiSurface,
 }
 
 impl Capabilities {
@@ -130,6 +138,7 @@ impl Capabilities {
             prompt_cache: false,
             attachments: false,
             sampling_params: true,
+            default_surface: ApiSurface::Default,
         }
     }
 }
@@ -705,6 +714,15 @@ impl<T: CredentialPresence + ?Sized> CredentialPresence for Arc<T> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn unspecified_capabilities_do_not_guess_a_default_surface() {
+        assert_eq!(Capabilities::default().default_surface, ApiSurface::Default);
+        assert_eq!(
+            Capabilities::text_only().default_surface,
+            ApiSurface::Default
+        );
+    }
 
     #[test]
     fn an_empty_responses_sidecar_preserves_ordinary_message_json() {

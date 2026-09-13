@@ -109,7 +109,8 @@ pub use crate::registry::reasoning_replay::{
     AmbiguousReasoningReplay, AmbiguousReplayWithholding, ENCRYPTED_REASONING_INCLUDE,
     InvalidReasoningReplayOption, ReasoningReplay, ReasoningReplayPolicy, ResponsesInputCursor,
     responses_history_ends_in_assistant_output, sealed_item_has_following_output,
-    validate_responses_replay_boundaries, withhold_ambiguous_responses_replay,
+    sealed_responses_replay_groups, validate_responses_replay_boundaries,
+    withhold_ambiguous_responses_replay,
 };
 pub use crate::registry::spec::{ApiSurface, Spec, generation};
 

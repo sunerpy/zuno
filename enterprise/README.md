@@ -12,6 +12,11 @@ The preview originally started from Zuno v0.10.29 and now incorporates v0.10.37 
 until their provider, consumer, entry point, and acceptance tests are present.
 See [STATUS.md](STATUS.md) for completed work and remaining gates.
 
+An additional main synchronization incorporates
+`0f069d1e6d24581ad941ab6bf681141480084330` for sealed-history replay and current
+tool authority. This post-release source commit is recorded separately from
+the stable release tag in `preview.json`.
+
 The PostgreSQL persistence adapter and its isolated verification procedure are
 documented in [English](POSTGRES.md) and [中文](POSTGRES.zh.md).
 The generic OAuth2 adapter and Entra specialization are described in

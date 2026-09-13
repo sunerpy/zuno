@@ -260,6 +260,7 @@ mod tests {
             prompt_cache: false,
             attachments: false,
             sampling_params: sampling,
+            default_surface: ApiSurface::Default,
         }
     }
 

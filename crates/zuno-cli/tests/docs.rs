@@ -3462,13 +3462,18 @@ fn recovery_input_and_bedrock_docs_pin_the_new_boundaries() {
     contains_all(
         "docs/harness-runtime.md",
         &[
-            "call becomes an inert assistant record",
-            "becomes explicitly untrusted",
+            "ordinary Responses requests keep the historical",
+            "call and result unchanged",
+            "Other protocols retain the declaration-aware fallback",
             "Current-turn calls remain native",
             "cannot add, remove, replace",
             "insert another message inside",
-            "re-role native tool protocol history",
-            "one occurrence-ordered fallback projection",
+            "re-role native",
+            "one occurrence-ordered projection",
+            "raw argument strings",
+            "does not expand the current request's tool list",
+            "text_complete",
+            "The mismatched text is not persisted",
         ],
     );
     contains_all(

@@ -86,6 +86,10 @@ use crate::session_command::SessionCommand;
 use crate::state::{ProviderEventUpdate, SqliteTurnPersistence, TurnPersistence, TurnState};
 use crate::status::{DiagnosticNoticeKey, SessionRunGuard, SessionRunRegistry};
 
+#[path = "sealed_replay.rs"]
+mod sealed_replay;
+use sealed_replay::{HistoricalReplayPolicy, SealedReplayHistory};
+
 /// Maximum queued transitions before the turn applies lossless backpressure.
 pub const TURN_EVENT_CHANNEL_CAPACITY: usize = 64;
 
@@ -2593,6 +2597,8 @@ async fn run_turn_in_span(
                 0
             };
             let withheld_reasoning_capsules = withhold_unreplayable_capsules(&mut history, scope);
+            let sealed_history =
+                SealedReplayHistory::capture(&history, &model).map_err(TurnError::Hook)?;
 
             let step_limit_finalization =
                 agent.max_steps.filter(|max_steps| steps >= max_steps.get());
@@ -2626,6 +2632,11 @@ async fn run_turn_in_span(
                 .resolve(model.provider.clone())
                 .map_err(ProviderError::from)?;
             let capabilities = provider.capabilities();
+            let historical_replay_policy = HistoricalReplayPolicy::resolve(
+                &model,
+                reasoning_replay,
+                capabilities.default_surface,
+            );
             let mut assistant = assistant_message(
                 &request, &session, &requested, &agent, &model, step, &history,
             )?;
@@ -2684,6 +2695,9 @@ async fn run_turn_in_span(
                 "transform_messages",
             )
             .map_err(TurnError::Hook)?;
+            sealed_history
+                .validate(&stable_history, "transform_messages")
+                .map_err(TurnError::Hook)?;
             if context_usage
                 .lock()
                 .expect("context usage lock")
@@ -2747,6 +2761,17 @@ async fn run_turn_in_span(
                 .map_err(TurnError::Hook)?;
             ensure_prepare_request_tool_subset(&hook_tool_authority, &completion.tools)
                 .map_err(TurnError::Hook)?;
+            let locked_tools: Arc<[ToolDefinition]> = locked_tools
+                .iter()
+                .filter(|definition| {
+                    completion
+                        .tools
+                        .iter()
+                        .any(|tool| tool.name == definition.id)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+                .into();
             ensure_historical_tool_protocol_unchanged(
                 &history_tool_projection.blocks,
                 &completion.messages,
@@ -2758,12 +2783,18 @@ async fn run_turn_in_span(
                 &history_tool_projection.occurrences,
                 &completion.tools,
             ));
-            let combined_history_tool_repair = downgrade_projected_tool_history(
-                &mut completion.messages,
-                &history_tool_projection.blocks,
-                &history_tool_projection.occurrences,
-                &combined_history_tool_fallbacks,
-            );
+            let combined_history_tool_repair = match historical_replay_policy {
+                HistoricalReplayPolicy::Preserve => HistoricalToolDeclarationRepair::default(),
+                HistoricalReplayPolicy::DeclarationBound => downgrade_projected_tool_history(
+                    &mut completion.messages,
+                    &history_tool_projection.blocks,
+                    &history_tool_projection.occurrences,
+                    &combined_history_tool_fallbacks,
+                ),
+            };
+            sealed_history
+                .validate_request(&completion, "prepare_request")
+                .map_err(TurnError::Hook)?;
             let context_epoch = store.persistence.context_epoch(&store.scope).await?;
             let reset = {
                 let mut usage = context_usage.lock().expect("context usage lock");
@@ -3338,20 +3369,30 @@ async fn run_turn_in_span(
             // reasoning item is several parts, and a hook rewrites exactly the segment
             // it was handed.
             let mut hook_failure = None;
+            let sealed_output = sealed_replay::output_is_sealed(&accumulator.items);
             for (position, item) in accumulator.items.iter_mut().enumerate() {
                 let StepItem::Text(text) = item else { continue };
                 if text.is_empty() {
                     continue;
                 }
                 let part_id = positional_part_id(&request.turn_id, step, position, PART_KIND_TEXT);
+                let sealed_original = sealed_output.then(|| text.clone());
                 let before = sha256_text(text);
                 let result = context
                     .hooks
                     .text_complete(&request.session_id, &assistant_id, &part_id, text)
                     .await;
+                let changed = before != sha256_text(text);
+                if changed && let Some(original) = sealed_original {
+                    *text = original;
+                    hook_failure = Some(
+                        "text_complete cannot rewrite provider-sealed assistant output".to_owned(),
+                    );
+                    break;
+                }
                 // Tail-after-assistant accounting cannot cover a hook rewriting that
                 // assistant itself, including a mutation followed by a hook failure.
-                accumulator.context_rewritten |= before != sha256_text(text);
+                accumulator.context_rewritten |= changed;
                 if let Err(message) = result {
                     hook_failure = Some(message);
                     break;

@@ -314,6 +314,7 @@ impl Provider for AnthropicProvider {
             prompt_cache: true,
             attachments: true,
             sampling_params: true,
+            default_surface: ApiSurface::Default,
         }
     }
 

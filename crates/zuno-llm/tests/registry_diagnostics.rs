@@ -47,6 +47,7 @@ impl Echo {
                 prompt_cache: true,
                 attachments: true,
                 sampling_params: false,
+                default_surface: zuno_llm::registry::ApiSurface::Default,
             },
         }
     }
