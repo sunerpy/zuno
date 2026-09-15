@@ -1,0 +1,22 @@
+[package]
+name = "zuno-acp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "zuno_acp"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+codex-app-server-client = { workspace = true }
+codex-app-server-protocol = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-std", "macros", "rt", "sync", "time"] }
+tracing = { workspace = true }

@@ -1,0 +1,155 @@
+name: Prepare Codex upstream sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Exact stable Codex tag (blank selects newest stable tag)
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: zuno-upstream-sync-main
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out exact Zuno source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch Codex release tags
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/openai/codex.git
+          git fetch --tags --prune upstream
+
+      - name: Validate sync helper
+        run: python3 -m unittest -v scripts/test_zuno_upstream.py
+
+      - name: Resolve and inspect candidate
+        id: plan
+        env:
+          REQUESTED_TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          plan_path="${RUNNER_TEMP}/upstream-plan.json"
+          target_args=()
+          if [[ -n "${REQUESTED_TARGET}" ]]; then
+            target_args=(--target "${REQUESTED_TARGET}")
+          fi
+          python3 scripts/zuno_upstream.py \
+            --no-fetch \
+            --json \
+            check \
+            --source HEAD \
+            "${target_args[@]}" > "${plan_path}"
+          target_tag="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["target_tag"])' "${plan_path}")"
+          relationship="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["relationship"])' "${plan_path}")"
+          source_dirty="$(python3 -c 'import json, sys; print(str(json.load(open(sys.argv[1]))["source_dirty"]).lower())' "${plan_path}")"
+          [[ "${relationship}" == descendant ]] || {
+            echo "unsafe upstream relationship: ${relationship}" >&2
+            exit 1
+          }
+          [[ "${source_dirty}" == false ]] || {
+            echo "reviewed Zuno source is dirty" >&2
+            exit 1
+          }
+          target_version="${target_tag#rust-v}"
+          if [[ ! "${target_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "unsafe target returned by sync helper: ${target_tag}" >&2
+            exit 1
+          fi
+          {
+            echo "target_tag=${target_tag}"
+            echo "target_version=${target_version}"
+            echo "plan_path=${plan_path}"
+          } >> "${GITHUB_OUTPUT}"
+          cat "${plan_path}"
+
+      - name: Prepare isolated candidate
+        id: candidate
+        env:
+          TARGET_TAG: ${{ steps.plan.outputs.target_tag }}
+          TARGET_VERSION: ${{ steps.plan.outputs.target_version }}
+        run: |
+          set -euo pipefail
+          branch="upstream-sync/${TARGET_VERSION}-${GITHUB_RUN_ID}"
+          candidate="${RUNNER_TEMP}/zuno-upstream-${TARGET_VERSION}"
+          candidate_report="${RUNNER_TEMP}/upstream-candidate.json"
+          python3 scripts/zuno_upstream.py \
+            --no-fetch \
+            --json \
+            prepare \
+            --source HEAD \
+            --target "${TARGET_TAG}" \
+            --branch "${branch}" \
+            --worktree "${candidate}" > "${candidate_report}"
+          git -C "${candidate}" config user.name github-actions[bot]
+          git -C "${candidate}" config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git -C "${candidate}" add --all
+          git -C "${candidate}" commit -m "chore(upstream): prepare Codex ${TARGET_VERSION} candidate"
+          {
+            echo "branch=${branch}"
+            echo "candidate=${candidate}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Push exact candidate branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE: ${{ steps.candidate.outputs.candidate }}
+          HEAD_BRANCH: ${{ steps.candidate.outputs.branch }}
+        run: |
+          set -euo pipefail
+          credential_file="${RUNNER_TEMP}/zuno-upstream-git-credential"
+          trap 'rm -f "${credential_file}"' EXIT
+          printf 'https://x-access-token:%s@github.com\n' "$GH_TOKEN" > "$credential_file"
+          chmod 600 "$credential_file"
+          git -C "$CANDIDATE" \
+            -c credential.helper= \
+            -c credential.helper="store --file=${credential_file}" \
+            push -u origin "$HEAD_BRANCH"
+
+      - name: Open review PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_BRANCH: ${{ steps.candidate.outputs.branch }}
+          TARGET_TAG: ${{ steps.plan.outputs.target_tag }}
+          PLAN_PATH: ${{ steps.plan.outputs.plan_path }}
+        run: |
+          set -euo pipefail
+          overlap="$(python3 - <<'PY'
+          import json
+          import os
+          plan = json.load(open(os.environ["PLAN_PATH"]))
+          paths = plan["overlapping_files"]
+          if not paths:
+              print("No path overlap was detected by the pre-replay comparison.")
+          else:
+              print("Potential overlapping paths:\n" + "\n".join(f"- `{path}`" for path in paths))
+          PY
+          )"
+          body="$(cat <<EOF
+          This candidate replays the reviewed Zuno delta onto exact Codex release \`${TARGET_TAG}\`.
+
+          It was created in an isolated CI worktree. Nothing was merged automatically.
+
+          ${overlap}
+
+          Required before merge: inspect conflicts/semantic drift, run targeted and shared Rust gates, regenerate schemas/locks, build all supported artifacts, and execute Zuno ACP/workflow/Kiro Provider smoke tests.
+          EOF
+          )"
+          gh pr create \
+            --base main \
+            --head "${HEAD_BRANCH}" \
+            --title "chore(upstream): sync Codex ${TARGET_TAG#rust-v}" \
+            --body "${body}"

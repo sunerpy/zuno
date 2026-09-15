@@ -1,0 +1,156 @@
+schema_version = 1
+project = "zuno"
+upstream_manifest = "UPSTREAM_CODEX.toml"
+
+[[capabilities]]
+id = "workflow-runtime"
+status = "implemented"
+ownership = "zuno-owned"
+summary = "User-owned YAML workflows with pluggable graph and dynamic script engines."
+zuno_paths = [
+  "codex-rs/zuno-workflows",
+  "codex-rs/app-server-protocol/src/protocol/v2/workflow.rs",
+  "codex-rs/app-server/src/request_processors/workflows.rs",
+  "codex-rs/app-server/src/request_processors/workflows",
+  "codex-rs/plugin/src/load_outcome.rs",
+  "codex-rs/plugin/src/manifest.rs",
+]
+shared_upstream_paths = [
+  "codex-rs/app-server/src/message_processor.rs",
+  "codex-rs/app-server/src/request_serialization.rs",
+  "codex-rs/code-mode",
+  "codex-rs/code-mode-host",
+  "codex-rs/code-mode-protocol",
+  "codex-rs/code-mode-runtime",
+  "codex-rs/core/src/thread_manager.rs",
+]
+contracts = [
+  "No business workflow is built into the application.",
+  "frontend-consensus is not a reserved identifier, command, API method, packaged resource, default profile, or auto-installed plugin.",
+  "Workflow definitions come only from explicit user, project, or plugin roots and are shared by every client surface.",
+  "DSH is a design source for runtime composition, not an embedded runtime or wire/config compatibility target.",
+  "Dynamic workflow scripts require independent authorization.",
+  "Completed or uncertain side effects are never mechanically replayed.",
+]
+
+[[capabilities]]
+id = "agent-backends"
+status = "implemented"
+ownership = "shared-modified"
+summary = "One backend contract for native child threads, Claude Code, and ACP agents."
+zuno_paths = [
+  "codex-rs/ext/agent/src/one_shot.rs",
+  "codex-rs/ext/agent/src/one_shot",
+  "codex-rs/ext/agent/src/registry.rs",
+  "codex-rs/ext/agent/src/registry",
+  "codex-rs/plugin/src/agent_backend.rs",
+  "codex-rs/plugin/src/load_outcome.rs",
+  "codex-rs/plugin/src/manifest.rs",
+  "codex-rs/core-plugins/src/agent_backends.rs",
+  "codex-rs/core-plugins/src/loader.rs",
+  "codex-rs/app-server/src/request_processors/workflows/backend_factory.rs",
+  "codex-rs/app-server/src/request_processors/workflows/dispatcher.rs",
+  "docs/zuno-plugin-agent-backends.md",
+  "docs/zuno-plugin-agent-backends.zh-CN.md",
+  "examples/zuno-plugins/agent-backends",
+]
+shared_upstream_paths = [
+  "codex-rs/core/src/agent",
+  "codex-rs/core/src/thread_manager.rs",
+]
+contracts = [
+  "Codex development agents use in-process child threads by default.",
+  "Agent references resolve through exact-generation provider factories; providers do not install business workflows or model routes.",
+  "Enabled plugins may mount versioned, namespaced native Codex, Claude Code, or ACP factories through zuno.agent-backends/v1 declarations.",
+  "Plugin declarations contain deployment process settings only; execution profiles remain authoritative for model, provider, reasoning, permission, and sandbox settings.",
+  "Workflow admission persists and revalidates a non-secret backend, plugin generation, execution-profile, model, permission, and sandbox binding digest.",
+  "Plugin backend generation covers declaration bytes and current-platform executable bytes; bare PATH commands are resolved, content-pinned in the factory binding, and rechecked before spawn.",
+  "Environment variable values and credentials never enter plugin metadata or the workflow binding ledger.",
+  "Unsupported backend capabilities fail before dispatch.",
+]
+
+[[capabilities]]
+id = "native-acp"
+status = "implemented"
+ownership = "shared-modified"
+summary = "Native ACP client surface over the same durable App Server thread and turn runtime."
+zuno_paths = [
+  "codex-rs/zuno-acp",
+  "codex-rs/cli/src/acp_cmd.rs",
+  "codex-rs/cli/tests/acp.rs",
+  "docs/zuno-acp.md",
+  "docs/zuno-acp.zh-CN.md",
+]
+shared_upstream_paths = [
+  "codex-rs/app-server",
+  "codex-rs/app-server-protocol",
+]
+contracts = [
+  "ACP clients do not own a private agent loop.",
+  "Turn interrupt, ordinary input, goal resume, and protected gates remain distinct.",
+]
+
+[[capabilities]]
+id = "upstream-sync"
+status = "implemented"
+ownership = "zuno-owned"
+summary = "Candidate-only replay of the reviewed Zuno delta onto an exact Codex stable release."
+zuno_paths = [
+  "UPSTREAM_CODEX.toml",
+  "FORK_DELTA.toml",
+  "scripts/zuno_upstream.py",
+  "scripts/test_zuno_upstream.py",
+]
+shared_upstream_paths = []
+contracts = [
+  "The active Zuno branch and worktree are never mutated by synchronization.",
+  "A dirty source is rejected before candidate preparation.",
+  "The exact upstream tag, commit, and tree are verified before replay.",
+]
+
+[[capabilities]]
+id = "zuno-product-packaging"
+status = "implemented"
+ownership = "shared-modified"
+summary = "Zuno product binary and cross-platform package target with a temporary Codex compatibility entrypoint."
+zuno_paths = [
+  "codex-rs/cli/src/codex.rs",
+]
+shared_upstream_paths = [
+  "codex-rs/cli/Cargo.toml",
+  "codex-rs/cli/src/main.rs",
+  "codex-rs/cli/BUILD.bazel",
+  "bazel/platforms/release_binaries.bzl",
+  "scripts/codex_package",
+  ".github/scripts/build-codex-package-archive.sh",
+  "justfile",
+]
+contracts = [
+  "The shipped product entrypoint, version identity, help, and shell completions are named Zuno.",
+  "Zuno package archives contain bin/zuno and retain the proven Codex-derived companion layout.",
+  "The Codex binary and release filegroup remain compatibility-only sync validation paths.",
+]
+
+[[capabilities]]
+id = "zuno-ci-release"
+status = "implemented"
+ownership = "zuno-owned"
+summary = "Public-runner PR gate and six-platform Zuno package release automation."
+zuno_paths = [
+  ".github/CODEOWNERS",
+  ".github/workflows/zuno-ci.yml",
+  ".github/workflows/zuno-release.yml",
+  "scripts/check_zuno_update_boundaries.py",
+  "scripts/smoke_zuno_package.py",
+]
+shared_upstream_paths = [
+  ".github/workflows/blocking-ci.yml",
+  ".github/workflows/postmerge-ci.yml",
+  ".github/workflows/v8-canary.yml",
+]
+contracts = [
+  "The protected main branch receives the required zuno/pr-gate context from public GitHub-hosted infrastructure.",
+  "OpenAI-only CI remains manually available but does not run automatically in the Zuno repository.",
+  "zuno-vX.Y.Z builds, natively smokes, attests, hashes, and publishes canonical Zuno packages for six OS/architecture targets.",
+  "All inherited Codex installers, daemon updaters, and tag publishers fail closed in the independent Zuno repository.",
+]

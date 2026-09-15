@@ -1,5 +1,0 @@
-export default {
-  description: "Get current weather for a city.",
-  args: { city: { type: "string", description: "City name" } },
-  execute: async ({ city }) => JSON.stringify({ city, temperature: 22, condition: "sunny" }),
-}

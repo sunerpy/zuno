@@ -1,0 +1,24 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AbsolutePathBuf": {
+      "description": "A path that is guaranteed to be absolute and normalized (though it is not guaranteed to be canonicalized or exist on the filesystem).\n\nIMPORTANT: When deserializing an `AbsolutePathBuf`, a base path must be set using [AbsolutePathBufGuard::new]. If no base path is set, the deserialization will fail unless the path being deserialized is already absolute.",
+      "type": "string"
+    }
+  },
+  "properties": {
+    "cwds": {
+      "description": "Working directories used for project and plugin discovery. Empty means the app-server process working directory.",
+      "items": {
+        "$ref": "#/definitions/AbsolutePathBuf"
+      },
+      "type": "array"
+    },
+    "forceReload": {
+      "description": "Re-read configured roots instead of accepting a registry cache hit.",
+      "type": "boolean"
+    }
+  },
+  "title": "WorkflowListParams",
+  "type": "object"
+}

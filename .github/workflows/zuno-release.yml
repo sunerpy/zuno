@@ -1,0 +1,291 @@
+name: Promote Zuno candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: New preview tag, for example zuno-v0.154.0
+        required: true
+        type: string
+      candidate_run_id:
+        description: Exact successful Zuno CI run that owns zuno-candidate
+        required: true
+        type: string
+      candidate_run_attempt:
+        description: Exact attempt number of the successful Zuno CI run
+        required: true
+        type: string
+      candidate_artifact_id:
+        description: Exact immutable zuno-candidate artifact ID
+        required: true
+        type: string
+      pull_request:
+        description: Merged source-fork pull request number
+        required: true
+        type: string
+      expected_head_sha:
+        description: Exact certified PR head SHA
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+  attestations: read
+  pull-requests: read
+
+concurrency:
+  group: zuno-candidate-promotion
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Promote exact candidate bytes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      CANDIDATE_RUN_ATTEMPT: ${{ inputs.candidate_run_attempt }}
+      CANDIDATE_ARTIFACT_ID: ${{ inputs.candidate_artifact_id }}
+      PR_NUMBER: ${{ inputs.pull_request }}
+      EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate merged source and exact candidate run
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^zuno-v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]
+          [[ "$CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$CANDIDATE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          [[ "$CANDIDATE_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          [[ "$EXPECTED_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+          pr="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
+          [[ "$(jq -r '.merged' <<<"$pr")" == true ]]
+          [[ "$(jq -r '.base.ref' <<<"$pr")" == main ]]
+          [[ "$(jq -r '.head.repo.full_name' <<<"$pr")" == "$GITHUB_REPOSITORY" ]]
+          [[ "$(jq -r '.head.sha' <<<"$pr")" == "$EXPECTED_HEAD_SHA" ]]
+          base_sha="$(jq -r '.base.sha' <<<"$pr")"
+          [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]]
+          merge_sha="$(jq -r '.merge_commit_sha' <<<"$pr")"
+          [[ "$merge_sha" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --no-tags origin "$EXPECTED_HEAD_SHA"
+          git fetch --no-tags origin "$merge_sha"
+          git merge-base --is-ancestor "$merge_sha" origin/main
+          git merge-base --is-ancestor "$EXPECTED_HEAD_SHA" "$merge_sha" || {
+            echo "merge $merge_sha does not retain certified PR head $EXPECTED_HEAD_SHA; squash and rebase merges are forbidden" >&2
+            exit 1
+          }
+          read -r -a merge_parents <<<"$(git show -s --format=%P "$merge_sha")"
+          [[ "${#merge_parents[@]}" -eq 2 ]] || {
+            echo "release merge $merge_sha must have exactly two parents" >&2
+            exit 1
+          }
+          [[ "${merge_parents[0]}" == "$base_sha" ]] || {
+            echo "release merge first parent ${merge_parents[0]} differs from PR base $base_sha" >&2
+            exit 1
+          }
+          [[ "${merge_parents[1]}" == "$EXPECTED_HEAD_SHA" ]] || {
+            echo "release merge second parent ${merge_parents[1]} differs from certified PR head $EXPECTED_HEAD_SHA" >&2
+            exit 1
+          }
+          read -r -a head_parents <<<"$(git show -s --format=%P "$EXPECTED_HEAD_SHA")"
+          [[ "${#head_parents[@]}" -eq 2 ]] || {
+            echo "source-history bridge must have exactly two parents" >&2
+            exit 1
+          }
+          [[ "${head_parents[0]}" == "$base_sha" ]] || {
+            echo "bridge first parent ${head_parents[0]} differs from PR base $base_sha" >&2
+            exit 1
+          }
+          head_tree="$(git rev-parse "${EXPECTED_HEAD_SHA}^{tree}")"
+          zuno_tree="$(git rev-parse "${head_parents[1]}^{tree}")"
+          [[ "$head_tree" == "$zuno_tree" ]] || {
+            echo "bridge tree $head_tree differs from reviewed Zuno tree $zuno_tree" >&2
+            exit 1
+          }
+          baseline_commit="$(git show "${EXPECTED_HEAD_SHA}:UPSTREAM_CODEX.toml" | awk '
+            /^\[baseline\]$/ { in_baseline=1; next }
+            /^\[/ { in_baseline=0 }
+            in_baseline && /^release_commit = / {
+              value=$0
+              sub(/^[^=]*=[[:space:]]*"/, "", value)
+              sub(/".*$/, "", value)
+              print value
+              exit
+            }
+          ')"
+          [[ "$baseline_commit" =~ ^[0-9a-f]{40}$ ]]
+          git merge-base --is-ancestor "$baseline_commit" "${head_parents[1]}" || {
+            echo "bridge second parent does not retain Codex baseline $baseline_commit" >&2
+            exit 1
+          }
+          merge_tree="$(git rev-parse "${merge_sha}^{tree}")"
+          [[ "$merge_tree" == "$head_tree" ]] || {
+            echo "merged tree $merge_tree differs from certified PR tree $head_tree" >&2
+            exit 1
+          }
+
+          run="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CANDIDATE_RUN_ID}")"
+          [[ "$(jq -r '.conclusion' <<<"$run")" == success ]]
+          [[ "$(jq -r '.event' <<<"$run")" == pull_request ]]
+          [[ "$(jq -r '.path' <<<"$run")" == '.github/workflows/zuno-ci.yml' ]]
+          [[ "$(jq -r '.head_sha' <<<"$run")" == "$EXPECTED_HEAD_SHA" ]]
+          [[ "$(jq -r '.run_attempt' <<<"$run")" == "$CANDIDATE_RUN_ATTEMPT" ]]
+          jq -e --argjson number "$PR_NUMBER" \
+            '[.pull_requests[].number] | index($number) != null' <<<"$run" >/dev/null
+          {
+            echo "merge_sha=$merge_sha"
+            echo "tree_sha=$merge_tree"
+            echo "head_parents=${head_parents[*]}"
+          } >> "$GITHUB_OUTPUT"
+      - name: Download exact sealed candidate artifact
+        id: artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${CANDIDATE_ARTIFACT_ID}")"
+          [[ "$(jq -r '.name' <<<"$artifact")" == zuno-candidate ]]
+          [[ "$(jq -r '.expired' <<<"$artifact")" == false ]]
+          [[ "$(jq -r '.workflow_run.id' <<<"$artifact")" == "$CANDIDATE_RUN_ID" ]]
+          [[ "$(jq -r '.workflow_run.head_sha' <<<"$artifact")" == "$EXPECTED_HEAD_SHA" ]]
+          artifact_digest="$(jq -r '.digest // empty' <<<"$artifact")"
+          [[ "$artifact_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "candidate artifact has no supported SHA-256 identity" >&2
+            exit 1
+          }
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${CANDIDATE_ARTIFACT_ID}/zip" \
+            > candidate-artifact.zip
+          actual_digest="sha256:$(sha256sum candidate-artifact.zip | awk '{print $1}')"
+          [[ "$actual_digest" == "$artifact_digest" ]] || {
+            echo "candidate artifact digest mismatch: expected $artifact_digest, got $actual_digest" >&2
+            exit 1
+          }
+          mkdir downloaded
+          unzip -q candidate-artifact.zip -d downloaded
+          echo "digest=$artifact_digest" >> "$GITHUB_OUTPUT"
+      - name: Verify candidate identity and every byte
+        id: candidate
+        shell: bash
+        env:
+          MERGE_TREE: ${{ steps.identity.outputs.tree_sha }}
+          EXPECTED_HEAD_PARENTS: ${{ steps.identity.outputs.head_parents }}
+        run: |
+          set -euo pipefail
+          manifest="$(find downloaded -type f -name candidate-manifest.json -print -quit)"
+          test -n "$manifest"
+          root="$(dirname "$manifest")"
+          python3 - "$manifest" "$root" <<'PY'
+          import hashlib, json, os, sys
+          from pathlib import Path
+
+          manifest_path, root = Path(sys.argv[1]), Path(sys.argv[2])
+          data = json.loads(manifest_path.read_text())
+          assert data["schemaVersion"] == 1
+          assert data["repository"] == os.environ["GITHUB_REPOSITORY"]
+          assert data["workflow"] == ".github/workflows/zuno-ci.yml"
+          assert data["runId"] == int(os.environ["CANDIDATE_RUN_ID"])
+          assert data["runAttempt"] == int(os.environ["CANDIDATE_RUN_ATTEMPT"])
+          assert data["pullRequest"] == int(os.environ["PR_NUMBER"])
+          assert data["headRepository"] == os.environ["GITHUB_REPOSITORY"]
+          assert data["headSha"] == os.environ["EXPECTED_HEAD_SHA"]
+          assert data["headParents"] == os.environ["EXPECTED_HEAD_PARENTS"].split()
+          assert data["treeSha"] == os.environ["MERGE_TREE"]
+          assert os.environ["RELEASE_TAG"] == f'zuno-v{data["version"]}'
+          for entry in data["files"]:
+              path = root / entry["name"]
+              raw = path.read_bytes()
+              assert len(raw) == entry["size"], entry["name"]
+              assert hashlib.sha256(raw).hexdigest() == entry["sha256"], entry["name"]
+          assert data["targets"] == [
+              "aarch64-apple-darwin",
+              "aarch64-pc-windows-msvc",
+              "aarch64-unknown-linux-gnu",
+              "x86_64-apple-darwin",
+              "x86_64-pc-windows-msvc",
+              "x86_64-unknown-linux-gnu",
+          ]
+          PY
+          (cd "$root" && sha256sum --check zuno-package_SHA256SUMS)
+          echo "root=$root" >> "$GITHUB_OUTPUT"
+      - name: Verify candidate provenance attestations
+        shell: bash
+        env:
+          ROOT: ${{ steps.candidate.outputs.root }}
+        run: |
+          set -euo pipefail
+          signer_workflow="${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}/.github/workflows/zuno-ci.yml"
+          gh attestation verify "$ROOT/candidate-manifest.json" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$signer_workflow" \
+            --deny-self-hosted-runners
+          for archive in "$ROOT"/zuno-package-*.tar.gz; do
+            gh attestation verify "$archive" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$signer_workflow" \
+              --deny-self-hosted-runners
+          done
+      - name: Create or validate immutable tag
+        shell: bash
+        env:
+          MERGE_SHA: ${{ steps.identity.outputs.merge_sha }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            git fetch --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+            [[ "$(git rev-parse "${RELEASE_TAG}^{commit}")" == "$MERGE_SHA" ]]
+          else
+            git tag -a "$RELEASE_TAG" "$MERGE_SHA" -m "Zuno ${RELEASE_TAG#zuno-v} preview"
+            git push origin "refs/tags/${RELEASE_TAG}"
+          fi
+      - name: Create or update draft release
+        shell: bash
+        env:
+          ROOT: ${{ steps.candidate.outputs.root }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --json isDraft >/tmp/zuno-release.json 2>/dev/null; then
+            [[ "$(jq -r '.isDraft' /tmp/zuno-release.json)" == true ]]
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft --prerelease --latest=false \
+              --title "Zuno ${RELEASE_TAG#zuno-v} source-fork preview" \
+              --notes "Preview source-fork cutover. Automatic update remains fail-closed; install manually after verifying zuno-package_SHA256SUMS."
+          fi
+          gh release upload "$RELEASE_TAG" --clobber \
+            "$ROOT"/zuno-package-*.tar.gz \
+            "$ROOT"/zuno-package_SHA256SUMS \
+            "$ROOT"/smoke-*.json \
+            "$ROOT"/candidate-manifest.json
+      - name: Download draft assets and verify public bytes
+        shell: bash
+        env:
+          ROOT: ${{ steps.candidate.outputs.root }}
+        run: |
+          set -euo pipefail
+          mkdir release-download
+          gh release download "$RELEASE_TAG" --dir release-download
+          diff -u "$ROOT/zuno-package_SHA256SUMS" release-download/zuno-package_SHA256SUMS
+          (cd release-download && sha256sum --check zuno-package_SHA256SUMS)
+          python3 - "$ROOT" release-download <<'PY'
+          from pathlib import Path
+          import hashlib, sys
+          left, right = Path(sys.argv[1]), Path(sys.argv[2])
+          names = sorted(path.name for path in left.iterdir() if path.is_file())
+          assert names == sorted(path.name for path in right.iterdir() if path.is_file())
+          for name in names:
+              assert hashlib.sha256((left / name).read_bytes()).digest() == hashlib.sha256((right / name).read_bytes()).digest(), name
+          PY
+      - name: Publish non-latest preview
+        shell: bash
+        run: gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false

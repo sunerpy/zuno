@@ -1,0 +1,116 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "WorkflowDocumentFormat": {
+      "description": "Source encoding for a user-, project-, or plugin-owned workflow document.",
+      "enum": [
+        "json",
+        "yaml"
+      ],
+      "type": "string"
+    },
+    "WorkflowEngine": {
+      "description": "Execution engine selected by a `zuno.workflow/v1` document.",
+      "enum": [
+        "graph/v1",
+        "javascript/v1",
+        "node-worker/v1"
+      ],
+      "type": "string"
+    },
+    "WorkflowScope": {
+      "description": "Discovery authority that supplied a workflow. This is provenance, not a precedence promise; `workflowId` remains the opaque selector.",
+      "enum": [
+        "user",
+        "project",
+        "plugin"
+      ],
+      "type": "string"
+    },
+    "WorkflowSourceIdentity": {
+      "description": "Immutable identity for one exact workflow source document.",
+      "properties": {
+        "digest": {
+          "description": "SHA-256 digest of the exact source bytes.",
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "source": {
+          "description": "Human-readable source provenance, such as a path or plugin resource id.",
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "digest",
+        "name",
+        "source",
+        "version"
+      ],
+      "type": "object"
+    },
+    "WorkflowSummary": {
+      "description": "A discovered and validated workflow. Zuno does not reserve names for built-in business workflows; every entry comes from a discoverable source.",
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "engine": {
+          "$ref": "#/definitions/WorkflowEngine"
+        },
+        "executableDigest": {
+          "description": "Digest of all executable material. For `scriptFile` workflows this binds both the document and resolved script bytes.",
+          "type": "string"
+        },
+        "identity": {
+          "$ref": "#/definitions/WorkflowSourceIdentity"
+        },
+        "scope": {
+          "$ref": "#/definitions/WorkflowScope"
+        },
+        "workflowId": {
+          "description": "Opaque registry selector. Callers must not derive this from the name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "engine",
+        "executableDigest",
+        "identity",
+        "scope",
+        "workflowId"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "definition": {
+      "description": "Parsed definition for clients that do not need source-level editing."
+    },
+    "document": {
+      "description": "Exact source text. Keeping the text preserves YAML comments and makes the digest independently verifiable by clients.",
+      "type": "string"
+    },
+    "format": {
+      "$ref": "#/definitions/WorkflowDocumentFormat"
+    },
+    "workflow": {
+      "$ref": "#/definitions/WorkflowSummary"
+    }
+  },
+  "required": [
+    "definition",
+    "document",
+    "format",
+    "workflow"
+  ],
+  "title": "WorkflowReadResponse",
+  "type": "object"
+}
