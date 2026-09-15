@@ -1,0 +1,6 @@
+{
+  "name": "example-agent-backends",
+  "version": "0.1.0",
+  "description": "Opt-in Agent backend declaration example",
+  "agentBackends": "./agent-backends.json"
+}

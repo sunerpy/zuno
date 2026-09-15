@@ -1,0 +1,17 @@
+{
+  "apiVersion": "zuno.agent-backends/v1",
+  "backends": {
+    "native-build": {
+      "kind": "native-codex"
+    },
+    "claude-review": {
+      "kind": "claude-code",
+      "command": "claude"
+    },
+    "external-acp": {
+      "kind": "acp",
+      "command": "./bin/external-agent-acp",
+      "args": ["--stdio"]
+    }
+  }
+}

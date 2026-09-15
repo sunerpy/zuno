@@ -1,204 +1,117 @@
-<div align="center">
-
-<img src="./docs/assets/zuno-logo.svg" alt="Zuno logo" width="160" />
-
 # Zuno
 
-### A Rust coding agent for durable, bounded work
+Zuno is a local, plugin-oriented agent runtime built as a full-source fork of
+[OpenAI Codex](https://github.com/openai/codex). It keeps Codex's Rust runtime,
+thread state, approvals, sandboxing, model providers, TUI, and App Server while
+adding native ACP, user-owned workflow engines, and a typed Agent-backend
+factory boundary.
+The project and executable are named **Zuno**; Codex remains the upstream source
+baseline.
 
-[![CI](https://github.com/sunerpy/zuno/actions/workflows/ci.yml/badge.svg)](https://github.com/sunerpy/zuno/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/sunerpy/zuno)](https://github.com/sunerpy/zuno/releases)
-[![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.98%2B-orange)](./rust-toolchain.toml)
+> Zuno next is under active development on the `zuno-next` line. Do not replace
+> an installed legacy Zuno binary until the candidate has passed the platform,
+> migration, ACP, workflow, and Provider acceptance gates.
 
-[Install](#install) · [Quick start](#quick-start) · [Runtime](#runtime-and-extensions) · [Documentation](#documentation)
+## Design rules
 
-[**English**](./README.md) · [简体中文](./docs/readme/README.zh-CN.md)
+- Workflows are user/project/plugin resources using `zuno.workflow/v1`; no
+  product-specific workflow or model routing is built into the application.
+- Native Codex subagents share the in-process thread runtime; Claude Code and
+  ACP are bounded external backends. Enabled plugins may declaratively mount
+  namespaced backend factories, while execution profiles retain model and
+  policy ownership.
+- ACP is a client projection over the same Codex App Server state, not another
+  agent loop.
+- Model/provider/profile selection remains configuration. Workflows use logical
+  routes instead of embedding credentials or mandatory model IDs.
+- Upstream Codex updates are replayed into an isolated candidate and never
+  merged automatically.
 
-</div>
+See [Zuno next architecture](ZUNO_ARCHITECTURE.md),
+[plugin-owned Agent backends](docs/zuno-plugin-agent-backends.md),
+[model profile examples](examples/zuno-config/README.md),
+[optional workflow templates](examples/zuno-workflows/README.md),
+[`UPSTREAM_CODEX.toml`](UPSTREAM_CODEX.toml), and
+[`FORK_DELTA.toml`](FORK_DELTA.toml) for the exact boundary and baseline.
 
-Zuno is a local coding agent with a built-in terminal interface, headless execution,
-ACP support, and HTTP serving. It stores sessions in SQLite and runs as a native Rust
-binary; Node and Python are not part of the runtime.
+## Build from source
 
-The project is in active early-stage 0.x development. Zuno defines its own
-configuration, commands, data formats, tool arguments, and extension protocol.
-
-## Why Zuno
-
-- **Work survives interruption.** Prompts, tool results, retries, plans, and child-agent
-  reports are durable session state. Reopening a session resumes recorded work.
-- **Agent roles have fixed ceilings.** `plan` is read-only, `build` owns delivery, and
-  `deep` handles difficult cross-cutting changes without recursive delegation.
-- **Command authority is explicit.** Permissions, risk checks, and OS confinement are
-  independent controls. Restricted modes fail closed when the requested sandbox cannot
-  be deployed unless trusted policy explicitly allows native execution.
-- **Providers stay replaceable.** OpenAI, Anthropic, Google, Bedrock, and
-  OpenAI-compatible endpoints use native Rust transports.
-- **One runtime serves every client.** TUI, headless, ACP, and HTTP surfaces consume the
-  same commands, events, inbox, and projections.
-
-## Install
-
-Release installers download the platform archive and verify it against the release
-`SHA256SUMS` before extraction.
-
-```sh
-# Linux and macOS
-curl -fsSL https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.sh | sh
-```
-
-```powershell
-# Windows PowerShell
-irm https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.ps1 | iex
-```
-
-To build the current Git revision from source:
+The Rust workspace is under `codex-rs`. Use the pinned toolchain and the
+repository's `just` commands:
 
 ```sh
-cargo install --git https://github.com/sunerpy/zuno zuno --locked
+rustup toolchain install 1.95.0
+cd codex-rs
+rustup run 1.95.0 cargo build -p codex-cli --bin zuno
+target/debug/zuno --help
 ```
 
-`rg` (ripgrep) 14 or newer is required only when the `glob` or `grep` tool is used;
-it is not a Zuno startup or core-runtime dependency. Bubblewrap 0.8.0 or newer is
-required only for confined `read-only` and `workspace-write` Shell execution on
-Linux. Explicit `danger-full-access` runs natively, as can an eligible, trusted
-`workspace-write` `run-unconfined` fallback, and a trusted `sandbox.backend: native`
-selection runs every Agent natively with the permission mode kept. macOS and Windows
-currently use those native paths because no confined backend is implemented there. See
-[Installation](./docs/guide/installation.md) for platform tools, configuration
-paths, release targets, checksum verification, and source-build prerequisites.
-
-An installed release can update itself:
+The final command path may also be exercised directly from the workspace:
 
 ```sh
-zuno self-update --check
-zuno self-update
+rustup run 1.95.0 cargo run -p codex-cli --bin zuno -- --help
 ```
 
-Install completion for the current user without editing a shell profile:
+Create a local platform package with the Zuno entrypoint and Codex-derived
+companion binaries:
 
 ```sh
-zuno completion zsh --install
+just assemble-zuno-package --target x86_64-unknown-linux-gnu
 ```
 
-The complete update contract is documented in
-[Self-update](./docs/reference/self-update.md).
+Release automation can build `//codex-rs/cli:zuno_release_binaries` (or run
+`just build-zuno-for-release`) without replacing the upstream Codex
+`release_binaries` compatibility target. The package currently retains internal
+layout names such as `codex-package.json` and `codex-resources`; these are stable
+runtime contracts, while the archive and executable are named `zuno-package-*`
+and `zuno`.
 
-## Quick start
-
-Zuno does not assume a provider or model. Start from the checked `myopenai` example:
+## Upstream update candidate
 
 ```sh
-install -d -m 700 "${XDG_CONFIG_HOME:-$HOME/.config}/zuno"
-install -m 600 examples/config/zuno.json \
-  "${XDG_CONFIG_HOME:-$HOME/.config}/zuno/zuno.json"
-$EDITOR "${XDG_CONFIG_HOME:-$HOME/.config}/zuno/zuno.json"
-printf '%s' "$MYOPENAI_API_KEY" | zuno providers login --provider myopenai
-zuno debug config
-zuno models myopenai --verbose
+# Fetch and report the newest stable Codex release without changing this branch.
+python3 scripts/zuno_upstream.py --json check
+
+# After the current Zuno delta is reviewed and committed, apply its exact tree
+# delta to a new Codex tag in an isolated candidate worktree. Conflicts stay
+# there for review; legacy-main bridge ancestry is never replayed.
+python3 scripts/zuno_upstream.py prepare \
+  --target rust-vX.Y.Z \
+  --worktree ../zuno-upstream-X.Y.Z
 ```
 
-On Windows PowerShell the default configuration path is
-`$HOME\.config\zuno\zuno.json`:
+Maintainers can run **Prepare Codex upstream sync** in GitHub Actions to create a
+candidate branch and pull request. The workflow never merges the candidate.
 
-```powershell
-$config = Join-Path $HOME ".config\zuno"
-New-Item -ItemType Directory -Force -Path $config | Out-Null
-Copy-Item examples\config\zuno.json (Join-Path $config "zuno.json")
-notepad (Join-Path $config "zuno.json")
-$env:MYOPENAI_API_KEY | zuno providers login --provider myopenai
-zuno debug config
-zuno models myopenai --verbose
-```
+Zuno pull requests use the repository-owned `zuno/pr-gate`; OpenAI-specific
+Codex CI remains manual because it depends on upstream private runners and
+publishing credentials. The PR gate builds each of six platform packages once,
+runs native ACP/layout smoke, emits provenance attestations, and seals the exact
+bytes to the PR head and tree. After a merge-method-only cutover preserves both
+histories, the promotion workflow accepts an explicit candidate run ID, verifies
+tree equality, creates `zuno-vX.Y.Z`, rechecks downloaded release bytes, and
+publishes a non-latest preview without rebuilding. The upstream `rust-v*`
+release workflow is retained only as a manual compatibility reference and never
+publishes a Zuno product release.
 
-The example uses the native `openai` transport. For a prebuilt installation without a
-source checkout, copy the contents of
-[`examples/config/zuno.json`](./examples/config/zuno.json) into the same config path.
+During this first source-migration release, `zuno update` deliberately fails
+closed with the Zuno Releases URL. It never invokes the inherited Codex npm,
+Homebrew, or chatgpt.com installers. The compatibility `zuno app` command,
+including `--download-url`, fails before it inspects a workspace path or reaches
+the inherited Codex Desktop launcher. Automatic replacement stays disabled
+until a Zuno-owned atomic installer passes the same six native platform gates.
+The persistent managed app-server daemon and its hidden updater loop are also
+disabled for this preview; Start, Restart, and Stop fail before daemon state is
+read or changed, while Version stays read-only. Foreground App Server, ACP, and
+remote-control transports remain available without installing or executing a
+Codex package. TUI startup tips are bundled locally and never fetch inherited
+announcements or advertise the Codex Desktop app.
 
-On Linux with working confinement, verify the full path with a read-only run:
+## Codex attribution and license
 
-```sh
-zuno run --agent plan "summarize this repository's architecture"
-```
+Zuno contains and modifies Codex source. Preserve OpenAI and third-party notices
+when redistributing builds. This repository remains licensed under the
+[Apache-2.0 License](LICENSE); see [NOTICE](NOTICE) for attribution.
 
-On macOS or Windows, or on a trusted Linux host without confinement, use the explicit
-native path documented in [Quick start](./docs/guide/quick-start.md).
-
-Then start the terminal application or run a bounded task directly:
-
-```sh
-zuno
-zuno run "add pagination to the users endpoint and run the tests"
-```
-
-See [Quick start](./docs/guide/quick-start.md) for provider configuration, sandbox
-checks, credentials, and first-run diagnostics.
-
-## Runtime and extensions
-
-Zuno's runtime is composed from typed Rust `Component`s. A `HarnessProfile` mounts
-components transactionally; each registration returns the disposer that removes the
-exact effect it created. `AgentDriver` controls the loop, while `ToolManifest` controls
-the model-visible tool surface.
-
-```rust
-let profile = zuno_harness::profile_with_tools(
-    "release-review",
-    Arc::new(ReleaseReviewDriver::new()),
-    ToolManifest::new([BuiltinSlot::Read, BuiltinSlot::Grep, BuiltinSlot::Task])?,
-    ToolContributions::default(),
-);
-```
-
-Agents, workflows, Skills, WASI components, and contained process tools use the same
-profile lifecycle. The assembled model request is persisted as
-`session.prompt.assembled` before it is sent to a provider.
-
-Read [Harness Runtime](./docs/harness-runtime.md) for the component model and
-[Project structure and execution flow](./docs/guide/project-structure.md) for the
-48-crate ownership map. Read
-[Plugins and extensions](./docs/plugins.md) for package formats and capability grants.
-Use [Developing agents and extensions](./docs/guide/extension-development.md) for
-complete declarative Agent, WASI guest, and native Rust implementation paths.
-The design record is in
-[Harness comparison](./docs/design/harness-comparison.md), and shared client ownership
-is described in
-[Client interfaces](./docs/design/client-interfaces.md).
-
-## Documentation
-
-Full documentation is published at [zuno.firlab.app](https://zuno.firlab.app); the
-source is in [`docs/`](./docs/README.md). Common starting points:
-
-- [Quick start](./docs/guide/quick-start.md) — provider setup, credentials, first run
-- [Configuration](./docs/reference/configuration.md) and
-  [Providers](./docs/reference/providers.md)
-- [Permissions and sandboxing](./docs/guide/permissions.md) — Shell authority
-- [Attachments](./docs/reference/attachments.md) — images and `@file` input
-- [Export and import](./docs/reference/portable-bundles.md) — portable config bundles
-- [Zed ACP](./docs/reference/zed-acp.md) — editors and other ACP clients
-- [HTTP API and OpenAPI](./docs/reference/http-api.md) — routes, authentication, SSE, and schema gaps
-- [Memory and learning](./docs/guide/memory-learning.md) — resident Memory, Experience, and reviewed Skills
-- [Project structure](./docs/guide/project-structure.md) — crate ownership and request flow
-- [Agent and extension development](./docs/guide/extension-development.md) — WASI and native Rust interfaces
-- [Documentation coverage](./docs/design/documentation-coverage.md) — canonical ownership map
-- [FAQ](./docs/faq.md) — troubleshooting
-
-## Development
-
-```sh
-make build
-./dist/zuno --version --long
-make test-par
-cargo clippy --workspace --all-targets
-cargo fmt --all --check
-```
-
-`make build` keeps Cargo's debug artifact in `target/debug` and stages the runnable
-binary at `dist/zuno`. See [CONTRIBUTING.md](./CONTRIBUTING.md) for repository workflow
-and required checks.
-
-## License
-
-Licensed under the [MIT License](./LICENSE).
+Upstream Codex build and contributor documentation remains available in
+[`docs/`](docs/) and at <https://developers.openai.com/codex>.

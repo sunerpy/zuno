@@ -1,0 +1,213 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "WorkflowCallRecord": {
+      "description": "One engine-to-host call in the durable ledger. The request digest allows a recovered engine to detect divergent replay before dispatching a side effect.",
+      "properties": {
+        "callId": {
+          "type": "string"
+        },
+        "completedAt": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operation": {
+          "description": "Extensible operation label (for example `agent`, `phase`, `checkpoint`).",
+          "type": "string"
+        },
+        "requestDigest": {
+          "type": "string"
+        },
+        "result": true,
+        "startedAt": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/definitions/WorkflowCallStatus"
+        }
+      },
+      "required": [
+        "callId",
+        "operation",
+        "requestDigest",
+        "status"
+      ],
+      "type": "object"
+    },
+    "WorkflowCallStatus": {
+      "enum": [
+        "queued",
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+        "uncertain"
+      ],
+      "type": "string"
+    },
+    "WorkflowEngine": {
+      "description": "Execution engine selected by a `zuno.workflow/v1` document.",
+      "enum": [
+        "graph/v1",
+        "javascript/v1",
+        "node-worker/v1"
+      ],
+      "type": "string"
+    },
+    "WorkflowRunRecord": {
+      "properties": {
+        "agentsStarted": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "bindingDigest": {
+          "description": "Digest of the frozen backend, plugin generation, execution profile, and effective runtime policy selected before this run was admitted.",
+          "type": "string"
+        },
+        "calls": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/WorkflowCallRecord"
+          },
+          "type": "array"
+        },
+        "completedAt": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "createdAt": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "engine": {
+          "$ref": "#/definitions/WorkflowEngine"
+        },
+        "engineRevision": {
+          "type": "string"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parentThreadId": {
+          "type": "string"
+        },
+        "requestDigest": {
+          "description": "Digest of the canonical start request, including workflow digest and args.",
+          "type": "string"
+        },
+        "result": true,
+        "runId": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/WorkflowRunStatus"
+        },
+        "updatedAt": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "workflow": {
+          "$ref": "#/definitions/WorkflowSourceIdentity"
+        }
+      },
+      "required": [
+        "agentsStarted",
+        "bindingDigest",
+        "createdAt",
+        "engine",
+        "engineRevision",
+        "parentThreadId",
+        "requestDigest",
+        "runId",
+        "status",
+        "updatedAt",
+        "workflow"
+      ],
+      "type": "object"
+    },
+    "WorkflowRunStatus": {
+      "description": "Durable state of an accepted workflow run.",
+      "oneOf": [
+        {
+          "enum": [
+            "pendingApproval",
+            "queued",
+            "running",
+            "completed",
+            "failed",
+            "cancelled"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "At least one side effect has an unknown outcome and must be inspected before any replay is considered.",
+          "enum": [
+            "uncertain"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "WorkflowSourceIdentity": {
+      "description": "Immutable identity for one exact workflow source document.",
+      "properties": {
+        "digest": {
+          "description": "SHA-256 digest of the exact source bytes.",
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "source": {
+          "description": "Human-readable source provenance, such as a path or plugin resource id.",
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "digest",
+        "name",
+        "source",
+        "version"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "run": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/WorkflowRunRecord"
+        }
+      ],
+      "description": "The request returns once the durable run is accepted, not when it ends."
+    }
+  },
+  "required": [
+    "run"
+  ],
+  "title": "WorkflowStartResponse",
+  "type": "object"
+}
