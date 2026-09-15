@@ -54,7 +54,7 @@ fn each_endpoint_product_requires_vendor_specific_app_exclusions() {
             .to_ascii_lowercase();
         assert_eq!(
             remediation,
-            "ask your security administrator to verify codex exclusions and required helper allowances",
+            "ask your security administrator to verify zuno exclusions and required compatibility-helper allowances",
             "{product}"
         );
         assert!(
@@ -62,7 +62,7 @@ fn each_endpoint_product_requires_vendor_specific_app_exclusions() {
                 .expect("serialize endpoint check")
                 .to_ascii_lowercase()
                 .contains("chatgpt"),
-            "{product}: endpoint diagnostics should only refer to Codex"
+            "{product}: endpoint diagnostics should refer to Zuno"
         );
 
         assert_eq!(check.issues.len(), 1, "{product}");
@@ -77,7 +77,7 @@ fn each_endpoint_product_requires_vendor_specific_app_exclusions() {
             issue.cause
         );
         assert!(
-            issue.cause.contains("Verify Codex exclusions."),
+            issue.cause.contains("Verify Zuno exclusions."),
             "{product}: {}",
             issue.cause
         );

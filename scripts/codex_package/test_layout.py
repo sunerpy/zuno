@@ -15,6 +15,29 @@ from codex_package.targets import TARGET_SPECS
 
 
 class PackageLayoutTest(unittest.TestCase):
+    def test_zuno_package_uses_zuno_as_its_only_entrypoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            package_dir = root / "package"
+            package_dir.mkdir()
+            inputs = PackageInputs(
+                entrypoint_bin=touch_executable(root / "zuno"),
+                code_mode_host_bin=touch_executable(root / "codex-code-mode-host"),
+                rg_bin=touch_executable(root / "rg"),
+                zsh_bin=None,
+                bwrap_bin=touch_executable(root / "bwrap"),
+                codex_command_runner_bin=None,
+                codex_windows_sandbox_setup_bin=None,
+            )
+
+            variant = PACKAGE_VARIANTS["zuno"]
+            spec = TARGET_SPECS["x86_64-unknown-linux-musl"]
+            build_package_dir(package_dir, "1.2.3", variant, spec, inputs)
+            validate_package_dir(package_dir, variant, spec, include_zsh=False)
+
+            self.assertTrue((package_dir / "bin" / "zuno").is_file())
+            self.assertFalse((package_dir / "bin" / "codex").exists())
+
     def test_macos_package_preserves_prebuilt_resource_binaries(self) -> None:
         for variant_name in ("codex", "codex-app-server"):
             for target in ("aarch64-apple-darwin", "x86_64-apple-darwin"):

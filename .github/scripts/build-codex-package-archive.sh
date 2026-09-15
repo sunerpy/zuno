@@ -5,7 +5,7 @@ usage() {
   cat <<'EOF'
 Usage: build-codex-package-archive.sh \
   --target <rust-target> \
-  --bundle <primary|app-server> \
+  --bundle <zuno|primary|app-server> \
   --entrypoint-dir <dir> \
   --archive-dir <dir> \
   [--bwrap-bin <path>] \
@@ -108,6 +108,11 @@ if [[ -z "$target" || -z "$bundle" || -z "$entrypoint_dir" || -z "$archive_dir" 
 fi
 
 case "$bundle" in
+  zuno)
+    variant="zuno"
+    entrypoint="zuno"
+    archive_stem="zuno-package"
+    ;;
   primary)
     variant="codex"
     entrypoint="codex"

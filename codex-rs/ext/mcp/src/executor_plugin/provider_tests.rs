@@ -423,6 +423,8 @@ fn resolved_plugin(
             keywords: Vec::new(),
             paths: PluginManifestPaths {
                 skills: Vec::new(),
+                workflows: Vec::new(),
+                agent_backends: None,
                 mcp_servers,
                 apps: None,
                 hooks: None,

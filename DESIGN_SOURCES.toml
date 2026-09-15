@@ -1,0 +1,29 @@
+schema_version = 1
+project = "zuno"
+
+[deepseek_harness]
+repository = "https://github.com/deepseek-ai/deepseek-harness.git"
+observed_ref = "origin/master"
+observed_commit = "0d1f50007f9bca3f52b06e1c3074fa14d5fb0720"
+observed_at = "2026-09-15T07:07:46Z"
+observed_tag = "dsh-v0.1.6-alpha.1"
+review_status = "targeted-only"
+reviewed_paths = [
+  "packages/subagent/subagent-codex/README.zh.md",
+  "packages/subagent/subagent-codex/src",
+  "packages/subagent/subagent-claude-code/README.zh.md",
+  "packages/jobs/jobs-local/src/index.ts",
+  "packages/subprocess/subprocess-local/src",
+  "packages/subprocess/subprocess/src",
+]
+adoption = "adapt"
+notes = "Fresh targeted review of c291e796..0d1f5000 covered 666 commits in the selected seams. DSH added awaited agent registration and duplex subprocess control while jobs-local changes were naming and lifecycle-test alignment. Zuno already awaits ACP initialization and owns cancellation; this source-fork additionally applies the effective profile through the host sandbox and makes external process-tree setup fail closed. The full DSH delta remains unclassified, so this is not a general compatibility baseline."
+
+[codex]
+manifest = "UPSTREAM_CODEX.toml"
+adoption = "source-fork"
+
+[oh_my_codex]
+review_status = "design-reference-only"
+adoption = "watch"
+notes = "Prompt and workflow ideas may inform optional user packages; no product workflow or model-specific prompt is embedded in core."

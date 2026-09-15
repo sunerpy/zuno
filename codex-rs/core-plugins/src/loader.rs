@@ -1,4 +1,5 @@
 use crate::PluginGitMode;
+use crate::agent_backends::load_plugin_agent_backends;
 use crate::app_mcp_routing::apply_app_mcp_routing_policy;
 use crate::app_mcp_routing::apps_route_available;
 use crate::is_openai_curated_marketplace_name;
@@ -850,6 +851,8 @@ async fn load_plugin(
         root,
         enabled: plugin.enabled,
         skill_roots: Vec::new(),
+        workflow_roots: Vec::new(),
+        agent_backends: Vec::new(),
         skill_discovery_mode: SkillDiscoveryMode::Recursive,
         disabled_skill_paths: HashSet::new(),
         has_enabled_skills: false,
@@ -919,6 +922,20 @@ async fn load_plugin(
             loaded_plugin.manifest_description = manifest.description.clone();
             loaded_plugin.skill_roots =
                 plugin_skill_roots(&plugin_root, manifest_paths, loaded_manifest.format);
+            loaded_plugin.workflow_roots = plugin_workflow_roots(manifest_paths);
+            match load_plugin_agent_backends(
+                &plugin_root,
+                manifest_paths.agent_backends.as_ref(),
+                manifest.version.as_deref(),
+            )
+            .await
+            {
+                Ok(agent_backends) => loaded_plugin.agent_backends = agent_backends,
+                Err(error) => {
+                    loaded_plugin.error = Some(error);
+                    return loaded_plugin;
+                }
+            }
             let plugin_identity = PluginIdentity {
                 plugin_id: loaded_plugin_id.as_key(),
                 remote_plugin_id: loaded_plugin.remote_plugin_id.clone(),
@@ -1075,6 +1092,13 @@ pub(crate) async fn load_plugin_skill_inventory(
         skills: outcome.skills,
         had_errors: !outcome.errors.is_empty(),
     }
+}
+
+pub(crate) fn plugin_workflow_roots(manifest_paths: &PluginManifestPaths) -> Vec<AbsolutePathBuf> {
+    let mut paths = manifest_paths.workflows.clone();
+    paths.sort_unstable();
+    paths.dedup();
+    paths
 }
 
 pub(crate) fn plugin_skill_roots(

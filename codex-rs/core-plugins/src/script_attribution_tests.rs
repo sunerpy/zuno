@@ -35,6 +35,8 @@ fn loaded_plugin(config_name: &str, root: &Path, enabled: bool) -> LoadedPlugin 
         root: path(root),
         enabled,
         skill_roots: Vec::new(),
+        workflow_roots: Vec::new(),
+        agent_backends: Vec::new(),
         skill_discovery_mode: SkillDiscoveryMode::Recursive,
         disabled_skill_paths: HashSet::new(),
         has_enabled_skills: false,

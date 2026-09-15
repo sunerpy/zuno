@@ -1,0 +1,11 @@
+# Copy this file to $ZUNO_HOME/bedrock-astra.config.toml, adjust the AWS profile
+# and region, then select it with: zuno --profile bedrock-astra
+model_provider = "amazon-bedrock"
+model = "openai.gpt-6-astra"
+model_reasoning_effort = "max"
+sandbox_mode = "workspace-write"
+approval_policy = "on-request"
+
+[model_providers.amazon-bedrock.aws]
+profile = "us"
+region = "us-west-2"

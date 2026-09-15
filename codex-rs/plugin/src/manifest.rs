@@ -18,6 +18,10 @@ pub struct PluginManifest<Resource> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginManifestPaths<Resource> {
     pub skills: Vec<Resource>,
+    /// User-authored Zuno workflow documents or directories declared by the plugin.
+    pub workflows: Vec<Resource>,
+    /// Versioned declarations for plugin-owned Agent backend factories.
+    pub agent_backends: Option<Resource>,
     pub mcp_servers: Option<PluginManifestMcpServers<Resource>>,
     pub apps: Option<Resource>,
     pub hooks: Option<PluginManifestHooks<Resource>>,
@@ -105,6 +109,8 @@ impl<Resource> PluginManifest<Resource> {
         } = self;
         let PluginManifestPaths {
             skills,
+            workflows,
+            agent_backends,
             mcp_servers,
             apps,
             hooks,
@@ -181,6 +187,11 @@ impl<Resource> PluginManifest<Resource> {
                     .into_iter()
                     .map(&mut map)
                     .collect::<Result<Vec<_>, _>>()?,
+                workflows: workflows
+                    .into_iter()
+                    .map(&mut map)
+                    .collect::<Result<Vec<_>, _>>()?,
+                agent_backends: agent_backends.map(&mut map).transpose()?,
                 mcp_servers,
                 apps: apps.map(&mut map).transpose()?,
                 hooks,

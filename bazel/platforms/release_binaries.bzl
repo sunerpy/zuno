@@ -13,7 +13,7 @@ _PLATFORM_TRIPLES = {
 
 PLATFORMS = _PLATFORM_TRIPLES.keys()
 
-def multiplatform_binaries(name, platforms = PLATFORMS):
+def multiplatform_binaries(name, platforms = PLATFORMS, filegroup_name = "release_binaries"):
     """Build a binary for a subset of the declared release platforms."""
     for platform in platforms:
         platform_data(
@@ -24,7 +24,7 @@ def multiplatform_binaries(name, platforms = PLATFORMS):
         )
 
     native.filegroup(
-        name = "release_binaries",
+        name = filegroup_name,
         srcs = [name + "_" + platform for platform in platforms],
         tags = ["manual"],
     )

@@ -4,12 +4,18 @@ use std::collections::HashSet;
 
 pub use codex_utils_plugins::mention_syntax;
 
+mod agent_backend;
 mod bundled_hooks;
 mod load_outcome;
 pub mod manifest;
 mod plugin_id;
 mod provider;
 
+pub use agent_backend::EffectivePluginAgentBackend;
+pub use agent_backend::PLUGIN_AGENT_BACKENDS_API_VERSION;
+pub use agent_backend::PluginAgentBackendCommand;
+pub use agent_backend::PluginAgentBackendDeclaration;
+pub use agent_backend::PluginAgentBackendKind;
 pub use bundled_hooks::is_allowlisted_bundled_cleanup_hook;
 use codex_config::HookEventsToml;
 use codex_utils_absolute_path::AbsolutePathBuf;

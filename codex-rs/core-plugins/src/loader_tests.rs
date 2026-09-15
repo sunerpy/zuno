@@ -27,6 +27,129 @@ fn user_layer(path: AbsolutePathBuf, config: &str) -> ConfigLayerEntry {
     )
 }
 
+#[test]
+fn plugin_workflow_roots_are_explicit_sorted_and_deduplicated() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let plugin_root = temp_dir.path().join("plugin");
+    write_file(
+        &plugin_root.join(".codex-plugin/plugin.json"),
+        r#"{
+          "name": "plugin",
+          "workflows": ["./workflows/z.yaml", "./workflows/a.yaml", "./workflows/z.yaml"]
+        }"#,
+    );
+    let manifest = load_plugin_manifest(&plugin_root).expect("manifest");
+
+    assert_eq!(
+        plugin_workflow_roots(&manifest.paths),
+        vec![
+            AbsolutePathBuf::from_absolute_path(plugin_root.join("workflows/a.yaml")).unwrap(),
+            AbsolutePathBuf::from_absolute_path(plugin_root.join("workflows/z.yaml")).unwrap(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn plugin_agent_backends_are_versioned_and_profile_neutral() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let plugin_root = AbsolutePathBuf::from_absolute_path(temp_dir.path().join("plugin"))
+        .expect("absolute plugin root");
+    let document_path = plugin_root.join("agent-backends.json");
+    write_file(&plugin_root.join("bin/review-acp"), "fixture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            plugin_root.join("bin/review-acp").as_path(),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("executable fixture mode");
+    }
+    write_file(
+        document_path.as_path(),
+        r#"{
+          "apiVersion": "zuno.agent-backends/v1",
+          "backends": {
+            "native-build": {"kind": "native-codex"},
+            "claude-review": {"kind": "claude-code", "command": "claude"},
+            "external-review": {
+              "kind": "acp",
+              "command": "./bin/review-acp",
+              "args": ["--stdio"],
+              "envVars": ["AWS_PROFILE"]
+            }
+          }
+        }"#,
+    );
+
+    let backends = load_plugin_agent_backends(&plugin_root, Some(&document_path), Some("1.2.3"))
+        .await
+        .expect("valid Agent backend declarations");
+
+    assert_eq!(
+        backends
+            .iter()
+            .map(|backend| backend.local_id.as_str())
+            .collect::<Vec<_>>(),
+        ["claude-review", "external-review", "native-build"]
+    );
+    assert_eq!(
+        backends[1].command,
+        Some(codex_plugin::PluginAgentBackendCommand::PluginPath(
+            plugin_root.join("bin/review-acp")
+        ))
+    );
+    let initial_generation = backends[1].source_generation.clone();
+    assert!(initial_generation.starts_with("zuno/plugin-agent-backend-source/v1:"));
+    assert_eq!(backends[1].plugin_version.as_deref(), Some("1.2.3"));
+    assert_eq!(backends[1].source_path, document_path);
+    assert_eq!(backends[1].source_digest.len(), 64);
+    assert_eq!(
+        backends[1].executable_digest.as_deref().map(str::len),
+        Some(64)
+    );
+
+    write_file(&plugin_root.join("bin/review-acp"), "fixture-v2");
+    let executable_changed =
+        load_plugin_agent_backends(&plugin_root, Some(&document_path), Some("1.2.3"))
+            .await
+            .expect("changed package command");
+    assert_ne!(initial_generation, executable_changed[1].source_generation);
+
+    let document = std::fs::read_to_string(document_path.as_path()).expect("document");
+    write_file(document_path.as_path(), &format!("{document}\n"));
+    let document_changed =
+        load_plugin_agent_backends(&plugin_root, Some(&document_path), Some("1.2.3"))
+            .await
+            .expect("changed declaration document");
+    assert_ne!(
+        executable_changed[1].source_generation,
+        document_changed[1].source_generation
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn plugin_agent_backends_reject_a_symlinked_document() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let plugin_root = AbsolutePathBuf::from_absolute_path(temp_dir.path().join("plugin"))
+        .expect("absolute plugin root");
+    std::fs::create_dir_all(plugin_root.as_path()).expect("plugin root");
+    let outside = temp_dir.path().join("outside.json");
+    write_file(
+        &outside,
+        r#"{"apiVersion":"zuno.agent-backends/v1","backends":{}}"#,
+    );
+    let document_path = plugin_root.join("agent-backends.json");
+    std::os::unix::fs::symlink(&outside, document_path.as_path()).expect("symlink declaration");
+
+    let error = load_plugin_agent_backends(&plugin_root, Some(&document_path), None)
+        .await
+        .expect_err("symlink must fail closed");
+
+    assert!(error.contains("not a regular file"));
+}
+
 #[tokio::test]
 async fn agent_plugin_overlay_apps_are_not_runtime_active() {
     let temp_dir = TempDir::new().expect("tempdir");

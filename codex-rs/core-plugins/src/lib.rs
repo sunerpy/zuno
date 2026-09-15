@@ -1,3 +1,4 @@
+mod agent_backends;
 mod app_mcp_routing;
 mod artifact_operation;
 mod command_migration;

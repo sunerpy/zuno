@@ -8,6 +8,8 @@ use codex_utils_plugins::SkillDiscoveryMode;
 
 use crate::AppConnectorId;
 use crate::AppDeclaration;
+use crate::EffectivePluginAgentBackend;
+use crate::PluginAgentBackendDeclaration;
 use crate::PluginCapabilitySummary;
 use crate::PluginHookSource;
 use crate::app_connector_ids_from_declarations;
@@ -25,6 +27,10 @@ pub struct LoadedPlugin<M> {
     pub root: AbsolutePathBuf,
     pub enabled: bool,
     pub skill_roots: Vec<AbsolutePathBuf>,
+    /// Workflow files or directories explicitly declared by this plugin.
+    pub workflow_roots: Vec<AbsolutePathBuf>,
+    /// Validated Agent backend factories explicitly declared by this plugin.
+    pub agent_backends: Vec<PluginAgentBackendDeclaration>,
     pub skill_discovery_mode: SkillDiscoveryMode,
     pub disabled_skill_paths: HashSet<AbsolutePathBuf>,
     pub has_enabled_skills: bool,
@@ -147,6 +153,70 @@ impl<M: Clone> PluginLoadOutcome<M> {
         skill_roots
     }
 
+    /// Returns active plugin workflow roots with their owning plugin identity.
+    ///
+    /// Paths retain plugin attribution so a workflow registry can apply plugin precedence
+    /// without treating installed plugin content as an application builtin.
+    pub fn effective_plugin_workflow_roots(&self) -> Vec<(AbsolutePathBuf, PluginIdentity)> {
+        let mut roots = Vec::new();
+        let mut seen_paths = HashSet::new();
+        for plugin in self.plugins.iter().filter(|plugin| plugin.is_active()) {
+            for path in &plugin.workflow_roots {
+                if seen_paths.insert(path.clone()) {
+                    roots.push((
+                        path.clone(),
+                        PluginIdentity {
+                            plugin_id: plugin.config_name.clone(),
+                            remote_plugin_id: plugin.remote_plugin_id.clone(),
+                        },
+                    ));
+                }
+            }
+        }
+        roots.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        roots
+    }
+
+    /// Returns every active plugin Agent backend with a namespaced runtime ID.
+    ///
+    /// Unlike path roots, declarations are not deduplicated: two active plugins
+    /// claiming the same namespace remain visible so the factory registry can
+    /// reject the conflict instead of silently selecting one implementation.
+    pub fn effective_plugin_agent_backends(&self) -> Vec<EffectivePluginAgentBackend> {
+        let mut backends = self
+            .plugins
+            .iter()
+            .filter(|plugin| plugin.is_active())
+            .flat_map(|plugin| {
+                let namespace = plugin.plugin_namespace.as_deref()?;
+                let plugin_identity = PluginIdentity {
+                    plugin_id: plugin.config_name.clone(),
+                    remote_plugin_id: plugin.remote_plugin_id.clone(),
+                };
+                Some(
+                    plugin
+                        .agent_backends
+                        .iter()
+                        .cloned()
+                        .map(move |declaration| EffectivePluginAgentBackend {
+                            id: format!("{namespace}/{}", declaration.local_id),
+                            plugin_identity: plugin_identity.clone(),
+                            declaration,
+                        }),
+                )
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        backends.sort_unstable_by(|left, right| {
+            left.id.cmp(&right.id).then_with(|| {
+                left.plugin_identity
+                    .plugin_id
+                    .cmp(&right.plugin_identity.plugin_id)
+            })
+        });
+        backends
+    }
+
     pub fn effective_mcp_servers(&self) -> HashMap<String, M> {
         let mut mcp_servers = HashMap::new();
         for plugin in self.plugins.iter().filter(|plugin| plugin.is_active()) {
@@ -225,6 +295,8 @@ mod tests {
             root: test_path(config_name),
             enabled: true,
             skill_roots,
+            workflow_roots: Vec::new(),
+            agent_backends: Vec::new(),
             skill_discovery_mode: SkillDiscoveryMode::Recursive,
             disabled_skill_paths: HashSet::new(),
             has_enabled_skills: true,
@@ -234,6 +306,75 @@ mod tests {
             hook_load_warnings: Vec::new(),
             error: None,
         }
+    }
+
+    #[test]
+    fn effective_plugin_workflow_roots_preserve_active_owner_identity() {
+        let shared_root = test_path("shared-workflows");
+        let mut first = loaded_plugin("zeta@test", Vec::new());
+        first.remote_plugin_id = Some("plugins~Plugin_zeta".to_string());
+        first.workflow_roots = vec![shared_root.clone()];
+        let mut duplicate = loaded_plugin("alpha@test", Vec::new());
+        duplicate.workflow_roots = vec![shared_root.clone()];
+        let mut disabled = loaded_plugin("disabled@test", Vec::new());
+        disabled.enabled = false;
+        disabled.workflow_roots = vec![test_path("disabled-workflows")];
+
+        let outcome = PluginLoadOutcome::from_plugins(vec![first, duplicate, disabled]);
+
+        assert_eq!(
+            outcome.effective_plugin_workflow_roots(),
+            vec![(
+                shared_root,
+                PluginIdentity {
+                    plugin_id: "zeta@test".to_string(),
+                    remote_plugin_id: Some("plugins~Plugin_zeta".to_string()),
+                },
+            )]
+        );
+    }
+
+    #[test]
+    fn effective_plugin_agent_backends_are_namespaced_and_conflicts_are_retained() {
+        let declaration = PluginAgentBackendDeclaration {
+            local_id: "review".to_string(),
+            kind: crate::PluginAgentBackendKind::Acp,
+            plugin_version: Some("1.0.0".to_string()),
+            source_path: test_path("agent-backends.json"),
+            source_digest: "fixture-document-digest".to_string(),
+            executable_digest: None,
+            source_generation: "fixture-generation".to_string(),
+            command: Some(crate::PluginAgentBackendCommand::Name(
+                "review-acp".to_string(),
+            )),
+            command_windows: None,
+            args: vec!["--stdio".to_string()],
+            env_vars: vec!["REVIEW_TOKEN".to_string()],
+            startup_timeout_ms: 20_000,
+            run_timeout_ms: None,
+            dispose_grace_ms: 3_000,
+            max_message_bytes: 8 * 1024 * 1024,
+        };
+        let mut first = loaded_plugin("first@test", Vec::new());
+        first.plugin_namespace = Some("shared".to_string());
+        first.remote_plugin_id = Some("plugins~Plugin_first".to_string());
+        first.agent_backends = vec![declaration.clone()];
+        let mut duplicate = loaded_plugin("second@test", Vec::new());
+        duplicate.plugin_namespace = Some("shared".to_string());
+        duplicate.agent_backends = vec![declaration.clone()];
+        let mut disabled = loaded_plugin("disabled@test", Vec::new());
+        disabled.plugin_namespace = Some("hidden".to_string());
+        disabled.agent_backends = vec![declaration];
+        disabled.enabled = false;
+
+        let outcome = PluginLoadOutcome::from_plugins(vec![first, duplicate, disabled]);
+        let backends = outcome.effective_plugin_agent_backends();
+
+        assert_eq!(backends.len(), 2);
+        assert_eq!(backends[0].id, "shared/review");
+        assert_eq!(backends[0].plugin_identity.plugin_id, "first@test");
+        assert_eq!(backends[1].id, "shared/review");
+        assert_eq!(backends[1].plugin_identity.plugin_id, "second@test");
     }
 
     #[test]

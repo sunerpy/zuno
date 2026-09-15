@@ -10,6 +10,7 @@ Run the builder through `just`:
 just assemble-codex-package --help
 just assemble-codex-package --variant codex-app-server
 just assemble-codex-package --target x86_64-unknown-linux-gnu
+just assemble-zuno-package --target x86_64-unknown-linux-gnu
 ```
 
 The builder creates a canonical Codex package directory:
@@ -39,9 +40,11 @@ artifacts; pass a GNU Linux target explicitly for native glibc local builds. If
 prints its path after the package is built.
 
 The `--variant` flag selects the package entrypoint. Supported variants are
-`codex` and `codex-app-server`. The `--package-version` flag sets the version in
-`codex-package.json`; it defaults to `[workspace.package].version` in
-`codex-rs/Cargo.toml`.
+`zuno`, `codex`, and `codex-app-server`. `zuno` builds and packages the product
+entrypoint; `codex` remains available so upstream packaging and compatibility
+checks can be replayed without rewriting them. The `--package-version` flag
+sets the version in `codex-package.json`; it defaults to
+`[workspace.package].version` in `codex-rs/Cargo.toml`.
 
 ## Source-built artifacts
 

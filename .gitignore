@@ -36,6 +36,7 @@ AGENTS.override.md
 
 # caches
 .cache/
+.codegraph/
 .turbo/
 .parcel-cache/
 .eslintcache

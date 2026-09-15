@@ -2,6 +2,11 @@
 
 set -eu
 
+if [ "${ZUNO_ALLOW_UPSTREAM_CODEX_INSTALLER:-}" != "1" ]; then
+  echo "This inherited Codex installer is disabled in Zuno. Download verified Zuno preview packages from https://github.com/sunerpy/zuno/releases." >&2
+  exit 64
+fi
+
 RELEASE="${CODEX_RELEASE:-latest}"
 NON_INTERACTIVE="${CODEX_NON_INTERACTIVE:-false}"
 DEFAULT_PREFER_RELEASES_OPENAI_COM="true"

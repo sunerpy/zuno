@@ -207,7 +207,7 @@ fn classify(channels: &[Option<Vec<Evidence>>]) -> DoctorCheck {
     let mut check = desktop_check("desktop.security.enforcement", status, summary).details(details);
     if status != CheckStatus::Ok {
         check = check.remediation(
-            "ask your organization's security administrator to review endpoint security events and the approved Codex application policy",
+            "Zuno does not install the inherited Codex Desktop app; ask your security administrator to review any matching inherited application events",
         );
     }
     check

@@ -277,6 +277,7 @@ impl ChatWidget {
             | ServerNotification::ThreadRealtimeTranscriptDone(_)
             | ServerNotification::WindowsWorldWritableWarning(_)
             | ServerNotification::WindowsSandboxSetupCompleted(_)
+            | ServerNotification::WorkflowRunUpdated(_)
             | ServerNotification::AccountLoginCompleted(_)
             | ServerNotification::ProjectChanged(_)
             | ServerNotification::ThreadProjectUpdated(_) => {}

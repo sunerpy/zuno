@@ -208,6 +208,7 @@ fn legacy_codex_overlay_keeps_portable_components_fixed() {
   "version": "9.9.9",
   "description": "Codex description",
   "skills": [],
+  "agentBackends": "./agent-backends.json",
   "mcpServers": null,
   "interface": {"displayName": "Codex Demo"}
 }"#,
@@ -235,6 +236,13 @@ fn legacy_codex_overlay_keeps_portable_components_fixed() {
             AbsolutePathBuf::from_absolute_path_checked(plugin_root.join("mcp.json"))
                 .expect("MCP path")
         ))
+    );
+    assert_eq!(
+        manifest.paths.agent_backends,
+        Some(
+            AbsolutePathBuf::from_absolute_path_checked(plugin_root.join("agent-backends.json"))
+                .expect("Agent backend declarations path")
+        )
     );
     assert_eq!(
         manifest

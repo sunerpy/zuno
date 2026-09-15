@@ -8,11 +8,13 @@ use codex_config::loader::load_config_layers_state;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
+use codex_core::config::resolve_profile_v2_config_path;
 use codex_exec_server::LOCAL_FS;
 use codex_features::feature_for_key;
 use codex_login::AuthManager;
 use codex_login::default_client::set_default_client_residency_requirement;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_cli::ProfileV2Name;
 use codex_utils_json_to_toml::json_to_toml;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -142,6 +144,30 @@ impl ConfigManager {
             fallback_cwd,
         )
         .await
+    }
+
+    /// Load one explicit file-based Zuno execution profile for a delegated Agent.
+    ///
+    /// The profile is resolved beneath the configured Zuno home using the same
+    /// typed profile name and config pipeline as `zuno --profile`.
+    pub(crate) async fn load_execution_profile(
+        &self,
+        profile: &str,
+        fallback_cwd: PathBuf,
+    ) -> std::io::Result<Config> {
+        let profile_name = profile.parse::<ProfileV2Name>().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid execution profile `{profile}`: {error}"),
+            )
+        })?;
+        let mut manager = self.clone();
+        manager.loader_overrides.user_config_path = Some(resolve_profile_v2_config_path(
+            manager.codex_home(),
+            &profile_name,
+        ));
+        manager.loader_overrides.user_config_profile = Some(profile_name);
+        manager.load_latest_config(Some(fallback_cwd)).await
     }
 
     /// Loads system, user, and runtime settings without discovering a project

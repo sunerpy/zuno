@@ -176,6 +176,7 @@ mod multi_agents;
 mod named_session_lookup;
 mod notifications;
 #[cfg(any(not(debug_assertions), test))]
+#[cfg(test)]
 mod npm_registry;
 pub(crate) mod onboarding;
 mod oss_selection;
@@ -225,7 +226,9 @@ pub use update_action::UpdateAction;
 #[cfg(not(debug_assertions))]
 pub use update_action::get_update_action;
 mod update_prompt;
-#[cfg(any(not(debug_assertions), test))]
+// Version parsing remains covered as an upstream compatibility unit, but the
+// Zuno preview does not compile a runtime release probe.
+#[cfg(test)]
 mod update_versions;
 mod updates;
 #[cfg(any(not(debug_assertions), test))]
@@ -1054,8 +1057,6 @@ async fn run_ratatui_app(
     let uses_remote_workspace = app_server_target.uses_remote_workspace();
     let workload_identity_selected = is_workload_identity_selected();
     color_eyre::install()?;
-
-    tooltips::announcement::prewarm(initial_config.http_client_factory());
 
     // Forward panic reports through tracing so they appear in the UI status
     // line, but do not swallow the default/color-eyre panic handler.

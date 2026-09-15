@@ -2354,6 +2354,156 @@
           "type": "object"
         },
         {
+          "description": "Discover user-, project-, and plugin-owned workflows.",
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "workflow/list"
+              ],
+              "title": "Workflow/listRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/WorkflowListParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Workflow/listRequest",
+          "type": "object"
+        },
+        {
+          "description": "Read one exact discovered workflow source document.",
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "workflow/read"
+              ],
+              "title": "Workflow/readRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/WorkflowReadParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Workflow/readRequest",
+          "type": "object"
+        },
+        {
+          "description": "Validate a workflow document without installing or executing it.",
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "workflow/validate"
+              ],
+              "title": "Workflow/validateRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/WorkflowValidateParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Workflow/validateRequest",
+          "type": "object"
+        },
+        {
+          "description": "Durably accept a workflow run and return before execution completes.",
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "workflow/start"
+              ],
+              "title": "Workflow/startRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/WorkflowStartParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Workflow/startRequest",
+          "type": "object"
+        },
+        {
+          "description": "Read a durable workflow run and its host-call ledger.",
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "workflow/run/read"
+              ],
+              "title": "Workflow/run/readRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/WorkflowRunReadParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Workflow/run/readRequest",
+          "type": "object"
+        },
+        {
+          "description": "Request idempotent cancellation of a durable workflow run.",
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "workflow/run/cancel"
+              ],
+              "title": "Workflow/run/cancelRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/WorkflowRunCancelParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Workflow/run/cancelRequest",
+          "type": "object"
+        },
+        {
           "properties": {
             "id": {
               "$ref": "#/definitions/v2/RequestId"
@@ -4736,6 +4886,26 @@
             "params"
           ],
           "title": "Thread/queue/changedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "workflow/run/updated"
+              ],
+              "title": "Workflow/run/updatedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/WorkflowRunUpdatedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Workflow/run/updatedNotification",
           "type": "object"
         },
         {
@@ -25533,6 +25703,558 @@
           "samplePaths"
         ],
         "title": "WindowsWorldWritableWarningNotification",
+        "type": "object"
+      },
+      "WorkflowCallRecord": {
+        "description": "One engine-to-host call in the durable ledger. The request digest allows a recovered engine to detect divergent replay before dispatching a side effect.",
+        "properties": {
+          "callId": {
+            "type": "string"
+          },
+          "completedAt": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "operation": {
+            "description": "Extensible operation label (for example `agent`, `phase`, `checkpoint`).",
+            "type": "string"
+          },
+          "requestDigest": {
+            "type": "string"
+          },
+          "result": true,
+          "startedAt": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/definitions/v2/WorkflowCallStatus"
+          }
+        },
+        "required": [
+          "callId",
+          "operation",
+          "requestDigest",
+          "status"
+        ],
+        "type": "object"
+      },
+      "WorkflowCallStatus": {
+        "enum": [
+          "queued",
+          "running",
+          "completed",
+          "failed",
+          "cancelled",
+          "uncertain"
+        ],
+        "type": "string"
+      },
+      "WorkflowDiagnostic": {
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "level": {
+            "$ref": "#/definitions/v2/WorkflowDiagnosticLevel"
+          },
+          "message": {
+            "type": "string"
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sourceId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sourceScope": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/WorkflowScope"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "code",
+          "level",
+          "message"
+        ],
+        "type": "object"
+      },
+      "WorkflowDiagnosticLevel": {
+        "enum": [
+          "warning",
+          "error"
+        ],
+        "type": "string"
+      },
+      "WorkflowDocumentFormat": {
+        "description": "Source encoding for a user-, project-, or plugin-owned workflow document.",
+        "enum": [
+          "json",
+          "yaml"
+        ],
+        "type": "string"
+      },
+      "WorkflowEngine": {
+        "description": "Execution engine selected by a `zuno.workflow/v1` document.",
+        "enum": [
+          "graph/v1",
+          "javascript/v1",
+          "node-worker/v1"
+        ],
+        "type": "string"
+      },
+      "WorkflowListParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "cwds": {
+            "description": "Working directories used for project and plugin discovery. Empty means the app-server process working directory.",
+            "items": {
+              "$ref": "#/definitions/v2/AbsolutePathBuf"
+            },
+            "type": "array"
+          },
+          "forceReload": {
+            "description": "Re-read configured roots instead of accepting a registry cache hit.",
+            "type": "boolean"
+          }
+        },
+        "title": "WorkflowListParams",
+        "type": "object"
+      },
+      "WorkflowListResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/definitions/v2/WorkflowSummary"
+            },
+            "type": "array"
+          },
+          "diagnostics": {
+            "default": [],
+            "description": "Source-local discovery failures. A malformed document does not hide an independent valid workflow from another source.",
+            "items": {
+              "$ref": "#/definitions/v2/WorkflowDiagnostic"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "WorkflowListResponse",
+        "type": "object"
+      },
+      "WorkflowReadParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "workflowId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workflowId"
+        ],
+        "title": "WorkflowReadParams",
+        "type": "object"
+      },
+      "WorkflowReadResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "definition": {
+            "description": "Parsed definition for clients that do not need source-level editing."
+          },
+          "document": {
+            "description": "Exact source text. Keeping the text preserves YAML comments and makes the digest independently verifiable by clients.",
+            "type": "string"
+          },
+          "format": {
+            "$ref": "#/definitions/v2/WorkflowDocumentFormat"
+          },
+          "workflow": {
+            "$ref": "#/definitions/v2/WorkflowSummary"
+          }
+        },
+        "required": [
+          "definition",
+          "document",
+          "format",
+          "workflow"
+        ],
+        "title": "WorkflowReadResponse",
+        "type": "object"
+      },
+      "WorkflowRunCancelParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "runId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "runId"
+        ],
+        "title": "WorkflowRunCancelParams",
+        "type": "object"
+      },
+      "WorkflowRunCancelResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "run": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/WorkflowRunRecord"
+              }
+            ],
+            "description": "Cancellation is idempotent; a terminal run is returned unchanged."
+          }
+        },
+        "required": [
+          "run"
+        ],
+        "title": "WorkflowRunCancelResponse",
+        "type": "object"
+      },
+      "WorkflowRunReadParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "runId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "runId"
+        ],
+        "title": "WorkflowRunReadParams",
+        "type": "object"
+      },
+      "WorkflowRunReadResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "run": {
+            "$ref": "#/definitions/v2/WorkflowRunRecord"
+          }
+        },
+        "required": [
+          "run"
+        ],
+        "title": "WorkflowRunReadResponse",
+        "type": "object"
+      },
+      "WorkflowRunRecord": {
+        "properties": {
+          "agentsStarted": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "bindingDigest": {
+            "description": "Digest of the frozen backend, plugin generation, execution profile, and effective runtime policy selected before this run was admitted.",
+            "type": "string"
+          },
+          "calls": {
+            "default": [],
+            "items": {
+              "$ref": "#/definitions/v2/WorkflowCallRecord"
+            },
+            "type": "array"
+          },
+          "completedAt": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "createdAt": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "engine": {
+            "$ref": "#/definitions/v2/WorkflowEngine"
+          },
+          "engineRevision": {
+            "type": "string"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parentThreadId": {
+            "type": "string"
+          },
+          "requestDigest": {
+            "description": "Digest of the canonical start request, including workflow digest and args.",
+            "type": "string"
+          },
+          "result": true,
+          "runId": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/definitions/v2/WorkflowRunStatus"
+          },
+          "updatedAt": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "workflow": {
+            "$ref": "#/definitions/v2/WorkflowSourceIdentity"
+          }
+        },
+        "required": [
+          "agentsStarted",
+          "bindingDigest",
+          "createdAt",
+          "engine",
+          "engineRevision",
+          "parentThreadId",
+          "requestDigest",
+          "runId",
+          "status",
+          "updatedAt",
+          "workflow"
+        ],
+        "type": "object"
+      },
+      "WorkflowRunStatus": {
+        "description": "Durable state of an accepted workflow run.",
+        "oneOf": [
+          {
+            "enum": [
+              "pendingApproval",
+              "queued",
+              "running",
+              "completed",
+              "failed",
+              "cancelled"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "At least one side effect has an unknown outcome and must be inspected before any replay is considered.",
+            "enum": [
+              "uncertain"
+            ],
+            "type": "string"
+          }
+        ]
+      },
+      "WorkflowRunUpdatedNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Durable workflow state changed after admission, execution, a host call, or cancellation.",
+        "properties": {
+          "run": {
+            "$ref": "#/definitions/v2/WorkflowRunRecord"
+          }
+        },
+        "required": [
+          "run"
+        ],
+        "title": "WorkflowRunUpdatedNotification",
+        "type": "object"
+      },
+      "WorkflowScope": {
+        "description": "Discovery authority that supplied a workflow. This is provenance, not a precedence promise; `workflowId` remains the opaque selector.",
+        "enum": [
+          "user",
+          "project",
+          "plugin"
+        ],
+        "type": "string"
+      },
+      "WorkflowSourceIdentity": {
+        "description": "Immutable identity for one exact workflow source document.",
+        "properties": {
+          "digest": {
+            "description": "SHA-256 digest of the exact source bytes.",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "source": {
+            "description": "Human-readable source provenance, such as a path or plugin resource id.",
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "digest",
+          "name",
+          "source",
+          "version"
+        ],
+        "type": "object"
+      },
+      "WorkflowStartParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Start one exact workflow revision. `runId` is client supplied so a retry after a lost response is idempotent. Reusing it with different args or a different digest must fail closed.",
+        "properties": {
+          "args": {
+            "default": null
+          },
+          "expectedDigest": {
+            "description": "Must match `WorkflowSummary.executableDigest`, preventing a document or external script change between discovery and execution.",
+            "type": "string"
+          },
+          "parentThreadId": {
+            "type": "string"
+          },
+          "runId": {
+            "type": "string"
+          },
+          "workflowId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "expectedDigest",
+          "parentThreadId",
+          "runId",
+          "workflowId"
+        ],
+        "title": "WorkflowStartParams",
+        "type": "object"
+      },
+      "WorkflowStartResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "run": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/WorkflowRunRecord"
+              }
+            ],
+            "description": "The request returns once the durable run is accepted, not when it ends."
+          }
+        },
+        "required": [
+          "run"
+        ],
+        "title": "WorkflowStartResponse",
+        "type": "object"
+      },
+      "WorkflowSummary": {
+        "description": "A discovered and validated workflow. Zuno does not reserve names for built-in business workflows; every entry comes from a discoverable source.",
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "engine": {
+            "$ref": "#/definitions/v2/WorkflowEngine"
+          },
+          "executableDigest": {
+            "description": "Digest of all executable material. For `scriptFile` workflows this binds both the document and resolved script bytes.",
+            "type": "string"
+          },
+          "identity": {
+            "$ref": "#/definitions/v2/WorkflowSourceIdentity"
+          },
+          "scope": {
+            "$ref": "#/definitions/v2/WorkflowScope"
+          },
+          "workflowId": {
+            "description": "Opaque registry selector. Callers must not derive this from the name.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "engine",
+          "executableDigest",
+          "identity",
+          "scope",
+          "workflowId"
+        ],
+        "type": "object"
+      },
+      "WorkflowValidateParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Validate an arbitrary document without installing it or mutating discovery roots. The source id is only provenance for diagnostics and digesting.",
+        "properties": {
+          "document": {
+            "type": "string"
+          },
+          "format": {
+            "$ref": "#/definitions/v2/WorkflowDocumentFormat"
+          },
+          "sourceId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "document",
+          "format",
+          "sourceId"
+        ],
+        "title": "WorkflowValidateParams",
+        "type": "object"
+      },
+      "WorkflowValidateResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "diagnostics": {
+            "default": [],
+            "items": {
+              "$ref": "#/definitions/v2/WorkflowDiagnostic"
+            },
+            "type": "array"
+          },
+          "valid": {
+            "type": "boolean"
+          },
+          "workflow": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/WorkflowSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "valid"
+        ],
+        "title": "WorkflowValidateResponse",
         "type": "object"
       },
       "WorkspaceMessage": {

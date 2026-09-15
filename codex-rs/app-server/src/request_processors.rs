@@ -567,6 +567,7 @@ mod thread_sections;
 mod token_usage_replay;
 mod turn_processor;
 mod windows_sandbox_processor;
+mod workflows;
 
 pub(crate) use account_processor::AccountRequestProcessor;
 pub(crate) use apps_processor::AppsRequestProcessor;
@@ -593,6 +594,13 @@ pub(crate) use thread_processor::ThreadRequestProcessor;
 pub(crate) use thread_queue_processor::ThreadQueueRequestProcessor;
 pub(crate) use turn_processor::TurnRequestProcessor;
 pub(crate) use windows_sandbox_processor::WindowsSandboxRequestProcessor;
+#[allow(unused_imports)]
+pub(crate) use workflows::WorkflowAgentDispatchError;
+#[allow(unused_imports)]
+pub(crate) use workflows::WorkflowAgentDispatchRequest;
+#[allow(unused_imports)]
+pub(crate) use workflows::WorkflowAgentDispatcher;
+pub(crate) use workflows::WorkflowRequestProcessor;
 
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;

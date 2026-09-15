@@ -1,0 +1,38 @@
+# Optional user-owned template. Zuno never installs or selects this workflow.
+apiVersion: zuno.workflow/v1
+kind: Workflow
+metadata:
+  name: design-review
+  version: "1"
+  description: Example design, review, and implementation graph
+spec:
+  engine: graph/v1
+  routes:
+    design:
+      agentRef: claude-code
+      executionProfile: design-agent
+    review:
+      agentRef: native-codex
+      executionProfile: review-agent
+    build:
+      agentRef: native-codex
+      executionProfile: build-agent
+  limits:
+    maxConcurrentAgents: 2
+    maxTotalAgents: 6
+    maxWallTimeMs: 1800000
+  nodes:
+    - id: design
+      route: design
+      input:
+        prompt: Produce a concrete frontend design and implementation brief for the supplied task.
+    - id: review
+      route: review
+      needs: [design]
+      input:
+        prompt: Review the proposed design, resolve conflicts, and return a decision-complete implementation plan.
+    - id: implement
+      route: build
+      needs: [review]
+      input:
+        prompt: Implement the approved plan, run the relevant validation, and report the final result.

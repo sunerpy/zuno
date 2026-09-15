@@ -145,6 +145,8 @@ members = [
     "codex-experimental-api-macros",
     "plugin",
     "model-provider",
+    "zuno-workflows",
+    "zuno-acp",
 ]
 resolver = "2"
 
@@ -298,6 +300,8 @@ codex-utils-template = { path = "utils/template" }
 codex-v8-poc = { path = "v8-poc" }
 codex-workload-identity = { path = "workload-identity" }
 codex-windows-sandbox = { path = "windows-sandbox-rs" }
+zuno-workflows = { path = "zuno-workflows" }
+zuno-acp = { path = "zuno-acp" }
 core_test_support = { path = "core/tests/common" }
 
 # External

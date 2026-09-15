@@ -5762,6 +5762,117 @@
         "mode"
       ],
       "type": "object"
+    },
+    "WorkflowDocumentFormat": {
+      "description": "Source encoding for a user-, project-, or plugin-owned workflow document.",
+      "enum": [
+        "json",
+        "yaml"
+      ],
+      "type": "string"
+    },
+    "WorkflowListParams": {
+      "properties": {
+        "cwds": {
+          "description": "Working directories used for project and plugin discovery. Empty means the app-server process working directory.",
+          "items": {
+            "$ref": "#/definitions/AbsolutePathBuf"
+          },
+          "type": "array"
+        },
+        "forceReload": {
+          "description": "Re-read configured roots instead of accepting a registry cache hit.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "WorkflowReadParams": {
+      "properties": {
+        "workflowId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workflowId"
+      ],
+      "type": "object"
+    },
+    "WorkflowRunCancelParams": {
+      "properties": {
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "runId"
+      ],
+      "type": "object"
+    },
+    "WorkflowRunReadParams": {
+      "properties": {
+        "runId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "runId"
+      ],
+      "type": "object"
+    },
+    "WorkflowStartParams": {
+      "description": "Start one exact workflow revision. `runId` is client supplied so a retry after a lost response is idempotent. Reusing it with different args or a different digest must fail closed.",
+      "properties": {
+        "args": {
+          "default": null
+        },
+        "expectedDigest": {
+          "description": "Must match `WorkflowSummary.executableDigest`, preventing a document or external script change between discovery and execution.",
+          "type": "string"
+        },
+        "parentThreadId": {
+          "type": "string"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "workflowId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "expectedDigest",
+        "parentThreadId",
+        "runId",
+        "workflowId"
+      ],
+      "type": "object"
+    },
+    "WorkflowValidateParams": {
+      "description": "Validate an arbitrary document without installing it or mutating discovery roots. The source id is only provenance for diagnostics and digesting.",
+      "properties": {
+        "document": {
+          "type": "string"
+        },
+        "format": {
+          "$ref": "#/definitions/WorkflowDocumentFormat"
+        },
+        "sourceId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "document",
+        "format",
+        "sourceId"
+      ],
+      "type": "object"
     }
   },
   "description": "Request from the client to the server.",
@@ -7914,6 +8025,156 @@
         "params"
       ],
       "title": "Command/exec/resizeRequest",
+      "type": "object"
+    },
+    {
+      "description": "Discover user-, project-, and plugin-owned workflows.",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "workflow/list"
+          ],
+          "title": "Workflow/listRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/WorkflowListParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Workflow/listRequest",
+      "type": "object"
+    },
+    {
+      "description": "Read one exact discovered workflow source document.",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "workflow/read"
+          ],
+          "title": "Workflow/readRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/WorkflowReadParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Workflow/readRequest",
+      "type": "object"
+    },
+    {
+      "description": "Validate a workflow document without installing or executing it.",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "workflow/validate"
+          ],
+          "title": "Workflow/validateRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/WorkflowValidateParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Workflow/validateRequest",
+      "type": "object"
+    },
+    {
+      "description": "Durably accept a workflow run and return before execution completes.",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "workflow/start"
+          ],
+          "title": "Workflow/startRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/WorkflowStartParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Workflow/startRequest",
+      "type": "object"
+    },
+    {
+      "description": "Read a durable workflow run and its host-call ledger.",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "workflow/run/read"
+          ],
+          "title": "Workflow/run/readRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/WorkflowRunReadParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Workflow/run/readRequest",
+      "type": "object"
+    },
+    {
+      "description": "Request idempotent cancellation of a durable workflow run.",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "workflow/run/cancel"
+          ],
+          "title": "Workflow/run/cancelRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/WorkflowRunCancelParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Workflow/run/cancelRequest",
       "type": "object"
     },
     {

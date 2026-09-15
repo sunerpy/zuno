@@ -210,6 +210,8 @@ fn apply_codex_agent_plugin_extension(
     let extension = parse_legacy_plugin_manifest_uri(plugin_root, source_path, contents)?;
     resolved.paths.apps = extension.paths.apps;
     resolved.paths.hooks = extension.paths.hooks;
+    resolved.paths.workflows = extension.paths.workflows;
+    resolved.paths.agent_backends = extension.paths.agent_backends;
     if extension.interface.is_some() {
         resolved.interface = extension.interface;
     }

@@ -847,6 +847,72 @@ async fn load_plugins_from_config(
         .await
 }
 
+#[test]
+fn fresh_plugin_load_rebinds_agent_backend_source_generation() {
+    let handle = std::thread::Builder::new()
+        .name("fresh_plugin_load_rebinds_agent_backend_source_generation".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(Box::pin(async {
+                let codex_home = TempDir::new().unwrap();
+                let plugin_root = codex_home
+                    .path()
+                    .join("plugins/cache")
+                    .join("test/sample/local");
+                write_file(
+                    &plugin_root.join(".codex-plugin/plugin.json"),
+                    r#"{"name":"sample","agentBackends":"./agent-backends.json"}"#,
+                );
+                write_file(
+                    &plugin_root.join("agent-backends.json"),
+                    r#"{
+          "apiVersion":"zuno.agent-backends/v1",
+          "backends":{"review":{"kind":"acp","command":"./bin/review-acp"}}
+        }"#,
+                );
+                let command = plugin_root.join("bin/review-acp");
+                write_file(&command, "generation-one");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut permissions = std::fs::metadata(&command).unwrap().permissions();
+                    permissions.set_mode(0o755);
+                    std::fs::set_permissions(&command, permissions).unwrap();
+                }
+                write_file(
+                    &codex_home.path().join(CONFIG_TOML_FILE),
+                    &plugin_config_toml(
+                        /*enabled*/ true, /*plugins_feature_enabled*/ true,
+                    ),
+                );
+                let config = load_config(codex_home.path(), codex_home.path()).await;
+                let manager = test_plugins_manager(codex_home.path().to_path_buf());
+                let generation = |outcome: &PluginLoadOutcome| {
+                    assert_eq!(outcome.plugins().len(), 1, "{outcome:?}");
+                    assert_eq!(outcome.plugins()[0].agent_backends.len(), 1, "{outcome:?}");
+                    outcome.plugins()[0].agent_backends[0]
+                        .source_generation
+                        .clone()
+                };
+
+                let first = manager.plugins_for_config(&config).await;
+                let first_generation = generation(&first);
+                write_file(&command, "generation-two");
+                let cached = manager.plugins_for_config(&config).await;
+                assert_eq!(generation(&cached), first_generation);
+
+                let fresh = manager.plugins_for_config_fresh(&config).await;
+                assert_ne!(generation(&fresh), first_generation);
+            }));
+        })
+        .unwrap();
+    handle.join().expect("large-stack plugin reload test");
+}
+
 async fn load_config(codex_home: &Path, cwd: &Path) -> PluginsConfigInput {
     load_plugins_config_input(codex_home, cwd).await
 }
@@ -969,6 +1035,8 @@ async fn load_plugins_loads_default_skills_and_mcp_servers() {
             root: AbsolutePathBuf::try_from(plugin_root.clone()).unwrap(),
             enabled: true,
             skill_roots: vec![plugin_root.join("skills").abs()],
+            workflow_roots: Vec::new(),
+            agent_backends: Vec::new(),
             skill_discovery_mode: SkillDiscoveryMode::Recursive,
             disabled_skill_paths: HashSet::new(),
             has_enabled_skills: true,
@@ -2093,6 +2161,7 @@ async fn load_plugins_uses_manifest_configured_component_paths() {
                 r#"{{
   "name": "sample",
   "skills": {skills_json},
+  "workflows": ["./workflows/review.yaml", "./workflows/review.yaml"],
   "mcpServers": "./config/custom.mcp.json",
   "apps": "./config/custom.app.json"
 }}"#
@@ -2174,6 +2243,10 @@ async fn load_plugins_uses_manifest_configured_component_paths() {
         expected_skill_roots.dedup();
 
         assert_eq!(outcome.plugins()[0].skill_roots, expected_skill_roots);
+        assert_eq!(
+            outcome.plugins()[0].workflow_roots,
+            vec![plugin_root.join("workflows/review.yaml").abs()]
+        );
         assert_eq!(
             outcome.plugins()[0].mcp_servers,
             HashMap::from([(
@@ -2391,6 +2464,8 @@ async fn load_plugin_skills_dedupes_overlapping_manifest_roots() {
                 plugin_root.join("skills/edk"),
                 plugin_root.join("skills/abc"),
             ],
+            workflows: Vec::new(),
+            agent_backends: None,
             mcp_servers: None,
             apps: None,
             hooks: None,
@@ -2631,6 +2706,8 @@ async fn load_plugins_preserves_disabled_plugins_without_effective_contributions
             root: AbsolutePathBuf::try_from(plugin_root).unwrap(),
             enabled: false,
             skill_roots: Vec::new(),
+            workflow_roots: Vec::new(),
+            agent_backends: Vec::new(),
             skill_discovery_mode: SkillDiscoveryMode::Recursive,
             disabled_skill_paths: HashSet::new(),
             has_enabled_skills: false,
@@ -2810,6 +2887,8 @@ fn capability_index_filters_inactive_and_zero_capability_plugins() {
         root: AbsolutePathBuf::try_from(codex_home.path().join(dir_name)).unwrap(),
         enabled: true,
         skill_roots: Vec::new(),
+        workflow_roots: Vec::new(),
+        agent_backends: Vec::new(),
         skill_discovery_mode: SkillDiscoveryMode::Recursive,
         disabled_skill_paths: HashSet::new(),
         has_enabled_skills: false,
@@ -2834,6 +2913,8 @@ fn capability_index_filters_inactive_and_zero_capability_plugins() {
     let outcome = PluginLoadOutcome::from_plugins(vec![
         LoadedPlugin {
             skill_roots: vec![codex_home.path().join("skills-plugin/skills").abs()],
+            workflow_roots: Vec::new(),
+            agent_backends: Vec::new(),
             has_enabled_skills: true,
             ..plugin("skills@test", "skills-plugin", "skills-plugin")
         },
@@ -2854,6 +2935,8 @@ fn capability_index_filters_inactive_and_zero_capability_plugins() {
         LoadedPlugin {
             enabled: false,
             skill_roots: vec![codex_home.path().join("disabled-plugin/skills").abs()],
+            workflow_roots: Vec::new(),
+            agent_backends: Vec::new(),
             apps: vec![app("hidden", "connector_hidden")],
             ..plugin("disabled@test", "disabled-plugin", "disabled-plugin")
         },

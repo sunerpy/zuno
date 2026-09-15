@@ -4,7 +4,10 @@ load("//bazel/rules:e2e_benchmark.bzl", "codex_e2e_benchmark")
 
 codex_rust_crate(
     name = "cli",
-    binaries_with_build_commit = ["codex"],
+    binaries_with_build_commit = [
+        "codex",
+        "zuno",
+    ],
     crate_name = "codex_cli",
     extra_binaries = [
         "//codex-rs/bwrap:bwrap",
@@ -15,6 +18,14 @@ codex_rust_crate(
 
 multiplatform_binaries(
     name = "codex",
+)
+
+# Zuno is the product binary. Keep Codex's release filegroup untouched so
+# upstream release workflows remain replayable, and expose a separate group for
+# Zuno's own candidate/release pipeline.
+multiplatform_binaries(
+    name = "zuno",
+    filegroup_name = "zuno_release_binaries",
 )
 
 codex_e2e_benchmark(

@@ -8,7 +8,7 @@ version.workspace = true
 name = "codex_agent_extension"
 path = "src/lib.rs"
 doctest = false
-test = false
+test = true
 
 [lints]
 workspace = true
@@ -16,9 +16,22 @@ workspace = true
 [dependencies]
 codex-core = { workspace = true }
 codex-protocol = { workspace = true }
+codex-sandboxing = { workspace = true }
+codex-utils-absolute-path = { workspace = true }
+codex-utils-path-uri = { workspace = true }
+codex-utils-pty = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "process", "rt", "sync", "time"] }
+tokio-util = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+codex-windows-sandbox = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
 core_test_support = { workspace = true }
 pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

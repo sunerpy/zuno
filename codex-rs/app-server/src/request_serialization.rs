@@ -48,6 +48,9 @@ pub(crate) enum RequestSerializationQueueKey {
     McpOauth {
         server_name: String,
     },
+    WorkflowRun {
+        run_id: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +106,10 @@ impl RequestSerializationQueueKey {
             ),
             ClientRequestSerializationScope::McpOauth { server_name } => (
                 Self::McpOauth { server_name },
+                RequestSerializationAccess::Exclusive,
+            ),
+            ClientRequestSerializationScope::WorkflowRun { run_id } => (
+                Self::WorkflowRun { run_id },
                 RequestSerializationAccess::Exclusive,
             ),
         }
@@ -318,6 +325,23 @@ mod tests {
 
     fn shutdown_wait_timeout() -> Duration {
         Duration::from_millis(/*millis*/ 50)
+    }
+
+    #[test]
+    fn workflow_run_scope_is_process_wide_and_exclusive() {
+        let (key, access) = RequestSerializationQueueKey::from_scope(
+            ConnectionId(91),
+            ClientRequestSerializationScope::WorkflowRun {
+                run_id: "run-1".to_string(),
+            },
+        );
+        assert_eq!(
+            key,
+            RequestSerializationQueueKey::WorkflowRun {
+                run_id: "run-1".to_string(),
+            }
+        );
+        assert_eq!(access, RequestSerializationAccess::Exclusive);
     }
 
     #[tokio::test]

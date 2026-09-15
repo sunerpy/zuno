@@ -71,11 +71,13 @@ use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout::state_db::StateDbHandle;
 use codex_skills_extension::HostSkillsService;
+use codex_thread_store::ForkBoundary;
 use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::LoadThreadHistoryParams;
 use codex_thread_store::LocalThreadStore;
 use codex_thread_store::LocalThreadStoreConfig;
 use codex_thread_store::MoveThreadToSectionParams;
+use codex_thread_store::PrepareForkParams;
 use codex_thread_store::PreparedFork;
 use codex_thread_store::ReadThreadByRolloutPathParams;
 use codex_thread_store::ReadThreadParams;
@@ -675,6 +677,14 @@ impl ThreadManager {
         self.state.plugins_manager.clone()
     }
 
+    /// Returns the process-scoped Code Mode provider shared by all threads.
+    ///
+    /// Non-thread runtimes such as user-owned workflow engines must reuse this
+    /// provider rather than starting a second in-process or companion runtime.
+    pub fn code_mode_session_provider(&self) -> Arc<dyn CodeModeSessionProvider> {
+        Arc::clone(&self.state.code_mode_session_provider)
+    }
+
     pub fn mcp_manager(&self) -> Arc<McpManager> {
         self.state.mcp_manager.clone()
     }
@@ -1015,8 +1025,22 @@ impl ThreadManager {
 
     async fn start_thread_inner(
         &self,
+        options: StartThreadOptions,
+        forked_from_thread_id: Option<ThreadId>,
+    ) -> CodexResult<NewThread> {
+        self.start_thread_inner_with_persistence(
+            options,
+            forked_from_thread_id,
+            ForkPersistence::Copied,
+        )
+        .await
+    }
+
+    async fn start_thread_inner_with_persistence(
+        &self,
         mut options: StartThreadOptions,
         forked_from_thread_id: Option<ThreadId>,
+        fork_persistence: ForkPersistence,
     ) -> CodexResult<NewThread> {
         let agent_control = self.agent_control_for_config(&options.config);
         let (resumed_session_source, resumed_thread_source) = options
@@ -1033,6 +1057,7 @@ impl ThreadManager {
         let mut request =
             ThreadSpawnRequest::new(options, Arc::clone(&self.state.auth_manager), agent_control);
         request.forked_from_thread_id = forked_from_thread_id;
+        request.fork_persistence = fork_persistence;
         Box::pin(self.state.spawn_thread(request)).await
     }
 
@@ -1047,6 +1072,51 @@ impl ThreadManager {
         // Persist queued rollout updates before reading the fork snapshot.
         fork_source.ensure_rollout_materialized().await;
         fork_source.flush_rollout().await?;
+        if fork_source.config_snapshot().await.history_mode == ThreadHistoryMode::Paginated {
+            let prepared = self
+                .state
+                .thread_store
+                .prepare_fork(PrepareForkParams {
+                    thread_id: forked_from_thread_id,
+                    boundary: ForkBoundary::Latest,
+                })
+                .await
+                .map_err(|err| {
+                    CodexErr::Fatal(format!(
+                        "failed to prepare paginated subagent fork source \
+                         {forked_from_thread_id}: {err}"
+                    ))
+                })?;
+            let inherited_multi_agent_version = fork_source
+                .multi_agent_version()
+                .unwrap_or(MultiAgentVersion::V1);
+            options.initial_history = fork_history_from_snapshot(
+                ForkSnapshot::Interrupted,
+                InitialHistory::Resumed(ResumedHistory {
+                    conversation_id: prepared.source_thread_id,
+                    history: Arc::clone(&prepared.model_context),
+                    rollout_path: None,
+                }),
+                InterruptedTurnHistoryMarker::from_config_and_version(
+                    &options.config,
+                    inherited_multi_agent_version,
+                ),
+            );
+            let persistence = ForkPersistence::Referenced {
+                history_base: prepared.history_base,
+                inherited_item_count: prepared.model_context.len(),
+            };
+            let result = self
+                .start_thread_inner_with_persistence(
+                    options,
+                    Some(forked_from_thread_id),
+                    persistence,
+                )
+                .await;
+            // Retain the source lifecycle reservation until the child reference is durable.
+            drop(prepared);
+            return result;
+        }
         let stored_thread = fork_source
             .read_thread(
                 /*include_archived*/ true, /*include_history*/ true,

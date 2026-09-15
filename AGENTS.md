@@ -1,3 +1,25 @@
+# Zuno source-fork rules
+
+This repository builds **Zuno** from the full OpenAI Codex source tree. Codex is
+the upstream baseline; the product executable, user-facing extension surface,
+and new project identity are Zuno. Preserve LICENSE and NOTICE attribution.
+
+- Never embed a business workflow, including `frontend-consensus`, in the
+  application. Workflows are user-, project-, or plugin-owned
+  `zuno.workflow/v1` documents selected at runtime.
+- Workflow routes use logical Agent/backend and execution-profile names. They
+  never hard-code a mandatory Provider, model, credential, or organization
+  process.
+- Native Codex children reuse the in-process thread runtime. External Claude
+  Code and ACP providers own bounded lifecycle/cancellation and are replaceable.
+- Native ACP is a projection over the same App Server thread and turn state; do
+  not add another agent loop.
+- Upstream updates are prepared only in isolated candidate worktrees via
+  `scripts/zuno_upstream.py`; never auto-merge them.
+- Use CodeGraph before source navigation when `.codegraph/` is usable.
+
+See `ZUNO_ARCHITECTURE.md`, `UPSTREAM_CODEX.toml`, and `FORK_DELTA.toml`.
+
 # Rust/codex-rs
 
 In the codex-rs folder where the rust code lives:

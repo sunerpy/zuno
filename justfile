@@ -17,9 +17,15 @@ alias c := codex
 codex *args:
     cargo run --bin codex -- {args}
 
-# `codex exec`
+# Zuno is the product entrypoint. `codex` above remains available only for
+# upstream scripts and compatibility checks while the fork delta is replayed.
+alias z := zuno
+zuno *args:
+    cargo run --bin zuno -- {args}
+
+# `zuno exec`
 exec *args:
-    cargo run --bin codex -- exec {args}
+    cargo run --bin zuno -- exec {args}
 
 # Start `codex exec-server` and run codex-tui.
 [no-cd]
@@ -40,6 +46,13 @@ code-mode-host *args:
 [no-cd]
 assemble-codex-package *args:
     {{ python }} {{ justfile_directory() }}/scripts/build_codex_package.py {args}
+
+# Assemble a local Zuno package while reusing Codex's proven package layout and
+# companion binaries. Callers can still pass target, profile, and prebuilt
+# resource arguments through to the canonical builder.
+[no-cd]
+assemble-zuno-package *args:
+    {{ python }} {{ justfile_directory() }}/scripts/build_codex_package.py --variant zuno {args}
 
 # Build the CLI and run the app-server test client
 app-server-test-client *args:
@@ -130,6 +143,17 @@ bazel-codex *args:
 bazel-codex *args:
     bazel run //codex-rs/cli:codex --run_under='cd /d "{{ invocation_directory_native() }}" &&' -- @($args | Select-Object -Skip 1)
 
+# Build and run Zuno from source using Bazel while keeping the upstream Codex
+# recipe above intact for sync validation.
+[no-cd]
+[unix]
+bazel-zuno *args:
+    bazel run //codex-rs/cli:zuno --run_under="cd $PWD &&" -- "$@"
+
+[windows]
+bazel-zuno *args:
+    bazel run //codex-rs/cli:zuno --run_under='cd /d "{{ invocation_directory_native() }}" &&' -- @($args | Select-Object -Skip 1)
+
 # Build and run the standalone code-mode host from source using Bazel.
 [no-cd]
 [unix]
@@ -169,13 +193,22 @@ bazel-argument-comment-lint:
 build-for-release:
     bazel build //codex-rs/cli:release_binaries
 
+# Build the Zuno product entrypoint for every release platform without changing
+# Codex's upstream release target.
+build-zuno-for-release:
+    bazel build //codex-rs/cli:zuno_release_binaries
+
 # Regenerate the json schema for config.toml from the current config types.
 write-config-schema:
     cargo run -p codex-config-schema --bin codex-write-config-schema
 
 # Regenerate vendored app-server protocol schema artifacts.
-write-app-server-schema *args:
-    cargo run -p codex-app-server-protocol --bin write_schema_fixtures -- {args}
+# The protocol crate exposes the writer through an ignored test so fixture
+# generation uses the same code path as the drift checks.
+[no-cd]
+write-app-server-schema:
+    {{ python }} {{ justfile_directory() }}/codex-rs/app-server-protocol/scripts/write_schema_fixtures.py
+    {{ python }} {{ justfile_directory() }}/codex-rs/app-server-protocol/scripts/write_schema_fixtures.py --experimental
 
 [no-cd]
 write-hooks-schema:

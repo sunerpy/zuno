@@ -193,6 +193,12 @@ enum RestartDecision {
 }
 
 pub async fn run(command: LifecycleCommand) -> Result<LifecycleOutput> {
+    if matches!(
+        command,
+        LifecycleCommand::Start | LifecycleCommand::Restart | LifecycleCommand::Stop
+    ) {
+        return Err(zuno_managed_daemon_disabled());
+    }
     ensure_supported_platform()?;
     #[cfg(windows)]
     if matches!(command, LifecycleCommand::Start | LifecycleCommand::Restart) {
@@ -202,6 +208,9 @@ pub async fn run(command: LifecycleCommand) -> Result<LifecycleOutput> {
 }
 
 pub async fn bootstrap(options: BootstrapOptions) -> Result<BootstrapOutput> {
+    let _ = options;
+    return Err(zuno_managed_daemon_disabled());
+    #[allow(unreachable_code)]
     ensure_supported_platform()?;
     #[cfg(windows)]
     backend::windows::ensure_not_elevated()?;
@@ -209,6 +218,8 @@ pub async fn bootstrap(options: BootstrapOptions) -> Result<BootstrapOutput> {
 }
 
 pub async fn ensure_remote_control_ready() -> Result<RemoteControlReadyOutput> {
+    return Err(zuno_managed_daemon_disabled());
+    #[allow(unreachable_code)]
     ensure_supported_platform()?;
     #[cfg(windows)]
     backend::windows::ensure_not_elevated()?;
@@ -233,12 +244,17 @@ pub async fn enable_remote_control_on_socket(
 
 /// Starts a manual pairing session through an already-running daemon app-server.
 pub async fn start_remote_control_pairing() -> Result<RemoteControlPairingStartResponse> {
+    return Err(zuno_managed_daemon_disabled());
+    #[allow(unreachable_code)]
     ensure_supported_platform()?;
     let daemon = Daemon::from_environment()?;
     remote_control_client::start_pairing(&daemon.socket_path).await
 }
 
 pub async fn set_remote_control(mode: RemoteControlMode) -> Result<RemoteControlOutput> {
+    let _ = mode;
+    return Err(zuno_managed_daemon_disabled());
+    #[allow(unreachable_code)]
     ensure_supported_platform()?;
     #[cfg(windows)]
     backend::windows::ensure_not_elevated()?;
@@ -248,10 +264,19 @@ pub async fn set_remote_control(mode: RemoteControlMode) -> Result<RemoteControl
 pub async fn run_pid_update_loop(
     http_client_factory: codex_http_client::HttpClientFactory,
 ) -> Result<()> {
+    let _ = http_client_factory;
+    return Err(zuno_managed_daemon_disabled());
+    #[allow(unreachable_code)]
     ensure_supported_platform()?;
     #[cfg(windows)]
     backend::windows::ensure_not_elevated()?;
     update_loop::run(http_client_factory).await
+}
+
+fn zuno_managed_daemon_disabled() -> anyhow::Error {
+    anyhow!(
+        "Zuno managed app-server daemon mutation is disabled until a Zuno-owned package updater passes all platform gates; run a foreground app server or remote-control session instead"
+    )
 }
 
 #[cfg(any(unix, windows))]
@@ -898,9 +923,28 @@ mod tests {
     use super::BootstrapOutput;
     use super::BootstrapStatus;
     use super::Daemon;
+    use super::LifecycleCommand;
     use super::LifecycleOutput;
     use super::LifecycleStatus;
     use super::RemoteControlStartOutput;
+    use super::run;
+
+    #[tokio::test]
+    async fn zuno_blocks_managed_daemon_mutations_before_filesystem_access() {
+        for command in [
+            LifecycleCommand::Start,
+            LifecycleCommand::Restart,
+            LifecycleCommand::Stop,
+        ] {
+            let error = run(command).await.expect_err("mutation must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Zuno managed app-server daemon mutation is disabled"),
+                "{error:#}"
+            );
+        }
+    }
     use super::RemoteControlStatus;
     use super::RestartDecision;
     use super::RestartIfRunningOutcome;

@@ -7,6 +7,10 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
+if ($env:ZUNO_ALLOW_UPSTREAM_CODEX_INSTALLER -ne "1") {
+    throw "This inherited Codex installer is disabled in Zuno. Download verified Zuno preview packages from https://github.com/sunerpy/zuno/releases."
+}
+
 if ([string]::IsNullOrWhiteSpace($Release)) {
     $Release = "latest"
 }

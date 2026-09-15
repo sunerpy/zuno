@@ -48,6 +48,7 @@ use crate::request_processors::ThreadQueueRequestProcessor;
 use crate::request_processors::ThreadRequestProcessor;
 use crate::request_processors::TurnRequestProcessor;
 use crate::request_processors::WindowsSandboxRequestProcessor;
+use crate::request_processors::WorkflowRequestProcessor;
 use crate::request_processors::read_server_diagnostics;
 use crate::request_serialization::QueuedInitializedRequest;
 use crate::request_serialization::RequestSerializationQueueKey;
@@ -162,6 +163,7 @@ pub(crate) struct MessageProcessor {
     thread_processor: ThreadRequestProcessor,
     turn_processor: TurnRequestProcessor,
     windows_sandbox_processor: WindowsSandboxRequestProcessor,
+    workflow_processor: Arc<WorkflowRequestProcessor>,
     request_serialization_queues: RequestSerializationQueues,
 }
 
@@ -565,6 +567,13 @@ impl MessageProcessor {
         let windows_sandbox_processor = WindowsSandboxRequestProcessor::new(
             outgoing.clone(),
             Arc::clone(&config),
+            config_manager.clone(),
+        );
+        let workflow_processor = WorkflowRequestProcessor::new(
+            Arc::clone(&config),
+            Arc::clone(&thread_manager),
+            thread_manager.code_mode_session_provider(),
+            outgoing.clone(),
             config_manager,
         );
 
@@ -596,6 +605,7 @@ impl MessageProcessor {
             thread_processor,
             turn_processor,
             windows_sandbox_processor,
+            workflow_processor,
             request_serialization_queues,
         }
     }
@@ -605,6 +615,7 @@ impl MessageProcessor {
         self.apps_processor.shutdown();
         self.models_refresh_worker.shutdown();
         self.skills_watcher.shutdown();
+        self.workflow_processor.shutdown();
     }
 
     pub(crate) async fn process_request(
@@ -1692,6 +1703,24 @@ impl MessageProcessor {
                 self.process_exec_processor
                     .process_resize_pty(request_id.clone(), params)
                     .await
+            }
+            ClientRequest::WorkflowList { params, .. } => {
+                self.workflow_processor.list(params).await
+            }
+            ClientRequest::WorkflowRead { params, .. } => {
+                self.workflow_processor.read(params).await
+            }
+            ClientRequest::WorkflowValidate { params, .. } => {
+                self.workflow_processor.validate(params).await
+            }
+            ClientRequest::WorkflowStart { params, .. } => {
+                self.workflow_processor.start(params).await
+            }
+            ClientRequest::WorkflowRunRead { params, .. } => {
+                self.workflow_processor.run_read(params).await
+            }
+            ClientRequest::WorkflowRunCancel { params, .. } => {
+                self.workflow_processor.run_cancel(params).await
             }
             ClientRequest::FeedbackUpload { params, .. } => {
                 self.feedback_processor.feedback_upload(params).await

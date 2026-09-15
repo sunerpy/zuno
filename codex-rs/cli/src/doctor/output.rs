@@ -79,7 +79,7 @@ pub(super) fn render_human_report(report: &DoctorReport, options: HumanOutputOpt
     let _ = writeln!(
         out,
         "{} {}",
-        bold("Codex Doctor", options),
+        bold("Zuno Doctor", options),
         dim(&header_suffix(report), options)
     );
     out.push('\n');
@@ -459,7 +459,7 @@ fn write_footer(out: &mut String, options: HumanOutputOptions) {
             out,
             "{}",
             dim(
-                "Run codex doctor without --summary for detailed diagnostics.",
+                "Run zuno doctor without --summary for detailed diagnostics.",
                 options
             )
         );
@@ -1210,7 +1210,7 @@ mod tests {
                 "token expired",
             )
             .detail("OPENAI_API_KEY: present")
-            .remediation("Run `codex login`."),
+            .remediation("Run `zuno login`."),
             DoctorCheck::new(
                 "updates.status",
                 "updates",
@@ -1256,11 +1256,11 @@ mod tests {
         let rendered = render_human_report(&sample_report(), detailed_no_color_unicode_options());
         let expected = format!(
             "\
-Codex Doctor v0.0.0
+Zuno Doctor v0.0.0
 
 Notes
    ⚠ terminal     narrow terminal
-   ✗ auth         token expired - Run `codex login`.
+   ✗ auth         token expired - Run `zuno login`.
 ─────────────────────────────────────────────────────────────
 
 Environment
@@ -1289,7 +1289,7 @@ Environment
   ✓ state        state paths inspectable
 
 Configuration
-  ✗ auth         token expired — Run `codex login`.
+  ✗ auth         token expired — Run `zuno login`.
       OPENAI_API_KEY           present
 
 Updates
@@ -1342,7 +1342,8 @@ Background Server
             .iter_mut()
             .find(|detail| detail.starts_with("exclusion targets: "))
             .expect("endpoint security check should include exclusion targets");
-        *targets = "exclusion targets: verified Codex app and required helpers".into();
+        *targets =
+            "exclusion targets: the Zuno executable and required compatibility helpers".into();
         report.checks.push(security);
         report.checks.extend([
             DoctorCheck::new(
@@ -1387,11 +1388,11 @@ Background Server
         let rendered = render_human_report(&sample_report(), summary_no_color_unicode_options());
         let expected = format!(
             "\
-Codex Doctor v0.0.0
+Zuno Doctor v0.0.0
 
 Notes
    ⚠ terminal     narrow terminal
-   ✗ auth         token expired - Run `codex login`.
+   ✗ auth         token expired - Run `zuno login`.
 ─────────────────────────────────────────────────────────────
 
 Environment
@@ -1405,7 +1406,7 @@ Environment
   ✓ state        state paths inspectable
 
 Configuration
-  ✗ auth         token expired — Run `codex login`.
+  ✗ auth         token expired — Run `zuno login`.
 
 Updates
   ✓ updates      update configuration is locally consistent
@@ -1421,7 +1422,7 @@ Background Server
 {}
 12 ok · 2 notes · 1 warn · 1 fail failed
 
-Run codex doctor without --summary for detailed diagnostics.
+Run zuno doctor without --summary for detailed diagnostics.
 --all expand truncated lists       --json redacted report
 ",
             "─".repeat(SEPARATOR_WIDTH)
@@ -1495,11 +1496,11 @@ Run codex doctor without --summary for detailed diagnostics.
         );
         let expected = format!(
             "\
-Codex Doctor v0.0.0
+Zuno Doctor v0.0.0
 
 Notes
    [!!] terminal     narrow terminal
-   [XX] auth         token expired - Run `codex login`.
+   [XX] auth         token expired - Run `zuno login`.
 -------------------------------------------------------------
 
 Environment
@@ -1513,7 +1514,7 @@ Environment
   [ok] state        state paths inspectable
 
 Configuration
-  [XX] auth         token expired - Run `codex login`.
+  [XX] auth         token expired - Run `zuno login`.
 
 Updates
   [ok] updates      update configuration is locally consistent
@@ -1529,7 +1530,7 @@ Background Server
 {}
 12 ok | 2 notes | 1 warn | 1 fail failed
 
-Run codex doctor without --summary for detailed diagnostics.
+Run zuno doctor without --summary for detailed diagnostics.
 --all expand truncated lists       --json redacted report
 ",
             "-".repeat(SEPARATOR_WIDTH)

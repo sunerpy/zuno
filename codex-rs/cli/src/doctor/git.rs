@@ -74,7 +74,7 @@ fn git_check_from_inputs(inputs: GitCheckInputs) -> DoctorCheck {
                 "Git repository detected but git executable was not found",
             )
             .expected("git available on PATH")
-            .remedy("Install Git or fix PATH so Codex can inspect repository metadata.")
+            .remedy("Install Git or fix PATH so Zuno can inspect repository metadata.")
             .field("selected git"),
         );
     }

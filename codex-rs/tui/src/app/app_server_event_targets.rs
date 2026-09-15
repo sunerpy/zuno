@@ -187,6 +187,9 @@ pub(super) fn server_notification_thread_target(
                 None => return ServerNotificationThreadTarget::AppScoped,
             }
         }
+        ServerNotification::WorkflowRunUpdated(notification) => {
+            Some(notification.run.parent_thread_id.as_str())
+        }
         ServerNotification::ProjectChanged(_)
         | ServerNotification::SkillsChanged(_)
         | ServerNotification::McpServerOauthLoginCompleted(_)
@@ -234,6 +237,11 @@ mod tests {
     use codex_app_server_protocol::ThreadSettings;
     use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
     use codex_app_server_protocol::WarningNotification;
+    use codex_app_server_protocol::WorkflowEngine;
+    use codex_app_server_protocol::WorkflowRunRecord;
+    use codex_app_server_protocol::WorkflowRunStatus;
+    use codex_app_server_protocol::WorkflowRunUpdatedNotification;
+    use codex_app_server_protocol::WorkflowSourceIdentity;
     use codex_protocol::ThreadId;
     use codex_protocol::config_types::CollaborationMode;
     use codex_protocol::config_types::ModeKind;
@@ -304,6 +312,40 @@ mod tests {
         let target = server_notification_thread_target(&notification);
 
         assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
+    }
+
+    #[test]
+    fn workflow_run_updates_route_to_the_parent_thread() {
+        let thread_id = ThreadId::new();
+        let notification = ServerNotification::WorkflowRunUpdated(WorkflowRunUpdatedNotification {
+            run: WorkflowRunRecord {
+                run_id: "run-1".to_string(),
+                workflow: WorkflowSourceIdentity {
+                    source: "project:workflow.yaml".to_string(),
+                    name: "review".to_string(),
+                    version: "1".to_string(),
+                    digest: "digest".to_string(),
+                },
+                engine: WorkflowEngine::GraphV1,
+                engine_revision: "graph/v1+zuno/v1".to_string(),
+                parent_thread_id: thread_id.to_string(),
+                request_digest: "request-digest".to_string(),
+                binding_digest: "binding-digest".to_string(),
+                status: WorkflowRunStatus::Running,
+                result: None,
+                error: None,
+                agents_started: 0,
+                calls: Vec::new(),
+                created_at: 1,
+                updated_at: 1,
+                completed_at: None,
+            },
+        });
+
+        assert_eq!(
+            server_notification_thread_target(&notification),
+            ServerNotificationThreadTarget::Thread(thread_id)
+        );
     }
 
     #[test]

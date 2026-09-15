@@ -887,6 +887,17 @@ impl PluginsManager {
         }
     }
 
+    /// Reloads the effective plugin set from its installed roots before returning it.
+    ///
+    /// Workflow binding uses this path at admission and immediately before dispatch
+    /// so a local plugin declaration or package-relative executable changed in
+    /// place cannot reuse a cached backend generation. Ordinary turn/plugin reads
+    /// keep using [`Self::plugins_for_config`] and its bounded cache.
+    pub async fn plugins_for_config_fresh(&self, config: &PluginsConfigInput) -> PluginLoadOutcome {
+        self.clear_loaded_plugins_cache();
+        self.plugins_for_config(config).await
+    }
+
     fn resolve_loaded_plugins_for_auth(
         &self,
         mut plugins: Vec<LoadedPlugin>,

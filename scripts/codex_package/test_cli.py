@@ -8,6 +8,8 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from codex_package.cli import parse_package_version
+from codex_package.cli import package_display_name
+from codex_package.targets import PACKAGE_VARIANTS
 
 
 class PackageVersionTest(unittest.TestCase):
@@ -42,6 +44,17 @@ class PackageVersionTest(unittest.TestCase):
             with self.subTest(version=version):
                 with self.assertRaises(argparse.ArgumentTypeError):
                     parse_package_version(version)
+
+
+class PackageDisplayNameTest(unittest.TestCase):
+    def test_zuno_is_reported_as_the_product_package(self) -> None:
+        self.assertEqual(package_display_name(PACKAGE_VARIANTS["zuno"]), "Zuno")
+
+    def test_upstream_variants_keep_codex_identity(self) -> None:
+        self.assertEqual(package_display_name(PACKAGE_VARIANTS["codex"]), "Codex")
+        self.assertEqual(
+            package_display_name(PACKAGE_VARIANTS["codex-app-server"]), "Codex"
+        )
 
 
 if __name__ == "__main__":

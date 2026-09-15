@@ -90,6 +90,7 @@ codex-tools = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-json-to-toml = { workspace = true }
 codex-utils-path-uri = { workspace = true }
+zuno-workflows = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 futures = { workspace = true }
@@ -113,6 +114,7 @@ tracing = { workspace = true, features = ["log"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "json"] }
 url = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v7"] }
+which = { workspace = true }
 
 [target.'cfg(all(target_os = "linux", target_env = "musl", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
 tikv-jemallocator = { workspace = true }
@@ -130,6 +132,7 @@ axum = { workspace = true, default-features = false, features = [
 base64 = { workspace = true }
 codex-model-provider-info = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
+codex-utils-plugins = { workspace = true }
 core_test_support = { workspace = true }
 flate2 = { workspace = true }
 hmac = { workspace = true }

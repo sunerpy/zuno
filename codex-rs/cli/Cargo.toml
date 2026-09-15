@@ -4,11 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 build = "build.rs"
-default-run = "codex"
+default-run = "zuno"
 
 [[bin]]
-name = "codex"
+name = "zuno"
 path = "src/main.rs"
+
+# Temporary compatibility binary for upstream tooling and package layouts.
+# Both targets execute the same Zuno source; the user-facing command is zuno.
+[[bin]]
+name = "codex"
+path = "src/codex.rs"
 
 [[bin]]
 name = "logs_client"
@@ -28,6 +34,7 @@ chrono = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 clap_complete = { workspace = true }
 codex-app-server = { workspace = true }
+codex-app-server-client = { workspace = true }
 codex-app-server-daemon = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-app-server-test-client = { workspace = true }
@@ -50,6 +57,7 @@ codex-exec-server = { workspace = true }
 codex-execpolicy = { workspace = true }
 codex-extension-api = { workspace = true }
 codex-features = { workspace = true }
+codex-feedback = { workspace = true }
 codex-git-attribution = { workspace = true }
 codex-git-utils = { workspace = true }
 codex-install-context = { workspace = true }
@@ -100,6 +108,7 @@ tracing-subscriber = { workspace = true }
 unicode-segmentation = { workspace = true }
 url = { workspace = true }
 which = { workspace = true }
+zuno-acp = { workspace = true }
 
 [target.'cfg(all(target_os = "linux", target_env = "musl", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
 tikv-jemallocator = { workspace = true }

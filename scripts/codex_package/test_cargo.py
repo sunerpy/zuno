@@ -14,6 +14,20 @@ from codex_package.targets import TARGET_SPECS
 
 
 class SourceBinariesForTargetTest(unittest.TestCase):
+    def test_zuno_package_builds_the_product_entrypoint(self) -> None:
+        self.assertEqual(
+            source_binaries_for_target(
+                TARGET_SPECS["x86_64-unknown-linux-musl"],
+                PACKAGE_VARIANTS["zuno"],
+                build_entrypoint=True,
+                build_code_mode_host=False,
+                build_bwrap=False,
+                build_codex_command_runner=False,
+                build_codex_windows_sandbox_setup=False,
+            ),
+            ["zuno"],
+        )
+
     def test_macos_package_with_prebuilt_entrypoint_builds_nothing(self) -> None:
         self.assertEqual(
             source_binaries_for_target(

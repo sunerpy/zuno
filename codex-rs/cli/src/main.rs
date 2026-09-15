@@ -54,11 +54,10 @@ use supports_color::Stream;
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod acp_cmd;
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 mod app_cmd;
 mod cloud_config;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-mod desktop_app;
 mod doctor;
 #[cfg(test)]
 #[path = "exec_server_args_tests.rs"]
@@ -75,6 +74,7 @@ mod remote_control_cmd;
 mod sandbox_setup;
 mod state_db_recovery;
 #[cfg(not(windows))]
+#[cfg(test)]
 mod wsl_paths;
 
 use crate::mcp_cmd::McpCli;
@@ -111,20 +111,19 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::user_input::UserInput;
 use codex_terminal_detection::TerminalName;
 
-/// Codex CLI
+/// Zuno CLI, derived from the Codex runtime.
 ///
 /// If no subcommand is specified, options will be forwarded to the interactive CLI.
 #[derive(Debug, Parser)]
 #[clap(
     author,
     version,
+    name = "zuno",
     // If a sub‑command is given, ignore requirements of the default args.
     subcommand_negates_reqs = true,
-    // The executable is sometimes invoked via a platform‑specific name like
-    // `codex-x86_64-unknown-linux-musl`, but the help output should always use
-    // the generic `codex` command name that users run.
-    bin_name = "codex",
-    override_usage = "codex [OPTIONS] [PROMPT]\n       codex [OPTIONS] <COMMAND> [ARGS]"
+    // Package aliases still use the Zuno product identity in user-facing help.
+    bin_name = "zuno",
+    override_usage = "zuno [OPTIONS] [PROMPT]\n       zuno [OPTIONS] <COMMAND> [ARGS]"
 )]
 struct MultitoolCli {
     #[clap(flatten)]
@@ -145,10 +144,13 @@ struct MultitoolCli {
 
 #[derive(Debug, clap::Subcommand)]
 enum Subcommand {
+    /// Run the native Agent Client Protocol server over stdio.
+    Acp(AcpCommand),
+
     /// Browse all agent sessions on the shared local app-server daemon.
     Agents(AgentsCommand),
 
-    /// Run Codex non-interactively.
+    /// Run Zuno non-interactively.
     #[clap(visible_alias = "e")]
     Exec(ExecCli),
 
@@ -161,10 +163,10 @@ enum Subcommand {
     /// Remove stored authentication credentials.
     Logout(LogoutCommand),
 
-    /// Manage external MCP servers for Codex.
+    /// Manage external MCP servers for Zuno.
     Mcp(McpCli),
 
-    /// Manage Codex plugins.
+    /// Manage Zuno plugins.
     Plugin(PluginCli),
 
     /// [experimental] Run the app server or related tooling.
@@ -173,20 +175,20 @@ enum Subcommand {
     /// [experimental] Manage the app-server daemon with remote control enabled.
     RemoteControl(RemoteControlCommand),
 
-    /// Launch the Desktop app (opens the app installer if missing).
+    /// Disabled compatibility command; Zuno never opens or installs Codex Desktop.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     App(app_cmd::AppCommand),
 
     /// Generate shell completion scripts.
     Completion(CompletionCommand),
 
-    /// Update Codex to the latest version.
+    /// Update Zuno to the latest version.
     Update,
 
-    /// Diagnose local Codex installation, config, auth, and runtime health.
+    /// Diagnose local Zuno installation, config, auth, and runtime health.
     Doctor(DoctorCommand),
 
-    /// Run commands within a Codex-provided sandbox.
+    /// Run commands within a Zuno-provided sandbox.
     Sandbox(HostSandboxArgs),
 
     /// Debugging tools.
@@ -196,7 +198,7 @@ enum Subcommand {
     #[clap(hide = true)]
     Execpolicy(ExecpolicyCommand),
 
-    /// Apply the latest diff produced by Codex agent as a `git apply` to your local working tree.
+    /// Apply the latest diff produced by a Zuno agent as a `git apply` to your local working tree.
     #[clap(visible_alias = "a")]
     Apply(ApplyCommand),
 
@@ -238,6 +240,16 @@ enum Subcommand {
 
     /// Inspect feature flags.
     Features(FeaturesCli),
+}
+
+#[derive(Debug, Parser)]
+struct AcpCommand {
+    /// Error out when config.toml contains fields that are not recognized by this version.
+    #[arg(long = "strict-config", default_value_t = false)]
+    strict_config: bool,
+
+    #[clap(flatten)]
+    shared: SharedCliOptions,
 }
 
 #[derive(Debug, Parser)]
@@ -311,7 +323,7 @@ struct DebugModelsCommand {
 
 #[derive(Debug, Parser)]
 struct ReviewCommand {
-    /// Error out when config.toml contains fields that are not recognized by this version of Codex.
+    /// Error out when config.toml contains fields that are not recognized by this version of Zuno.
     #[arg(long = "strict-config", default_value_t = false)]
     strict_config: bool,
 
@@ -388,7 +400,7 @@ struct SessionArchiveConfigOverrides {
     #[clap(flatten)]
     shared: SharedCliOptions,
 
-    /// Error out when config.toml contains fields that are not recognized by this version of Codex.
+    /// Error out when config.toml contains fields that are not recognized by this version of Zuno.
     #[arg(long = "strict-config", default_value_t = false)]
     strict_config: bool,
 
@@ -556,7 +568,7 @@ struct AppServerCommand {
     #[command(flatten)]
     code_mode_host: codex_app_server::AppServerCodeModeHostArgs,
 
-    /// Error out when config.toml contains fields that are not recognized by this version of Codex.
+    /// Error out when config.toml contains fields that are not recognized by this version of Zuno.
     #[arg(long = "strict-config", default_value_t = false)]
     strict_config: bool,
 
@@ -604,7 +616,7 @@ struct ExecServerCommand {
     #[command(subcommand)]
     command: Option<ExecServerSubcommand>,
 
-    /// Error out when config.toml contains fields that are not recognized by this version of Codex.
+    /// Error out when config.toml contains fields that are not recognized by this version of Zuno.
     #[arg(
         id = "exec_server_strict_config",
         long = "strict-config",
@@ -891,57 +903,15 @@ fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run the update action and print the result.
+/// Automatic replacement is deliberately disabled for the first Zuno source-fork release.
 fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
-    println!();
-    let cmd_str = action.command_str();
-    println!("Updating Codex via `{cmd_str}`...");
-    let status = {
-        #[cfg(windows)]
-        {
-            let (cmd, args) = action.command_args();
-            let cmd = if action == UpdateAction::StandaloneWindows {
-                // These args contain PowerShell metacharacters, so do not let
-                // PATHEXT select a batch shim for this action.
-                "powershell.exe"
-            } else {
-                cmd
-            };
-            let path_env =
-                std::env::var_os("PATH").ok_or_else(|| anyhow::anyhow!("PATH is not set"))?;
-            let command_path = resolve_windows_update_command_from_path(cmd, &path_env)?;
-            // Do not let a project-local command or package-manager config
-            // influence the updater after the user accepts the update prompt.
-            let update_cwd = tempfile::tempdir()?;
-            // Resolve through PATH without consulting the project cwd. When
-            // this returns a .cmd/.bat shim, std::process::Command routes the
-            // absolute path through the system command processor.
-            std::process::Command::new(command_path)
-                .args(args)
-                .current_dir(update_cwd.path())
-                .status()?
-        }
-        #[cfg(not(windows))]
-        {
-            let (cmd, args) = action.command_args();
-            let command_path = crate::wsl_paths::normalize_for_wsl(cmd);
-            let normalized_args: Vec<String> = args
-                .iter()
-                .map(crate::wsl_paths::normalize_for_wsl)
-                .collect();
-            std::process::Command::new(&command_path)
-                .args(&normalized_args)
-                .status()?
-        }
-    };
-    if !status.success() {
-        anyhow::bail!("`{cmd_str}` failed with status {status}");
-    }
-    println!("\n🎉 Update ran successfully! Please restart Codex.");
-    Ok(())
+    let _ = action;
+    anyhow::bail!(
+        "Automatic Zuno update is disabled until a Zuno-owned atomic installer passes all platform gates. Update manually from https://github.com/sunerpy/zuno/releases."
+    )
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn resolve_windows_update_command_from_path(
     command: &str,
     path_env: &std::ffi::OsStr,
@@ -962,7 +932,7 @@ fn run_update_command() -> anyhow::Result<()> {
     #[cfg(debug_assertions)]
     {
         anyhow::bail!(
-            "`codex update` is not available in debug builds. Install a release build of Codex to use this command."
+            "`zuno update` is not available in debug builds. Use a verified Zuno release package from https://github.com/sunerpy/zuno/releases."
         );
     }
 
@@ -970,7 +940,7 @@ fn run_update_command() -> anyhow::Result<()> {
     {
         let Some(action) = codex_tui::get_update_action() else {
             anyhow::bail!(
-                "Could not detect the Codex installation method. Please update manually: https://developers.openai.com/codex/cli/"
+                "Automatic Zuno update is disabled until a Zuno-owned atomic installer passes all platform gates. Update manually from https://github.com/sunerpy/zuno/releases."
             );
         };
         run_update_action(action)
@@ -1222,6 +1192,34 @@ async fn cli_main(
             )
             .await?;
             handle_app_exit(exit_info)?;
+        }
+        Some(Subcommand::Acp(acp_cli)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "acp",
+            )?;
+            let strict_config = acp_cli.strict_config || root_strict_config;
+            let subcommand_selected_permission_mode = acp_cli.shared.sandbox_mode.is_some()
+                || acp_cli.shared.auto_review
+                || acp_cli.shared.dangerously_bypass_approvals_and_sandbox;
+            let mut acp_interactive = interactive;
+            acp_interactive
+                .shared
+                .apply_subcommand_overrides(acp_cli.shared);
+            if subcommand_selected_permission_mode {
+                acp_interactive.approval_policy = None;
+            }
+            acp_interactive
+                .shared
+                .take_auto_review_config_overrides(&mut root_config_overrides);
+            acp_cmd::run(
+                root_config_overrides,
+                acp_interactive,
+                arg0_paths.clone(),
+                strict_config,
+            )
+            .await?;
         }
         Some(Subcommand::Exec(mut exec_cli)) => {
             reject_remote_mode_for_subcommand(
@@ -1897,6 +1895,7 @@ fn profile_v2_for_subcommand<'a>(
 
     match subcommand {
         Subcommand::Agents(_)
+        | Subcommand::Acp(_)
         | Subcommand::Exec(_)
         | Subcommand::Review(_)
         | Subcommand::Resume(_)
@@ -1911,7 +1910,7 @@ fn profile_v2_for_subcommand<'a>(
             subcommand: DebugSubcommand::PromptInput(_),
         }) => Ok(Some(profile_v2)),
         _ => anyhow::bail!(
-            "--profile only applies to runtime commands and `codex mcp`: `codex`, `codex exec`, `codex review`, `codex resume`, `codex queue`, `codex archive`, `codex delete`, `codex unarchive`, `codex fork`, `codex mcp`, `codex sandbox`, and `codex debug prompt-input`."
+            "--profile only applies to runtime commands and `zuno mcp`: `zuno`, `zuno acp`, `zuno exec`, `zuno review`, `zuno resume`, `zuno queue`, `zuno archive`, `zuno delete`, `zuno unarchive`, `zuno fork`, `zuno mcp`, `zuno sandbox`, and `zuno debug prompt-input`."
         ),
     }
 }
@@ -2470,6 +2469,7 @@ fn reject_unsupported_worktree_for_subcommand(
     subcommand: &Option<Subcommand>,
 ) -> anyhow::Result<()> {
     let subcommand_worktree = match subcommand {
+        Some(Subcommand::Acp(command)) => command.shared.worktree,
         Some(Subcommand::Exec(command)) => command.shared.worktree,
         Some(Subcommand::Resume(command)) => command.config_overrides.0.shared.worktree,
         Some(Subcommand::Fork(command)) => command.config_overrides.0.shared.worktree,
@@ -2541,6 +2541,7 @@ fn unsupported_subcommand_name_for_strict_config(
 ) -> Option<&'static str> {
     match subcommand {
         None
+        | Some(Subcommand::Acp(_))
         | Some(Subcommand::Agents(_))
         | Some(Subcommand::Exec(_))
         | Some(Subcommand::Review(_))
@@ -2984,7 +2985,7 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
 
 fn print_completion(cmd: CompletionCommand) {
     let mut app = MultitoolCli::command();
-    let name = "codex";
+    let name = "zuno";
     generate(cmd.shell, &mut app, name, &mut std::io::stdout());
 }
 
@@ -2995,6 +2996,13 @@ mod tests {
     use codex_protocol::ThreadId;
     use codex_tui::TokenUsage;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn command_metadata_uses_zuno_product_identity() {
+        let command = MultitoolCli::command();
+        assert_eq!(command.get_name(), "zuno");
+        assert!(command.render_version().starts_with("zuno "));
+    }
 
     #[test]
     fn interactive_tui_future_stays_bounded() {
@@ -3283,6 +3291,12 @@ mod tests {
     #[test]
     fn profile_v2_is_allowed_for_runtime_subcommands() {
         assert_eq!(
+            profile_v2_for_args(&["codex", "--profile", "work", "acp"])
+                .expect("acp supports profile-v2")
+                .as_deref(),
+            Some("work")
+        );
+        assert_eq!(
             profile_v2_for_args(&["codex", "--profile", "work", "resume"])
                 .expect("resume supports profile-v2")
                 .as_deref(),
@@ -3306,6 +3320,37 @@ mod tests {
                 .as_deref(),
             Some("work")
         );
+    }
+
+    #[test]
+    fn acp_parses_runtime_options_on_both_sides_of_subcommand() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "--model",
+            "root-model",
+            "acp",
+            "--model",
+            "acp-model",
+            "--strict-config",
+            "--cd",
+            "/tmp",
+        ])
+        .expect("parse native ACP command");
+
+        let Some(Subcommand::Acp(acp)) = cli.subcommand else {
+            panic!("expected ACP subcommand");
+        };
+        let mut shared = cli.interactive.shared.into_inner();
+        shared.apply_subcommand_overrides(acp.shared);
+        assert_eq!(shared.model.as_deref(), Some("acp-model"));
+        assert_eq!(shared.cwd.as_deref(), Some(std::path::Path::new("/tmp")));
+        assert!(acp.strict_config);
+    }
+
+    #[test]
+    fn acp_is_visible_in_top_level_help() {
+        let help = help_from_args(&["codex", "--help"]);
+        assert!(help.contains("  acp "), "{help}");
     }
 
     #[test]

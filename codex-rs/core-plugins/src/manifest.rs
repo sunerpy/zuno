@@ -58,6 +58,10 @@ struct RawPluginManifest {
     #[serde(default)]
     skills: Option<RawPluginManifestPaths>,
     #[serde(default)]
+    workflows: Option<RawPluginManifestPaths>,
+    #[serde(default)]
+    agent_backends: Option<String>,
+    #[serde(default)]
     mcp_servers: Option<RawPluginManifestMcpServers>,
     #[serde(default)]
     apps: Option<String>,
@@ -298,6 +302,8 @@ fn resolve_raw_plugin_manifest(
         description,
         keywords,
         skills,
+        workflows,
+        agent_backends,
         mcp_servers,
         apps,
         hooks,
@@ -394,6 +400,12 @@ fn resolve_raw_plugin_manifest(
         keywords,
         paths: codex_plugin::manifest::PluginManifestPaths {
             skills: resolve_manifest_paths(plugin_root, "skills", skills.as_ref()),
+            workflows: resolve_manifest_paths(plugin_root, "workflows", workflows.as_ref()),
+            agent_backends: resolve_manifest_path(
+                plugin_root,
+                "agentBackends",
+                agent_backends.as_deref(),
+            ),
             mcp_servers: resolve_manifest_mcp_servers(plugin_root, mcp_servers),
             apps: resolve_manifest_path(plugin_root, "apps", apps.as_deref()),
             hooks: resolve_manifest_hooks(plugin_root, hooks),
@@ -977,6 +989,8 @@ mod tests {
             r#"{
   "name": "demo-plugin",
   "skills": "./skills",
+  "workflows": ["./workflows/frontend.yaml"],
+  "agentBackends": "./agent-backends.json",
   "mcpServers": "./.mcp.json",
   "apps": "./apps",
   "hooks": "./hooks.json",
@@ -997,6 +1011,16 @@ mod tests {
                 keywords: Vec::new(),
                 paths: PluginManifestPaths {
                     skills: vec![plugin_root.join("skills").expect("skills URI")],
+                    workflows: vec![
+                        plugin_root
+                            .join("workflows/frontend.yaml")
+                            .expect("workflow URI")
+                    ],
+                    agent_backends: Some(
+                        plugin_root
+                            .join("agent-backends.json")
+                            .expect("Agent backends URI"),
+                    ),
                     mcp_servers: Some(PluginManifestMcpServers::Path(
                         plugin_root.join(".mcp.json").expect("MCP URI"),
                     )),

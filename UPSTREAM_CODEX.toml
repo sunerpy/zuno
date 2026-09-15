@@ -1,0 +1,20 @@
+schema_version = 1
+project = "zuno"
+strategy = "codex-source-fork"
+
+[baseline]
+release_tag = "rust-v0.154.0"
+release_commit = "6b9826e3aa83b1a5947db50f4332cb9c65f1b340"
+release_tree = "74ba48a4b6b086beb9226a79ffe0f3d9f6d40f52"
+observed_main_commit = "a8964cb1bad67bc26a826fb07d1bef99c6a3f008"
+observed_at = "2026-09-15T07:07:46Z"
+
+[legacy]
+release_tag = "v0.10.39"
+release_commit = "ceacceeb43486bb7c14e745802d496ecf2e81f30"
+branch = "legacy/v0.10"
+
+[sync]
+remote = "upstream"
+candidate_only = true
+automatic_merge = false

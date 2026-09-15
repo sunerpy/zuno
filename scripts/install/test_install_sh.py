@@ -17,6 +17,51 @@ MISMATCH_VERSION = "0.145.0"
 
 
 class InstallShTest(unittest.TestCase):
+    def test_zuno_default_denial_has_no_network_or_install_side_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            request_log = root / "requests.log"
+            fake_curl = bin_dir / "curl"
+            fake_curl.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"$ZUNO_TEST_REQUEST_LOG\"\nexit 99\n",
+                encoding="utf-8",
+            )
+            fake_curl.chmod(0o755)
+
+            home = root / "home"
+            home.mkdir()
+            codex_home = root / "codex-home"
+            install_dir = root / "install-bin"
+            env = os.environ.copy()
+            env.pop("ZUNO_ALLOW_UPSTREAM_CODEX_INSTALLER", None)
+            env.update(
+                {
+                    "CODEX_HOME": str(codex_home),
+                    "CODEX_INSTALL_DIR": str(install_dir),
+                    "HOME": str(home),
+                    "PATH": f"{bin_dir}:/usr/bin:/bin",
+                    "SHELL": "/bin/sh",
+                    "ZUNO_TEST_REQUEST_LOG": str(request_log),
+                }
+            )
+
+            result = subprocess.run(
+                ["/bin/sh", str(INSTALL_SCRIPT)],
+                capture_output=True,
+                check=False,
+                env=env,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 64)
+            self.assertIn("inherited Codex installer is disabled in Zuno", result.stderr)
+            self.assertIn("https://github.com/sunerpy/zuno/releases", result.stderr)
+            self.assertFalse(request_log.exists(), "the denied installer attempted network I/O")
+            self.assertFalse(codex_home.exists(), "the denied installer wrote CODEX_HOME")
+            self.assertFalse(install_dir.exists(), "the denied installer wrote its install root")
+
     def test_metadata_fetch_failure_is_not_reported_as_missing_assets(self) -> None:
         result, requests = run_installer(VERSION, metadata_failure=True)
 
@@ -679,6 +724,10 @@ def run_installer_in(
             "HOME": str(home),
             "PATH": f"{bin_dir}:/usr/bin:/bin",
             "SHELL": "/bin/sh",
+            # Every test below this helper intentionally exercises the inherited
+            # upstream installer. Zuno product paths omit this explicit opt-in
+            # and must fail before performing network or filesystem I/O.
+            "ZUNO_ALLOW_UPSTREAM_CODEX_INSTALLER": "1",
         }
     )
     if use_mirror is None:

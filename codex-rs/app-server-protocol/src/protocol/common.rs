@@ -136,6 +136,7 @@ pub enum ClientRequestSerializationScope {
     FuzzyFileSearchSession { session_id: String },
     FsWatch { watch_id: String },
     McpOauth { server_name: String },
+    WorkflowRun { run_id: String },
 }
 
 macro_rules! serialization_scope_expr {
@@ -201,6 +202,11 @@ macro_rules! serialization_scope_expr {
     ($actual_params:ident, mcp_oauth_server($params:ident . $field:ident)) => {
         Some(ClientRequestSerializationScope::McpOauth {
             server_name: $actual_params.$field.clone(),
+        })
+    };
+    ($actual_params:ident, workflow_run_id($params:ident . $field:ident)) => {
+        Some(ClientRequestSerializationScope::WorkflowRun {
+            run_id: $actual_params.$field.clone(),
         })
     };
 }
@@ -1359,6 +1365,43 @@ client_request_definitions! {
         response: v2::ProcessResizePtyResponse,
     },
 
+    /// Discover user-, project-, and plugin-owned workflows.
+    WorkflowList => "workflow/list" {
+        params: v2::WorkflowListParams,
+        serialization: global("workflows"),
+        response: v2::WorkflowListResponse,
+    },
+    /// Read one exact discovered workflow source document.
+    WorkflowRead => "workflow/read" {
+        params: v2::WorkflowReadParams,
+        serialization: global_shared_read("workflows"),
+        response: v2::WorkflowReadResponse,
+    },
+    /// Validate a workflow document without installing or executing it.
+    WorkflowValidate => "workflow/validate" {
+        params: v2::WorkflowValidateParams,
+        serialization: None,
+        response: v2::WorkflowValidateResponse,
+    },
+    /// Durably accept a workflow run and return before execution completes.
+    WorkflowStart => "workflow/start" {
+        params: v2::WorkflowStartParams,
+        serialization: workflow_run_id(params.run_id),
+        response: v2::WorkflowStartResponse,
+    },
+    /// Read a durable workflow run and its host-call ledger.
+    WorkflowRunRead => "workflow/run/read" {
+        params: v2::WorkflowRunReadParams,
+        serialization: workflow_run_id(params.run_id),
+        response: v2::WorkflowRunReadResponse,
+    },
+    /// Request idempotent cancellation of a durable workflow run.
+    WorkflowRunCancel => "workflow/run/cancel" {
+        params: v2::WorkflowRunCancelParams,
+        serialization: workflow_run_id(params.run_id),
+        response: v2::WorkflowRunCancelResponse,
+    },
+
     ConfigRead => "config/read" {
         params: v2::ConfigReadParams,
         serialization: global_shared_read("config"),
@@ -1892,6 +1935,7 @@ server_notification_definitions! {
     ThreadGoalCleared => "thread/goal/cleared" (v2::ThreadGoalClearedNotification),
     #[experimental("thread/queue/changed")]
     ThreadQueueChanged => "thread/queue/changed" (v2::ThreadQueueChangedNotification),
+    WorkflowRunUpdated => "workflow/run/updated" (v2::WorkflowRunUpdatedNotification),
     #[experimental("project/changed")]
     ProjectChanged => "project/changed" (v2::ProjectChangedNotification),
     #[experimental("thread/project/updated")]
