@@ -49,7 +49,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev bubblewrap
       - name: Check Rust formatting
         run: cargo fmt --all -- --config imports_granularity=Item --check
       - name: Validate workflow and packaging tooling
@@ -194,7 +194,7 @@ jobs:
           bash .github/scripts/build-codex-package-archive.sh \
             --target "$TARGET" \
             --bundle zuno \
-            --entrypoint-dir "codex-rs/target/${TARGET}/release" \
+            --entrypoint-dir "${CARGO_TARGET_DIR}/${TARGET}/release" \
             --archive-dir "codex-rs/dist/${TARGET}"
       - name: Smoke packaged native ACP and layout
         shell: bash
@@ -211,7 +211,7 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-          ZUNO_SANDBOX_E2E_HELPER: ${{ github.workspace }}/codex-rs/target/${{ matrix.target }}/release/zuno
+          ZUNO_SANDBOX_E2E_HELPER: ${{ env.CARGO_TARGET_DIR }}/${{ matrix.target }}/release/zuno
         run: >-
           cargo test --locked --target "$TARGET"
           -p codex-agent-extension
