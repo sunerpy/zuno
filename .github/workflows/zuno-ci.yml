@@ -109,7 +109,10 @@ jobs:
   package:
     name: Package ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    # Cold release LTO on Intel macOS and x86_64 Windows exceeds 90 minutes.
+    # Keep every native target and capability; allow the build to finish instead
+    # of substituting cross compilation or dropping package companions.
+    timeout-minutes: 180
     permissions:
       contents: read
       id-token: write

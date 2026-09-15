@@ -177,6 +177,7 @@ def main() -> int:
         zuno_ci,
         "doctor::updates::tests::preview_update_check_is_explicitly_offline_and_non_mutating",
     )
+    require(zuno_ci, "timeout-minutes: 180")
     require(zuno_ci, "bubblewrap")
     require(zuno_ci, '--entrypoint-dir "${CARGO_TARGET_DIR}/${TARGET}/release"')
     require(zuno_ci, "Smoke external Agent host sandbox")
