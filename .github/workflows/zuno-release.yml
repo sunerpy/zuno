@@ -141,8 +141,9 @@ jobs:
           [[ "$(jq -r '.path' <<<"$run")" == '.github/workflows/zuno-ci.yml' ]]
           [[ "$(jq -r '.head_sha' <<<"$run")" == "$EXPECTED_HEAD_SHA" ]]
           [[ "$(jq -r '.run_attempt' <<<"$run")" == "$CANDIDATE_RUN_ATTEMPT" ]]
-          jq -e --argjson number "$PR_NUMBER" \
-            '[.pull_requests[].number] | index($number) != null' <<<"$run" >/dev/null
+          # The Actions run API may return an empty pull_requests array after
+          # merge. PR identity is bound independently by the PR head check above
+          # and the sealed manifest check below; do not depend on this advisory field.
           {
             echo "merge_sha=$merge_sha"
             echo "tree_sha=$merge_tree"
