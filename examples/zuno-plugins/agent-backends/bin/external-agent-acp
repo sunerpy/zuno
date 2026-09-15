@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Minimal ACP v1 stdio provider for the Zuno plugin packaging example."""
+
+import json
+import sys
+
+
+def reply(request_id, result):
+    print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+
+
+for line in sys.stdin:
+    request = json.loads(line)
+    request_id = request.get("id")
+    method = request.get("method")
+    params = request.get("params") or {}
+    if request_id is None:
+        continue
+    if method == "initialize":
+        reply(request_id, {"protocolVersion": 1, "agentInfo": {"name": "Example ACP", "version": "1"}})
+    elif method == "session/new":
+        reply(request_id, {"sessionId": "example-session"})
+    elif method in {"session/set_model", "session/set_config_option"}:
+        reply(request_id, {})
+    elif method == "session/prompt":
+        text = "".join(
+            block.get("text", "")
+            for block in params.get("prompt", [])
+            if block.get("type") == "text"
+        )
+        print(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": params.get("sessionId"),
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": text or "Example ACP completed"},
+                        },
+                    },
+                }
+            ),
+            flush=True,
+        )
+        reply(request_id, {"stopReason": "end_turn"})
+    else:
+        print(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32601, "message": f"unsupported method: {method}"},
+                }
+            ),
+            flush=True,
+        )

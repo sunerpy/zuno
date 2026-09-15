@@ -1,0 +1,367 @@
+name: Zuno CI
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zuno-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref_name != 'main' }}
+
+env:
+  CODEX_REPO_ROOT: ${{ github.workspace }}
+  CARGO_INCREMENTAL: "0"
+  RUST_MIN_STACK: "33554432"
+  SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+
+jobs:
+  static:
+    name: Zuno static and runtime tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/setup-ci
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: clippy,rustfmt
+      - name: Install actionlint
+        shell: bash
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.11
+          actionlint_bin="$(go env GOBIN)"
+          if [[ -z "$actionlint_bin" ]]; then
+            actionlint_bin="$(go env GOPATH)/bin"
+          fi
+          "$actionlint_bin/actionlint" -version
+          echo "$actionlint_bin" >> "$GITHUB_PATH"
+      - name: Install Linux sandbox build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev bubblewrap
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --config imports_granularity=Item --check
+      - name: Validate workflow and packaging tooling
+        working-directory: .
+        shell: bash
+        run: |
+          python3 scripts/test_zuno_upstream.py
+          CODEX_REPO_ROOT="$PWD" PYTHONPATH="$PWD/scripts" \
+            python3 -m unittest \
+              codex_package.test_cargo \
+              codex_package.test_cli \
+              codex_package.test_layout
+          python3 -m py_compile scripts/smoke_zuno_package.py
+          python3 scripts/check_zuno_update_boundaries.py
+          actionlint .github/workflows/zuno-ci.yml .github/workflows/zuno-release.yml .github/workflows/zuno-upstream-sync.yml
+      - name: Verify generated App Server schemas
+        working-directory: .
+        shell: bash
+        run: |
+          just write-app-server-schema
+          git diff --exit-code -- codex-rs/app-server-protocol/schema
+      - name: Test workflow and backend crates
+        shell: bash
+        run: |
+          cargo test -p zuno-workflows
+          cargo test -p codex-plugin
+          cargo test -p codex-core-plugins --lib -- --test-threads=1
+          cargo test -p codex-agent-extension
+          cargo test -p zuno-acp
+          cargo test -p codex-cli --test acp
+          cargo test -p codex-app-server --test all workflow_
+          cargo test -p codex-app-server --lib request_processors::workflows::backend_factory::tests::
+          cargo test -p codex-app-server-daemon tests::zuno_blocks_managed_daemon_mutations_before_filesystem_access --lib
+          cargo test -p codex-tui update_action --lib
+          cargo test -p codex-tui update_versions --lib
+          cargo test -p codex-cli --bin zuno doctor::updates::tests::preview_update_check_is_explicitly_offline_and_non_mutating
+      - name: Check optimized Zuno type graph
+        run: cargo check --release -p codex-cli --bin zuno
+      - name: Lint Zuno product surface
+        run: >-
+          cargo clippy
+          -p codex-plugin
+          -p codex-core-plugins
+          -p zuno-workflows
+          -p codex-agent-extension
+          -p zuno-acp
+          -p codex-app-server
+          -p codex-tui
+          -p codex-cli
+          --all-targets -- -D warnings
+      - name: Require a clean checkout
+        working-directory: .
+        run: |
+          git diff --check
+          git diff --exit-code
+
+  package:
+    name: Package ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    # Cold release LTO on Intel macOS and x86_64 Windows exceeds 90 minutes.
+    # Keep every native target and capability; allow the build to finish instead
+    # of substituting cross compilation or dropping package companions.
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            os: linux
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            os: linux
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            os: macos
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            os: macos
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            os: windows
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            os: windows
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13"
+          architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+      - uses: ./.github/actions/setup-ci
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: zuno-candidate-${{ matrix.target }}
+          cache-targets: false
+          cache-bin: false
+      - name: Install Linux package build dependencies
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
+      - name: Configure V8 artifact
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: ${{ matrix.target }}
+      - name: Configure MSVC linker
+        if: matrix.os == 'windows'
+        uses: ./.github/actions/setup-msvc-env
+        with:
+          target: ${{ matrix.target }}
+      - name: Build Zuno and package companions
+        working-directory: codex-rs
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.os }}
+        run: |
+          set -euo pipefail
+          binaries=(--bin zuno --bin codex-code-mode-host)
+          if [[ "$PLATFORM" == linux ]]; then
+            binaries+=(--bin bwrap)
+          elif [[ "$PLATFORM" == windows ]]; then
+            binaries+=(--bin codex-command-runner --bin codex-windows-sandbox-setup)
+          fi
+          cargo build --locked --release --target "$TARGET" "${binaries[@]}"
+      - name: Build canonical Zuno package archives
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p "codex-rs/dist/${TARGET}"
+          bash .github/scripts/build-codex-package-archive.sh \
+            --target "$TARGET" \
+            --bundle zuno \
+            --entrypoint-dir "${CARGO_TARGET_DIR}/${TARGET}/release" \
+            --archive-dir "codex-rs/dist/${TARGET}"
+      - name: Smoke packaged native ACP and layout
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          python3 scripts/smoke_zuno_package.py \
+            --archive "codex-rs/dist/${TARGET}/zuno-package-${TARGET}.tar.gz" \
+            --target "$TARGET" \
+            --report "codex-rs/dist/${TARGET}/smoke-${TARGET}.json"
+      - name: Smoke external Agent host sandbox
+        if: matrix.os == 'linux'
+        working-directory: codex-rs
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ZUNO_SANDBOX_E2E_HELPER: ${{ env.CARGO_TARGET_DIR }}/${{ matrix.target }}/release/zuno
+        run: >-
+          cargo test --locked --target "$TARGET"
+          -p codex-agent-extension
+          one_shot::claude_code::tests::workspace_profile_confines_the_external_process_on_linux
+          -- --ignored --exact
+      - name: Attest candidate archives
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: codex-rs/dist/${{ matrix.target }}/zuno-package-${{ matrix.target }}.tar.gz
+      - name: Upload native candidate
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: zuno-package-${{ matrix.target }}
+          path: |
+            codex-rs/dist/${{ matrix.target }}/zuno-package-${{ matrix.target }}.tar.gz
+            codex-rs/dist/${{ matrix.target }}/smoke-${{ matrix.target }}.json
+          if-no-files-found: error
+          retention-days: 14
+
+  seal:
+    name: Seal exact candidate bytes
+    needs: [static, package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: zuno-package-*
+          path: downloaded
+          merge-multiple: true
+      - name: Bind candidate to PR head and tree
+        shell: bash
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          set -euo pipefail
+          mkdir candidate
+          cp downloaded/zuno-package-*.tar.gz downloaded/smoke-*.json candidate/
+          find candidate -maxdepth 1 -type f \
+            -name 'zuno-package-*.tar.gz' \
+            -print0 | sort -z | xargs -0 sha256sum | sed 's#  candidate/#  #' > candidate/zuno-package_SHA256SUMS
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+
+          root = Path("candidate")
+          targets = [
+              "aarch64-apple-darwin",
+              "aarch64-pc-windows-msvc",
+              "aarch64-unknown-linux-gnu",
+              "x86_64-apple-darwin",
+              "x86_64-pc-windows-msvc",
+              "x86_64-unknown-linux-gnu",
+          ]
+          for target in targets:
+              assert (root / f"zuno-package-{target}.tar.gz").is_file(), target
+              assert (root / f"smoke-{target}.json").is_file(), target
+          archives = sorted(root.glob("zuno-package-*.tar.gz"))
+          assert len(archives) == 6, len(archives)
+          version = next(
+              line.split('"')[1]
+              for line in Path("codex-rs/Cargo.toml").read_text().splitlines()
+              if line.startswith("version = ")
+          )
+          files = []
+          for path in sorted(root.iterdir()):
+              if path.is_file() and path.name != "candidate-manifest.json":
+                  data = path.read_bytes()
+                  files.append({
+                      "name": path.name,
+                      "size": len(data),
+                      "sha256": hashlib.sha256(data).hexdigest(),
+                  })
+          manifest = {
+              "schemaVersion": 1,
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "workflow": ".github/workflows/zuno-ci.yml",
+              "runId": int(os.environ["GITHUB_RUN_ID"]),
+              "runAttempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "pullRequest": int(os.environ["PR_NUMBER"]),
+              "headRepository": os.environ["HEAD_REPOSITORY"],
+              "headSha": os.environ["HEAD_SHA"],
+              "headParents": subprocess.check_output(
+                  ["git", "show", "-s", "--format=%P", "HEAD"], text=True
+              ).split(),
+              "treeSha": subprocess.check_output(
+                  ["git", "rev-parse", "HEAD^{tree}"], text=True
+              ).strip(),
+              "version": version,
+              "targets": targets,
+              "files": files,
+          }
+          (root / "candidate-manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+          )
+          PY
+          test "$(wc -l < candidate/zuno-package_SHA256SUMS)" -eq 6
+      - name: Attest sealed candidate manifest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: candidate/candidate-manifest.json
+      - name: Upload sealed candidate
+        id: upload_candidate
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: zuno-candidate
+          path: candidate/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Record exact promotion inputs
+        shell: bash
+        env:
+          ARTIFACT_ID: ${{ steps.upload_candidate.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload_candidate.outputs.artifact-digest }}
+        run: |
+          {
+            echo "candidate_run_id=${GITHUB_RUN_ID}"
+            echo "candidate_run_attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "candidate_artifact_id=${ARTIFACT_ID}"
+            echo "candidate_artifact_digest=${ARTIFACT_DIGEST}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  required:
+    name: zuno/pr-gate
+    if: always()
+    needs: [static, package, seal]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require exact candidate success
+        shell: bash
+        env:
+          STATIC_RESULT: ${{ needs.static.result }}
+          PACKAGE_RESULT: ${{ needs.package.result }}
+          SEAL_RESULT: ${{ needs.seal.result }}
+        run: |
+          set -euo pipefail
+          [[ "$STATIC_RESULT" == success ]]
+          [[ "$PACKAGE_RESULT" == success ]]
+          [[ "$SEAL_RESULT" == success ]]

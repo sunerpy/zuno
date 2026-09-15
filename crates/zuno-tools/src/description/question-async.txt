@@ -1,5 +1,0 @@
-Ask optional clarifying questions without waiting or ending the turn. The question is durable and the user's reply arrives later as new input. Continue independent work and state any assumptions; skipping or leaving a question unanswered is never consent. In Work and Goal, question also returns immediately for optional clarification. Use goal_request_input for required Goal input and plan_exit for explicit Plan-to-Work authorization.
-
-Unattended ordinary questions auto-defer after 120 seconds without submitting an answer or waking the model. User interaction snoozes the deadline. The stable question and saved drafts remain available for a later answer; no highlighted or recommended choice is automatic.
-
-Only the root agent asks ordinary user questions. A child returns any required decision and evidence to its parent instead of asking the user directly. This is not a replacement for native permission or required external-input controls.

@@ -1,26 +1,97 @@
-/experiments
-/target
-/examples/plugins/wasi-word-count/plugin.wasm
+# deps
+# Node.js dependencies
+node_modules
+.pnpm-store
+.pnpm-debug.log
 
-# Release archives and the unpacked artifact `make smoke-artifact` exercises.
-# Build outputs, never source.
-/dist
+# Keep pnpm-lock.yaml
+!pnpm-lock.yaml
 
-# Local agent working directories. These hold a maintainer's own plans,
-# measurement transcripts, and reference clones of the projects this design
-# draws on. They are private working material, never distributed source, and
-# nothing under `crates/` or `docs/` may depend on a path inside them.
-.omo/
-.zuno/
+# build
+dist/
+bazel-*
+user.bazelrc
+build/
+out/
+storybook-static/
 
-*.pdb
+# ignore README for publishing
+codex-cli/README.md
+
+# ignore Nix derivation results
+result
+
+# editor
+.vscode/
+.idea/
+.history/
+.zed/
+*.swp
+*~
+
+# cli tools
+CLAUDE.md
+.claude/
+AGENTS.override.md
+
+# caches
+.cache/
+.codegraph/
+.turbo/
+.parcel-cache/
+.eslintcache
+.nyc_output/
+.jest/
+*.tsbuildinfo
+
+# logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# env
+.env*
+!.env.example
+.venv/
+
+# package
+*.tgz
+
+# ci
+.vercel/
+.netlify/
+/.tmp/sdk-ci/
+/upstream-rusty-v8/
+
+# patches
+apply_patch/
+
+# coverage
+coverage/
+
+# personal files
+personal/
+
+# os
 .DS_Store
+Thumbs.db
+Icon?
+.Spotlight-V100/
+
+# Unwanted package managers
+.yarn/
+yarn.lock
+
+# release
+package.json-e
+session.ts-e
+CHANGELOG.ignore.md
+
+# nix related
+.direnv
+.envrc
+
+# Python bytecode files
 __pycache__/
-
-# CodeGraph's local index: a derived artifact of this checkout, like /target.
-# Rebuilt by `codegraph init`; never a source of truth.
-/.codegraph
-
-# Scratch directories reviewers and subagents create while probing this checkout
-# (LSP sandboxes, worktree-scoped temp dirs). Derived, never source.
-/.tmp-*
+*.pyc
