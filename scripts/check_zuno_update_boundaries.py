@@ -190,6 +190,8 @@ def main() -> int:
     require(release, "git merge-base --is-ancestor \"$EXPECTED_HEAD_SHA\"")
     require(release, "candidate_run_attempt:")
     require(release, "candidate_artifact_id:")
+    reject(release, "[.pull_requests[].number]")
+    require(release, 'assert data["pullRequest"] == int(os.environ["PR_NUMBER"])')
     require(release, '[[ "${#merge_parents[@]}" -eq 2 ]]')
     require(release, '[[ "${merge_parents[0]}" == "$base_sha" ]]')
     require(release, '[[ "${merge_parents[1]}" == "$EXPECTED_HEAD_SHA" ]]')
