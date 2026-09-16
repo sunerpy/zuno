@@ -195,6 +195,11 @@ def main() -> int:
     require(release, '[[ "${#merge_parents[@]}" -eq 2 ]]')
     require(release, '[[ "${merge_parents[0]}" == "$base_sha" ]]')
     require(release, '[[ "${merge_parents[1]}" == "$EXPECTED_HEAD_SHA" ]]')
+    require(release, "-c user.name='github-actions[bot]'")
+    require(
+        release,
+        "-c user.email='41898282+github-actions[bot]@users.noreply.github.com'",
+    )
     upstream_sync = ".github/workflows/zuno-upstream-sync.yml"
     require(upstream_sync, 'plan_path="${RUNNER_TEMP}/upstream-plan.json"')
     reject(upstream_sync, "> upstream-plan.json")

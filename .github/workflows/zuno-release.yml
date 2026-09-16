@@ -247,7 +247,10 @@ jobs:
             git fetch --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
             [[ "$(git rev-parse "${RELEASE_TAG}^{commit}")" == "$MERGE_SHA" ]]
           else
-            git tag -a "$RELEASE_TAG" "$MERGE_SHA" -m "Zuno ${RELEASE_TAG#zuno-v} preview"
+            git \
+              -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              tag -a "$RELEASE_TAG" "$MERGE_SHA" -m "Zuno ${RELEASE_TAG#zuno-v} preview"
             git push origin "refs/tags/${RELEASE_TAG}"
           fi
       - name: Create or update draft release
