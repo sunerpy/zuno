@@ -251,7 +251,14 @@ jobs:
               -c user.name='github-actions[bot]' \
               -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
               tag -a "$RELEASE_TAG" "$MERGE_SHA" -m "Zuno ${RELEASE_TAG#zuno-v} preview"
-            git push origin "refs/tags/${RELEASE_TAG}"
+            credential_file="${RUNNER_TEMP}/zuno-release-git-credential"
+            trap 'rm -f "${credential_file}"' EXIT
+            printf 'https://x-access-token:%s@github.com\n' "$GH_TOKEN" > "$credential_file"
+            chmod 600 "$credential_file"
+            git \
+              -c credential.helper= \
+              -c credential.helper="store --file=${credential_file}" \
+              push origin "refs/tags/${RELEASE_TAG}"
           fi
       - name: Create or update draft release
         shell: bash

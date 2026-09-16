@@ -200,6 +200,11 @@ def main() -> int:
         release,
         "-c user.email='41898282+github-actions[bot]@users.noreply.github.com'",
     )
+    require(release, 'credential_file="${RUNNER_TEMP}/zuno-release-git-credential"')
+    require(release, 'trap \'rm -f "${credential_file}"\' EXIT')
+    require(release, 'chmod 600 "$credential_file"')
+    require(release, "-c credential.helper= \\")
+    require(release, '-c credential.helper="store --file=${credential_file}"')
     upstream_sync = ".github/workflows/zuno-upstream-sync.yml"
     require(upstream_sync, 'plan_path="${RUNNER_TEMP}/upstream-plan.json"')
     reject(upstream_sync, "> upstream-plan.json")
