@@ -108,6 +108,17 @@ It then creates the immutable tag `zuno-vX.Y.Z` on the merge commit, uploads
 the six archives, `zuno-package_SHA256SUMS`, smoke reports, and the manifest,
 re-downloads them to compare bytes, and publishes a non-latest prerelease.
 
+## Repository secret for a fully automatic gate
+
+Pull requests opened with the default `GITHUB_TOKEN` cannot start
+`pull_request` workflows, so `zuno/pr-gate` would not run on the candidate.
+Create a fine-grained personal access token scoped to this repository with
+**Contents: read and write** and **Pull requests: read and write**, and store it
+as the repository secret `ZUNO_UPSTREAM_SYNC_TOKEN`. The watcher uses it only
+for the push and PR steps. Without the secret the candidate PR still opens, the
+watcher leaves a comment, and closing and reopening the PR (or pushing to the
+branch) starts the gate by hand.
+
 ## Manual controls
 
 - Run the watcher immediately: **Actions → Prepare Codex upstream sync → Run

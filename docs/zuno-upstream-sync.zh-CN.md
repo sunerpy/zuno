@@ -90,6 +90,15 @@ cd .. && git add --all && git commit && git push -u origin upstream-sync/X.Y.Z
 `zuno-package_SHA256SUMS`、冒烟报告和 manifest，重新下载比对字节，最后发布为
 非 latest 的预览版。
 
+## 让门禁全自动的仓库密钥
+
+用默认 `GITHUB_TOKEN` 打开的 PR 不会触发 `pull_request` workflow，因此
+`zuno/pr-gate` 不会自动跑在候选上。请创建一个仅限本仓库的 fine-grained personal
+access token，授予 **Contents: read and write** 与 **Pull requests: read and
+write**，存为仓库 secret `ZUNO_UPSTREAM_SYNC_TOKEN`。巡检只在推送与开 PR 两步使用它。
+没有该 secret 时候选 PR 仍会打开，巡检会留言说明，关闭再重新打开 PR（或向分支推送）
+即可手动启动门禁。
+
 ## 手动控制
 
 - 立即巡检：**Actions → Prepare Codex upstream sync → Run workflow**（可指定精确标签）。

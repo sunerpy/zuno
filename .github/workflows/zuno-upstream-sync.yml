@@ -241,10 +241,16 @@ jobs:
           EOF
           git -C "${CANDIDATE}" show --stat --format='%H%n%s' HEAD | head -n 40
 
+      # Pushes and pull requests made with the default GITHUB_TOKEN do not
+      # trigger `pull_request` workflows, so the PR gate would never run on the
+      # candidate. Configure the ZUNO_UPSTREAM_SYNC_TOKEN secret (a fine-grained
+      # token with contents and pull-requests write on this repository) to get a
+      # fully automatic gate; without it the candidate PR still opens, and the
+      # summary explains how to start the gate by hand.
       - name: Push exact candidate branch
         if: steps.candidate.outputs.outcome == 'candidate'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.ZUNO_UPSTREAM_SYNC_TOKEN || github.token }}
           CANDIDATE: ${{ steps.candidate.outputs.candidate }}
           HEAD_BRANCH: ${{ steps.plan.outputs.branch }}
           REMOTE_SHA: ${{ steps.state.outputs.remote_sha }}
@@ -266,7 +272,8 @@ jobs:
       - name: Open or refresh review PR
         if: steps.candidate.outputs.outcome == 'candidate'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.ZUNO_UPSTREAM_SYNC_TOKEN || github.token }}
+          USING_DEFAULT_TOKEN: ${{ secrets.ZUNO_UPSTREAM_SYNC_TOKEN == '' }}
           HEAD_BRANCH: ${{ steps.plan.outputs.branch }}
           TARGET_TAG: ${{ steps.plan.outputs.target_tag }}
           TARGET_VERSION: ${{ steps.plan.outputs.target_version }}
@@ -328,6 +335,14 @@ jobs:
               --body "${body}")"
           fi
           echo "Candidate PR: ${pr_url}" >> "${GITHUB_STEP_SUMMARY}"
+          if [[ "${USING_DEFAULT_TOKEN}" == true ]]; then
+            {
+              echo
+              echo "> The candidate was pushed with the default GITHUB_TOKEN, which cannot start \`pull_request\` workflows."
+              echo "> Start the PR gate by closing and reopening the PR, or configure the \`ZUNO_UPSTREAM_SYNC_TOKEN\` secret for a fully automatic gate."
+            } >> "${GITHUB_STEP_SUMMARY}"
+            gh pr comment "${pr_url}" --body "This candidate was pushed with the default GITHUB_TOKEN, so \`zuno/pr-gate\` did not start automatically. Close and reopen the PR to run it, or configure the \`ZUNO_UPSTREAM_SYNC_TOKEN\` repository secret so future candidates gate on their own."
+          fi
 
           # A clean replay supersedes any open conflict report for this release.
           if [[ -n "${CONFLICT_ISSUE}" ]]; then
