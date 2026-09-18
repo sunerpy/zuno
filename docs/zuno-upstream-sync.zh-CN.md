@@ -62,17 +62,17 @@ python3 scripts/zuno_upstream.py --no-fetch prepare \
   --source main --target rust-vX.Y.Z \
   --branch upstream-sync/X.Y.Z \
   --worktree ../zuno-upstream-X.Y.Z
-# 冲突文件带有标记；modify/delete 会保留 Zuno 版本。UPSTREAM_CODEX.toml 已写入新 release。
-# 在 ../zuno-upstream-X.Y.Z 中处理标记后，重新生成派生产物：
-cd ../zuno-upstream-X.Y.Z/codex-rs
-cargo update --workspace
-python3 app-server-protocol/scripts/write_schema_fixtures.py
-python3 app-server-protocol/scripts/write_schema_fixtures.py --experimental
-cargo run -p codex-config-schema --bin codex-write-config-schema
-cd ../..
-# finalize 会拒绝残留的冲突标记，并以 main 与 release 为双父节点提交，带 Zuno-Source-Commit /
+# 以下命令都在仓库根目录执行。冲突文件带有标记；modify/delete 会保留 Zuno 版本。
+# UPSTREAM_CODEX.toml 已写入新 release。在 ../zuno-upstream-X.Y.Z 中处理标记后，重新生成派生产物：
+(cd ../zuno-upstream-X.Y.Z/codex-rs \
+  && cargo update --workspace \
+  && python3 app-server-protocol/scripts/write_schema_fixtures.py \
+  && python3 app-server-protocol/scripts/write_schema_fixtures.py --experimental \
+  && cargo run -p codex-config-schema --bin codex-write-config-schema)
+# finalize 会拒绝残留的冲突标记，使用 prepare 记录的 main 提交（传入不同的 --source 会被拒绝；
+# main 前进了就重新 prepare），并以 main 与 release 为双父节点提交，带 Zuno-Source-Commit /
 # Zuno-Upstream-* trailer：
-python3 scripts/zuno_upstream.py finalize --worktree ../zuno-upstream-X.Y.Z --source main
+python3 scripts/zuno_upstream.py finalize --worktree ../zuno-upstream-X.Y.Z
 git -C ../zuno-upstream-X.Y.Z push -u origin upstream-sync/X.Y.Z
 ```
 

@@ -747,6 +747,12 @@ class ZunoUpstreamTest(unittest.TestCase):
             self.assertEqual(unresolved.exception.details["conflicting_files"], ["shared"])
 
             (worktree / "shared").write_text("resolved\n")
+            # A source that moved on since prepare must not be attached silently.
+            git(repo.root, "checkout", "-q", "zuno")
+            repo.write("later", "moved on\n")
+            moved = repo.commit("zuno moved on")
+            with self.assertRaisesRegex(zuno_upstream.SyncError, "prepared from"):
+                zuno_upstream.finalize(worktree, "UPSTREAM_CODEX.toml", moved, None)
             finalized = zuno_upstream.finalize(worktree, "UPSTREAM_CODEX.toml", None, None)
             self.assertEqual(
                 git(worktree, "show", "-s", "--format=%P", finalized.commit).split(),

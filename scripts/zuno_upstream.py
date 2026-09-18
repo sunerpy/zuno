@@ -499,19 +499,29 @@ def finalize(
         raise SyncError(f"candidate worktree {worktree} is not on a branch")
     baseline = read_baseline(worktree / manifest_name)
     validate_baseline(worktree, baseline)
+    recorded = run(
+        worktree,
+        ["rev-parse", "--verify", "--quiet", f"{SOURCE_REF_PREFIX}{branch}^{{commit}}"],
+        check=False,
+    )
+    recorded_commit = recorded.stdout.strip() if recorded.returncode == 0 else ""
     if source:
         source_commit = resolve_commit(worktree, source)
-    else:
-        recorded = run(
-            worktree,
-            ["rev-parse", "--verify", "--quiet", f"{SOURCE_REF_PREFIX}{branch}^{{commit}}"],
-            check=False,
-        )
-        if recorded.returncode != 0 or not recorded.stdout.strip():
+        # The candidate tree was merged against the source that `prepare`
+        # recorded; attaching it to a different (for example newer) commit would
+        # silently drop whatever that commit changed.
+        if recorded_commit and recorded_commit != source_commit:
             raise SyncError(
-                f"no recorded source commit for {branch}; pass --source <commit> explicitly"
+                f"--source {source} resolves to {source_commit}, but this candidate was "
+                f"prepared from {recorded_commit}; re-run prepare against the new source "
+                "instead of finalizing a stale merge"
             )
-        source_commit = recorded.stdout.strip()
+    elif recorded_commit:
+        source_commit = recorded_commit
+    else:
+        raise SyncError(
+            f"no recorded source commit for {branch}; pass --source <commit> explicitly"
+        )
     if is_ancestor(worktree, baseline.release_commit, source_commit):
         raise SyncError(
             f"source {source_commit} already contains {baseline.release_tag}; nothing to merge"

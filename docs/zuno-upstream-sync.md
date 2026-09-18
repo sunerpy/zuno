@@ -76,18 +76,19 @@ python3 scripts/zuno_upstream.py --no-fetch prepare \
   --source main --target rust-vX.Y.Z \
   --branch upstream-sync/X.Y.Z \
   --worktree ../zuno-upstream-X.Y.Z
-# conflicted files carry markers; modify/delete pairs keep the Zuno version.
-# UPSTREAM_CODEX.toml already records the new release. Fix the markers in
-# ../zuno-upstream-X.Y.Z, then regenerate derived artifacts:
-cd ../zuno-upstream-X.Y.Z/codex-rs
-cargo update --workspace
-python3 app-server-protocol/scripts/write_schema_fixtures.py
-python3 app-server-protocol/scripts/write_schema_fixtures.py --experimental
-cargo run -p codex-config-schema --bin codex-write-config-schema
-cd ../..
-# finalize refuses leftover conflict markers and commits the merge of main and
-# the release with the Zuno-Source-Commit / Zuno-Upstream-* trailers:
-python3 scripts/zuno_upstream.py finalize --worktree ../zuno-upstream-X.Y.Z --source main
+# Everything below runs from the repository root. Conflicted files carry
+# markers; modify/delete pairs keep the Zuno version. UPSTREAM_CODEX.toml
+# already records the new release. Fix the markers in ../zuno-upstream-X.Y.Z,
+# then regenerate derived artifacts:
+(cd ../zuno-upstream-X.Y.Z/codex-rs \
+  && cargo update --workspace \
+  && python3 app-server-protocol/scripts/write_schema_fixtures.py \
+  && python3 app-server-protocol/scripts/write_schema_fixtures.py --experimental \
+  && cargo run -p codex-config-schema --bin codex-write-config-schema)
+# finalize refuses leftover conflict markers, uses the main commit recorded by
+# prepare (a different --source is rejected; re-run prepare if main moved), and
+# commits the merge with the Zuno-Source-Commit / Zuno-Upstream-* trailers:
+python3 scripts/zuno_upstream.py finalize --worktree ../zuno-upstream-X.Y.Z
 git -C ../zuno-upstream-X.Y.Z push -u origin upstream-sync/X.Y.Z
 ```
 

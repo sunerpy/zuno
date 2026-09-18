@@ -387,14 +387,17 @@ jobs:
             --source main --target ${TARGET_TAG} \\
             --branch upstream-sync/${TARGET_VERSION} \\
             --worktree ../zuno-upstream-${TARGET_VERSION}
-          # fix the conflict markers in the worktree above (the new baseline is already
-          # written to UPSTREAM_CODEX.toml), regenerate derived artifacts:
+          # Run from the repository root. Fix the conflict markers in the worktree above
+          # (the new baseline is already written to UPSTREAM_CODEX.toml), then regenerate
+          # derived artifacts:
           (cd ../zuno-upstream-${TARGET_VERSION}/codex-rs && cargo update --workspace \\
             && python3 app-server-protocol/scripts/write_schema_fixtures.py \\
             && python3 app-server-protocol/scripts/write_schema_fixtures.py --experimental \\
             && cargo run -p codex-config-schema --bin codex-write-config-schema)
-          # then commit as a merge of main and the release (finalize refuses leftover markers):
-          python3 scripts/zuno_upstream.py finalize --worktree ../zuno-upstream-${TARGET_VERSION} --source main
+          # Commit as a merge of the recorded main commit and the release. finalize refuses
+          # leftover markers and refuses a source that differs from the one prepare recorded;
+          # if main moved meanwhile, re-run prepare instead.
+          python3 scripts/zuno_upstream.py finalize --worktree ../zuno-upstream-${TARGET_VERSION}
           git -C ../zuno-upstream-${TARGET_VERSION} push -u origin upstream-sync/${TARGET_VERSION}
           \`\`\`
 
