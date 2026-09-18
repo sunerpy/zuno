@@ -47,7 +47,7 @@ const OPENAI_BUNDLED_ALPHA_MARKETPLACE_NAME: &str = "openai-bundled-alpha";
 const OPENAI_PRIMARY_RUNTIME_MARKETPLACE_NAME: &str = "openai-primary-runtime";
 
 #[derive(Debug, Parser)]
-#[command(bin_name = "codex plugin")]
+#[command(bin_name = "zuno plugin")]
 pub struct PluginCli {
     #[clap(flatten)]
     pub config_overrides: CliConfigOverrides,
@@ -79,8 +79,8 @@ pub enum PluginSubcommand {
 
 #[derive(Debug, Parser)]
 #[command(
-    bin_name = "codex plugin add",
-    after_help = "Examples:\n  codex plugin add sample@debug\n  codex plugin add sample --marketplace debug"
+    bin_name = "zuno plugin add",
+    after_help = "Examples:\n  zuno plugin add sample@debug\n  zuno plugin add sample --marketplace debug"
 )]
 pub struct AddPluginArgs {
     /// Plugin selector to install: either PLUGIN@MARKETPLACE or PLUGIN with --marketplace.
@@ -98,8 +98,8 @@ pub struct AddPluginArgs {
 
 #[derive(Debug, Parser)]
 #[command(
-    bin_name = "codex plugin list",
-    after_help = "Examples:\n  codex plugin list\n  codex plugin list --marketplace debug\n  codex plugin list --json\n  codex plugin list --available --json"
+    bin_name = "zuno plugin list",
+    after_help = "Examples:\n  zuno plugin list\n  zuno plugin list --marketplace debug\n  zuno plugin list --json\n  zuno plugin list --available --json"
 )]
 pub struct ListPluginsArgs {
     /// Only list plugins from this marketplace name.
@@ -117,8 +117,8 @@ pub struct ListPluginsArgs {
 
 #[derive(Debug, Parser)]
 #[command(
-    bin_name = "codex plugin remove",
-    after_help = "Examples:\n  codex plugin remove sample@debug\n  codex plugin remove sample --marketplace debug"
+    bin_name = "zuno plugin remove",
+    after_help = "Examples:\n  zuno plugin remove sample@debug\n  zuno plugin remove sample --marketplace debug"
 )]
 pub struct RemovePluginArgs {
     /// Plugin selector to remove: either PLUGIN@MARKETPLACE or PLUGIN with --marketplace.
@@ -731,7 +731,7 @@ struct PluginCommandContext {
 async fn load_plugin_command_context(
     overrides: Vec<(String, toml::Value)>,
 ) -> Result<PluginCommandContext> {
-    let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
+    let codex_home = find_codex_home().context("failed to resolve ZUNO_HOME")?;
     let config = Config::load_with_cli_overrides(overrides)
         .await
         .context("failed to load configuration")?;

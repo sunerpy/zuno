@@ -1068,7 +1068,7 @@ fn plugin_sharing_disabled_remote_section_error() -> PluginRemoteSectionError {
     PluginRemoteSectionError {
         section_id: "shared-with-me".to_string(),
         label: "Shared with me".to_string(),
-        message: "Plugin sharing is disabled for this Codex session. Enable plugin sharing to load shared plugins.".to_string(),
+        message: "Plugin sharing is disabled for this Zuno session. Enable plugin sharing to load shared plugins.".to_string(),
     }
 }
 
@@ -1582,7 +1582,7 @@ mod tests {
             PluginRemoteSectionError {
                 section_id: "shared-with-me".to_string(),
                 label: "Shared with me".to_string(),
-                message: "Plugin sharing is disabled for this Codex session. Enable plugin sharing to load shared plugins.".to_string(),
+                message: "Plugin sharing is disabled for this Zuno session. Enable plugin sharing to load shared plugins.".to_string(),
             }
         );
     }

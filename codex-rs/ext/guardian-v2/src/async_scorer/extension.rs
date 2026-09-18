@@ -581,7 +581,7 @@ impl GuardianV2Extension {
                 })
                 .collect();
             classification_input.extend([
-                "The Codex agent has requested the following action:\n".to_owned(),
+                "The Zuno agent has requested the following action:\n".to_owned(),
                 ">>> APPROVAL REQUEST START\n".to_owned(),
                 "Planned action JSON:\n".to_owned(),
                 format!("{planned_action}\n"),

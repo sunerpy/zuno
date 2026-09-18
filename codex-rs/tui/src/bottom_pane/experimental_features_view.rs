@@ -101,7 +101,7 @@ impl ExperimentalFeaturesView {
         let mut header = ColumnRenderable::new();
         header.push(Line::from("Experimental features".bold()));
         for text in [
-            "Checked features are configured on. Some experimental features take effect only in new tasks or after restarting the Codex server.",
+            "Checked features are configured on. Some experimental features take effect only in new tasks or after restarting the Zuno server.",
             self.discovery_status.as_str(),
         ].into_iter().filter(|text| !text.is_empty()) {
             for line in textwrap::wrap(text, usize::from(width.max(1))) {
@@ -343,7 +343,7 @@ impl BottomPaneView for ExperimentalFeaturesView {
             }
             Err(error) => {
                 tracing::warn!(%error, "experimental feature discovery failed");
-                self.discovery_status = "Server experiments unavailable. Reopen /experimental to retry; restart this Codex client if requests remain unanswered.".to_string();
+                self.discovery_status = "Server experiments unavailable. Reopen /experimental to retry; restart this Zuno client if requests remain unanswered.".to_string();
             }
         }
         true

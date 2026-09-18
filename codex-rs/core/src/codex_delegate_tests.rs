@@ -303,7 +303,7 @@ async fn run_codex_thread_interactive_rejects_approval_policy_that_can_prompt() 
             if matches!(
                 err.details(),
                 CodexErrorDetails::InvalidRequest(message)
-                    if message == "Codex delegates require approval policy `never`"
+                    if message == "Zuno delegates require approval policy `never`"
             )
     ));
 }

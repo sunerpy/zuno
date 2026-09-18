@@ -206,7 +206,7 @@ impl PtyCodex {
             .arg(repo_root)
             .env("TERM", "xterm-256color")
             .env("OPENAI_API_KEY", "focus-palette-test")
-            .env("CODEX_HOME", codex_home.path())
+            .env("ZUNO_HOME", codex_home.path())
             .stdin(stdin)
             .stdout(stdout)
             .stderr(slave)
@@ -233,7 +233,7 @@ impl PtyCodex {
             self.read_output(Duration::from_millis(/*millis*/ 50))?;
             self.answer_startup_queries()?;
 
-            if self.palette_answered && self.screen_contains("OpenAI Codex") {
+            if self.palette_answered && self.screen_contains(">_ Zuno") {
                 return Ok(());
             }
 

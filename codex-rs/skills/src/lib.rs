@@ -59,14 +59,14 @@ const SKILLS_DIR_NAME: &str = "skills";
 const SYSTEM_SKILLS_MARKER_FILENAME: &str = ".codex-system-skills.marker";
 const SYSTEM_SKILLS_MARKER_SALT: &str = "v1";
 
-/// Returns the on-disk cache location for embedded system skills from an absolute CODEX_HOME.
+/// Returns the on-disk cache location for embedded system skills from an absolute ZUNO_HOME.
 pub fn system_cache_root_dir(codex_home: &AbsolutePathBuf) -> AbsolutePathBuf {
     codex_home
         .join(SKILLS_DIR_NAME)
         .join(SYSTEM_SKILLS_DIR_NAME)
 }
 
-/// Installs embedded system skills into `CODEX_HOME/skills/.system`.
+/// Installs embedded system skills into `ZUNO_HOME/skills/.system`.
 ///
 /// Clears any existing system skills directory first and then writes the embedded
 /// skills directory into place.

@@ -4,26 +4,21 @@ use std::path::Path;
 use std::path::PathBuf;
 
 const ZUNO_HOME_ENV: &str = "ZUNO_HOME";
-const CODEX_HOME_ENV: &str = "CODEX_HOME";
 const DEFAULT_ZUNO_HOME_DIR: &str = ".zuno";
 
 /// Returns Zuno's configuration and durable-state directory.
 ///
-/// `ZUNO_HOME` is authoritative. `CODEX_HOME` remains a lower-precedence
-/// migration alias so an explicitly isolated Codex-derived setup can be tested
-/// without copying credentials. When neither is set, Zuno uses `~/.zuno` and
-/// does not inspect or modify `~/.codex`.
+/// `ZUNO_HOME` is the only environment override. When it is unset, Zuno uses
+/// `~/.zuno`. `CODEX_HOME` and `~/.codex` belong to a separately installed
+/// Codex and are never read, so the two products cannot share or clobber each
+/// other's config, credentials, sessions, or state.
 ///
 /// An explicitly configured path must already exist and be a directory. It is
 /// canonicalized before use; the default path is not required to exist yet.
 pub fn find_codex_home() -> std::io::Result<AbsolutePathBuf> {
     let zuno_home = non_empty_env(ZUNO_HOME_ENV);
-    let codex_home = non_empty_env(CODEX_HOME_ENV);
     resolve_zuno_home(
-        zuno_home
-            .as_deref()
-            .map(|value| (ZUNO_HOME_ENV, value))
-            .or_else(|| codex_home.as_deref().map(|value| (CODEX_HOME_ENV, value))),
+        zuno_home.as_deref().map(|value| (ZUNO_HOME_ENV, value)),
         home_dir().as_deref(),
     )
 }
@@ -84,7 +79,6 @@ fn resolve_configured_home(name: &str, value: &str) -> std::io::Result<AbsoluteP
 
 #[cfg(test)]
 mod tests {
-    use super::CODEX_HOME_ENV;
     use super::DEFAULT_ZUNO_HOME_DIR;
     use super::ZUNO_HOME_ENV;
     use super::resolve_zuno_home;
@@ -120,8 +114,8 @@ mod tests {
             .to_str()
             .expect("file Zuno home path should be valid utf-8");
 
-        let error = resolve_zuno_home(Some((CODEX_HOME_ENV, file_str)), Some(temp_home.path()))
-            .expect_err("file CODEX_HOME alias");
+        let error = resolve_zuno_home(Some((ZUNO_HOME_ENV, file_str)), Some(temp_home.path()))
+            .expect_err("file ZUNO_HOME");
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
         assert!(
             error.to_string().contains("not a directory"),

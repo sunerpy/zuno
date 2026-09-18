@@ -365,7 +365,7 @@ async fn fresh_startup_reads_destination_and_cleared_model_uses_catalog() -> Res
             let rendered = render_bottom_popup(&app.chat_widget, /*width*/ 80)
                 .replace(&destination.path().display().to_string(), "<PROJECT>");
             insta::assert_snapshot!(rendered, @r"
-            › Ask Codex to do anything
+            › Ask Zuno to do anything
 
               gpt-6-astra high · <PROJECT>
             ");

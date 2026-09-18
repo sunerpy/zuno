@@ -5,7 +5,7 @@ import type { AbsolutePathBuf } from "./AbsolutePathBuf";
 
 export type InitializeResponse = { userAgent: string,
 /**
- * Absolute path to the server's $CODEX_HOME directory.
+ * Absolute path to the server's $ZUNO_HOME directory.
  */
 codexHome: AbsolutePathBuf,
 /**

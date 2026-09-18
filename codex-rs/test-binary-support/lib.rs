@@ -46,12 +46,12 @@ where
         TestBinaryDispatchMode::InstallAliases => {
             let codex_home = match tempfile::Builder::new().prefix(codex_home_prefix).tempdir() {
                 Ok(codex_home) => codex_home,
-                Err(error) => panic!("failed to create test CODEX_HOME: {error}"),
+                Err(error) => panic!("failed to create test ZUNO_HOME: {error}"),
             };
-            let previous_codex_home = std::env::var_os("CODEX_HOME");
+            let previous_codex_home = std::env::var_os("ZUNO_HOME");
             // Safety: this runs from a test ctor before test threads begin.
             unsafe {
-                std::env::set_var("CODEX_HOME", codex_home.path());
+                std::env::set_var("ZUNO_HOME", codex_home.path());
             }
 
             let arg0 = match arg0_dispatch() {
@@ -60,10 +60,10 @@ where
             };
             match previous_codex_home.as_ref() {
                 Some(value) => unsafe {
-                    std::env::set_var("CODEX_HOME", value);
+                    std::env::set_var("ZUNO_HOME", value);
                 },
                 None => unsafe {
-                    std::env::remove_var("CODEX_HOME");
+                    std::env::remove_var("ZUNO_HOME");
                 },
             }
 

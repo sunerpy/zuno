@@ -135,7 +135,7 @@ impl HostSkillsService {
             cache_by_config: RwLock::new(VecDeque::new()),
             root_scan_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_ROOT_SCANS)),
         };
-        // The cache is shared by every process using this CODEX_HOME. Disabled services filter
+        // The cache is shared by every process using this ZUNO_HOME. Disabled services filter
         // system roots when loading rather than mutating shared state.
         if bundled_skills_enabled {
             service.ensure_system_skills_installed();

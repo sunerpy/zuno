@@ -72,16 +72,32 @@ and `zuno`.
 # Fetch and report the newest stable Codex release without changing this branch.
 python3 scripts/zuno_upstream.py --json check
 
-# After the current Zuno delta is reviewed and committed, apply its exact tree
-# delta to a new Codex tag in an isolated candidate worktree. Conflicts stay
-# there for review; legacy-main bridge ancestry is never replayed.
+# After the current Zuno delta is reviewed and committed, merge it onto a new
+# Codex tag in an isolated candidate worktree (three-way, with the recorded
+# baseline as merge base). Conflicts stay there for review.
 python3 scripts/zuno_upstream.py prepare \
   --target rust-vX.Y.Z \
   --worktree ../zuno-upstream-X.Y.Z
 ```
 
-Maintainers can run **Prepare Codex upstream sync** in GitHub Actions to create a
-candidate branch and pull request. The workflow never merges the candidate.
+**Prepare Codex upstream sync** runs every six hours in GitHub Actions and on
+demand. When openai/codex publishes a new stable `rust-vX.Y.Z`, it prepares the
+candidate, keeps the `upstream-sync/X.Y.Z` pull request current with `main`, and
+files an issue instead when the replay conflicts. Merging that PR with a merge
+commit is the only manual step: **Promote Zuno candidate** then tags
+`zuno-vX.Y.Z` from the sealed PR-gate bytes automatically. The workflow never
+merges the candidate. See [docs/zuno-upstream-sync.md](docs/zuno-upstream-sync.md)
+([中文](docs/zuno-upstream-sync.zh-CN.md)).
+
+For a server, use the statically linked single-file
+`zuno-standalone-x86_64-unknown-linux-musl` from each release with the strict
+approval profile (`zuno -a untrusted -s danger-full-access`), which stops for a
+human before every command; see [docs/zuno-server-strict.md](docs/zuno-server-strict.md)
+([中文](docs/zuno-server-strict.zh-CN.md)).
+
+Zuno reads its configuration and state from `ZUNO_HOME` (default `~/.zuno`)
+only. `CODEX_HOME` and `~/.codex` belong to a separately installed Codex and are
+never consulted.
 
 Zuno pull requests use the repository-owned `zuno/pr-gate`; OpenAI-specific
 Codex CI remains manual because it depends on upstream private runners and

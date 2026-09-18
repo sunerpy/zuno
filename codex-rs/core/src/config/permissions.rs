@@ -893,7 +893,7 @@ fn push_warning(startup_warnings: &mut Vec<String>, message: String) {
 
 fn missing_filesystem_entries_warning(profile_name: &str) -> String {
     format!(
-        "Permissions profile `{profile_name}` does not define any recognized filesystem entries for this version of Codex. Filesystem access will remain restricted. Upgrade Codex if this profile expects filesystem permissions."
+        "Permissions profile `{profile_name}` does not define any recognized filesystem entries for this version of Zuno. Filesystem access will remain restricted. Upgrade Zuno if this profile expects filesystem permissions."
     )
 }
 
@@ -908,10 +908,10 @@ fn maybe_push_unknown_special_path_warning(
         startup_warnings,
         match subpath.as_deref() {
             Some(subpath) => format!(
-                "Configured filesystem path `{path}` with nested entry `{subpath}` is not recognized by this version of Codex and will be ignored. Upgrade Codex if this path is required."
+                "Configured filesystem path `{path}` with nested entry `{subpath}` is not recognized by this version of Zuno and will be ignored. Upgrade Zuno if this path is required."
             ),
             None => format!(
-                "Configured filesystem path `{path}` is not recognized by this version of Codex and will be ignored. Upgrade Codex if this path is required."
+                "Configured filesystem path `{path}` is not recognized by this version of Zuno and will be ignored. Upgrade Zuno if this path is required."
             ),
         },
     );

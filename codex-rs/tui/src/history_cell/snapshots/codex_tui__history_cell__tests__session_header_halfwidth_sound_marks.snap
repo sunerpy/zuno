@@ -6,7 +6,7 @@ Buffer {
     area: Rect { x: 0, y: 0, width: 80, height: 6 },
     content: [
         "╭───────────────────────────────────────────╮                                   ",
-        "│ >_ OpenAI Codex (vtest)                   │                                   ",
+        "│ >_ Zuno (vtest)                           │                                   ",
         "│                                           │                                   ",
         "│ model:     gpt-5-ｶﾞ-ﾊﾟ   /model to change │                                   ", // hidden by multi-width symbols: [(20, " "), (23, " ")]
         "│ directory: project                        │                                   ",
@@ -17,7 +17,7 @@ Buffer {
         x: 45, y: 0, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
         x: 0, y: 1, fg: Reset, bg: Reset, underline: Reset, modifier: DIM,
         x: 5, y: 1, fg: Reset, bg: Reset, underline: Reset, modifier: BOLD,
-        x: 17, y: 1, fg: Reset, bg: Reset, underline: Reset, modifier: DIM,
+        x: 9, y: 1, fg: Reset, bg: Reset, underline: Reset, modifier: DIM,
         x: 45, y: 1, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
         x: 0, y: 2, fg: Reset, bg: Reset, underline: Reset, modifier: DIM,
         x: 45, y: 2, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,

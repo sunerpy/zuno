@@ -138,14 +138,18 @@ pub const CONTEXT_WINDOW_OPEN_TAG: &str = "<context_window>";
 pub const CONTEXT_WINDOW_CLOSE_TAG: &str = "</context_window>";
 pub const CONTEXT_WINDOW_GUIDANCE_OPEN_TAG: &str = "<context_window_guidance>";
 pub const CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG: &str = "</context_window_guidance>";
-pub const USER_MESSAGE_BEGIN: &str = "## My request for Codex:";
+pub const USER_MESSAGE_BEGIN: &str = "## My request for Zuno:";
+/// Heading written before the product rename; still recognized in stored history.
+pub const LEGACY_USER_MESSAGE_BEGIN: &str = "## My request for Codex:";
 
 /// Removes the model-context prefix from a user message before displaying it.
 pub fn strip_user_message_prefix(text: &str) -> &str {
-    match text.find(USER_MESSAGE_BEGIN) {
-        Some(idx) => text[idx + USER_MESSAGE_BEGIN.len()..].trim(),
-        None => text.trim(),
+    for marker in [USER_MESSAGE_BEGIN, LEGACY_USER_MESSAGE_BEGIN] {
+        if let Some(idx) = text.find(marker) {
+            return text[idx + marker.len()..].trim();
+        }
     }
+    text.trim()
 }
 
 // TODO(anp): Replace `TurnEnvironmentSelection` with `PathUri` once path URIs carry environment
@@ -982,8 +986,10 @@ impl Op {
 #[serde(rename_all = "kebab-case")]
 #[strum(serialize_all = "kebab-case")]
 pub enum AskForApproval {
-    /// Internal policy for projects marked untrusted. Commands require
-    /// approval unless an explicit exec policy rule allows them.
+    /// Strict approval: every command and file edit requires approval unless
+    /// an explicit exec policy rule allows it. Selectable with
+    /// `approval_policy = "untrusted"` or `--ask-for-approval untrusted`, and
+    /// the default for projects marked untrusted.
     #[serde(rename = "untrusted")]
     #[strum(serialize = "untrusted")]
     UnlessTrusted,
@@ -4438,6 +4444,22 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
     use tempfile::TempDir;
+
+    #[test]
+    fn strip_user_message_prefix_accepts_current_and_legacy_headings() {
+        assert_eq!(
+            strip_user_message_prefix("# Context\n## My request for Zuno:\n  fix the bug\n"),
+            "fix the bug"
+        );
+        assert_eq!(
+            strip_user_message_prefix("# Context\n## My request for Codex:\n  stored earlier\n"),
+            "stored earlier"
+        );
+        assert_eq!(
+            strip_user_message_prefix("  plain request  "),
+            "plain request"
+        );
+    }
 
     #[test]
     fn review_decision_denied_round_trip() -> Result<()> {

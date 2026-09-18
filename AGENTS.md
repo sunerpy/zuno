@@ -15,7 +15,9 @@ and new project identity are Zuno. Preserve LICENSE and NOTICE attribution.
 - Native ACP is a projection over the same App Server thread and turn state; do
   not add another agent loop.
 - Upstream updates are prepared only in isolated candidate worktrees via
-  `scripts/zuno_upstream.py`; never auto-merge them.
+  `scripts/zuno_upstream.py` (scheduled by `zuno-upstream-sync.yml`); never
+  auto-merge them. See `docs/zuno-upstream-sync.md`.
+- Zuno's home is `ZUNO_HOME` or `~/.zuno`; never read `CODEX_HOME` or `~/.codex`.
 - Use CodeGraph before source navigation when `.codegraph/` is usable.
 
 See `ZUNO_ARCHITECTURE.md`, `UPSTREAM_CODEX.toml`, and `FORK_DELTA.toml`.

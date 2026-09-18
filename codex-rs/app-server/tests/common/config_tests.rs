@@ -3,7 +3,7 @@ use tempfile::TempDir;
 
 #[test]
 fn mock_responses_config_composes_model_provider_features_and_extra_tables() {
-    let home = TempDir::new().expect("temporary CODEX_HOME");
+    let home = TempDir::new().expect("temporary ZUNO_HOME");
     MockResponsesConfig::new("http://127.0.0.1:1234")
         .with_model("custom-model")
         .with_model_provider("openai-custom")
@@ -40,7 +40,7 @@ fn mock_responses_config_composes_model_provider_features_and_extra_tables() {
 
 #[test]
 fn legacy_mock_responses_writer_preserves_provider_auth_and_feature_overrides() {
-    let home = TempDir::new().expect("temporary CODEX_HOME");
+    let home = TempDir::new().expect("temporary ZUNO_HOME");
     write_mock_responses_config_toml(
         home.path(),
         "http://127.0.0.1:1234",

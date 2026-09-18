@@ -214,10 +214,27 @@ def main() -> int:
     require(upstream_sync, "Push exact candidate branch")
     require(upstream_sync, "-c credential.helper= \\")
     require(upstream_sync, 'credential.helper="store --file=${credential_file}"')
-    if text(upstream_sync).count("GH_TOKEN: ${{ github.token }}") != 2:
+    sync_text = text(upstream_sync)
+    default_token = "GH_TOKEN: ${{ github.token }}"
+    push_token = "GH_TOKEN: ${{ secrets.ZUNO_UPSTREAM_SYNC_TOKEN || github.token }}"
+    if sync_text.count(default_token) != 2 or sync_text.count(push_token) != 2:
         raise SystemExit(
-            "upstream sync must expose GH_TOKEN only to the final push and PR steps"
+            "upstream sync must expose the default token only to the state and conflict-report "
+            "steps and the optional automation token only to the push and PR steps"
         )
+    # Steps that fetch or replay upstream code must never see any token: the
+    # checkout/fetch/plan steps before state inspection, and the candidate
+    # preparation and regeneration steps between state inspection and the push.
+    inspect_at = sync_text.index("name: Inspect existing candidate and conflict report")
+    prepare_at = sync_text.index("name: Prepare isolated candidate")
+    push_at = sync_text.index("name: Push exact candidate branch")
+    if "GH_TOKEN" in sync_text[:inspect_at] or "GH_TOKEN" in sync_text[prepare_at:push_at]:
+        raise SystemExit("upstream sync exposes a token to a fetch or replay step")
+    reject(upstream_sync, "persist-credentials: true")
+    require(upstream_sync, "check \\\n            --allow-current")
+    require(upstream_sync, "--force-with-lease=refs/heads/${HEAD_BRANCH}:")
+    reject(upstream_sync, "gh pr merge")
+    reject(upstream_sync, "--auto")
 
     smoke = text("scripts/smoke_zuno_package.py")
     isolation = smoke.index('runtime_env["HOME"]')

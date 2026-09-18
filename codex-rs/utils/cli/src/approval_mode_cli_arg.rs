@@ -13,6 +13,10 @@ pub enum ApprovalModeCliArg {
     /// Never ask for user approval
     /// Execution failures are immediately returned to the model.
     Never,
+
+    /// Strict mode: ask before every command and file edit unless an exec
+    /// policy rule explicitly allows it.
+    Untrusted,
 }
 
 impl From<ApprovalModeCliArg> for AskForApproval {
@@ -20,6 +24,7 @@ impl From<ApprovalModeCliArg> for AskForApproval {
         match value {
             ApprovalModeCliArg::OnRequest => AskForApproval::OnRequest,
             ApprovalModeCliArg::Never => AskForApproval::Never,
+            ApprovalModeCliArg::Untrusted => AskForApproval::UnlessTrusted,
         }
     }
 }

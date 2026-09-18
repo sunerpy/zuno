@@ -3,7 +3,7 @@ source: tui/src/chatwidget/tests/bedrock_catalog_tests.rs
 expression: "render_bottom_popup(&chat, 100)"
 ---
   Select Model and Effort
-  Access legacy models by running codex -m <model_name> or in your config.toml
+  Access legacy models by running zuno -m <model_name> or in your config.toml
 
 › 1. global.openai.gpt-5.6-sol (current)  Latest frontier agentic coding model.
   2. global.openai.gpt-6-astra            Our most capable model for complex, demanding work.

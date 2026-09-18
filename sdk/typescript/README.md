@@ -147,7 +147,7 @@ const codex = new Codex({
 ```
 
 For configuration keys that cannot be expressed as dotted paths, pass raw TOML overrides with `configOverrides`. Each entry
-is forwarded unchanged as a separate `--config` argument, without modifying `CODEX_HOME`:
+is forwarded unchanged as a separate `--config` argument, without modifying `ZUNO_HOME`:
 
 ```typescript
 const codex = new Codex({

@@ -454,7 +454,7 @@ def _result_detail(
 
 def _isolated_environment(codex_home: Path) -> dict[str, str]:
     env = dict(os.environ)
-    env["CODEX_HOME"] = str(codex_home)
+    env["ZUNO_HOME"] = str(codex_home)
     # Direct app-server MCP calls do not need a model or credentials.
     for name in ("CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_API_KEY"):
         env.pop(name, None)

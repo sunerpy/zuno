@@ -100,7 +100,7 @@ impl ToolExecutor<ToolInvocation> for DynamicToolHandler {
             self.spec(),
             Some(ToolSearchSourceInfo {
                 name: "Dynamic tools".to_string(),
-                description: Some("Tools provided by the current Codex thread.".to_string()),
+                description: Some("Tools provided by the current Zuno thread.".to_string()),
             }),
         )
     }

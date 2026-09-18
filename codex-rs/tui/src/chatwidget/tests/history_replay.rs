@@ -979,7 +979,7 @@ async fn app_server_forked_thread_history_line_uses_app_server_title_snapshot() 
     assert!(combined.contains("app-server-parent-thread"));
     assert!(
         !combined.contains("stale-local-thread"),
-        "app-server fork title lookup should not read local CODEX_HOME"
+        "app-server fork title lookup should not read local ZUNO_HOME"
     );
     assert_chatwidget_snapshot!("app_server_forked_thread_history_line", combined);
 }
@@ -1018,7 +1018,7 @@ async fn app_server_forked_thread_history_line_without_app_server_name_ignores_l
 
     assert!(
         !combined.contains("stale-local-thread"),
-        "app-server fork title lookup should not read local CODEX_HOME"
+        "app-server fork title lookup should not read local ZUNO_HOME"
     );
     assert_chatwidget_snapshot!(
         "app_server_forked_thread_history_line_without_app_server_name",

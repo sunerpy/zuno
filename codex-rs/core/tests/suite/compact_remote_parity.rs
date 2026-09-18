@@ -1046,8 +1046,8 @@ fn normalize_tmp_prefix_before_marker(text: &mut String, marker: &str) {
             .or_else(|| prefix.rfind("/tmp/.tmp"))
             .or(windows_appdata_temp_start);
         if let Some(start_index) = start {
-            text.replace_range(start_index..marker_index, "<CODEX_HOME>");
-            search_start = start_index + "<CODEX_HOME>".len() + marker.len();
+            text.replace_range(start_index..marker_index, "<ZUNO_HOME>");
+            search_start = start_index + "<ZUNO_HOME>".len() + marker.len();
         } else {
             search_start = marker_index + marker.len();
         }
@@ -1063,8 +1063,8 @@ fn normalize_string_rewrites_linux_temp_skill_paths() {
 
     assert_eq!(
         text,
-        "file: <CODEX_HOME>/skills/.system/imagegen/SKILL.md and \
-         <CODEX_HOME>/skills/custom/SKILL.md"
+        "file: <ZUNO_HOME>/skills/.system/imagegen/SKILL.md and \
+         <ZUNO_HOME>/skills/custom/SKILL.md"
     );
 }
 
@@ -1077,8 +1077,8 @@ fn normalize_string_rewrites_windows_temp_skill_paths() {
 
     assert_eq!(
         text,
-        "file: <CODEX_HOME>/skills/.system/imagegen/SKILL.md and \
-         <CODEX_HOME>\\skills\\custom\\SKILL.md"
+        "file: <ZUNO_HOME>/skills/.system/imagegen/SKILL.md and \
+         <ZUNO_HOME>\\skills\\custom\\SKILL.md"
     );
 }
 

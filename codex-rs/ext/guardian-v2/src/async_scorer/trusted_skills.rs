@@ -15,7 +15,7 @@ const MAX_TRUSTED_SKILLS: usize = 16;
 const MAX_TRUSTED_SKILL_PATH_BYTES: usize = 512;
 const MAX_TRUSTED_SKILL_PATHS_BYTES: usize = 2_048;
 const MAX_TRUSTED_SKILL_TOKENS: usize = 768;
-const TRUSTED_SKILLS_PREFIX: &str = "Codex-verified invoked user-owned skill paths:\n";
+const TRUSTED_SKILLS_PREFIX: &str = "Zuno-verified invoked user-owned skill paths:\n";
 
 /// Host-verified user-owned skill paths for the current Guardian classification.
 #[derive(Clone, Debug, PartialEq, Eq)]

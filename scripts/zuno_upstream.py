@@ -23,9 +23,29 @@ STABLE_TAG = re.compile(
 )
 STRING_FIELD = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*("(?:[^"\\]|\\.)*")\s*$')
 
+# Derived artifacts are regenerated from source after the replay, so a textual
+# conflict in them carries no information. They are reset to the upstream side
+# and reported so the caller regenerates them (see docs/zuno-upstream-sync.md).
+GENERATED_PATH_PREFIXES = (
+    "codex-rs/app-server-protocol/schema/",
+    "codex-rs/core/config.schema.json",
+    "codex-rs/Cargo.lock",
+)
+
+
+def is_generated_path(path: str) -> bool:
+    return any(
+        path == prefix.rstrip("/") or path.startswith(prefix)
+        for prefix in GENERATED_PATH_PREFIXES
+    )
+
 
 class SyncError(RuntimeError):
-    pass
+    """A sync precondition failed; ``details`` carries machine-readable context."""
+
+    def __init__(self, message: str, details: dict[str, object] | None = None) -> None:
+        super().__init__(message)
+        self.details = details or {}
 
 
 def stable_tag_version(tag: str) -> tuple[int, int, int]:
@@ -52,11 +72,42 @@ class SyncPlan:
     target_commit: str
     target_tree: str
     relationship: str
+    merge_base: str
+    baseline_only_commits: list[str]
     upstream_changed_files: int
     zuno_changed_files: int
     overlapping_files: list[str]
     source_dirty: bool
     candidate_only: bool = True
+
+
+@dataclass(frozen=True)
+class CurrentStatus:
+    """The recorded baseline already is the newest stable Codex release."""
+
+    status: str
+    source: str
+    source_commit: str
+    baseline_tag: str
+    baseline_commit: str
+    latest_stable_tag: str
+    source_dirty: bool
+    candidate_only: bool = True
+
+
+@dataclass(frozen=True)
+class FinalizedCandidate:
+    branch: str
+    worktree: str
+    commit: str
+    tree: str
+    source_commit: str
+    target_tag: str
+    target_commit: str
+
+
+SOURCE_REF_PREFIX = "refs/zuno-upstream-source/"
+CONFLICT_MARKERS = ("<<<<<<< ", "=======", ">>>>>>> ")
 
 
 @dataclass(frozen=True)
@@ -67,6 +118,7 @@ class PreparedCandidate:
     target_commit: str
     candidate_base_commit: str
     manifest_updated: bool
+    regenerate_paths: list[str]
 
 
 def run(
@@ -167,6 +219,31 @@ def exact_target(repo: Path, requested: str | None) -> str:
     return tags[-1]
 
 
+def merge_base(repo: Path, left: str, right: str) -> str | None:
+    result = run(repo, ["merge-base", left, right], check=False)
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def baseline_only_commits(repo: Path, baseline: str, target: str) -> list[str]:
+    """Commits reachable from the baseline tag whose patches are absent from the target.
+
+    Codex cuts every release on a short branch off main (a release commit plus
+    any cherry-picks), so a newer tag normally does not descend from the older
+    one. Whatever only exists on the old release branch is not carried into the
+    candidate, so it is surfaced for review.
+    """
+    entries = []
+    for line in run(repo, ["cherry", target, baseline]).stdout.splitlines():
+        marker, _, commit = line.partition(" ")
+        if marker != "+" or not commit:
+            continue
+        subject = run(repo, ["log", "-1", "--format=%s", commit]).stdout.strip()
+        entries.append(f"{commit} {subject}")
+    return entries
+
+
 def is_ancestor(repo: Path, older: str, newer: str) -> bool:
     return (
         run(repo, ["merge-base", "--is-ancestor", older, newer], check=False).returncode
@@ -216,12 +293,20 @@ def make_plan(repo: Path, baseline: Baseline, source: str, target_tag: str) -> S
             f"target {target_tag} does not advance baseline commit "
             f"{baseline.release_commit}"
         )
-    if not is_ancestor(repo, baseline.release_commit, target_commit):
-        raise SyncError(
-            f"target {target_tag} is not a descendant of baseline "
-            f"{baseline.release_tag}; divergent release lines require explicit manual recovery"
-        )
-    relationship = "descendant"
+    if is_ancestor(repo, baseline.release_commit, target_commit):
+        relationship = "descendant"
+        common = baseline.release_commit
+    else:
+        # Upstream release tags live on sibling release branches cut from main,
+        # so the normal case is a shared ancestor rather than direct descent.
+        found = merge_base(repo, baseline.release_commit, target_commit)
+        if found is None:
+            raise SyncError(
+                f"target {target_tag} shares no history with baseline "
+                f"{baseline.release_tag}; unrelated release lines require explicit manual recovery"
+            )
+        relationship = "release-branch"
+        common = found
     upstream_files = changed_files(repo, baseline.release_commit, target_commit)
     zuno_files = changed_files(repo, baseline.release_commit, source_commit)
     return SyncPlan(
@@ -233,6 +318,10 @@ def make_plan(repo: Path, baseline: Baseline, source: str, target_tag: str) -> S
         target_commit=target_commit,
         target_tree=target_tree,
         relationship=relationship,
+        merge_base=common,
+        baseline_only_commits=baseline_only_commits(
+            repo, baseline.release_commit, target_commit
+        ),
         upstream_changed_files=len(upstream_files),
         zuno_changed_files=len(zuno_files),
         overlapping_files=sorted(upstream_files & zuno_files),
@@ -271,6 +360,35 @@ def replace_manifest_baseline(
     manifest.write_text("".join(output), encoding="utf-8")
 
 
+MERGE_TREE_STAGE = re.compile(r"^[0-7]{6} [0-9a-f]{40,64} [123]\t(?P<path>.+)$")
+
+
+def parse_merge_tree(output: str) -> tuple[str, list[str], list[str]]:
+    """Split ``git merge-tree --write-tree`` output into tree, conflicted paths, messages."""
+    lines = output.splitlines()
+    if not lines or not re.fullmatch(r"[0-9a-f]{40,64}", lines[0].strip()):
+        raise SyncError(f"unexpected git merge-tree output: {output[:200]!r}")
+    tree = lines[0].strip()
+    conflicting: list[str] = []
+    messages: list[str] = []
+    in_messages = False
+    for line in lines[1:]:
+        if not in_messages:
+            match = MERGE_TREE_STAGE.match(line)
+            if match:
+                path = match.group("path")
+                if path not in conflicting:
+                    conflicting.append(path)
+                continue
+            if not line.strip():
+                in_messages = True
+                continue
+            in_messages = True
+        if line.strip():
+            messages.append(line.rstrip())
+    return tree, sorted(conflicting), messages
+
+
 def prepare(
     repo: Path,
     manifest_name: str,
@@ -294,32 +412,35 @@ def prepare(
     if worktree.exists():
         raise SyncError(f"candidate worktree path already exists: {worktree}")
     run(repo, ["worktree", "add", "-b", branch, str(worktree), plan.target_commit])
-    delta = run(
+    # Three-way merge with the recorded baseline as the explicit base: ours is
+    # the exact upstream release, theirs is the reviewed Zuno source. Unlike
+    # `git apply --3way`, the ort merge follows upstream renames and reports
+    # modify/delete pairs as conflicts instead of aborting. Requires git >= 2.40.
+    merge = run(
         repo,
         [
-            "diff",
-            "--binary",
-            "--full-index",
-            "--no-renames",
-            plan.baseline_commit,
+            "merge-tree",
+            "--write-tree",
+            f"--merge-base={plan.baseline_commit}",
+            plan.target_commit,
             plan.source_commit,
         ],
-    ).stdout
-    apply = subprocess.run(
-        ["git", "apply", "--index", "--3way", "--whitespace=nowarn", "-"],
-        cwd=worktree,
-        input=delta,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
         check=False,
     )
-    if apply.returncode != 0:
-        detail = apply.stderr.strip() or apply.stdout.strip()
-        raise SyncError(
-            "candidate delta replay has conflicts; source branch is untouched and the candidate "
-            f"was retained at {worktree}: {detail}"
-        )
+    if merge.returncode not in (0, 1):
+        detail = merge.stderr.strip() or merge.stdout.strip()
+        raise SyncError(f"git merge-tree failed while preparing the candidate: {detail}")
+    tree, conflicting, messages = parse_merge_tree(merge.stdout)
+    run(worktree, ["read-tree", "--reset", "-u", tree])
+    regenerate = [path for path in conflicting if is_generated_path(path)]
+    source_conflicts = [path for path in conflicting if not is_generated_path(path)]
+    if regenerate:
+        # Derived artifacts are rebuilt from the merged source; keep the exact
+        # upstream bytes as the placeholder instead of conflict markers.
+        run(worktree, ["checkout", plan.target_commit, "--", *regenerate])
+    # The new baseline and the source commit are recorded even when conflicts
+    # remain, so a manually resolved candidate still finalizes and promotes
+    # against the exact upstream release it was built from.
     candidate_manifest = worktree / manifest_name
     replace_manifest_baseline(
         candidate_manifest,
@@ -327,6 +448,26 @@ def prepare(
         plan.target_commit,
         plan.target_tree,
     )
+    run(worktree, ["add", "--", manifest_name])
+    run(repo, ["update-ref", f"{SOURCE_REF_PREFIX}{branch}", plan.source_commit])
+    if source_conflicts:
+        raise SyncError(
+            "candidate merge has conflicts; source branch is untouched and the candidate "
+            f"was retained at {worktree} with conflict markers; resolve them, regenerate "
+            "derived artifacts, then run `zuno_upstream.py finalize --worktree` to commit",
+            details={
+                "status": "conflict",
+                "candidate_branch": branch,
+                "candidate_worktree": str(worktree),
+                "source_commit": plan.source_commit,
+                "target_tag": plan.target_tag,
+                "target_commit": plan.target_commit,
+                "conflicting_files": source_conflicts,
+                "generated_conflicts": regenerate,
+                "conflict_messages": messages,
+                "manifest_updated": True,
+            },
+        )
     return PreparedCandidate(
         branch=branch,
         worktree=str(worktree),
@@ -334,6 +475,126 @@ def prepare(
         target_commit=plan.target_commit,
         candidate_base_commit=resolve_commit(worktree, "HEAD"),
         manifest_updated=True,
+        regenerate_paths=regenerate,
+    )
+
+
+def finalize(
+    worktree: Path,
+    manifest_name: str,
+    source: str | None,
+    message: str | None,
+) -> FinalizedCandidate:
+    """Commit the prepared candidate as a merge of the Zuno source and the upstream release.
+
+    The commit's first parent is the reviewed Zuno source (so the candidate PR
+    merges into it trivially and the promoted tree equals the certified head
+    tree) and its second parent is the exact upstream release commit recorded in
+    the candidate's manifest, which keeps the baseline reachable for later syncs.
+    """
+    if not (worktree / ".git").exists():
+        raise SyncError(f"candidate worktree is not a git worktree: {worktree}")
+    branch = run(worktree, ["branch", "--show-current"]).stdout.strip()
+    if not branch:
+        raise SyncError(f"candidate worktree {worktree} is not on a branch")
+    baseline = read_baseline(worktree / manifest_name)
+    validate_baseline(worktree, baseline)
+    recorded = run(
+        worktree,
+        ["rev-parse", "--verify", "--quiet", f"{SOURCE_REF_PREFIX}{branch}^{{commit}}"],
+        check=False,
+    )
+    recorded_commit = recorded.stdout.strip() if recorded.returncode == 0 else ""
+    if source:
+        source_commit = resolve_commit(worktree, source)
+        # The candidate tree was merged against the source that `prepare`
+        # recorded; attaching it to a different (for example newer) commit would
+        # silently drop whatever that commit changed.
+        if recorded_commit and recorded_commit != source_commit:
+            raise SyncError(
+                f"--source {source} resolves to {source_commit}, but this candidate was "
+                f"prepared from {recorded_commit}; re-run prepare against the new source "
+                "instead of finalizing a stale merge"
+            )
+    elif recorded_commit:
+        source_commit = recorded_commit
+    else:
+        raise SyncError(
+            f"no recorded source commit for {branch}; pass --source <commit> explicitly"
+        )
+    if is_ancestor(worktree, baseline.release_commit, source_commit):
+        raise SyncError(
+            f"source {source_commit} already contains {baseline.release_tag}; nothing to merge"
+        )
+    changed = [
+        line
+        for line in run(
+            worktree, ["diff", "--name-only", "--no-renames", baseline.release_commit]
+        ).stdout.splitlines()
+        if line
+    ]
+    unresolved = []
+    for path in changed:
+        candidate_path = worktree / path
+        if not candidate_path.is_file():
+            continue
+        try:
+            text = candidate_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        if any(
+            line.startswith(CONFLICT_MARKERS[0]) or line.startswith(CONFLICT_MARKERS[2])
+            for line in text.splitlines()
+        ):
+            unresolved.append(path)
+    if unresolved:
+        raise SyncError(
+            "candidate still contains conflict markers",
+            details={"status": "conflict", "conflicting_files": sorted(unresolved)},
+        )
+    run(worktree, ["add", "--all"])
+    tree = run(worktree, ["write-tree"]).stdout.strip()
+    version = baseline.release_tag.removeprefix("rust-v")
+    subject = message or f"chore(upstream): merge Codex {version} into Zuno"
+    body = (
+        f"{subject}\n\n"
+        f"Merges exact Codex release {baseline.release_tag} into the reviewed Zuno source "
+        f"{source_commit}.\n\n"
+        f"Zuno-Source-Commit: {source_commit}\n"
+        f"Zuno-Upstream-Tag: {baseline.release_tag}\n"
+        f"Zuno-Upstream-Commit: {baseline.release_commit}\n"
+    )
+    commit_tree = subprocess.run(
+        [
+            "git",
+            "commit-tree",
+            tree,
+            "-p",
+            source_commit,
+            "-p",
+            baseline.release_commit,
+        ],
+        cwd=worktree,
+        input=body,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if commit_tree.returncode != 0:
+        raise SyncError(f"git commit-tree failed: {commit_tree.stderr.strip()}")
+    commit = commit_tree.stdout.strip()
+    run(worktree, ["update-ref", f"refs/heads/{branch}", commit])
+    run(worktree, ["reset", "-q"])
+    run(worktree, ["update-ref", "-d", f"{SOURCE_REF_PREFIX}{branch}"], check=False)
+    return FinalizedCandidate(
+        branch=branch,
+        worktree=str(worktree),
+        commit=commit,
+        tree=tree,
+        source_commit=source_commit,
+        target_tag=baseline.release_tag,
+        target_commit=baseline.release_commit,
     )
 
 
@@ -349,9 +610,25 @@ def parser() -> argparse.ArgumentParser:
         command = subparsers.add_parser(name)
         command.add_argument("--source", default="HEAD")
         command.add_argument("--target")
+        if name == "check":
+            command.add_argument(
+                "--allow-current",
+                action="store_true",
+                help=(
+                    "exit successfully with status=current when no stable Codex tag "
+                    "is newer than the recorded baseline (for scheduled runs)"
+                ),
+            )
         if name == "prepare":
             command.add_argument("--branch")
             command.add_argument("--worktree", type=Path, required=True)
+    finalize_command = subparsers.add_parser(
+        "finalize",
+        help="commit a prepared candidate worktree as a merge of the Zuno source and the upstream release",
+    )
+    finalize_command.add_argument("--worktree", type=Path, required=True)
+    finalize_command.add_argument("--source", help="Zuno source commit (defaults to the one recorded by prepare)")
+    finalize_command.add_argument("--message", help="commit subject (trailers are appended automatically)")
     return result
 
 
@@ -372,12 +649,37 @@ def emit(value: object, as_json: bool) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        if args.command == "finalize":
+            emit(
+                finalize(args.worktree.resolve(), args.manifest, args.source, args.message),
+                args.json,
+            )
+            return 0
         repo = repo_root(args.repo.resolve())
         manifest = repo / args.manifest
         baseline = read_baseline(manifest)
         if not args.no_fetch:
             run(repo, ["fetch", "--tags", "--prune", args.remote])
         target_tag = exact_target(repo, args.target)
+        if (
+            args.command == "check"
+            and args.allow_current
+            and stable_tag_version(target_tag) <= stable_tag_version(baseline.release_tag)
+        ):
+            validate_baseline(repo, baseline)
+            emit(
+                CurrentStatus(
+                    status="current",
+                    source=args.source,
+                    source_commit=resolve_commit(repo, args.source),
+                    baseline_tag=baseline.release_tag,
+                    baseline_commit=baseline.release_commit,
+                    latest_stable_tag=target_tag,
+                    source_dirty=dirty(repo),
+                ),
+                args.json,
+            )
+            return 0
         plan = make_plan(repo, baseline, args.source, target_tag)
         if args.command == "check":
             emit(plan, args.json)
@@ -394,9 +696,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     except SyncError as error:
         if args.json:
-            print(json.dumps({"error": str(error)}, indent=2, sort_keys=True))
+            payload: dict[str, object] = {"error": str(error)}
+            payload.update(error.details)
+            print(json.dumps(payload, indent=2, sort_keys=True))
         else:
             print(f"error: {error}", file=sys.stderr)
+            for name, value in error.details.items():
+                if isinstance(value, list):
+                    print(f"{name}: {len(value)}", file=sys.stderr)
+                    for entry in value:
+                        print(f"  - {entry}", file=sys.stderr)
+                else:
+                    print(f"{name}: {value}", file=sys.stderr)
         return 1
 
 

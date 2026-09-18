@@ -1,5 +1,5 @@
 # Copy this file to $ZUNO_HOME/kiro-sol.config.toml (or the compatible
-# $CODEX_HOME location during the developer preview), set KIRO_PROVIDER_API_KEY,
+# $ZUNO_HOME location during the developer preview), set KIRO_PROVIDER_API_KEY,
 # then select it with: zuno --profile kiro-sol
 model_provider = "kiro-local"
 model = "gpt-5.6-sol"

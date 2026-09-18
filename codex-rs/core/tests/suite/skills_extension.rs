@@ -3547,7 +3547,7 @@ async fn production_turn_fairly_shortens_extension_catalog_descriptions() -> Res
     let warning = event_rx.try_recv()?.into_warning();
     assert_eq!(
         warning.message,
-        "Skill descriptions were shortened to fit the skills context budget. Codex can still see every skill, but some descriptions are shorter. Disable unused skills or plugins to leave more room for the rest."
+        "Skill descriptions were shortened to fit the skills context budget. Zuno can still see every skill, but some descriptions are shorter. Disable unused skills or plugins to leave more room for the rest."
     );
 
     Ok(())

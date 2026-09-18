@@ -1,4 +1,4 @@
-// Keep the ACL probe independent of test-harness startup, which writes CODEX_HOME.
+// Keep the ACL probe independent of test-harness startup, which writes ZUNO_HOME.
 #[cfg(target_os = "windows")]
 mod win;
 

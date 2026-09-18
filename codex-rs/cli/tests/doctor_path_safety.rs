@@ -104,7 +104,7 @@ wire_api = "responses"
         let mut command = assert_cmd::Command::new(&self.program);
         command
             .current_dir(&self.workspace)
-            .env("CODEX_HOME", &self.home)
+            .env("ZUNO_HOME", &self.home)
             .env("HOME", self.root.path())
             .env("PATH", &self.path)
             .env("CODEX_TEST_HELPER_MARKER", &self.marker)

@@ -94,18 +94,24 @@ contracts = [
 id = "upstream-sync"
 status = "implemented"
 ownership = "zuno-owned"
-summary = "Candidate-only replay of the reviewed Zuno delta onto an exact Codex stable release."
+summary = "Scheduled candidate-only replay of the reviewed Zuno delta onto each new exact Codex stable release, with automatic promotion after the human merge."
 zuno_paths = [
   "UPSTREAM_CODEX.toml",
   "FORK_DELTA.toml",
   "scripts/zuno_upstream.py",
   "scripts/test_zuno_upstream.py",
+  ".github/workflows/zuno-upstream-sync.yml",
+  "docs/zuno-upstream-sync.md",
+  "docs/zuno-upstream-sync.zh-CN.md",
 ]
 shared_upstream_paths = []
 contracts = [
   "The active Zuno branch and worktree are never mutated by synchronization.",
   "A dirty source is rejected before candidate preparation.",
   "The exact upstream tag, commit, and tree are verified before replay.",
+  "The watcher tracks only the newest stable Codex tag, is idempotent per main commit, and reports replay conflicts as an issue instead of pushing.",
+  "Merging the candidate PR with a merge commit is the only manual step; nothing is merged automatically.",
+  "A candidate is finalized as a merge whose first parent is the reviewed main commit and whose second parent is the exact upstream release commit recorded in UPSTREAM_CODEX.toml, even after manual conflict resolution.",
 ]
 
 [[capabilities]]
@@ -132,6 +138,32 @@ contracts = [
 ]
 
 [[capabilities]]
+id = "server-strict-standalone"
+status = "implemented"
+ownership = "shared-modified"
+summary = "Statically linked single-file Linux binary plus a strict approval mode for server troubleshooting."
+zuno_paths = [
+  "scripts/zuno_standalone_smoke.py",
+  "examples/zuno-config/server-strict.config.toml",
+  "docs/zuno-server-strict.md",
+  "docs/zuno-server-strict.zh-CN.md",
+]
+shared_upstream_paths = [
+  "codex-rs/core/src/config/mod.rs",
+  "codex-rs/app-server/src/lib.rs",
+  "codex-rs/app-server/src/config_manager_service.rs",
+  "codex-rs/utils/cli/src/approval_mode_cli_arg.rs",
+  "codex-rs/protocol/src/protocol.rs",
+  ".github/workflows/zuno-ci.yml",
+  ".github/workflows/zuno-release.yml",
+]
+contracts = [
+  "approval_policy = \"untrusted\" is selectable in config, profiles, and --ask-for-approval; it prompts for every command and edit unless an explicit exec policy rule allows it.",
+  "Every release publishes zuno-standalone-x86_64-unknown-linux-musl, a static ELF with no dynamic loader, attested and sealed with the platform packages.",
+  "The PR gate runs the standalone strict-mode smoke (approval requested for ls, decline executes nothing; approval_policy = never runs it) before sealing.",
+]
+
+[[capabilities]]
 id = "zuno-ci-release"
 status = "implemented"
 ownership = "zuno-owned"
@@ -152,5 +184,6 @@ contracts = [
   "The protected main branch receives the required zuno/pr-gate context from public GitHub-hosted infrastructure.",
   "OpenAI-only CI remains manually available but does not run automatically in the Zuno repository.",
   "zuno-vX.Y.Z builds, natively smokes, attests, hashes, and publishes canonical Zuno packages for six OS/architecture targets.",
+  "A merged same-repository upstream-sync/* pull request is promoted automatically from its sealed PR-gate bytes; every other promotion is an explicit dispatch.",
   "All inherited Codex installers, daemon updaters, and tag publishers fail closed in the independent Zuno repository.",
 ]

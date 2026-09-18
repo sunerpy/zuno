@@ -596,7 +596,7 @@ sandbox_mode = "danger-full-access"
         ConfigLayerSource::LegacyManagedConfigTomlFromFile { .. }
     )));
     let expected_warnings = vec![format!(
-        "Ignoring deprecated managed config file at {}; CODEX_HOME/managed_config.toml is no longer supported on Windows. Use %ProgramData%\\OpenAI\\Codex\\requirements.toml for enforced settings or config.toml for defaults.",
+        "Ignoring deprecated managed config file at {}; ZUNO_HOME/managed_config.toml is no longer supported on Windows. Use %ProgramData%\\OpenAI\\Codex\\requirements.toml for enforced settings or config.toml for defaults.",
         managed_config_path.display()
     )];
     assert_eq!(stack.startup_warnings(), Some(expected_warnings.as_slice()));
