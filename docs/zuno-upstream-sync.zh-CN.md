@@ -36,8 +36,9 @@ zuno-upstream-sync.yml ── 重放无冲突 ──▶ 分支 upstream-sync/X.Y
 2. 查找 `upstream-sync/X.Y.Z` 上已打开的候选 PR，或该标签对应的冲突 issue。若其中
    任何一个已记录当前 `main` 提交（`Zuno-Source-Commit` trailer），本次运行为空操作。
    这保证了定时任务幂等。
-3. 否则在隔离 worktree 中准备候选：`git worktree add <tmp> rust-vX.Y.Z`，三方
-   apply `git diff <baseline> <main>`，再改写 `UPSTREAM_CODEX.toml` 的 `[baseline]`。
+3. 否则在隔离 worktree 中准备候选：`git worktree add <tmp> rust-vX.Y.Z`，执行
+   `git merge-tree --merge-base=<baseline> rust-vX.Y.Z main`（ort 合并，带重命名检测，
+   需要 git 2.40+）并检出到该 worktree，再改写 `UPSTREAM_CODEX.toml` 的 `[baseline]`。
    `main` 永不被修改。派生产物（`codex-rs/Cargo.lock`、
    `codex-rs/app-server-protocol/schema/**`、`codex-rs/core/config.schema.json`）不做
    文本合并：它们的冲突会被重置为上游字节，重放完成后巡检会从合并后的源码重新生成
@@ -58,7 +59,8 @@ python3 scripts/zuno_upstream.py --no-fetch prepare \
   --source main --target rust-vX.Y.Z \
   --branch upstream-sync/X.Y.Z \
   --worktree ../zuno-upstream-X.Y.Z
-# 在 ../zuno-upstream-X.Y.Z 中处理冲突标记，然后重新生成派生产物：
+# 冲突文件带有标记；modify/delete 会保留 Zuno 版本。
+# 在 ../zuno-upstream-X.Y.Z 中处理后，重新生成派生产物：
 cd ../zuno-upstream-X.Y.Z/codex-rs
 cargo update --workspace
 python3 app-server-protocol/scripts/write_schema_fixtures.py

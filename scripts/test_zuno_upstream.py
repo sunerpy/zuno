@@ -611,6 +611,48 @@ class ZunoUpstreamTest(unittest.TestCase):
                 raised.exception.details["generated_conflicts"], ["codex-rs/Cargo.lock"]
             )
 
+    def test_prepare_follows_upstream_renames_and_reports_modify_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo_path = root / "repo"
+            repo_path.mkdir()
+            repo = Repository(repo_path)
+            repo.write("renamed_by_upstream.rs", "line1\nline2\nline3\nline4\nline5\n")
+            repo.write("deleted_by_upstream.rs", "gone\n")
+            repo.commit("base")
+            base, tree = repo.tag_baseline("rust-v0.1.0")
+
+            git(repo.root, "checkout", "-q", "-b", "release-next")
+            git(repo.root, "mv", "renamed_by_upstream.rs", "new_name.rs")
+            git(repo.root, "rm", "-q", "deleted_by_upstream.rs")
+            repo.commit("upstream renames and deletes")
+            git(repo.root, "tag", "rust-v0.2.0")
+
+            git(repo.root, "checkout", "-q", "-b", "zuno", base)
+            repo.manifest("rust-v0.1.0", base, tree)
+            repo.write("renamed_by_upstream.rs", "line1\nline2\nzuno\nline4\nline5\n")
+            repo.write("deleted_by_upstream.rs", "zuno keeps this\n")
+            repo.commit("zuno delta")
+            baseline = zuno_upstream.read_baseline(repo.root / "UPSTREAM_CODEX.toml")
+            plan = zuno_upstream.make_plan(repo.root, baseline, "zuno", "rust-v0.2.0")
+            worktree = root / "candidate"
+            with self.assertRaises(zuno_upstream.SyncError) as raised:
+                zuno_upstream.prepare(
+                    repo.root, "UPSTREAM_CODEX.toml", plan, "upstream-sync/0.2.0", worktree
+                )
+            details = raised.exception.details
+            self.assertEqual(details["conflicting_files"], ["deleted_by_upstream.rs"])
+            self.assertTrue(
+                any("modify/delete" in message for message in details["conflict_messages"]),
+                details["conflict_messages"],
+            )
+            # The Zuno edit followed the upstream rename instead of aborting.
+            self.assertFalse((worktree / "renamed_by_upstream.rs").exists())
+            self.assertEqual(
+                (worktree / "new_name.rs").read_text(), "line1\nline2\nzuno\nline4\nline5\n"
+            )
+            self.assertEqual((worktree / "deleted_by_upstream.rs").read_text(), "zuno keeps this\n")
+
 
 if __name__ == "__main__":
     unittest.main()

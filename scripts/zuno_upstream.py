@@ -345,6 +345,35 @@ def replace_manifest_baseline(
     manifest.write_text("".join(output), encoding="utf-8")
 
 
+MERGE_TREE_STAGE = re.compile(r"^[0-7]{6} [0-9a-f]{40,64} [123]\t(?P<path>.+)$")
+
+
+def parse_merge_tree(output: str) -> tuple[str, list[str], list[str]]:
+    """Split ``git merge-tree --write-tree`` output into tree, conflicted paths, messages."""
+    lines = output.splitlines()
+    if not lines or not re.fullmatch(r"[0-9a-f]{40,64}", lines[0].strip()):
+        raise SyncError(f"unexpected git merge-tree output: {output[:200]!r}")
+    tree = lines[0].strip()
+    conflicting: list[str] = []
+    messages: list[str] = []
+    in_messages = False
+    for line in lines[1:]:
+        if not in_messages:
+            match = MERGE_TREE_STAGE.match(line)
+            if match:
+                path = match.group("path")
+                if path not in conflicting:
+                    conflicting.append(path)
+                continue
+            if not line.strip():
+                in_messages = True
+                continue
+            in_messages = True
+        if line.strip():
+            messages.append(line.rstrip())
+    return tree, sorted(conflicting), messages
+
+
 def prepare(
     repo: Path,
     manifest_name: str,
@@ -368,56 +397,47 @@ def prepare(
     if worktree.exists():
         raise SyncError(f"candidate worktree path already exists: {worktree}")
     run(repo, ["worktree", "add", "-b", branch, str(worktree), plan.target_commit])
-    delta = run(
+    # Three-way merge with the recorded baseline as the explicit base: ours is
+    # the exact upstream release, theirs is the reviewed Zuno source. Unlike
+    # `git apply --3way`, the ort merge follows upstream renames and reports
+    # modify/delete pairs as conflicts instead of aborting. Requires git >= 2.40.
+    merge = run(
         repo,
         [
-            "diff",
-            "--binary",
-            "--full-index",
-            "--no-renames",
-            plan.baseline_commit,
+            "merge-tree",
+            "--write-tree",
+            f"--merge-base={plan.baseline_commit}",
+            plan.target_commit,
             plan.source_commit,
         ],
-    ).stdout
-    apply = subprocess.run(
-        ["git", "apply", "--index", "--3way", "--whitespace=nowarn", "-"],
-        cwd=worktree,
-        input=delta,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
         check=False,
     )
-    regenerate: list[str] = []
-    if apply.returncode != 0:
-        detail = apply.stderr.strip() or apply.stdout.strip()
-        conflicting = sorted(
-            line
-            for line in run(
-                worktree, ["diff", "--name-only", "--diff-filter=U"]
-            ).stdout.splitlines()
-            if line
+    if merge.returncode not in (0, 1):
+        detail = merge.stderr.strip() or merge.stdout.strip()
+        raise SyncError(f"git merge-tree failed while preparing the candidate: {detail}")
+    tree, conflicting, messages = parse_merge_tree(merge.stdout)
+    run(worktree, ["read-tree", "--reset", "-u", tree])
+    regenerate = [path for path in conflicting if is_generated_path(path)]
+    source_conflicts = [path for path in conflicting if not is_generated_path(path)]
+    if regenerate:
+        # Derived artifacts are rebuilt from the merged source; keep the exact
+        # upstream bytes as the placeholder instead of conflict markers.
+        run(worktree, ["checkout", plan.target_commit, "--", *regenerate])
+    if source_conflicts:
+        raise SyncError(
+            "candidate merge has conflicts; source branch is untouched and the candidate "
+            f"was retained at {worktree} with conflict markers",
+            details={
+                "status": "conflict",
+                "candidate_branch": branch,
+                "candidate_worktree": str(worktree),
+                "target_tag": plan.target_tag,
+                "target_commit": plan.target_commit,
+                "conflicting_files": source_conflicts,
+                "generated_conflicts": regenerate,
+                "conflict_messages": messages,
+            },
         )
-        regenerate = [path for path in conflicting if is_generated_path(path)]
-        source_conflicts = [path for path in conflicting if not is_generated_path(path)]
-        if source_conflicts:
-            raise SyncError(
-                "candidate delta replay has conflicts; source branch is untouched and the candidate "
-                f"was retained at {worktree}: {detail}",
-                details={
-                    "status": "conflict",
-                    "candidate_branch": branch,
-                    "candidate_worktree": str(worktree),
-                    "target_tag": plan.target_tag,
-                    "target_commit": plan.target_commit,
-                    "conflicting_files": source_conflicts,
-                    "generated_conflicts": regenerate,
-                },
-            )
-        # Only derived artifacts conflicted: keep the upstream bytes as a
-        # placeholder and let the caller regenerate them from the merged source.
-        run(worktree, ["checkout", "--ours", "--", *regenerate])
-        run(worktree, ["add", "--", *regenerate])
     candidate_manifest = worktree / manifest_name
     replace_manifest_baseline(
         candidate_manifest,

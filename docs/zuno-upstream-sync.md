@@ -42,8 +42,9 @@ tag, optional `refresh`). Each run:
    (`Zuno-Source-Commit` trailer), the run is a no-op. This makes the schedule
    idempotent.
 3. Otherwise prepares the candidate in an isolated worktree:
-   `git worktree add <tmp> rust-vX.Y.Z`, then a three-way apply of
-   `git diff <baseline> <main>`, then rewrites the `[baseline]` section of
+   `git worktree add <tmp> rust-vX.Y.Z`, then `git merge-tree --merge-base=<baseline>
+   rust-vX.Y.Z main` (ort merge with rename detection; needs git 2.40+) checked
+   out into that worktree, then rewrites the `[baseline]` section of
    `UPSTREAM_CODEX.toml`. `main` is never modified. Derived artifacts
    (`codex-rs/Cargo.lock`, `codex-rs/app-server-protocol/schema/**`,
    `codex-rs/core/config.schema.json`) are never merged as text: a conflict in
@@ -70,7 +71,8 @@ python3 scripts/zuno_upstream.py --no-fetch prepare \
   --source main --target rust-vX.Y.Z \
   --branch upstream-sync/X.Y.Z \
   --worktree ../zuno-upstream-X.Y.Z
-# fix conflict markers in ../zuno-upstream-X.Y.Z, then regenerate derived artifacts:
+# conflicted files carry markers; modify/delete pairs keep the Zuno version.
+# fix them in ../zuno-upstream-X.Y.Z, then regenerate derived artifacts:
 cd ../zuno-upstream-X.Y.Z/codex-rs
 cargo update --workspace
 python3 app-server-protocol/scripts/write_schema_fixtures.py

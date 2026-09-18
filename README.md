@@ -72,9 +72,9 @@ and `zuno`.
 # Fetch and report the newest stable Codex release without changing this branch.
 python3 scripts/zuno_upstream.py --json check
 
-# After the current Zuno delta is reviewed and committed, apply its exact tree
-# delta to a new Codex tag in an isolated candidate worktree. Conflicts stay
-# there for review; legacy-main bridge ancestry is never replayed.
+# After the current Zuno delta is reviewed and committed, merge it onto a new
+# Codex tag in an isolated candidate worktree (three-way, with the recorded
+# baseline as merge base). Conflicts stay there for review.
 python3 scripts/zuno_upstream.py prepare \
   --target rust-vX.Y.Z \
   --worktree ../zuno-upstream-X.Y.Z

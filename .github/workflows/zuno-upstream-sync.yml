@@ -294,7 +294,7 @@ jobs:
           if not paths:
               print("No path overlap was detected by the pre-replay comparison.")
           else:
-              print(f"{len(paths)} paths are modified on both sides (replayed cleanly with a three-way apply):")
+              print(f"{len(paths)} paths are modified on both sides (merged cleanly with the Codex baseline as merge base):")
               print("\n".join(f"- `{path}`" for path in paths))
           only = plan["baseline_only_commits"]
           if only:
