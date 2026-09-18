@@ -19,6 +19,7 @@ use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::SandboxPermissions;
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::protocol::AskForApproval;
 use codex_sandboxing::policy_transforms::effective_permission_profile;
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
 
@@ -182,9 +183,22 @@ impl ProcessEntry {
         input: &str,
         strict_auto_review: bool,
     ) -> Result<Option<(ApprovalAction, String)>, UnifiedExecError> {
-        if input.is_empty()
-            || (!self.tty && input == "\u{3}")
-            || !context
+        if input.is_empty() || (!self.tty && input == "\u{3}") {
+            return Ok(None);
+        }
+        // Under the strict approval policy every terminal input is a new command
+        // until a human has reviewed it, regardless of the write_stdin_approval
+        // feature and of whether the terminal's permissions changed. A bare
+        // interrupt cannot start anything and stays exempt.
+        let strict_policy = matches!(
+            context.step_context.settings.approval_policy(),
+            AskForApproval::UnlessTrusted
+        );
+        if strict_policy && input == "\u{3}" {
+            return Ok(None);
+        }
+        if !strict_policy
+            && !context
                 .session
                 .features()
                 .enabled(Feature::WriteStdinApproval)
@@ -214,7 +228,10 @@ impl ProcessEntry {
         let sandbox_permissions = permissions
             .review_requirement(&current, environment.permission_profile())
             .map_err(approval_error)?;
-        if sandbox_permissions == SandboxPermissions::UseDefault && !strict_auto_review {
+        if sandbox_permissions == SandboxPermissions::UseDefault
+            && !strict_auto_review
+            && !strict_policy
+        {
             return Ok(None);
         }
         // Manual approvals shell-quote the input, which cannot preserve NUL bytes.
@@ -223,9 +240,14 @@ impl ProcessEntry {
                 "terminal input contains a NUL byte and cannot be reviewed safely",
             ));
         }
-        let reason = permissions
+        let mut reason = permissions
             .approval_reason(sandbox_permissions)
             .map_err(approval_error)?;
+        if strict_policy {
+            reason = format!(
+                "Strict approval policy: every terminal input is reviewed before it runs. {reason}"
+            );
+        }
         let action = ApprovalAction::WriteStdin {
             id: self.call_id.clone(),
             approval_id: context.call_id.clone(),

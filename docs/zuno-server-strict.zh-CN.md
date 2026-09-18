@@ -53,14 +53,24 @@ zuno --profile server-strict
 该 profile 同时设置 `approvals_reviewer = "user"`，自动审阅器永远不能替你放行。审批提示里的
 "本会话内允许"仍然可以让你对已经审过的同一条命令不再被反复询问。
 
+持久终端同样受控。模型用 `exec_command` 保持一个 shell 打开、之后再用 `write_stdin` 往里输入时，
+严格模式把每次输入都当作新命令重新审批（只有单独的 Ctrl-C 例外），不依赖实验性的
+`write_stdin_approval` 特性，终端权限没变也一样。
+
+仍能跳过提示的只有操作者自己写下的东西：`$ZUNO_HOME/rules/*.rules` 里的 `allow` 规则，或
+`hooks.json` 里回答 `allow` 的 `PermissionRequest` hook。严格 profile 两者都不附带；在要求每条
+命令都审批的主机上不要添加它们。
+
 `zuno exec` 是无头模式，始终以 `approval_policy = "never"` 运行；严格模式作用于交互式
 TUI、`zuno app-server` 与 `zuno acp`。
 
 ## 冒烟测试
 
 `scripts/zuno_standalone_smoke.py` 只依赖 Python 标准库。它校验 ELF 没有动态加载器、运行
-`zuno --version`，然后用本地 mock 模型驱动 `zuno app-server`：模型提出 `ls`，严格模式下
-服务端必须发出 `item/commandExecution/requestApproval`，拒绝后回合必须结束且什么都没执行。
+`zuno --version`，然后用本地 mock 模型分三段驱动 `zuno app-server`：严格模式下对提出的 `ls`
+必须发出 `item/commandExecution/requestApproval` 且拒绝后什么都没执行；`approval_policy = "never"`
+下同样的 `ls` 必须不问直接运行；批准 `/bin/sh -i` 之后，后续的 `write_stdin` 必须再次审批
+（kind 为 `writeStdin`），拒绝后不留任何痕迹。
 
 ```sh
 python3 scripts/zuno_standalone_smoke.py --binary ./zuno-standalone-x86_64-unknown-linux-musl
