@@ -205,18 +205,16 @@ jobs:
           shared-key: zuno-upstream-sync
           cache-bin: false
 
-      - name: Regenerate derived artifacts and commit candidate
+      - name: Regenerate derived artifacts and finalize candidate
         if: steps.candidate.outputs.outcome == 'candidate'
         env:
           CANDIDATE: ${{ steps.candidate.outputs.candidate }}
-          TARGET_TAG: ${{ steps.plan.outputs.target_tag }}
           TARGET_VERSION: ${{ steps.plan.outputs.target_version }}
           SOURCE_SHA: ${{ steps.plan.outputs.source_sha }}
-          UPSTREAM_COMMIT: ${{ steps.candidate.outputs.upstream_commit }}
         run: |
           set -euo pipefail
           # Derived artifacts (Cargo.lock, App Server schema fixtures, config
-          # schema) are rebuilt from the replayed source instead of merged as
+          # schema) are rebuilt from the merged source instead of merged as
           # text; the PR gate checks the schema fixtures for drift.
           (
             cd "${CANDIDATE}/codex-rs"
@@ -225,21 +223,16 @@ jobs:
             python3 app-server-protocol/scripts/write_schema_fixtures.py --experimental
             cargo run -q -p codex-config-schema --bin codex-write-config-schema
           )
+          # finalize commits the candidate as a merge whose first parent is the
+          # reviewed main commit and whose second parent is the exact upstream
+          # release, so the PR merges trivially and promotion can verify both.
           git -C "${CANDIDATE}" config user.name github-actions[bot]
           git -C "${CANDIDATE}" config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git -C "${CANDIDATE}" add --all
-          git -C "${CANDIDATE}" commit -q -F - <<EOF
-          chore(upstream): prepare Codex ${TARGET_VERSION} candidate
-
-          Replays the reviewed Zuno delta from main@${SOURCE_SHA} onto exact
-          Codex release ${TARGET_TAG}, then regenerates Cargo.lock, the App
-          Server schema fixtures, and the config schema from the merged source.
-
-          Zuno-Source-Commit: ${SOURCE_SHA}
-          Zuno-Upstream-Tag: ${TARGET_TAG}
-          Zuno-Upstream-Commit: ${UPSTREAM_COMMIT}
-          EOF
-          git -C "${CANDIDATE}" show --stat --format='%H%n%s' HEAD | head -n 40
+          python3 scripts/zuno_upstream.py --json finalize \
+            --worktree "${CANDIDATE}" \
+            --source "${SOURCE_SHA}" \
+            --message "chore(upstream): merge Codex ${TARGET_VERSION} into Zuno"
+          git -C "${CANDIDATE}" show --stat --format='%H %P%n%s' HEAD | head -n 40
 
       # Pushes and pull requests made with the default GITHUB_TOKEN do not
       # trigger `pull_request` workflows, so the PR gate would never run on the
@@ -304,9 +297,9 @@ jobs:
           PY
           )"
           body="$(cat <<EOF
-          This candidate replays the reviewed Zuno delta onto exact Codex release \`${TARGET_TAG}\` (\`${UPSTREAM_COMMIT}\`).
+          This candidate merges exact Codex release \`${TARGET_TAG}\` (\`${UPSTREAM_COMMIT}\`) into the reviewed Zuno source \`main@${SOURCE_SHA}\`. The head commit's first parent is that \`main\` commit and its second parent is the release commit, so the diff below is exactly the upstream change plus regenerated derived artifacts.
 
-          It was prepared in an isolated CI worktree by the scheduled upstream watcher. Nothing was merged automatically; the watcher force-updates this branch whenever \`main\` moves so the candidate always replays the current reviewed delta.
+          It was prepared in an isolated CI worktree by the scheduled upstream watcher. Nothing was merged automatically; the watcher force-updates this branch whenever \`main\` moves so the candidate always builds on the current reviewed source.
 
           ${overlap}
 
@@ -382,7 +375,7 @@ jobs:
           PY
           )"
           body="$(cat <<EOF
-          Replaying the reviewed Zuno delta from \`main@${SOURCE_SHA}\` onto Codex \`${TARGET_TAG}\` leaves ${count} conflicting paths. The automation did not push anything; \`main\` is untouched.
+          Merging Codex \`${TARGET_TAG}\` into \`main@${SOURCE_SHA}\` leaves ${count} conflicting paths. The automation did not push anything; \`main\` is untouched.
 
           ${files}
 
@@ -394,13 +387,18 @@ jobs:
             --source main --target ${TARGET_TAG} \\
             --branch upstream-sync/${TARGET_VERSION} \\
             --worktree ../zuno-upstream-${TARGET_VERSION}
-          # fix the conflict markers in the worktree above, then:
-          git -C ../zuno-upstream-${TARGET_VERSION} add --all
-          git -C ../zuno-upstream-${TARGET_VERSION} commit -m "chore(upstream): prepare Codex ${TARGET_VERSION} candidate"
+          # fix the conflict markers in the worktree above (the new baseline is already
+          # written to UPSTREAM_CODEX.toml), regenerate derived artifacts:
+          (cd ../zuno-upstream-${TARGET_VERSION}/codex-rs && cargo update --workspace \\
+            && python3 app-server-protocol/scripts/write_schema_fixtures.py \\
+            && python3 app-server-protocol/scripts/write_schema_fixtures.py --experimental \\
+            && cargo run -p codex-config-schema --bin codex-write-config-schema)
+          # then commit as a merge of main and the release (finalize refuses leftover markers):
+          python3 scripts/zuno_upstream.py finalize --worktree ../zuno-upstream-${TARGET_VERSION} --source main
           git -C ../zuno-upstream-${TARGET_VERSION} push -u origin upstream-sync/${TARGET_VERSION}
           \`\`\`
 
-          Open the PR from that branch (label \`upstream-sync\`). Once \`main\` changes, the watcher retries the replay and closes this issue if it becomes clean.
+          Open the PR from that branch (label \`upstream-sync\`). Once \`main\` changes, the watcher retries the merge and closes this issue if it becomes clean.
 
           Zuno-Source-Commit: ${SOURCE_SHA}
           Zuno-Upstream-Tag: ${TARGET_TAG}

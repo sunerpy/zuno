@@ -43,8 +43,11 @@ zuno-upstream-sync.yml ── 重放无冲突 ──▶ 分支 upstream-sync/X.Y
    `codex-rs/app-server-protocol/schema/**`、`codex-rs/core/config.schema.json`）不做
    文本合并：它们的冲突会被重置为上游字节，重放完成后巡检会从合并后的源码重新生成
    三者（`cargo update --workspace`、带与不带 `--experimental` 的
-   `write_schema_fixtures.py`、`codex-write-config-schema`），再提交。
-4. 重放干净时，用 `--force-with-lease` 强推 `upstream-sync/X.Y.Z`，并新建或刷新
+   `write_schema_fixtures.py`、`codex-write-config-schema`），再由
+   `scripts/zuno_upstream.py finalize` 提交：提交是一个合并，**第一父节点是 `main`
+   提交，第二父节点是精确的 release 提交**。因此候选包含 `main`，PR diff 恰好是上游改动，
+   GitHub 合并是平凡的（晋升的 tree 等于认证 head 的 tree），release 提交也对下一次同步可达。
+4. 合并干净时，用 `--force-with-lease` 强推 `upstream-sync/X.Y.Z`，并新建或刷新
    PR。`main` 一旦前进，下一次运行会重新准备候选，使 PR 始终重放当前已评审差量。
    更旧版本的候选 PR 和同标签的冲突 issue 会被标记为已取代并关闭。
 5. 有冲突时，新建或更新一个 issue，列出冲突路径和本地解决命令。不推送任何东西。
@@ -59,14 +62,18 @@ python3 scripts/zuno_upstream.py --no-fetch prepare \
   --source main --target rust-vX.Y.Z \
   --branch upstream-sync/X.Y.Z \
   --worktree ../zuno-upstream-X.Y.Z
-# 冲突文件带有标记；modify/delete 会保留 Zuno 版本。
-# 在 ../zuno-upstream-X.Y.Z 中处理后，重新生成派生产物：
+# 冲突文件带有标记；modify/delete 会保留 Zuno 版本。UPSTREAM_CODEX.toml 已写入新 release。
+# 在 ../zuno-upstream-X.Y.Z 中处理标记后，重新生成派生产物：
 cd ../zuno-upstream-X.Y.Z/codex-rs
 cargo update --workspace
 python3 app-server-protocol/scripts/write_schema_fixtures.py
 python3 app-server-protocol/scripts/write_schema_fixtures.py --experimental
 cargo run -p codex-config-schema --bin codex-write-config-schema
-cd .. && git add --all && git commit && git push -u origin upstream-sync/X.Y.Z
+cd ../..
+# finalize 会拒绝残留的冲突标记，并以 main 与 release 为双父节点提交，带 Zuno-Source-Commit /
+# Zuno-Upstream-* trailer：
+python3 scripts/zuno_upstream.py finalize --worktree ../zuno-upstream-X.Y.Z --source main
+git -C ../zuno-upstream-X.Y.Z push -u origin upstream-sync/X.Y.Z
 ```
 
 从该分支开 PR 并加上 `upstream-sync` 标签，晋升流程才会识别它。当之后某次对
@@ -83,6 +90,8 @@ cd .. && git add --all && git commit && git push -u origin upstream-sync/X.Y.Z
 
 - PR 已合并进 `main`，合并提交恰有两个父节点：PR base 与已认证的 head（squash 与
   rebase 会改变认证字节，因而被拒绝）；
+- finalize 产出的候选 head 本身是合并：第一父节点为 PR base，第二父节点为其
+  `UPSTREAM_CODEX.toml` 记录的 release 提交，且 tree 与记录一致；
 - 合并后的 tree 等于认证 head 的 tree，即发布的字节就是 PR gate 构建的字节；
 - head 保留了其 `UPSTREAM_CODEX.toml` 记录的 Codex 基线；
 - 封存的 `candidate-manifest.json` 与每个归档都匹配 run、attempt、PR、head、父节点、

@@ -51,8 +51,13 @@ tag, optional `refresh`). Each run:
    them is reset to the upstream bytes, and after the replay the watcher
    regenerates all three from the merged source (`cargo update --workspace`,
    `write_schema_fixtures.py` with and without `--experimental`, and
-   `codex-write-config-schema`) before committing.
-4. On a clean replay it force-pushes `upstream-sync/X.Y.Z` (with
+   `codex-write-config-schema`) before committing. The commit is created by
+   `scripts/zuno_upstream.py finalize`: a merge whose **first parent is the
+   `main` commit** and whose **second parent is the exact release commit**. The
+   candidate therefore contains `main`, the PR diff is exactly the upstream
+   change, the GitHub merge is trivial (so the promoted tree equals the certified
+   head tree), and the release commit stays reachable for the next sync.
+4. On a clean merge it force-pushes `upstream-sync/X.Y.Z` (with
    `--force-with-lease`) and opens or refreshes the PR. Whenever `main` moves,
    the next run re-prepares the candidate so the PR always replays the current
    reviewed delta. Older open candidates and any conflict issue for the same tag
@@ -72,13 +77,18 @@ python3 scripts/zuno_upstream.py --no-fetch prepare \
   --branch upstream-sync/X.Y.Z \
   --worktree ../zuno-upstream-X.Y.Z
 # conflicted files carry markers; modify/delete pairs keep the Zuno version.
-# fix them in ../zuno-upstream-X.Y.Z, then regenerate derived artifacts:
+# UPSTREAM_CODEX.toml already records the new release. Fix the markers in
+# ../zuno-upstream-X.Y.Z, then regenerate derived artifacts:
 cd ../zuno-upstream-X.Y.Z/codex-rs
 cargo update --workspace
 python3 app-server-protocol/scripts/write_schema_fixtures.py
 python3 app-server-protocol/scripts/write_schema_fixtures.py --experimental
 cargo run -p codex-config-schema --bin codex-write-config-schema
-cd .. && git add --all && git commit && git push -u origin upstream-sync/X.Y.Z
+cd ../..
+# finalize refuses leftover conflict markers and commits the merge of main and
+# the release with the Zuno-Source-Commit / Zuno-Upstream-* trailers:
+python3 scripts/zuno_upstream.py finalize --worktree ../zuno-upstream-X.Y.Z --source main
+git -C ../zuno-upstream-X.Y.Z push -u origin upstream-sync/X.Y.Z
 ```
 
 Open the PR from that branch and add the `upstream-sync` label so promotion
@@ -99,6 +109,9 @@ Before anything is published it verifies that:
 - the PR is merged into `main` with a two-parent merge commit whose parents are
   exactly the PR base and the certified head (squash and rebase merges are
   rejected because they change the certified bytes);
+- a finalized upstream-sync head is itself a merge whose first parent is the PR
+  base and whose second parent is the release commit recorded in its
+  `UPSTREAM_CODEX.toml`, with the recorded release tree;
 - the merged tree equals the certified head tree, so the released bytes are
   the ones the PR gate built;
 - the head retains the Codex baseline recorded in its `UPSTREAM_CODEX.toml`;

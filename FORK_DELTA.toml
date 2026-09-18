@@ -111,6 +111,7 @@ contracts = [
   "The exact upstream tag, commit, and tree are verified before replay.",
   "The watcher tracks only the newest stable Codex tag, is idempotent per main commit, and reports replay conflicts as an issue instead of pushing.",
   "Merging the candidate PR with a merge commit is the only manual step; nothing is merged automatically.",
+  "A candidate is finalized as a merge whose first parent is the reviewed main commit and whose second parent is the exact upstream release commit recorded in UPSTREAM_CODEX.toml, even after manual conflict resolution.",
 ]
 
 [[capabilities]]

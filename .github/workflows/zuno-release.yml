@@ -174,43 +174,64 @@ jobs:
           }
           read -r -a head_parents <<<"$(git show -s --format=%P "$EXPECTED_HEAD_SHA")"
           head_tree="$(git rev-parse "${EXPECTED_HEAD_SHA}^{tree}")"
+          manifest_field() {
+            git show "${EXPECTED_HEAD_SHA}:UPSTREAM_CODEX.toml" | awk -v field="$1" '
+              /^\[baseline\]$/ { in_baseline=1; next }
+              /^\[/ { in_baseline=0 }
+              in_baseline && index($0, field " = ") == 1 {
+                value=$0
+                sub(/^[^=]*=[[:space:]]*"/, "", value)
+                sub(/".*$/, "", value)
+                print value
+                exit
+              }
+            '
+          }
+          baseline_commit="$(manifest_field release_commit)"
+          baseline_tree="$(manifest_field release_tree)"
+          [[ "$baseline_commit" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$baseline_tree" =~ ^[0-9a-f]{40}$ ]]
           case "${#head_parents[@]}" in
             1)
-              # Ordinary candidate (for example an upstream-sync replay): a linear
-              # commit whose ancestry must still contain the recorded Codex baseline.
+              # Linear candidate: a commit whose ancestry must contain the recorded Codex baseline.
               zuno_ancestor="$EXPECTED_HEAD_SHA"
               ;;
             2)
-              # Source-history bridge used by the original cutover: the merge of the
-              # PR base and the reviewed Zuno tree, with the Zuno tree unchanged.
-              [[ "${head_parents[0]}" == "$base_sha" ]] || {
-                echo "bridge first parent ${head_parents[0]} differs from PR base $base_sha" >&2
-                exit 1
-              }
-              zuno_tree="$(git rev-parse "${head_parents[1]}^{tree}")"
-              [[ "$head_tree" == "$zuno_tree" ]] || {
-                echo "bridge tree $head_tree differs from reviewed Zuno tree $zuno_tree" >&2
-                exit 1
-              }
-              zuno_ancestor="${head_parents[1]}"
+              if [[ "${head_parents[1]}" == "$baseline_commit" ]]; then
+                # Upstream-sync candidate produced by `zuno_upstream.py finalize`: a merge
+                # whose first parent is the reviewed main commit (the PR base) and whose
+                # second parent is the exact Codex release recorded in the manifest.
+                [[ "${head_parents[0]}" == "$base_sha" ]] || {
+                  echo "candidate first parent ${head_parents[0]} differs from PR base $base_sha" >&2
+                  exit 1
+                }
+                git fetch --no-tags origin "$baseline_commit" 2>/dev/null || true
+                release_tree="$(git rev-parse "${baseline_commit}^{tree}")"
+                [[ "$release_tree" == "$baseline_tree" ]] || {
+                  echo "release commit $baseline_commit has tree $release_tree, manifest records $baseline_tree" >&2
+                  exit 1
+                }
+                zuno_ancestor="$EXPECTED_HEAD_SHA"
+              else
+                # Source-history bridge used by the original cutover: the merge of the
+                # PR base and the reviewed Zuno tree, with the Zuno tree unchanged.
+                [[ "${head_parents[0]}" == "$base_sha" ]] || {
+                  echo "bridge first parent ${head_parents[0]} differs from PR base $base_sha" >&2
+                  exit 1
+                }
+                zuno_tree="$(git rev-parse "${head_parents[1]}^{tree}")"
+                [[ "$head_tree" == "$zuno_tree" ]] || {
+                  echo "bridge tree $head_tree differs from reviewed Zuno tree $zuno_tree" >&2
+                  exit 1
+                }
+                zuno_ancestor="${head_parents[1]}"
+              fi
               ;;
             *)
-              echo "certified PR head must have one parent or be a two-parent source-history bridge" >&2
+              echo "certified PR head must have one parent, be a finalized upstream-sync merge, or be a two-parent source-history bridge" >&2
               exit 1
               ;;
           esac
-          baseline_commit="$(git show "${EXPECTED_HEAD_SHA}:UPSTREAM_CODEX.toml" | awk '
-            /^\[baseline\]$/ { in_baseline=1; next }
-            /^\[/ { in_baseline=0 }
-            in_baseline && /^release_commit = / {
-              value=$0
-              sub(/^[^=]*=[[:space:]]*"/, "", value)
-              sub(/".*$/, "", value)
-              print value
-              exit
-            }
-          ')"
-          [[ "$baseline_commit" =~ ^[0-9a-f]{40}$ ]]
           git merge-base --is-ancestor "$baseline_commit" "$zuno_ancestor" || {
             echo "certified head $zuno_ancestor does not retain Codex baseline $baseline_commit" >&2
             exit 1
