@@ -721,7 +721,7 @@ pub struct Config {
     /// appends one extra argument containing a JSON payload describing the
     /// event.
     ///
-    /// Example `~/.codex/config.toml` snippet:
+    /// Example `~/.zuno/config.toml` snippet:
     ///
     /// ```toml
     /// notify = ["notify-send", "Codex"]
@@ -902,7 +902,7 @@ pub struct Config {
     /// Memories subsystem settings.
     pub memories: MemoriesConfig,
 
-    /// Directory containing all Codex state (defaults to `~/.codex` but can be
+    /// Directory containing all Codex state (defaults to `~/.zuno` but can be
     /// overridden by the `ZUNO_HOME` environment variable).
     pub codex_home: AbsolutePathBuf,
 
@@ -912,7 +912,7 @@ pub struct Config {
     /// Directory where Codex writes log files (defaults to `$ZUNO_HOME/log`).
     pub log_dir: PathBuf,
 
-    /// Settings that govern if and what will be written to `~/.codex/history.jsonl`.
+    /// Settings that govern if and what will be written to `~/.zuno/history.jsonl`.
     pub history: History,
 
     /// When true, session is not persisted on disk. Default to `false`
@@ -4770,7 +4770,7 @@ fn normalize_guardian_policy_config(value: Option<&str>) -> Option<String> {
 
 /// Returns the path to the Codex configuration directory, which can be
 /// specified by the `ZUNO_HOME` environment variable. If not set, defaults to
-/// `~/.codex`.
+/// `~/.zuno`.
 ///
 /// - If `ZUNO_HOME` is set, the value must exist and be a directory. The
 ///   value will be canonicalized and this function will Err otherwise.
