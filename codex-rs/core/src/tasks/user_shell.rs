@@ -158,7 +158,7 @@ pub(crate) async fn execute_user_shell_command(
         send_user_shell_error(
             &session,
             turn_context.as_ref(),
-            "shell working directory is not native to the Codex host",
+            "shell working directory is not native to the Zuno host",
         )
         .await;
         return;

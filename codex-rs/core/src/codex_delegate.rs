@@ -62,7 +62,7 @@ pub(crate) async fn run_codex_thread_interactive(
 ) -> Result<(Arc<Session>, SessionIo), CodexErr> {
     if config.permissions.approval_policy.value() != AskForApproval::Never {
         return Err(CodexErr::InvalidRequest(
-            "Codex delegates require approval policy `never`".to_string(),
+            "Zuno delegates require approval policy `never`".to_string(),
         ));
     }
     config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);

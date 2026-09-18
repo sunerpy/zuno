@@ -195,12 +195,12 @@ fn current_thread_section_keeps_latest_turns_when_history_exceeds_budget() {
 
 #[test]
 fn startup_context_blob_is_wrapped_in_tags_without_final_truncation() {
-    let body = "Startup context from Codex.\n## Current Thread\nhello";
+    let body = "Startup context from Zuno.\n## Current Thread\nhello";
     let wrapped = format_startup_context_blob(body);
 
     assert_eq!(
         wrapped,
-        "<startup_context>\nStartup context from Codex.\n## Current Thread\nhello\n</startup_context>"
+        "<startup_context>\nStartup context from Zuno.\n## Current Thread\nhello\n</startup_context>"
     );
 }
 
