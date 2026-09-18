@@ -36,7 +36,7 @@ async fn cloud_list_only_allows_trusted_credential_destinations() -> Result<()> 
         let mut command = assert_cmd::Command::new(codex_utils_cargo_bin::cargo_bin("codex")?);
         command
             .current_dir(codex_home.path())
-            .env("CODEX_HOME", codex_home.path())
+            .env("ZUNO_HOME", codex_home.path())
             .env_remove("CODEX_ACCESS_TOKEN")
             .env_remove("OPENAI_API_KEY")
             .env_remove("CODEX_CLOUD_TASKS_MODE")

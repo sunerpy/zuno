@@ -139,7 +139,7 @@ impl AmbientPet {
     /// Load the active ambient pet and prepare its frame cache.
     ///
     /// This resolves the selected pet id, extracts per-frame PNGs into the
-    /// CODEX_HOME cache, and records the terminal protocol support snapshot used
+    /// ZUNO_HOME cache, and records the terminal protocol support snapshot used
     /// for later draw requests. A caller that repeatedly recreates `AmbientPet`
     /// instead of mutating one instance would lose animation timing continuity
     /// and pay the frame-cache preparation cost more often than necessary.

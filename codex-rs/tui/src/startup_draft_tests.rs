@@ -661,7 +661,7 @@ async fn startup_draft_waits_for_onboarding_before_accepting_input() {
                 codex_home.path(),
                 Ok(system_config_path),
                 || Ok(false),
-                |name| (name == "CODEX_HOME").then(|| codex_home.path().as_os_str().to_os_string()),
+                |name| (name == "ZUNO_HOME").then(|| codex_home.path().as_os_str().to_os_string()),
             )
         {
             StartupDraftInitialScreen::Onboarding

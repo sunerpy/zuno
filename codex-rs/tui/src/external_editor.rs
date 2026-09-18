@@ -182,16 +182,15 @@ pub(crate) async fn run_editor(
         return Err(Report::msg("editor command is empty"));
     }
 
-    let default_codex_home = dirs::home_dir().map(|home| home.join(".codex"));
+    // Only the resolved Zuno home and the project-local `.codex` folder are
+    // candidates; `~/.codex` belongs to a separately installed Codex.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let project_codex_home = cwd.join(".codex");
-    let mut candidate_homes = vec![codex_home];
-    if let Some(default_codex_home) = default_codex_home.as_deref() {
-        candidate_homes.push(default_codex_home);
-    }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    candidate_homes.push(&project_codex_home);
-    let editor_directory = editor_directory(&candidate_homes, file_system_policy, cwd)?;
+    let candidate_homes: &[&Path] = &[codex_home, &project_codex_home];
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let candidate_homes: &[&Path] = &[codex_home];
+    let editor_directory = editor_directory(candidate_homes, file_system_policy, cwd)?;
     // Convert to TempPath immediately so no file handle stays open on Windows.
     let temp_path = Builder::new()
         .suffix(".md")

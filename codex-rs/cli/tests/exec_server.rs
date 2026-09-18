@@ -50,7 +50,7 @@ use wiremock::matchers::path;
 
 fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command> {
     let mut cmd = assert_cmd::Command::new(codex_utils_cargo_bin::cargo_bin("codex")?);
-    cmd.env("CODEX_HOME", codex_home);
+    cmd.env("ZUNO_HOME", codex_home);
     Ok(cmd)
 }
 
@@ -187,7 +187,7 @@ metrics_exporter = {{ otlp-http = {{ endpoint = "{collector_url}/v1/metrics", pr
 
     let mut command = tokio::process::Command::new(executable);
     command
-        .env("CODEX_HOME", codex_home.path())
+        .env("ZUNO_HOME", codex_home.path())
         .env("CODEX_API_KEY", "test-api-key")
         .env(
             codex_exec_server::CODEX_EXEC_SERVER_EXIT_ON_STDIN_CLOSE_ENV_VAR,
@@ -425,7 +425,7 @@ metrics_exporter = {{ otlp-http = {{ endpoint = "{base_url}/v1/metrics", protoco
     let subprocess = async move {
         let mut command = tokio::process::Command::new(codex_bin);
         command
-            .env("CODEX_HOME", codex_home)
+            .env("ZUNO_HOME", codex_home)
             .env("NO_PROXY", "127.0.0.1,localhost")
             .env("no_proxy", "127.0.0.1,localhost")
             .args(["exec-server", "--listen", "stdio"])
@@ -555,7 +555,7 @@ async fn send_json_line(
 fn local_exec_server_exits_successfully_on_sigterm() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mut child = std::process::Command::new(codex_utils_cargo_bin::cargo_bin("codex")?)
-        .env("CODEX_HOME", codex_home.path())
+        .env("ZUNO_HOME", codex_home.path())
         .args(["exec-server", "--listen", "ws://127.0.0.1:0"])
         .stdout(Stdio::piped())
         .spawn()?;

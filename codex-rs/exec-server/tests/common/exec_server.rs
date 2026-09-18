@@ -105,9 +105,9 @@ impl ExecServerHarness {
         if !command
             .as_std()
             .get_envs()
-            .any(|(key, value)| key == "CODEX_HOME" && value.is_some())
+            .any(|(key, value)| key == "ZUNO_HOME" && value.is_some())
         {
-            command.env("CODEX_HOME", codex_home.path());
+            command.env("ZUNO_HOME", codex_home.path());
         }
         let mut child = command.spawn()?;
 

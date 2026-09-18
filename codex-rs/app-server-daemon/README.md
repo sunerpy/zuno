@@ -17,7 +17,7 @@ whose host permits detached child processes.
 Windows automatic attachment requires the canonical socket address to fit the
 108-byte AF_UNIX limit (including its terminator). A short junction alias whose
 resolved address exceeds that limit falls back to the embedded server. Use a
-shorter `CODEX_HOME` to share the daemon; discovery does not trust a mutable alias.
+shorter `ZUNO_HOME` to share the daemon; discovery does not trust a mutable alias.
 
 Shared clients use the environment inherited when the daemon started. Opening a
 new terminal or clearing variables there does not clear the running daemon's
@@ -57,18 +57,18 @@ On Windows, use a non-elevated PowerShell terminal whose host allows breakaway:
 
 ```powershell
 irm https://chatgpt.com/codex/install.ps1 | iex
-$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+$codexHome = if ($env:ZUNO_HOME) { $env:ZUNO_HOME } else { Join-Path $HOME '.codex' }
 & "$codexHome\packages\standalone\current\bin\codex.exe" app-server daemon bootstrap --remote-control
 ```
 
 `bootstrap` requires the standalone managed install. It records the daemon
-settings under `CODEX_HOME/app-server-daemon/`, starts app-server as a
+settings under `ZUNO_HOME/app-server-daemon/`, starts app-server as a
 pidfile-backed detached process, and launches a detached updater loop.
 
 ## Installation and update cases
 
 The daemon uses the standalone installer (`install.sh` on Unix, `install.ps1`
-on Windows) and its managed binary under `CODEX_HOME/packages/standalone/current`:
+on Windows) and its managed binary under `ZUNO_HOME/packages/standalone/current`:
 `bin/codex` or `bin/codex.exe`, falling back to the legacy flat layout when present.
 
 | Situation | What starts | Does this daemon fetch new binaries? | Does a running app-server eventually move to a newer binary on its own? |
@@ -121,13 +121,13 @@ daemon normally.
 `stop` sends a graceful termination request first, then sends a second
 termination signal after the grace window if the process is still alive.
 
-All mutating lifecycle commands are serialized per `CODEX_HOME`, so a concurrent
+All mutating lifecycle commands are serialized per `ZUNO_HOME`, so a concurrent
 `start`, `restart`, `enable-remote-control`, `disable-remote-control`, `stop`,
 or `bootstrap` does not race another in-flight lifecycle operation.
 
 ## State
 
-The daemon stores its local state under `CODEX_HOME/app-server-daemon/`:
+The daemon stores its local state under `ZUNO_HOME/app-server-daemon/`:
 
 - `settings.json` for persisted launch settings
 - `app-server.pid` for the app-server process record

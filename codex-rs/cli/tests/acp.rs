@@ -7,7 +7,7 @@ use tempfile::TempDir;
 
 fn zuno_command(codex_home: &Path) -> Result<assert_cmd::Command> {
     let mut command = assert_cmd::Command::new(codex_utils_cargo_bin::cargo_bin("zuno")?);
-    command.env("CODEX_HOME", codex_home);
+    command.env("ZUNO_HOME", codex_home);
     Ok(command)
 }
 

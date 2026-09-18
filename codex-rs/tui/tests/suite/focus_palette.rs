@@ -206,7 +206,7 @@ impl PtyCodex {
             .arg(repo_root)
             .env("TERM", "xterm-256color")
             .env("OPENAI_API_KEY", "focus-palette-test")
-            .env("CODEX_HOME", codex_home.path())
+            .env("ZUNO_HOME", codex_home.path())
             .stdin(stdin)
             .stdout(stdout)
             .stderr(slave)

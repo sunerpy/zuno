@@ -230,7 +230,7 @@ class AppServerHarness:
         return CodexConfig(
             cwd=str(self.workspace),
             env={
-                "CODEX_HOME": str(self.codex_home),
+                "ZUNO_HOME": str(self.codex_home),
                 "CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG": "1",
                 "RUST_LOG": "warn",
             },

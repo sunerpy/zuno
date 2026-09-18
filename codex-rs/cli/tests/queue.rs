@@ -179,7 +179,7 @@ async fn run_remote_queue_command(response: QueueResponse) -> Result<(Output, Va
         ]
     };
     let output = tokio::process::Command::new(codex_utils_cargo_bin::cargo_bin("codex")?)
-        .env("CODEX_HOME", codex_home.path())
+        .env("ZUNO_HOME", codex_home.path())
         .env("CODEX_REMOTE_TOKEN", "test-token")
         .args(remote_args)
         .args(["--thread", THREAD_ID, "--message", "do the thing"])
@@ -214,7 +214,7 @@ async fn queue_rejects_local_daemon_that_does_not_support_queueing() -> Result<(
     });
 
     let output = tokio::process::Command::new(codex_utils_cargo_bin::cargo_bin("codex")?)
-        .env("CODEX_HOME", codex_home.path())
+        .env("ZUNO_HOME", codex_home.path())
         .args(["queue", "--thread", THREAD_ID, "--message", "do the thing"])
         .output()
         .await?;
@@ -248,7 +248,7 @@ async fn queue_rejects_overrides_that_bypass_local_daemon() -> Result<()> {
     });
 
     let output = tokio::process::Command::new(codex_utils_cargo_bin::cargo_bin("codex")?)
-        .env("CODEX_HOME", codex_home.path())
+        .env("ZUNO_HOME", codex_home.path())
         .args([
             "queue",
             "-c",

@@ -131,7 +131,7 @@ async fn marketplace_remove_preserves_project_marketplace(user_entry: bool) -> R
     if user_entry {
         record_user_marketplace(codex_home.path(), "debug", &configured_marketplace_update())?;
     }
-    // TestAppServer starts in CODEX_HOME, so make it a trusted project as well.
+    // TestAppServer starts in ZUNO_HOME, so make it a trusted project as well.
     std::fs::create_dir_all(codex_home.path().join(".git"))?;
     std::fs::create_dir_all(codex_home.path().join(".codex"))?;
     let project_config_path = codex_home.path().join(".codex/config.toml");

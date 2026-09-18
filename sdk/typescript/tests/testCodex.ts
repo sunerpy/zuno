@@ -80,7 +80,7 @@ function mergeTestConfig(
   return {
     ...mergedConfig,
     // Disable plugins in SDK integration tests so background curated-plugin
-    // sync does not race temp CODEX_HOME cleanup.
+    // sync does not race temp ZUNO_HOME cleanup.
     features:
       featureOverrides && typeof featureOverrides === "object" && !Array.isArray(featureOverrides)
         ? { ...featureOverrides, plugins: false }

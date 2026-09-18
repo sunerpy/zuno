@@ -4,12 +4,12 @@ import path from "node:path";
 
 import { afterEach, beforeEach } from "@jest/globals";
 
-const originalCodexHome = process.env.CODEX_HOME;
+const originalCodexHome = process.env.ZUNO_HOME;
 let currentCodexHome: string | undefined;
 
 beforeEach(async () => {
   currentCodexHome = await fs.mkdtemp(path.join(os.tmpdir(), "codex-sdk-test-"));
-  process.env.CODEX_HOME = currentCodexHome;
+  process.env.ZUNO_HOME = currentCodexHome;
 });
 
 afterEach(async () => {
@@ -17,9 +17,9 @@ afterEach(async () => {
   currentCodexHome = undefined;
 
   if (originalCodexHome === undefined) {
-    delete process.env.CODEX_HOME;
+    delete process.env.ZUNO_HOME;
   } else {
-    process.env.CODEX_HOME = originalCodexHome;
+    process.env.ZUNO_HOME = originalCodexHome;
   }
 
   if (codexHomeToDelete) {

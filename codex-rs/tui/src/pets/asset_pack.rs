@@ -3,7 +3,7 @@
 //! Unlike custom pets, built-in pets are not checked into the TUI package as
 //! local spritesheets. The TUI resolves them from the public Codex pets CDN on
 //! first use, verifies that the downloaded file has the expected spritesheet
-//! geometry, and installs it into a versioned cache under CODEX_HOME.
+//! geometry, and installs it into a versioned cache under ZUNO_HOME.
 //!
 //! This module deliberately stops at "a validated spritesheet exists at this
 //! path". Higher layers remain responsible for deciding when downloads are

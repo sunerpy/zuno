@@ -649,13 +649,13 @@ impl PluginsManager {
         auth_manager: Arc<AuthManager>,
         skill_root_loader: Arc<dyn SkillRootLoader<PluginSkillRoot>>,
     ) -> Self {
-        // Product restrictions are enforced at marketplace admission time for a given CODEX_HOME:
+        // Product restrictions are enforced at marketplace admission time for a given ZUNO_HOME:
         // listing, install, and curated refresh all consult this restriction context before new
         // plugins enter local config or cache. After admission, runtime plugin loading trusts the
-        // contents of that CODEX_HOME and does not re-filter configured plugins by product, so
+        // contents of that ZUNO_HOME and does not re-filter configured plugins by product, so
         // already-admitted plugins may continue exposing MCP servers/tools from shared local state.
         //
-        // This assumes a single CODEX_HOME is only used by one product.
+        // This assumes a single ZUNO_HOME is only used by one product.
         let remote_installed_plugin_bundle_sync_gate =
             crate::remote::remote_installed_plugin_bundle_sync_gate(&codex_home);
         Self {

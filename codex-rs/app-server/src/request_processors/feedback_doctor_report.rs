@@ -112,7 +112,7 @@ fn doctor_command(executable: &Path, cwd: &Path, codex_home: &Path) -> Command {
         .arg("--json")
         .arg("--feedback")
         .current_dir(codex_home)
-        .env("CODEX_HOME", codex_home);
+        .env("ZUNO_HOME", codex_home);
     command
 }
 
@@ -218,7 +218,7 @@ mod tests {
         );
         assert_eq!(
             command.get_envs().collect::<Vec<_>>(),
-            [("CODEX_HOME".as_ref(), Some(codex_home.path().as_os_str()))]
+            [("ZUNO_HOME".as_ref(), Some(codex_home.path().as_os_str()))]
         );
     }
 

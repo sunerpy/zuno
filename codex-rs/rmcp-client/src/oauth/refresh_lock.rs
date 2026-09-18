@@ -43,7 +43,7 @@ impl RefreshCredentialLock {
         store_key: &str,
         acquire_timeout: Duration,
     ) -> Result<Self> {
-        // Scope coordination to CODEX_HOME alongside File and Secrets state. Direct keyring
+        // Scope coordination to ZUNO_HOME alongside File and Secrets state. Direct keyring
         // coordination across homes needs a separate cross-platform rendezvous.
         // TODO(stevenlee): define that rendezvous before expanding this lock's scope.
         let mut hasher = Sha256::new();

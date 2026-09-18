@@ -731,11 +731,11 @@ async fn symlinked_writable_root_reports_sandbox_failure_instead_of_session_corr
         "sandbox preparation failure should not be diagnosed as session corruption: {error}"
     );
     let error = error
-        .replace(&canonical_home_path, "$CODEX_HOME")
-        .replace(&home_path, "$CODEX_HOME");
+        .replace(&canonical_home_path, "$ZUNO_HOME")
+        .replace(&home_path, "$ZUNO_HOME");
     insta::assert_snapshot!(error, @"
-    Fatal error: Failed to initialize session: failed to load AGENTS.md instructions for environment `local`: failed to prepare fs sandbox: failed to prepare Seatbelt sandbox: writable root $CODEX_HOME/visualizations contains symlink component $CODEX_HOME/visualizations; symlinked writable roots are not supported.
-    If this writable root is at or beneath CODEX_HOME and you trust its symlink targets, set `allow_symlinked_codex_home = true` at the top level of `$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`) on the execution host, then restart Codex or its executor. This opt-out trusts targets outside CODEX_HOME and targets changed between commands. It does not apply to other writable roots.
+    Fatal error: Failed to initialize session: failed to load AGENTS.md instructions for environment `local`: failed to prepare fs sandbox: failed to prepare Seatbelt sandbox: writable root $ZUNO_HOME/visualizations contains symlink component $ZUNO_HOME/visualizations; symlinked writable roots are not supported.
+    If this writable root is at or beneath ZUNO_HOME and you trust its symlink targets, set `allow_symlinked_codex_home = true` at the top level of `$ZUNO_HOME/config.toml` (normally `~/.codex/config.toml`) on the execution host, then restart Codex or its executor. This opt-out trusts targets outside ZUNO_HOME and targets changed between commands. It does not apply to other writable roots.
     ");
 
     Ok(())

@@ -177,7 +177,7 @@ impl EnvironmentManager {
 
     /// Discovers configured environments without starting remote connections.
     ///
-    /// If `CODEX_HOME/environments.toml` is present, it defines the configured
+    /// If `ZUNO_HOME/environments.toml` is present, it defines the configured
     /// environments. Otherwise this preserves the legacy
     /// `CODEX_EXEC_SERVER_URL` behavior.
     pub async fn prepare_from_codex_home(
@@ -192,7 +192,7 @@ impl EnvironmentManager {
         Ok(PreparedEnvironmentManager { source })
     }
 
-    /// Builds a manager from `CODEX_HOME` with an explicit outbound HTTP policy.
+    /// Builds a manager from `ZUNO_HOME` with an explicit outbound HTTP policy.
     pub async fn from_codex_home(
         codex_home: impl AsRef<std::path::Path>,
         local_runtime_paths: Option<ExecServerRuntimePaths>,
