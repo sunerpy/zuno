@@ -1019,7 +1019,7 @@ async fn guardian_v2_routes_scoped_tool_approvals(
                 .filter_map(|item| item["content"].as_array())
                 .flatten()
                 .filter_map(|entry| entry["text"].as_str())
-                .find(|text| text.starts_with("Codex verified that this exact MCP tool"))
+                .find(|text| text.starts_with("Zuno verified that this exact MCP tool"))
                 .expect("home-configured MCP tool should receive trusted developer context");
             let (_, trusted_metadata) = trusted_tool_context
                 .split_once('\n')
