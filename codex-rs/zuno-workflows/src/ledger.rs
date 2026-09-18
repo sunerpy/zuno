@@ -28,7 +28,9 @@ use crate::WorkflowRunId;
 use crate::WorkflowSourceIdentity;
 use codex_state::SqliteConfig;
 use serde_json::Value as JsonValue;
+use sqlx::Sqlite;
 use sqlx::SqlitePool;
+use sqlx::Transaction;
 use std::path::PathBuf;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -50,6 +52,18 @@ impl WorkflowLedger {
             Ok(ledger) => Ok(ledger),
             Err(error) => Err(error),
         }
+    }
+
+    /// Begins a transaction that takes SQLite's write lock up front.
+    ///
+    /// Every mutation below reads the current row before updating it. With a
+    /// deferred `BEGIN`, SQLite returns `SQLITE_BUSY` at the read-to-write
+    /// upgrade without invoking the busy handler when another writer is active,
+    /// which surfaced as "database is locked" failures while the engine and
+    /// concurrent `workflow/run/read` calls shared the ledger. `BEGIN IMMEDIATE`
+    /// waits for the lock within the pool's busy timeout instead.
+    async fn begin_write(&self) -> Result<Transaction<'static, Sqlite>, sqlx::Error> {
+        self.pool.begin_with("BEGIN IMMEDIATE").await
     }
 
     pub async fn from_pool(pool: SqlitePool, path: PathBuf) -> Result<Self, WorkflowLedgerError> {
@@ -82,7 +96,7 @@ impl WorkflowLedger {
         } else {
             WorkflowRunStatus::Queued
         };
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write().await?;
         let inserted = sqlx::query(
             r#"
 INSERT INTO workflow_runs (
@@ -175,7 +189,7 @@ ON CONFLICT(run_id) DO NOTHING
         reason: Option<&str>,
     ) -> Result<WorkflowLedgerRun, WorkflowLedgerError> {
         let now = now_millis()?;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write().await?;
         let current = read_run_row(&mut transaction, run_id).await?;
         if current.status.is_terminal() {
             transaction.commit().await?;
@@ -231,7 +245,7 @@ WHERE run_id = ?
         }
         let now = now_millis()?;
         let request_json = serde_json::to_string(&request.request)?;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write().await?;
         let run = read_run_row(&mut transaction, &request.run_id).await?;
         if run.status != WorkflowRunStatus::Running {
             return Err(WorkflowLedgerError::InvalidRunTransition {
@@ -300,7 +314,7 @@ ON CONFLICT(run_id, call_id) DO NOTHING
         let now = now_millis()?;
         let (status, result, error) = completion.fields();
         let result_json = result.map(serde_json::to_string).transpose()?;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write().await?;
         let current = read_call_in_transaction(&mut transaction, run_id, call_id).await?;
         if current.status.is_terminal() {
             let same = current.status == status
@@ -375,7 +389,7 @@ WHERE run_id = ? AND call_id = ? AND status = 'running'
     /// replayed mechanically; they become `uncertain` for authoritative inspection.
     pub async fn recover_interrupted(&self) -> Result<RecoverySummary, WorkflowLedgerError> {
         let now = now_millis()?;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write().await?;
         let uncertain_calls = sqlx::query(
             r#"
 UPDATE workflow_calls
@@ -418,7 +432,7 @@ WHERE status = 'running'
     ) -> Result<WorkflowLedgerRun, WorkflowLedgerError> {
         let now = now_millis()?;
         let result_json = result.as_ref().map(serde_json::to_string).transpose()?;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write().await?;
         let current = read_run_row(&mut transaction, run_id).await?;
         if current.status == target {
             let full = read_run_in_transaction(&mut transaction, run_id).await?;
