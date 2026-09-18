@@ -359,7 +359,7 @@ impl ChatWidget {
         self.finalize_turn();
 
         let message = if message.trim().is_empty() {
-            "Codex is currently experiencing high load.".to_string()
+            "Zuno is currently experiencing high load.".to_string()
         } else {
             message
         };

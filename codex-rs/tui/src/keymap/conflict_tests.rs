@@ -31,7 +31,7 @@ fn conflicting_contexts_report_the_first_conflict_in_validation_order() {
             format!(
                 "Ambiguous `tui.keymap.{context}` bindings: `{first}` and `{second}` use the same key. \
 Set unique keys in `~/.codex/config.toml` and retry. \
-See the Codex keymap documentation for supported actions and examples."
+See the Zuno keymap documentation for supported actions and examples."
             )
         );
         config.remove(context);

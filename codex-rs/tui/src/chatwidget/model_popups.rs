@@ -254,7 +254,7 @@ impl ChatWidget {
 
         let header = self.model_menu_header(
             "Select Model and Effort",
-            "Access legacy models by running codex -m <model_name> or in your config.toml",
+            "Access legacy models by running zuno -m <model_name> or in your config.toml",
         );
         self.show_model_selection_view(SelectionViewParams {
             view_id: Some(view_id),

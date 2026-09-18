@@ -17,7 +17,7 @@ expression: popup
     - Proxy environment variables are set and may affect connectivity.
       - HTTPS_PROXY = hello
 
-› 1. Yes  Share the current Codex session logs and diagnostics with the team
+› 1. Yes  Share the current Zuno session logs and diagnostics with the team
           for troubleshooting.
   2. No
 

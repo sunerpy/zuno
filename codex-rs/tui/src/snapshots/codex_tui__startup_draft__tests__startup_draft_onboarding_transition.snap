@@ -6,13 +6,13 @@ before onboarding: hidden (0x0 viewport)
 ---
 after onboarding:
 ╭───────────────────────────────────────╮
-│ >_ OpenAI Codex (v<VERSION>)              │
+│ >_ Zuno (v<VERSION>)                    │
 │                                       │
 │ model:     loading   /model to change │
 │ directory: loading                    │
 ╰───────────────────────────────────────╯
 
 
-› Ask Codex to do anything
+› Ask Zuno to do anything
 
   ? for shortcuts

@@ -117,7 +117,7 @@ impl MemoriesSettingsView {
         let mut header = ColumnRenderable::new();
         header.push(Line::from("Memories".bold()));
         header.push(Line::from(
-            "Choose how Codex uses and creates memories. Changes are saved to config.toml".dim(),
+            "Choose how Zuno uses and creates memories. Changes are saved to config.toml".dim(),
         ));
         header
     }
