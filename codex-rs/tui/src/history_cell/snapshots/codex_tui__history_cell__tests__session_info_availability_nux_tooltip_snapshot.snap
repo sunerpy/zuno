@@ -3,7 +3,7 @@ source: tui/src/history_cell.rs
 expression: rendered
 ---
 ╭─────────────────────────────────────╮
-│ >_ Zuno (v0.154.0)                  │
+│ >_ Zuno (v0.154.1)                  │
 │                                     │
 │ model:     gpt-5   /model to change │
 │ directory: /tmp/project             │
