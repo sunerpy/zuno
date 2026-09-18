@@ -32,7 +32,7 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(/*millis*/ 100);
 pub(crate) const MAX_REFERENCED_TASKS: usize = 16;
 pub(crate) const MAX_TASK_TITLE_CHARS: usize = 160;
 const MAX_REFERENCED_THREAD_ID_BYTES: usize = 768;
-const REQUEST_HEADING: &str = "## My request for Zuno:";
+const REQUEST_HEADING: &str = codex_protocol::protocol::USER_MESSAGE_BEGIN;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TaskMention {
