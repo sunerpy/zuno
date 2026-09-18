@@ -1964,7 +1964,7 @@ async fn assert_luna_pool_context(thread_context_enabled: bool) -> Result<()> {
         {"type": "input_text", "text": ">>> TRANSCRIPT END\n\n"},
         {
             "type": "input_text",
-            "text": "The Codex agent has requested the following action:\n"
+            "text": "The Zuno agent has requested the following action:\n"
         },
         {"type": "input_text", "text": ">>> APPROVAL REQUEST START\n"},
         {"type": "input_text", "text": "Planned action JSON:\n"},

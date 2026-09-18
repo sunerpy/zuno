@@ -41,7 +41,7 @@ const MANUAL_RECAP_FAILURE_MESSAGE: &str = "Could not generate a recap. Please t
 const MANUAL_RECAP_IN_PROGRESS_MESSAGE: &str = "A recap is already being generated.";
 const MANUAL_RECAP_EMPTY_HISTORY_MESSAGE: &str = "There is no conversation history to recap.";
 const RECAP_PROMPT_PREFIX: &str = concat!(
-    "Write a brief catch-up for a user returning to this Codex task. ",
+    "Write a brief catch-up for a user returning to this Zuno task. ",
     "In at most 40 words and one or two plain-text sentences, explain the ",
     "objective, what was completed or learned, and the next step or blocker. ",
     "Mention changed files, tests, approvals, or requested decisions only ",

@@ -136,6 +136,16 @@ async fn prompt_preserves_root_authorization_reasons_and_denied_reads() -> Resul
         })
     );
     let text = prompt_text(&items);
+    // The reviewer prompt must describe the running product as Zuno, never as Codex.
+    assert!(
+        text.contains("The following is the Zuno agent history"),
+        "{text}"
+    );
+    assert!(
+        text.contains("The Zuno agent has requested the following action:"),
+        "{text}"
+    );
+    assert!(!text.contains("Codex agent"), "{text}");
     for expected in [
         ">>> ROOT CONVERSATION START",
         "user: inspect only public files",

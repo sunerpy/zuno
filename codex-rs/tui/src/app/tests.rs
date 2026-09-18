@@ -6001,6 +6001,14 @@ async fn set_thread_goal_draft_materializes_long_objective_and_confirms_before_p
         .codex_home_path(&app.chat_widget.config_ref().codex_home)
         .expect("codex home");
     assert!(goal_files::objective_file_path(&goal.objective, Some(&codex_home)).is_some());
+    // References written before the product rename must still resolve.
+    let legacy_reference = goal.objective.replacen(
+        "Read the Zuno goal objective file",
+        "Read the Codex goal objective file",
+        1,
+    );
+    assert_ne!(legacy_reference, goal.objective);
+    assert!(goal_files::objective_file_path(&legacy_reference, Some(&codex_home)).is_some());
     assert_eq!(
         goal_files::objective_text_for_edit(&mut app_server, Some(&codex_home), &goal.objective)
             .await
