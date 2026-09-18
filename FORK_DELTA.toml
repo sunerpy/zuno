@@ -94,18 +94,23 @@ contracts = [
 id = "upstream-sync"
 status = "implemented"
 ownership = "zuno-owned"
-summary = "Candidate-only replay of the reviewed Zuno delta onto an exact Codex stable release."
+summary = "Scheduled candidate-only replay of the reviewed Zuno delta onto each new exact Codex stable release, with automatic promotion after the human merge."
 zuno_paths = [
   "UPSTREAM_CODEX.toml",
   "FORK_DELTA.toml",
   "scripts/zuno_upstream.py",
   "scripts/test_zuno_upstream.py",
+  ".github/workflows/zuno-upstream-sync.yml",
+  "docs/zuno-upstream-sync.md",
+  "docs/zuno-upstream-sync.zh-CN.md",
 ]
 shared_upstream_paths = []
 contracts = [
   "The active Zuno branch and worktree are never mutated by synchronization.",
   "A dirty source is rejected before candidate preparation.",
   "The exact upstream tag, commit, and tree are verified before replay.",
+  "The watcher tracks only the newest stable Codex tag, is idempotent per main commit, and reports replay conflicts as an issue instead of pushing.",
+  "Merging the candidate PR with a merge commit is the only manual step; nothing is merged automatically.",
 ]
 
 [[capabilities]]
@@ -152,5 +157,6 @@ contracts = [
   "The protected main branch receives the required zuno/pr-gate context from public GitHub-hosted infrastructure.",
   "OpenAI-only CI remains manually available but does not run automatically in the Zuno repository.",
   "zuno-vX.Y.Z builds, natively smokes, attests, hashes, and publishes canonical Zuno packages for six OS/architecture targets.",
+  "A merged same-repository upstream-sync/* pull request is promoted automatically from its sealed PR-gate bytes; every other promotion is an explicit dispatch.",
   "All inherited Codex installers, daemon updaters, and tag publishers fail closed in the independent Zuno repository.",
 ]

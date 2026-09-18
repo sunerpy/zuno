@@ -214,10 +214,24 @@ def main() -> int:
     require(upstream_sync, "Push exact candidate branch")
     require(upstream_sync, "-c credential.helper= \\")
     require(upstream_sync, 'credential.helper="store --file=${credential_file}"')
-    if text(upstream_sync).count("GH_TOKEN: ${{ github.token }}") != 2:
+    sync_text = text(upstream_sync)
+    token = "GH_TOKEN: ${{ github.token }}"
+    if sync_text.count(token) != 4:
         raise SystemExit(
-            "upstream sync must expose GH_TOKEN only to the final push and PR steps"
+            "upstream sync must expose GH_TOKEN only to the state, push, PR, and conflict-report steps"
         )
+    # Steps that fetch or replay upstream code must never see the token: the
+    # checkout/fetch/plan steps before state inspection, and the candidate
+    # preparation step between state inspection and the push.
+    inspect_at = sync_text.index("name: Inspect existing candidate and conflict report")
+    prepare_at = sync_text.index("name: Prepare isolated candidate")
+    push_at = sync_text.index("name: Push exact candidate branch")
+    if token in sync_text[:inspect_at] or token in sync_text[prepare_at:push_at]:
+        raise SystemExit("upstream sync exposes GH_TOKEN to a fetch or replay step")
+    require(upstream_sync, "check \\\n            --allow-current")
+    require(upstream_sync, "--force-with-lease=refs/heads/${HEAD_BRANCH}:")
+    reject(upstream_sync, "gh pr merge")
+    reject(upstream_sync, "--auto")
 
     smoke = text("scripts/smoke_zuno_package.py")
     isolation = smoke.index('runtime_env["HOME"]')

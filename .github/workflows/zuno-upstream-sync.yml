@@ -1,5 +1,10 @@
 name: Prepare Codex upstream sync
 
+# Watches openai/codex for new stable `rust-vX.Y.Z` releases and keeps exactly
+# one review PR per release current against `main`. It never merges anything:
+# the merge is the single human step, after which `zuno-release.yml` promotes
+# the already-built candidate bytes automatically.
+
 on:
   workflow_dispatch:
     inputs:
@@ -7,18 +12,34 @@ on:
         description: Exact stable Codex tag (blank selects newest stable tag)
         required: false
         type: string
+      refresh:
+        description: Re-prepare the candidate even if the open PR already matches main
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    # Poll every six hours; upstream stable releases are irregular. Off the hour
+    # to avoid the top-of-hour rush.
+    - cron: "23 */6 * * *"
 
 permissions:
   contents: write
   pull-requests: write
+  issues: write
 
 concurrency:
   group: zuno-upstream-sync-main
   cancel-in-progress: false
 
+env:
+  CANDIDATE_LABEL: upstream-sync
+  CONFLICT_LABEL: upstream-sync-conflict
+
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    # Regenerating schema fixtures compiles the protocol and config crates.
+    timeout-minutes: 90
     steps:
       - name: Check out exact Zuno source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -36,7 +57,7 @@ jobs:
       - name: Validate sync helper
         run: python3 -m unittest -v scripts/test_zuno_upstream.py
 
-      - name: Resolve and inspect candidate
+      - name: Resolve newest stable release
         id: plan
         env:
           REQUESTED_TARGET: ${{ inputs.target }}
@@ -51,12 +72,21 @@ jobs:
             --no-fetch \
             --json \
             check \
+            --allow-current \
             --source HEAD \
             "${target_args[@]}" > "${plan_path}"
+          cat "${plan_path}"
+          status="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("status", "plan"))' "${plan_path}")"
+          if [[ "${status}" == current ]]; then
+            baseline="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["baseline_tag"])' "${plan_path}")"
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            echo "Baseline ${baseline} is already the newest stable Codex release; nothing to prepare." >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
           target_tag="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["target_tag"])' "${plan_path}")"
           relationship="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["relationship"])' "${plan_path}")"
           source_dirty="$(python3 -c 'import json, sys; print(str(json.load(open(sys.argv[1]))["source_dirty"]).lower())' "${plan_path}")"
-          [[ "${relationship}" == descendant ]] || {
+          [[ "${relationship}" == descendant || "${relationship}" == release-branch ]] || {
             echo "unsafe upstream relationship: ${relationship}" >&2
             exit 1
           }
@@ -70,61 +100,181 @@ jobs:
             exit 1
           fi
           {
+            echo "skip=false"
             echo "target_tag=${target_tag}"
             echo "target_version=${target_version}"
             echo "plan_path=${plan_path}"
+            echo "source_sha=$(git rev-parse HEAD)"
+            echo "branch=upstream-sync/${target_version}"
           } >> "${GITHUB_OUTPUT}"
-          cat "${plan_path}"
+
+      - name: Inspect existing candidate and conflict report
+        id: state
+        if: steps.plan.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.plan.outputs.branch }}
+          SOURCE_SHA: ${{ steps.plan.outputs.source_sha }}
+          TARGET_TAG: ${{ steps.plan.outputs.target_tag }}
+          REFRESH: ${{ inputs.refresh }}
+        run: |
+          set -euo pipefail
+          gh label create "${CANDIDATE_LABEL}" --force --color 0E8A16 \
+            --description "Codex upstream release candidate prepared by automation" >/dev/null
+          gh label create "${CONFLICT_LABEL}" --force --color B60205 \
+            --description "Codex upstream candidate needs manual conflict resolution" >/dev/null
+
+          remote_sha="$(git ls-remote --heads origin "refs/heads/${BRANCH}" | awk '{print $1}')"
+          pr_json="$(gh pr list --state open --head "${BRANCH}" --base main --json number,body,headRefOid --limit 1)"
+          pr_number="$(jq -r '.[0].number // empty' <<<"${pr_json}")"
+          pr_source="$(jq -r '.[0].body // ""' <<<"${pr_json}" | sed -n 's/^Zuno-Source-Commit: \([0-9a-f]\{40\}\)$/\1/p' | head -n1)"
+
+          issue_json="$(gh issue list --state open --label "${CONFLICT_LABEL}" --search "\"${TARGET_TAG}\" in:title" --json number,body --limit 1)"
+          issue_number="$(jq -r '.[0].number // empty' <<<"${issue_json}")"
+          issue_source="$(jq -r '.[0].body // ""' <<<"${issue_json}" | sed -n 's/^Zuno-Source-Commit: \([0-9a-f]\{40\}\)$/\1/p' | head -n1)"
+
+          action=prepare
+          if [[ -n "${pr_number}" && "${pr_source}" == "${SOURCE_SHA}" && "${REFRESH}" != true ]]; then
+            action=skip
+            echo "Candidate PR #${pr_number} already replays main@${SOURCE_SHA} onto ${TARGET_TAG}; nothing to do." >> "${GITHUB_STEP_SUMMARY}"
+          elif [[ -n "${issue_number}" && "${issue_source}" == "${SOURCE_SHA}" && "${REFRESH}" != true ]]; then
+            action=skip
+            echo "Conflict issue #${issue_number} already describes main@${SOURCE_SHA} onto ${TARGET_TAG}; waiting for manual resolution." >> "${GITHUB_STEP_SUMMARY}"
+          fi
+          {
+            echo "action=${action}"
+            echo "remote_sha=${remote_sha}"
+            echo "pr_number=${pr_number}"
+            echo "issue_number=${issue_number}"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Prepare isolated candidate
         id: candidate
+        if: steps.plan.outputs.skip != 'true' && steps.state.outputs.action == 'prepare'
         env:
           TARGET_TAG: ${{ steps.plan.outputs.target_tag }}
           TARGET_VERSION: ${{ steps.plan.outputs.target_version }}
+          SOURCE_SHA: ${{ steps.plan.outputs.source_sha }}
+          BRANCH: ${{ steps.plan.outputs.branch }}
         run: |
           set -euo pipefail
-          branch="upstream-sync/${TARGET_VERSION}-${GITHUB_RUN_ID}"
-          candidate="${RUNNER_TEMP}/zuno-upstream-${TARGET_VERSION}"
+          # Nested inside the checkout so the Rust cache action can key on it.
+          candidate="${GITHUB_WORKSPACE}/.zuno-candidate"
           candidate_report="${RUNNER_TEMP}/upstream-candidate.json"
+          set +e
           python3 scripts/zuno_upstream.py \
             --no-fetch \
             --json \
             prepare \
             --source HEAD \
             --target "${TARGET_TAG}" \
-            --branch "${branch}" \
+            --branch "${BRANCH}" \
             --worktree "${candidate}" > "${candidate_report}"
-          git -C "${candidate}" config user.name github-actions[bot]
-          git -C "${candidate}" config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git -C "${candidate}" add --all
-          git -C "${candidate}" commit -m "chore(upstream): prepare Codex ${TARGET_VERSION} candidate"
+          prepare_exit=$?
+          set -e
+          cat "${candidate_report}"
+          status="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("status", ""))' "${candidate_report}")"
+          if [[ "${prepare_exit}" -ne 0 ]]; then
+            [[ "${status}" == conflict ]] || {
+              echo "candidate preparation failed without a conflict report" >&2
+              exit "${prepare_exit}"
+            }
+            {
+              echo "outcome=conflict"
+              echo "report=${candidate_report}"
+            } >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          upstream_commit="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["target_commit"])' "${candidate_report}")"
           {
-            echo "branch=${branch}"
+            echo "outcome=candidate"
             echo "candidate=${candidate}"
+            echo "report=${candidate_report}"
+            echo "upstream_commit=${upstream_commit}"
           } >> "${GITHUB_OUTPUT}"
 
+      - name: Install Rust toolchain for derived artifacts
+        if: steps.candidate.outputs.outcome == 'candidate'
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+
+      - name: Restore Rust build cache for derived artifacts
+        if: steps.candidate.outputs.outcome == 'candidate'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: .zuno-candidate/codex-rs
+          shared-key: zuno-upstream-sync
+          cache-bin: false
+
+      - name: Regenerate derived artifacts and commit candidate
+        if: steps.candidate.outputs.outcome == 'candidate'
+        env:
+          CANDIDATE: ${{ steps.candidate.outputs.candidate }}
+          TARGET_TAG: ${{ steps.plan.outputs.target_tag }}
+          TARGET_VERSION: ${{ steps.plan.outputs.target_version }}
+          SOURCE_SHA: ${{ steps.plan.outputs.source_sha }}
+          UPSTREAM_COMMIT: ${{ steps.candidate.outputs.upstream_commit }}
+        run: |
+          set -euo pipefail
+          # Derived artifacts (Cargo.lock, App Server schema fixtures, config
+          # schema) are rebuilt from the replayed source instead of merged as
+          # text; the PR gate checks the schema fixtures for drift.
+          (
+            cd "${CANDIDATE}/codex-rs"
+            cargo update --workspace
+            python3 app-server-protocol/scripts/write_schema_fixtures.py
+            python3 app-server-protocol/scripts/write_schema_fixtures.py --experimental
+            cargo run -q -p codex-config-schema --bin codex-write-config-schema
+          )
+          git -C "${CANDIDATE}" config user.name github-actions[bot]
+          git -C "${CANDIDATE}" config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git -C "${CANDIDATE}" add --all
+          git -C "${CANDIDATE}" commit -q -F - <<EOF
+          chore(upstream): prepare Codex ${TARGET_VERSION} candidate
+
+          Replays the reviewed Zuno delta from main@${SOURCE_SHA} onto exact
+          Codex release ${TARGET_TAG}, then regenerates Cargo.lock, the App
+          Server schema fixtures, and the config schema from the merged source.
+
+          Zuno-Source-Commit: ${SOURCE_SHA}
+          Zuno-Upstream-Tag: ${TARGET_TAG}
+          Zuno-Upstream-Commit: ${UPSTREAM_COMMIT}
+          EOF
+          git -C "${CANDIDATE}" show --stat --format='%H%n%s' HEAD | head -n 40
+
       - name: Push exact candidate branch
+        if: steps.candidate.outputs.outcome == 'candidate'
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE: ${{ steps.candidate.outputs.candidate }}
-          HEAD_BRANCH: ${{ steps.candidate.outputs.branch }}
+          HEAD_BRANCH: ${{ steps.plan.outputs.branch }}
+          REMOTE_SHA: ${{ steps.state.outputs.remote_sha }}
         run: |
           set -euo pipefail
           credential_file="${RUNNER_TEMP}/zuno-upstream-git-credential"
           trap 'rm -f "${credential_file}"' EXIT
           printf 'https://x-access-token:%s@github.com\n' "$GH_TOKEN" > "$credential_file"
           chmod 600 "$credential_file"
+          lease=("--force-with-lease=refs/heads/${HEAD_BRANCH}:")
+          if [[ -n "${REMOTE_SHA}" ]]; then
+            lease=("--force-with-lease=refs/heads/${HEAD_BRANCH}:${REMOTE_SHA}")
+          fi
           git -C "$CANDIDATE" \
             -c credential.helper= \
             -c credential.helper="store --file=${credential_file}" \
-            push -u origin "$HEAD_BRANCH"
+            push "${lease[@]}" -u origin "HEAD:refs/heads/${HEAD_BRANCH}"
 
-      - name: Open review PR
+      - name: Open or refresh review PR
+        if: steps.candidate.outputs.outcome == 'candidate'
         env:
           GH_TOKEN: ${{ github.token }}
-          HEAD_BRANCH: ${{ steps.candidate.outputs.branch }}
+          HEAD_BRANCH: ${{ steps.plan.outputs.branch }}
           TARGET_TAG: ${{ steps.plan.outputs.target_tag }}
+          TARGET_VERSION: ${{ steps.plan.outputs.target_version }}
+          SOURCE_SHA: ${{ steps.plan.outputs.source_sha }}
+          UPSTREAM_COMMIT: ${{ steps.candidate.outputs.upstream_commit }}
           PLAN_PATH: ${{ steps.plan.outputs.plan_path }}
+          EXISTING_PR: ${{ steps.state.outputs.pr_number }}
+          CONFLICT_ISSUE: ${{ steps.state.outputs.issue_number }}
         run: |
           set -euo pipefail
           overlap="$(python3 - <<'PY'
@@ -132,24 +282,129 @@ jobs:
           import os
           plan = json.load(open(os.environ["PLAN_PATH"]))
           paths = plan["overlapping_files"]
+          print(f'Upstream changed {plan["upstream_changed_files"]} files; the Zuno delta touches {plan["zuno_changed_files"]} files.')
+          print()
           if not paths:
               print("No path overlap was detected by the pre-replay comparison.")
           else:
-              print("Potential overlapping paths:\n" + "\n".join(f"- `{path}`" for path in paths))
+              print(f"{len(paths)} paths are modified on both sides (replayed cleanly with a three-way apply):")
+              print("\n".join(f"- `{path}`" for path in paths))
+          only = plan["baseline_only_commits"]
+          if only:
+              print()
+              print(f"{len(only)} commits exist only on the previous Codex release branch and are not part of the new tag:")
+              print("\n".join(f"- `{entry}`" for entry in only))
           PY
           )"
           body="$(cat <<EOF
-          This candidate replays the reviewed Zuno delta onto exact Codex release \`${TARGET_TAG}\`.
+          This candidate replays the reviewed Zuno delta onto exact Codex release \`${TARGET_TAG}\` (\`${UPSTREAM_COMMIT}\`).
 
-          It was created in an isolated CI worktree. Nothing was merged automatically.
+          It was prepared in an isolated CI worktree by the scheduled upstream watcher. Nothing was merged automatically; the watcher force-updates this branch whenever \`main\` moves so the candidate always replays the current reviewed delta.
 
           ${overlap}
 
-          Required before merge: inspect conflicts/semantic drift, run targeted and shared Rust gates, regenerate schemas/locks, build all supported artifacts, and execute Zuno ACP/workflow/Kiro Provider smoke tests.
+          ## Release flow
+
+          1. \`zuno/pr-gate\` builds, smokes, attests, and seals the six platform packages for the exact head SHA.
+          2. Review the upstream changes and any semantic drift in the overlapping paths.
+          3. Merge with **Create a merge commit** (squash and rebase are rejected by promotion).
+          4. \`zuno-release.yml\` then promotes the sealed bytes of this PR head to \`zuno-v${TARGET_VERSION}\` without rebuilding.
+
+          Zuno-Source-Commit: ${SOURCE_SHA}
+          Zuno-Upstream-Tag: ${TARGET_TAG}
+          Zuno-Upstream-Commit: ${UPSTREAM_COMMIT}
           EOF
           )"
-          gh pr create \
-            --base main \
-            --head "${HEAD_BRANCH}" \
-            --title "chore(upstream): sync Codex ${TARGET_TAG#rust-v}" \
-            --body "${body}"
+          if [[ -n "${EXISTING_PR}" ]]; then
+            gh pr edit "${EXISTING_PR}" --body "${body}" --add-label "${CANDIDATE_LABEL}"
+            gh pr comment "${EXISTING_PR}" --body "Refreshed the candidate: replayed main@\`${SOURCE_SHA}\` onto \`${TARGET_TAG}\`."
+            pr_url="$(gh pr view "${EXISTING_PR}" --json url --jq .url)"
+          else
+            pr_url="$(gh pr create \
+              --base main \
+              --head "${HEAD_BRANCH}" \
+              --label "${CANDIDATE_LABEL}" \
+              --title "chore(upstream): sync Codex ${TARGET_VERSION}" \
+              --body "${body}")"
+          fi
+          echo "Candidate PR: ${pr_url}" >> "${GITHUB_STEP_SUMMARY}"
+
+          # A clean replay supersedes any open conflict report for this release.
+          if [[ -n "${CONFLICT_ISSUE}" ]]; then
+            gh issue close "${CONFLICT_ISSUE}" --comment "Superseded: main@\`${SOURCE_SHA}\` now replays cleanly onto \`${TARGET_TAG}\` in ${pr_url}."
+          fi
+
+          # Close superseded candidates for older releases; only the newest stable release is tracked.
+          gh pr list --state open --label "${CANDIDATE_LABEL}" --base main --json number,headRefName \
+            --jq '.[] | select(.headRefName | startswith("upstream-sync/")) | select(.headRefName != env.HEAD_BRANCH) | .number' \
+            | while read -r stale; do
+                [[ -n "${stale}" ]] || continue
+                gh pr close "${stale}" --comment "Superseded by ${pr_url} (Codex ${TARGET_TAG} is now the newest stable release)."
+              done
+
+      - name: Report replay conflicts
+        if: steps.candidate.outputs.outcome == 'conflict'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_TAG: ${{ steps.plan.outputs.target_tag }}
+          TARGET_VERSION: ${{ steps.plan.outputs.target_version }}
+          SOURCE_SHA: ${{ steps.plan.outputs.source_sha }}
+          REPORT: ${{ steps.candidate.outputs.report }}
+          EXISTING_ISSUE: ${{ steps.state.outputs.issue_number }}
+        run: |
+          set -euo pipefail
+          files="$(python3 - <<'PY'
+          import json
+          import os
+          paths = json.load(open(os.environ["REPORT"]))["conflicting_files"]
+          print("\n".join(f"- `{path}`" for path in paths))
+          PY
+          )"
+          count="$(python3 - <<'PY'
+          import json
+          import os
+          print(len(json.load(open(os.environ["REPORT"]))["conflicting_files"]))
+          PY
+          )"
+          body="$(cat <<EOF
+          Replaying the reviewed Zuno delta from \`main@${SOURCE_SHA}\` onto Codex \`${TARGET_TAG}\` leaves ${count} conflicting paths. The automation did not push anything; \`main\` is untouched.
+
+          ${files}
+
+          ## Resolve locally
+
+          \`\`\`sh
+          git fetch --tags --prune upstream
+          python3 scripts/zuno_upstream.py --no-fetch prepare \\
+            --source main --target ${TARGET_TAG} \\
+            --branch upstream-sync/${TARGET_VERSION} \\
+            --worktree ../zuno-upstream-${TARGET_VERSION}
+          # fix the conflict markers in the worktree above, then:
+          git -C ../zuno-upstream-${TARGET_VERSION} add --all
+          git -C ../zuno-upstream-${TARGET_VERSION} commit -m "chore(upstream): prepare Codex ${TARGET_VERSION} candidate"
+          git -C ../zuno-upstream-${TARGET_VERSION} push -u origin upstream-sync/${TARGET_VERSION}
+          \`\`\`
+
+          Open the PR from that branch (label \`upstream-sync\`). Once \`main\` changes, the watcher retries the replay and closes this issue if it becomes clean.
+
+          Zuno-Source-Commit: ${SOURCE_SHA}
+          Zuno-Upstream-Tag: ${TARGET_TAG}
+          EOF
+          )"
+          if [[ -n "${EXISTING_ISSUE}" ]]; then
+            gh issue edit "${EXISTING_ISSUE}" --body "${body}"
+            gh issue comment "${EXISTING_ISSUE}" --body "Still conflicting when replaying main@\`${SOURCE_SHA}\` (${count} paths)."
+            issue_url="$(gh issue view "${EXISTING_ISSUE}" --json url --jq .url)"
+          else
+            issue_url="$(gh issue create \
+              --title "chore(upstream): Codex ${TARGET_TAG} candidate has replay conflicts" \
+              --label "${CONFLICT_LABEL}" \
+              --body "${body}")"
+          fi
+          {
+            echo "## Replay conflicts for ${TARGET_TAG}"
+            echo
+            echo "${count} conflicting paths; tracked in ${issue_url}."
+            echo
+            echo "${files}"
+          } >> "${GITHUB_STEP_SUMMARY}"

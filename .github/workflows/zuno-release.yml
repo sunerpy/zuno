@@ -1,6 +1,14 @@
 name: Promote Zuno candidate
 
+# Promotes the exact bytes that `zuno-ci.yml` sealed for a merged PR head into a
+# `zuno-vX.Y.Z` tag and GitHub release, without rebuilding. Runs automatically
+# when an `upstream-sync/*` candidate PR is merged; every other release stays a
+# manual dispatch with explicit run/artifact inputs.
+
 on:
+  pull_request:
+    types: [closed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       tag:
@@ -41,22 +49,88 @@ concurrency:
 jobs:
   promote:
     name: Promote exact candidate bytes
+    # Automatic promotion is limited to merged same-repository upstream-sync
+    # candidates; anything else must be dispatched with explicit inputs.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.pull_request.merged == true &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        startsWith(github.event.pull_request.head.ref, 'upstream-sync/')
+      )
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       GH_TOKEN: ${{ github.token }}
-      RELEASE_TAG: ${{ inputs.tag }}
-      CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
-      CANDIDATE_RUN_ATTEMPT: ${{ inputs.candidate_run_attempt }}
-      CANDIDATE_ARTIFACT_ID: ${{ inputs.candidate_artifact_id }}
-      PR_NUMBER: ${{ inputs.pull_request }}
-      EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: main
           fetch-depth: 0
           persist-credentials: false
+      - name: Resolve promotion inputs
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_RUN_ID: ${{ inputs.candidate_run_id }}
+          INPUT_RUN_ATTEMPT: ${{ inputs.candidate_run_attempt }}
+          INPUT_ARTIFACT_ID: ${{ inputs.candidate_artifact_id }}
+          INPUT_PR_NUMBER: ${{ inputs.pull_request }}
+          INPUT_HEAD_SHA: ${{ inputs.expected_head_sha }}
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            release_tag="$INPUT_TAG"
+            run_id="$INPUT_RUN_ID"
+            run_attempt="$INPUT_RUN_ATTEMPT"
+            artifact_id="$INPUT_ARTIFACT_ID"
+            pr_number="$INPUT_PR_NUMBER"
+            head_sha="$INPUT_HEAD_SHA"
+          else
+            # Merged upstream-sync candidate: derive every input from the PR head
+            # and the successful Zuno CI run that sealed it.
+            pr_number="$EVENT_PR_NUMBER"
+            head_sha="$EVENT_HEAD_SHA"
+            [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]
+            git fetch --no-tags origin "$head_sha"
+            version="$(git show "${head_sha}:codex-rs/Cargo.toml" | awk -F\" '/^version = /{print $2; exit}')"
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+              echo "candidate head $head_sha has no release version in codex-rs/Cargo.toml" >&2
+              exit 1
+            }
+            release_tag="zuno-v${version}"
+            runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/zuno-ci.yml/runs?event=pull_request&status=success&head_sha=${head_sha}&per_page=20")"
+            run_id="$(jq -r '[.workflow_runs[] | select(.conclusion == "success")] | sort_by(.id) | last | .id // empty' <<<"$runs")"
+            [[ "$run_id" =~ ^[1-9][0-9]*$ ]] || {
+              echo "no successful Zuno CI run sealed candidate head $head_sha" >&2
+              exit 1
+            }
+            run_attempt="$(jq -r --argjson id "$run_id" '.workflow_runs[] | select(.id == $id) | .run_attempt' <<<"$runs")"
+            artifacts="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts?name=zuno-candidate")"
+            artifact_id="$(jq -r '[.artifacts[] | select(.name == "zuno-candidate" and .expired == false)] | sort_by(.id) | last | .id // empty' <<<"$artifacts")"
+            [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]] || {
+              echo "Zuno CI run $run_id has no live zuno-candidate artifact" >&2
+              exit 1
+            }
+          fi
+          {
+            echo "RELEASE_TAG=${release_tag}"
+            echo "CANDIDATE_RUN_ID=${run_id}"
+            echo "CANDIDATE_RUN_ATTEMPT=${run_attempt}"
+            echo "CANDIDATE_ARTIFACT_ID=${artifact_id}"
+            echo "PR_NUMBER=${pr_number}"
+            echo "EXPECTED_HEAD_SHA=${head_sha}"
+          } >> "$GITHUB_ENV"
+          {
+            echo "## Promotion inputs"
+            echo
+            echo "- tag: \`${release_tag}\`"
+            echo "- pull request: #${pr_number} head \`${head_sha}\`"
+            echo "- Zuno CI run: ${run_id} attempt ${run_attempt}, artifact ${artifact_id}"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Validate merged source and exact candidate run
         id: identity
         shell: bash
@@ -99,20 +173,32 @@ jobs:
             exit 1
           }
           read -r -a head_parents <<<"$(git show -s --format=%P "$EXPECTED_HEAD_SHA")"
-          [[ "${#head_parents[@]}" -eq 2 ]] || {
-            echo "source-history bridge must have exactly two parents" >&2
-            exit 1
-          }
-          [[ "${head_parents[0]}" == "$base_sha" ]] || {
-            echo "bridge first parent ${head_parents[0]} differs from PR base $base_sha" >&2
-            exit 1
-          }
           head_tree="$(git rev-parse "${EXPECTED_HEAD_SHA}^{tree}")"
-          zuno_tree="$(git rev-parse "${head_parents[1]}^{tree}")"
-          [[ "$head_tree" == "$zuno_tree" ]] || {
-            echo "bridge tree $head_tree differs from reviewed Zuno tree $zuno_tree" >&2
-            exit 1
-          }
+          case "${#head_parents[@]}" in
+            1)
+              # Ordinary candidate (for example an upstream-sync replay): a linear
+              # commit whose ancestry must still contain the recorded Codex baseline.
+              zuno_ancestor="$EXPECTED_HEAD_SHA"
+              ;;
+            2)
+              # Source-history bridge used by the original cutover: the merge of the
+              # PR base and the reviewed Zuno tree, with the Zuno tree unchanged.
+              [[ "${head_parents[0]}" == "$base_sha" ]] || {
+                echo "bridge first parent ${head_parents[0]} differs from PR base $base_sha" >&2
+                exit 1
+              }
+              zuno_tree="$(git rev-parse "${head_parents[1]}^{tree}")"
+              [[ "$head_tree" == "$zuno_tree" ]] || {
+                echo "bridge tree $head_tree differs from reviewed Zuno tree $zuno_tree" >&2
+                exit 1
+              }
+              zuno_ancestor="${head_parents[1]}"
+              ;;
+            *)
+              echo "certified PR head must have one parent or be a two-parent source-history bridge" >&2
+              exit 1
+              ;;
+          esac
           baseline_commit="$(git show "${EXPECTED_HEAD_SHA}:UPSTREAM_CODEX.toml" | awk '
             /^\[baseline\]$/ { in_baseline=1; next }
             /^\[/ { in_baseline=0 }
@@ -125,8 +211,8 @@ jobs:
             }
           ')"
           [[ "$baseline_commit" =~ ^[0-9a-f]{40}$ ]]
-          git merge-base --is-ancestor "$baseline_commit" "${head_parents[1]}" || {
-            echo "bridge second parent does not retain Codex baseline $baseline_commit" >&2
+          git merge-base --is-ancestor "$baseline_commit" "$zuno_ancestor" || {
+            echo "certified head $zuno_ancestor does not retain Codex baseline $baseline_commit" >&2
             exit 1
           }
           merge_tree="$(git rev-parse "${merge_sha}^{tree}")"
@@ -271,7 +357,7 @@ jobs:
           else
             gh release create "$RELEASE_TAG" --verify-tag --draft --prerelease --latest=false \
               --title "Zuno ${RELEASE_TAG#zuno-v} source-fork preview" \
-              --notes "Preview source-fork cutover. Automatic update remains fail-closed; install manually after verifying zuno-package_SHA256SUMS."
+              --notes "Zuno ${RELEASE_TAG#zuno-v} rebuilt from Codex rust-v${RELEASE_TAG#zuno-v} with the reviewed Zuno delta (PR #${PR_NUMBER}). Automatic update remains fail-closed; install manually after verifying zuno-package_SHA256SUMS."
           fi
           gh release upload "$RELEASE_TAG" --clobber \
             "$ROOT"/zuno-package-*.tar.gz \

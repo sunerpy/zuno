@@ -23,9 +23,29 @@ STABLE_TAG = re.compile(
 )
 STRING_FIELD = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*("(?:[^"\\]|\\.)*")\s*$')
 
+# Derived artifacts are regenerated from source after the replay, so a textual
+# conflict in them carries no information. They are reset to the upstream side
+# and reported so the caller regenerates them (see docs/zuno-upstream-sync.md).
+GENERATED_PATH_PREFIXES = (
+    "codex-rs/app-server-protocol/schema/",
+    "codex-rs/core/config.schema.json",
+    "codex-rs/Cargo.lock",
+)
+
+
+def is_generated_path(path: str) -> bool:
+    return any(
+        path == prefix.rstrip("/") or path.startswith(prefix)
+        for prefix in GENERATED_PATH_PREFIXES
+    )
+
 
 class SyncError(RuntimeError):
-    pass
+    """A sync precondition failed; ``details`` carries machine-readable context."""
+
+    def __init__(self, message: str, details: dict[str, object] | None = None) -> None:
+        super().__init__(message)
+        self.details = details or {}
 
 
 def stable_tag_version(tag: str) -> tuple[int, int, int]:
@@ -52,9 +72,25 @@ class SyncPlan:
     target_commit: str
     target_tree: str
     relationship: str
+    merge_base: str
+    baseline_only_commits: list[str]
     upstream_changed_files: int
     zuno_changed_files: int
     overlapping_files: list[str]
+    source_dirty: bool
+    candidate_only: bool = True
+
+
+@dataclass(frozen=True)
+class CurrentStatus:
+    """The recorded baseline already is the newest stable Codex release."""
+
+    status: str
+    source: str
+    source_commit: str
+    baseline_tag: str
+    baseline_commit: str
+    latest_stable_tag: str
     source_dirty: bool
     candidate_only: bool = True
 
@@ -67,6 +103,7 @@ class PreparedCandidate:
     target_commit: str
     candidate_base_commit: str
     manifest_updated: bool
+    regenerate_paths: list[str]
 
 
 def run(
@@ -167,6 +204,31 @@ def exact_target(repo: Path, requested: str | None) -> str:
     return tags[-1]
 
 
+def merge_base(repo: Path, left: str, right: str) -> str | None:
+    result = run(repo, ["merge-base", left, right], check=False)
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def baseline_only_commits(repo: Path, baseline: str, target: str) -> list[str]:
+    """Commits reachable from the baseline tag whose patches are absent from the target.
+
+    Codex cuts every release on a short branch off main (a release commit plus
+    any cherry-picks), so a newer tag normally does not descend from the older
+    one. Whatever only exists on the old release branch is not carried into the
+    candidate, so it is surfaced for review.
+    """
+    entries = []
+    for line in run(repo, ["cherry", target, baseline]).stdout.splitlines():
+        marker, _, commit = line.partition(" ")
+        if marker != "+" or not commit:
+            continue
+        subject = run(repo, ["log", "-1", "--format=%s", commit]).stdout.strip()
+        entries.append(f"{commit} {subject}")
+    return entries
+
+
 def is_ancestor(repo: Path, older: str, newer: str) -> bool:
     return (
         run(repo, ["merge-base", "--is-ancestor", older, newer], check=False).returncode
@@ -216,12 +278,20 @@ def make_plan(repo: Path, baseline: Baseline, source: str, target_tag: str) -> S
             f"target {target_tag} does not advance baseline commit "
             f"{baseline.release_commit}"
         )
-    if not is_ancestor(repo, baseline.release_commit, target_commit):
-        raise SyncError(
-            f"target {target_tag} is not a descendant of baseline "
-            f"{baseline.release_tag}; divergent release lines require explicit manual recovery"
-        )
-    relationship = "descendant"
+    if is_ancestor(repo, baseline.release_commit, target_commit):
+        relationship = "descendant"
+        common = baseline.release_commit
+    else:
+        # Upstream release tags live on sibling release branches cut from main,
+        # so the normal case is a shared ancestor rather than direct descent.
+        found = merge_base(repo, baseline.release_commit, target_commit)
+        if found is None:
+            raise SyncError(
+                f"target {target_tag} shares no history with baseline "
+                f"{baseline.release_tag}; unrelated release lines require explicit manual recovery"
+            )
+        relationship = "release-branch"
+        common = found
     upstream_files = changed_files(repo, baseline.release_commit, target_commit)
     zuno_files = changed_files(repo, baseline.release_commit, source_commit)
     return SyncPlan(
@@ -233,6 +303,10 @@ def make_plan(repo: Path, baseline: Baseline, source: str, target_tag: str) -> S
         target_commit=target_commit,
         target_tree=target_tree,
         relationship=relationship,
+        merge_base=common,
+        baseline_only_commits=baseline_only_commits(
+            repo, baseline.release_commit, target_commit
+        ),
         upstream_changed_files=len(upstream_files),
         zuno_changed_files=len(zuno_files),
         overlapping_files=sorted(upstream_files & zuno_files),
@@ -314,12 +388,36 @@ def prepare(
         stderr=subprocess.PIPE,
         check=False,
     )
+    regenerate: list[str] = []
     if apply.returncode != 0:
         detail = apply.stderr.strip() or apply.stdout.strip()
-        raise SyncError(
-            "candidate delta replay has conflicts; source branch is untouched and the candidate "
-            f"was retained at {worktree}: {detail}"
+        conflicting = sorted(
+            line
+            for line in run(
+                worktree, ["diff", "--name-only", "--diff-filter=U"]
+            ).stdout.splitlines()
+            if line
         )
+        regenerate = [path for path in conflicting if is_generated_path(path)]
+        source_conflicts = [path for path in conflicting if not is_generated_path(path)]
+        if source_conflicts:
+            raise SyncError(
+                "candidate delta replay has conflicts; source branch is untouched and the candidate "
+                f"was retained at {worktree}: {detail}",
+                details={
+                    "status": "conflict",
+                    "candidate_branch": branch,
+                    "candidate_worktree": str(worktree),
+                    "target_tag": plan.target_tag,
+                    "target_commit": plan.target_commit,
+                    "conflicting_files": source_conflicts,
+                    "generated_conflicts": regenerate,
+                },
+            )
+        # Only derived artifacts conflicted: keep the upstream bytes as a
+        # placeholder and let the caller regenerate them from the merged source.
+        run(worktree, ["checkout", "--ours", "--", *regenerate])
+        run(worktree, ["add", "--", *regenerate])
     candidate_manifest = worktree / manifest_name
     replace_manifest_baseline(
         candidate_manifest,
@@ -334,6 +432,7 @@ def prepare(
         target_commit=plan.target_commit,
         candidate_base_commit=resolve_commit(worktree, "HEAD"),
         manifest_updated=True,
+        regenerate_paths=regenerate,
     )
 
 
@@ -349,6 +448,15 @@ def parser() -> argparse.ArgumentParser:
         command = subparsers.add_parser(name)
         command.add_argument("--source", default="HEAD")
         command.add_argument("--target")
+        if name == "check":
+            command.add_argument(
+                "--allow-current",
+                action="store_true",
+                help=(
+                    "exit successfully with status=current when no stable Codex tag "
+                    "is newer than the recorded baseline (for scheduled runs)"
+                ),
+            )
         if name == "prepare":
             command.add_argument("--branch")
             command.add_argument("--worktree", type=Path, required=True)
@@ -378,6 +486,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not args.no_fetch:
             run(repo, ["fetch", "--tags", "--prune", args.remote])
         target_tag = exact_target(repo, args.target)
+        if (
+            args.command == "check"
+            and args.allow_current
+            and stable_tag_version(target_tag) <= stable_tag_version(baseline.release_tag)
+        ):
+            validate_baseline(repo, baseline)
+            emit(
+                CurrentStatus(
+                    status="current",
+                    source=args.source,
+                    source_commit=resolve_commit(repo, args.source),
+                    baseline_tag=baseline.release_tag,
+                    baseline_commit=baseline.release_commit,
+                    latest_stable_tag=target_tag,
+                    source_dirty=dirty(repo),
+                ),
+                args.json,
+            )
+            return 0
         plan = make_plan(repo, baseline, args.source, target_tag)
         if args.command == "check":
             emit(plan, args.json)
@@ -394,9 +521,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     except SyncError as error:
         if args.json:
-            print(json.dumps({"error": str(error)}, indent=2, sort_keys=True))
+            payload: dict[str, object] = {"error": str(error)}
+            payload.update(error.details)
+            print(json.dumps(payload, indent=2, sort_keys=True))
         else:
             print(f"error: {error}", file=sys.stderr)
+            for name, value in error.details.items():
+                if isinstance(value, list):
+                    print(f"{name}: {len(value)}", file=sys.stderr)
+                    for entry in value:
+                        print(f"  - {entry}", file=sys.stderr)
+                else:
+                    print(f"{name}: {value}", file=sys.stderr)
         return 1
 
 

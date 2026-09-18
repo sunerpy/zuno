@@ -80,8 +80,18 @@ python3 scripts/zuno_upstream.py prepare \
   --worktree ../zuno-upstream-X.Y.Z
 ```
 
-Maintainers can run **Prepare Codex upstream sync** in GitHub Actions to create a
-candidate branch and pull request. The workflow never merges the candidate.
+**Prepare Codex upstream sync** runs every six hours in GitHub Actions and on
+demand. When openai/codex publishes a new stable `rust-vX.Y.Z`, it prepares the
+candidate, keeps the `upstream-sync/X.Y.Z` pull request current with `main`, and
+files an issue instead when the replay conflicts. Merging that PR with a merge
+commit is the only manual step: **Promote Zuno candidate** then tags
+`zuno-vX.Y.Z` from the sealed PR-gate bytes automatically. The workflow never
+merges the candidate. See [docs/zuno-upstream-sync.md](docs/zuno-upstream-sync.md)
+([中文](docs/zuno-upstream-sync.zh-CN.md)).
+
+Zuno reads its configuration and state from `ZUNO_HOME` (default `~/.zuno`)
+only. `CODEX_HOME` and `~/.codex` belong to a separately installed Codex and are
+never consulted.
 
 Zuno pull requests use the repository-owned `zuno/pr-gate`; OpenAI-specific
 Codex CI remains manual because it depends on upstream private runners and

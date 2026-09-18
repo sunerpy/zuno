@@ -164,11 +164,61 @@ class ZunoUpstreamTest(unittest.TestCase):
             baseline = zuno_upstream.read_baseline(repo.root / "UPSTREAM_CODEX.toml")
 
             with self.assertRaisesRegex(
-                zuno_upstream.SyncError, "not a descendant.*manual recovery"
+                zuno_upstream.SyncError, "shares no history.*manual recovery"
             ):
                 zuno_upstream.make_plan(
                     repo.root, baseline, source, "rust-v0.2.0"
                 )
+
+    def test_plan_accepts_sibling_release_branch_and_lists_baseline_only_commits(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo_path = root / "repo"
+            repo_path.mkdir()
+            repo = Repository(repo_path)
+            repo.write("shared", "base\n")
+            trunk = repo.commit("trunk base")
+            trunk_branch = git(repo.root, "branch", "--show-current")
+
+            # Codex release branches: a release commit on top of trunk per tag.
+            git(repo.root, "checkout", "-q", "-b", "release-0.1", trunk)
+            repo.write("CHANGELOG", "0.1.0\n")
+            base = repo.commit("## New Features 0.1.0")
+            base_tree = git(repo.root, "rev-parse", "HEAD^{tree}")
+            git(repo.root, "tag", "rust-v0.1.0")
+
+            git(repo.root, "checkout", "-q", trunk_branch)
+            repo.write("shared", "trunk change\n")
+            repo.commit("trunk moves on")
+            git(repo.root, "checkout", "-q", "-b", "release-0.2")
+            repo.write("CHANGELOG", "0.2.0\n")
+            repo.commit("## New Features 0.2.0")
+            git(repo.root, "tag", "rust-v0.2.0")
+
+            git(repo.root, "checkout", "-q", "-b", "zuno", base)
+            repo.manifest("rust-v0.1.0", base, base_tree)
+            repo.write("zuno", "feature\n")
+            source = repo.commit("zuno delta")
+
+            baseline = zuno_upstream.read_baseline(repo.root / "UPSTREAM_CODEX.toml")
+            plan = zuno_upstream.make_plan(repo.root, baseline, source, "rust-v0.2.0")
+            self.assertEqual(plan.relationship, "release-branch")
+            self.assertEqual(plan.merge_base, trunk)
+            self.assertEqual(
+                plan.baseline_only_commits, [f"{base} ## New Features 0.1.0"]
+            )
+            self.assertEqual(plan.overlapping_files, [])
+
+            worktree = root / "candidate"
+            prepared = zuno_upstream.prepare(
+                repo.root, "UPSTREAM_CODEX.toml", plan, "upstream-sync/0.2.0", worktree
+            )
+            self.assertEqual(prepared.candidate_base_commit, plan.target_commit)
+            self.assertEqual((worktree / "shared").read_text(), "trunk change\n")
+            self.assertEqual((worktree / "CHANGELOG").read_text(), "0.2.0\n")
+            self.assertEqual((worktree / "zuno").read_text(), "feature\n")
 
     def test_prepare_replays_delta_in_candidate_and_updates_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -333,6 +383,233 @@ class ZunoUpstreamTest(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertEqual(payload["target_tag"], "rust-v0.2.0")
             self.assertTrue(payload["candidate_only"])
+
+    def test_cli_check_allow_current_reports_current_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Repository(Path(directory))
+            repo.write("base", "base\n")
+            repo.commit("base")
+            base, tree = repo.tag_baseline("rust-v0.2.0")
+            git(repo.root, "tag", "rust-v0.3.0-alpha.1")
+            repo.manifest("rust-v0.2.0", base, tree)
+            repo.commit("manifest")
+            strict = subprocess.run(
+                [str(SCRIPT), "--repo", str(repo.root), "--no-fetch", "--json", "check"],
+                text=True,
+                check=False,
+                stdout=subprocess.PIPE,
+            )
+            self.assertEqual(strict.returncode, 1)
+            self.assertIn("strictly newer", json.loads(strict.stdout)["error"])
+            relaxed = subprocess.run(
+                [
+                    str(SCRIPT),
+                    "--repo",
+                    str(repo.root),
+                    "--no-fetch",
+                    "--json",
+                    "check",
+                    "--allow-current",
+                ],
+                text=True,
+                check=True,
+                stdout=subprocess.PIPE,
+            )
+            payload = json.loads(relaxed.stdout)
+            self.assertEqual(payload["status"], "current")
+            self.assertEqual(payload["baseline_tag"], "rust-v0.2.0")
+            self.assertEqual(payload["latest_stable_tag"], "rust-v0.2.0")
+            self.assertFalse(payload["source_dirty"])
+
+    def test_cli_check_allow_current_still_plans_newer_release(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Repository(Path(directory))
+            repo.write("base", "base\n")
+            repo.commit("base")
+            base, tree = repo.tag_baseline("rust-v0.1.0")
+            repo.manifest("rust-v0.1.0", base, tree)
+            repo.commit("manifest")
+            source_branch = git(repo.root, "branch", "--show-current")
+            git(repo.root, "checkout", "-q", "-b", "release-next", base)
+            repo.write("base", "next\n")
+            repo.commit("upstream next")
+            git(repo.root, "tag", "rust-v0.2.0")
+            git(repo.root, "checkout", "-q", source_branch)
+            result = subprocess.run(
+                [
+                    str(SCRIPT),
+                    "--repo",
+                    str(repo.root),
+                    "--no-fetch",
+                    "--json",
+                    "check",
+                    "--allow-current",
+                ],
+                text=True,
+                check=True,
+                stdout=subprocess.PIPE,
+            )
+            payload = json.loads(result.stdout)
+            self.assertNotIn("status", payload)
+            self.assertEqual(payload["target_tag"], "rust-v0.2.0")
+            self.assertEqual(payload["relationship"], "descendant")
+
+    def test_prepare_reports_conflicting_files_and_keeps_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo_path = root / "repo"
+            repo_path.mkdir()
+            repo = Repository(repo_path)
+            repo.write("shared", "base\n")
+            repo.write("other", "base\n")
+            repo.commit("base")
+            base, tree = repo.tag_baseline("rust-v0.1.0")
+
+            git(repo.root, "checkout", "-q", "-b", "release-next")
+            repo.write("shared", "upstream\n")
+            repo.commit("upstream next")
+            git(repo.root, "tag", "rust-v0.2.0")
+
+            git(repo.root, "checkout", "-q", "-b", "zuno", base)
+            repo.manifest("rust-v0.1.0", base, tree)
+            repo.write("shared", "zuno\n")
+            repo.write("other", "zuno\n")
+            source = repo.commit("zuno delta")
+            baseline = zuno_upstream.read_baseline(repo.root / "UPSTREAM_CODEX.toml")
+            plan = zuno_upstream.make_plan(repo.root, baseline, "zuno", "rust-v0.2.0")
+            self.assertEqual(plan.overlapping_files, ["shared"])
+            worktree = root / "candidate"
+            with self.assertRaises(zuno_upstream.SyncError) as raised:
+                zuno_upstream.prepare(
+                    repo.root, "UPSTREAM_CODEX.toml", plan, "upstream-sync/0.2.0", worktree
+                )
+            details = raised.exception.details
+            self.assertEqual(details["status"], "conflict")
+            self.assertEqual(details["conflicting_files"], ["shared"])
+            self.assertEqual(details["candidate_branch"], "upstream-sync/0.2.0")
+            self.assertEqual(details["candidate_worktree"], str(worktree))
+            self.assertEqual(git(repo.root, "rev-parse", "zuno"), source)
+            self.assertTrue(worktree.is_dir())
+            self.assertIn("<<<<<<<", (worktree / "shared").read_text())
+            self.assertEqual((worktree / "other").read_text(), "zuno\n")
+
+    def test_cli_prepare_conflict_is_machine_readable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo_path = root / "repo"
+            repo_path.mkdir()
+            repo = Repository(repo_path)
+            repo.write("shared", "base\n")
+            repo.commit("base")
+            base, tree = repo.tag_baseline("rust-v0.1.0")
+            git(repo.root, "checkout", "-q", "-b", "release-next")
+            repo.write("shared", "upstream\n")
+            repo.commit("upstream next")
+            git(repo.root, "tag", "rust-v0.2.0")
+            git(repo.root, "checkout", "-q", "-b", "zuno", base)
+            repo.manifest("rust-v0.1.0", base, tree)
+            repo.write("shared", "zuno\n")
+            repo.commit("zuno delta")
+            result = subprocess.run(
+                [
+                    str(SCRIPT),
+                    "--repo",
+                    str(repo.root),
+                    "--no-fetch",
+                    "--json",
+                    "prepare",
+                    "--source",
+                    "zuno",
+                    "--target",
+                    "rust-v0.2.0",
+                    "--worktree",
+                    str(root / "candidate"),
+                ],
+                text=True,
+                check=False,
+                stdout=subprocess.PIPE,
+            )
+            self.assertEqual(result.returncode, 1)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["status"], "conflict")
+            self.assertEqual(payload["conflicting_files"], ["shared"])
+            self.assertIn("conflicts", payload["error"])
+
+    def test_prepare_resets_generated_conflicts_to_upstream_and_reports_them(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo_path = root / "repo"
+            repo_path.mkdir()
+            repo = Repository(repo_path)
+            repo.write("codex-rs/Cargo.lock", "base\n")
+            repo.write("codex-rs/app-server-protocol/schema/json/A.json", "base\n")
+            repo.write("src.rs", "base\n")
+            repo.commit("base")
+            base, tree = repo.tag_baseline("rust-v0.1.0")
+
+            git(repo.root, "checkout", "-q", "-b", "release-next")
+            repo.write("codex-rs/Cargo.lock", "upstream\n")
+            repo.write("codex-rs/app-server-protocol/schema/json/A.json", "upstream\n")
+            repo.commit("upstream next")
+            git(repo.root, "tag", "rust-v0.2.0")
+
+            git(repo.root, "checkout", "-q", "-b", "zuno", base)
+            repo.manifest("rust-v0.1.0", base, tree)
+            repo.write("codex-rs/Cargo.lock", "zuno\n")
+            repo.write("codex-rs/app-server-protocol/schema/json/A.json", "zuno\n")
+            repo.write("src.rs", "zuno\n")
+            repo.commit("zuno delta")
+            baseline = zuno_upstream.read_baseline(repo.root / "UPSTREAM_CODEX.toml")
+            plan = zuno_upstream.make_plan(repo.root, baseline, "zuno", "rust-v0.2.0")
+            worktree = root / "candidate"
+            prepared = zuno_upstream.prepare(
+                repo.root, "UPSTREAM_CODEX.toml", plan, "upstream-sync/0.2.0", worktree
+            )
+            self.assertEqual(
+                prepared.regenerate_paths,
+                [
+                    "codex-rs/Cargo.lock",
+                    "codex-rs/app-server-protocol/schema/json/A.json",
+                ],
+            )
+            self.assertEqual((worktree / "codex-rs/Cargo.lock").read_text(), "upstream\n")
+            self.assertEqual(
+                (worktree / "codex-rs/app-server-protocol/schema/json/A.json").read_text(),
+                "upstream\n",
+            )
+            self.assertEqual((worktree / "src.rs").read_text(), "zuno\n")
+            self.assertEqual(git(worktree, "diff", "--name-only", "--diff-filter=U"), "")
+
+    def test_prepare_reports_source_conflicts_separately_from_generated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo_path = root / "repo"
+            repo_path.mkdir()
+            repo = Repository(repo_path)
+            repo.write("codex-rs/Cargo.lock", "base\n")
+            repo.write("src.rs", "base\n")
+            repo.commit("base")
+            base, tree = repo.tag_baseline("rust-v0.1.0")
+            git(repo.root, "checkout", "-q", "-b", "release-next")
+            repo.write("codex-rs/Cargo.lock", "upstream\n")
+            repo.write("src.rs", "upstream\n")
+            repo.commit("upstream next")
+            git(repo.root, "tag", "rust-v0.2.0")
+            git(repo.root, "checkout", "-q", "-b", "zuno", base)
+            repo.manifest("rust-v0.1.0", base, tree)
+            repo.write("codex-rs/Cargo.lock", "zuno\n")
+            repo.write("src.rs", "zuno\n")
+            repo.commit("zuno delta")
+            baseline = zuno_upstream.read_baseline(repo.root / "UPSTREAM_CODEX.toml")
+            plan = zuno_upstream.make_plan(repo.root, baseline, "zuno", "rust-v0.2.0")
+            with self.assertRaises(zuno_upstream.SyncError) as raised:
+                zuno_upstream.prepare(
+                    repo.root, "UPSTREAM_CODEX.toml", plan, "upstream-sync/0.2.0", root / "candidate"
+                )
+            self.assertEqual(raised.exception.details["conflicting_files"], ["src.rs"])
+            self.assertEqual(
+                raised.exception.details["generated_conflicts"], ["codex-rs/Cargo.lock"]
+            )
 
 
 if __name__ == "__main__":
