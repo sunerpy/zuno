@@ -106,6 +106,7 @@ write**，存为仓库 secret `ZUNO_UPSTREAM_SYNC_TOKEN`。巡检只在推送与
 - 立即巡检：**Actions → Prepare Codex upstream sync → Run workflow**（可指定精确标签）。
 - 重新准备已打开的候选：以 `refresh = true` 触发。
 - 暂停自动化：在 Actions 页面禁用这两个 workflow 即可，无需改其他配置。
+- 巡检始终检出并重放 `main`，即使从其他分支手动触发也是如此；对巡检本身的改动要合并后才生效。
 
 ## 不变量
 

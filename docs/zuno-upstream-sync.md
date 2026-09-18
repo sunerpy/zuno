@@ -128,6 +128,9 @@ branch) starts the gate by hand.
 - Re-prepare an already open candidate: dispatch with `refresh = true`.
 - Pause the automation: disable the two workflows in the Actions UI; nothing
   else needs to change.
+- The watcher always checks out and replays `main`, even when dispatched from
+  another branch, so changes to the watcher itself only take effect once they
+  are merged.
 
 ## Invariants
 
