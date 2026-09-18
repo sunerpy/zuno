@@ -30,7 +30,7 @@ fn conflicting_contexts_report_the_first_conflict_in_validation_order() {
             RuntimeKeymap::from_config(&keymap).expect_err("expected binding conflict"),
             format!(
                 "Ambiguous `tui.keymap.{context}` bindings: `{first}` and `{second}` use the same key. \
-Set unique keys in `~/.codex/config.toml` and retry. \
+Set unique keys in `~/.zuno/config.toml` and retry. \
 See the Zuno keymap documentation for supported actions and examples."
             )
         );
