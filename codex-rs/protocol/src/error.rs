@@ -96,7 +96,7 @@ pub enum CodexErrorDetails {
     #[error("rate limit exceeded: {0}")]
     RateLimitExceeded(String),
     #[error(
-        "Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying."
+        "Zuno ran out of room in the model's context window. Start a new thread or clear earlier history before retrying."
     )]
     ContextWindowExceeded,
     #[error("no thread with id: {0}")]

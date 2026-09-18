@@ -504,7 +504,7 @@ async fn oauth_access_denied_unknown_reason_uses_generic_error_page() -> Result<
         "generic oauth denial should preserve the oauth error details"
     );
     assert!(
-        body.contains("Return to Codex to retry"),
+        body.contains("Return to Zuno to retry"),
         "generic oauth denial should keep the generic help text"
     );
     assert!(

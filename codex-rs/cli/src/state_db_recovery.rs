@@ -34,8 +34,8 @@ fn sqlite_home_is_blocking_file(startup_error: &LocalStateDbStartupError) -> boo
 }
 
 pub(crate) fn print_auto_backup_start(startup_error: &LocalStateDbStartupError) {
-    eprintln!("Codex couldn't start because its local database appears to be damaged.");
-    eprintln!("Moving the damaged local database aside so Codex can rebuild it from saved data.");
+    eprintln!("Zuno couldn't start because its local database appears to be damaged.");
+    eprintln!("Moving the damaged local database aside so Zuno can rebuild it from saved data.");
     print_technical_details(startup_error);
 }
 
@@ -49,9 +49,9 @@ pub(crate) fn confirm_fresh_start_rebuild(
     startup_error: &LocalStateDbStartupError,
     backups: &[RuntimeDbBackup],
 ) -> std::io::Result<()> {
-    eprintln!("Codex rebuilt its local database.");
+    eprintln!("Zuno rebuilt its local database.");
     eprintln!(
-        "Codex detected a damaged local database, moved it into a backup folder, and will continue startup with a fresh database."
+        "Zuno detected a damaged local database, moved it into a backup folder, and will continue startup with a fresh database."
     );
     eprintln!("Database path: {}", startup_error.database_path().display());
     if let Some(backup_folder) = backup_folder(backups) {
@@ -71,15 +71,15 @@ pub(crate) fn confirm_fresh_start_rebuild(
 }
 
 pub(crate) fn print_diagnostic_guidance(startup_error: &LocalStateDbStartupError) {
-    eprintln!("Codex couldn't start because its local database appears to be damaged.");
-    eprintln!("Run `codex doctor` to check your setup and get next-step guidance.");
+    eprintln!("Zuno couldn't start because its local database appears to be damaged.");
+    eprintln!("Run `zuno doctor` to check your setup and get next-step guidance.");
     eprintln!("If this keeps happening, share the technical details below when asking for help.");
     print_technical_details(startup_error);
 }
 
 pub(crate) fn print_locked_guidance(startup_error: &LocalStateDbStartupError) {
-    eprintln!("Codex couldn't start because another Codex process is using its local data.");
-    eprintln!("Quit any other copies of Codex that may still be running, then try again.");
+    eprintln!("Zuno couldn't start because another Zuno process is using its local data.");
+    eprintln!("Quit any other copies of Zuno that may still be running, then try again.");
     print_technical_details(startup_error);
 }
 

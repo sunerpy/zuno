@@ -459,7 +459,7 @@ fn normalize_writable_root_for_sandbox(
             "writable root {} contains symlink component {}; symlinked writable roots are not supported.\n\
              If this writable root is at or beneath ZUNO_HOME and you trust its symlink targets, \
              set `allow_symlinked_codex_home = true` at the top level of `$ZUNO_HOME/config.toml` \
-             (normally `~/.codex/config.toml`) on the execution host, then restart Codex or its executor. \
+             (normally `~/.zuno/config.toml`) on the execution host, then restart Zuno or its executor. \
              This opt-out trusts targets outside ZUNO_HOME and targets changed between commands. \
              It does not apply to other writable roots.",
             root.display(),

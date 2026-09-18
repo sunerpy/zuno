@@ -1118,7 +1118,7 @@ fn substantial_description_shortening_emits_warning() {
     assert_eq!(
         render.report.warning_message(),
         Some(
-            "Skill descriptions were shortened to fit the skills context budget. Codex can still see every skill, but some descriptions are shorter. Disable unused skills or plugins to leave more room for the rest."
+            "Skill descriptions were shortened to fit the skills context budget. Zuno can still see every skill, but some descriptions are shorter. Disable unused skills or plugins to leave more room for the rest."
                 .to_string()
         )
     );

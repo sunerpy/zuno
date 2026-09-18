@@ -140,8 +140,8 @@ async fn sandbox_fetches_and_enforces_cloud_managed_permission_profile() -> Resu
     );
     if !nested_macos_sandbox_unavailable {
         assert!(
-            String::from_utf8(output.stdout)?.starts_with("codex"),
-            "expected the sandboxed Codex version command to run",
+            String::from_utf8(output.stdout)?.starts_with("zuno"),
+            "expected the sandboxed Zuno version command to run",
         );
     }
 
