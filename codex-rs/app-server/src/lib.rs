@@ -7,7 +7,6 @@ use codex_code_mode::GrpcCodeModeSessionProvider;
 use codex_config::LoaderOverrides;
 use codex_config::NoopThreadConfigLoader;
 use codex_core::config::Config;
-use codex_core::config::UnsupportedUntrustedApprovalPolicyError;
 use codex_core::resolve_installation_id;
 use codex_login::AuthManager;
 #[cfg(debug_assertions)]
@@ -82,14 +81,6 @@ use tracing_subscriber::registry::Registry;
 use tracing_subscriber::util::SubscriberInitExt;
 
 const SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY: &str = "Zuno rebuilt its local database.";
-
-fn is_unsupported_untrusted_approval_policy_error(err: &std::io::Error) -> bool {
-    err.get_ref().is_some_and(
-        <dyn std::error::Error + Send + Sync + 'static>::is::<
-            UnsupportedUntrustedApprovalPolicyError,
-        >,
-    )
-}
 
 mod analytics_utils;
 mod app_info;
@@ -524,9 +515,6 @@ pub async fn run_main_with_transport_options(
                 config.http_client_factory(),
             );
         }
-        Err(err) if is_unsupported_untrusted_approval_policy_error(&err) => {
-            return Err(err);
-        }
         Err(err) => {
             warn!(error = %err, "Failed to preload config for cloud config bundle");
             // If this fails, we cannot install cloud/thread config loaders, so non-strict
@@ -540,9 +528,6 @@ pub async fn run_main_with_transport_options(
         .await
     {
         Ok(config) => config,
-        Err(err) if is_unsupported_untrusted_approval_policy_error(&err) => {
-            return Err(err);
-        }
         Err(err) => {
             if strict_config {
                 return Err(err);

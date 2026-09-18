@@ -986,8 +986,10 @@ impl Op {
 #[serde(rename_all = "kebab-case")]
 #[strum(serialize_all = "kebab-case")]
 pub enum AskForApproval {
-    /// Internal policy for projects marked untrusted. Commands require
-    /// approval unless an explicit exec policy rule allows them.
+    /// Strict approval: every command and file edit requires approval unless
+    /// an explicit exec policy rule allows it. Selectable with
+    /// `approval_policy = "untrusted"` or `--ask-for-approval untrusted`, and
+    /// the default for projects marked untrusted.
     #[serde(rename = "untrusted")]
     #[strum(serialize = "untrusted")]
     UnlessTrusted,

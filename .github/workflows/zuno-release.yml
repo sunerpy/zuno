@@ -344,6 +344,13 @@ jobs:
               --signer-workflow "$signer_workflow" \
               --deny-self-hosted-runners
           done
+          for standalone in "$ROOT"/zuno-standalone-*; do
+            [[ -f "$standalone" ]] || continue
+            gh attestation verify "$standalone" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$signer_workflow" \
+              --deny-self-hosted-runners
+          done
       - name: Create or validate immutable tag
         shell: bash
         env:
@@ -380,11 +387,11 @@ jobs:
               --title "Zuno ${RELEASE_TAG#zuno-v} source-fork preview" \
               --notes "Zuno ${RELEASE_TAG#zuno-v} rebuilt from Codex rust-v${RELEASE_TAG#zuno-v} with the reviewed Zuno delta (PR #${PR_NUMBER}). Automatic update remains fail-closed; install manually after verifying zuno-package_SHA256SUMS."
           fi
-          gh release upload "$RELEASE_TAG" --clobber \
-            "$ROOT"/zuno-package-*.tar.gz \
-            "$ROOT"/zuno-package_SHA256SUMS \
-            "$ROOT"/smoke-*.json \
-            "$ROOT"/candidate-manifest.json
+          assets=("$ROOT"/zuno-package-*.tar.gz "$ROOT"/zuno-package_SHA256SUMS "$ROOT"/smoke-*.json "$ROOT"/candidate-manifest.json)
+          for standalone in "$ROOT"/zuno-standalone-*; do
+            [[ -f "$standalone" ]] && assets+=("$standalone")
+          done
+          gh release upload "$RELEASE_TAG" --clobber "${assets[@]}"
       - name: Download draft assets and verify public bytes
         shell: bash
         env:

@@ -62,7 +62,7 @@ jobs:
               codex_package.test_cargo \
               codex_package.test_cli \
               codex_package.test_layout
-          python3 -m py_compile scripts/smoke_zuno_package.py
+          python3 -m py_compile scripts/smoke_zuno_package.py scripts/zuno_standalone_smoke.py
           python3 scripts/check_zuno_update_boundaries.py
           actionlint .github/workflows/zuno-ci.yml .github/workflows/zuno-release.yml .github/workflows/zuno-upstream-sync.yml
       - name: Verify generated App Server schemas
@@ -234,9 +234,85 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  standalone:
+    name: Standalone x86_64-unknown-linux-musl
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      STANDALONE_TARGET: x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13"
+      - uses: ./.github/actions/setup-ci
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: zuno-standalone-x86_64-unknown-linux-musl
+          cache-targets: false
+          cache-bin: false
+      - name: Install musl build tools
+        shell: bash
+        run: |
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends musl-tools
+      - name: Build the statically linked Zuno binary
+        working-directory: codex-rs
+        shell: bash
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          AWS_LC_SYS_NO_JITTER_ENTROPY: "1"
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target "$STANDALONE_TARGET" --bin zuno
+          mkdir -p dist/standalone
+          cp "${CARGO_TARGET_DIR}/${STANDALONE_TARGET}/release/zuno" "dist/standalone/zuno-standalone-${STANDALONE_TARGET}"
+          strip "dist/standalone/zuno-standalone-${STANDALONE_TARGET}"
+          file "dist/standalone/zuno-standalone-${STANDALONE_TARGET}"
+          ls -l "dist/standalone/zuno-standalone-${STANDALONE_TARGET}"
+      - name: Smoke strict approval mode with the standalone binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/zuno_standalone_smoke.py \
+            --binary "codex-rs/dist/standalone/zuno-standalone-${STANDALONE_TARGET}" \
+            --timeout 120 \
+            | tee "codex-rs/dist/standalone/smoke-standalone-${STANDALONE_TARGET}.json"
+      - name: Run the binary in an empty container
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'FROM scratch\nCOPY zuno-standalone-%s /zuno\nENTRYPOINT ["/zuno"]\n' "$STANDALONE_TARGET" \
+            | docker build --quiet -t zuno-standalone-smoke -f - codex-rs/dist/standalone
+          docker run --rm zuno-standalone-smoke --version
+      - name: Attest standalone binary
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: codex-rs/dist/standalone/zuno-standalone-${{ env.STANDALONE_TARGET }}
+      - name: Upload standalone candidate
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: zuno-standalone-${{ env.STANDALONE_TARGET }}
+          path: |
+            codex-rs/dist/standalone/zuno-standalone-${{ env.STANDALONE_TARGET }}
+            codex-rs/dist/standalone/smoke-standalone-${{ env.STANDALONE_TARGET }}.json
+          if-no-files-found: error
+          retention-days: 14
+
   seal:
     name: Seal exact candidate bytes
-    needs: [static, package]
+    needs: [static, package, standalone]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -254,6 +330,11 @@ jobs:
           pattern: zuno-package-*
           path: downloaded
           merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: zuno-standalone-*
+          path: downloaded
+          merge-multiple: true
       - name: Bind candidate to PR head and tree
         shell: bash
         env:
@@ -263,7 +344,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir candidate
-          cp downloaded/zuno-package-*.tar.gz downloaded/smoke-*.json candidate/
+          cp downloaded/zuno-package-*.tar.gz downloaded/zuno-standalone-* downloaded/smoke-*.json candidate/
           find candidate -maxdepth 1 -type f \
             -name 'zuno-package-*.tar.gz' \
             -print0 | sort -z | xargs -0 sha256sum | sed 's#  candidate/#  #' > candidate/zuno-package_SHA256SUMS
@@ -285,6 +366,10 @@ jobs:
               assert (root / f"smoke-{target}.json").is_file(), target
           archives = sorted(root.glob("zuno-package-*.tar.gz"))
           assert len(archives) == 6, len(archives)
+          standalone_targets = ["x86_64-unknown-linux-musl"]
+          for target in standalone_targets:
+              assert (root / f"zuno-standalone-{target}").is_file(), target
+              assert (root / f"smoke-standalone-{target}.json").is_file(), target
           version = next(
               line.split('"')[1]
               for line in Path("codex-rs/Cargo.toml").read_text().splitlines()
@@ -316,6 +401,7 @@ jobs:
               ).strip(),
               "version": version,
               "targets": targets,
+              "standaloneTargets": standalone_targets,
               "files": files,
           }
           (root / "candidate-manifest.json").write_text(
@@ -351,7 +437,7 @@ jobs:
   required:
     name: zuno/pr-gate
     if: always()
-    needs: [static, package, seal]
+    needs: [static, package, standalone, seal]
     runs-on: ubuntu-24.04
     steps:
       - name: Require exact candidate success
@@ -359,9 +445,11 @@ jobs:
         env:
           STATIC_RESULT: ${{ needs.static.result }}
           PACKAGE_RESULT: ${{ needs.package.result }}
+          STANDALONE_RESULT: ${{ needs.standalone.result }}
           SEAL_RESULT: ${{ needs.seal.result }}
         run: |
           set -euo pipefail
           [[ "$STATIC_RESULT" == success ]]
           [[ "$PACKAGE_RESULT" == success ]]
+          [[ "$STANDALONE_RESULT" == success ]]
           [[ "$SEAL_RESULT" == success ]]

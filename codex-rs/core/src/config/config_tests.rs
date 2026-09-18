@@ -11064,7 +11064,7 @@ trust_level = "untrusted"
 }
 
 #[tokio::test]
-async fn explicit_untrusted_approval_policy_is_rejected() -> std::io::Result<()> {
+async fn explicit_untrusted_approval_policy_selects_strict_approvals() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     std::fs::write(
         codex_home.path().join(CONFIG_TOML_FILE),
@@ -11072,17 +11072,14 @@ async fn explicit_untrusted_approval_policy_is_rejected() -> std::io::Result<()>
 "#,
     )?;
 
-    let error = ConfigBuilder::without_managed_config_for_tests()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
         .build()
-        .await
-        .expect_err("untrusted approval policy should be rejected");
-    assert!(
-        error
-            .to_string()
-            .contains("approval_policy = \"untrusted\" is no longer supported"),
-        "unexpected error: {error}"
+        .await?;
+    assert_eq!(
+        config.permissions.approval_policy.value(),
+        AskForApproval::UnlessTrusted
     );
     Ok(())
 }

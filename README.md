@@ -89,6 +89,12 @@ commit is the only manual step: **Promote Zuno candidate** then tags
 merges the candidate. See [docs/zuno-upstream-sync.md](docs/zuno-upstream-sync.md)
 ([中文](docs/zuno-upstream-sync.zh-CN.md)).
 
+For a server, use the statically linked single-file
+`zuno-standalone-x86_64-unknown-linux-musl` from each release with the strict
+approval profile (`zuno -a untrusted -s danger-full-access`), which stops for a
+human before every command; see [docs/zuno-server-strict.md](docs/zuno-server-strict.md)
+([中文](docs/zuno-server-strict.zh-CN.md)).
+
 Zuno reads its configuration and state from `ZUNO_HOME` (default `~/.zuno`)
 only. `CODEX_HOME` and `~/.codex` belong to a separately installed Codex and are
 never consulted.

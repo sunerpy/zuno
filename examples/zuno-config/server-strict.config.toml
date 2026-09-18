@@ -1,0 +1,26 @@
+# Strict troubleshooting profile for a standalone Zuno binary on a server.
+#
+# Copy this file to $ZUNO_HOME/server-strict.config.toml (default
+# ~/.zuno/server-strict.config.toml), point model_provider at the provider you
+# use, then start with:
+#
+#     zuno --profile server-strict
+#
+# Every shell command and every file edit proposed by the model stops for your
+# approval first. Only an explicit `allow` rule in $ZUNO_HOME/rules/*.rules can
+# skip the prompt, and no rules ship by default. The same two settings work as
+# flags on any other profile: `zuno -a untrusted -s danger-full-access`.
+
+# Strict approval: prompt before every command and edit.
+approval_policy = "untrusted"
+# Route every approval to the human; never let an automatic reviewer approve.
+approvals_reviewer = "user"
+# No sandbox on the server: the standalone binary has no bundled bubblewrap, and
+# the approval prompt is the safety boundary during troubleshooting.
+sandbox_mode = "danger-full-access"
+
+# Replace with the provider and model you actually use, for example the
+# `kiro-local` provider from kiro-sol.config.toml.
+model_provider = "openai"
+model = "gpt-5.2"
+model_reasoning_effort = "medium"
