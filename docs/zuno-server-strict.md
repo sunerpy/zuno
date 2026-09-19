@@ -62,6 +62,17 @@ The profile also sets `approvals_reviewer = "user"` so an automatic reviewer can
 never approve on your behalf. "Approve for this session" in the prompt still
 lets you stop being asked for an identical command you already reviewed.
 
+Persistent terminals are covered too. When the model keeps a shell open with
+`exec_command` and later types into it with `write_stdin`, strict mode reviews
+every such input as a new command (only a bare Ctrl-C is exempt), regardless of
+the experimental `write_stdin_approval` feature and even when the terminal's
+permissions did not change.
+
+What can still skip the prompt is only what the operator wrote down: an
+`allow` rule in `$ZUNO_HOME/rules/*.rules`, or a `PermissionRequest` hook in
+`hooks.json` that answers `allow`. The strict profile ships neither; do not add
+them on a host where every command must be reviewed.
+
 `zuno exec` is headless and always runs with `approval_policy = "never"`; strict
 mode applies to the interactive TUI, `zuno app-server`, and `zuno acp`.
 
@@ -69,9 +80,11 @@ mode applies to the interactive TUI, `zuno app-server`, and `zuno acp`.
 
 `scripts/zuno_standalone_smoke.py` needs only the Python standard library. It
 verifies the ELF has no dynamic loader, runs `zuno --version`, then drives
-`zuno app-server` against a local mock model that proposes `ls`: in strict mode
-the server must emit `item/commandExecution/requestApproval`, and declining
-must end the turn without executing anything.
+`zuno app-server` against a local mock model in three phases: strict mode must
+emit `item/commandExecution/requestApproval` for a proposed `ls` and declining
+must execute nothing; `approval_policy = "never"` must run the same `ls` without
+a prompt; and after an approved `/bin/sh -i`, a follow-up `write_stdin` must be
+reviewed again (kind `writeStdin`) and, once declined, leave no trace.
 
 ```sh
 python3 scripts/zuno_standalone_smoke.py --binary ./zuno-standalone-x86_64-unknown-linux-musl

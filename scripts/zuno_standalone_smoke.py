@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -75,10 +76,53 @@ def sse(events: list[dict[str, object]]) -> bytes:
     return "".join(out).encode("utf-8")
 
 
+def function_call(call_id: str, name: str, arguments: dict[str, object]) -> dict[str, object]:
+    return {
+        "type": "function_call",
+        "call_id": call_id,
+        "name": name,
+        "arguments": json.dumps(arguments),
+    }
+
+
+def assistant_message(text: str) -> dict[str, object]:
+    return {
+        "type": "message",
+        "role": "assistant",
+        "id": "msg-final",
+        "content": [{"type": "output_text", "text": text}],
+    }
+
+
+SESSION_PLACEHOLDER = "$SESSION_ID"
+
+
+def resolve_session_id(item: dict[str, object], body: dict[str, object]) -> dict[str, object]:
+    """Fill the terminal session id the server reported into a scripted write_stdin call."""
+    arguments = item.get("arguments")
+    if not isinstance(arguments, str) or SESSION_PLACEHOLDER not in arguments:
+        return item
+    session_id = None
+    for entry in body.get("input") or []:
+        if not isinstance(entry, dict) or entry.get("type") != "function_call_output":
+            continue
+        output = entry.get("output")
+        text = output if isinstance(output, str) else json.dumps(output)
+        match = re.search(r"session ID (\d+)", text)
+        if match:
+            session_id = int(match.group(1))
+    if session_id is None:
+        raise RuntimeError("no terminal session id in the model request")
+    resolved = dict(item)
+    resolved["arguments"] = arguments.replace(f'"{SESSION_PLACEHOLDER}"', str(session_id))
+    return resolved
+
+
 class MockResponses(BaseHTTPRequestHandler):
-    """Two-turn Responses mock: propose `ls`, then acknowledge the outcome."""
+    """Scripted Responses mock: each model request pops the next output item."""
 
     calls: list[dict[str, object]] = []
+    script: list[dict[str, object]] = []
     lock = threading.Lock()
 
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002 - BaseHTTPRequestHandler API
@@ -94,35 +138,16 @@ class MockResponses(BaseHTTPRequestHandler):
         with MockResponses.lock:
             MockResponses.calls.append(body)
             call_number = len(MockResponses.calls)
+            if MockResponses.script:
+                item = MockResponses.script.pop(0)
+            else:
+                item = assistant_message("Done.")
+        item = resolve_session_id(item, body)
         response_id = f"resp-{call_number}"
-        if call_number == 1:
-            events = [
-                {"type": "response.created", "response": {"id": response_id}},
-                {
-                    "type": "response.output_item.done",
-                    "item": {
-                        "type": "function_call",
-                        "call_id": "call-ls",
-                        "name": "exec_command",
-                        "arguments": json.dumps({"cmd": "ls", "yield_time_ms": 1000}),
-                    },
-                },
-            ]
-        else:
-            events = [
-                {"type": "response.created", "response": {"id": response_id}},
-                {
-                    "type": "response.output_item.done",
-                    "item": {
-                        "type": "message",
-                        "role": "assistant",
-                        "id": f"msg-{call_number}",
-                        "content": [
-                            {"type": "output_text", "text": "Understood, the command was not run."}
-                        ],
-                    },
-                },
-            ]
+        events = [
+            {"type": "response.created", "response": {"id": response_id}},
+            {"type": "response.output_item.done", "item": item},
+        ]
         events.append(
             {
                 "type": "response.completed",
@@ -271,11 +296,18 @@ class AppServer:
 
 
 def run_turn(
-    binary: Path, root: Path, base_url: str, approval_policy: str, timeout: float
+    binary: Path,
+    root: Path,
+    base_url: str,
+    approval_policy: str,
+    timeout: float,
+    script: list[dict[str, object]],
+    decisions: dict[str, str],
 ) -> dict[str, object]:
-    """Drive one App Server turn where the mock model proposes `ls`."""
+    """Drive one App Server turn; `decisions` maps approval kinds to responses."""
     with MockResponses.lock:
         MockResponses.calls.clear()
+        MockResponses.script = list(script)
     home = root / "zuno-home"
     workspace = root / "workspace"
     workspace.mkdir(parents=True)
@@ -304,29 +336,42 @@ def run_turn(
                 "input": [{"type": "text", "text": "List the files in this directory."}],
             },
         )
-        completed = app.read_until(
-            lambda m: m.get("method") in (APPROVAL_METHOD, "turn/completed")
-        )
-        if completed.get("method") == APPROVAL_METHOD:
-            params = completed.get("params") or {}
-            command = params.get("command") or ""
-            if "ls" not in command:
-                raise SmokeError(f"approval request did not carry the ls command: {params}")
-            result["approval_request"] = {
-                "command": command,
-                "reason": params.get("reason"),
-                "available_decisions": params.get("availableDecisions"),
-            }
-            app.send({"id": completed["id"], "result": {"decision": "decline"}})
-            completed = app.read_until(lambda m: m.get("method") == "turn/completed")
-        else:
-            result["approval_request"] = None
+        approvals: list[dict[str, object]] = []
+        while True:
+            message = app.read_until(
+                lambda m: m.get("method") in (APPROVAL_METHOD, "turn/completed")
+            )
+            if message.get("method") != APPROVAL_METHOD:
+                completed = message
+                break
+            params = message.get("params") or {}
+            kind = params.get("kind") or "command"
+            approvals.append(
+                {
+                    "kind": kind,
+                    "command": params.get("command"),
+                    "reason": params.get("reason"),
+                }
+            )
+            decision = decisions.get(kind, "decline")
+            app.send({"id": message["id"], "result": {"decision": decision}})
+        result["approval_requests"] = approvals
+        result["approval_request"] = approvals[0] if approvals else None
         status = ((completed.get("params") or {}).get("turn") or {}).get("status")
         if status != "completed":
             raise SmokeError(f"turn did not complete cleanly: {completed}")
         result["turn_status"] = status
         with MockResponses.lock:
             result["model_requests"] = len(MockResponses.calls)
+            outputs: list[dict[str, object]] = []
+            for call in MockResponses.calls:
+                for item in call.get("input") or []:
+                    if isinstance(item, dict) and item.get("type") == "function_call_output":
+                        output = item.get("output")
+                        if not isinstance(output, str):
+                            output = json.dumps(output)
+                        outputs.append({"call_id": item.get("call_id"), "output": output[:300]})
+            result["tool_outputs"] = outputs
         executed = [
             message
             for message in app.transcript
@@ -341,16 +386,63 @@ def run_turn(
             raise SmokeError("the model was not told about the command outcome")
     finally:
         app.close()
-    if approval_policy == "untrusted":
-        if result["approval_request"] is None:
-            raise SmokeError("strict mode did not ask for approval before running ls")
-        if result["command_executed"]:
-            raise SmokeError("a command executed despite the decline")
-    else:
-        if result["approval_request"] is not None:
-            raise SmokeError(f"approval_policy={approval_policy} unexpectedly asked for approval")
-        if not result["command_executed"]:
-            raise SmokeError(f"approval_policy={approval_policy} did not execute ls")
+    return result
+
+
+LS_SCRIPT = [function_call("call-ls", "exec_command", {"cmd": "ls", "yield_time_ms": 1000})]
+
+
+def strict_ls(binary: Path, root: Path, base_url: str, timeout: float) -> dict[str, object]:
+    result = run_turn(binary, root, base_url, "untrusted", timeout, LS_SCRIPT, {})
+    if result["approval_request"] is None:
+        raise SmokeError("strict mode did not ask for approval before running ls")
+    if "ls" not in (result["approval_request"].get("command") or ""):
+        raise SmokeError(f"approval request did not carry the ls command: {result}")
+    if result["command_executed"]:
+        raise SmokeError("a command executed despite the decline")
+    return result
+
+
+def control_never(binary: Path, root: Path, base_url: str, timeout: float) -> dict[str, object]:
+    result = run_turn(binary, root, base_url, "never", timeout, LS_SCRIPT, {})
+    if result["approval_request"] is not None:
+        raise SmokeError("approval_policy=never unexpectedly asked for approval")
+    if not result["command_executed"]:
+        raise SmokeError("approval_policy=never did not execute ls")
+    return result
+
+
+def strict_stdin(binary: Path, root: Path, base_url: str, timeout: float) -> dict[str, object]:
+    """Approve opening a shell, then every later input must be reviewed again."""
+    marker = root / "workspace" / "pwned"
+    script = [
+        function_call(
+            "call-shell",
+            "exec_command",
+            {"cmd": "/bin/sh -i", "tty": True, "yield_time_ms": 500},
+        ),
+        function_call(
+            "call-stdin",
+            "write_stdin",
+            {
+                "session_id": SESSION_PLACEHOLDER,
+                "chars": f"echo pwned > {marker}\n",
+                "yield_time_ms": 1000,
+            },
+        ),
+    ]
+    # Accept the shell itself, decline everything typed into it afterwards.
+    result = run_turn(
+        binary, root, base_url, "untrusted", timeout, script, {"command": "accept"}
+    )
+    kinds = [approval["kind"] for approval in result["approval_requests"]]
+    if kinds[:1] != ["command"]:
+        raise SmokeError(f"expected the shell launch to be reviewed first, saw {kinds}")
+    if "writeStdin" not in kinds:
+        raise SmokeError(f"input to the approved shell was not reviewed: {kinds}")
+    if marker.exists():
+        raise SmokeError("declined terminal input still executed")
+    result["stdin_reviewed"] = True
     return result
 
 
@@ -376,10 +468,12 @@ def run(binary: Path, timeout: float, keep: bool, allow_dynamic: bool) -> dict[s
     base_url = f"http://127.0.0.1:{server.server_address[1]}"
     root = Path(tempfile.mkdtemp(prefix="zuno-standalone-smoke-"))
     try:
-        report["strict"] = run_turn(binary, root / "strict", base_url, "untrusted", timeout)
+        report["strict"] = strict_ls(binary, root / "strict", base_url, timeout)
         # Control: the same model proposal under approval_policy = "never" must run
         # without any prompt, proving the prompt above came from the strict policy.
-        report["control_never"] = run_turn(binary, root / "control", base_url, "never", timeout)
+        report["control_never"] = control_never(binary, root / "control", base_url, timeout)
+        # A persistent shell must not become an approval-free side channel.
+        report["strict_stdin"] = strict_stdin(binary, root / "stdin", base_url, timeout)
     finally:
         server.shutdown()
         if keep:

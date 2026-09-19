@@ -182,6 +182,7 @@ mod unified_exec;
 mod unified_exec_process_events;
 mod unified_exec_stdin_approval;
 mod unified_exec_stdin_review_size;
+mod unified_exec_strict_policy;
 #[cfg(unix)]
 mod unified_exec_zsh_fork_approvals;
 mod unstable_features_warning;
