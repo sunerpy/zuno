@@ -234,6 +234,9 @@ def main() -> int:
     require(upstream_sync, "check \\\n            --allow-current")
     require(upstream_sync, "--force-with-lease=refs/heads/${HEAD_BRANCH}:")
     reject(upstream_sync, "gh pr merge")
+    # gh infers the repo from git remotes and prefers one named `upstream`; the
+    # sync checkout adds exactly that remote for openai/codex.
+    require(upstream_sync, "GH_REPO: ${{ github.repository }}")
     reject(upstream_sync, "--auto")
 
     smoke = text("scripts/smoke_zuno_package.py")

@@ -34,6 +34,10 @@ concurrency:
 env:
   CANDIDATE_LABEL: upstream-sync
   CONFLICT_LABEL: upstream-sync-conflict
+  # The checkout gains an `upstream` remote pointing at openai/codex, and gh
+  # prefers a remote named upstream when inferring the repository. Pin every gh
+  # call to this repository so labels, issues, and PRs never target upstream.
+  GH_REPO: ${{ github.repository }}
 
 jobs:
   prepare:
