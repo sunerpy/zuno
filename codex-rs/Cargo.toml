@@ -521,7 +521,7 @@ whoami = "1.6.1"
 wildmatch = "2.6.1"
 winapi-util = "0.1.11"
 zip = "2.4.2"
-zstd = "0.13"
+zstd = "0.14"
 
 wiremock = "0.6"
 zeroize = "1.8.2"
