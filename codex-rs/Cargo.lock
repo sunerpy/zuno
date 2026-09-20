@@ -2604,6 +2604,7 @@ dependencies = [
  "codex-chatgpt",
  "codex-cloud-config",
  "codex-cloud-tasks",
+ "codex-code-mode-host",
  "codex-config",
  "codex-core",
  "codex-core-plugins",

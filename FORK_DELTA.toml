@@ -141,9 +141,12 @@ contracts = [
 id = "server-strict-standalone"
 status = "implemented"
 ownership = "shared-modified"
-summary = "Statically linked single-file Linux binary plus a strict approval mode for server troubleshooting."
+summary = "Statically linked single-file Linux binary (code-mode host embedded) plus a strict approval mode for server troubleshooting."
 zuno_paths = [
   "scripts/zuno_standalone_smoke.py",
+  "scripts/zuno_standalone_live_check.py",
+  "codex-rs/cli/src/embedded_code_mode_host.rs",
+  "codex-rs/install-context/tests/code_mode_host_override.rs",
   "examples/zuno-config/server-strict.config.toml",
   "docs/zuno-server-strict.md",
   "docs/zuno-server-strict.zh-CN.md",
@@ -154,13 +157,18 @@ shared_upstream_paths = [
   "codex-rs/app-server/src/config_manager_service.rs",
   "codex-rs/utils/cli/src/approval_mode_cli_arg.rs",
   "codex-rs/protocol/src/protocol.rs",
+  "codex-rs/core/src/unified_exec/stdin_approval.rs",
+  "codex-rs/install-context/src/lib.rs",
+  "codex-rs/cli/Cargo.toml",
+  "codex-rs/cli/src/main.rs",
   ".github/workflows/zuno-ci.yml",
   ".github/workflows/zuno-release.yml",
 ]
 contracts = [
   "approval_policy = \"untrusted\" is selectable in config, profiles, and --ask-for-approval; it prompts for every command and edit unless an explicit exec policy rule allows it.",
   "Every release publishes zuno-standalone-x86_64-unknown-linux-musl, a static ELF with no dynamic loader, attested and sealed with the platform packages.",
-  "The PR gate runs the standalone strict-mode smoke (approval requested for ls, decline executes nothing; approval_policy = never runs it) before sealing.",
+  "On musl targets codex-cli compiles codex-code-mode-host into zuno (a target-scoped dependency, not a cargo feature): the standalone binary serves code_mode_only models (the Kiro gpt-5.6 families) from a single file through an arg0 alias in the per-session helper directory.",
+  "The PR gate runs the standalone strict-mode smoke (approval requested for ls, decline executes nothing; approval_policy = never runs it; write_stdin into an approved shell is reviewed again; a code_mode_only model reaches the embedded host and its exec_command still prompts) on the runner and inside a foreign container before sealing.",
 ]
 
 [[capabilities]]

@@ -8,10 +8,15 @@ minimal container next to the binary. It checks that:
    version;
 2. with ``approval_policy = "untrusted"`` (strict mode) the App Server asks the
    user before running even a harmless ``ls`` proposed by the model, and a
-   declined approval ends the turn without executing anything.
+   declined approval ends the turn without executing anything;
+3. the same proposal runs unprompted under ``approval_policy = "never"``;
+4. input typed into an approved persistent shell is reviewed again;
+5. a ``code_mode_only`` model (the Kiro gpt-5.6 families are catalogued that
+   way) reaches the code-mode host embedded in the binary, and the shell call
+   its JavaScript makes still stops at the approval prompt.
 
-The model is a local mock of the OpenAI Responses API that first asks to run
-``ls`` and then, once told the command was declined, answers with a message.
+The model is a local mock of the OpenAI Responses API that replays a scripted
+tool call and then, once told the outcome, answers with a message.
 """
 
 from __future__ import annotations
@@ -85,6 +90,11 @@ def function_call(call_id: str, name: str, arguments: dict[str, object]) -> dict
     }
 
 
+def custom_tool_call(call_id: str, name: str, input_text: str) -> dict[str, object]:
+    """A freeform tool call; code mode sends the JavaScript program as `input`."""
+    return {"type": "custom_tool_call", "call_id": call_id, "name": name, "input": input_text}
+
+
 def assistant_message(text: str) -> dict[str, object]:
     return {
         "type": "message",
@@ -95,6 +105,11 @@ def assistant_message(text: str) -> dict[str, object]:
 
 
 SESSION_PLACEHOLDER = "$SESSION_ID"
+# Unknown to the model catalog, so the server hands it the direct tool set.
+MOCK_MODEL = "mock-model"
+# Catalogued with `tool_mode = "code_mode_only"`: every tool call goes through the
+# code-mode host, which a standalone binary has to carry inside itself.
+CODE_MODE_ONLY_MODEL = "gpt-5.6-sol"
 
 
 def resolve_session_id(item: dict[str, object], body: dict[str, object]) -> dict[str, object]:
@@ -175,11 +190,11 @@ class MockResponses(BaseHTTPRequestHandler):
         self.end_headers()
 
 
-def write_config(home: Path, base_url: str, approval_policy: str) -> None:
+def write_config(home: Path, base_url: str, approval_policy: str, model: str = MOCK_MODEL) -> None:
     home.mkdir(parents=True, exist_ok=True)
     (home / "config.toml").write_text(
         f"""# Server troubleshooting profile exercised by the smoke test.
-model = "mock-model"
+model = "{model}"
 model_provider = "mock_provider"
 approval_policy = "{approval_policy}"
 approvals_reviewer = "user"
@@ -205,6 +220,12 @@ class AppServer:
         }
         env["ZUNO_HOME"] = str(home)
         env.setdefault("HOME", str(home))
+        # Release builds refuse to create helper aliases (sandbox, apply_patch, the
+        # embedded code-mode host) when ZUNO_HOME sits under the temp dir. A server
+        # uses ~/.zuno, so give the process a temp dir that does not contain its home.
+        process_tmp = home.parent / "process-tmp"
+        process_tmp.mkdir(parents=True, exist_ok=True)
+        env["TMPDIR"] = str(process_tmp)
         # stderr goes to a file so verbose logging can never block the server.
         self.stderr_path = home / "app-server.stderr.log"
         self._stderr = self.stderr_path.open("w", encoding="utf-8")
@@ -303,6 +324,7 @@ def run_turn(
     timeout: float,
     script: list[dict[str, object]],
     decisions: dict[str, str],
+    model: str = MOCK_MODEL,
 ) -> dict[str, object]:
     """Drive one App Server turn; `decisions` maps approval kinds to responses."""
     with MockResponses.lock:
@@ -312,8 +334,8 @@ def run_turn(
     workspace = root / "workspace"
     workspace.mkdir(parents=True)
     (workspace / "README.txt").write_text("smoke workspace\n", encoding="utf-8")
-    write_config(home, base_url, approval_policy)
-    result: dict[str, object] = {"approval_policy": approval_policy}
+    write_config(home, base_url, approval_policy, model)
+    result: dict[str, object] = {"approval_policy": approval_policy, "model": model}
     app = AppServer(binary, home, workspace, timeout)
     try:
         app.request(
@@ -366,11 +388,14 @@ def run_turn(
             outputs: list[dict[str, object]] = []
             for call in MockResponses.calls:
                 for item in call.get("input") or []:
-                    if isinstance(item, dict) and item.get("type") == "function_call_output":
-                        output = item.get("output")
-                        if not isinstance(output, str):
-                            output = json.dumps(output)
-                        outputs.append({"call_id": item.get("call_id"), "output": output[:300]})
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type") not in ("function_call_output", "custom_tool_call_output"):
+                        continue
+                    output = item.get("output")
+                    if not isinstance(output, str):
+                        output = json.dumps(output)
+                    outputs.append({"call_id": item.get("call_id"), "output": output[:600]})
             result["tool_outputs"] = outputs
         executed = [
             message
@@ -446,6 +471,44 @@ def strict_stdin(binary: Path, root: Path, base_url: str, timeout: float) -> dic
     return result
 
 
+CODE_MODE_MARKER = "code_mode_marker_7f3a"
+CODE_MODE_SCRIPT = [
+    custom_tool_call(
+        "call-code",
+        "exec",
+        f'text(JSON.stringify(await tools.exec_command({{ cmd: "printf {CODE_MODE_MARKER}" }})));',
+    )
+]
+
+
+def strict_code_mode(binary: Path, root: Path, base_url: str, timeout: float) -> dict[str, object]:
+    """A code_mode_only model must reach the embedded host, and its nested shell
+    call must still stop at the strict approval prompt before running."""
+    result = run_turn(
+        binary,
+        root,
+        base_url,
+        "untrusted",
+        timeout,
+        CODE_MODE_SCRIPT,
+        {"command": "accept"},
+        model=CODE_MODE_ONLY_MODEL,
+    )
+    outputs = " ".join(str(o["output"]) for o in result["tool_outputs"])
+    if "failed to start" in outputs or "code-mode host" in outputs.lower():
+        raise SmokeError(f"the code-mode host did not start: {outputs[:600]}")
+    if result["approval_request"] is None:
+        raise SmokeError("strict mode did not review the command issued from code mode")
+    if CODE_MODE_MARKER not in (result["approval_request"].get("command") or ""):
+        raise SmokeError(f"approval request did not carry the code-mode command: {result}")
+    if not result["command_executed"]:
+        raise SmokeError("the approved code-mode command did not run")
+    if CODE_MODE_MARKER not in outputs:
+        raise SmokeError(f"code-mode output did not reach the model: {outputs[:600]}")
+    result["code_mode_host"] = "embedded"
+    return result
+
+
 def run(binary: Path, timeout: float, keep: bool, allow_dynamic: bool) -> dict[str, object]:
     report: dict[str, object] = {"binary": str(binary)}
     report["elf"] = check_static_elf(binary, allow_dynamic)
@@ -474,6 +537,9 @@ def run(binary: Path, timeout: float, keep: bool, allow_dynamic: bool) -> dict[s
         report["control_never"] = control_never(binary, root / "control", base_url, timeout)
         # A persistent shell must not become an approval-free side channel.
         report["strict_stdin"] = strict_stdin(binary, root / "stdin", base_url, timeout)
+        # Kiro-style models are code_mode_only: without the embedded host every tool
+        # call fails with "the shell tool failed to start" even though the mock passes.
+        report["strict_code_mode"] = strict_code_mode(binary, root / "code-mode", base_url, timeout)
     finally:
         server.shutdown()
         if keep:

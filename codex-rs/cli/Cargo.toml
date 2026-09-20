@@ -112,6 +112,10 @@ zuno-acp = { workspace = true }
 
 [target.'cfg(all(target_os = "linux", target_env = "musl", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
 tikv-jemallocator = { workspace = true }
+# The musl build is the single-file distribution. It compiles `codex-code-mode-host`
+# into `zuno` so `code_mode_only` models work without a sibling binary; packaged
+# installs on other targets keep shipping the host next to the executable.
+codex-code-mode-host = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 codex_windows_sandbox = { package = "codex-windows-sandbox", path = "../windows-sandbox-rs" }
