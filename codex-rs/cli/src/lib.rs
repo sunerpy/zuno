@@ -1,4 +1,10 @@
 pub(crate) mod debug_sandbox;
+#[cfg(all(
+    target_os = "linux",
+    target_env = "musl",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub mod embedded_code_mode_host;
 mod exit_status;
 pub(crate) mod login;
 

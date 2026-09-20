@@ -62,7 +62,7 @@ jobs:
               codex_package.test_cargo \
               codex_package.test_cli \
               codex_package.test_layout
-          python3 -m py_compile scripts/smoke_zuno_package.py scripts/zuno_standalone_smoke.py
+          python3 -m py_compile scripts/smoke_zuno_package.py scripts/zuno_standalone_smoke.py scripts/zuno_standalone_live_check.py
           python3 scripts/check_zuno_update_boundaries.py
           actionlint .github/workflows/zuno-ci.yml .github/workflows/zuno-release.yml .github/workflows/zuno-upstream-sync.yml
       - name: Verify generated App Server schemas
@@ -86,6 +86,8 @@ jobs:
           cargo test -p codex-tui update_action --lib
           cargo test -p codex-tui update_versions --lib
           cargo test -p codex-cli --bin zuno doctor::updates::tests::preview_update_check_is_explicitly_offline_and_non_mutating
+          cargo test -p codex-install-context
+          cargo test -p codex-core --test all unified_exec_strict_policy
       - name: Check optimized Zuno type graph
         run: cargo check --release -p codex-cli --bin zuno
       - name: Lint Zuno product surface
@@ -266,6 +268,12 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends musl-tools
+      # On musl targets codex-cli compiles the code-mode host (V8) into zuno so
+      # code_mode_only models work from a single file; fetch the verified V8 archive.
+      - name: Configure rusty_v8 artifact overrides and verify checksums
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: x86_64-unknown-linux-musl
       - name: Build the statically linked Zuno binary
         working-directory: codex-rs
         shell: bash
@@ -296,6 +304,19 @@ jobs:
           printf 'FROM scratch\nCOPY zuno-standalone-%s /zuno\nENTRYPOINT ["/zuno"]\n' "$STANDALONE_TARGET" \
             | docker build --quiet -t zuno-standalone-smoke -f - codex-rs/dist/standalone
           docker run --rm zuno-standalone-smoke --version
+      # Repeat the smoke in a userland that has none of the build host's libraries or
+      # sibling binaries, so the embedded code-mode host is the only one that can answer.
+      - name: Smoke strict approval mode inside a foreign container
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "${PWD}/codex-rs/dist/standalone:/dist:ro" \
+            -v "${PWD}/scripts:/scripts:ro" \
+            python:3.13-slim \
+            python3 /scripts/zuno_standalone_smoke.py \
+              --binary "/dist/zuno-standalone-${STANDALONE_TARGET}" \
+              --timeout 120
       - name: Attest standalone binary
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:

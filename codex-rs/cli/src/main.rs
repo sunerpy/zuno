@@ -1086,6 +1086,12 @@ fn stage_str(stage: Stage) -> &'static str {
 }
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(all(
+        target_os = "linux",
+        target_env = "musl",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    codex_cli::embedded_code_mode_host::dispatch_if_requested();
     codex_build_info::initialize!();
     let remote_control_disabled = codex_app_server::take_remote_control_disabled_env();
     arg0_dispatch_or_else(move |arg0_paths: Arg0DispatchPaths| async move {
@@ -1098,6 +1104,12 @@ async fn cli_main(
     arg0_paths: Arg0DispatchPaths,
     remote_control_disabled: bool,
 ) -> anyhow::Result<()> {
+    #[cfg(all(
+        target_os = "linux",
+        target_env = "musl",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    codex_cli::embedded_code_mode_host::install_alias(&arg0_paths);
     let MultitoolCli {
         config_overrides: mut root_config_overrides,
         feature_toggles,

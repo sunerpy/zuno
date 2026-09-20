@@ -8,7 +8,8 @@ use semver::Version;
 use serde::Deserialize;
 
 const BIN_DIRNAME: &str = "bin";
-const CODE_MODE_HOST_EXECUTABLE_NAME: &str = if cfg!(windows) {
+/// File name of the code-mode host helper that ships next to the Codex executable.
+pub const CODE_MODE_HOST_EXECUTABLE_NAME: &str = if cfg!(windows) {
     "codex-code-mode-host.exe"
 } else {
     "codex-code-mode-host"
@@ -20,6 +21,9 @@ const RESOURCES_DIRNAME: &str = "codex-resources";
 const STANDALONE_PACKAGES_DIRNAME: &str = "standalone";
 const ZSH_DIRNAME: &str = "zsh";
 static INSTALL_CONTEXT: OnceLock<InstallContext> = OnceLock::new();
+/// Process-wide replacement for the code-mode host program, see
+/// [`InstallContext::set_code_mode_host_program_override`].
+static CODE_MODE_HOST_PROGRAM_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StandalonePlatform {
@@ -173,7 +177,21 @@ impl InstallContext {
         default_rg_command()
     }
 
+    /// Launch code-mode hosts from `program` for the rest of this process.
+    ///
+    /// Single-file distributions compile the host into the main executable and
+    /// point this at an alias of themselves whose file name is
+    /// [`CODE_MODE_HOST_EXECUTABLE_NAME`], so the alias dispatches into the
+    /// embedded host when spawned. Returns `false` if an override was already
+    /// installed; the first one wins.
+    pub fn set_code_mode_host_program_override(program: PathBuf) -> bool {
+        CODE_MODE_HOST_PROGRAM_OVERRIDE.set(program).is_ok()
+    }
+
     pub fn code_mode_host_program(&self) -> PathBuf {
+        if let Some(program) = CODE_MODE_HOST_PROGRAM_OVERRIDE.get() {
+            return program.clone();
+        }
         // prefer the one packed under codex-resources
         self.bundled_resource(CODE_MODE_HOST_EXECUTABLE_NAME)
             .map_or_else(
