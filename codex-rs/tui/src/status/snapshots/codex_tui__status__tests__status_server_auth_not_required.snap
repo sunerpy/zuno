@@ -5,7 +5,7 @@ expression: rendered
 /status
 
 ╭─────────────────────────────────────────────────────────────────────────────╮
-│  >_ Zuno (v0.154.2)                                                         │
+│  >_ Zuno (v0.154.3)                                                         │
 │                                                                             │
 │  Model:            gpt-5.6-sol (reasoning none, summaries auto)             │
 │  Model provider:   server-ollama                                            │
