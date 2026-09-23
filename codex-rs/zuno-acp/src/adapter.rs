@@ -34,6 +34,10 @@ mod session;
 
 use mapping::*;
 
+#[cfg(test)]
+use projection::answers_from_elicitation;
+#[cfg(test)]
+use projection::elicitation_form_request;
 use projection::handle_app_server_event;
 #[cfg(test)]
 use projection::history_updates;
@@ -65,6 +69,17 @@ pub struct CodexAcpAgent {
 struct BridgeState {
     sessions: Mutex<HashMap<String, SessionRoute>>,
     turns: Mutex<TurnRegistry>,
+    /// `clientCapabilities` from `initialize`; decides which client-side
+    /// methods (for example `elicitation/create`) the bridge may call.
+    client_capabilities: Mutex<Value>,
+}
+
+impl BridgeState {
+    fn client_supports_form_elicitation(&self) -> bool {
+        lock(&self.client_capabilities)
+            .pointer("/elicitation/form")
+            .is_some_and(|mode| !mode.is_null())
+    }
 }
 
 #[derive(Clone)]
@@ -99,7 +114,14 @@ impl Agent for CodexAcpAgent {
         client: ClientConnection,
     ) -> Result<Value, RpcError> {
         match method {
-            "initialize" => initialize(&params),
+            "initialize" => {
+                let response = initialize(&params)?;
+                *lock(&self.state.client_capabilities) = params
+                    .get("clientCapabilities")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                Ok(response)
+            }
             "authenticate" => Ok(json!({})),
             "session/new" => self.new_session(&params, &client).await,
             "session/load" | "session/resume" => self.resume_session(&params, &client).await,
@@ -310,6 +332,93 @@ mod tests {
         );
         assert_eq!(started[0]["toolCallId"], "call-1");
         assert_eq!(started[0]["kind"], "execute");
+        assert_eq!(started[0]["name"], "shell");
+        let spawned = notification_updates(
+            "item/started",
+            &json!({"item":{"type":"collabAgentToolCall","id":"call-2","tool":"spawn_agent"}}),
+        );
+        assert_eq!(spawned[0]["name"], "spawn_agent");
+        assert_eq!(spawned[0]["kind"], "think");
+        let mcp = notification_updates(
+            "item/started",
+            &json!({"item":{"type":"mcpToolCall","id":"call-3","server":"docs","tool":"search"}}),
+        );
+        assert_eq!(mcp[0]["title"], "docs.search");
+        assert_eq!(mcp[0]["name"], "search");
+    }
+
+    #[test]
+    fn lifecycle_items_are_not_projected_as_tool_calls() {
+        for item_type in [
+            "contextCompaction",
+            "enteredReviewMode",
+            "exitedReviewMode",
+            "functionCallOutput",
+            "plan",
+        ] {
+            let updates =
+                notification_updates("item/started", &json!({"item":{"type":item_type,"id":"x"}}));
+            assert!(
+                updates
+                    .iter()
+                    .all(|update| update["sessionUpdate"] != "tool_call"),
+                "{item_type} must not become a tool call: {updates:?}"
+            );
+            let completed = notification_updates(
+                "item/completed",
+                &json!({"item":{"type":item_type,"id":"x"}}),
+            );
+            assert!(
+                completed
+                    .iter()
+                    .all(|update| update["sessionUpdate"] != "tool_call_update"),
+                "{item_type} must not complete a tool call: {completed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn free_text_questions_become_a_form_elicitation() {
+        let params = json!({
+            "itemId": "call-9",
+            "questions": [
+                {"id":"strategy","header":"Strategy","question":"How should I proceed?",
+                 "options":[{"label":"Careful","description":"slow"},{"label":"Fast","description":"quick"}]},
+                {"id":"notes","header":"Notes","question":"Anything else?","options":null},
+            ]
+        });
+        let request = elicitation_form_request("sess-1", &params).expect("form request");
+        assert_eq!(request["sessionId"], "sess-1");
+        assert_eq!(request["toolCallId"], "call-9");
+        assert_eq!(request["mode"], "form");
+        assert_eq!(
+            request["requestedSchema"]["properties"]["strategy"]["enum"],
+            json!(["Careful", "Fast"])
+        );
+        assert_eq!(
+            request["requestedSchema"]["properties"]["notes"]["type"],
+            "string"
+        );
+        assert_eq!(
+            request["requestedSchema"]["required"],
+            json!(["strategy", "notes"])
+        );
+        let answers = answers_from_elicitation(
+            &params,
+            &json!({"action":"accept","content":{"strategy":"Fast","notes":"ship it"}}),
+        )
+        .expect("answers");
+        assert_eq!(answers["answers"]["strategy"]["answers"], json!(["Fast"]));
+        assert_eq!(answers["answers"]["notes"]["answers"], json!(["ship it"]));
+        let declined =
+            answers_from_elicitation(&params, &json!({"action":"decline"})).expect_err("declined");
+        assert_eq!(declined.code, -32800);
+        let secret = elicitation_form_request(
+            "sess-1",
+            &json!({"questions":[{"id":"token","header":"Token","question":"API token?","isSecret":true}]}),
+        )
+        .expect_err("secrets never go through form mode");
+        assert_eq!(secret.code, -32600);
     }
 
     #[test]

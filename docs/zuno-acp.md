@@ -66,6 +66,33 @@ request cannot target the live turn. ACP's `-32000` (authentication required)
 and `-32002` (resource not found) and App Server's `-32001` (overloaded) pass
 through unchanged.
 
+## Protocol version and client compatibility
+
+The bridge speaks ACP wire protocol **1**, the stable version. ACP versions
+three things independently: the `protocolVersion` integer negotiated in
+`initialize` (1 stable, 2 draft), the JSON schema release (1.x), and the SDK
+packages (the Rust `agent-client-protocol` crate is at 2.x while still speaking
+wire protocol 1). A client that upgrades its SDK, such as Zed 1.21 moving to
+`agent-client-protocol` 2.1 with schema 1.7, still sends `protocolVersion: 1`;
+nothing in Zuno changes for it. Protocol 2 will be added behind explicit
+negotiation once it leaves draft status, keeping protocol 1 served.
+
+Within protocol 1 the bridge tracks the schema additions clients rely on:
+
+- `tool_call` updates carry the first-class `name` (schema 1.8) alongside
+  `title` and `kind`: `shell`, `apply_patch`, `web_search`, `spawn_agent`
+  (which Zed uses to recognise sub-agents), the MCP or dynamic tool's own name,
+  `view_image`, `image_generation`, `sleep`.
+- App Server lifecycle items (`contextCompaction`, review-mode markers,
+  `functionCallOutput`) are not projected as tool calls.
+- When the client advertises `clientCapabilities.elicitation.form` (schema
+  1.7), tool questions from the model (`item/tool/requestUserInput`) are asked
+  through one `elicitation/create` form: multiple-choice questions become
+  `enum` properties, free-text questions become `string` properties. Secret
+  questions are refused because form mode must not carry credentials. Clients
+  without form elicitation keep the previous behaviour: multiple choice through
+  `session/request_permission`, free text rejected.
+
 Zuno-specific capabilities continue to evolve behind explicit protocol
 metadata. An ACP SDK package version alone does not opt a connection into an
 unstable wire protocol.

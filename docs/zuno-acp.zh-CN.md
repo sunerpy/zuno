@@ -54,5 +54,25 @@ prompt 内容块到 App Server 输入的映射与参考实现 `codex-acp` 一致
 `-32000`（需要认证）、`-32002`（资源不存在）与 App Server 的 `-32001`（过载）
 原样透传。
 
+## 协议版本与客户端兼容
+
+桥接层使用 ACP 线协议 **1**（稳定版）。ACP 有三条互相独立的版本轴：`initialize` 中协商的
+`protocolVersion` 整数（1 稳定、2 草案）、JSON schema 发布版本（1.x）、以及 SDK 包版本
+（Rust crate `agent-client-protocol` 已到 2.x，但仍说线协议 1）。客户端升级 SDK——例如
+Zed 1.21 升到 `agent-client-protocol` 2.1 与 schema 1.7——发送的仍是 `protocolVersion: 1`，
+Zuno 无需改动。协议 2 走出草案后会在显式协商之后追加，同时继续服务协议 1。
+
+在协议 1 之内，桥接层跟进客户端依赖的 schema 增量：
+
+- `tool_call` 更新携带一等 `name`（schema 1.8），与 `title`、`kind` 并列：`shell`、
+  `apply_patch`、`web_search`、`spawn_agent`（Zed 用它识别子代理）、MCP 或动态工具自身
+  的名字、`view_image`、`image_generation`、`sleep`。
+- App Server 的生命周期条目（`contextCompaction`、review 模式标记、`functionCallOutput`）
+  不再被投影成工具调用。
+- 客户端宣告 `clientCapabilities.elicitation.form`（schema 1.7）时，模型的提问
+  （`item/tool/requestUserInput`）通过一次 `elicitation/create` 表单收集：选择题变成
+  `enum` 属性，自由文本变成 `string` 属性；机密问题拒绝，因为表单模式不得承载凭据。
+  没有表单能力的客户端保持原行为：选择题走 `session/request_permission`，自由文本拒绝。
+
 Zuno 专属能力必须通过显式协议元数据逐步演进。仅凭 ACP SDK 包版本号，不能
 视为连接已经启用不稳定的 wire protocol。
