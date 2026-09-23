@@ -126,6 +126,56 @@ class ZunoUpstreamTest(unittest.TestCase):
             with self.assertRaises(zuno_upstream.SyncError):
                 zuno_upstream.exact_target(repo.root, None, baseline, "next", ["0.11.0"])
 
+    def test_open_candidates_come_from_unmerged_remote_branches(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "origin").mkdir()
+            origin = Repository(root / "origin")
+            origin.write("file", "base\n")
+            origin.commit("base")
+            base, tree = origin.tag_baseline("rust-v0.9.0")
+            for tag in ["rust-v0.10.0", "rust-v0.10.1", "rust-v0.11.0"]:
+                origin.write("file", f"{tag}\n")
+                origin.commit(tag)
+                git(origin.root, "tag", tag)
+            baseline_commit = git(origin.root, "rev-parse", "rust-v0.10.0^{commit}")
+            baseline_tree = git(origin.root, "rev-parse", "rust-v0.10.0^{tree}")
+            git(origin.root, "checkout", "-q", "-b", "zuno", baseline_commit)
+            origin.manifest("rust-v0.10.0", baseline_commit, baseline_tree)
+            source = origin.commit("zuno")
+            # A merged candidate (ancestor of zuno), an open one, and noise.
+            git(origin.root, "branch", "upstream-sync/0.10.0", source)
+            git(origin.root, "checkout", "-q", "-b", "upstream-sync/0.11.0", "rust-v0.11.0")
+            origin.write("file", "candidate\n")
+            origin.commit("candidate 0.11.0")
+            git(origin.root, "branch", "upstream-sync/not-a-version", "rust-v0.10.1")
+            git(origin.root, "checkout", "-q", "zuno")
+
+            clone = root / "clone"
+            subprocess.run(["git", "clone", "-q", str(origin.root), str(clone)], check=True)
+            git(clone, "fetch", "-q", "--tags", "origin")
+            self.assertEqual(
+                zuno_upstream.open_candidates_on_remote(clone, "origin", source),
+                ["rust-v0.11.0"],
+            )
+            baseline = zuno_upstream.read_baseline(clone / "UPSTREAM_CODEX.toml")
+            # Without the remote the next release is 0.10.1; the open 0.11.0
+            # candidate wins through the CLI wiring.
+            plain = subprocess.run(
+                [sys.executable, str(SCRIPT), "--repo", str(clone), "--no-fetch", "--json",
+                 "check", "--source", "origin/zuno", "--policy", "next"],
+                text=True, check=True, stdout=subprocess.PIPE,
+            ).stdout
+            self.assertEqual(json.loads(plain)["target_tag"], "rust-v0.10.1")
+            with_remote = subprocess.run(
+                [sys.executable, str(SCRIPT), "--repo", str(clone), "--no-fetch", "--json",
+                 "check", "--source", "origin/zuno", "--policy", "next",
+                 "--open-candidates-remote", "origin"],
+                text=True, check=True, stdout=subprocess.PIPE,
+            ).stdout
+            self.assertEqual(json.loads(with_remote)["target_tag"], "rust-v0.11.0")
+            self.assertEqual(baseline.release_tag, "rust-v0.10.0")
+
     def test_latest_stable_ignores_alpha_and_sorts_semver(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Repository(Path(directory))

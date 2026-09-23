@@ -290,6 +290,37 @@ def exact_target(
     return chosen
 
 
+CANDIDATE_BRANCH_PREFIX = "upstream-sync/"
+
+
+def open_candidates_on_remote(repo: Path, remote: str, source_commit: str) -> list[str]:
+    """Stable tags of candidate branches on ``remote`` that are not yet merged into ``source_commit``.
+
+    A candidate branch ``upstream-sync/X.Y.Z`` counts as open while its tip is
+    not an ancestor of the source: merged candidates are ancestors and drop out,
+    so only unmerged work influences target selection. Abandoned candidates must
+    be deleted from the remote (the watcher deletes the ones it supersedes).
+    """
+    listing = run(repo, ["ls-remote", "--heads", remote, f"refs/heads/{CANDIDATE_BRANCH_PREFIX}*"])
+    open_tags: list[str] = []
+    for line in listing.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        sha, ref = parts
+        version = ref.removeprefix(f"refs/heads/{CANDIDATE_BRANCH_PREFIX}")
+        tag = f"rust-v{version}"
+        if not STABLE_TAG.fullmatch(tag):
+            continue
+        if run(repo, ["cat-file", "-e", f"{sha}^{{commit}}"], check=False).returncode != 0:
+            if run(repo, ["fetch", "--quiet", remote, ref], check=False).returncode != 0:
+                continue
+        if is_ancestor(repo, sha, source_commit):
+            continue
+        open_tags.append(tag)
+    return sorted(open_tags, key=stable_tag_version)
+
+
 def merge_base(repo: Path, left: str, right: str) -> str | None:
     result = run(repo, ["merge-base", left, right], check=False)
     if result.returncode != 0:
@@ -965,6 +996,14 @@ def parser() -> argparse.ArgumentParser:
                 "candidate newer than the policy's pick is kept instead of regressing to an older tag"
             ),
         )
+        command.add_argument(
+            "--open-candidates-remote",
+            metavar="REMOTE",
+            help=(
+                "discover open candidates from this remote's upstream-sync/* branches whose tip "
+                "is not yet merged into --source"
+            ),
+        )
         if name == "check":
             command.add_argument(
                 "--allow-current",
@@ -1108,9 +1147,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         baseline = read_baseline(manifest)
         if not args.no_fetch:
             run(repo, ["fetch", "--tags", "--prune", args.remote])
-        target_tag = exact_target(
-            repo, args.target, baseline, args.policy, tuple(args.open_candidate or ())
-        )
+        open_candidates = list(args.open_candidate or ())
+        if args.open_candidates_remote:
+            open_candidates += open_candidates_on_remote(
+                repo, args.open_candidates_remote, resolve_commit(repo, args.source)
+            )
+        target_tag = exact_target(repo, args.target, baseline, args.policy, open_candidates)
         if (
             args.command == "check"
             and args.allow_current
