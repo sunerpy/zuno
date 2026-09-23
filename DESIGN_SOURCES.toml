@@ -27,3 +27,10 @@ adoption = "source-fork"
 review_status = "design-reference-only"
 adoption = "watch"
 notes = "Prompt and workflow ideas may inform optional user packages; no product workflow or model-specific prompt is embedded in core."
+
+[codex_harness_article]
+url = "https://openai.com/index/unlocking-the-codex-harness/"
+published = "2026-02-04"
+review_status = "design-reference-only"
+adoption = "adapt"
+notes = "OpenAI's description of the harness (core agent loop) and the App Server edge. docs/zuno-enterprise-agent.md records which harness primitives an enterprise agent composes, which enterprise concerns have no primitive, and the phased plan to add them as Zuno-owned layers without a second agent loop."

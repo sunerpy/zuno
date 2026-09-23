@@ -29,6 +29,7 @@ baseline.
 
 See [Zuno next architecture](ZUNO_ARCHITECTURE.md),
 [plugin-owned Agent backends](docs/zuno-plugin-agent-backends.md),
+[the enterprise agent design baseline](docs/zuno-enterprise-agent.md),
 [model profile examples](examples/zuno-config/README.md),
 [optional workflow templates](examples/zuno-workflows/README.md),
 [`UPSTREAM_CODEX.toml`](UPSTREAM_CODEX.toml), and
