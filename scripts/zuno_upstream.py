@@ -240,7 +240,24 @@ def stable_tags(repo: Path) -> list[str]:
     return [tag for _, tag in tagged]
 
 
-def exact_target(repo: Path, requested: str | None) -> str:
+TARGET_POLICIES = ("next", "newest")
+
+
+def exact_target(
+    repo: Path,
+    requested: str | None,
+    baseline: Baseline | None = None,
+    policy: str = "next",
+) -> str:
+    """Pick the stable Codex tag to sync.
+
+    An explicit ``requested`` tag always wins. Otherwise ``policy`` decides:
+    ``next`` (default) returns the oldest stable tag newer than the recorded
+    baseline so every release is replayed in order and gets its own Zuno
+    version; ``newest`` returns the newest stable tag and skips intermediate
+    releases. When no tag is newer than the baseline, the newest tag is
+    returned so the caller can report an up-to-date baseline.
+    """
     if requested:
         if not STABLE_TAG.fullmatch(requested):
             raise SyncError(
@@ -248,9 +265,16 @@ def exact_target(repo: Path, requested: str | None) -> str:
             )
         resolve_commit(repo, requested)
         return requested
+    if policy not in TARGET_POLICIES:
+        raise SyncError(f"unknown target policy {policy!r}; expected one of {TARGET_POLICIES}")
     tags = stable_tags(repo)
     if not tags:
         raise SyncError("no stable Codex rust-vX.Y.Z tag is available locally")
+    if policy == "next" and baseline is not None:
+        floor = stable_tag_version(baseline.release_tag)
+        for tag in tags:
+            if stable_tag_version(tag) > floor:
+                return tag
     return tags[-1]
 
 
@@ -911,6 +935,15 @@ def parser() -> argparse.ArgumentParser:
         command = subparsers.add_parser(name)
         command.add_argument("--source", default="HEAD")
         command.add_argument("--target")
+        command.add_argument(
+            "--policy",
+            choices=TARGET_POLICIES,
+            default="next",
+            help=(
+                "which stable tag to sync when --target is omitted: 'next' replays releases "
+                "in order (the oldest tag newer than the baseline), 'newest' jumps to the latest"
+            ),
+        )
         if name == "check":
             command.add_argument(
                 "--allow-current",
@@ -1054,7 +1087,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         baseline = read_baseline(manifest)
         if not args.no_fetch:
             run(repo, ["fetch", "--tags", "--prune", args.remote])
-        target_tag = exact_target(repo, args.target)
+        target_tag = exact_target(repo, args.target, baseline, args.policy)
         if (
             args.command == "check"
             and args.allow_current

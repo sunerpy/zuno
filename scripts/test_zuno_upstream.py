@@ -72,6 +72,38 @@ class Repository:
 
 
 class ZunoUpstreamTest(unittest.TestCase):
+    def test_target_policy_next_replays_releases_in_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Repository(Path(directory))
+            repo.write("file", "base\n")
+            repo.commit("base")
+            base, tree = repo.tag_baseline("rust-v0.9.0")
+            for tag in ["rust-v0.10.0", "rust-v0.10.1", "rust-v0.11.0", "rust-v0.11.0-alpha.3"]:
+                repo.write("file", f"{tag}\n")
+                repo.commit(tag)
+                git(repo.root, "tag", tag)
+            repo.manifest("rust-v0.10.0", base, tree)
+            baseline = zuno_upstream.read_baseline(repo.root / "UPSTREAM_CODEX.toml")
+            self.assertEqual(
+                zuno_upstream.exact_target(repo.root, None, baseline, "next"), "rust-v0.10.1"
+            )
+            self.assertEqual(
+                zuno_upstream.exact_target(repo.root, None, baseline, "newest"), "rust-v0.11.0"
+            )
+            # Nothing newer than the baseline: both policies report the newest tag
+            # so `check --allow-current` can say the baseline is current.
+            repo.manifest("rust-v0.11.0", base, tree)
+            current = zuno_upstream.read_baseline(repo.root / "UPSTREAM_CODEX.toml")
+            self.assertEqual(
+                zuno_upstream.exact_target(repo.root, None, current, "next"), "rust-v0.11.0"
+            )
+            self.assertEqual(
+                zuno_upstream.exact_target(repo.root, "rust-v0.10.0", baseline, "next"),
+                "rust-v0.10.0",
+            )
+            with self.assertRaises(zuno_upstream.SyncError):
+                zuno_upstream.exact_target(repo.root, None, baseline, "latest")
+
     def test_latest_stable_ignores_alpha_and_sorts_semver(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Repository(Path(directory))

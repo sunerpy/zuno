@@ -4,10 +4,15 @@ Zuno is a source-level fork of [openai/codex](https://github.com/openai/codex).
 Every stable Codex release (`rust-vX.Y.Z`) is folded into Zuno by replaying the
 reviewed Zuno delta onto that exact release, building the six platform packages
 once, and promoting those exact bytes to `zuno-vX.Y.Z`. Zuno versions therefore
-track Codex versions.
+track Codex versions, and releases are replayed in order so every Codex release
+becomes a Zuno release.
 
-The pipeline has exactly one manual step: merging the candidate pull request.
-Everything before and after it is automated.
+The pipeline has one review gate: merging the candidate pull request. By default
+that merge is manual; with `[sync].automatic_merge = true` in
+`UPSTREAM_CODEX.toml` a candidate whose replay needed no manual conflict
+resolution is queued for GitHub auto-merge and merges as soon as the PR gate
+passes (see *Hands-off mode* below). Everything before and after the merge is
+automated.
 
 ```text
 openai/codex tag rust-vX.Y.Z
@@ -32,11 +37,15 @@ zuno-upstream-sync.yml ── replay clean ──▶ branch upstream-sync/X.Y.Z 
 ## Watcher: `zuno-upstream-sync.yml`
 
 Runs on a six-hour schedule and on `workflow_dispatch` (optional exact `target`
-tag, optional `refresh`). Each run:
+tag, optional `refresh`, optional `policy`). Each run:
 
 1. Fetches Codex tags and runs `scripts/zuno_upstream.py check --allow-current`.
-   When the newest stable tag equals the recorded baseline in
-   `UPSTREAM_CODEX.toml`, the run ends with a summary and no side effects.
+   With the default policy `next` the target is the oldest stable tag newer
+   than the baseline recorded in `UPSTREAM_CODEX.toml`, so releases are synced
+   one by one in order; `policy: newest` jumps to the latest tag instead. An
+   open candidate for a newer release (for example one resolved by hand) is
+   never regressed: the run continues with that release. When no stable tag is
+   newer than the baseline, the run ends with a summary and no side effects.
 2. Looks for an open candidate PR on `upstream-sync/X.Y.Z` or an open conflict
    issue for the tag. If either already records the current `main` commit
    (`Zuno-Source-Commit` trailer), the run is a no-op. This makes the schedule
@@ -74,8 +83,20 @@ tag, optional `refresh`). Each run:
    paths, the replay summary, and the local commands to resolve them. Nothing is
    pushed.
 
-Only one release is tracked at a time: the newest stable tag. Alpha tags are
-ignored.
+One candidate is open at a time. Alpha tags are ignored.
+
+## Hands-off mode
+
+Set `automatic_merge = true` under `[sync]` in `UPSTREAM_CODEX.toml` to let
+clean candidates merge without a human: after opening or refreshing the PR the
+watcher runs `gh pr merge --auto --merge`, GitHub merges it with a merge commit
+as soon as `zuno/pr-gate` succeeds, and `zuno-release.yml` promotes the sealed
+bytes. Candidates that needed manual conflict resolution are pushed by a person
+and are never queued automatically. Two repository settings gate this:
+**Allow auto-merge** must be enabled, and the `main` ruleset must not require a
+human review (today it requires a code-owner review, so auto-merge waits for
+that approval). When GitHub refuses to queue the merge the watcher leaves a
+comment on the PR and the candidate waits for a manual merge.
 
 ## Rebrand replay: `FORK_REBRAND.toml`
 
@@ -228,7 +249,11 @@ branch) starts the gate by hand.
   cuts each release on its own short branch, so the target normally is a sibling
   of the baseline rather than a descendant; the two must share history, and
   commits that exist only on the old release branch are listed in the PR.
-- Nothing is merged automatically. The merge is the review gate.
+- Releases are replayed in order (`policy: next`), one candidate at a time, so
+  every Codex release gets a Zuno release; `policy: newest` is an explicit
+  choice to skip intermediate releases.
+- The merge is the review gate: manual unless hands-off mode is enabled, and
+  hands-off mode only ever queues candidates whose replay was fully automatic.
 - Automation resolves a conflict hunk only when `FORK_REBRAND.toml` reproduces
   the Zuno side from the Codex baseline byte for byte; every other hunk waits
   for a human. Reviewed post-merge edits are reused, never re-derived, when

@@ -17,4 +17,8 @@ branch = "legacy/v0.10"
 [sync]
 remote = "upstream"
 candidate_only = true
+# false: merging the candidate PR is a manual review step. true: a candidate
+# whose replay needed no manual conflict resolution is queued for GitHub
+# auto-merge and merges (merge commit) once zuno/pr-gate passes; requires the
+# repository to allow auto-merge and a main ruleset without a required review.
 automatic_merge = false

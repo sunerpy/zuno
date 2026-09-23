@@ -87,9 +87,12 @@ files an issue instead when the replay conflicts. Conflicts that exist only
 because Zuno renamed Codex text are resolved from
 [`FORK_REBRAND.toml`](FORK_REBRAND.toml) before anything is reported, and
 resolutions from an earlier candidate of the same release are reused when `main`
-moves. Merging that PR with a merge commit is the only manual step: **Promote Zuno candidate** then tags
-`zuno-vX.Y.Z` from the sealed PR-gate bytes automatically. The workflow never
-merges the candidate. See [docs/zuno-upstream-sync.md](docs/zuno-upstream-sync.md)
+moves. Releases are replayed in order, one candidate at a time. Merging that PR
+with a merge commit is the review gate: manual by default, or queued for GitHub
+auto-merge behind the PR gate when `UPSTREAM_CODEX.toml` sets
+`[sync].automatic_merge = true` (clean replays only). **Promote Zuno candidate**
+then tags `zuno-vX.Y.Z` from the sealed PR-gate bytes automatically. See
+[docs/zuno-upstream-sync.md](docs/zuno-upstream-sync.md)
 ([中文](docs/zuno-upstream-sync.zh-CN.md)).
 
 For a server, use the statically linked single-file

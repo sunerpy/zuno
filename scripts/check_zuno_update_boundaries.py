@@ -233,11 +233,23 @@ def main() -> int:
     reject(upstream_sync, "persist-credentials: true")
     require(upstream_sync, "check \\\n            --allow-current")
     require(upstream_sync, "--force-with-lease=refs/heads/${HEAD_BRANCH}:")
-    reject(upstream_sync, "gh pr merge")
+    # The watcher itself never merges. The one permitted merge command only
+    # queues GitHub auto-merge (merge commit, behind the required PR gate) and
+    # only when the reviewed manifest opts in with [sync].automatic_merge = true.
+    if sync_text.count("gh pr merge") != 1:
+        raise SystemExit("upstream sync must contain exactly one gh pr merge (the guarded auto-merge queue)")
+    merge_at = sync_text.index("gh pr merge")
+    guard = sync_text[max(0, merge_at - 400) : merge_at]
+    if 'if [[ "${automatic_merge}" == true ]]' not in guard:
+        raise SystemExit("gh pr merge in upstream sync is not guarded by [sync].automatic_merge")
+    if "tomllib.load(open(\"UPSTREAM_CODEX.toml\", \"rb\")).get(\"sync\", {}).get(\"automatic_merge\", False)" not in sync_text:
+        raise SystemExit("upstream sync must read automatic_merge from UPSTREAM_CODEX.toml")
+    require(upstream_sync, 'gh pr merge "${pr_url}" --auto --merge')
+    if sync_text.count("--auto") != 1 or "--squash" in sync_text or "--rebase" in sync_text or "--admin" in sync_text:
+        raise SystemExit("upstream sync may only queue a merge-commit auto-merge; no squash, rebase or admin merges")
     # gh infers the repo from git remotes and prefers one named `upstream`; the
     # sync checkout adds exactly that remote for openai/codex.
     require(upstream_sync, "GH_REPO: ${{ github.repository }}")
-    reject(upstream_sync, "--auto")
 
     smoke = text("scripts/smoke_zuno_package.py")
     isolation = smoke.index('runtime_env["HOME"]')

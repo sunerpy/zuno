@@ -3,9 +3,11 @@
 Zuno 是 [openai/codex](https://github.com/openai/codex) 的源码级 fork。每个 Codex
 正式版（`rust-vX.Y.Z`）都会被折叠进 Zuno：把已评审的 Zuno 差量重放到该精确
 release 上，六个平台包只构建一次，再把这些字节原样晋升为 `zuno-vX.Y.Z`。因此
-Zuno 的版本号跟随 Codex。
+Zuno 的版本号跟随 Codex，release 按顺序逐个重放，每个 Codex release 都对应一个 Zuno release。
 
-整条流水线只有一个人工步骤：合并候选 PR。此前此后全部自动。
+流水线只有一道评审门：合并候选 PR。默认由人合并；在 `UPSTREAM_CODEX.toml` 设置
+`[sync].automatic_merge = true` 后，重放过程中无需人工解决冲突的候选会被排入 GitHub
+auto-merge，PR 门禁通过即合入（见下文"免人工模式"）。合并前后全部自动。
 
 ```text
 openai/codex 打标签 rust-vX.Y.Z
@@ -28,11 +30,13 @@ zuno-upstream-sync.yml ── 重放无冲突 ──▶ 分支 upstream-sync/X.Y
 
 ## 巡检：`zuno-upstream-sync.yml`
 
-每 6 小时定时运行，也可 `workflow_dispatch`（可选精确 `target` 标签、可选
-`refresh`）。每次运行：
+每 6 小时定时运行，也可 `workflow_dispatch`（可选精确 `target` 标签、可选 `refresh`、
+可选 `policy`）。每次运行：
 
-1. 拉取 Codex 标签，执行 `scripts/zuno_upstream.py check --allow-current`。
-   若最新正式标签等于 `UPSTREAM_CODEX.toml` 记录的基线，直接结束，不产生任何副作用。
+1. 拉取 Codex 标签，执行 `scripts/zuno_upstream.py check --allow-current`。默认策略 `next`
+   选择比 `UPSTREAM_CODEX.toml` 基线更新的最旧正式标签，因此 release 按顺序逐个同步；
+   `policy: newest` 则直接跳到最新标签。已为更新 release 打开的候选（例如人工解决过的）
+   永不回退：本次运行继续处理它。没有比基线更新的正式标签时直接结束，不产生任何副作用。
 2. 查找 `upstream-sync/X.Y.Z` 上已打开的候选 PR，或该标签对应的冲突 issue。若其中
    任何一个已记录当前 `main` 提交（`Zuno-Source-Commit` trailer），本次运行为空操作。
    这保证了定时任务幂等。
@@ -58,7 +62,16 @@ zuno-upstream-sync.yml ── 重放无冲突 ──▶ 分支 upstream-sync/X.Y
    issue（本标签及更旧标签的）都会被标记为已取代并关闭。
 6. 仍有冲突时，新建或更新一个 issue，列出冲突路径、重放摘要和本地解决命令。不推送任何东西。
 
-同一时间只跟踪一个 release：最新正式标签。alpha 标签被忽略。
+同一时间只开一个候选。alpha 标签被忽略。
+
+## 免人工模式
+
+在 `UPSTREAM_CODEX.toml` 的 `[sync]` 下设置 `automatic_merge = true`，干净的候选就无需人工合并：
+巡检在新建或刷新 PR 后执行 `gh pr merge --auto --merge`，`zuno/pr-gate` 通过后 GitHub 以合并
+提交合入，`zuno-release.yml` 随即晋升封存字节。需要人工解决冲突的候选由人推送，永远不会被
+自动排队。两项仓库设置决定它能否生效：必须开启 **Allow auto-merge**，且 `main` 的 ruleset
+不能要求人工评审（目前要求 code owner 评审，所以自动合并会等那次批准）。GitHub 拒绝排队时
+巡检会在 PR 上留言，候选等待人工合并。
 
 ## 改名重放：`FORK_REBRAND.toml`
 
@@ -176,7 +189,9 @@ write**，存为仓库 secret `ZUNO_UPSTREAM_SYNC_TOKEN`。巡检只在推送与
 - 重放前校验精确的上游标签、提交与 tree。Codex 每个 release 都在独立的短分支上切出，
   因此目标通常是基线的兄弟而非后代；两者必须共享历史，仅存在于旧 release 分支上的
   提交会列在 PR 里。
-- 不自动合并任何东西。合并就是评审门。
+- release 按顺序重放（`policy: next`），一次一个候选，每个 Codex release 都对应一个 Zuno
+  release；`policy: newest` 是显式选择跳过中间版本。
+- 合并就是评审门：默认人工；开启免人工模式后也只会排队重放完全自动的候选。
 - 自动化只在 `FORK_REBRAND.toml` 能从 Codex 基线逐字节复现 Zuno 侧时解决一个冲突块；其余
   冲突块都等待人工。`main` 前进时复用已评审的合并后编辑，而不是重新推导。
 - 评审后的字节不再重新构建；晋升只是重新发布 PR gate 封存的产物。
