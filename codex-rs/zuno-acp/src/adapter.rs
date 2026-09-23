@@ -108,6 +108,7 @@ impl Agent for CodexAcpAgent {
             "session/prompt" => self.prompt(&params, &client).await,
             "session/steer" => self.steer_session(&params, &client).await,
             "session/set_config_option" => self.set_option(&params).await,
+            "session/set_mode" => self.set_mode(&params).await,
             "session/set_model" => self.set_model(&params).await,
             "session/close" => {
                 let session_id = required_string(&params, "sessionId")?;
@@ -195,15 +196,76 @@ mod tests {
         let prompt = json!([
             {"type":"text","text":"inspect"},
             {"type":"image","mimeType":"image/png","data":"aGVsbG8="},
+            {"type":"image","mimeType":"image/png","data":"ignored","uri":"https://example.invalid/a.png"},
             {"type":"resource_link","name":"spec","uri":"file:///tmp/spec.md"},
-            {"type":"resource","resource":{"mimeType":"text/plain","text":"context"}},
+            {"type":"resource_link","uri":"file:///tmp/notes/plan.md"},
+            {"type":"resource","resource":{"uri":"file:///tmp/ctx.txt","mimeType":"text/plain","text":"context"}},
+            {"type":"resource","resource":{"uri":"file:///tmp/pixel.png","mimeType":"image/png","blob":"iVBORw0KGgo="}},
+            {"type":"resource","resource":{"uri":"file:///tmp/archive.bin","mimeType":"application/octet-stream","blob":"AAEC"}},
         ]);
         let mapped = acp_prompt_to_codex(Some(&prompt)).expect("prompt maps");
-        assert_eq!(mapped.len(), 4);
+        assert_eq!(mapped.len(), 8);
         assert_eq!(mapped[0]["type"], "text");
         assert_eq!(mapped[1]["url"], "data:image/png;base64,aGVsbG8=");
-        assert_eq!(mapped[2]["text"], "Resource spec: file:///tmp/spec.md");
-        assert_eq!(mapped[3]["text"], "context");
+        // A fetchable image URI is passed through instead of re-encoding the data.
+        assert_eq!(mapped[2]["url"], "https://example.invalid/a.png");
+        // Links keep the same shape the official codex-acp adapter produces so
+        // prompts behave identically across Codex ACP agents.
+        assert_eq!(mapped[3]["text"], "[@spec](file:///tmp/spec.md)");
+        assert_eq!(mapped[4]["text"], "[@plan.md](file:///tmp/notes/plan.md)");
+        assert_eq!(
+            mapped[5]["text"],
+            "[@ctx.txt](file:///tmp/ctx.txt)\n<context ref=\"file:///tmp/ctx.txt\">\ncontext\n</context>"
+        );
+        assert_eq!(mapped[6]["type"], "image");
+        assert_eq!(mapped[6]["url"], "data:image/png;base64,iVBORw0KGgo=");
+        // A non-image blob is never presented to the model as an image.
+        assert_eq!(mapped[7]["type"], "text");
+        assert_eq!(
+            mapped[7]["text"],
+            "[@archive.bin](file:///tmp/archive.bin)\n<context ref=\"file:///tmp/archive.bin\" mimeType=\"application/octet-stream\" encoding=\"base64\">\nAAEC\n</context>"
+        );
+    }
+
+    #[test]
+    fn prompt_rejects_blocks_the_agent_never_advertised() {
+        let error = acp_prompt_to_codex(Some(&json!([
+            {"type":"audio","mimeType":"audio/wav","data":"AAEC"}
+        ])))
+        .expect_err("audio is not advertised");
+        assert_eq!(error.code, -32602);
+        let error = acp_prompt_to_codex(Some(&json!([
+            {"type":"resource","resource":{"uri":"file:///x","mimeType":"application/pdf"}}
+        ])))
+        .expect_err("resource needs text or blob");
+        assert_eq!(error.code, -32602);
+    }
+
+    #[test]
+    fn bridge_error_codes_do_not_alias_acp_or_app_server_codes() {
+        use crate::transport::SESSION_BUSY_CODE;
+        use crate::transport::STEER_REJECTED_CODE;
+        // ACP v1: -32000 auth required, -32002 resource not found; App Server:
+        // -32001 overloaded. Both sides' codes are forwarded verbatim.
+        for reserved in [
+            -32000, -32001, -32002, -32600, -32601, -32602, -32603, -32800,
+        ] {
+            assert_ne!(SESSION_BUSY_CODE, reserved);
+            assert_ne!(STEER_REJECTED_CODE, reserved);
+        }
+        assert_ne!(SESSION_BUSY_CODE, STEER_REJECTED_CODE);
+    }
+
+    #[test]
+    fn set_mode_translates_to_the_mode_config_option() {
+        let translated = set_mode_as_config_option(&json!({"sessionId":"s","modeId":"plan"}))
+            .expect("translates");
+        assert_eq!(translated["sessionId"], "s");
+        assert_eq!(translated["configId"], "mode");
+        assert_eq!(translated["value"], "plan");
+        let error =
+            set_mode_as_config_option(&json!({"sessionId":"s"})).expect_err("modeId required");
+        assert_eq!(error.code, -32602);
     }
 
     #[test]
@@ -283,5 +345,22 @@ mod tests {
         assert_eq!(response["protocolVersion"], 1);
         assert_eq!(response["agentInfo"]["name"], "Zuno");
         assert_eq!(response["agentCapabilities"]["loadSession"], true);
+        let response = initialize(&json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {"fs": {"readTextFile": true, "writeTextFile": false}, "terminal": true},
+            "clientInfo": {"name": "zed", "version": "1.0"},
+        }))
+        .expect("initialize with capabilities");
+        assert_eq!(response["protocolVersion"], 1);
+    }
+
+    #[test]
+    fn initialize_rejects_malformed_client_capabilities() {
+        let error = initialize(&json!({"protocolVersion": 1, "clientCapabilities": "yes"}))
+            .expect_err("capabilities must be an object");
+        assert_eq!(error.code, -32602);
+        let error = initialize(&json!({"protocolVersion": 1, "clientInfo": []}))
+            .expect_err("clientInfo must be an object");
+        assert_eq!(error.code, -32602);
     }
 }
