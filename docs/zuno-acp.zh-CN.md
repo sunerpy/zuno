@@ -70,9 +70,11 @@ Zuno 无需改动。协议 2 走出草案后会在显式协商之后追加，同
 - App Server 的生命周期条目（`contextCompaction`、review 模式标记、`functionCallOutput`）
   不再被投影成工具调用。
 - 客户端宣告 `clientCapabilities.elicitation.form`（schema 1.7）时，模型的提问
-  （`item/tool/requestUserInput`）通过一次 `elicitation/create` 表单收集：选择题变成
-  `enum` 属性，自由文本变成 `string` 属性；机密问题拒绝，因为表单模式不得承载凭据。
-  没有表单能力的客户端保持原行为：选择题走 `session/request_permission`，自由文本拒绝。
+  （`item/tool/requestUserInput`）通过一次 `elicitation/create` 表单收集。App Server 的提问
+  工具始终允许自由填写的"其他"答案（`isOther`），这类问题保持为 `string` 属性并在描述里列出
+  建议选项；只有不带 `isOther` 的问题才变成封闭的 `enum`。机密问题拒绝，因为表单模式不得
+  承载凭据。没有表单能力的客户端保持原行为：给出的选项走 `session/request_permission`，
+  不能自由作答。
 
 Zuno 专属能力必须通过显式协议元数据逐步演进。仅凭 ACP SDK 包版本号，不能
 视为连接已经启用不稳定的 wire protocol。

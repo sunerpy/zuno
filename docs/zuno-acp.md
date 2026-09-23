@@ -87,11 +87,13 @@ Within protocol 1 the bridge tracks the schema additions clients rely on:
   `functionCallOutput`) are not projected as tool calls.
 - When the client advertises `clientCapabilities.elicitation.form` (schema
   1.7), tool questions from the model (`item/tool/requestUserInput`) are asked
-  through one `elicitation/create` form: multiple-choice questions become
-  `enum` properties, free-text questions become `string` properties. Secret
-  questions are refused because form mode must not carry credentials. Clients
-  without form elicitation keep the previous behaviour: multiple choice through
-  `session/request_permission`, free text rejected.
+  through one `elicitation/create` form. The App Server tool always allows a
+  free-form "Other" answer (`isOther`), so such questions stay `string`
+  properties that list the suggested options in their description; only
+  questions without `isOther` become closed `enum` properties. Secret questions
+  are refused because form mode must not carry credentials. Clients without form
+  elicitation keep the previous behaviour: the listed options through
+  `session/request_permission`, no free-form answer.
 
 Zuno-specific capabilities continue to evolve behind explicit protocol
 metadata. An ACP SDK package version alone does not opt a connection into an

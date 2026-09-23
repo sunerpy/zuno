@@ -333,11 +333,37 @@ pub(super) fn elicitation_form_request(
             .and_then(Value::as_array)
             .filter(|options| !options.is_empty())
         {
+            // The App Server tool always allows a free-form "Other" answer
+            // (`isOther`), which a closed `enum` would silently drop. Form
+            // schemas are limited to primitives and enums, so an open question
+            // stays a `string` and lists its suggestions in the description.
             let labels = options
                 .iter()
                 .filter_map(|option| option.get("label").and_then(Value::as_str))
                 .collect::<Vec<_>>();
-            property["enum"] = json!(labels);
+            if question.get("isOther").and_then(Value::as_bool) == Some(true) {
+                let suggestions = options
+                    .iter()
+                    .filter_map(|option| {
+                        let label = option.get("label").and_then(Value::as_str)?;
+                        match option.get("description").and_then(Value::as_str) {
+                            Some(description) if !description.is_empty() => {
+                                Some(format!("{label} ({description})"))
+                            }
+                            _ => Some(label.to_owned()),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let description = if prompt.is_empty() {
+                    format!("Options: {suggestions}. Or type another answer.")
+                } else {
+                    format!("{prompt}\nOptions: {suggestions}. Or type another answer.")
+                };
+                property["description"] = Value::String(description);
+            } else {
+                property["enum"] = json!(labels);
+            }
         }
         properties.insert(id.clone(), property);
         required.push(Value::String(id));

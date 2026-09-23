@@ -76,9 +76,11 @@ struct BridgeState {
 
 impl BridgeState {
     fn client_supports_form_elicitation(&self) -> bool {
+        // The schema advertises a mode as an (possibly empty) object; null or a
+        // missing key means unsupported.
         lock(&self.client_capabilities)
             .pointer("/elicitation/form")
-            .is_some_and(|mode| !mode.is_null())
+            .is_some_and(Value::is_object)
     }
 }
 
@@ -378,12 +380,17 @@ mod tests {
     }
 
     #[test]
-    fn free_text_questions_become_a_form_elicitation() {
+    fn tool_questions_become_a_form_elicitation_that_keeps_other_answers() {
+        // Production `request_user_input` questions always carry options and
+        // `isOther: true` (core normalizes them that way); the legacy shapes
+        // without `isOther` or without options are still accepted.
         let params = json!({
             "itemId": "call-9",
             "questions": [
-                {"id":"strategy","header":"Strategy","question":"How should I proceed?",
-                 "options":[{"label":"Careful","description":"slow"},{"label":"Fast","description":"quick"}]},
+                {"id":"strategy","header":"Strategy","question":"How should I proceed?","isOther":true,
+                 "options":[{"label":"Careful (Recommended)","description":"slow"},{"label":"Fast","description":"quick"}]},
+                {"id":"mode","header":"Mode","question":"Which mode?","isOther":false,
+                 "options":[{"label":"build","description":""},{"label":"plan","description":""}]},
                 {"id":"notes","header":"Notes","question":"Anything else?","options":null},
             ]
         });
@@ -391,9 +398,19 @@ mod tests {
         assert_eq!(request["sessionId"], "sess-1");
         assert_eq!(request["toolCallId"], "call-9");
         assert_eq!(request["mode"], "form");
+        let strategy = &request["requestedSchema"]["properties"]["strategy"];
+        assert_eq!(strategy["type"], "string");
+        assert!(
+            strategy.get("enum").is_none(),
+            "an open question must not be a closed enum"
+        );
         assert_eq!(
-            request["requestedSchema"]["properties"]["strategy"]["enum"],
-            json!(["Careful", "Fast"])
+            strategy["description"],
+            "How should I proceed?\nOptions: Careful (Recommended) (slow); Fast (quick). Or type another answer."
+        );
+        assert_eq!(
+            request["requestedSchema"]["properties"]["mode"]["enum"],
+            json!(["build", "plan"])
         );
         assert_eq!(
             request["requestedSchema"]["properties"]["notes"]["type"],
@@ -401,14 +418,18 @@ mod tests {
         );
         assert_eq!(
             request["requestedSchema"]["required"],
-            json!(["strategy", "notes"])
+            json!(["strategy", "mode", "notes"])
         );
         let answers = answers_from_elicitation(
             &params,
-            &json!({"action":"accept","content":{"strategy":"Fast","notes":"ship it"}}),
+            &json!({"action":"accept","content":{"strategy":"Try both in a worktree","mode":"plan","notes":"ship it"}}),
         )
         .expect("answers");
-        assert_eq!(answers["answers"]["strategy"]["answers"], json!(["Fast"]));
+        assert_eq!(
+            answers["answers"]["strategy"]["answers"],
+            json!(["Try both in a worktree"])
+        );
+        assert_eq!(answers["answers"]["mode"]["answers"], json!(["plan"]));
         assert_eq!(answers["answers"]["notes"]["answers"], json!(["ship it"]));
         let declined =
             answers_from_elicitation(&params, &json!({"action":"decline"})).expect_err("declined");
