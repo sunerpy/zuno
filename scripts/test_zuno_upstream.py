@@ -103,6 +103,28 @@ class ZunoUpstreamTest(unittest.TestCase):
             )
             with self.assertRaises(zuno_upstream.SyncError):
                 zuno_upstream.exact_target(repo.root, None, baseline, "latest")
+            # An open candidate for a newer release is kept (releases between the
+            # baseline and it are superseded); an older or unknown one is ignored.
+            self.assertEqual(
+                zuno_upstream.exact_target(
+                    repo.root, None, baseline, "next", ["rust-v0.11.0"]
+                ),
+                "rust-v0.11.0",
+            )
+            self.assertEqual(
+                zuno_upstream.exact_target(
+                    repo.root, None, baseline, "next", ["rust-v0.9.0", "rust-v0.99.0"]
+                ),
+                "rust-v0.10.1",
+            )
+            self.assertEqual(
+                zuno_upstream.exact_target(
+                    repo.root, "rust-v0.10.1", baseline, "next", ["rust-v0.11.0"]
+                ),
+                "rust-v0.10.1",
+            )
+            with self.assertRaises(zuno_upstream.SyncError):
+                zuno_upstream.exact_target(repo.root, None, baseline, "next", ["0.11.0"])
 
     def test_latest_stable_ignores_alpha_and_sorts_semver(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

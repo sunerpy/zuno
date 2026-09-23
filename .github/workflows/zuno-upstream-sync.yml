@@ -80,6 +80,19 @@ jobs:
           target_args=(--policy "${POLICY}")
           if [[ -n "${REQUESTED_TARGET}" ]]; then
             target_args=(--target "${REQUESTED_TARGET}")
+          else
+            # Releases are replayed in order, but a candidate branch that is
+            # already open (pushed and not yet merged into main) for a newer
+            # release, for example one resolved by hand, is never regressed to
+            # an older tag. Merged candidates are ancestors of main and ignored.
+            while read -r sha ref; do
+              [[ -n "${sha}" ]] || continue
+              version="${ref#refs/heads/upstream-sync/}"
+              [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+              git fetch --quiet origin "${ref}" || continue
+              git merge-base --is-ancestor "${sha}" HEAD && continue
+              target_args+=(--open-candidate "rust-v${version}")
+            done < <(git ls-remote --heads origin 'refs/heads/upstream-sync/*')
           fi
           python3 scripts/zuno_upstream.py \
             --no-fetch \
@@ -95,28 +108,6 @@ jobs:
             echo "skip=true" >> "${GITHUB_OUTPUT}"
             echo "Baseline ${baseline} is already the newest stable Codex release; nothing to prepare." >> "${GITHUB_STEP_SUMMARY}"
             exit 0
-          fi
-          # Releases are replayed in order, but a candidate branch that already
-          # exists for a newer release (for example one resolved by hand) is
-          # never regressed to an older tag: keep working on that release.
-          if [[ -z "${REQUESTED_TARGET}" ]]; then
-            planned="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["target_tag"])' "${plan_path}")"
-            open_newer="$(git ls-remote --heads origin 'refs/heads/upstream-sync/*' \
-              | sed -n 's#.*refs/heads/upstream-sync/##p' \
-              | python3 -c '
-          import re, sys
-          planned = sys.argv[1].removeprefix("rust-v")
-          def key(v): return tuple(int(part) for part in v.split("."))
-          versions = [v.strip() for v in sys.stdin if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", v.strip())]
-          newer = [v for v in versions if key(v) > key(planned)]
-          print(max(newer, key=key) if newer else "")
-          ' "${planned}")"
-            if [[ -n "${open_newer}" ]]; then
-              echo "An open candidate for rust-v${open_newer} is newer than the planned ${planned}; continuing with it." >> "${GITHUB_STEP_SUMMARY}"
-              python3 scripts/zuno_upstream.py --no-fetch --json check --allow-current --source HEAD \
-                --target "rust-v${open_newer}" > "${plan_path}"
-              cat "${plan_path}"
-            fi
           fi
           target_tag="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["target_tag"])' "${plan_path}")"
           relationship="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["relationship"])' "${plan_path}")"
@@ -355,7 +346,7 @@ jobs:
           body="$(cat <<EOF
           This candidate merges exact Codex release \`${TARGET_TAG}\` (\`${UPSTREAM_COMMIT}\`) into the reviewed Zuno source \`main@${SOURCE_SHA}\`. The head commit's first parent is that \`main\` commit and its second parent is the release commit, so the diff below is exactly the upstream change plus regenerated derived artifacts.
 
-          It was prepared in an isolated CI worktree by the scheduled upstream watcher. Nothing was merged automatically; the watcher force-updates this branch whenever \`main\` moves so the candidate always builds on the current reviewed source.
+          It was prepared in an isolated CI worktree by the scheduled upstream watcher, which force-updates this branch whenever \`main\` moves so the candidate always builds on the current reviewed source. Merging is the review gate: manual, or queued for GitHub auto-merge behind \`zuno/pr-gate\` when \`UPSTREAM_CODEX.toml\` sets \`[sync].automatic_merge = true\` and this replay needed no manual resolution.
 
           ${overlap}
 
@@ -427,14 +418,19 @@ jobs:
                 gh issue close "${stale}" --comment "Superseded: Codex ${TARGET_TAG} is now being synced; its candidate is ${pr_url}."
               done
 
-          # Optional hands-off merge: with `[sync].automatic_merge = true` in
-          # UPSTREAM_CODEX.toml a candidate whose replay needed no manual
-          # resolution is queued for GitHub auto-merge, so it merges (as a merge
-          # commit) the moment zuno/pr-gate passes and promotion follows. The
-          # repository must allow auto-merge and its main ruleset must not
-          # require a human review for this to complete.
+          # Hands-off merge: with `[sync].automatic_merge = true` in
+          # UPSTREAM_CODEX.toml a candidate whose replay was fully automatic
+          # (rebrand replay only; nothing copied from a hand-resolved candidate)
+          # is queued for GitHub auto-merge, so it merges (as a merge commit)
+          # the moment zuno/pr-gate passes and promotion follows. The repository
+          # must allow auto-merge and its main ruleset must not require a human
+          # review for this to complete.
           automatic_merge="$(python3 -c 'import tomllib; print(str(tomllib.load(open("UPSTREAM_CODEX.toml", "rb")).get("sync", {}).get("automatic_merge", False)).lower())')"
-          if [[ "${automatic_merge}" == true ]]; then
+          reused="$(python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1])).get("rebrand", {}).get("reused", [])))' "${REPORT}")"
+          if [[ "${automatic_merge}" == true && "${reused}" != 0 ]]; then
+            echo "Auto-merge not queued: ${reused} path(s) were carried over from a hand-resolved candidate, so this replay was not fully automatic." >> "${GITHUB_STEP_SUMMARY}"
+            gh pr comment "${pr_url}" --body "Auto-merge was not queued: ${reused} path(s) were carried over from a hand-resolved candidate (see the rebrand replay above), so this candidate waits for a manual merge."
+          elif [[ "${automatic_merge}" == true ]]; then
             if gh pr merge "${pr_url}" --auto --merge; then
               echo "Auto-merge queued: the candidate merges when zuno/pr-gate passes." >> "${GITHUB_STEP_SUMMARY}"
               gh pr comment "${pr_url}" --body "Auto-merge is queued (\`[sync].automatic_merge = true\`): this candidate merges with a merge commit as soon as \`zuno/pr-gate\` passes, and \`zuno-release.yml\` then promotes it."

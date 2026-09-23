@@ -7,12 +7,13 @@ once, and promoting those exact bytes to `zuno-vX.Y.Z`. Zuno versions therefore
 track Codex versions, and releases are replayed in order so every Codex release
 becomes a Zuno release.
 
-The pipeline has one review gate: merging the candidate pull request. By default
-that merge is manual; with `[sync].automatic_merge = true` in
-`UPSTREAM_CODEX.toml` a candidate whose replay needed no manual conflict
-resolution is queued for GitHub auto-merge and merges as soon as the PR gate
-passes (see *Hands-off mode* below). Everything before and after the merge is
-automated.
+The pipeline has one review gate: merging the candidate pull request. With
+`[sync].automatic_merge = true` in `UPSTREAM_CODEX.toml` (the default) a
+candidate whose replay was fully automatic is queued for GitHub auto-merge and
+merges as soon as the PR gate passes, so a clean Codex release becomes a Zuno
+release without a person (see *Hands-off mode* below for the two repository
+settings this needs). A candidate that needed manual conflict resolution waits
+for a person. Everything before and after the merge is automated.
 
 ```text
 openai/codex tag rust-vX.Y.Z
@@ -87,16 +88,19 @@ One candidate is open at a time. Alpha tags are ignored.
 
 ## Hands-off mode
 
-Set `automatic_merge = true` under `[sync]` in `UPSTREAM_CODEX.toml` to let
-clean candidates merge without a human: after opening or refreshing the PR the
-watcher runs `gh pr merge --auto --merge`, GitHub merges it with a merge commit
-as soon as `zuno/pr-gate` succeeds, and `zuno-release.yml` promotes the sealed
-bytes. Candidates that needed manual conflict resolution are pushed by a person
-and are never queued automatically. Two repository settings gate this:
-**Allow auto-merge** must be enabled, and the `main` ruleset must not require a
-human review (today it requires a code-owner review, so auto-merge waits for
-that approval). When GitHub refuses to queue the merge the watcher leaves a
-comment on the PR and the candidate waits for a manual merge.
+`automatic_merge = true` under `[sync]` in `UPSTREAM_CODEX.toml` (the default)
+lets fully automatic candidates merge without a human: after opening or
+refreshing the PR the watcher runs `gh pr merge --auto --merge`, GitHub merges
+it with a merge commit as soon as `zuno/pr-gate` succeeds, and
+`zuno-release.yml` promotes the sealed bytes. "Fully automatic" means the
+replay needed no manual conflict resolution and copied nothing from a
+hand-resolved candidate (`--reuse`); such candidates, and every candidate when
+the flag is `false`, wait for a manual merge. Two repository settings gate the
+hands-off path and are the owner's decision: **Allow auto-merge** must be
+enabled, and the `main` ruleset must not require a human review (a required
+code-owner review makes auto-merge wait for that approval). When GitHub refuses
+to queue the merge the watcher leaves a comment on the PR and the candidate
+waits for a manual merge.
 
 ## Rebrand replay: `FORK_REBRAND.toml`
 
@@ -252,8 +256,9 @@ branch) starts the gate by hand.
 - Releases are replayed in order (`policy: next`), one candidate at a time, so
   every Codex release gets a Zuno release; `policy: newest` is an explicit
   choice to skip intermediate releases.
-- The merge is the review gate: manual unless hands-off mode is enabled, and
-  hands-off mode only ever queues candidates whose replay was fully automatic.
+- The merge is the review gate. Hands-off mode only ever queues candidates
+  whose replay was fully automatic; anything a person touched waits for a
+  person.
 - Automation resolves a conflict hunk only when `FORK_REBRAND.toml` reproduces
   the Zuno side from the Codex baseline byte for byte; every other hunk waits
   for a human. Reviewed post-merge edits are reused, never re-derived, when

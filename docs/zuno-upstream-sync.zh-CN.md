@@ -5,9 +5,10 @@ Zuno 是 [openai/codex](https://github.com/openai/codex) 的源码级 fork。每
 release 上，六个平台包只构建一次，再把这些字节原样晋升为 `zuno-vX.Y.Z`。因此
 Zuno 的版本号跟随 Codex，release 按顺序逐个重放，每个 Codex release 都对应一个 Zuno release。
 
-流水线只有一道评审门：合并候选 PR。默认由人合并；在 `UPSTREAM_CODEX.toml` 设置
-`[sync].automatic_merge = true` 后，重放过程中无需人工解决冲突的候选会被排入 GitHub
-auto-merge，PR 门禁通过即合入（见下文"免人工模式"）。合并前后全部自动。
+流水线只有一道评审门：合并候选 PR。`UPSTREAM_CODEX.toml` 的 `[sync].automatic_merge = true`
+（默认）让重放完全自动的候选排入 GitHub auto-merge，PR 门禁通过即合入，干净的 Codex release
+无需任何人就成为 Zuno release（所需的两项仓库设置见下文"免人工模式"）。需要人工解决冲突的
+候选等待人工合并。合并前后全部自动。
 
 ```text
 openai/codex 打标签 rust-vX.Y.Z
@@ -66,12 +67,13 @@ zuno-upstream-sync.yml ── 重放无冲突 ──▶ 分支 upstream-sync/X.Y
 
 ## 免人工模式
 
-在 `UPSTREAM_CODEX.toml` 的 `[sync]` 下设置 `automatic_merge = true`，干净的候选就无需人工合并：
-巡检在新建或刷新 PR 后执行 `gh pr merge --auto --merge`，`zuno/pr-gate` 通过后 GitHub 以合并
-提交合入，`zuno-release.yml` 随即晋升封存字节。需要人工解决冲突的候选由人推送，永远不会被
-自动排队。两项仓库设置决定它能否生效：必须开启 **Allow auto-merge**，且 `main` 的 ruleset
-不能要求人工评审（目前要求 code owner 评审，所以自动合并会等那次批准）。GitHub 拒绝排队时
-巡检会在 PR 上留言，候选等待人工合并。
+`UPSTREAM_CODEX.toml` 的 `[sync]` 下 `automatic_merge = true`（默认）让完全自动的候选无需人工
+合并：巡检在新建或刷新 PR 后执行 `gh pr merge --auto --merge`，`zuno/pr-gate` 通过后 GitHub 以
+合并提交合入，`zuno-release.yml` 随即晋升封存字节。"完全自动"指重放没有人工解决冲突，也没有
+从人工解决过的候选复制任何内容（`--reuse`）；这类候选，以及开关为 `false` 时的所有候选，都
+等待人工合并。两项仓库设置决定免人工路径能否走通，由仓库所有者决定：必须开启
+**Allow auto-merge**，且 `main` 的 ruleset 不能要求人工评审（要求 code owner 评审时自动合并
+会等那次批准）。GitHub 拒绝排队时巡检会在 PR 上留言，候选等待人工合并。
 
 ## 改名重放：`FORK_REBRAND.toml`
 
@@ -191,7 +193,7 @@ write**，存为仓库 secret `ZUNO_UPSTREAM_SYNC_TOKEN`。巡检只在推送与
   提交会列在 PR 里。
 - release 按顺序重放（`policy: next`），一次一个候选，每个 Codex release 都对应一个 Zuno
   release；`policy: newest` 是显式选择跳过中间版本。
-- 合并就是评审门：默认人工；开启免人工模式后也只会排队重放完全自动的候选。
+- 合并就是评审门。免人工模式只会排队重放完全自动的候选；任何经人手的候选都等人合并。
 - 自动化只在 `FORK_REBRAND.toml` 能从 Codex 基线逐字节复现 Zuno 侧时解决一个冲突块；其余
   冲突块都等待人工。`main` 前进时复用已评审的合并后编辑，而不是重新推导。
 - 评审后的字节不再重新构建；晋升只是重新发布 PR gate 封存的产物。

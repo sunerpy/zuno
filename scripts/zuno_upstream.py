@@ -248,6 +248,7 @@ def exact_target(
     requested: str | None,
     baseline: Baseline | None = None,
     policy: str = "next",
+    open_candidates: Sequence[str] = (),
 ) -> str:
     """Pick the stable Codex tag to sync.
 
@@ -255,8 +256,12 @@ def exact_target(
     ``next`` (default) returns the oldest stable tag newer than the recorded
     baseline so every release is replayed in order and gets its own Zuno
     version; ``newest`` returns the newest stable tag and skips intermediate
-    releases. When no tag is newer than the baseline, the newest tag is
-    returned so the caller can report an up-to-date baseline.
+    releases. ``open_candidates`` are the stable tags of candidates that are
+    already open (unmerged) for this source: an open candidate newer than the
+    policy's pick wins, so a release someone already resolved by hand is never
+    regressed to an older tag; releases between the baseline and that candidate
+    are superseded by it. When no tag is newer than the baseline, the newest tag
+    is returned so the caller can report an up-to-date baseline.
     """
     if requested:
         if not STABLE_TAG.fullmatch(requested):
@@ -270,12 +275,19 @@ def exact_target(
     tags = stable_tags(repo)
     if not tags:
         raise SyncError("no stable Codex rust-vX.Y.Z tag is available locally")
+    chosen = tags[-1]
     if policy == "next" and baseline is not None:
         floor = stable_tag_version(baseline.release_tag)
         for tag in tags:
             if stable_tag_version(tag) > floor:
-                return tag
-    return tags[-1]
+                chosen = tag
+                break
+    for candidate in open_candidates:
+        if not STABLE_TAG.fullmatch(candidate):
+            raise SyncError(f"open candidate must be an exact stable tag like rust-v0.154.0: {candidate}")
+        if candidate in tags and stable_tag_version(candidate) > stable_tag_version(chosen):
+            chosen = candidate
+    return chosen
 
 
 def merge_base(repo: Path, left: str, right: str) -> str | None:
@@ -944,6 +956,15 @@ def parser() -> argparse.ArgumentParser:
                 "in order (the oldest tag newer than the baseline), 'newest' jumps to the latest"
             ),
         )
+        command.add_argument(
+            "--open-candidate",
+            action="append",
+            metavar="TAG",
+            help=(
+                "stable tag of a candidate that is already open for this source; an open "
+                "candidate newer than the policy's pick is kept instead of regressing to an older tag"
+            ),
+        )
         if name == "check":
             command.add_argument(
                 "--allow-current",
@@ -1087,7 +1108,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         baseline = read_baseline(manifest)
         if not args.no_fetch:
             run(repo, ["fetch", "--tags", "--prune", args.remote])
-        target_tag = exact_target(repo, args.target, baseline, args.policy)
+        target_tag = exact_target(
+            repo, args.target, baseline, args.policy, tuple(args.open_candidate or ())
+        )
         if (
             args.command == "check"
             and args.allow_current
