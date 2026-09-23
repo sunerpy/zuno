@@ -57,6 +57,7 @@ jobs:
         shell: bash
         run: |
           python3 scripts/test_zuno_upstream.py
+          python3 scripts/test_zuno_rebrand.py
           CODEX_REPO_ROOT="$PWD" PYTHONPATH="$PWD/scripts" \
             python3 -m unittest \
               codex_package.test_cargo \
