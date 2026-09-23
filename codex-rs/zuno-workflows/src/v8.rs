@@ -165,24 +165,24 @@ impl WorkflowEngineProvider for V8WorkflowEngine {
             });
             let session = self
                 .sessions
-                .create_session_with_limits(
-                    delegate,
-                    CodeModeSessionCellExecutionLimits {
-                        max_yield_time_ms: limits.max_wall_time_ms,
-                        max_heap_size_bytes: heap_limit,
-                    },
-                )
+                .create_session_with_limits(CodeModeSessionCellExecutionLimits {
+                    max_yield_time_ms: limits.max_wall_time_ms,
+                    max_heap_size_bytes: heap_limit,
+                })
                 .await
                 .map_err(engine_error)?;
             let source = workflow_source(&request)?;
             let started = session
-                .execute(ExecuteRequest {
-                    tool_call_id: request.run_id.as_str().to_string(),
-                    enabled_tools: host_tools(),
-                    source,
-                    yield_time_ms: Some(WAIT_YIELD_TIME_MS),
-                    max_output_tokens: Some(MAX_SCRIPT_OUTPUT_TOKENS),
-                })
+                .execute(
+                    ExecuteRequest {
+                        tool_call_id: request.run_id.as_str().to_string(),
+                        enabled_tools: host_tools(),
+                        source,
+                        yield_time_ms: Some(WAIT_YIELD_TIME_MS),
+                        max_output_tokens: Some(MAX_SCRIPT_OUTPUT_TOKENS),
+                    },
+                    delegate,
+                )
                 .await
                 .map_err(engine_error)?;
             let cell_id = started.cell_id.clone();

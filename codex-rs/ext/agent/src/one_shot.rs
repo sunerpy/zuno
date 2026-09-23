@@ -11,6 +11,7 @@ pub use native_codex::NativeCodexBackend;
 
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::sandbox::effective_windows_sandbox_type;
 use codex_sandboxing::SandboxCommand;
 use codex_sandboxing::SandboxDirectSpawnTransformRequest;
 use codex_sandboxing::SandboxManager;
@@ -190,8 +191,10 @@ pub struct OneShotProcessSandboxConfig {
     /// one-shot process adapter does not yet carry. Reject rather than bypass it.
     pub managed_network_configured: bool,
     pub use_legacy_landlock: bool,
+    /// Configured Windows backend (`None`, restricted token, or MXC); combined
+    /// with `windows_sandbox_level` the same way core's executor does.
+    pub windows_sandbox_type: SandboxType,
     pub windows_sandbox_level: WindowsSandboxLevel,
-    pub windows_sandbox_private_desktop: bool,
 }
 
 pub type OneShotAgentFuture<'a> =
@@ -316,10 +319,12 @@ pub(crate) fn prepare_external_process_command(
         .clone()
         .materialize_project_roots_with_workspace_roots(&sandbox.workspace_roots);
     let manager = SandboxManager::new();
+    let windows_sandbox_type =
+        effective_windows_sandbox_type(sandbox.windows_sandbox_type, sandbox.windows_sandbox_level);
     let sandbox_type = manager.select_initial(
         &permission_profile,
         SandboxablePreference::Auto,
-        sandbox.windows_sandbox_level,
+        windows_sandbox_type,
         /*has_managed_network_requirements*/ false,
     );
     if manager.should_sandbox(
@@ -384,10 +389,13 @@ pub(crate) fn prepare_external_process_command(
                 environment_id: None,
                 network: None,
                 sandbox_policy_cwd: &cwd_uri,
-                codex_linux_sandbox_exe: sandbox.codex_linux_sandbox_exe.as_deref(),
+                sandbox_exe: if cfg!(windows) {
+                    sandbox.codex_self_exe.as_deref()
+                } else {
+                    sandbox.codex_linux_sandbox_exe.as_deref()
+                },
                 use_legacy_landlock: sandbox.use_legacy_landlock,
                 windows_sandbox_level: sandbox.windows_sandbox_level,
-                windows_sandbox_private_desktop: sandbox.windows_sandbox_private_desktop,
             },
         })
         .map_err(|_| process_sandbox_error(backend))?;
@@ -454,7 +462,6 @@ fn prepare_windows_sandbox_command(
         &environment,
         permission_profile,
         sandbox.windows_sandbox_level,
-        sandbox.windows_sandbox_private_desktop,
         /*proxy_enforced*/ false,
         /*network_proxy_restricting_sid*/ None,
         codex_windows_sandbox::WindowsSandboxProxySettingsMode::Preserve,
@@ -474,7 +481,8 @@ fn prepare_windows_sandbox_command(
             value.additional_deny_write_paths.as_slice()
         }),
         sandbox.codex_home.as_path(),
-    );
+    )
+    .map_err(|_| process_sandbox_error(backend))?;
     let mut command = Command::new(wrapper);
     command
         .args(args)

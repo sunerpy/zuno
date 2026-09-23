@@ -54,7 +54,6 @@ use codex_utils_plugins::SkillDiscoveryMode;
 use codex_utils_plugins::find_plugin_manifest_path;
 use codex_utils_plugins::migrated_command_skills_root;
 use serde_json::Value as JsonValue;
-use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
@@ -130,8 +129,6 @@ pub(crate) fn log_plugin_load_errors(plugins: &[LoadedPlugin<McpServerConfig>]) 
 }
 
 /// Load configured plugins without applying auth-dependent runtime policies.
-// TODO(sites-migration): Remove the exclusion parameter and lint allowance when bundled Sites is retired.
-#[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace", skip_all)]
 pub(crate) async fn load_plugins_from_layer_stack(
     config_layer_stack: &ConfigLayerStack,
@@ -141,7 +138,6 @@ pub(crate) async fn load_plugins_from_layer_stack(
     restriction_product: Option<Product>,
     remote_global_catalog_active: bool,
     skill_root_loader: &dyn SkillRootLoader<PluginSkillRoot>,
-    excluded_plugin_ids: &BTreeSet<String>,
 ) -> Vec<LoadedPlugin<McpServerConfig>> {
     let skill_config_rules = skill_config_rules_from_stack(config_layer_stack);
     let RemoteInstalledPluginsSnapshot {
@@ -151,7 +147,6 @@ pub(crate) async fn load_plugins_from_layer_stack(
     load_plugins_from_layer_stack_with_scope(
         config_layer_stack,
         extra_plugins,
-        excluded_plugin_ids,
         store,
         remote_global_catalog_active,
         PluginLoadScope::AllCapabilities {
@@ -168,18 +163,16 @@ pub(crate) async fn load_plugins_from_layer_stack(
 async fn load_plugins_from_layer_stack_with_scope(
     config_layer_stack: &ConfigLayerStack,
     extra_plugins: HashMap<String, PluginConfig>,
-    excluded_plugin_ids: &BTreeSet<String>,
     store: &PluginStore,
     remote_global_catalog_active: bool,
     scope: PluginLoadScope<'_>,
 ) -> Vec<LoadedPlugin<McpServerConfig>> {
-    let mut configured_plugins = merge_configured_plugins_with_remote_installed(
+    let configured_plugins = merge_configured_plugins_with_remote_installed(
         configured_plugins_from_stack(config_layer_stack, store.codex_home().as_path()),
         extra_plugins,
         store,
         remote_global_catalog_active,
     );
-    configured_plugins.retain(|id, _| !excluded_plugin_ids.contains(id));
     let mut configured_plugins: Vec<_> = configured_plugins.into_iter().collect();
     configured_plugins.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
 
@@ -209,7 +202,6 @@ async fn load_plugins_from_layer_stack_with_scope(
 pub async fn load_plugin_hooks_from_layer_stack(
     config_layer_stack: &ConfigLayerStack,
     extra_plugins: HashMap<String, PluginConfig>,
-    excluded_plugin_ids: &BTreeSet<String>,
     store: &PluginStore,
     target_curated_marketplace: TargetCuratedMarketplace,
     remote_global_catalog_active: bool,
@@ -217,7 +209,6 @@ pub async fn load_plugin_hooks_from_layer_stack(
     let mut plugins = load_plugins_from_layer_stack_with_scope(
         config_layer_stack,
         extra_plugins,
-        excluded_plugin_ids,
         store,
         remote_global_catalog_active,
         PluginLoadScope::HooksOnly,
@@ -247,6 +238,11 @@ fn merge_configured_plugins_with_remote_installed(
     remote_global_catalog_active: bool,
 ) -> HashMap<String, PluginConfig> {
     if remote_global_catalog_active {
+        // Older Desktop clients can still sync bundled Sites to an independently updated
+        // SSH app-server. A cached remote install takes precedence, even when disabled.
+        if extra_plugins.contains_key("sites@openai-curated-remote") {
+            configured_plugins.remove("sites@openai-bundled");
+        }
         configured_plugins.retain(|plugin_key, _| match PluginId::parse(plugin_key) {
             Ok(plugin_id) => plugin_id.marketplace_name != crate::OPENAI_CURATED_MARKETPLACE_NAME,
             Err(_) => true,
@@ -986,6 +982,9 @@ async fn load_plugin(
 
 fn apply_plugin_mcp_server_policy(config: &mut McpServerConfig, policy: &PluginMcpServerConfig) {
     config.enabled = policy.enabled;
+    if let Some(ema) = &policy.ema_auth {
+        ema.apply(config);
+    }
     if let Some(approval_mode) = policy.default_tools_approval_mode {
         config.default_tools_approval_mode = Some(approval_mode);
     }
@@ -1459,8 +1458,11 @@ pub fn apply_configured_plugin_mcp_server_policies(
 ) {
     for (name, server) in servers {
         if let Some(policy) = policies.get(name) {
-            let declared_approval_mode = server.default_tools_approval_mode.unwrap_or_default();
             server.enabled &= policy.enabled;
+            if let Some(ema) = &policy.ema_auth {
+                ema.apply(server);
+            }
+            let declared_approval_mode = server.default_tools_approval_mode.unwrap_or_default();
 
             if let Some(approval_mode) = policy.default_tools_approval_mode {
                 server.default_tools_approval_mode =

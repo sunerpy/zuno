@@ -435,23 +435,17 @@ pub(super) struct ProcessTree;
 
 impl ProcessTree {
     fn terminate(&self) {
-        #[cfg(all(unix, not(target_os = "macos")))]
+        // On macOS the pty helper retries denied group signals against the
+        // group's members itself, so one call serves every Unix target.
+        #[cfg(unix)]
         let _ = codex_utils_pty::process_group::terminate_process_group(self.process_group_id);
-        #[cfg(target_os = "macos")]
-        let _ = codex_utils_pty::process_group::terminate_process_group_with_member_fallback(
-            self.process_group_id,
-        );
         #[cfg(windows)]
         let _ = self.job.terminate();
     }
 
     fn kill(&self) {
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(unix)]
         let _ = codex_utils_pty::process_group::kill_process_group(self.process_group_id);
-        #[cfg(target_os = "macos")]
-        let _ = codex_utils_pty::process_group::kill_process_group_with_member_fallback(
-            self.process_group_id,
-        );
         #[cfg(windows)]
         let _ = self.job.terminate();
     }

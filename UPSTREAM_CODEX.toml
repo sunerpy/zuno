@@ -3,9 +3,9 @@ project = "zuno"
 strategy = "codex-source-fork"
 
 [baseline]
-release_tag = "rust-v0.154.0"
-release_commit = "6b9826e3aa83b1a5947db50f4332cb9c65f1b340"
-release_tree = "74ba48a4b6b086beb9226a79ffe0f3d9f6d40f52"
+release_tag = "rust-v0.156.1"
+release_commit = "b412ff32c417f855c2b2d1581b77058eed87c84b"
+release_tree = "0a0b0bf9acf2f45e9239e7a52ef79f7702aa5799"
 observed_main_commit = "a8964cb1bad67bc26a826fb07d1bef99c6a3f008"
 observed_at = "2026-09-15T07:07:46Z"
 

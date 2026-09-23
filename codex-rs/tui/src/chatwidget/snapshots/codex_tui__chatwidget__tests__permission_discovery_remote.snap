@@ -4,6 +4,7 @@ expression: "render_bottom_popup(&chat, 110)"
 ---
   Update Model Permissions
 
+
 › 1. Ask for approval (current)  Zuno can read and edit files in the current workspace, and run commands.
                                  Approval is required to access the internet or edit other files.
      Approve for me (disabled)   Only ask for actions detected as potentially unsafe. (disabled: Disabled by
@@ -15,4 +16,4 @@ expression: "render_bottom_popup(&chat, 110)"
                                  files or access the internet. (disabled: Disabled by requirements.)
   2. server-only                 Description from the connected server.
 
-  Press enter to confirm or esc to go back
+  enter select · esc back

@@ -1,0 +1,14 @@
+---
+source: tui/src/app/tests.rs
+assertion_line: 6350
+expression: rendered
+---
+╭────────────────────────────────────────╮
+│ >_ Zuno (v0.156.1)                     │
+│                                        │
+│ model:     gpt-test   /model to change │
+│ directory: <thread cwd>                │
+╰────────────────────────────────────────╯
+
+
+› Next thread prompt

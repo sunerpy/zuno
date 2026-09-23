@@ -63,11 +63,12 @@ def main() -> int:
         "pub async fn start_remote_control_pairing(",
         "pub async fn set_remote_control(",
         "pub async fn run_pid_update_loop(",
+        "pub async fn update(",
     ]:
         body = function_body(daemon, signature)
         disabled = body.find("zuno_managed_daemon_disabled()")
         mutation = min(
-            (position for token in ["ensure_supported_platform()?", "Daemon::from_environment()?", "update_loop::run("] if (position := body.find(token)) >= 0),
+            (position for token in ["ensure_supported_platform()?", "Daemon::from_environment()?", "update_loop::run(", "update_loop::request_manual_update("] if (position := body.find(token)) >= 0),
             default=len(body),
         )
         if disabled < 0 or disabled > mutation:
