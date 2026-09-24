@@ -61,7 +61,7 @@ pub(super) fn route_from_lifecycle(
         .or_else(|| response.pointer("/thread/model").and_then(Value::as_str))
         .ok_or_else(|| RpcError::internal("thread lifecycle response omitted model"))?
         .to_owned();
-    Ok(SessionRoute {
+    let mut route = SessionRoute {
         client: client.session_scoped(),
         cwd: response
             .get("cwd")
@@ -83,7 +83,26 @@ pub(super) fn route_from_lifecycle(
             .get("reasoningEffort")
             .and_then(Value::as_str)
             .map(str::to_owned),
-        mode: "build".to_owned(),
+        collaboration_mode: response
+            .pointer("/collaborationMode/mode")
+            .or_else(|| response.pointer("/thread/collaborationMode/mode"))
+            .and_then(Value::as_str)
+            .unwrap_or("default")
+            .to_owned(),
+        approval_policy: approval_policy_id(response.get("approvalPolicy")),
+        approvals_reviewer: response
+            .get("approvalsReviewer")
+            .and_then(Value::as_str)
+            .unwrap_or("user")
+            .to_owned(),
+        sandbox_type: response
+            .pointer("/sandbox/type")
+            .or_else(|| response.pointer("/sandboxPolicy/type"))
+            .and_then(Value::as_str)
+            .unwrap_or("workspaceWrite")
+            .to_owned(),
+        custom_permissions: None,
+        effort_before_preset: None,
         active_turn_id: response
             .pointer("/thread/turns")
             .and_then(Value::as_array)
@@ -96,27 +115,224 @@ pub(super) fn route_from_lifecycle(
             .and_then(|turn| turn.get("id"))
             .and_then(Value::as_str)
             .map(str::to_owned),
-    })
+    };
+    if permission_mode_id(&route) == CUSTOM_PERMISSION_MODE {
+        // Keep the thread's own settings so the custom mode stays selectable.
+        route.custom_permissions = Some(json!({
+            "approvalPolicy": response
+                .get("approvalPolicy")
+                .cloned()
+                .unwrap_or(Value::String(route.approval_policy.clone())),
+            "approvalsReviewer": route.approvals_reviewer,
+            "sandboxPolicy": response
+                .get("sandbox")
+                .or_else(|| response.get("sandboxPolicy"))
+                .cloned()
+                .unwrap_or_else(|| sandbox_policy_json(&route.sandbox_type)),
+        }));
+    }
+    Ok(route)
 }
 
-pub(super) fn lifecycle_response(session_id: &str, route: &SessionRoute) -> Value {
+/// Parse a `model/list` response page into catalog entries (in server order).
+pub(super) fn catalog_from_model_list(response: &Value) -> Vec<ModelEntry> {
+    response
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|model| {
+                    let id = model.get("id").and_then(Value::as_str)?;
+                    let name = model
+                        .get("displayName")
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or(id);
+                    Some(ModelEntry {
+                        id: id.to_owned(),
+                        name: name.to_owned(),
+                        description: model
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                        efforts: model
+                            .get("supportedReasoningEfforts")
+                            .and_then(Value::as_array)
+                            .map(|efforts| {
+                                efforts
+                                    .iter()
+                                    .filter_map(|effort| {
+                                        Some((
+                                            effort.get("reasoningEffort")?.as_str()?.to_owned(),
+                                            effort
+                                                .get("description")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("")
+                                                .to_owned(),
+                                        ))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        hidden: model
+                            .get("hidden")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse `collaborationMode/list`: for every mode, the model and effort the
+/// preset switches to. `CollaborationModeMask` keeps the snake_case wire name
+/// `reasoning_effort` (an explicit serde rename), and serialises both "keep"
+/// and "clear" as `null`, so `null` is read as "keep the session's effort".
+pub(super) fn collaboration_presets_from_list(response: &Value) -> Vec<CollaborationPreset> {
+    response
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|presets| {
+            presets
+                .iter()
+                .filter_map(|preset| {
+                    let mode = preset.get("mode")?.as_str()?.to_owned();
+                    Some(CollaborationPreset {
+                        mode,
+                        model: preset
+                            .get("model")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        effort: preset
+                            .get("reasoning_effort")
+                            .or_else(|| preset.get("reasoningEffort"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The models a client may pick: every visible catalog entry, plus the
+/// session's current model when the catalog does not list it (a custom model
+/// from config, or a catalog the App Server could not provide).
+fn selectable_models(route: &SessionRoute, catalog: &[ModelEntry]) -> Vec<ModelEntry> {
+    let mut models: Vec<ModelEntry> = catalog
+        .iter()
+        .filter(|model| !model.hidden || model.id == route.model)
+        .cloned()
+        .collect();
+    if !models.iter().any(|model| model.id == route.model) {
+        models.insert(
+            0,
+            ModelEntry {
+                id: route.model.clone(),
+                name: route.model.clone(),
+                description: String::new(),
+                efforts: Vec::new(),
+                hidden: false,
+            },
+        );
+    }
+    models
+}
+
+const EFFORT_LABELS: &[(&str, &str)] = &[
+    ("none", "None"),
+    ("minimal", "Minimal"),
+    ("low", "Low"),
+    ("medium", "Medium"),
+    ("high", "High"),
+    ("xhigh", "Extra high"),
+    ("max", "Maximum"),
+    ("ultra", "Ultra"),
+];
+
+fn effort_label(effort: &str) -> String {
+    EFFORT_LABELS
+        .iter()
+        .find(|(id, _)| *id == effort)
+        .map(|(_, label)| (*label).to_owned())
+        .unwrap_or_else(|| effort.to_owned())
+}
+
+/// Reasoning efforts offered for the session's model: the catalog's list for
+/// that model, or every known effort when the catalog does not describe it.
+fn effort_options(route: &SessionRoute, catalog: &[ModelEntry]) -> Vec<Value> {
+    let current = route.effort.as_deref();
+    let mut options: Vec<Value> = catalog
+        .iter()
+        .find(|model| model.id == route.model)
+        .filter(|model| !model.efforts.is_empty())
+        .map(|model| {
+            model
+                .efforts
+                .iter()
+                .map(|(effort, description)| {
+                    json!({ "value": effort, "name": effort_label(effort), "description": description })
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            EFFORT_LABELS
+                .iter()
+                .filter(|(id, _)| !matches!(*id, "none" | "minimal"))
+                .map(|(id, label)| json!({ "value": id, "name": label }))
+                .collect()
+        });
+    if let Some(current) = current
+        && !options.iter().any(|option| option["value"] == current)
+    {
+        options.insert(
+            0,
+            json!({ "value": current, "name": effort_label(current) }),
+        );
+    }
+    options
+}
+
+/// `approvalPolicy` is a string for the simple policies and an object
+/// (`{"granular": {...}}`) for the granular one.
+pub(super) fn approval_policy_id(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(policy)) => policy.clone(),
+        Some(Value::Object(map)) => map
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "granular".to_owned()),
+        _ => "on-request".to_owned(),
+    }
+}
+
+pub(super) fn lifecycle_response(
+    session_id: &str,
+    route: &SessionRoute,
+    catalog: &[ModelEntry],
+) -> Value {
+    let available_models: Vec<Value> = selectable_models(route, catalog)
+        .iter()
+        .map(|model| {
+            json!({
+                "modelId": model.id,
+                "name": model.name,
+                "description": model.description,
+                "_meta": { "zuno": { "provider": route.model_provider } },
+            })
+        })
+        .collect();
     json!({
         "sessionId": session_id,
-        "configOptions": config_options(route),
-        "modes": {
-            "currentModeId": route.mode,
-            "availableModes": [
-                { "id": "build", "name": "Build" },
-                { "id": "plan", "name": "Plan" },
-            ],
-        },
+        "configOptions": config_options(route, catalog),
+        "modes": session_modes(route),
         "models": {
             "currentModelId": route.model,
-            "availableModels": [{
-                "modelId": route.model,
-                "name": route.model,
-                "_meta": { "zuno": { "provider": route.model_provider } },
-            }],
+            "availableModels": available_models,
         },
         "_meta": {
             "zuno": {
@@ -124,37 +340,56 @@ pub(super) fn lifecycle_response(session_id: &str, route: &SessionRoute) -> Valu
                 "cwd": route.cwd,
                 "modelProvider": route.model_provider,
                 "reasoningEffort": route.effort,
+                "collaborationMode": route.collaboration_mode,
+                "approvalPolicy": route.approval_policy,
+                "approvalsReviewer": route.approvals_reviewer,
+                "sandbox": route.sandbox_type,
             },
         },
     })
 }
 
-pub(super) fn config_options(route: &SessionRoute) -> Vec<Value> {
+pub(super) fn config_options(route: &SessionRoute, catalog: &[ModelEntry]) -> Vec<Value> {
+    let model_options: Vec<Value> = selectable_models(route, catalog)
+        .iter()
+        .map(|model| json!({ "value": model.id, "name": model.name, "description": model.description }))
+        .collect();
+    let modes = session_modes(route);
+    let mode_options: Vec<Value> = modes["availableModes"]
+        .as_array()
+        .map(|modes| {
+            modes
+                .iter()
+                .map(|mode| json!({ "value": mode["id"], "name": mode["name"], "description": mode["description"] }))
+                .collect()
+        })
+        .unwrap_or_default();
+    let collaboration_options: Vec<Value> = COLLABORATION_MODES
+        .iter()
+        .map(|(id, name, description)| json!({ "value": id, "name": name, "description": description }))
+        .collect();
     vec![
         json!({
             "id": "mode", "name": "Mode", "category": "mode", "type": "select",
-            "currentValue": route.mode,
-            "options": [
-                { "value": "build", "name": "Build" },
-                { "value": "plan", "name": "Plan" },
-            ],
+            "description": "Approval and sandboxing preset for the session",
+            "currentValue": modes["currentModeId"],
+            "options": mode_options,
+        }),
+        json!({
+            "id": "collaboration_mode", "name": "Collaboration mode", "category": "collaboration_mode",
+            "type": "select", "description": "How Zuno collaborates for the following turns",
+            "currentValue": route.collaboration_mode,
+            "options": collaboration_options,
         }),
         json!({
             "id": "model", "name": "Model", "category": "model", "type": "select",
             "currentValue": route.model,
-            "options": [{ "value": route.model, "name": route.model }],
+            "options": model_options,
         }),
         json!({
             "id": "reasoning_effort", "name": "Reasoning effort", "category": "thought_level",
             "type": "select", "currentValue": route.effort.as_deref().unwrap_or("medium"),
-            "options": [
-                { "value": "low", "name": "Low" },
-                { "value": "medium", "name": "Medium" },
-                { "value": "high", "name": "High" },
-                { "value": "xhigh", "name": "Extra high" },
-                { "value": "max", "name": "Maximum" },
-                { "value": "ultra", "name": "Ultra" },
-            ],
+            "options": effort_options(route, catalog),
         }),
     ]
 }
@@ -267,8 +502,9 @@ fn uri_as_link(name: Option<&str>, uri: &str) -> String {
     }
 }
 
-/// `session/set_mode` is the dedicated ACP v1 mode method; the same change is
-/// expressed through the `mode` config option, so it is translated to that call.
+/// `session/set_mode` is the dedicated ACP v1 mode method; the same change
+/// (an approval/sandbox preset) is expressed through the `mode` config option,
+/// so it is translated to that call.
 pub(super) fn set_mode_as_config_option(params: &Value) -> Result<Value, RpcError> {
     let session_id = required_string(params, "sessionId")?;
     let mode_id = required_string(params, "modeId")?;

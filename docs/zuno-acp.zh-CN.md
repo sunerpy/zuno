@@ -76,6 +76,25 @@ Zuno 无需改动。协议 2 走出草案后会在显式协商之后追加，同
   建议选项；只有不带 `isOther` 的问题才变成封闭的 `enum`。机密问题拒绝，因为表单模式不得
   承载凭据。没有表单能力的客户端保持原行为：给出的选项走 `session/request_permission`，
   不能自由作答。
+- 会话表面对齐参考实现 `codex-acp`，Zed 等客户端看到的东西与之一致：
+  - **模式（modes）是权限预设**：`read-only`、`workspace-write`、`agent`（自动评审）、
+    `strict`（`docs/zuno-server-strict.md` 的服务器模式：每条命令与编辑都先审批，批准后不带沙箱运行）、
+    `agent-full-access`；当前模式由线程的审批策略、评审者和沙箱推导。配置匹配不上任何预设
+    （细粒度审批策略、外部沙箱）时还会列出 `custom` 条目，应用过预设后仍可选回它恢复原设置。
+    `session/set_mode`（或 `mode` 配置项）通过 `thread/settings/update` 应用预设。
+  - **协作模式是配置项** `collaboration_mode`（`default` / `plan`），`/plan` 也能切换并随后推送
+    `config_option_update`。切换时应用服务端 `collaborationMode/list` 的预设，与 TUI 完全一致：
+    plan 模式以预设的推理强度（内置目录里是 medium）和服务端的 plan 提示词运行；切回预设未指定
+    强度的模式时恢复进入前的强度；它不是一个独立的 ACP agent。
+  - **模型来自目录**：`availableModels` 与 `model` 配置项列出 `model/list` 的全部可见条目（即 TUI
+    `/model` 选择器的内容），`reasoning_effort` 的选项是所选模型支持的强度；只存在于配置里的模型
+    仍可选。
+  - **斜杠命令**在每次会话生命周期响应之后以 `available_commands_update` 推送，prompt 以 `/` 开头时
+    由桥接自己处理：`plan`、`compact`、`review [说明]`、`review-branch <分支>`、`review-commit <sha>`、
+    `status`、`skills`、`mcp`、`goal <目标|clear|pause|resume>`、`rename <名称>`、`logout`，以及每个
+    已发现技能对应的 `$skill` 条目。会跑一轮的命令（`review*`、`compact`、`goal`）以该轮的结束原因
+    回应 prompt，其余命令回一条 `agent_message_chunk` 后 `end_turn`；未知的 `/词` 与 `$skill` 原样
+    交给模型。
 - 审批与提问在事件循环之外桥接：每个 App Server 请求在自己的任务里等待客户端应答，桥接
   同时继续读取客户端帧并投影通知，因此多个会话可以同时挂着提示，`session/cancel` 也仍能
   送达。（以前是内联等待，应答帧永远读不到，桥接会死锁。）

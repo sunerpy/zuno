@@ -89,6 +89,7 @@ contracts = [
   "ACP clients do not own a private agent loop.",
   "Turn interrupt, ordinary input, goal resume, and protected gates remain distinct.",
   "Bridged App Server requests (approvals, tool questions) wait for the client off the event loop; the transport keeps being read while any number of them are pending.",
+  "The ACP session surface mirrors the reference codex-acp adapter: modes are approval/sandbox presets (read-only, workspace-write, agent, strict, agent-full-access), the collaboration mode is a config option applied with the server's collaborationMode/list preset, models and reasoning efforts come from model/list, and the Codex slash commands that need no terminal are advertised through available_commands_update and handled by the bridge.",
 ]
 
 [[capabilities]]
