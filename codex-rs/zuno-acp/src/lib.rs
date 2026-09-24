@@ -32,6 +32,7 @@ pub const IMPLEMENTED_METHODS: &[&str] = &[
     "session/prompt",
     "session/steer",
     "session/set_config_option",
+    "session/set_mode",
     "session/set_model",
     "session/cancel",
     "session/close",

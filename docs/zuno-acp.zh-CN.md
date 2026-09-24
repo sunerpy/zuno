@@ -37,8 +37,44 @@ ACP 传输独占 stdout；日志与诊断信息不得写入协议流。
 ## 协议范围
 
 当前适配器实现稳定 ACP v1 的初始化、session 新建/加载/恢复/分叉/列表、
-prompt、同进程 steer、模型与配置更新、取消、关闭与删除，并在 ACP 权限请求、
-session/turn 更新和 App Server 事件之间进行转换。
+prompt、同进程 steer、模型/模式/配置更新（`session/set_mode`、`session/set_model`
+与 `session/set_config_option` 落到同一份线程设置）、取消、关闭与删除，并在 ACP
+权限请求、session/turn 更新和 App Server 事件之间进行转换。
+
+prompt 内容块到 App Server 输入的映射与参考实现 `codex-acp` 一致，因此无论客户端
+连接哪一个 Codex ACP agent，同一段 prompt 对模型的含义相同：`text` 与 `image`
+直接透传（`http(s)` 或 `data:` 图片 URI 原样使用）；`resource_link` 变成
+`[@name](uri)` 链接；内嵌文本 `resource` 变成该链接加一个
+`<context ref="uri">` 块；内嵌 `image/*` blob 变成图片；其他 blob 变成 base64 的
+`<context>` 块。`initialize` 未宣告的块类型（例如 `audio`）以 `-32602` 拒绝。
+
+桥接层自有的两种结果使用实现自定义的 JSON-RPC 错误码，且刻意避开两侧已有含义的
+码：`session/prompt` 被并入当前活动 turn 作为 steer 时返回 `-32010`（`data` 携带
+持久化的并入信息）；`session/steer` 无法命中活动 turn 时返回 `-32011`。ACP 的
+`-32000`（需要认证）、`-32002`（资源不存在）与 App Server 的 `-32001`（过载）
+原样透传。
+
+## 协议版本与客户端兼容
+
+桥接层使用 ACP 线协议 **1**（稳定版）。ACP 有三条互相独立的版本轴：`initialize` 中协商的
+`protocolVersion` 整数（1 稳定、2 草案）、JSON schema 发布版本（1.x）、以及 SDK 包版本
+（Rust crate `agent-client-protocol` 已到 2.x，但仍说线协议 1）。客户端升级 SDK——例如
+Zed 1.21 升到 `agent-client-protocol` 2.1 与 schema 1.7——发送的仍是 `protocolVersion: 1`，
+Zuno 无需改动。协议 2 走出草案后会在显式协商之后追加，同时继续服务协议 1。
+
+在协议 1 之内，桥接层跟进客户端依赖的 schema 增量：
+
+- `tool_call` 更新携带一等 `name`（schema 1.8），与 `title`、`kind` 并列：`shell`、
+  `apply_patch`、`web_search`、`spawn_agent`（Zed 用它识别子代理）、MCP 或动态工具自身
+  的名字、`view_image`、`image_generation`、`sleep`。
+- App Server 的生命周期条目（`contextCompaction`、review 模式标记、`functionCallOutput`）
+  不再被投影成工具调用。
+- 客户端宣告 `clientCapabilities.elicitation.form`（schema 1.7）时，模型的提问
+  （`item/tool/requestUserInput`）通过一次 `elicitation/create` 表单收集。App Server 的提问
+  工具始终允许自由填写的"其他"答案（`isOther`），这类问题保持为 `string` 属性并在描述里列出
+  建议选项；只有不带 `isOther` 的问题才变成封闭的 `enum`。机密问题拒绝，因为表单模式不得
+  承载凭据。没有表单能力的客户端保持原行为：给出的选项走 `session/request_permission`，
+  不能自由作答。
 
 Zuno 专属能力必须通过显式协议元数据逐步演进。仅凭 ACP SDK 包版本号，不能
 视为连接已经启用不稳定的 wire protocol。

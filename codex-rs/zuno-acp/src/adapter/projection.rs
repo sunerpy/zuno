@@ -270,7 +270,11 @@ async fn bridge_server_request(state: &BridgeState, request: &Value) -> Result<V
             }))
         }
         "item/tool/requestUserInput" => {
-            bridge_tool_user_input(&route.client, thread_id, params).await
+            if state.client_supports_form_elicitation() {
+                bridge_tool_user_input_form(&route.client, thread_id, params).await
+            } else {
+                bridge_tool_user_input(&route.client, thread_id, params).await
+            }
         }
         _ => Err(RpcError::downstream(
             -32601,
@@ -280,6 +284,165 @@ async fn bridge_server_request(state: &BridgeState, request: &Value) -> Result<V
     }
 }
 
+/// Collect tool questions through one ACP `elicitation/create` form (ACP 1.7):
+/// multiple-choice questions become `enum` properties and free-text questions
+/// become `string` properties, so clients that advertise
+/// `clientCapabilities.elicitation.form` can answer both.
+async fn bridge_tool_user_input_form(
+    client: &ClientConnection,
+    session_id: &str,
+    params: &Value,
+) -> Result<Value, RpcError> {
+    let request = elicitation_form_request(session_id, params)?;
+    let response = client.request("elicitation/create", request).await?;
+    answers_from_elicitation(params, &response)
+}
+
+pub(super) fn elicitation_form_request(
+    session_id: &str,
+    params: &Value,
+) -> Result<Value, RpcError> {
+    let questions = params
+        .get("questions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RpcError::internal("tool input request omitted questions"))?;
+    let mut properties = Map::new();
+    let mut required = Vec::new();
+    let mut message = Vec::new();
+    for question in questions {
+        let id = required_string(question, "id")?;
+        if question.get("isSecret").and_then(Value::as_bool) == Some(true) {
+            // "Form mode MUST NOT be used to request secrets or credentials."
+            return Err(RpcError::invalid_request(
+                "ACP form elicitation cannot collect secret tool input",
+            ));
+        }
+        let header = question
+            .get("header")
+            .and_then(Value::as_str)
+            .unwrap_or(id.as_str())
+            .to_owned();
+        let prompt = question
+            .get("question")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let mut property = json!({ "type": "string", "title": header, "description": prompt });
+        if let Some(options) = question
+            .get("options")
+            .and_then(Value::as_array)
+            .filter(|options| !options.is_empty())
+        {
+            // The App Server tool always allows a free-form "Other" answer
+            // (`isOther`), which a closed `enum` would silently drop. Form
+            // schemas are limited to primitives and enums, so an open question
+            // stays a `string` and lists its suggestions in the description.
+            let labels = options
+                .iter()
+                .filter_map(|option| option.get("label").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            if question.get("isOther").and_then(Value::as_bool) == Some(true) {
+                let suggestions = options
+                    .iter()
+                    .filter_map(|option| {
+                        let label = option.get("label").and_then(Value::as_str)?;
+                        match option.get("description").and_then(Value::as_str) {
+                            Some(description) if !description.is_empty() => {
+                                Some(format!("{label} ({description})"))
+                            }
+                            _ => Some(label.to_owned()),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let description = if prompt.is_empty() {
+                    format!("Options: {suggestions}. Or type another answer.")
+                } else {
+                    format!("{prompt}\nOptions: {suggestions}. Or type another answer.")
+                };
+                property["description"] = Value::String(description);
+            } else {
+                property["enum"] = json!(labels);
+            }
+        }
+        properties.insert(id.clone(), property);
+        required.push(Value::String(id));
+        if !prompt.is_empty() {
+            message.push(format!("{header}: {prompt}"));
+        }
+    }
+    if properties.is_empty() {
+        return Err(RpcError::internal(
+            "tool input request contained no questions",
+        ));
+    }
+    let mut request = json!({
+        "sessionId": session_id,
+        "mode": "form",
+        "message": if message.is_empty() {
+            "The agent needs more information to continue.".to_owned()
+        } else {
+            message.join("\n")
+        },
+        "requestedSchema": {
+            "type": "object",
+            "properties": Value::Object(properties),
+            "required": required,
+        },
+    });
+    if let Some(item_id) = params.get("itemId").filter(|id| !id.is_null()) {
+        request["toolCallId"] = item_id.clone();
+    }
+    Ok(request)
+}
+
+pub(super) fn answers_from_elicitation(
+    params: &Value,
+    response: &Value,
+) -> Result<Value, RpcError> {
+    match response.get("action").and_then(Value::as_str) {
+        Some("accept") => {}
+        Some("decline") => return Err(RpcError::cancelled("tool input was declined")),
+        Some("cancel") | None => return Err(RpcError::cancelled("tool input was cancelled")),
+        Some(other) => {
+            return Err(RpcError::internal(format!(
+                "unsupported elicitation action {other}"
+            )));
+        }
+    }
+    let content = response
+        .get("content")
+        .and_then(Value::as_object)
+        .ok_or_else(|| RpcError::cancelled("tool input was accepted without answers"))?;
+    let questions = params
+        .get("questions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RpcError::internal("tool input request omitted questions"))?;
+    let mut answers = Map::new();
+    for question in questions {
+        let id = required_string(question, "id")?;
+        let answer = match content.get(&id) {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Number(number)) => number.to_string(),
+            Some(Value::Bool(flag)) => flag.to_string(),
+            Some(Value::Array(items)) => items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => {
+                return Err(RpcError::cancelled(format!(
+                    "tool input question {id} was left unanswered"
+                )));
+            }
+        };
+        answers.insert(id, json!({ "answers": [answer] }));
+    }
+    Ok(json!({ "answers": answers }))
+}
+
+/// Fallback for clients without form elicitation: multiple choice through
+/// `session/request_permission`; free-text questions cannot be bridged.
 async fn bridge_tool_user_input(
     client: &ClientConnection,
     session_id: &str,

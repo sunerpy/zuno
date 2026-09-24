@@ -1,5 +1,7 @@
 use super::projection::replay_thread;
 use super::*;
+use crate::transport::SESSION_BUSY_CODE;
+use crate::transport::STEER_REJECTED_CODE;
 
 impl CodexAcpAgent {
     #[must_use]
@@ -178,7 +180,7 @@ impl CodexAcpAgent {
                 .and_then(Value::as_str)
                 .unwrap_or(&active_turn_id);
             return Err(RpcError::downstream(
-                -32001,
+                SESSION_BUSY_CODE,
                 "prompt was admitted as steering into the active turn",
                 Some(json!({
                     "admission": "steered",
@@ -234,7 +236,7 @@ impl CodexAcpAgent {
         self.bind_client(&session_id, client);
         let active_turn_id = route.active_turn_id.ok_or_else(|| {
             RpcError::downstream(
-                -32002,
+                STEER_REJECTED_CODE,
                 "session has no active turn to steer",
                 Some(json!({ "sessionId": session_id, "reason": "noActiveTurn" })),
             )
@@ -245,7 +247,7 @@ impl CodexAcpAgent {
             .unwrap_or(&active_turn_id);
         if expected_turn_id != active_turn_id {
             return Err(RpcError::downstream(
-                -32002,
+                STEER_REJECTED_CODE,
                 "expectedTurnId does not match the active turn",
                 Some(json!({
                     "sessionId": session_id,
@@ -335,6 +337,12 @@ impl CodexAcpAgent {
             _ => unreachable!(),
         }
         Ok(json!({ "configOptions": config_options(route) }))
+    }
+
+    pub(super) async fn set_mode(&self, params: &Value) -> Result<Value, RpcError> {
+        let translated = set_mode_as_config_option(params)?;
+        let _config_options = self.set_option(&translated).await?;
+        Ok(json!({}))
     }
 
     pub(super) async fn set_model(&self, params: &Value) -> Result<Value, RpcError> {
