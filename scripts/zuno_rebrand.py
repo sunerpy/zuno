@@ -207,8 +207,13 @@ class Rebrand:
                 ]
                 frozen.append((match.start(), match.start() + len(replacement)))
                 if allowed is not None:
+                    # The span that contains the match grows or shrinks with it;
+                    # spans after the match move as a whole.
                     allowed = [
-                        (start + delta, end + delta) if start >= match.end() else (start, end)
+                        (
+                            start + delta if start >= match.end() else start,
+                            end + delta if end >= match.end() else end,
+                        )
                         for start, end in allowed
                     ]
         if text != line:
@@ -220,21 +225,36 @@ class Rebrand:
 CODE_SUFFIXES = (".rs",)
 
 
+RAW_STRING_START = re.compile(r'(?:b|c)?r(#*)"')
+
+
 def rust_text_spans(line: str) -> list[tuple[int, int]]:
     """Spans of a Rust source line that are text: string literal contents and a
     trailing ``//`` comment. Everything else is code and is never rebranded when
-    the rules run in ``text_only`` mode. A string left open at the end of the line
-    (a raw or multi-line literal) counts as text to the end of the line; a line
-    that continues such a literal has no quote and counts as code, which only
-    loses a rename, never adds one."""
+    the rules run in ``text_only`` mode. Ordinary literals honour backslash
+    escapes; raw literals (``r"..."``, ``r#"..."#``, ``br"..."``) do not and end
+    at a quote followed by the same number of ``#``. A string left open at the
+    end of the line (a multi-line literal) counts as text to the end of the line;
+    a line that continues such a literal has no quote and counts as code, which
+    only loses a rename, never adds one."""
     spans: list[tuple[int, int]] = []
     length = len(line)
     index = 0
     in_string = False
+    raw_terminator: str | None = None
     start = 0
     while index < length:
         char = line[index]
         if in_string:
+            if raw_terminator is not None:
+                if line.startswith(raw_terminator, index):
+                    spans.append((start, index))
+                    in_string = False
+                    raw_terminator = None
+                    index += len(raw_terminator or '"')
+                    continue
+                index += 1
+                continue
             if char == "\\":
                 index += 2
                 continue
@@ -242,6 +262,13 @@ def rust_text_spans(line: str) -> list[tuple[int, int]]:
                 spans.append((start, index))
                 in_string = False
             index += 1
+            continue
+        raw = RAW_STRING_START.match(line, index)
+        if raw is not None and (index == 0 or not (line[index - 1].isalnum() or line[index - 1] == "_")):
+            in_string = True
+            raw_terminator = '"' + raw.group(1)
+            start = raw.end()
+            index = raw.end()
             continue
         if char == '"':
             in_string = True

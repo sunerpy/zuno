@@ -158,7 +158,9 @@ jobs:
           # (recorded in the PR body). GitHub keeps the queue when a collaborator
           # pushes to the branch, so a head that no longer matches is a
           # hand-touched candidate: withdraw the queue before this run decides
-          # anything else, including skipping.
+          # anything else, including skipping. The PR gate performs the same
+          # check when it finishes on such a head (zuno-ci.yml), so the queue is
+          # gone before the gate can turn green for it; this is the backstop.
           if [[ -n "${pr_number}" && "${pr_auto_merge}" == true && "${pr_head}" != "${pr_candidate}" ]]; then
             gh pr merge "${pr_number}" --disable-auto
             gh pr comment "${pr_number}" --body "Auto-merge withdrawn: the branch head \`${pr_head}\` is not the candidate the watcher pushed (\`${pr_candidate:-none recorded}\`), so this candidate now waits for a manual merge."
@@ -398,8 +400,10 @@ jobs:
             # Withdraw any auto-merge an earlier run queued before touching the
             # PR: the branch head just changed, and if a later command in this
             # step fails the PR must not keep a queue that would merge a head
-            # this run never cleared. A failed withdrawal aborts the step.
-            if [[ "$(gh pr view "${EXISTING_PR}" --json autoMergeRequest --jq '.autoMergeRequest != null')" == true ]]; then
+            # this run never cleared. The probe is an assignment so that its
+            # failure aborts the step too; a failed withdrawal aborts as well.
+            queued="$(gh pr view "${EXISTING_PR}" --json autoMergeRequest --jq '.autoMergeRequest != null')"
+            if [[ "${queued}" == true ]]; then
               gh pr merge "${pr_url}" --disable-auto
             fi
             gh pr edit "${EXISTING_PR}" --body "${body}" --add-label "${CANDIDATE_LABEL}"
@@ -511,8 +515,12 @@ jobs:
           set -euo pipefail
           # A candidate that now needs a person must not keep an auto-merge that
           # an earlier clean replay queued on its PR; withdraw it before anything
-          # else here can fail. A failed withdrawal aborts the step.
-          if [[ -n "${EXISTING_PR}" ]] && [[ "$(gh pr view "${EXISTING_PR}" --json autoMergeRequest --jq '.autoMergeRequest != null')" == true ]]; then
+          # else here can fail. A failed probe or withdrawal aborts the step.
+          queued=false
+          if [[ -n "${EXISTING_PR}" ]]; then
+            queued="$(gh pr view "${EXISTING_PR}" --json autoMergeRequest --jq '.autoMergeRequest != null')"
+          fi
+          if [[ "${queued}" == true ]]; then
             gh pr merge "${EXISTING_PR}" --disable-auto
             gh pr comment "${EXISTING_PR}" --body "Auto-merge withdrawn: replaying main@\`${SOURCE_SHA}\` onto \`${TARGET_TAG}\` now conflicts, so this candidate waits for a person (see the conflict issue)."
           fi

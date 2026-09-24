@@ -775,8 +775,11 @@ def replay_rebrand_into(
         if expected != current:
             (worktree / path).write_text(expected, encoding="utf-8")
             replay.refreshed.append(path)
-            if guarded:
-                replay.guarded.append(path)
+        if guarded:
+            # Reported even when nothing had to be rewritten: the new lines may be
+            # user-visible text inside a multi-line literal that only a person can
+            # tell apart from code.
+            replay.guarded.append(path)
     zuno_touched = set(zuno_delta) | conflicted
     baseline_paths = set(run(repo, ["ls-tree", "-r", "--name-only", plan.baseline_commit]).stdout.split("\n"))
     for path in sorted(changed_files(repo, plan.baseline_commit, plan.target_commit)):

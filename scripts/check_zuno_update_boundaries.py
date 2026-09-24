@@ -318,12 +318,30 @@ def main() -> int:
             "upstream sync must withdraw a stale auto-merge before closing superseded PRs and issues"
         )
     # A withdrawal that fails must abort the step, never be swallowed: a stale
-    # queue would otherwise merge a head this run never cleared.
+    # queue would otherwise merge a head this run never cleared. The probe that
+    # gates it must be an assignment: a command substitution inside `[[ ]]`
+    # does not trip `set -e`, so a failed probe would silently skip the withdrawal.
     if (
         "--disable-auto >/dev/null" in sync_text
         or "--disable-auto || true" in sync_text
     ):
         raise SystemExit("upstream sync must not ignore a failed auto-merge withdrawal")
+    if '[[ "$(gh pr view' in sync_text:
+        raise SystemExit(
+            "upstream sync must assign the auto-merge probe before testing it"
+        )
+    # The PR gate withdraws a queue whose head is not the watcher's candidate, so
+    # a collaborator push cannot ride the queue into main before the next cron
+    # tick; the watcher's state step is only the backstop.
+    require(zuno_ci, "Withdraw auto-merge from a head the watcher did not push")
+    require(zuno_ci, 'gh pr merge "${PR_NUMBER}" --disable-auto')
+    require(zuno_ci, '"${head}" != "${candidate}"')
+    require(zuno_ci, "startsWith(github.event.pull_request.head.ref, 'upstream-sync/')")
+    require(
+        zuno_ci, "github.event.pull_request.head.repo.full_name == github.repository"
+    )
+    if '[[ "$(gh pr view' in text(zuno_ci):
+        raise SystemExit("zuno-ci must assign the auto-merge probe before testing it")
     # Issues are closed with the default token so the automation token needs no
     # issues permission; the conflict step already runs under the default token.
     if (

@@ -466,7 +466,36 @@ jobs:
     if: always()
     needs: [static, package, standalone, seal]
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
+      # A queued auto-merge on an upstream-sync/* candidate belongs to the exact
+      # head the watcher pushed (recorded as Zuno-Candidate-Commit in the PR
+      # body). GitHub keeps the queue when someone with write access pushes
+      # another head and the watcher only looks every six hours, so this gate
+      # withdraws the queue itself before it can turn green for a head nobody
+      # cleared. Only the watcher's own heads may merge hands-off; a person who
+      # pushed to the candidate merges it by hand. A failed probe or
+      # withdrawal fails the gate.
+      - name: Withdraw auto-merge from a head the watcher did not push
+        if: startsWith(github.event.pull_request.head.ref, 'upstream-sync/') && github.event.pull_request.head.repo.full_name == github.repository
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          pr_json="$(gh pr view "${PR_NUMBER}" --json body,headRefOid,autoMergeRequest)"
+          queued="$(jq -r '.autoMergeRequest != null' <<<"${pr_json}")"
+          head="$(jq -r '.headRefOid' <<<"${pr_json}")"
+          candidate="$(jq -r '.body // ""' <<<"${pr_json}" | sed -n 's/^Zuno-Candidate-Commit: \([0-9a-f]\{40\}\)$/\1/p' | head -n1)"
+          if [[ "${queued}" == true && "${head}" != "${candidate}" ]]; then
+            gh pr merge "${PR_NUMBER}" --disable-auto
+            gh pr comment "${PR_NUMBER}" --body "Auto-merge withdrawn by \`zuno/pr-gate\`: the branch head \`${head}\` is not the candidate the upstream watcher pushed (\`${candidate:-none recorded}\`). Only watcher-pushed heads merge hands-off; merge this candidate by hand once it is reviewed."
+            echo "Withdrew auto-merge from PR #${PR_NUMBER}: head ${head} is not the watcher's candidate ${candidate:-<none>}." >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Require exact candidate success
         shell: bash
         env:

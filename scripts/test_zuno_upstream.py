@@ -984,6 +984,7 @@ class RebrandReplayTest(unittest.TestCase):
         repo.write("snapshots/status.snap", "│ >_ Codex (v0.0.0)   │\n")
         repo.write("clean.md", "Codex is clean.\n\n\n\nfooter\n")
         repo.write("ui.rs", 'fn banner() -> &str { "Codex is ready" }\n\n\n\n\nfn end() {}\n')
+        repo.write("pure.rs", 'fn title() -> &str { "Codex" }\n\n\n\n\nfn end() {}\n')
         repo.commit("base")
         base, tree = repo.tag_baseline("rust-v0.1.0")
 
@@ -998,6 +999,11 @@ class RebrandReplayTest(unittest.TestCase):
             "ui.rs",
             'fn banner() -> &str { "Codex is ready" }\n\n\n\n\nfn end() {}\n'
             "fn agent() -> Codex { Codex::new() } // Codex boots\n",
+        )
+        # A new line that is code only: nothing to rewrite, but still reported.
+        repo.write(
+            "pure.rs",
+            'fn title() -> &str { "Codex" }\n\n\n\n\nfn end() {}\nfn agent() -> Codex { Codex::new() }\n',
         )
         # New upstream files: a rendered snapshot inside the `added` scope and a
         # source file outside it.
@@ -1018,6 +1024,7 @@ class RebrandReplayTest(unittest.TestCase):
         repo.write("snapshots/status.snap", "│ >_ Zuno (v0.1.3)    │\n")
         repo.write("clean.md", "Zuno is clean.\n\n\n\nfooter\n")
         repo.write("ui.rs", 'fn banner() -> &str { "Zuno is ready" }\n\n\n\n\nfn end() {}\n')
+        repo.write("pure.rs", 'fn title() -> &str { "Zuno" }\n\n\n\n\nfn end() {}\n')
         source = repo.commit("zuno delta")
         return repo, source, target
 
@@ -1046,7 +1053,13 @@ class RebrandReplayTest(unittest.TestCase):
             self.assertEqual(replay["reused"], [])
             # The line upstream added to a source file keeps its identifiers; only
             # its comment (and the string the predicate already proved) is renamed.
-            self.assertEqual(replay["guarded"], ["ui.rs"])
+            # pure.rs needed no rewrite (its new line is code only) so it is not
+            # refreshed, but it is still reported for review.
+            self.assertEqual(replay["guarded"], ["pure.rs", "ui.rs"])
+            self.assertEqual(
+                (worktree / "pure.rs").read_text(),
+                'fn title() -> &str { "Zuno" }\n\n\n\n\nfn end() {}\nfn agent() -> Codex { Codex::new() }\n',
+            )
             self.assertEqual(
                 (worktree / "ui.rs").read_text(),
                 'fn banner() -> &str { "Zuno is ready" }\n\n\n\n\nfn end() {}\n'

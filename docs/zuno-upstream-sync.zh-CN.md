@@ -75,9 +75,11 @@ zuno-upstream-sync.yml ── 重放无冲突 ──▶ 分支 upstream-sync/X.Y
 从人工解决过的候选复制任何内容（`--reuse`）；这类候选，以及开关为 `false` 时的所有候选，都
 等待人工合并。每次刷新都会先撤回上一轮排下的 auto-merge 再重新判定，所以不再完全自动的候选
 （或开关改成 `false`）不会搭着旧队列进 `main`；重放撞上冲突时同样撤回。队列只对巡检推送的
-那个精确 head 有效（记录在 PR 正文的 `Zuno-Candidate-Commit`）：协作者向分支推送时 GitHub 会
-保留 auto-merge，所以每一轮巡检（包括本来会跳过的那些）一旦发现 PR head 不是该提交就撤回队列并
-在 PR 上说明。只有 `main` 的 ruleset 仍要求 `zuno/pr-gate` 时巡检才排队，否则没有待定的必需检查，
+那个精确 head 有效（记录在 PR 正文的 `Zuno-Candidate-Commit`）：有写权限的协作者向分支推送时
+GitHub 会保留 auto-merge，所以 `zuno/pr-gate` 自己在 `upstream-sync/*` 的 head 上变绿之前，会先
+检查该 head 是否就是记录的提交，不是就撤回队列并在 PR 上说明（门禁要跑一个多小时，届时巡检早已
+记录自己的 head）；每一轮巡检（包括本来会跳过的那些）也重复这项检查作为兜底。只有 `main` 的
+ruleset 仍要求 `zuno/pr-gate` 时巡检才排队，否则没有待定的必需检查，
 `--auto` 会立刻合并；并且只有配置了 `ZUNO_UPSTREAM_SYNC_TOKEN` secret 时才排队：用默认
 `GITHUB_TOKEN` 排下的队列被 GitHub 合并时，产生的 `pull_request: closed` 事件不会启动任何
 workflow，`zuno-release.yml` 永远不会晋升它，发布会静默缺失。三项仓库决定共同决定免人工路径能否
@@ -115,8 +117,7 @@ Zuno 差量的大部分是对用户可见 Codex 文案的改名（产品名、`Z
 谓词为它们担保）只在字符串字面量和 `//` 注释内改名，所以新出现的裸 `Codex` 类型或 `CODEX_HOME`
 常量保持上游原样，而不会变成门禁可能编译不到的代码；这类文件在 PR 里列为 `guarded`。基线里已有
 的行则按谓词证明的结果完整改名。其余 Zuno 差量之外的文件永不
-改写；规则会改动其新上游文本的路径会以 `drift` 列在 JSON 报告里供审阅。若规则真的碰到了刷新
-的 `.rs` 文件里的标识符，会编译失败并被门禁抓住。
+改写；规则会改动其新上游文本的路径会以 `drift` 列在 JSON 报告里供审阅。
 
 规则永远不会脱离谓词运行，所以规则集不完整只会损失覆盖率，不会损害正确性。用下面的命令
 度量覆盖率：
@@ -194,7 +195,7 @@ fine-grained personal access token，授予 **Contents: read and write** 与 **P
 read and write**（不需要 issues 权限；issue 始终用默认 token 处理），存为仓库 secret
 `ZUNO_UPSTREAM_SYNC_TOKEN`。巡检只在推送与开 PR 两步使用它。没有该 secret 时候选 PR 仍会
 打开，巡检会留言说明且不排队 auto-merge，关闭再重新打开 PR（或向分支推送）即可手动启动门禁；
-之后的合并与晋升 dispatch 也都是手动。
+之后的合并是手动的，而人工合并仍会自动晋升（`closed` 事件的 actor 是那个人）。
 
 该 token 暴露给的步骤运行在已经执行过候选树（包括上游 release 的构建脚本，派生产物用 `cargo`
 重新生成）的同一 runner 上。被攻破的 Codex release 因而可能拿到它；token 仅限本仓库，而同一个
@@ -205,9 +206,11 @@ prepare job 与持有 token 的 publish job 可以消除它。
 
 - 立即巡检：**Actions → Prepare Codex upstream sync → Run workflow**（可指定精确标签）。
 - 重新准备已打开的候选：以 `refresh = true` 触发。
-- 暂停自动化：**先**在 `main` 上把 `[sync].automatic_merge` 改为 `false`（或对每个开放候选执行
-  `gh pr merge <候选> --disable-auto`），再到 Actions 页面禁用这两个 workflow。禁用 workflow 不会
-  取消已经排队的 auto-merge：门禁一过 GitHub 仍会合并候选，而晋升 workflow 已被禁用，不会有发布。
+- 暂停自动化：**先**对每个开放的 `upstream-sync/*` PR 执行 `gh pr merge <候选> --disable-auto`
+  （`gh pr list --label upstream-sync`），再到 Actions 页面禁用这两个 workflow；如果暂停要跨过
+  下一次巡检，再在 `main` 上把 `[sync].automatic_merge` 改为 `false`。禁用 workflow 不会取消已经
+  排队的 auto-merge，开关也只有巡检才读，两者单独都撤不掉队列：门禁一过 GitHub 仍会合并候选，
+  而晋升 workflow 已被禁用，不会有发布。
 - 离线演练：`--trust-local-tags` 跳过"所选标签必须由 openai/codex 发布"的校验。巡检永不传它。
 - 巡检始终检出并重放 `main`，即使从其他分支手动触发也是如此；对巡检本身的改动要合并后才生效。
 
@@ -222,7 +225,7 @@ prepare job 与持有 token 的 publish job 可以消除它。
 - release 按顺序重放（`policy: next`），一次一个候选，每个 Codex release 都对应一个 Zuno
   release；`policy: newest` 是显式选择跳过中间版本。
 - 合并就是评审门。免人工模式只会排队重放完全自动的候选，只在有自动化 token 时排队，且只对巡检
-  推送的精确 head 有效；任何经人手的候选都等人合并。
+  推送的精确 head 有效（PR 门禁会在其他 head 通过之前撤回队列）；任何经人手的候选都等人合并。
 - 自动化只在 `FORK_REBRAND.toml` 能从 Codex 基线逐字节复现 Zuno 侧时解决一个冲突块，或者该块
   只是 `codex-rs/Cargo.toml` 的工作区 `version` 一行（Zuno 版本跟随 Codex 版本）；其余冲突块都
   等待人工。源码永不改名。`main` 前进时复用已评审的合并后编辑，而不是重新推导；若期间 `main` 上

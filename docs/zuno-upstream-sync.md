@@ -103,9 +103,12 @@ auto-merge queued by an earlier run and re-decides, so a candidate that stops
 being fully automatic (or a flag flipped to `false`) never rides a stale queue
 into `main`; a replay that hits conflicts also withdraws it. The queue is tied
 to the exact head the watcher pushed (recorded as `Zuno-Candidate-Commit` in the
-PR body): GitHub keeps auto-merge when a collaborator pushes to the branch, so
-every run, including one that otherwise skips, withdraws the queue as soon as
-the PR head is not that commit and says so on the PR. The watcher only queues
+PR body): GitHub keeps auto-merge when a collaborator with write access pushes
+to the branch, so `zuno/pr-gate` itself, before it can turn green on an
+`upstream-sync/*` head, withdraws the queue when that head is not the recorded
+commit and says so on the PR (the gate takes over an hour, by which time the
+watcher has recorded its own head); every watcher run, including one that
+otherwise skips, repeats the check as a backstop. The watcher only queues
 while the `main` ruleset still requires the `zuno/pr-gate` check, because
 without a pending required check `--auto` would merge at once, and only when
 the `ZUNO_UPSTREAM_SYNC_TOKEN` secret is configured: a merge that GitHub
@@ -167,9 +170,7 @@ files are listed as `guarded` in the PR. Lines that already existed in the
 baseline are rebranded in full, exactly as the predicate proved. Every other
 file outside the Zuno
 delta is never rewritten; paths whose new upstream text the rules would change
-are listed as `drift` in the JSON report for review. A rule that did reach an
-identifier inside a refreshed `.rs` file would fail to compile and be caught by
-the gate.
+are listed as `drift` in the JSON report for review.
 
 Rules never run without the predicate, so an incomplete rule set costs coverage,
 not correctness. Measure coverage with
@@ -266,8 +267,9 @@ issues are always handled with the default token), and store it as the
 repository secret `ZUNO_UPSTREAM_SYNC_TOKEN`. The watcher uses it only for the
 push and PR steps. Without the secret the candidate PR still opens, the watcher
 leaves a comment, auto-merge is not queued, and closing and reopening the PR
-(or pushing to the branch) starts the gate by hand; the merge and the promotion
-dispatch then stay manual.
+(or pushing to the branch) starts the gate by hand; the merge then stays
+manual, and a person's merge still promotes automatically (the `closed` event
+carries that person as its actor).
 
 The token is exposed to steps that run after the candidate tree, including the
 upstream release's build scripts, has been executed on the same runner (the
@@ -282,12 +284,14 @@ token-free prepare job and a token-holding publish job would remove it.
 - Run the watcher immediately: **Actions → Prepare Codex upstream sync → Run
   workflow** (optionally with an exact tag).
 - Re-prepare an already open candidate: dispatch with `refresh = true`.
-- Pause the automation: set `[sync].automatic_merge = false` on `main` (or run
-  `gh pr merge <candidate> --disable-auto` on every open candidate) **before**
-  disabling the two workflows in the Actions UI. Disabling a workflow does not
-  cancel an auto-merge that is already queued: GitHub would still merge the
-  candidate when its gate passes, and with the promotion workflow disabled no
-  release would follow.
+- Pause the automation: first run `gh pr merge <candidate> --disable-auto` on
+  every open `upstream-sync/*` PR (`gh pr list --label upstream-sync`), then
+  disable the two workflows in the Actions UI, and set
+  `[sync].automatic_merge = false` on `main` if the pause is to outlive the
+  next watcher run. Disabling a workflow does not cancel an auto-merge that is
+  already queued, and the flag is only read by the watcher, so neither step on
+  its own withdraws a queue: GitHub would still merge the candidate when its
+  gate passes, and with the promotion workflow disabled no release would follow.
 - Offline dry runs: `--trust-local-tags` skips the check that the chosen tag
   is published by openai/codex. The watcher never passes it.
 - The watcher always checks out and replays `main`, even when dispatched from
@@ -311,7 +315,8 @@ token-free prepare job and a token-holding publish job would remove it.
   choice to skip intermediate releases.
 - The merge is the review gate. Hands-off mode only ever queues candidates
   whose replay was fully automatic, only with the automation token, and only
-  for the exact head the watcher pushed; anything a person touched waits for a
+  for the exact head the watcher pushed (the PR gate withdraws the queue from
+  any other head before it can pass); anything a person touched waits for a
   person.
 - Automation resolves a conflict hunk only when `FORK_REBRAND.toml` reproduces
   the Zuno side from the Codex baseline byte for byte, or when the hunk is

@@ -117,6 +117,33 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual(spans('let raw = r#"Codex starts'), [(13, 25)])
         self.assertEqual(spans("and continues Codex here"), [])
         self.assertEqual(spans('url("https://x/a//b") // Codex'), [(5, 19), (22, 30)])
+        # Raw literals take no escapes and end at the matching `"#…`.
+        self.assertEqual(spans('let p = r"C:\\"; let c: Codex = x;'), [(10, 13)])
+        self.assertEqual(spans('render(r"\\", "Codex is ready")'), [(9, 10), (14, 28)])
+        self.assertEqual(spans('let raw = r#"Codex " starts"#; let c: Codex = y;'), [(13, 27)])
+        self.assertEqual(spans('let b = br"x"; // Codex'), [(11, 12), (15, 23)])
+        self.assertEqual(spans('for"Codex"'), [(4, 9)])
+
+    def test_text_only_spans_follow_earlier_replacements(self) -> None:
+        # A shortening rule inside the string must not let a later rule reach the
+        # code after the closing quote; a lengthening rule must not hide text.
+        self.assertEqual(
+            rules().apply('foo("OpenAI Codex", Codex)', version=None, path="x.rs", text_only=True),
+            'foo("Zuno", Codex)',
+        )
+        self.assertEqual(
+            rules().apply(
+                'let s = "an open source project led by OpenAI. Restart Codex."; let c: Codex = x;',
+                version=None,
+                path="x.rs",
+                text_only=True,
+            ),
+            'let s = "an open source project forked from OpenAI\'s Codex CLI. Restart Zuno."; let c: Codex = x;',
+        )
+        self.assertEqual(
+            rules().apply('let p = r"C:\\"; let c: Codex = x; // Codex', version=None, path="x.rs", text_only=True),
+            'let p = r"C:\\"; let c: Codex = x; // Zuno',
+        )
 
     def test_text_only_apply_keeps_code_and_rebrands_strings_and_comments(self) -> None:
         text = (
