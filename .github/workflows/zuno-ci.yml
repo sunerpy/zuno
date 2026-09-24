@@ -249,6 +249,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
           targets: ${{ matrix.target }}
+      # The CodeBuild Windows image carries a Chocolatey Rust (1.84, GNU
+      # toolchain) early on the system PATH, and the runner appends rather than
+      # prepends the rustup bin directory there, so every later step would pick
+      # the wrong cargo, rustc and rust-lld. Put the rustup toolchain first.
+      - name: Prefer the rustup toolchain over the image's Chocolatey Rust (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
+          "PATH=$cargoBin;$env:PATH" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          & (Join-Path $cargoBin 'cargo.exe') --version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: zuno-candidate-${{ matrix.target }}
@@ -260,12 +271,15 @@ jobs:
         run: |
           set -euo pipefail
           # Ubuntu on the x86_64 runner image, Amazon Linux 2023 on the ARM one.
+          # zstd writes the .tar.zst package archive; the Ubuntu image lacks it
+          # and the repository's DotSlash wrapper only covers Windows.
           if command -v apt-get >/dev/null 2>&1; then
             sudo apt-get update -y
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev zstd
           else
-            sudo dnf install -y pkgconf-pkg-config libcap-devel
+            sudo dnf install -y pkgconf-pkg-config libcap-devel zstd
           fi
+          zstd --version
       - name: Configure V8 artifact
         uses: ./.github/actions/setup-rusty-v8
         with:
