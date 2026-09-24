@@ -301,11 +301,14 @@ def main() -> int:
     sync_text = text(upstream_sync)
     default_token = "GH_TOKEN: ${{ github.token }}"
     push_token = "GH_TOKEN: ${{ secrets.ZUNO_UPSTREAM_SYNC_TOKEN || github.token }}"
-    if sync_text.count(default_token) != 2 or sync_text.count(push_token) != 2:
+    if sync_text.count(default_token) != 2 or sync_text.count(push_token) != 3:
         raise SystemExit(
             "upstream sync must expose the default token only to the state and conflict-report "
-            "steps and the optional automation token only to the push and PR steps"
+            "steps and the optional automation token only to the token check, push and PR steps"
         )
+    # The token health check must never create a ref: dry run only.
+    require(upstream_sync, "Verify the automation token")
+    require(upstream_sync, 'push --dry-run origin "HEAD:refs/heads/upstream-sync/token-check-${GITHUB_RUN_ID}"')
     # Steps that fetch or replay upstream code must never see any token: the
     # checkout/fetch/plan steps before state inspection, and the candidate
     # preparation and regeneration steps between state inspection and the push.

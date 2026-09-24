@@ -190,6 +190,32 @@ jobs:
             echo "issue_number=${issue_number}"
           } >> "${GITHUB_OUTPUT}"
 
+      # Runs on every tick, including the ones with nothing to prepare, so a
+      # revoked, expired or under-scoped ZUNO_UPSTREAM_SYNC_TOKEN shows up here
+      # long before a release needs it. `git push --dry-run` goes through
+      # GitHub's write authorization for the candidate namespace without creating
+      # a ref; the PR read proves the pull-requests scope. Without the secret
+      # hands-off mode is off anyway, so the default token is not checked.
+      - name: Verify the automation token
+        env:
+          GH_TOKEN: ${{ secrets.ZUNO_UPSTREAM_SYNC_TOKEN || github.token }}
+          USING_DEFAULT_TOKEN: ${{ secrets.ZUNO_UPSTREAM_SYNC_TOKEN == '' }}
+        run: |
+          set -euo pipefail
+          if [[ "${USING_DEFAULT_TOKEN}" == true ]]; then
+            echo "No ZUNO_UPSTREAM_SYNC_TOKEN secret: hands-off merges stay off; nothing to verify." >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          credential_file="${RUNNER_TEMP}/zuno-upstream-token-check"
+          trap 'rm -f "${credential_file}"' EXIT
+          printf 'https://x-access-token:%s@github.com\n' "$GH_TOKEN" > "$credential_file"
+          chmod 600 "$credential_file"
+          git -c credential.helper= -c credential.helper="store --file=${credential_file}" \
+            push --dry-run origin "HEAD:refs/heads/upstream-sync/token-check-${GITHUB_RUN_ID}" 2>&1 | tail -n 2
+          open_prs="$(gh pr list --state open --label "${CANDIDATE_LABEL}" --json number --jq 'length')"
+          login="$(gh api user --jq .login)"
+          echo "Automation token OK: acts as ${login}; can push to upstream-sync/* (dry run) and read pull requests (${open_prs} open candidate PR(s))." >> "${GITHUB_STEP_SUMMARY}"
+
       - name: Prepare isolated candidate
         id: candidate
         if: steps.plan.outputs.skip != 'true' && steps.state.outputs.action == 'prepare'

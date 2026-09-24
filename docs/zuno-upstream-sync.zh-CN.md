@@ -193,7 +193,9 @@ finalize 之前先跑 TUI 全量测试（`cargo test -p codex-tui`，PR 门禁�
 它排队的 auto-merge 被 GitHub 合并后也不会跑 `zuno-release.yml`。请创建一个仅限本仓库的
 fine-grained personal access token，授予 **Contents: read and write** 与 **Pull requests:
 read and write**（不需要 issues 权限；issue 始终用默认 token 处理），存为仓库 secret
-`ZUNO_UPSTREAM_SYNC_TOKEN`。巡检只在推送与开 PR 两步使用它。没有该 secret 时候选 PR 仍会
+`ZUNO_UPSTREAM_SYNC_TOKEN`。巡检只在推送与开 PR 两步使用它，并在每一轮都校验它（向
+`upstream-sync/*` 命名空间做一次 `git push --dry-run`，再读一次 PR 列表），因此 token 被吊销、
+过期或权限不足时，定时运行会在真正需要它之前就失败报警。没有该 secret 时候选 PR 仍会
 打开，巡检会留言说明且不排队 auto-merge，关闭再重新打开 PR（或向分支推送）即可手动启动门禁；
 之后的合并是手动的，而人工合并仍会自动晋升（`closed` 事件的 actor 是那个人）。
 
