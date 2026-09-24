@@ -95,8 +95,9 @@ struct BridgeState {
 struct CollaborationPreset {
     mode: String,
     model: Option<String>,
-    /// `Some(None)` clears the effort, `Some(Some(e))` sets it, `None` keeps it.
-    effort: Option<Option<String>>,
+    /// The effort the preset switches to; `None` keeps the session's effort
+    /// (the wire cannot distinguish "keep" from "clear": both are `null`).
+    effort: Option<String>,
 }
 
 /// One entry of the App Server model catalog as the bridge needs it.
@@ -133,6 +134,13 @@ struct SessionRoute {
     approval_policy: String,
     approvals_reviewer: String,
     sandbox_type: String,
+    /// The thread's own `approvalPolicy` / `approvalsReviewer` / `sandboxPolicy`
+    /// when they matched no preset at session start, so the `custom` mode can be
+    /// selected again after a preset was applied.
+    custom_permissions: Option<Value>,
+    /// The effort in force before a collaboration preset changed it, restored
+    /// when a mode whose preset leaves the effort alone is selected.
+    effort_before_preset: Option<Option<String>>,
     active_turn_id: Option<String>,
 }
 
@@ -502,7 +510,7 @@ mod tests {
                 None,
                 "untrusted",
                 "user",
-                "workspaceWrite"
+                "dangerFullAccess"
             )),
             "strict"
         );
@@ -619,22 +627,61 @@ mod tests {
 
     #[test]
     fn collaboration_presets_carry_the_servers_effort_for_plan_mode() {
+        // The wire shape of `collaborationMode/list`: `CollaborationModeMask`
+        // renames the effort field to snake_case, and both "keep" and "clear"
+        // serialise as null.
         let presets = collaboration_presets_from_list(&json!({"data": [
-            {"name": "Plan", "mode": "plan", "model": null, "reasoningEffort": "medium"},
-            {"name": "Default", "mode": "default", "model": null, "reasoningEffort": null},
+            {"name": "Plan", "mode": "plan", "model": null, "reasoning_effort": "medium"},
+            {"name": "Default", "mode": "default", "model": null, "reasoning_effort": null},
         ]}));
         assert_eq!(presets.len(), 2);
         assert_eq!(
-            presets[0].effort,
-            Some(Some("medium".to_owned())),
+            presets[0].effort.as_deref(),
+            Some("medium"),
             "plan switches to medium like the TUI preset"
         );
         assert_eq!(
-            presets[1].effort,
-            Some(None),
-            "default clears the preset effort"
+            presets[1].effort, None,
+            "a null effort keeps the session's (or the remembered) effort"
         );
         assert_eq!(presets[0].model, None);
+    }
+
+    #[test]
+    fn strict_preset_matches_the_server_strict_profile_and_custom_settings_are_kept() {
+        // examples/zuno-config/server-strict.config.toml: untrusted approvals,
+        // user reviewer, danger-full-access sandbox.
+        let strict = test_route("m", None, "untrusted", "user", "dangerFullAccess");
+        assert_eq!(permission_mode_id(&strict), "strict");
+        assert!(strict.custom_permissions.is_none());
+        let granular = route_from_lifecycle(
+            &json!({
+                "thread": {"id": "t"}, "model": "m",
+                "approvalPolicy": {"granular": {"sandbox_approval": true}},
+                "approvalsReviewer": "user",
+                "sandbox": {"type": "externalSandbox", "networkAccess": "enabled"},
+            }),
+            "/w",
+            &ClientConnection::detached_for_tests(),
+        )
+        .unwrap();
+        let custom = granular
+            .custom_permissions
+            .as_ref()
+            .expect("custom settings kept");
+        assert_eq!(
+            custom["approvalPolicy"]["granular"]["sandbox_approval"],
+            true
+        );
+        assert_eq!(custom["sandboxPolicy"]["type"], "externalSandbox");
+        let modes = session_modes(&granular);
+        assert_eq!(modes["currentModeId"], "custom");
+        assert!(
+            modes["availableModes"][0]["description"]
+                .as_str()
+                .unwrap()
+                .contains("granular")
+        );
     }
 
     #[test]

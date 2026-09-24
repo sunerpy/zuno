@@ -52,17 +52,22 @@ The session surface follows the reference `codex-acp` adapter so a client such
 as Zed sees the same things from Zuno:
 
 - **Modes are permission presets.** `session/new` advertises `read-only`,
-  `workspace-write`, `agent` (auto review), `strict` (Zuno's server mode:
-  every command and edit is approved first) and `agent-full-access`; the current
-  mode is derived from the thread's approval policy, reviewer and sandbox, and a
-  thread whose settings match no preset shows a read-only `custom` entry.
-  `session/set_mode` (or the `mode` config option) applies the preset through
-  `thread/settings/update`.
+  `workspace-write`, `agent` (auto review), `strict` (Zuno's server mode from
+  `docs/zuno-server-strict.md`: every command and edit is approved first and
+  approved actions run without a sandbox) and `agent-full-access`; the current
+  mode is derived from the thread's approval policy, reviewer and sandbox. A
+  thread whose settings match no preset (a granular policy, an external sandbox)
+  also lists a `custom` entry that restores those settings after a preset was
+  applied. `session/set_mode` (or the `mode` config option) applies the preset
+  through `thread/settings/update`.
 - **The collaboration mode is a config option** (`collaboration_mode`:
-  `default` or `plan`), also toggled by `/plan`. Switching applies the server's
-  `collaborationMode/list` preset exactly as the TUI does, so plan mode runs at
-  the preset's reasoning effort (medium in the bundled catalog) with the
-  server's plan instructions; there is no separate ACP agent for it.
+  `default` or `plan`), also toggled by `/plan`, which then pushes a
+  `config_option_update`. Switching applies the server's
+  `collaborationMode/list` preset exactly as the TUI does: plan mode runs at the
+  preset's reasoning effort (medium in the bundled catalog) with the server's
+  plan instructions, and switching back to a mode whose preset names no effort
+  restores the effort the session had before; there is no separate ACP agent
+  for plan mode.
 - **Models come from the catalog.** `availableModels` and the `model` config
   option list every visible entry of `model/list` (what the TUI's `/model`
   picker offers), and the `reasoning_effort` options are the efforts the

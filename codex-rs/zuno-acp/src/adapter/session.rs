@@ -368,15 +368,30 @@ impl CodexAcpAgent {
                 update["effort"] = Value::String(value.to_owned());
             }
             "permissions" => update["permissions"] = Value::String(value.to_owned()),
+            "mode" if value == CUSTOM_PERMISSION_MODE => {
+                let custom = route.custom_permissions.clone().ok_or_else(|| {
+                    RpcError::invalid_params(
+                        "this session has no custom permission settings to return to",
+                    )
+                })?;
+                update["approvalPolicy"] = custom["approvalPolicy"].clone();
+                update["approvalsReviewer"] = custom["approvalsReviewer"].clone();
+                update["sandboxPolicy"] = custom["sandboxPolicy"].clone();
+            }
             "mode" => {
                 let preset = permission_preset(value).ok_or_else(|| {
                     RpcError::invalid_params(format!(
-                        "mode must be one of {}",
+                        "mode must be one of {}{}",
                         PERMISSION_PRESETS
                             .iter()
                             .map(|preset| preset.id)
                             .collect::<Vec<_>>()
-                            .join(", ")
+                            .join(", "),
+                        if route.custom_permissions.is_some() {
+                            ", custom"
+                        } else {
+                            ""
+                        }
                     ))
                 })?;
                 update["approvalPolicy"] = Value::String(preset.approval_policy.to_owned());
@@ -390,12 +405,22 @@ impl CodexAcpAgent {
                     ));
                 }
                 let preset = self.collaboration_preset(value).await;
+                // A preset that names an effort switches to it and remembers
+                // the effort it replaced; a preset that does not (the bundled
+                // default mode) restores that remembered effort, so toggling
+                // plan on and off returns the session to where it was.
                 let effort = match preset.as_ref().and_then(|preset| preset.effort.clone()) {
                     Some(effort) => {
-                        collaboration_effort = Some(effort.clone());
-                        effort
+                        collaboration_effort = Some(Some(effort.clone()));
+                        Some(effort)
                     }
-                    None => route.effort.clone(),
+                    None => match &route.effort_before_preset {
+                        Some(previous) => {
+                            collaboration_effort = Some(previous.clone());
+                            previous.clone()
+                        }
+                        None => route.effort.clone(),
+                    },
                 };
                 let model = preset
                     .as_ref()
@@ -430,11 +455,29 @@ impl CodexAcpAgent {
                     route.approval_policy = preset.approval_policy.to_owned();
                     route.approvals_reviewer = preset.approvals_reviewer.to_owned();
                     route.sandbox_type = preset.sandbox_type.to_owned();
+                } else if let Some(custom) = &route.custom_permissions {
+                    route.approval_policy = approval_policy_id(custom.get("approvalPolicy"));
+                    route.approvals_reviewer = custom
+                        .get("approvalsReviewer")
+                        .and_then(Value::as_str)
+                        .unwrap_or("user")
+                        .to_owned();
+                    route.sandbox_type = custom
+                        .pointer("/sandboxPolicy/type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("workspaceWrite")
+                        .to_owned();
                 }
             }
             "collaboration_mode" => {
                 route.collaboration_mode = value.to_owned();
                 if let Some(effort) = collaboration_effort {
+                    let restoring = route.effort_before_preset.as_ref() == Some(&effort);
+                    if restoring {
+                        route.effort_before_preset = None;
+                    } else if route.effort_before_preset.is_none() && effort != route.effort {
+                        route.effort_before_preset = Some(route.effort.clone());
+                    }
                     route.effort = effort;
                 }
             }

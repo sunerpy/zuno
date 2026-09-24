@@ -61,7 +61,7 @@ pub(super) fn route_from_lifecycle(
         .or_else(|| response.pointer("/thread/model").and_then(Value::as_str))
         .ok_or_else(|| RpcError::internal("thread lifecycle response omitted model"))?
         .to_owned();
-    Ok(SessionRoute {
+    let mut route = SessionRoute {
         client: client.session_scoped(),
         cwd: response
             .get("cwd")
@@ -101,6 +101,8 @@ pub(super) fn route_from_lifecycle(
             .and_then(Value::as_str)
             .unwrap_or("workspaceWrite")
             .to_owned(),
+        custom_permissions: None,
+        effort_before_preset: None,
         active_turn_id: response
             .pointer("/thread/turns")
             .and_then(Value::as_array)
@@ -113,7 +115,23 @@ pub(super) fn route_from_lifecycle(
             .and_then(|turn| turn.get("id"))
             .and_then(Value::as_str)
             .map(str::to_owned),
-    })
+    };
+    if permission_mode_id(&route) == CUSTOM_PERMISSION_MODE {
+        // Keep the thread's own settings so the custom mode stays selectable.
+        route.custom_permissions = Some(json!({
+            "approvalPolicy": response
+                .get("approvalPolicy")
+                .cloned()
+                .unwrap_or(Value::String(route.approval_policy.clone())),
+            "approvalsReviewer": route.approvals_reviewer,
+            "sandboxPolicy": response
+                .get("sandbox")
+                .or_else(|| response.get("sandboxPolicy"))
+                .cloned()
+                .unwrap_or_else(|| sandbox_policy_json(&route.sandbox_type)),
+        }));
+    }
+    Ok(route)
 }
 
 /// Parse a `model/list` response page into catalog entries (in server order).
@@ -170,7 +188,9 @@ pub(super) fn catalog_from_model_list(response: &Value) -> Vec<ModelEntry> {
 }
 
 /// Parse `collaborationMode/list`: for every mode, the model and effort the
-/// preset switches to. Efforts come as `reasoningEffort: null | "medium"`.
+/// preset switches to. `CollaborationModeMask` keeps the snake_case wire name
+/// `reasoning_effort` (an explicit serde rename), and serialises both "keep"
+/// and "clear" as `null`, so `null` is read as "keep the session's effort".
 pub(super) fn collaboration_presets_from_list(response: &Value) -> Vec<CollaborationPreset> {
     response
         .get("data")
@@ -180,19 +200,17 @@ pub(super) fn collaboration_presets_from_list(response: &Value) -> Vec<Collabora
                 .iter()
                 .filter_map(|preset| {
                     let mode = preset.get("mode")?.as_str()?.to_owned();
-                    let effort = match preset.get("reasoningEffort") {
-                        None => None,
-                        Some(Value::Null) => Some(None),
-                        Some(Value::String(effort)) => Some(Some(effort.clone())),
-                        Some(_) => None,
-                    };
                     Some(CollaborationPreset {
                         mode,
                         model: preset
                             .get("model")
                             .and_then(Value::as_str)
                             .map(str::to_owned),
-                        effort,
+                        effort: preset
+                            .get("reasoning_effort")
+                            .or_else(|| preset.get("reasoningEffort"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
                     })
                 })
                 .collect()

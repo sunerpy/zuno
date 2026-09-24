@@ -219,6 +219,24 @@ async fn project_notification(state: &BridgeState, notification: &Value) {
             state.settle_turn(turn_id.to_owned(), outcome);
         }
         "thread/settings/updated" => state.apply_settings(params),
+        // A turn the App Server accepted but core refused before it started (for
+        // example `review/start` in a directory that is not a git repository)
+        // produces only this notification: settle the waiters so `session/prompt`
+        // fails instead of hanging.
+        "error" if params.get("willRetry").and_then(Value::as_bool) != Some(true) => {
+            if let (Some(thread_id), Some(turn_id)) = (thread_id, turn_id) {
+                let outcome = TurnOutcome {
+                    status: "failed".to_owned(),
+                    error: params
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                };
+                state.record_turn_settled(thread_id, turn_id);
+                state.settle_thread_turn(thread_id, outcome.clone());
+                state.settle_turn(turn_id.to_owned(), outcome);
+            }
+        }
         _ => {}
     }
 

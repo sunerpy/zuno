@@ -43,13 +43,16 @@ pub(super) const PERMISSION_PRESETS: &[PermissionPreset] = &[
         approvals_reviewer: "auto_review",
         sandbox_type: "workspaceWrite",
     },
+    // Mirrors examples/zuno-config/server-strict.config.toml: every command and
+    // edit is approved first and then runs unsandboxed, because the standalone
+    // server binary ships no sandbox helper (see docs/zuno-server-strict.md).
     PermissionPreset {
         id: "strict",
         name: "Strict",
-        description: "Zuno server mode: approve every command and edit before it runs.",
+        description: "Zuno server mode: approve every command and edit first; approved actions run without a sandbox.",
         approval_policy: "untrusted",
         approvals_reviewer: "user",
-        sandbox_type: "workspaceWrite",
+        sandbox_type: "dangerFullAccess",
     },
     PermissionPreset {
         id: "agent-full-access",
@@ -96,8 +99,9 @@ pub(super) fn sandbox_policy_json(sandbox_type: &str) -> Value {
     }
 }
 
-/// ACP `modes` for a session: every preset, plus the synthetic custom entry when
-/// the thread's settings match none of them.
+/// ACP `modes` for a session: every preset, plus the `custom` entry whenever the
+/// thread started with settings that match none of them (it stays selectable
+/// after a preset was applied, restoring those settings).
 pub(super) fn session_modes(route: &SessionRoute) -> Value {
     let current = permission_mode_id(route);
     let mut available: Vec<Value> = PERMISSION_PRESETS
@@ -115,16 +119,31 @@ pub(super) fn session_modes(route: &SessionRoute) -> Value {
             })
         })
         .collect();
-    if current == CUSTOM_PERMISSION_MODE {
+    if current == CUSTOM_PERMISSION_MODE || route.custom_permissions.is_some() {
+        let description = match &route.custom_permissions {
+            Some(custom) => format!(
+                "approval {} reviewed by {}, sandbox {} (from config)",
+                approval_policy_id(custom.get("approvalPolicy")),
+                custom
+                    .get("approvalsReviewer")
+                    .and_then(Value::as_str)
+                    .unwrap_or("user"),
+                custom
+                    .pointer("/sandboxPolicy/type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?"),
+            ),
+            None => format!(
+                "approval {} reviewed by {}, sandbox {}",
+                route.approval_policy, route.approvals_reviewer, route.sandbox_type
+            ),
+        };
         available.insert(
             0,
             json!({
                 "id": CUSTOM_PERMISSION_MODE,
                 "name": "Custom (from config)",
-                "description": format!(
-                    "approval {} reviewed by {}, sandbox {}",
-                    route.approval_policy, route.approvals_reviewer, route.sandbox_type
-                ),
+                "description": description,
             }),
         );
     }
@@ -330,10 +349,22 @@ impl CodexAcpAgent {
                 } else {
                     "plan"
                 };
-                self.set_option(&json!({
-                    "sessionId": session_id, "configId": "collaboration_mode", "value": next,
-                }))
-                .await?;
+                let options = self
+                    .set_option(&json!({
+                        "sessionId": session_id, "configId": "collaboration_mode", "value": next,
+                    }))
+                    .await?;
+                // The bridge changed a config option itself, so tell the client
+                // (a `session/set_config_option` response would have carried it).
+                client
+                    .session_update(
+                        session_id,
+                        json!({
+                            "sessionUpdate": "config_option_update",
+                            "configOptions": options["configOptions"],
+                        }),
+                    )
+                    .await?;
                 say(format!(
                     "Plan mode {}.",
                     if next == "plan" {

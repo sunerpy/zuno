@@ -78,12 +78,14 @@ Zuno 无需改动。协议 2 走出草案后会在显式协商之后追加，同
   不能自由作答。
 - 会话表面对齐参考实现 `codex-acp`，Zed 等客户端看到的东西与之一致：
   - **模式（modes）是权限预设**：`read-only`、`workspace-write`、`agent`（自动评审）、
-    `strict`（Zuno 服务器模式，每条命令与编辑都先审批）、`agent-full-access`；当前模式由线程的
-    审批策略、评审者和沙箱推导，配置匹配不上任何预设时显示只读的 `custom` 条目。
+    `strict`（`docs/zuno-server-strict.md` 的服务器模式：每条命令与编辑都先审批，批准后不带沙箱运行）、
+    `agent-full-access`；当前模式由线程的审批策略、评审者和沙箱推导。配置匹配不上任何预设
+    （细粒度审批策略、外部沙箱）时还会列出 `custom` 条目，应用过预设后仍可选回它恢复原设置。
     `session/set_mode`（或 `mode` 配置项）通过 `thread/settings/update` 应用预设。
-  - **协作模式是配置项** `collaboration_mode`（`default` / `plan`），`/plan` 也能切换。切换时应用
-    服务端 `collaborationMode/list` 的预设，与 TUI 完全一致：plan 模式以预设的推理强度（内置目录里
-    是 medium）和服务端的 plan 提示词运行；它不是一个独立的 ACP agent。
+  - **协作模式是配置项** `collaboration_mode`（`default` / `plan`），`/plan` 也能切换并随后推送
+    `config_option_update`。切换时应用服务端 `collaborationMode/list` 的预设，与 TUI 完全一致：
+    plan 模式以预设的推理强度（内置目录里是 medium）和服务端的 plan 提示词运行；切回预设未指定
+    强度的模式时恢复进入前的强度；它不是一个独立的 ACP agent。
   - **模型来自目录**：`availableModels` 与 `model` 配置项列出 `model/list` 的全部可见条目（即 TUI
     `/model` 选择器的内容），`reasoning_effort` 的选项是所选模型支持的强度；只存在于配置里的模型
     仍可选。
