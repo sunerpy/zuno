@@ -271,10 +271,10 @@ fn external_process_sandbox(config: &Config) -> OneShotProcessSandboxConfig {
         codex_linux_sandbox_exe: config.codex_linux_sandbox_exe.clone(),
         managed_network_configured: config.permissions.network.is_some(),
         use_legacy_landlock: config.features.use_legacy_landlock(),
+        windows_sandbox_type: config.permissions.windows_sandbox_type,
         windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::from_config(
             config,
         ),
-        windows_sandbox_private_desktop: config.permissions.windows_sandbox_private_desktop,
     }
 }
 

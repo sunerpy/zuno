@@ -76,7 +76,7 @@ impl WorkflowAgentBinding {
                 .collect::<Vec<_>>(),
             "windowsSandbox": {
                 "mode": config.permissions.windows_sandbox_mode,
-                "privateDesktop": config.permissions.windows_sandbox_private_desktop,
+                "type": config.permissions.windows_sandbox_type,
             },
             "processSandbox": {
                 "codexSelfExecutable": config.codex_self_exe.as_ref()

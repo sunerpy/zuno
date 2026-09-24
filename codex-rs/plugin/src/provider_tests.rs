@@ -44,6 +44,7 @@ fn environment_descriptor_binds_every_manifest_resource() {
         description: None,
         keywords: Vec::new(),
         paths: PluginManifestPaths {
+            onboarding_skill: None,
             skills: vec![path_uri(&skills)],
             workflows: vec![path_uri(&workflows)],
             agent_backends: None,
@@ -80,6 +81,7 @@ fn environment_descriptor_binds_every_manifest_resource() {
             description: None,
             keywords: Vec::new(),
             paths: PluginManifestPaths {
+                onboarding_skill: None,
                 skills: vec![resource("executor-1", &skills)],
                 workflows: vec![resource("executor-1", &workflows)],
                 agent_backends: None,
@@ -114,6 +116,7 @@ fn environment_descriptor_rejects_resources_outside_package_root() {
         description: None,
         keywords: Vec::new(),
         paths: PluginManifestPaths {
+            onboarding_skill: None,
             skills: Vec::new(),
             workflows: Vec::new(),
             agent_backends: None,

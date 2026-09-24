@@ -175,7 +175,7 @@ bazel-lock-check:
 
 [windows]
 bazel-lock-check:
-    bazel mod deps --lockfile_mode=error; if ($LASTEXITCODE -ne 0) { Write-Error "MODULE.bazel.lock is out of date. Run 'just bazel-lock-update' and commit the updated lockfile."; exit 1 }
+    bazel mod deps --lockfile_mode=error; if ($LASTEXITCODE -ne 0) { Write-Error "Unable to verify MODULE.bazel.lock; see the Bazel error above. If Bazel reports an out-of-date lockfile, run 'just bazel-lock-update' and commit the updated lockfile."; exit 1 }
 
 bazel-test:
     bazel test --test_tag_filters=-argument-comment-lint //... --keep_going
@@ -202,13 +202,12 @@ build-zuno-for-release:
 write-config-schema:
     cargo run -p codex-config-schema --bin codex-write-config-schema
 
-# Regenerate vendored app-server protocol schema artifacts.
-# The protocol crate exposes the writer through an ignored test so fixture
-# generation uses the same code path as the drift checks.
-[no-cd]
-write-app-server-schema:
-    {{ python }} {{ justfile_directory() }}/codex-rs/app-server-protocol/scripts/write_schema_fixtures.py
-    {{ python }} {{ justfile_directory() }}/codex-rs/app-server-protocol/scripts/write_schema_fixtures.py --experimental
+# Regenerate app-server protocol schemas and the Python SDK derived from them.
+# Zuno also regenerates the precomputed experimental exports in the same recipe
+# so a bare `just write-app-server-schema` refreshes every checked-in fixture.
+write-app-server-schema *args:
+    {{ python }} app-server-protocol/scripts/write_schema_fixtures.py {args}
+    {{ python }} app-server-protocol/scripts/write_schema_fixtures.py --experimental {args}
 
 [no-cd]
 write-hooks-schema:

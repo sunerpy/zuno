@@ -2,11 +2,11 @@
 source: tui/src/bottom_pane/list_selection_view.rs
 expression: render_lines(&view)
 ---
-                                                
   Select Approval Mode                          
-  Switch between Codex approval presets         
+  Switch between Zuno approval presets          
                                                 
-› 1. Read Only (current)  Codex can read files  
-  2. Full Access          Codex can edit files  
+                                                
+› 1. Read Only (current)  Zuno can read files   
+  2. Full Access          Zuno can edit files   
                                                 
   Press enter to confirm or esc to go back

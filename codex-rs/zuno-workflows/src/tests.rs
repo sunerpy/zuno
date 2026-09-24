@@ -187,16 +187,14 @@ impl WorkflowHost for RecordingHost {
 
 struct FakeV8Provider;
 
-struct FakeV8Session {
-    delegate: std::sync::Arc<dyn codex_code_mode::CodeModeSessionDelegate>,
-}
+struct FakeV8Session;
 
 impl codex_code_mode::CodeModeSession for FakeV8Session {
     fn execute<'a>(
         &'a self,
         request: codex_code_mode::ExecuteRequest,
+        delegate: std::sync::Arc<dyn codex_code_mode::CodeModeSessionDelegate>,
     ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::StartedCell> {
-        let delegate = self.delegate.clone();
         Box::pin(async move {
             let missing = request.source.contains("route: 'missing'");
             let route = if missing { "missing" } else { "review" };
@@ -272,22 +270,18 @@ impl codex_code_mode::CodeModeSession for FakeV8Session {
 }
 
 impl codex_code_mode::CodeModeSessionProvider for FakeV8Provider {
-    fn create_session<'a>(
-        &'a self,
-        delegate: std::sync::Arc<dyn codex_code_mode::CodeModeSessionDelegate>,
-    ) -> codex_code_mode::CodeModeSessionProviderFuture<'a> {
+    fn create_session(&self) -> codex_code_mode::CodeModeSessionProviderFuture<'_> {
         Box::pin(async move {
-            Ok(std::sync::Arc::new(FakeV8Session { delegate })
+            Ok(std::sync::Arc::new(FakeV8Session)
                 as std::sync::Arc<dyn codex_code_mode::CodeModeSession>)
         })
     }
 
     fn create_session_with_limits<'a>(
         &'a self,
-        delegate: std::sync::Arc<dyn codex_code_mode::CodeModeSessionDelegate>,
         _limits: codex_code_mode::CodeModeSessionCellExecutionLimits,
     ) -> codex_code_mode::CodeModeSessionProviderFuture<'a> {
-        self.create_session(delegate)
+        self.create_session()
     }
 }
 

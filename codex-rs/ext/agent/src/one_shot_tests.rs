@@ -117,8 +117,8 @@ fn restricted_external_process_is_wrapped_by_the_linux_sandbox() {
         codex_linux_sandbox_exe: Some(helper.clone()),
         managed_network_configured: false,
         use_legacy_landlock: false,
+        windows_sandbox_type: codex_sandboxing::SandboxType::None,
         windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
-        windows_sandbox_private_desktop: false,
     };
 
     let command = prepare_external_process_command(
@@ -154,8 +154,8 @@ fn restricted_external_process_fails_closed_without_the_linux_sandbox_helper() {
         codex_linux_sandbox_exe: None,
         managed_network_configured: false,
         use_legacy_landlock: false,
+        windows_sandbox_type: codex_sandboxing::SandboxType::None,
         windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
-        windows_sandbox_private_desktop: false,
     };
 
     let error = prepare_external_process_command(
@@ -183,8 +183,8 @@ fn explicit_full_access_external_process_stays_native() {
         codex_linux_sandbox_exe: None,
         managed_network_configured: false,
         use_legacy_landlock: false,
+        windows_sandbox_type: codex_sandboxing::SandboxType::None,
         windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
-        windows_sandbox_private_desktop: false,
     };
 
     let command = prepare_external_process_command(
@@ -216,8 +216,8 @@ fn external_process_does_not_bypass_a_managed_network_proxy() {
         codex_linux_sandbox_exe: None,
         managed_network_configured: true,
         use_legacy_landlock: false,
+        windows_sandbox_type: codex_sandboxing::SandboxType::None,
         windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
-        windows_sandbox_private_desktop: false,
     };
 
     let error = prepare_external_process_command(
@@ -259,8 +259,8 @@ async fn workspace_profile_confines_the_external_process_on_linux() {
         codex_linux_sandbox_exe: Some(helper),
         managed_network_configured: false,
         use_legacy_landlock: false,
+        windows_sandbox_type: codex_sandboxing::SandboxType::None,
         windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
-        windows_sandbox_private_desktop: false,
     };
     let script = format!(
         "touch '{}' 2>/dev/null || true; if test -e '{}'; then printf WRITTEN; else printf DENIED; fi",

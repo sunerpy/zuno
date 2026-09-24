@@ -209,6 +209,13 @@ jobs:
           shared-key: zuno-upstream-sync
           cache-bin: false
 
+      # write_schema_fixtures.py regenerates the Python SDK types through uv.
+      - name: Install uv for SDK type generation
+        if: steps.candidate.outputs.outcome == 'candidate'
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.3"
+
       - name: Regenerate derived artifacts and finalize candidate
         if: steps.candidate.outputs.outcome == 'candidate'
         env:

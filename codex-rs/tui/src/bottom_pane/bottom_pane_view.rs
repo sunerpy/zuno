@@ -144,6 +144,11 @@ pub(crate) trait BottomPaneView: Renderable {
         Some(request)
     }
 
+    /// Return true when this view already presents the matching app-server request.
+    fn matches_app_server_request(&self, _request: &ResolvedAppServerRequest) -> bool {
+        false
+    }
+
     /// Dismiss a request that was resolved by another client.
     ///
     /// Returns `true` when the view changed state.
@@ -155,7 +160,7 @@ pub(crate) trait BottomPaneView: Renderable {
     ///
     /// Views that return `true` surface an "Action Required" terminal title
     /// instead of the normal working spinner so terminal tabs clearly show that
-    /// Codex needs user input.
+    /// Zuno needs user input.
     fn terminal_title_requires_action(&self) -> bool {
         false
     }
