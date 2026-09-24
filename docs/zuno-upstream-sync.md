@@ -11,9 +11,10 @@ The pipeline has one review gate: merging the candidate pull request. With
 `[sync].automatic_merge = true` in `UPSTREAM_CODEX.toml` (the default) a
 candidate whose replay was fully automatic is queued for GitHub auto-merge and
 merges as soon as the PR gate passes, so a clean Codex release becomes a Zuno
-release without a person (see *Hands-off mode* below for the two repository
-settings this needs). A candidate that needed manual conflict resolution waits
-for a person. Everything before and after the merge is automated.
+release without a person (see *Hands-off mode* below for the repository secret
+and the two settings this needs). A candidate that needed manual conflict
+resolution waits for a person. Everything before and after the merge is
+automated.
 
 ```text
 openai/codex tag rust-vX.Y.Z
@@ -100,14 +101,23 @@ hand-resolved candidate (`--reuse`); such candidates, and every candidate when
 the flag is `false`, wait for a manual merge. Every refresh first withdraws any
 auto-merge queued by an earlier run and re-decides, so a candidate that stops
 being fully automatic (or a flag flipped to `false`) never rides a stale queue
-into `main`; a replay that hits conflicts also withdraws it. The watcher only
-queues while the `main` ruleset still requires the `zuno/pr-gate` check,
-because without a pending required check `--auto` would merge at once. Two
-repository settings gate the hands-off path and are the owner's decision:
-**Allow auto-merge** must be enabled, and the `main` ruleset must not require a
-human review (a required code-owner review makes auto-merge wait for that
-approval). When GitHub refuses to queue the merge the watcher leaves a comment
-on the PR and the candidate waits for a manual merge.
+into `main`; a replay that hits conflicts also withdraws it. The queue is tied
+to the exact head the watcher pushed (recorded as `Zuno-Candidate-Commit` in the
+PR body): GitHub keeps auto-merge when a collaborator pushes to the branch, so
+every run, including one that otherwise skips, withdraws the queue as soon as
+the PR head is not that commit and says so on the PR. The watcher only queues
+while the `main` ruleset still requires the `zuno/pr-gate` check, because
+without a pending required check `--auto` would merge at once, and only when
+the `ZUNO_UPSTREAM_SYNC_TOKEN` secret is configured: a merge that GitHub
+completes for a queue raised with the default `GITHUB_TOKEN` fires a
+`pull_request: closed` event that starts no workflow, so `zuno-release.yml`
+would never promote it and the release would silently not happen. Three
+repository decisions gate the hands-off path and belong to the owner: the
+secret (see *Repository secret for a fully automatic gate*), **Allow
+auto-merge** enabled, and a `main` ruleset that requires no human review (a
+required code-owner review makes auto-merge wait for that approval). When any
+of them is missing, or GitHub refuses to queue the merge, the watcher leaves a
+comment on the PR and the candidate waits for a manual merge.
 
 Delete a candidate branch you abandon (`git push origin --delete
 upstream-sync/X.Y.Z` after closing its PR): the watcher treats every unmerged
@@ -149,7 +159,13 @@ Files upstream **adds** inside an `[[added]]` scope of the manifest (today: TUI
 text whose source already says Zuno. Note that `zuno/pr-gate` runs only a few
 targeted TUI tests, so a mis-rebranded snapshot surfaces in the full
 `cargo test -p codex-tui` run (see *Resolving conflicts locally*), not in the
-gate; the rewrite never touches source code. Every other file outside the Zuno
+gate. Source code is never renamed: in a `.rs` file the lines upstream added
+(which no predicate has vouched for) are rebranded only inside string literals
+and `//` comments, so a new bare `Codex` type or `CODEX_HOME` constant is left
+as upstream wrote it instead of becoming code the gate might not compile; such
+files are listed as `guarded` in the PR. Lines that already existed in the
+baseline are rebranded in full, exactly as the predicate proved. Every other
+file outside the Zuno
 delta is never rewritten; paths whose new upstream text the rules would change
 are listed as `drift` in the JSON report for review. A rule that did reach an
 identifier inside a refreshed `.rs` file would fail to compile and be caught by
@@ -241,22 +257,39 @@ re-downloads them to compare bytes, and publishes a non-latest prerelease.
 
 ## Repository secret for a fully automatic gate
 
-Pull requests opened with the default `GITHUB_TOKEN` cannot start
-`pull_request` workflows, so `zuno/pr-gate` would not run on the candidate.
-Create a fine-grained personal access token scoped to this repository with
-**Contents: read and write** and **Pull requests: read and write**, and store it
-as the repository secret `ZUNO_UPSTREAM_SYNC_TOKEN`. The watcher uses it only
-for the push and PR steps. Without the secret the candidate PR still opens, the
-watcher leaves a comment, and closing and reopening the PR (or pushing to the
-branch) starts the gate by hand.
+Events raised by the default `GITHUB_TOKEN` start no workflows: a pull request
+it opens does not run `zuno/pr-gate`, and a merge GitHub completes for an
+auto-merge it queued does not run `zuno-release.yml`. Create a fine-grained
+personal access token scoped to this repository with **Contents: read and
+write** and **Pull requests: read and write** (no issues permission is needed;
+issues are always handled with the default token), and store it as the
+repository secret `ZUNO_UPSTREAM_SYNC_TOKEN`. The watcher uses it only for the
+push and PR steps. Without the secret the candidate PR still opens, the watcher
+leaves a comment, auto-merge is not queued, and closing and reopening the PR
+(or pushing to the branch) starts the gate by hand; the merge and the promotion
+dispatch then stay manual.
+
+The token is exposed to steps that run after the candidate tree, including the
+upstream release's build scripts, has been executed on the same runner (the
+derived artifacts are regenerated with `cargo`). A compromised Codex release
+could therefore reach the token; it is scoped to this repository, and the same
+release would reach `main` through the gate anyway, so the residual risk is
+push access to non-protected branches. Splitting the watcher into a
+token-free prepare job and a token-holding publish job would remove it.
 
 ## Manual controls
 
 - Run the watcher immediately: **Actions → Prepare Codex upstream sync → Run
   workflow** (optionally with an exact tag).
 - Re-prepare an already open candidate: dispatch with `refresh = true`.
-- Pause the automation: disable the two workflows in the Actions UI; nothing
-  else needs to change.
+- Pause the automation: set `[sync].automatic_merge = false` on `main` (or run
+  `gh pr merge <candidate> --disable-auto` on every open candidate) **before**
+  disabling the two workflows in the Actions UI. Disabling a workflow does not
+  cancel an auto-merge that is already queued: GitHub would still merge the
+  candidate when its gate passes, and with the promotion workflow disabled no
+  release would follow.
+- Offline dry runs: `--trust-local-tags` skips the check that the chosen tag
+  is published by openai/codex. The watcher never passes it.
 - The watcher always checks out and replays `main`, even when dispatched from
   another branch, so changes to the watcher itself only take effect once they
   are merged.
@@ -265,19 +298,28 @@ branch) starts the gate by hand.
 
 - `main` and the active worktree are never mutated by synchronization.
 - Candidates are always prepared from a clean `main`; a dirty source aborts.
-- The exact upstream tag, commit, and tree are verified before replay. Codex
-  cuts each release on its own short branch, so the target normally is a sibling
-  of the baseline rather than a descendant; the two must share history, and
-  commits that exist only on the old release branch are listed in the PR.
+- The exact upstream tag, commit, and tree are verified before replay, and the
+  chosen tag must point at the commit `openai/codex` publishes for it: tags are
+  fetched into one namespace, so a `rust-vX.Y.Z` tag that exists only on this
+  fork's `origin` is refused instead of being merged and released as a Codex
+  release. Codex cuts each release on its own short branch, so the target
+  normally is a sibling of the baseline rather than a descendant; the two must
+  share history, and commits that exist only on the old release branch are
+  listed in the PR.
 - Releases are replayed in order (`policy: next`), one candidate at a time, so
   every Codex release gets a Zuno release; `policy: newest` is an explicit
   choice to skip intermediate releases.
 - The merge is the review gate. Hands-off mode only ever queues candidates
-  whose replay was fully automatic; anything a person touched waits for a
+  whose replay was fully automatic, only with the automation token, and only
+  for the exact head the watcher pushed; anything a person touched waits for a
   person.
 - Automation resolves a conflict hunk only when `FORK_REBRAND.toml` reproduces
-  the Zuno side from the Codex baseline byte for byte; every other hunk waits
-  for a human. Reviewed post-merge edits are reused, never re-derived, when
-  `main` moves.
+  the Zuno side from the Codex baseline byte for byte, or when the hunk is
+  solely the workspace `version` line of `codex-rs/Cargo.toml` (Zuno versions
+  track Codex versions); every other hunk waits for a human. Source code is
+  never renamed. Reviewed post-merge edits are reused, never re-derived, when
+  `main` moves; when `FORK_REBRAND.toml` itself changed on `main` in between,
+  the reused paths reflect the rules of the earlier candidate and count as
+  hand-resolved, so the candidate waits for a person.
 - Released bytes are never rebuilt after review; promotion only republishes the
   sealed PR-gate artifacts.

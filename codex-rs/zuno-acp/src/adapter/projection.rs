@@ -75,10 +75,14 @@ impl BridgeState {
     }
 }
 
+/// The answer the ACP client gave to a bridged App Server request, ready to be
+/// forwarded with [`settle_server_request`].
+pub(super) type BridgedServerRequest = (AppRequestId, Result<Value, RpcError>);
+
 pub(super) async fn handle_app_server_event(
-    app_server: &mut AppServerClient,
-    state: &BridgeState,
+    state: &Arc<BridgeState>,
     event: AppServerEvent,
+    bridged: &mut JoinSet<BridgedServerRequest>,
 ) -> Result<(), AcpBridgeError> {
     match event {
         AppServerEvent::ServerNotification(notification) => {
@@ -88,26 +92,15 @@ pub(super) async fn handle_app_server_event(
         AppServerEvent::ServerRequest(request) => {
             let request_id = request.id().clone();
             let value = serde_json::to_value(request.as_ref())?;
-            let result = bridge_server_request(state, &value).await;
-            match result {
-                Ok(result) => {
-                    app_server
-                        .resolve_server_request(request_id, result)
-                        .await?
-                }
-                Err(error) => {
-                    app_server
-                        .reject_server_request(
-                            request_id,
-                            JSONRPCErrorError {
-                                code: error.code,
-                                message: error.message,
-                                data: error.data,
-                            },
-                        )
-                        .await?;
-                }
-            }
+            let state = Arc::clone(state);
+            // Bridging an approval or a tool question waits for the ACP client's
+            // answer, which the transport read loop delivers; that loop is polled
+            // by the same event loop that called us, so the wait must not happen
+            // inline or the answer is never read and the turn hangs.
+            bridged.spawn(async move {
+                let result = bridge_server_request(&state, &value).await;
+                (request_id, result)
+            });
         }
         AppServerEvent::Lagged { skipped } => {
             tracing::warn!(skipped, "ACP App Server event stream lagged");
@@ -115,6 +108,33 @@ pub(super) async fn handle_app_server_event(
         AppServerEvent::Disconnected { message } => {
             tracing::warn!(%message, "ACP App Server disconnected");
             return Err(AcpBridgeError::AppServerClosed);
+        }
+    }
+    Ok(())
+}
+
+/// Forward a bridged answer to the App Server request that asked for it.
+pub(super) async fn settle_server_request(
+    app_server: &AppServerClient,
+    (request_id, result): BridgedServerRequest,
+) -> Result<(), AcpBridgeError> {
+    match result {
+        Ok(result) => {
+            app_server
+                .resolve_server_request(request_id, result)
+                .await?
+        }
+        Err(error) => {
+            app_server
+                .reject_server_request(
+                    request_id,
+                    JSONRPCErrorError {
+                        code: error.code,
+                        message: error.message,
+                        data: error.data,
+                    },
+                )
+                .await?;
         }
     }
     Ok(())

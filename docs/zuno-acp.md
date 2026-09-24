@@ -96,6 +96,11 @@ Within protocol 1 the bridge tracks the schema additions clients rely on:
   are refused because form mode must not carry credentials. Clients without form
   elicitation keep the previous behaviour: the listed options through
   `session/request_permission`, no free-form answer.
+- Approvals and tool questions are bridged off the event loop: each App Server
+  request waits for the client's answer in its own task while the bridge keeps
+  reading client frames and projecting notifications, so several sessions can
+  have prompts pending at once and `session/cancel` still arrives. (Waiting
+  inline used to deadlock the bridge: the answer frame was never read.)
 
 Zuno-specific capabilities continue to evolve behind explicit protocol
 metadata. An ACP SDK package version alone does not opt a connection into an

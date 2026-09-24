@@ -20,6 +20,7 @@ use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
 use tokio::sync::oneshot;
+use tokio::task::JoinSet;
 
 use crate::transport::Agent;
 use crate::transport::ClientConnection;
@@ -43,6 +44,7 @@ use projection::handle_app_server_event;
 use projection::history_updates;
 #[cfg(test)]
 use projection::notification_updates;
+use projection::settle_server_request;
 
 const DEFAULT_LIST_LIMIT: u64 = 100;
 const ACP_PROTOCOL_VERSION: u64 = 1;
@@ -57,6 +59,8 @@ pub enum AcpBridgeError {
     EventEncoding(#[from] serde_json::Error),
     #[error("Codex App Server request failed: {0}")]
     AppServerIo(#[from] std::io::Error),
+    #[error("bridging a Codex App Server request panicked: {0}")]
+    BridgeTask(#[from] tokio::task::JoinError),
 }
 
 #[derive(Clone)]
@@ -185,13 +189,21 @@ pub async fn serve_in_process_stdio(args: InProcessClientStartArgs) -> Result<()
 }
 
 /// Run ACP v1 over stdio while routing all execution through an existing Codex App Server.
+///
+/// Three things are polled together: the ACP transport (which reads client
+/// frames, including the answers to requests the bridge sent), the App Server
+/// event stream, and the bridged App Server requests that are waiting for such
+/// an answer. Those requests run as tasks so that waiting for the client never
+/// stops the transport from being read.
 pub async fn serve_app_server_stdio(mut app_server: AppServerClient) -> Result<(), AcpBridgeError> {
     let agent = CodexAcpAgent::new(app_server.request_handle());
     let state = Arc::clone(&agent.state);
     let mut transport = Box::pin(serve_stdio(agent));
+    let mut bridged = JoinSet::new();
     loop {
         tokio::select! {
             result = &mut transport => {
+                bridged.shutdown().await;
                 app_server.shutdown().await?;
                 return result.map_err(Into::into);
             }
@@ -199,7 +211,10 @@ pub async fn serve_app_server_stdio(mut app_server: AppServerClient) -> Result<(
                 let Some(event) = event else {
                     return Err(AcpBridgeError::AppServerClosed);
                 };
-                handle_app_server_event(&mut app_server, &state, event).await?;
+                handle_app_server_event(&state, event, &mut bridged).await?;
+            }
+            Some(settled) = bridged.join_next(), if !bridged.is_empty() => {
+                settle_server_request(&app_server, settled?).await?;
             }
         }
     }

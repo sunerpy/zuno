@@ -254,7 +254,8 @@ staged installer proves lock, checksum, atomic switch, rollback, and
 installed-byte smoke on all six native targets.
 
 ```sh
-# Read-only report against the newest locally/freshly fetched stable tag.
+# Read-only report against the next stable tag after the recorded baseline
+# (--policy newest skips ahead to the latest).
 python3 scripts/zuno_upstream.py --json check
 
 # Prepare a separate candidate after the Zuno delta has been reviewed and

@@ -9,7 +9,7 @@ Codex baseline onto an exact upstream release tag.
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
 import re
@@ -136,11 +136,15 @@ class RebrandReplay:
     # Upstream-changed paths outside the Zuno delta that the rules would alter;
     # reported for review, never rewritten.
     drift: list[str]
+    # Source files (resolved or refreshed) in which a line upstream added kept an
+    # identifier the rules would have renamed: only string literals and comments
+    # of new code lines are rebranded, never the code itself.
+    guarded: list[str] = field(default_factory=list)
 
 
 def empty_replay() -> RebrandReplay:
     return RebrandReplay(
-        resolved=[], deleted=[], refreshed=[], reused=[], partial=[], added=[], drift=[]
+        resolved=[], deleted=[], refreshed=[], reused=[], partial=[], added=[], drift=[], guarded=[]
     )
 
 
@@ -241,6 +245,43 @@ def stable_tags(repo: Path) -> list[str]:
 
 
 TARGET_POLICIES = ("next", "newest")
+
+
+def verify_tag_on_remote(repo: Path, remote: str, tag: str) -> str:
+    """Require the local ``tag`` to point at the commit ``remote`` publishes for it.
+
+    Fetched tags share one namespace, so a ``rust-vX.Y.Z`` tag that exists only
+    on the fork's own origin (pushed by mistake, or by someone with write access
+    who wants a commit merged and released without review) would otherwise pass
+    for a Codex release. Returns the verified commit. Fails closed when the
+    remote cannot be listed.
+    """
+    local = resolve_commit(repo, tag)
+    listing = run(
+        repo,
+        ["ls-remote", "--tags", remote, f"refs/tags/{tag}", f"refs/tags/{tag}^{{}}"],
+        check=False,
+    )
+    if listing.returncode != 0:
+        raise SyncError(
+            f"cannot verify {tag} against remote {remote!r}: {listing.stderr.strip()}"
+        )
+    published: dict[str, str] = {}
+    for line in listing.stdout.splitlines():
+        commit, _, ref = line.strip().partition("\t")
+        if commit and ref:
+            published[ref] = commit
+    remote_commit = published.get(f"refs/tags/{tag}^{{}}") or published.get(f"refs/tags/{tag}")
+    if remote_commit is None:
+        raise SyncError(
+            f"{tag} exists locally but remote {remote!r} does not publish it; "
+            "refusing to sync a tag that is not a Codex release"
+        )
+    if remote_commit != local:
+        raise SyncError(
+            f"{tag} points at {local} locally but remote {remote!r} publishes {remote_commit}"
+        )
+    return local
 
 
 def exact_target(
@@ -688,6 +729,8 @@ def replay_rebrand_into(
             if report.remaining == 0:
                 (worktree / path).write_text(resolved, encoding="utf-8")
                 replay.resolved.append(path)
+                if report.guarded:
+                    replay.guarded.append(path)
                 continue
             if report.resolved:
                 (worktree / path).write_text(resolved, encoding="utf-8")
@@ -722,10 +765,18 @@ def replay_rebrand_into(
         if rebrand.apply(base, version=source_version, path=path) != zuno:
             continue
         upstream = blob(repo, plan.target_commit, path)
-        expected = rebrand.apply(upstream if upstream is not None else base, version=target_version, path=path)
+        expected, guarded = zuno_rebrand.rebrand_new_text(
+            rebrand,
+            base,
+            upstream if upstream is not None else base,
+            version=target_version,
+            path=path,
+        )
         if expected != current:
             (worktree / path).write_text(expected, encoding="utf-8")
             replay.refreshed.append(path)
+            if guarded:
+                replay.guarded.append(path)
     zuno_touched = set(zuno_delta) | conflicted
     baseline_paths = set(run(repo, ["ls-tree", "-r", "--name-only", plan.baseline_commit]).stdout.split("\n"))
     for path in sorted(changed_files(repo, plan.baseline_commit, plan.target_commit)):
@@ -972,6 +1023,11 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--manifest", default="UPSTREAM_CODEX.toml")
     result.add_argument("--remote", default="upstream")
     result.add_argument("--no-fetch", action="store_true")
+    result.add_argument(
+        "--trust-local-tags",
+        action="store_true",
+        help="skip verifying the target tag against --remote (offline use only; the watcher never passes this)",
+    )
     result.add_argument("--json", action="store_true")
     subparsers = result.add_subparsers(dest="command", required=True)
     for name in ("check", "prepare"):
@@ -1078,6 +1134,20 @@ def describe_rebrand(report: dict[str, object]) -> str:
         lines += ["", "<details>", f"<summary>{title} ({len(paths)})</summary>", ""]
         lines += [f"- `{path}`" for path in paths]
         lines += ["", "</details>"]
+    guarded = replay.get("guarded", [])
+    if guarded:
+        lines += [
+            "",
+            "<details>",
+            f"<summary>New upstream code lines kept their identifiers ({len(guarded)})</summary>",
+            "",
+            "In these source files upstream added lines in which the rules matched outside a "
+            "string literal or comment (for example a bare `Codex` type). Code is never renamed; "
+            "check whether any of those lines is user-visible text in a multi-line literal.",
+            "",
+        ]
+        lines += [f"- `{path}`" for path in guarded]
+        lines += ["", "</details>"]
     drift = replay.get("drift", [])
     visible = [path for path in drift if path.startswith(DRIFT_SURFACES) and path.endswith(".rs")]
     if visible:
@@ -1153,6 +1223,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 repo, args.open_candidates_remote, resolve_commit(repo, args.source)
             )
         target_tag = exact_target(repo, args.target, baseline, args.policy, open_candidates)
+        if not args.trust_local_tags:
+            # The tag was chosen from the local tag list; only the upstream remote
+            # can say whether it is a Codex release.
+            verify_tag_on_remote(repo, args.remote, target_tag)
         if (
             args.command == "check"
             and args.allow_current

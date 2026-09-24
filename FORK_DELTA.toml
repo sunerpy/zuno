@@ -88,6 +88,7 @@ shared_upstream_paths = [
 contracts = [
   "ACP clients do not own a private agent loop.",
   "Turn interrupt, ordinary input, goal resume, and protected gates remain distinct.",
+  "Bridged App Server requests (approvals, tool questions) wait for the client off the event loop; the transport keeps being read while any number of them are pending.",
 ]
 
 [[capabilities]]
@@ -111,11 +112,11 @@ shared_upstream_paths = []
 contracts = [
   "The active Zuno branch and worktree are never mutated by synchronization.",
   "A dirty source is rejected before candidate preparation.",
-  "The exact upstream tag, commit, and tree are verified before replay.",
+  "The exact upstream tag, commit, and tree are verified before replay, and the chosen tag must point at the commit the openai/codex remote publishes for it; a rust-v* tag that exists only on the fork's origin is refused.",
   "The watcher replays stable Codex tags in release order (policy next; newest skips ahead), never regresses an open candidate to an older tag, is idempotent per main commit, and reports replay conflicts as an issue instead of pushing.",
-  "A conflict hunk is resolved by automation only when FORK_REBRAND.toml reproduces the Zuno side from the Codex baseline byte for byte, or when it is solely the workspace version line of codex-rs/Cargo.toml (Zuno versions track Codex versions); every other hunk waits for a human.",
+  "A conflict hunk is resolved by automation only when FORK_REBRAND.toml reproduces the Zuno side from the Codex baseline byte for byte, or when it is solely the workspace version line of codex-rs/Cargo.toml (Zuno versions track Codex versions); every other hunk waits for a human. Source code is never renamed: lines upstream added to a .rs file are rebranded only inside string literals and comments.",
   "Post-merge edits of a finalized candidate for the same release are reused for every path main has not changed since.",
-  "Merging the candidate PR with a merge commit is the review gate. With [sync].automatic_merge = true in UPSTREAM_CODEX.toml (the default) a candidate whose replay was fully automatic is queued for GitHub auto-merge behind zuno/pr-gate; a candidate that needed manual resolution or reused hand-resolved edits, or any candidate when the flag is false, waits for a person.",
+  "Merging the candidate PR with a merge commit is the review gate. With [sync].automatic_merge = true in UPSTREAM_CODEX.toml (the default) a candidate whose replay was fully automatic is queued for GitHub auto-merge behind zuno/pr-gate, only with the ZUNO_UPSTREAM_SYNC_TOKEN secret (a merge completed for a GITHUB_TOKEN queue starts no promotion) and only for the exact head the watcher pushed; a candidate that needed manual resolution or reused hand-resolved edits, a candidate someone pushed to, or any candidate when the flag is false, waits for a person.",
   "A candidate is finalized as a merge whose first parent is the reviewed main commit and whose second parent is the exact upstream release commit recorded in UPSTREAM_CODEX.toml, even after manual conflict resolution.",
 ]
 

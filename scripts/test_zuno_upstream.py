@@ -126,6 +126,50 @@ class ZunoUpstreamTest(unittest.TestCase):
             with self.assertRaises(zuno_upstream.SyncError):
                 zuno_upstream.exact_target(repo.root, None, baseline, "next", ["0.11.0"])
 
+    def test_target_tag_must_be_published_by_the_upstream_remote(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "upstream").mkdir()
+            upstream = Repository(Path(directory) / "upstream")
+            upstream.write("file", "base\n")
+            upstream.commit("base")
+            base, tree = upstream.tag_baseline("rust-v0.10.0")
+            upstream.write("file", "next\n")
+            upstream.commit("next")
+            git(upstream.root, "tag", "-a", "-m", "release", "rust-v0.10.1")
+            clone = Path(directory) / "clone"
+            subprocess.run(
+                ["git", "clone", "-q", "--origin", "upstream", str(upstream.root), str(clone)],
+                check=True,
+            )
+            Repository(clone).manifest("rust-v0.10.0", base, tree)
+            git(clone, "add", "--all")
+            git(clone, "commit", "-q", "-m", "manifest")
+            # The real release (an annotated tag) verifies through its peeled commit.
+            self.assertEqual(
+                zuno_upstream.verify_tag_on_remote(clone, "upstream", "rust-v0.10.1"),
+                git(clone, "rev-parse", "rust-v0.10.1^{commit}"),
+            )
+            # A tag that exists only locally (or only on the fork's origin) is not a
+            # Codex release, and check refuses it instead of planning a sync.
+            git(clone, "tag", "rust-v0.10.2")
+            with self.assertRaises(zuno_upstream.SyncError):
+                zuno_upstream.verify_tag_on_remote(clone, "upstream", "rust-v0.10.2")
+            refused = subprocess.run(
+                [sys.executable, str(SCRIPT), "--repo", str(clone), "--no-fetch", "--json", "check",
+                 "--allow-current", "--source", "HEAD", "--target", "rust-v0.10.2"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("does not publish it", json.loads(refused.stdout)["error"])
+            # A tag whose local commit differs from the published one is refused too.
+            git(clone, "tag", "-d", "rust-v0.10.2")
+            git(clone, "tag", "-f", "rust-v0.10.1", "rust-v0.10.0")
+            with self.assertRaises(zuno_upstream.SyncError):
+                zuno_upstream.verify_tag_on_remote(clone, "upstream", "rust-v0.10.1")
+            # Without the remote the verification fails closed.
+            with self.assertRaises(zuno_upstream.SyncError):
+                zuno_upstream.verify_tag_on_remote(clone, "nowhere", "rust-v0.10.1")
+
     def test_open_candidates_come_from_unmerged_remote_branches(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -162,13 +206,13 @@ class ZunoUpstreamTest(unittest.TestCase):
             # Without the remote the next release is 0.10.1; the open 0.11.0
             # candidate wins through the CLI wiring.
             plain = subprocess.run(
-                [sys.executable, str(SCRIPT), "--repo", str(clone), "--no-fetch", "--json",
+                [sys.executable, str(SCRIPT), "--repo", str(clone), "--no-fetch", "--trust-local-tags", "--json",
                  "check", "--source", "origin/zuno", "--policy", "next"],
                 text=True, check=True, stdout=subprocess.PIPE,
             ).stdout
             self.assertEqual(json.loads(plain)["target_tag"], "rust-v0.10.1")
             with_remote = subprocess.run(
-                [sys.executable, str(SCRIPT), "--repo", str(clone), "--no-fetch", "--json",
+                [sys.executable, str(SCRIPT), "--repo", str(clone), "--no-fetch", "--trust-local-tags", "--json",
                  "check", "--source", "origin/zuno", "--policy", "next",
                  "--open-candidates-remote", "origin"],
                 text=True, check=True, stdout=subprocess.PIPE,
@@ -476,7 +520,7 @@ class ZunoUpstreamTest(unittest.TestCase):
                     str(SCRIPT),
                     "--repo",
                     str(repo.root),
-                    "--no-fetch",
+                    "--no-fetch", "--trust-local-tags",
                     "--json",
                     "check",
                 ],
@@ -498,7 +542,7 @@ class ZunoUpstreamTest(unittest.TestCase):
             repo.manifest("rust-v0.2.0", base, tree)
             repo.commit("manifest")
             strict = subprocess.run(
-                [str(SCRIPT), "--repo", str(repo.root), "--no-fetch", "--json", "check"],
+                [str(SCRIPT), "--repo", str(repo.root), "--no-fetch", "--trust-local-tags", "--json", "check"],
                 text=True,
                 check=False,
                 stdout=subprocess.PIPE,
@@ -510,7 +554,7 @@ class ZunoUpstreamTest(unittest.TestCase):
                     str(SCRIPT),
                     "--repo",
                     str(repo.root),
-                    "--no-fetch",
+                    "--no-fetch", "--trust-local-tags",
                     "--json",
                     "check",
                     "--allow-current",
@@ -544,7 +588,7 @@ class ZunoUpstreamTest(unittest.TestCase):
                     str(SCRIPT),
                     "--repo",
                     str(repo.root),
-                    "--no-fetch",
+                    "--no-fetch", "--trust-local-tags",
                     "--json",
                     "check",
                     "--allow-current",
@@ -619,7 +663,7 @@ class ZunoUpstreamTest(unittest.TestCase):
                     str(SCRIPT),
                     "--repo",
                     str(repo.root),
-                    "--no-fetch",
+                    "--no-fetch", "--trust-local-tags",
                     "--json",
                     "prepare",
                     "--source",
@@ -884,7 +928,7 @@ class ZunoUpstreamTest(unittest.TestCase):
             source = repo.commit("zuno delta")
             worktree = root / "candidate"
             subprocess.run(
-                [str(SCRIPT), "--repo", str(repo.root), "--no-fetch", "--json", "prepare",
+                [str(SCRIPT), "--repo", str(repo.root), "--no-fetch", "--trust-local-tags", "--json", "prepare",
                  "--source", "zuno", "--target", "rust-v0.2.0", "--worktree", str(worktree)],
                 text=True, check=True, stdout=subprocess.PIPE,
             )
@@ -939,6 +983,7 @@ class RebrandReplayTest(unittest.TestCase):
         repo.write("gone.md", "Codex leaves.\n")
         repo.write("snapshots/status.snap", "│ >_ Codex (v0.0.0)   │\n")
         repo.write("clean.md", "Codex is clean.\n\n\n\nfooter\n")
+        repo.write("ui.rs", 'fn banner() -> &str { "Codex is ready" }\n\n\n\n\nfn end() {}\n')
         repo.commit("base")
         base, tree = repo.tag_baseline("rust-v0.1.0")
 
@@ -949,6 +994,11 @@ class RebrandReplayTest(unittest.TestCase):
         repo.write("mixed.md", "Codex docs v2\n\nunrelated\n\nlimit = 6\n")
         (repo.root / "gone.md").unlink()
         repo.write("clean.md", "Codex is clean.\n\n\n\nfooter\nCodex is new.\n")
+        repo.write(
+            "ui.rs",
+            'fn banner() -> &str { "Codex is ready" }\n\n\n\n\nfn end() {}\n'
+            "fn agent() -> Codex { Codex::new() } // Codex boots\n",
+        )
         # New upstream files: a rendered snapshot inside the `added` scope and a
         # source file outside it.
         repo.write("snapshots/new_popup.snap", "│ >_ Codex (v0.0.0) │\nAsk Codex\n")
@@ -967,6 +1017,7 @@ class RebrandReplayTest(unittest.TestCase):
         repo.write("gone.md", "Zuno leaves.\n")
         repo.write("snapshots/status.snap", "│ >_ Zuno (v0.1.3)    │\n")
         repo.write("clean.md", "Zuno is clean.\n\n\n\nfooter\n")
+        repo.write("ui.rs", 'fn banner() -> &str { "Zuno is ready" }\n\n\n\n\nfn end() {}\n')
         source = repo.commit("zuno delta")
         return repo, source, target
 
@@ -989,10 +1040,18 @@ class RebrandReplayTest(unittest.TestCase):
             self.assertEqual(replay["resolved"], ["codex-rs/Cargo.toml", "greeting.md"])
             self.assertEqual(replay["deleted"], ["gone.md"])
             self.assertEqual(replay["partial"], ["mixed.md"])
-            self.assertEqual(replay["refreshed"], ["clean.md", "snapshots/status.snap"])
+            self.assertEqual(replay["refreshed"], ["clean.md", "snapshots/status.snap", "ui.rs"])
             self.assertEqual(replay["added"], ["snapshots/new_popup.snap"])
             self.assertEqual(replay["drift"], ["new_module.rs"])
             self.assertEqual(replay["reused"], [])
+            # The line upstream added to a source file keeps its identifiers; only
+            # its comment (and the string the predicate already proved) is renamed.
+            self.assertEqual(replay["guarded"], ["ui.rs"])
+            self.assertEqual(
+                (worktree / "ui.rs").read_text(),
+                'fn banner() -> &str { "Zuno is ready" }\n\n\n\n\nfn end() {}\n'
+                "fn agent() -> Codex { Codex::new() } // Zuno boots\n",
+            )
             self.assertEqual(
                 (worktree / "snapshots/new_popup.snap").read_text(), "│ >_ Zuno (v0.2.0)  │\nAsk Zuno\n"
             )
@@ -1130,7 +1189,7 @@ class RebrandReplayTest(unittest.TestCase):
                     str(SCRIPT),
                     "--repo",
                     str(repo.root),
-                    "--no-fetch",
+                    "--no-fetch", "--trust-local-tags",
                     "--json",
                     "prepare",
                     "--source",

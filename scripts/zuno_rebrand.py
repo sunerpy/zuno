@@ -132,8 +132,20 @@ class Rebrand:
             added.append(AddedScope(prefix=entry["prefix"], suffix=suffix))
         return cls(protect=tuple(protect), rules=tuple(rules), added=tuple(added))
 
-    def apply(self, text: str, *, version: str | None, path: str | None) -> str:
-        """Rewrite ``text`` line by line; ``text`` keeps its line endings."""
+    def apply(
+        self,
+        text: str,
+        *,
+        version: str | None,
+        path: str | None,
+        text_only: bool = False,
+    ) -> str:
+        """Rewrite ``text`` line by line; ``text`` keeps its line endings.
+
+        With ``text_only`` a source file (see ``CODE_SUFFIXES``) is rewritten only
+        inside string literals and line comments, so an identifier such as a bare
+        ``Codex`` type is never renamed. Other files are unaffected by the flag.
+        """
         rules = [
             rule
             for rule in self.rules
@@ -141,10 +153,20 @@ class Rebrand:
         ]
         if not rules:
             return text
+        guard = text_only and path is not None and path.endswith(CODE_SUFFIXES)
         parts = text.split("\n")
-        return "\n".join(self._apply_line(line, rules, version) for line in parts)
+        return "\n".join(
+            self._apply_line(line, rules, version, rust_text_spans(line) if guard else None)
+            for line in parts
+        )
 
-    def _apply_line(self, line: str, rules: Sequence[Rule], version: str | None) -> str:
+    def _apply_line(
+        self,
+        line: str,
+        rules: Sequence[Rule],
+        version: str | None,
+        allowed: list[tuple[int, int]] | None = None,
+    ) -> str:
         if not line:
             return line
         # Frozen spans are never matched again: protected phrases and the text a
@@ -168,6 +190,10 @@ class Rebrand:
                 for match in rule.pattern.finditer(text)
                 if match.end() > match.start()
                 and not any(match.start() < end and start < match.end() for start, end in frozen)
+                and (
+                    allowed is None
+                    or any(start <= match.start() and match.end() <= end for start, end in allowed)
+                )
             ]
             for match in reversed(matches):
                 # Replacements are literal text: no group references, no escapes,
@@ -180,9 +206,100 @@ class Rebrand:
                     for start, end in frozen
                 ]
                 frozen.append((match.start(), match.start() + len(replacement)))
+                if allowed is not None:
+                    allowed = [
+                        (start + delta, end + delta) if start >= match.end() else (start, end)
+                        for start, end in allowed
+                    ]
         if text != line:
             text = restore_width(line, text)
         return text
+
+
+# Source files whose new upstream lines are rebranded in text positions only.
+CODE_SUFFIXES = (".rs",)
+
+
+def rust_text_spans(line: str) -> list[tuple[int, int]]:
+    """Spans of a Rust source line that are text: string literal contents and a
+    trailing ``//`` comment. Everything else is code and is never rebranded when
+    the rules run in ``text_only`` mode. A string left open at the end of the line
+    (a raw or multi-line literal) counts as text to the end of the line; a line
+    that continues such a literal has no quote and counts as code, which only
+    loses a rename, never adds one."""
+    spans: list[tuple[int, int]] = []
+    length = len(line)
+    index = 0
+    in_string = False
+    start = 0
+    while index < length:
+        char = line[index]
+        if in_string:
+            if char == "\\":
+                index += 2
+                continue
+            if char == '"':
+                spans.append((start, index))
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            start = index + 1
+            index += 1
+            continue
+        if char == "'":
+            # Char literals (`'"'`, `'\''`) must not toggle string state;
+            # lifetimes (`'a`) do not match either shape.
+            if index + 2 < length and line[index + 1] != "\\" and line[index + 2] == "'":
+                index += 3
+                continue
+            if index + 3 < length and line[index + 1] == "\\" and line[index + 3] == "'":
+                index += 4
+                continue
+        if char == "/" and line.startswith("//", index):
+            spans.append((index, length))
+            return spans
+        index += 1
+    if in_string:
+        spans.append((start, length))
+    return spans
+
+
+def rebrand_new_text(
+    rebrand: Rebrand,
+    base_text: str,
+    upstream_text: str,
+    *,
+    version: str | None,
+    path: str,
+) -> tuple[str, bool]:
+    """Rebrand ``upstream_text`` after its base passed the predicate.
+
+    Lines that already existed in ``base_text`` were proven rename-only by the
+    predicate and are rebranded in full. In a source file (``CODE_SUFFIXES``) the
+    lines upstream added are rebranded in text positions only, so a new bare
+    ``Codex`` identifier is left alone instead of being rewritten into code that
+    may not compile where the PR gate does not build. Returns the text and
+    whether that guard changed anything."""
+    expected = rebrand.apply(upstream_text, version=version, path=path)
+    if not path.endswith(CODE_SUFFIXES):
+        return expected, False
+    guarded = rebrand.apply(upstream_text, version=version, path=path, text_only=True)
+    if guarded == expected:
+        return expected, False
+    base_lines = set(base_text.split("\n"))
+    result: list[str] = []
+    fired = False
+    for original, full, safe in zip(
+        upstream_text.split("\n"), expected.split("\n"), guarded.split("\n"), strict=True
+    ):
+        if full == safe or original in base_lines:
+            result.append(full)
+            continue
+        result.append(safe)
+        fired = True
+    return "\n".join(result), fired
 
 
 def display_width(text: str) -> int:
@@ -224,6 +341,9 @@ class ConflictHunk:
 class ResolutionReport:
     resolved: int = 0
     remaining: int = 0
+    # Resolved hunks in which a new upstream code line kept an identifier the
+    # rules would otherwise have renamed (see ``rebrand_new_text``).
+    guarded: int = 0
     reasons: list[str] = field(default_factory=list)
 
 
@@ -309,12 +429,15 @@ def resolve_conflicts(
         if isinstance(segment, str):
             output.append(segment)
             continue
-        replacement = _resolve_hunk(segment, rebrand, path, source_version, target_version)
-        if replacement is None:
+        resolution = _resolve_hunk(segment, rebrand, path, source_version, target_version)
+        if resolution is None:
             report.remaining += 1
             output.append(_render_hunk(segment))
             continue
+        replacement, guarded = resolution
         report.resolved += 1
+        if guarded:
+            report.guarded += 1
         if replacement:
             output.append("\n".join(replacement))
         else:
@@ -328,17 +451,21 @@ def _resolve_hunk(
     path: str,
     source_version: str | None,
     target_version: str | None,
-) -> list[str] | None:
-    """Return the resolved lines of ``hunk`` or ``None`` when it needs a human."""
+) -> tuple[list[str], bool] | None:
+    """Return the resolved lines of ``hunk`` (and whether the code guard fired)
+    or ``None`` when it needs a human."""
     if hunk.base is None:
         return None
     if path == WORKSPACE_MANIFEST and _is_version_hunk(hunk):
-        return list(hunk.ours)
+        return list(hunk.ours), False
     if rebrand.apply(hunk.text("base"), version=source_version, path=path) != hunk.text("theirs"):
         return None
     if not hunk.ours:
-        return []
-    return rebrand.apply(hunk.text("ours"), version=target_version, path=path).split("\n")
+        return [], False
+    resolved, guarded = rebrand_new_text(
+        rebrand, hunk.text("base"), hunk.text("ours"), version=target_version, path=path
+    )
+    return resolved.split("\n"), guarded
 
 
 def _is_version_hunk(hunk: ConflictHunk) -> bool:

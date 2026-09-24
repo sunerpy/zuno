@@ -4,9 +4,12 @@ name: Prepare Codex upstream sync
 # one review PR per release current against `main`, replaying releases in
 # order so every Codex release becomes a Zuno release. Merging the candidate PR
 # is the review gate: with `[sync].automatic_merge = true` in UPSTREAM_CODEX.toml
-# (the default) a fully automatic replay is queued for GitHub auto-merge behind
-# the PR gate; anything a person touched waits for a manual merge. After the
-# merge `zuno-release.yml` promotes the already-built candidate bytes.
+# (the default) and the ZUNO_UPSTREAM_SYNC_TOKEN secret configured, a fully
+# automatic replay is queued for GitHub auto-merge behind the PR gate; anything
+# a person touched waits for a manual merge. After the merge `zuno-release.yml`
+# promotes the already-built candidate bytes. The token matters twice: events
+# raised by the default GITHUB_TOKEN start no workflows, so without it neither
+# the PR gate nor the promotion would run on their own.
 
 on:
   workflow_dispatch:
@@ -145,9 +148,22 @@ jobs:
             --description "Codex upstream candidate needs manual conflict resolution" >/dev/null
 
           remote_sha="$(git ls-remote --heads origin "refs/heads/${BRANCH}" | awk '{print $1}')"
-          pr_json="$(gh pr list --state open --head "${BRANCH}" --base main --json number,body,headRefOid --limit 1)"
+          pr_json="$(gh pr list --state open --head "${BRANCH}" --base main --json number,body,headRefOid,autoMergeRequest --limit 1)"
           pr_number="$(jq -r '.[0].number // empty' <<<"${pr_json}")"
+          pr_head="$(jq -r '.[0].headRefOid // empty' <<<"${pr_json}")"
+          pr_auto_merge="$(jq -r '(.[0].autoMergeRequest // null) != null' <<<"${pr_json}")"
           pr_source="$(jq -r '.[0].body // ""' <<<"${pr_json}" | sed -n 's/^Zuno-Source-Commit: \([0-9a-f]\{40\}\)$/\1/p' | head -n1)"
+          pr_candidate="$(jq -r '.[0].body // ""' <<<"${pr_json}" | sed -n 's/^Zuno-Candidate-Commit: \([0-9a-f]\{40\}\)$/\1/p' | head -n1)"
+          # Auto-merge is only ever queued for the exact head the watcher pushed
+          # (recorded in the PR body). GitHub keeps the queue when a collaborator
+          # pushes to the branch, so a head that no longer matches is a
+          # hand-touched candidate: withdraw the queue before this run decides
+          # anything else, including skipping.
+          if [[ -n "${pr_number}" && "${pr_auto_merge}" == true && "${pr_head}" != "${pr_candidate}" ]]; then
+            gh pr merge "${pr_number}" --disable-auto
+            gh pr comment "${pr_number}" --body "Auto-merge withdrawn: the branch head \`${pr_head}\` is not the candidate the watcher pushed (\`${pr_candidate:-none recorded}\`), so this candidate now waits for a manual merge."
+            echo "Withdrew auto-merge from PR #${pr_number}: head ${pr_head} is not the watcher's candidate ${pr_candidate:-<none>}." >> "${GITHUB_STEP_SUMMARY}"
+          fi
 
           issue_json="$(gh issue list --state open --label "${CONFLICT_LABEL}" --search "\"${TARGET_TAG}\" in:title" --json number,body --limit 1)"
           issue_number="$(jq -r '.[0].number // empty' <<<"${issue_json}")"
@@ -252,6 +268,7 @@ jobs:
           version: "0.11.3"
 
       - name: Regenerate derived artifacts and finalize candidate
+        id: finalize
         if: steps.candidate.outputs.outcome == 'candidate'
         env:
           CANDIDATE: ${{ steps.candidate.outputs.candidate }}
@@ -279,13 +296,17 @@ jobs:
             --source "${SOURCE_SHA}" \
             --message "chore(upstream): merge Codex ${TARGET_VERSION} into Zuno"
           git -C "${CANDIDATE}" show --stat --format='%H %P%n%s' HEAD | head -n 40
+          echo "candidate_commit=$(git -C "${CANDIDATE}" rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
 
-      # Pushes and pull requests made with the default GITHUB_TOKEN do not
-      # trigger `pull_request` workflows, so the PR gate would never run on the
-      # candidate. Configure the ZUNO_UPSTREAM_SYNC_TOKEN secret (a fine-grained
-      # token with contents and pull-requests write on this repository) to get a
-      # fully automatic gate; without it the candidate PR still opens, and the
-      # summary explains how to start the gate by hand.
+      # Pushes, pull requests and merges made with the default GITHUB_TOKEN do
+      # not trigger `pull_request` workflows, so the PR gate would never run on
+      # the candidate and a merge completed by auto-merge queued with that token
+      # would never run `zuno-release.yml`. Configure the ZUNO_UPSTREAM_SYNC_TOKEN
+      # secret (a fine-grained token with contents and pull-requests write on
+      # this repository) to get a fully automatic gate and promotion; without it
+      # the candidate PR still opens, auto-merge is not queued, and the summary
+      # explains how to start the gate by hand. Issues are always handled with
+      # the default token, so the automation token needs no issues permission.
       - name: Push exact candidate branch
         if: steps.candidate.outputs.outcome == 'candidate'
         env:
@@ -313,6 +334,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.ZUNO_UPSTREAM_SYNC_TOKEN || github.token }}
           USING_DEFAULT_TOKEN: ${{ secrets.ZUNO_UPSTREAM_SYNC_TOKEN == '' }}
+          ISSUE_TOKEN: ${{ github.token }}
+          CANDIDATE_COMMIT: ${{ steps.finalize.outputs.candidate_commit }}
           HEAD_BRANCH: ${{ steps.plan.outputs.branch }}
           TARGET_TAG: ${{ steps.plan.outputs.target_tag }}
           TARGET_VERSION: ${{ steps.plan.outputs.target_version }}
@@ -335,7 +358,11 @@ jobs:
               print("No path overlap was detected by the pre-replay comparison.")
           else:
               print(f"{len(paths)} paths are modified on both sides (merged cleanly with the Codex baseline as merge base, or resolved by the rebrand replay below):")
-              print("\n".join(f"- `{path}`" for path in paths))
+              # GitHub rejects bodies over 65536 characters; the full list is in the plan output.
+              shown = paths[:200]
+              print("\n".join(f"- `{path}`" for path in shown))
+              if len(paths) > len(shown):
+                  print(f"- … and {len(paths) - len(shown)} more (see the workflow log)")
           only = plan["baseline_only_commits"]
           if only:
               print()
@@ -363,12 +390,20 @@ jobs:
           Zuno-Source-Commit: ${SOURCE_SHA}
           Zuno-Upstream-Tag: ${TARGET_TAG}
           Zuno-Upstream-Commit: ${UPSTREAM_COMMIT}
+          Zuno-Candidate-Commit: ${CANDIDATE_COMMIT}
           EOF
           )"
           if [[ -n "${EXISTING_PR}" ]]; then
+            pr_url="$(gh pr view "${EXISTING_PR}" --json url --jq .url)"
+            # Withdraw any auto-merge an earlier run queued before touching the
+            # PR: the branch head just changed, and if a later command in this
+            # step fails the PR must not keep a queue that would merge a head
+            # this run never cleared. A failed withdrawal aborts the step.
+            if [[ "$(gh pr view "${EXISTING_PR}" --json autoMergeRequest --jq '.autoMergeRequest != null')" == true ]]; then
+              gh pr merge "${pr_url}" --disable-auto
+            fi
             gh pr edit "${EXISTING_PR}" --body "${body}" --add-label "${CANDIDATE_LABEL}"
             gh pr comment "${EXISTING_PR}" --body "Refreshed the candidate: replayed main@\`${SOURCE_SHA}\` onto \`${TARGET_TAG}\`."
-            pr_url="$(gh pr view "${EXISTING_PR}" --json url --jq .url)"
           else
             pr_url="$(gh pr create \
               --base main \
@@ -389,7 +424,8 @@ jobs:
 
           # A clean replay supersedes any open conflict report for this release.
           if [[ -n "${CONFLICT_ISSUE}" ]]; then
-            gh issue close "${CONFLICT_ISSUE}" --comment "Superseded: main@\`${SOURCE_SHA}\` now replays cleanly onto \`${TARGET_TAG}\` in ${pr_url}."
+            GH_TOKEN="${ISSUE_TOKEN}" gh issue close "${CONFLICT_ISSUE}" --comment "Superseded: main@\`${SOURCE_SHA}\` now replays cleanly onto \`${TARGET_TAG}\` in ${pr_url}." \
+              || echo "::warning::could not close conflict issue #${CONFLICT_ISSUE}"
           fi
 
           # Close superseded candidates and conflict reports for OLDER releases
@@ -403,12 +439,13 @@ jobs:
           def key(v): return tuple(int(part) for part in v.split("."))
           sys.exit(0 if key(sys.argv[1]) < key(sys.argv[2]) else 1)
           PY
-                gh pr close "${stale}" --comment "Superseded by ${pr_url} (Codex ${TARGET_TAG} is now being synced)."
+                gh pr close "${stale}" --comment "Superseded by ${pr_url} (Codex ${TARGET_TAG} is now being synced)." \
+                  || echo "::warning::could not close superseded candidate PR #${stale}"
                 # Remove the branch too: an unmerged upstream-sync/* branch on
                 # origin would otherwise keep counting as an open candidate.
                 gh api -X DELETE "repos/${GH_REPO}/git/refs/heads/${branch}" >/dev/null || true
               done
-          gh issue list --state open --label "${CONFLICT_LABEL}" --json number,title \
+          GH_TOKEN="${ISSUE_TOKEN}" gh issue list --state open --label "${CONFLICT_LABEL}" --json number,title \
             --jq '.[] | select(.title | contains(env.TARGET_TAG) | not) | "\(.number) \(.title)"' \
             | while read -r stale title; do
                 [[ -n "${stale}" ]] || continue
@@ -419,7 +456,8 @@ jobs:
           def key(v): return tuple(int(part) for part in v.split("."))
           sys.exit(0 if key(sys.argv[1]) < key(sys.argv[2]) else 1)
           PY
-                gh issue close "${stale}" --comment "Superseded: Codex ${TARGET_TAG} is now being synced; its candidate is ${pr_url}."
+                GH_TOKEN="${ISSUE_TOKEN}" gh issue close "${stale}" --comment "Superseded: Codex ${TARGET_TAG} is now being synced; its candidate is ${pr_url}." \
+                  || echo "::warning::could not close superseded conflict issue #${stale}"
               done
 
           # Hands-off merge: with `[sync].automatic_merge = true` in
@@ -428,11 +466,13 @@ jobs:
           # is queued for GitHub auto-merge, so it merges (as a merge commit)
           # the moment zuno/pr-gate passes and promotion follows. The repository
           # must allow auto-merge and its main ruleset must not require a human
-          # review for this to complete. Every refresh first withdraws any
-          # auto-merge queued by an earlier run, so a candidate that stopped
-          # being fully automatic (or a flag flipped to false) cannot ride a
-          # stale queue into main.
-          gh pr merge "${pr_url}" --disable-auto >/dev/null 2>&1 || true
+          # review for this to complete, and the queue must be raised with the
+          # automation token: a merge that GitHub completes for an auto-merge
+          # queued by the default GITHUB_TOKEN raises a `pull_request: closed`
+          # event that starts no workflow, so `zuno-release.yml` would never
+          # promote it. The earlier queue was already withdrawn above, so a
+          # candidate that stopped being fully automatic (or a flag flipped to
+          # false) cannot ride a stale queue into main.
           automatic_merge="$(python3 -c 'import tomllib; print(str(tomllib.load(open("UPSTREAM_CODEX.toml", "rb")).get("sync", {}).get("automatic_merge", False)).lower())')"
           reused="$(python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1])).get("rebrand", {}).get("reused", [])))' "${REPORT}")"
           # Auto-merge is only safe while the main ruleset still requires the
@@ -444,6 +484,9 @@ jobs:
           elif [[ "${automatic_merge}" == true && "${gate_required}" != true ]]; then
             echo "Auto-merge not queued: the main ruleset does not require zuno/pr-gate, so auto-merge would merge without the gate." >> "${GITHUB_STEP_SUMMARY}"
             gh pr comment "${pr_url}" --body "Auto-merge was not queued: the \`main\` ruleset does not require the \`zuno/pr-gate\` status check, so GitHub would merge immediately instead of behind the gate. Restore the required check or merge this candidate by hand."
+          elif [[ "${automatic_merge}" == true && "${USING_DEFAULT_TOKEN}" == true ]]; then
+            echo "Auto-merge not queued: only the default GITHUB_TOKEN is available, and a merge it completes would not start zuno-release.yml." >> "${GITHUB_STEP_SUMMARY}"
+            gh pr comment "${pr_url}" --body "Auto-merge was not queued: only the default GITHUB_TOKEN is available, and a merge completed for a queue it raised would not trigger \`zuno-release.yml\`, so the release would silently never happen. Configure the \`ZUNO_UPSTREAM_SYNC_TOKEN\` repository secret for hands-off merges; until then merge this candidate by hand."
           elif [[ "${automatic_merge}" == true ]]; then
             if gh pr merge "${pr_url}" --auto --merge; then
               echo "Auto-merge queued: the candidate merges when zuno/pr-gate passes." >> "${GITHUB_STEP_SUMMARY}"
@@ -466,6 +509,13 @@ jobs:
           EXISTING_PR: ${{ steps.state.outputs.pr_number }}
         run: |
           set -euo pipefail
+          # A candidate that now needs a person must not keep an auto-merge that
+          # an earlier clean replay queued on its PR; withdraw it before anything
+          # else here can fail. A failed withdrawal aborts the step.
+          if [[ -n "${EXISTING_PR}" ]] && [[ "$(gh pr view "${EXISTING_PR}" --json autoMergeRequest --jq '.autoMergeRequest != null')" == true ]]; then
+            gh pr merge "${EXISTING_PR}" --disable-auto
+            gh pr comment "${EXISTING_PR}" --body "Auto-merge withdrawn: replaying main@\`${SOURCE_SHA}\` onto \`${TARGET_TAG}\` now conflicts, so this candidate waits for a person (see the conflict issue)."
+          fi
           files="$(python3 - <<'PY'
           import json
           import os
@@ -554,8 +604,3 @@ jobs:
           PY
                 gh issue close "${stale}" --comment "Superseded by ${issue_url}: Codex ${TARGET_TAG} is now being synced."
               done
-          # A candidate that now needs a person must not keep an auto-merge that
-          # an earlier clean replay queued on its PR.
-          if [[ -n "${EXISTING_PR}" ]]; then
-            gh pr merge "${EXISTING_PR}" --disable-auto >/dev/null 2>&1 || true
-          fi

@@ -108,6 +108,57 @@ class ApplyTest(unittest.TestCase):
             rebrand = zuno_rebrand.Rebrand.load(manifest)
         self.assertEqual(rebrand.apply("Codex Zuno", version=None, path=None), "Zuno Codex X")
 
+    def test_rust_text_spans_find_strings_and_comments(self) -> None:
+        spans = zuno_rebrand.rust_text_spans
+        self.assertEqual(spans('let a: Codex = x; // Codex here'), [(18, 31)])
+        self.assertEqual(spans('let s = "Codex \\" quoted"; let c: Codex = y;'), [(9, 24)])
+        self.assertEqual(spans("let q = '\"'; let c: Codex = y; // tail"), [(31, 38)])
+        self.assertEqual(spans("let lt: &'a Codex = y;"), [])
+        self.assertEqual(spans('let raw = r#"Codex starts'), [(13, 25)])
+        self.assertEqual(spans("and continues Codex here"), [])
+        self.assertEqual(spans('url("https://x/a//b") // Codex'), [(5, 19), (22, 30)])
+
+    def test_text_only_apply_keeps_code_and_rebrands_strings_and_comments(self) -> None:
+        text = (
+            'let agent: Codex = Codex::new(); // Codex boots\n'
+            'eprintln!("Codex updated in CODEX_HOME");\n'
+            "Restart Codex to continue.\n"
+        )
+        self.assertEqual(
+            rules().apply(text, version=None, path="codex-rs/tui/src/x.rs", text_only=True),
+            'let agent: Codex = Codex::new(); // Zuno boots\n'
+            'eprintln!("Zuno updated in ZUNO_HOME");\n'
+            "Restart Codex to continue.\n",
+        )
+        # Non-source paths ignore the flag entirely.
+        self.assertEqual(
+            rules().apply("Restart Codex.\n", version=None, path="docs/x.md", text_only=True),
+            "Restart Zuno.\n",
+        )
+
+    def test_rebrand_new_text_guards_only_lines_upstream_added(self) -> None:
+        base = 'const A: u8 = 1;\nlet banner = "Codex is ready";\nRestart Codex.\n'
+        upstream = (
+            'const A: u8 = 2;\nlet banner = "Codex is ready";\nRestart Codex.\n'
+            "let agent: Codex = spawn(); // Codex boots\n"
+        )
+        # Lines that existed in the base were validated by the predicate and are
+        # rebranded in full even outside string literals (a multi-line literal
+        # continuation, say); only the new line is guarded.
+        result, guarded = zuno_rebrand.rebrand_new_text(
+            rules(), base, upstream, version=None, path="codex-rs/tui/src/x.rs"
+        )
+        self.assertTrue(guarded)
+        self.assertEqual(
+            result,
+            'const A: u8 = 2;\nlet banner = "Zuno is ready";\nRestart Zuno.\n'
+            "let agent: Codex = spawn(); // Zuno boots\n",
+        )
+        result, guarded = zuno_rebrand.rebrand_new_text(
+            rules(), base, 'let banner = "Codex is ready";\nRun codex now\n', version=None, path="x.md"
+        )
+        self.assertEqual((result, guarded), ('let banner = "Zuno is ready";\nRun zuno now\n', False))
+
     def test_manifest_validation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manifest = Path(directory) / "rules.toml"
@@ -131,6 +182,29 @@ class ResolveTest(unittest.TestCase):
         )
         self.assertEqual(resolved, "a\nRun `zuno login` now.\nc\n")
         self.assertEqual((report.resolved, report.remaining), (1, 0))
+
+    def test_new_upstream_code_lines_keep_identifiers_in_resolved_hunks(self) -> None:
+        # The base line is proven rename-only (a string literal); the line upstream
+        # added mentions Codex as a type, which the rules must not turn into code.
+        text = hunk(
+            'let banner = "Codex is ready";\nlet agent: Codex = spawn(); // Codex boots\n',
+            'let banner = "Codex is ready";\n',
+            'let banner = "Zuno is ready";\n',
+        )
+        resolved, report = zuno_rebrand.resolve_conflicts(
+            text, rules(), path="codex-rs/tui/src/x.rs", source_version=None, target_version=None
+        )
+        self.assertEqual(
+            resolved, 'let banner = "Zuno is ready";\nlet agent: Codex = spawn(); // Zuno boots\n'
+        )
+        self.assertEqual((report.resolved, report.remaining, report.guarded), (1, 0, 1))
+        # Outside source files nothing is guarded.
+        text = hunk("Codex is ready\nmeet Codex\n", "Codex is ready\n", "Zuno is ready\n")
+        resolved, report = zuno_rebrand.resolve_conflicts(
+            text, rules(), path="docs/x.md", source_version=None, target_version=None
+        )
+        self.assertEqual(resolved, "Zuno is ready\nmeet Zuno\n")
+        self.assertEqual(report.guarded, 0)
 
     def test_semantic_hunk_keeps_its_markers_and_labels(self) -> None:
         text = "a\n" + hunk("new logic\n", "old\n", "zuno logic\n") + "c\n"

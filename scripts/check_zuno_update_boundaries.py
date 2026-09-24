@@ -18,7 +18,9 @@ def require(path: str, needle: str) -> None:
 
 def reject(path: str, needle: str) -> None:
     if needle in text(path):
-        raise SystemExit(f"{path} still contains reachable Codex update target: {needle}")
+        raise SystemExit(
+            f"{path} still contains reachable Codex update target: {needle}"
+        )
 
 
 def runtime_text(path: str) -> str:
@@ -29,7 +31,9 @@ def runtime_text(path: str) -> str:
 
 def reject_runtime(path: str, needle: str) -> None:
     if needle in runtime_text(path):
-        raise SystemExit(f"{path} still contains reachable inherited behavior: {needle}")
+        raise SystemExit(
+            f"{path} still contains reachable inherited behavior: {needle}"
+        )
 
 
 def function_body(path: str, signature: str) -> str:
@@ -54,9 +58,13 @@ def main() -> int:
     guard = lifecycle_body.split("ensure_supported_platform()?", 1)[0]
     for variant in ["Start", "Restart", "Stop"]:
         if f"LifecycleCommand::{variant}" not in guard:
-            raise SystemExit(f"public daemon {variant} does not fail closed before filesystem access")
+            raise SystemExit(
+                f"public daemon {variant} does not fail closed before filesystem access"
+            )
     if "LifecycleCommand::Version" in guard:
-        raise SystemExit("read-only daemon Version was accidentally blocked as a mutation")
+        raise SystemExit(
+            "read-only daemon Version was accidentally blocked as a mutation"
+        )
     require(daemon, "zuno_blocks_managed_daemon_mutations_before_filesystem_access")
     for signature in [
         "pub async fn bootstrap(",
@@ -69,7 +77,16 @@ def main() -> int:
         body = function_body(daemon, signature)
         disabled = body.find("zuno_managed_daemon_disabled()")
         mutation = min(
-            (position for token in ["ensure_supported_platform()?", "Daemon::from_environment()?", "update_loop::run(", "update_loop::request_manual_update("] if (position := body.find(token)) >= 0),
+            (
+                position
+                for token in [
+                    "ensure_supported_platform()?",
+                    "Daemon::from_environment()?",
+                    "update_loop::run(",
+                    "update_loop::request_manual_update(",
+                ]
+                if (position := body.find(token)) >= 0
+            ),
             default=len(body),
         )
         if disabled < 0 or disabled > mutation:
@@ -81,7 +98,9 @@ def main() -> int:
         raise SystemExit("zuno app does not return the fixed disabled-state error")
     for forbidden in ["canonicalize", "run_app_open_or_install", "crate::desktop_app"]:
         if forbidden in runtime_text(app_cmd):
-            raise SystemExit(f"zuno app can still reach inherited installer behavior: {forbidden}")
+            raise SystemExit(
+                f"zuno app can still reach inherited installer behavior: {forbidden}"
+            )
     require(app_cmd, "zuno_app_refuses_paths_and_download_urls_before_side_effects")
     reject("codex-rs/cli/src/main.rs", "mod desktop_app;")
 
@@ -94,7 +113,10 @@ def main() -> int:
     ]:
         require(workflow, "if: github.repository == 'openai/codex'")
 
-    require("codex-rs/tui/src/update_action.rs", "pub(crate) fn from_install_context(_context")
+    require(
+        "codex-rs/tui/src/update_action.rs",
+        "pub(crate) fn from_install_context(_context",
+    )
     require("codex-rs/tui/src/update_action.rs", "None")
     require("codex-rs/cli/src/main.rs", "Automatic Zuno update is disabled")
     tui_updates = "codex-rs/tui/src/updates.rs"
@@ -131,15 +153,29 @@ def main() -> int:
         reject("codex-rs/tui/assets/tooltips.txt", forbidden)
 
     doctor_boundaries = {
-        "codex-rs/cli/src/doctor.rs": ["rerun zuno doctor", "Run zuno login", "no Zuno credentials"],
+        "codex-rs/cli/src/doctor.rs": [
+            "rerun zuno doctor",
+            "Run zuno login",
+            "no Zuno credentials",
+        ],
         "codex-rs/cli/src/doctor/background.rs": ["Run zuno app-server daemon version"],
         "codex-rs/cli/src/doctor/runtime.rs": ["bundled Zuno package"],
         "codex-rs/cli/src/doctor/desktop.rs": ["rerun zuno doctor"],
-        "codex-rs/cli/src/doctor/sandbox.rs": ["run zuno sandbox setup", "Zuno sandbox rules"],
-        "codex-rs/cli/src/doctor/network.rs": ["`zuno features enable respect_system_proxy`"],
+        "codex-rs/cli/src/doctor/sandbox.rs": [
+            "run zuno sandbox setup",
+            "Zuno sandbox rules",
+        ],
+        "codex-rs/cli/src/doctor/network.rs": [
+            "`zuno features enable respect_system_proxy`"
+        ],
         "codex-rs/cli/src/doctor/git.rs": ["Zuno can inspect repository metadata"],
-        "codex-rs/cli/src/doctor/security.rs": ["Zuno exclusions", "Zuno executable and compatibility-helper exclusions"],
-        "codex-rs/cli/src/doctor/thread_inventory.rs": ["Start Zuno with no state DB present"],
+        "codex-rs/cli/src/doctor/security.rs": [
+            "Zuno exclusions",
+            "Zuno executable and compatibility-helper exclusions",
+        ],
+        "codex-rs/cli/src/doctor/thread_inventory.rs": [
+            "Start Zuno with no state DB present"
+        ],
         "codex-rs/cli/src/doctor/output.rs": ["Zuno Doctor", "Run zuno doctor"],
     }
     for path, required in doctor_boundaries.items():
@@ -189,7 +225,7 @@ def main() -> int:
     )
     release = ".github/workflows/zuno-release.yml"
     require(release, "Download exact sealed candidate artifact")
-    require(release, "git merge-base --is-ancestor \"$EXPECTED_HEAD_SHA\"")
+    require(release, 'git merge-base --is-ancestor "$EXPECTED_HEAD_SHA"')
     require(release, "candidate_run_attempt:")
     require(release, "candidate_artifact_id:")
     reject(release, "[.pull_requests[].number]")
@@ -203,7 +239,7 @@ def main() -> int:
         "-c user.email='41898282+github-actions[bot]@users.noreply.github.com'",
     )
     require(release, 'credential_file="${RUNNER_TEMP}/zuno-release-git-credential"')
-    require(release, 'trap \'rm -f "${credential_file}"\' EXIT')
+    require(release, "trap 'rm -f \"${credential_file}\"' EXIT")
     require(release, 'chmod 600 "$credential_file"')
     require(release, "-c credential.helper= \\")
     require(release, '-c credential.helper="store --file=${credential_file}"')
@@ -211,6 +247,8 @@ def main() -> int:
     require(upstream_sync, 'plan_path="${RUNNER_TEMP}/upstream-plan.json"')
     reject(upstream_sync, "> upstream-plan.json")
     reject(upstream_sync, "base_branch:")
+    # The watcher must verify the chosen tag against openai/codex, never trust local tags.
+    reject(upstream_sync, "--trust-local-tags")
     require(upstream_sync, "ref: main")
     require(upstream_sync, "persist-credentials: false")
     require(upstream_sync, "Push exact candidate branch")
@@ -230,7 +268,10 @@ def main() -> int:
     inspect_at = sync_text.index("name: Inspect existing candidate and conflict report")
     prepare_at = sync_text.index("name: Prepare isolated candidate")
     push_at = sync_text.index("name: Push exact candidate branch")
-    if "GH_TOKEN" in sync_text[:inspect_at] or "GH_TOKEN" in sync_text[prepare_at:push_at]:
+    if (
+        "GH_TOKEN" in sync_text[:inspect_at]
+        or "GH_TOKEN" in sync_text[prepare_at:push_at]
+    ):
         raise SystemExit("upstream sync exposes a token to a fetch or replay step")
     reject(upstream_sync, "persist-credentials: true")
     require(upstream_sync, "check \\\n            --allow-current")
@@ -241,7 +282,9 @@ def main() -> int:
     merges = [m.start() for m in re.finditer(r"gh pr merge ", sync_text)]
     queue = 'gh pr merge "${pr_url}" --auto --merge'
     if sync_text.count(queue) != 1:
-        raise SystemExit("upstream sync must contain exactly one guarded auto-merge queue command")
+        raise SystemExit(
+            "upstream sync must contain exactly one guarded auto-merge queue command"
+        )
     for start in merges:
         snippet = sync_text[start : start + 60]
         if not snippet.startswith(queue) and "--disable-auto" not in snippet:
@@ -249,18 +292,63 @@ def main() -> int:
     merge_at = sync_text.index(queue)
     guard = sync_text[max(0, merge_at - 400) : merge_at]
     if 'elif [[ "${automatic_merge}" == true ]]' not in guard:
-        raise SystemExit("the auto-merge queue in upstream sync is not guarded by [sync].automatic_merge")
+        raise SystemExit(
+            "the auto-merge queue in upstream sync is not guarded by [sync].automatic_merge"
+        )
     for needle in [
         '"${reused}" != 0',
         '"${gate_required}" != true',
+        'elif [[ "${automatic_merge}" == true && "${USING_DEFAULT_TOKEN}" == true ]]',
         'gh pr merge "${pr_url}" --disable-auto',
         'gh pr merge "${EXISTING_PR}" --disable-auto',
+        # The state step withdraws a queue whose PR head is not the commit the
+        # watcher recorded, on every run including the ones that skip.
+        'gh pr merge "${pr_number}" --disable-auto',
+        '"${pr_head}" != "${pr_candidate}"',
+        "Zuno-Candidate-Commit: ${CANDIDATE_COMMIT}",
     ]:
         require(upstream_sync, needle)
-    if "tomllib.load(open(\"UPSTREAM_CODEX.toml\", \"rb\")).get(\"sync\", {}).get(\"automatic_merge\", False)" not in sync_text:
-        raise SystemExit("upstream sync must read automatic_merge from UPSTREAM_CODEX.toml")
-    if sync_text.count("--auto ") != 1 or "--squash" in sync_text or "--rebase" in sync_text or "--admin" in sync_text:
-        raise SystemExit("upstream sync may only queue a merge-commit auto-merge; no squash, rebase or admin merges")
+    # The PR step withdraws the earlier queue before any command that can fail
+    # (closing superseded PRs and issues), so a failure cannot leave a stale queue.
+    withdraw_at = sync_text.index('gh pr merge "${pr_url}" --disable-auto')
+    if withdraw_at > sync_text.index(
+        'gh issue close "${CONFLICT_ISSUE}"'
+    ) or withdraw_at > sync_text.index('gh pr close "${stale}"'):
+        raise SystemExit(
+            "upstream sync must withdraw a stale auto-merge before closing superseded PRs and issues"
+        )
+    # A withdrawal that fails must abort the step, never be swallowed: a stale
+    # queue would otherwise merge a head this run never cleared.
+    if (
+        "--disable-auto >/dev/null" in sync_text
+        or "--disable-auto || true" in sync_text
+    ):
+        raise SystemExit("upstream sync must not ignore a failed auto-merge withdrawal")
+    # Issues are closed with the default token so the automation token needs no
+    # issues permission; the conflict step already runs under the default token.
+    if (
+        sync_text.count('GH_TOKEN="${ISSUE_TOKEN}" gh issue close') != 2
+        or sync_text.count("gh issue close") != 3
+    ):
+        raise SystemExit(
+            "upstream sync must close issues from the PR step with the default token"
+        )
+    if (
+        'tomllib.load(open("UPSTREAM_CODEX.toml", "rb")).get("sync", {}).get("automatic_merge", False)'
+        not in sync_text
+    ):
+        raise SystemExit(
+            "upstream sync must read automatic_merge from UPSTREAM_CODEX.toml"
+        )
+    if (
+        sync_text.count("--auto ") != 1
+        or "--squash" in sync_text
+        or "--rebase" in sync_text
+        or "--admin" in sync_text
+    ):
+        raise SystemExit(
+            "upstream sync may only queue a merge-commit auto-merge; no squash, rebase or admin merges"
+        )
     # gh infers the repo from git remotes and prefers one named `upstream`; the
     # sync checkout adds exactly that remote for openai/codex.
     require(upstream_sync, "GH_REPO: ${{ github.repository }}")

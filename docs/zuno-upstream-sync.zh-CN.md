@@ -7,8 +7,8 @@ Zuno 的版本号跟随 Codex，release 按顺序逐个重放，每个 Codex rel
 
 流水线只有一道评审门：合并候选 PR。`UPSTREAM_CODEX.toml` 的 `[sync].automatic_merge = true`
 （默认）让重放完全自动的候选排入 GitHub auto-merge，PR 门禁通过即合入，干净的 Codex release
-无需任何人就成为 Zuno release（所需的两项仓库设置见下文"免人工模式"）。需要人工解决冲突的
-候选等待人工合并。合并前后全部自动。
+无需任何人就成为 Zuno release（所需的仓库 secret 与两项仓库设置见下文"免人工模式"）。需要
+人工解决冲突的候选等待人工合并。合并前后全部自动。
 
 ```text
 openai/codex 打标签 rust-vX.Y.Z
@@ -21,7 +21,9 @@ zuno-upstream-sync.yml ── 重放无冲突 ──▶ 分支 upstream-sync/X.Y
             本地解决后推送分支              签署并封存六个平台包
                                                    │
                                                    ▼
-                                        人工评审 + 选择 "Create a merge commit"
+                                    评审门：免人工 auto-merge（重放完全自动且
+                                    [sync].automatic_merge）或由人选择
+                                    "Create a merge commit"
                                                    │
                                                    ▼
                                         zuno-release.yml（pull_request: closed）
@@ -72,11 +74,16 @@ zuno-upstream-sync.yml ── 重放无冲突 ──▶ 分支 upstream-sync/X.Y
 合并提交合入，`zuno-release.yml` 随即晋升封存字节。"完全自动"指重放没有人工解决冲突，也没有
 从人工解决过的候选复制任何内容（`--reuse`）；这类候选，以及开关为 `false` 时的所有候选，都
 等待人工合并。每次刷新都会先撤回上一轮排下的 auto-merge 再重新判定，所以不再完全自动的候选
-（或开关改成 `false`）不会搭着旧队列进 `main`；重放撞上冲突时同样撤回。只有 `main` 的 ruleset
-仍要求 `zuno/pr-gate` 时巡检才排队，否则没有待定的必需检查，`--auto` 会立刻合并。两项仓库
-设置决定免人工路径能否走通，由仓库所有者决定：必须开启 **Allow auto-merge**，且 `main` 的
-ruleset 不能要求人工评审（要求 code owner 评审时自动合并会等那次批准）。GitHub 拒绝排队时巡检
-会在 PR 上留言，候选等待人工合并。
+（或开关改成 `false`）不会搭着旧队列进 `main`；重放撞上冲突时同样撤回。队列只对巡检推送的
+那个精确 head 有效（记录在 PR 正文的 `Zuno-Candidate-Commit`）：协作者向分支推送时 GitHub 会
+保留 auto-merge，所以每一轮巡检（包括本来会跳过的那些）一旦发现 PR head 不是该提交就撤回队列并
+在 PR 上说明。只有 `main` 的 ruleset 仍要求 `zuno/pr-gate` 时巡检才排队，否则没有待定的必需检查，
+`--auto` 会立刻合并；并且只有配置了 `ZUNO_UPSTREAM_SYNC_TOKEN` secret 时才排队：用默认
+`GITHUB_TOKEN` 排下的队列被 GitHub 合并时，产生的 `pull_request: closed` 事件不会启动任何
+workflow，`zuno-release.yml` 永远不会晋升它，发布会静默缺失。三项仓库决定共同决定免人工路径能否
+走通，由仓库所有者做出：该 secret（见"让门禁全自动的仓库密钥"）、开启 **Allow auto-merge**、以及
+`main` 的 ruleset 不要求人工评审（要求 code owner 评审时自动合并会等那次批准）。任一缺失，或
+GitHub 拒绝排队时，巡检会在 PR 上留言，候选等待人工合并。
 
 放弃某个候选时请删除其分支（关闭 PR 后 `git push origin --delete upstream-sync/X.Y.Z`）：巡检把
 `origin` 上所有未合入的 `upstream-sync/*` 分支都当作开放候选，会一直优先于更旧的 release。
@@ -104,7 +111,10 @@ Zuno 差量的大部分是对用户可见 Codex 文案的改名（产品名、`Z
 新文案同样会被改名，`${version}` 占位也会挪到新 release。上游在清单 `[[added]]` 作用域内
 **新增**的文件（目前是 TUI 的 `.snap`）不经谓词直接改名：它们是渲染文本，源码已经写着 Zuno。
 注意 `zuno/pr-gate` 只跑少数定向 TUI 测试，改错的快照要到全量 `cargo test -p codex-tui`
-（见"本地解决冲突"）才会暴露，而不是在门禁里；改写从不触及源码。其余 Zuno 差量之外的文件永不
+（见"本地解决冲突"）才会暴露，而不是在门禁里。源码永不改名：`.rs` 文件里上游新增的行（没有任何
+谓词为它们担保）只在字符串字面量和 `//` 注释内改名，所以新出现的裸 `Codex` 类型或 `CODEX_HOME`
+常量保持上游原样，而不会变成门禁可能编译不到的代码；这类文件在 PR 里列为 `guarded`。基线里已有
+的行则按谓词证明的结果完整改名。其余 Zuno 差量之外的文件永不
 改写；规则会改动其新上游文本的路径会以 `drift` 列在 JSON 报告里供审阅。若规则真的碰到了刷新
 的 `.rs` 文件里的标识符，会编译失败并被门禁抓住。
 
@@ -178,30 +188,44 @@ finalize 之前先跑 TUI 全量测试（`cargo test -p codex-tui`，PR 门禁�
 
 ## 让门禁全自动的仓库密钥
 
-用默认 `GITHUB_TOKEN` 打开的 PR 不会触发 `pull_request` workflow，因此
-`zuno/pr-gate` 不会自动跑在候选上。请创建一个仅限本仓库的 fine-grained personal
-access token，授予 **Contents: read and write** 与 **Pull requests: read and
-write**，存为仓库 secret `ZUNO_UPSTREAM_SYNC_TOKEN`。巡检只在推送与开 PR 两步使用它。
-没有该 secret 时候选 PR 仍会打开，巡检会留言说明，关闭再重新打开 PR（或向分支推送）
-即可手动启动门禁。
+默认 `GITHUB_TOKEN` 产生的事件不会启动任何 workflow：它打开的 PR 不会跑 `zuno/pr-gate`，
+它排队的 auto-merge 被 GitHub 合并后也不会跑 `zuno-release.yml`。请创建一个仅限本仓库的
+fine-grained personal access token，授予 **Contents: read and write** 与 **Pull requests:
+read and write**（不需要 issues 权限；issue 始终用默认 token 处理），存为仓库 secret
+`ZUNO_UPSTREAM_SYNC_TOKEN`。巡检只在推送与开 PR 两步使用它。没有该 secret 时候选 PR 仍会
+打开，巡检会留言说明且不排队 auto-merge，关闭再重新打开 PR（或向分支推送）即可手动启动门禁；
+之后的合并与晋升 dispatch 也都是手动。
+
+该 token 暴露给的步骤运行在已经执行过候选树（包括上游 release 的构建脚本，派生产物用 `cargo`
+重新生成）的同一 runner 上。被攻破的 Codex release 因而可能拿到它；token 仅限本仓库，而同一个
+release 本来也会经门禁进入 `main`，所以残余风险是对非保护分支的推送权限。把巡检拆成无 token 的
+prepare job 与持有 token 的 publish job 可以消除它。
 
 ## 手动控制
 
 - 立即巡检：**Actions → Prepare Codex upstream sync → Run workflow**（可指定精确标签）。
 - 重新准备已打开的候选：以 `refresh = true` 触发。
-- 暂停自动化：在 Actions 页面禁用这两个 workflow 即可，无需改其他配置。
+- 暂停自动化：**先**在 `main` 上把 `[sync].automatic_merge` 改为 `false`（或对每个开放候选执行
+  `gh pr merge <候选> --disable-auto`），再到 Actions 页面禁用这两个 workflow。禁用 workflow 不会
+  取消已经排队的 auto-merge：门禁一过 GitHub 仍会合并候选，而晋升 workflow 已被禁用，不会有发布。
+- 离线演练：`--trust-local-tags` 跳过"所选标签必须由 openai/codex 发布"的校验。巡检永不传它。
 - 巡检始终检出并重放 `main`，即使从其他分支手动触发也是如此；对巡检本身的改动要合并后才生效。
 
 ## 不变量
 
 - 同步过程永不修改 `main` 与当前 worktree。
 - 候选总是从干净的 `main` 准备；源脏则中止。
-- 重放前校验精确的上游标签、提交与 tree。Codex 每个 release 都在独立的短分支上切出，
-  因此目标通常是基线的兄弟而非后代；两者必须共享历史，仅存在于旧 release 分支上的
-  提交会列在 PR 里。
+- 重放前校验精确的上游标签、提交与 tree，且所选标签必须指向 `openai/codex` 为它发布的提交：
+  标签抓取到同一个命名空间，只存在于本 fork `origin` 上的 `rust-vX.Y.Z` 会被拒绝，而不是当作
+  Codex release 合并并发布。Codex 每个 release 都在独立的短分支上切出，因此目标通常是基线的
+  兄弟而非后代；两者必须共享历史，仅存在于旧 release 分支上的提交会列在 PR 里。
 - release 按顺序重放（`policy: next`），一次一个候选，每个 Codex release 都对应一个 Zuno
   release；`policy: newest` 是显式选择跳过中间版本。
-- 合并就是评审门。免人工模式只会排队重放完全自动的候选；任何经人手的候选都等人合并。
-- 自动化只在 `FORK_REBRAND.toml` 能从 Codex 基线逐字节复现 Zuno 侧时解决一个冲突块；其余
-  冲突块都等待人工。`main` 前进时复用已评审的合并后编辑，而不是重新推导。
+- 合并就是评审门。免人工模式只会排队重放完全自动的候选，只在有自动化 token 时排队，且只对巡检
+  推送的精确 head 有效；任何经人手的候选都等人合并。
+- 自动化只在 `FORK_REBRAND.toml` 能从 Codex 基线逐字节复现 Zuno 侧时解决一个冲突块，或者该块
+  只是 `codex-rs/Cargo.toml` 的工作区 `version` 一行（Zuno 版本跟随 Codex 版本）；其余冲突块都
+  等待人工。源码永不改名。`main` 前进时复用已评审的合并后编辑，而不是重新推导；若期间 `main` 上
+  的 `FORK_REBRAND.toml` 本身变了，复用的路径反映的是上一候选的规则，并按人工解决计入，候选因而
+  等人合并。
 - 评审后的字节不再重新构建；晋升只是重新发布 PR gate 封存的产物。

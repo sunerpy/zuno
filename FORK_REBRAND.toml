@@ -9,11 +9,18 @@
 # reports how much of the Zuno delta the rules currently reproduce.
 #
 # Rules run per line, in order. `replace` is literal text (no regex group
-# references or escapes) and is never matched again by a later rule. Files that upstream adds under an `[[added]]` scope are rebranded
-# without the predicate (there is no Zuno text to compare against): they are
-# rendered-text snapshots whose source already says Zuno, so the PR gate's
-# snapshot tests catch anything the rules got wrong. `${version}` in `replace` expands to the workspace version of the
-# tree being produced (`codex-rs/Cargo.toml`). When a rule shortens or lengthens
+# references or escapes) and is never matched again by a later rule. Source code
+# is never renamed: in a `.rs` file the lines upstream added (which no predicate
+# vouches for) are rewritten only inside string literals and `//` comments, so a
+# new bare `Codex` type stays as upstream wrote it (reported as `guarded`).
+# Files that upstream adds under an `[[added]]` scope are rebranded without the
+# predicate (there is no Zuno text to compare against): they are rendered-text
+# snapshots whose source already says Zuno. The PR gate runs only a few targeted
+# TUI tests, so a wrong rewrite there is caught by the candidate diff review or
+# the next full `cargo test -p codex-tui`, not by the gate; keep `[[added]]`
+# scopes to rendered text. `${version}` in `replace` expands to the workspace
+# version of the tree being produced (`codex-rs/Cargo.toml`). When a rule
+# shortens or lengthens
 # a line that ends in padding (trailing spaces, spaces before a closing `"`,
 # `",` or `│`), the padding is adjusted so the rendered width is unchanged,
 # which is how the TUI snapshots were rebranded.
