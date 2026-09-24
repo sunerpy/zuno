@@ -50,11 +50,12 @@ jobs:
       - name: Install actionlint
         shell: bash
         run: |
-          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.11
-          actionlint_bin="$(go env GOBIN)"
-          if [[ -z "$actionlint_bin" ]]; then
-            actionlint_bin="$(go env GOPATH)/bin"
-          fi
+          set -euo pipefail
+          # The CodeBuild image sets a multi-entry GOPATH, so pin GOBIN instead
+          # of deriving the install directory from `go env`.
+          actionlint_bin="${RUNNER_TEMP}/actionlint-bin"
+          mkdir -p "$actionlint_bin"
+          GOBIN="$actionlint_bin" go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.11
           "$actionlint_bin/actionlint" -version
           echo "$actionlint_bin" >> "$GITHUB_PATH"
       - name: Install Linux sandbox build dependencies
@@ -141,6 +142,11 @@ jobs:
       contents: read
       id-token: write
       attestations: write
+    env:
+      # The CodeBuild large instances have 8 vCPUs but 15 GB; eight parallel
+      # LTO rustc processes were OOM-killed, so mirror the 4-job budget of the
+      # GitHub-hosted runners this gate used to run on.
+      CARGO_BUILD_JOBS: "4"
     strategy:
       fail-fast: false
       matrix:
@@ -182,14 +188,36 @@ jobs:
             os: windows
             smoke: layout
     steps:
+      # The CodeBuild Windows work tree sits under a long prefix and the image
+      # does not enable long paths, so the checkout would fail on the TUI
+      # snapshot file names.
+      - name: Enable long paths for Git (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          git config --system core.longpaths true
+          git config --global core.longpaths true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ env.SOURCE_SHA }}
           persist-credentials: false
+      # setup-python has no builds for Amazon Linux, which is what the ARM64
+      # runner image is; install the distribution's Python 3.12 there instead.
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        if: matrix.image != 'image:arm-3.0'
         with:
           python-version: "3.13"
           architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+      - name: Install Python 3.12 from Amazon Linux
+        if: matrix.image == 'image:arm-3.0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo dnf install -y python3.12
+          sudo ln -sf /usr/bin/python3.12 /usr/local/bin/python3
+          sudo ln -sf /usr/bin/python3.12 /usr/local/bin/python
+          hash -r
+          python3 --version
       - uses: ./.github/actions/setup-ci
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
@@ -254,17 +282,19 @@ jobs:
           SMOKE: ${{ matrix.smoke }}
         run: |
           set -euo pipefail
-          extra=()
+          # macOS ships bash 3.2, where an empty array trips `set -u`; keep the
+          # optional flag in a plain variable.
+          extra=""
           if [[ "$SMOKE" == layout ]]; then
             # Cross-built for an architecture this runner cannot execute: verify
             # the archive layout and the machine type of every binary instead.
-            extra=(--layout-only)
+            extra="--layout-only"
           fi
           python3 scripts/smoke_zuno_package.py \
             --archive "codex-rs/dist/${TARGET}/zuno-package-${TARGET}.tar.gz" \
             --target "$TARGET" \
             --report "codex-rs/dist/${TARGET}/smoke-${TARGET}.json" \
-            "${extra[@]}"
+            $extra
       - name: Smoke external Agent host sandbox
         if: matrix.os == 'linux'
         working-directory: codex-rs
@@ -305,6 +335,8 @@ jobs:
       attestations: write
     env:
       STANDALONE_TARGET: x86_64-unknown-linux-musl
+      # See the package job: 15 GB does not fit eight parallel LTO rustc jobs.
+      CARGO_BUILD_JOBS: "4"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
