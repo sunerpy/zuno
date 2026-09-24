@@ -220,7 +220,7 @@ mod tests {
         let prompt = json!([
             {"type":"text","text":"inspect"},
             {"type":"image","mimeType":"image/png","data":"aGVsbG8="},
-            {"type":"image","mimeType":"image/png","data":"ignored","uri":"https://example.invalid/a.png"},
+            {"type":"image","mimeType":"image/png","data":"aGk=","uri":"https://example.invalid/a.png"},
             {"type":"resource_link","name":"spec","uri":"file:///tmp/spec.md"},
             {"type":"resource_link","uri":"file:///tmp/notes/plan.md"},
             {"type":"resource","resource":{"uri":"file:///tmp/ctx.txt","mimeType":"text/plain","text":"context"}},
@@ -231,8 +231,9 @@ mod tests {
         assert_eq!(mapped.len(), 8);
         assert_eq!(mapped[0]["type"], "text");
         assert_eq!(mapped[1]["url"], "data:image/png;base64,aGVsbG8=");
-        // A fetchable image URI is passed through instead of re-encoding the data.
-        assert_eq!(mapped[2]["url"], "https://example.invalid/a.png");
+        // An optional `uri` never replaces the bytes: App Server rejects remote
+        // image URLs, so the client's data is always inlined.
+        assert_eq!(mapped[2]["url"], "data:image/png;base64,aGk=");
         // Links keep the same shape the official codex-acp adapter produces so
         // prompts behave identically across Codex ACP agents.
         assert_eq!(mapped[3]["text"], "[@spec](file:///tmp/spec.md)");
@@ -337,10 +338,28 @@ mod tests {
         assert_eq!(started[0]["name"], "shell");
         let spawned = notification_updates(
             "item/started",
-            &json!({"item":{"type":"collabAgentToolCall","id":"call-2","tool":"spawn_agent"}}),
+            &json!({"item":{"type":"collabAgentToolCall","id":"call-2","tool":"spawnAgent"}}),
         );
         assert_eq!(spawned[0]["name"], "spawn_agent");
         assert_eq!(spawned[0]["kind"], "think");
+        // Other collab tools keep their own names so clients do not mistake a
+        // wait or close for a newly spawned sub-agent.
+        for (wire, expected) in [
+            ("wait", "wait"),
+            ("closeAgent", "close_agent"),
+            ("sendInput", "send_input"),
+        ] {
+            let update = notification_updates(
+                "item/started",
+                &json!({"item":{"type":"collabAgentToolCall","id":"call-x","tool":wire}}),
+            );
+            assert_eq!(update[0]["name"], expected, "{wire}");
+        }
+        let activity = notification_updates(
+            "item/started",
+            &json!({"item":{"type":"subAgentActivity","id":"act-1","kind":"started","agentThreadId":"t","agentPath":"a"}}),
+        );
+        assert_eq!(activity[0]["name"], "sub_agent_activity");
         let mcp = notification_updates(
             "item/started",
             &json!({"item":{"type":"mcpToolCall","id":"call-3","server":"docs","tool":"search"}}),

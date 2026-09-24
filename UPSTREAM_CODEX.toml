@@ -20,8 +20,9 @@ candidate_only = true
 # true: a candidate whose replay was fully automatic (no manual conflict
 # resolution, nothing carried over from a hand-resolved candidate) is queued for
 # GitHub auto-merge and merges (merge commit) once zuno/pr-gate passes, so every
-# clean Codex release becomes a Zuno release without a person. Requires the
-# repository to allow auto-merge and a main ruleset without a required review;
-# otherwise the watcher leaves a comment and the candidate waits for a manual
-# merge. false: merging every candidate PR is a manual review step.
+# clean Codex release becomes a Zuno release without a person. The watcher only
+# queues when the main ruleset still requires zuno/pr-gate; GitHub completes the
+# merge only if the repository allows auto-merge and the ruleset requires no
+# human review. In every other case the watcher leaves a comment and the
+# candidate waits for a manual merge. false: every candidate PR is merged by hand.
 automatic_merge = true

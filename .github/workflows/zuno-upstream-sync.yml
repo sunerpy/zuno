@@ -3,15 +3,16 @@ name: Prepare Codex upstream sync
 # Watches openai/codex for new stable `rust-vX.Y.Z` releases and keeps exactly
 # one review PR per release current against `main`, replaying releases in
 # order so every Codex release becomes a Zuno release. Merging the candidate PR
-# is the review gate: manual by default, or queued for GitHub auto-merge behind
-# the PR gate when `[sync].automatic_merge = true` in UPSTREAM_CODEX.toml.
-# After the merge `zuno-release.yml` promotes the already-built candidate bytes.
+# is the review gate: with `[sync].automatic_merge = true` in UPSTREAM_CODEX.toml
+# (the default) a fully automatic replay is queued for GitHub auto-merge behind
+# the PR gate; anything a person touched waits for a manual merge. After the
+# merge `zuno-release.yml` promotes the already-built candidate bytes.
 
 on:
   workflow_dispatch:
     inputs:
       target:
-        description: Exact stable Codex tag (blank selects newest stable tag)
+        description: Exact stable Codex tag (blank follows the policy input)
         required: false
         type: string
       refresh:
@@ -427,12 +428,22 @@ jobs:
           # is queued for GitHub auto-merge, so it merges (as a merge commit)
           # the moment zuno/pr-gate passes and promotion follows. The repository
           # must allow auto-merge and its main ruleset must not require a human
-          # review for this to complete.
+          # review for this to complete. Every refresh first withdraws any
+          # auto-merge queued by an earlier run, so a candidate that stopped
+          # being fully automatic (or a flag flipped to false) cannot ride a
+          # stale queue into main.
+          gh pr merge "${pr_url}" --disable-auto >/dev/null 2>&1 || true
           automatic_merge="$(python3 -c 'import tomllib; print(str(tomllib.load(open("UPSTREAM_CODEX.toml", "rb")).get("sync", {}).get("automatic_merge", False)).lower())')"
           reused="$(python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1])).get("rebrand", {}).get("reused", [])))' "${REPORT}")"
+          # Auto-merge is only safe while the main ruleset still requires the
+          # zuno/pr-gate check; without it `--auto` would merge immediately.
+          gate_required="$(gh api "repos/${GH_REPO}/rules/branches/main" --jq '[.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[]?.context] | index("zuno/pr-gate") != null' 2>/dev/null || echo false)"
           if [[ "${automatic_merge}" == true && "${reused}" != 0 ]]; then
             echo "Auto-merge not queued: ${reused} path(s) were carried over from a hand-resolved candidate, so this replay was not fully automatic." >> "${GITHUB_STEP_SUMMARY}"
             gh pr comment "${pr_url}" --body "Auto-merge was not queued: ${reused} path(s) were carried over from a hand-resolved candidate (see the rebrand replay above), so this candidate waits for a manual merge."
+          elif [[ "${automatic_merge}" == true && "${gate_required}" != true ]]; then
+            echo "Auto-merge not queued: the main ruleset does not require zuno/pr-gate, so auto-merge would merge without the gate." >> "${GITHUB_STEP_SUMMARY}"
+            gh pr comment "${pr_url}" --body "Auto-merge was not queued: the \`main\` ruleset does not require the \`zuno/pr-gate\` status check, so GitHub would merge immediately instead of behind the gate. Restore the required check or merge this candidate by hand."
           elif [[ "${automatic_merge}" == true ]]; then
             if gh pr merge "${pr_url}" --auto --merge; then
               echo "Auto-merge queued: the candidate merges when zuno/pr-gate passes." >> "${GITHUB_STEP_SUMMARY}"
@@ -452,6 +463,7 @@ jobs:
           SOURCE_SHA: ${{ steps.plan.outputs.source_sha }}
           REPORT: ${{ steps.candidate.outputs.report }}
           EXISTING_ISSUE: ${{ steps.state.outputs.issue_number }}
+          EXISTING_PR: ${{ steps.state.outputs.pr_number }}
         run: |
           set -euo pipefail
           files="$(python3 - <<'PY'
@@ -527,10 +539,23 @@ jobs:
             echo
             echo "${replay}"
           } >> "${GITHUB_STEP_SUMMARY}"
-          # Conflict reports for older releases are superseded by this one.
+          # Conflict reports for OLDER releases are superseded by this one; a
+          # report for a newer release is left alone.
           gh issue list --state open --label "${CONFLICT_LABEL}" --json number,title \
-            --jq '.[] | select(.title | contains(env.TARGET_TAG) | not) | .number' \
-            | while read -r stale; do
+            --jq '.[] | select(.title | contains(env.TARGET_TAG) | not) | "\(.number) \(.title)"' \
+            | while read -r stale title; do
                 [[ -n "${stale}" ]] || continue
-                gh issue close "${stale}" --comment "Superseded by ${issue_url}: Codex ${TARGET_TAG} is now the newest stable release."
+                version="$(sed -n 's/.*rust-v\([0-9][0-9.]*[0-9]\).*/\1/p' <<<"${title}")"
+                [[ -n "${version}" ]] || continue
+                python3 - "${version}" "${TARGET_VERSION}" <<'PY' || continue
+          import sys
+          def key(v): return tuple(int(part) for part in v.split("."))
+          sys.exit(0 if key(sys.argv[1]) < key(sys.argv[2]) else 1)
+          PY
+                gh issue close "${stale}" --comment "Superseded by ${issue_url}: Codex ${TARGET_TAG} is now being synced."
               done
+          # A candidate that now needs a person must not keep an auto-merge that
+          # an earlier clean replay queued on its PR.
+          if [[ -n "${EXISTING_PR}" ]]; then
+            gh pr merge "${EXISTING_PR}" --disable-auto >/dev/null 2>&1 || true
+          fi

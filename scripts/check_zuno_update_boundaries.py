@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Fail if Zuno can reach inherited Codex updater or publisher entrypoints."""
 
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -237,16 +238,28 @@ def main() -> int:
     # The watcher itself never merges. The one permitted merge command only
     # queues GitHub auto-merge (merge commit, behind the required PR gate) and
     # only when the reviewed manifest opts in with [sync].automatic_merge = true.
-    if sync_text.count("gh pr merge") != 1:
-        raise SystemExit("upstream sync must contain exactly one gh pr merge (the guarded auto-merge queue)")
-    merge_at = sync_text.index("gh pr merge")
+    merges = [m.start() for m in re.finditer(r"gh pr merge ", sync_text)]
+    queue = 'gh pr merge "${pr_url}" --auto --merge'
+    if sync_text.count(queue) != 1:
+        raise SystemExit("upstream sync must contain exactly one guarded auto-merge queue command")
+    for start in merges:
+        snippet = sync_text[start : start + 60]
+        if not snippet.startswith(queue) and "--disable-auto" not in snippet:
+            raise SystemExit(f"unexpected gh pr merge in upstream sync: {snippet!r}")
+    merge_at = sync_text.index(queue)
     guard = sync_text[max(0, merge_at - 400) : merge_at]
-    if 'if [[ "${automatic_merge}" == true ]]' not in guard:
-        raise SystemExit("gh pr merge in upstream sync is not guarded by [sync].automatic_merge")
+    if 'elif [[ "${automatic_merge}" == true ]]' not in guard:
+        raise SystemExit("the auto-merge queue in upstream sync is not guarded by [sync].automatic_merge")
+    for needle in [
+        '"${reused}" != 0',
+        '"${gate_required}" != true',
+        'gh pr merge "${pr_url}" --disable-auto',
+        'gh pr merge "${EXISTING_PR}" --disable-auto',
+    ]:
+        require(upstream_sync, needle)
     if "tomllib.load(open(\"UPSTREAM_CODEX.toml\", \"rb\")).get(\"sync\", {}).get(\"automatic_merge\", False)" not in sync_text:
         raise SystemExit("upstream sync must read automatic_merge from UPSTREAM_CODEX.toml")
-    require(upstream_sync, 'gh pr merge "${pr_url}" --auto --merge')
-    if sync_text.count("--auto") != 1 or "--squash" in sync_text or "--rebase" in sync_text or "--admin" in sync_text:
+    if sync_text.count("--auto ") != 1 or "--squash" in sync_text or "--rebase" in sync_text or "--admin" in sync_text:
         raise SystemExit("upstream sync may only queue a merge-commit auto-merge; no squash, rebase or admin merges")
     # gh infers the repo from git remotes and prefers one named `upstream`; the
     # sync checkout adds exactly that remote for openai/codex.

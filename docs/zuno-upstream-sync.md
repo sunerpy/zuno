@@ -26,7 +26,9 @@ zuno-upstream-sync.yml ── replay clean ──▶ branch upstream-sync/X.Y.Z 
             resolve locally, push branch   attests and seals the six packages
                                                    │
                                                    ▼
-                                        human review + "Create a merge commit"
+                                    review gate: hands-off auto-merge (fully automatic
+                                    replay, [sync].automatic_merge) or a person's
+                                    "Create a merge commit"
                                                    │
                                                    ▼
                                         zuno-release.yml (pull_request: closed)
@@ -95,12 +97,22 @@ it with a merge commit as soon as `zuno/pr-gate` succeeds, and
 `zuno-release.yml` promotes the sealed bytes. "Fully automatic" means the
 replay needed no manual conflict resolution and copied nothing from a
 hand-resolved candidate (`--reuse`); such candidates, and every candidate when
-the flag is `false`, wait for a manual merge. Two repository settings gate the
-hands-off path and are the owner's decision: **Allow auto-merge** must be
-enabled, and the `main` ruleset must not require a human review (a required
-code-owner review makes auto-merge wait for that approval). When GitHub refuses
-to queue the merge the watcher leaves a comment on the PR and the candidate
-waits for a manual merge.
+the flag is `false`, wait for a manual merge. Every refresh first withdraws any
+auto-merge queued by an earlier run and re-decides, so a candidate that stops
+being fully automatic (or a flag flipped to `false`) never rides a stale queue
+into `main`; a replay that hits conflicts also withdraws it. The watcher only
+queues while the `main` ruleset still requires the `zuno/pr-gate` check,
+because without a pending required check `--auto` would merge at once. Two
+repository settings gate the hands-off path and are the owner's decision:
+**Allow auto-merge** must be enabled, and the `main` ruleset must not require a
+human review (a required code-owner review makes auto-merge wait for that
+approval). When GitHub refuses to queue the merge the watcher leaves a comment
+on the PR and the candidate waits for a manual merge.
+
+Delete a candidate branch you abandon (`git push origin --delete
+upstream-sync/X.Y.Z` after closing its PR): the watcher treats every unmerged
+`upstream-sync/*` branch on `origin` as an open candidate and will keep
+preferring it over older releases.
 
 ## Rebrand replay: `FORK_REBRAND.toml`
 
@@ -134,10 +146,14 @@ release added new wording to a file Zuno had already rebranded, the new wording
 is rebranded too, and the `${version}` placeholder is moved to the new release.
 Files upstream **adds** inside an `[[added]]` scope of the manifest (today: TUI
 `.snap` files) are rebranded without a predicate, because they are rendered
-text whose source already says Zuno and the PR gate's snapshot tests catch any
-miss. Every other file outside the Zuno delta is never rewritten; paths whose
-new upstream text the rules would change are listed as `drift` in the JSON
-report for review.
+text whose source already says Zuno. Note that `zuno/pr-gate` runs only a few
+targeted TUI tests, so a mis-rebranded snapshot surfaces in the full
+`cargo test -p codex-tui` run (see *Resolving conflicts locally*), not in the
+gate; the rewrite never touches source code. Every other file outside the Zuno
+delta is never rewritten; paths whose new upstream text the rules would change
+are listed as `drift` in the JSON report for review. A rule that did reach an
+identifier inside a refreshed `.rs` file would fail to compile and be caught by
+the gate.
 
 Rules never run without the predicate, so an incomplete rule set costs coverage,
 not correctness. Measure coverage with

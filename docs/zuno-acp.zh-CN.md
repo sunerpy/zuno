@@ -42,8 +42,8 @@ prompt、同进程 steer、模型/模式/配置更新（`session/set_mode`、`se
 权限请求、session/turn 更新和 App Server 事件之间进行转换。
 
 prompt 内容块到 App Server 输入的映射与参考实现 `codex-acp` 一致，因此无论客户端
-连接哪一个 Codex ACP agent，同一段 prompt 对模型的含义相同：`text` 与 `image`
-直接透传（`http(s)` 或 `data:` 图片 URI 原样使用）；`resource_link` 变成
+连接哪一个 Codex ACP agent，同一段 prompt 对模型的含义相同：`text` 直接透传，`image` 始终
+内联为 `data:` URL（App Server 拒绝远端图片 URL，可选的 `uri` 不会替代字节）；`resource_link` 变成
 `[@name](uri)` 链接；内嵌文本 `resource` 变成该链接加一个
 `<context ref="uri">` 块；内嵌 `image/*` blob 变成图片；其他 blob 变成 base64 的
 `<context>` 块。`initialize` 未宣告的块类型（例如 `audio`）以 `-32602` 拒绝。
@@ -65,8 +65,9 @@ Zuno 无需改动。协议 2 走出草案后会在显式协商之后追加，同
 在协议 1 之内，桥接层跟进客户端依赖的 schema 增量：
 
 - `tool_call` 更新携带一等 `name`（schema 1.8），与 `title`、`kind` 并列：`shell`、
-  `apply_patch`、`web_search`、`spawn_agent`（Zed 用它识别子代理）、MCP 或动态工具自身
-  的名字、`view_image`、`image_generation`、`sleep`。
+  `apply_patch`、`web_search`、协作工具自身的 snake_case 名字（`spawn_agent`——Zed 用它识别
+  子代理——以及 `wait`、`close_agent` 等）、`sub_agent_activity`、MCP 或动态工具自身的名字、
+  `view_image`、`image_generation`、`sleep`。
 - App Server 的生命周期条目（`contextCompaction`、review 模式标记、`functionCallOutput`）
   不再被投影成工具调用。
 - 客户端宣告 `clientCapabilities.elicitation.form`（schema 1.7）时，模型的提问

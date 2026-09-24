@@ -50,8 +50,9 @@ and from App Server events.
 
 Prompt blocks map to App Server input the same way the reference `codex-acp`
 adapter maps them, so a prompt means the same thing to the model whichever Codex
-ACP agent a client talks to: `text` and `image` pass through (an `http(s)` or
-`data:` image URI is used as-is), `resource_link` becomes a `[@name](uri)` link,
+ACP agent a client talks to: `text` passes through and `image` is always inlined as a `data:` URL (App Server
+rejects remote image URLs, so an optional `uri` never replaces the bytes),
+`resource_link` becomes a `[@name](uri)` link,
 an embedded text `resource` becomes that link followed by a
 `<context ref="uri">` block, an embedded `image/*` blob becomes an image, and any
 other blob becomes a base64 `<context>` block. Block types the `initialize`
@@ -80,9 +81,10 @@ negotiation once it leaves draft status, keeping protocol 1 served.
 Within protocol 1 the bridge tracks the schema additions clients rely on:
 
 - `tool_call` updates carry the first-class `name` (schema 1.8) alongside
-  `title` and `kind`: `shell`, `apply_patch`, `web_search`, `spawn_agent`
-  (which Zed uses to recognise sub-agents), the MCP or dynamic tool's own name,
-  `view_image`, `image_generation`, `sleep`.
+  `title` and `kind`: `shell`, `apply_patch`, `web_search`, the collab tool's
+  own snake_case name (`spawn_agent`, which Zed uses to recognise sub-agents,
+  `wait`, `close_agent`, ...), `sub_agent_activity`, the MCP or dynamic tool's
+  own name, `view_image`, `image_generation`, `sleep`.
 - App Server lifecycle items (`contextCompaction`, review-mode markers,
   `functionCallOutput`) are not projected as tool calls.
 - When the client advertises `clientCapabilities.elicitation.form` (schema

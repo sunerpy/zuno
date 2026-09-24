@@ -177,13 +177,15 @@ pub(super) fn acp_prompt_to_codex(prompt: Option<&Value>) -> Result<Vec<Value>, 
                 input.push(json!({ "type": "text", "text": text, "textElements": [] }));
             }
             Some("image") => {
+                // Always inline the client's bytes: App Server rejects remote
+                // image URLs (`validate_user_input_image_urls`), so an optional
+                // `uri` is informational only and must not replace `data`.
                 let mime = required_string(block, "mimeType")?;
                 let data = required_string(block, "data")?;
-                let url = match block.get("uri").and_then(Value::as_str) {
-                    Some(uri) if is_fetchable_image_uri(uri) => uri.to_owned(),
-                    _ => format!("data:{mime};base64,{data}"),
-                };
-                input.push(json!({ "type": "image", "url": url }));
+                input.push(json!({
+                    "type": "image",
+                    "url": format!("data:{mime};base64,{data}"),
+                }));
             }
             Some("resource_link") => {
                 let uri = required_string(block, "uri")?;
@@ -245,10 +247,6 @@ pub(super) fn acp_prompt_to_codex(prompt: Option<&Value>) -> Result<Vec<Value>, 
 
 fn text_input(text: String) -> Value {
     json!({ "type": "text", "text": text, "textElements": [] })
-}
-
-fn is_fetchable_image_uri(uri: &str) -> bool {
-    uri.starts_with("http://") || uri.starts_with("https://") || uri.starts_with("data:")
 }
 
 /// `[@name](uri)`, defaulting the label to the file name of a `file://` URI.

@@ -229,9 +229,19 @@ fn tool_identity(item_type: &str, item: &Value) -> (&'static str, String, String
             ("other", format!("{server}.{tool}"), tool.to_owned())
         }
         "dynamicToolCall" => ("other", tool("Tool"), tool("tool")),
-        "collabAgentToolCall" | "subAgentActivity" => {
-            ("think", tool("Sub-agent"), "spawn_agent".to_owned())
-        }
+        // The wire tool is camelCase (`spawnAgent`, `wait`, `closeAgent`, ...);
+        // the first-class name is the snake_case tool name, so only a real
+        // spawn is named `spawn_agent` (clients recognise sub-agents by it).
+        "collabAgentToolCall" => (
+            "think",
+            tool("Sub-agent"),
+            snake_case(&tool("collab_agent")),
+        ),
+        "subAgentActivity" => (
+            "think",
+            "Sub-agent activity".to_owned(),
+            "sub_agent_activity".to_owned(),
+        ),
         "webSearch" => ("search", "Web search".to_owned(), "web_search".to_owned()),
         "imageView" => ("read", "View image".to_owned(), "view_image".to_owned()),
         "imageGeneration" => (
@@ -242,6 +252,21 @@ fn tool_identity(item_type: &str, item: &Value) -> (&'static str, String, String
         "sleep" => ("other", "Wait".to_owned(), "sleep".to_owned()),
         _ => ("other", item_type.to_owned(), item_type.to_owned()),
     }
+}
+
+fn snake_case(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 4);
+    for ch in value.chars() {
+        if ch.is_ascii_uppercase() {
+            if !out.is_empty() {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn item_failed(item: &Value) -> bool {

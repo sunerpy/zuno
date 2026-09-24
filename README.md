@@ -71,7 +71,8 @@ and `zuno`.
 ## Upstream update candidate
 
 ```sh
-# Fetch and report the newest stable Codex release without changing this branch.
+# Fetch and report the next stable Codex release to sync (--policy newest for the
+# latest) without changing this branch.
 python3 scripts/zuno_upstream.py --json check
 
 # After the current Zuno delta is reviewed and committed, merge it onto a new
