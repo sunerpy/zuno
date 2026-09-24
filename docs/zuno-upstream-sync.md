@@ -265,7 +265,10 @@ personal access token scoped to this repository with **Contents: read and
 write** and **Pull requests: read and write** (no issues permission is needed;
 issues are always handled with the default token), and store it as the
 repository secret `ZUNO_UPSTREAM_SYNC_TOKEN`. The watcher uses it only for the
-push and PR steps. Without the secret the candidate PR still opens, the watcher
+push and PR steps, and checks it on every tick (a `git push --dry-run` into the
+`upstream-sync/*` namespace plus a pull-request read) so a revoked, expired or
+under-scoped token fails the scheduled run long before a release needs it.
+Without the secret the candidate PR still opens, the watcher
 leaves a comment, auto-merge is not queued, and closing and reopening the PR
 (or pushing to the branch) starts the gate by hand; the merge then stays
 manual, and a person's merge still promotes automatically (the `closed` event
