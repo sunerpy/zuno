@@ -2,8 +2,11 @@
 #
 # GitHub-hosted Windows runners do not always expose a secondary D: volume. When
 # they do not, create a Dev Drive VHD. CI depends on this path for its
-# build directories where CI spends significant time doing I/O, so fail the
-# job if no real Dev Drive is available.
+# build directories where CI spends significant time doing I/O.
+#
+# Zuno: on a CodeBuild-hosted runner (a Windows Server container) Hyper-V
+# cmdlets and Dev Drive volumes are unavailable, so fall back to a plain
+# directory under RUNNER_TEMP instead of failing the job.
 
 function Test-DevDrive {
     param([string]$Drive)
@@ -56,7 +59,10 @@ if ((Test-Path "D:\") -and (Test-DevDrive "D:")) {
 
         Write-Output "Using Dev Drive at $Drive"
     } catch {
-        throw "Failed to create Dev Drive: $($_.Exception.Message)"
+        $Fallback = Join-Path $env:RUNNER_TEMP "codex-ci"
+        Write-Warning "Failed to create Dev Drive: $($_.Exception.Message). Using plain directory $Fallback instead."
+        New-Item -ItemType Directory -Force -Path $Fallback | Out-Null
+        $Drive = $Fallback
     }
 }
 

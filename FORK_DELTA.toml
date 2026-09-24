@@ -181,7 +181,7 @@ contracts = [
 id = "zuno-ci-release"
 status = "implemented"
 ownership = "zuno-owned"
-summary = "Public-runner PR gate and six-platform Zuno package release automation."
+summary = "PR gate, promotion and watcher on CodeBuild-hosted GitHub Actions runners, and six-platform Zuno package release automation."
 zuno_paths = [
   ".github/CODEOWNERS",
   ".github/workflows/zuno-ci.yml",
@@ -195,10 +195,10 @@ shared_upstream_paths = [
   ".github/workflows/v8-canary.yml",
 ]
 contracts = [
-  "The protected main branch receives the required zuno/pr-gate context from public GitHub-hosted infrastructure.",
+  "The protected main branch receives the required zuno/pr-gate context from CodeBuild-hosted GitHub Actions runners in the Zuno AWS account (zuno-runner and zuno-runner-windows in us-east-2, zuno-runner-macos on a reserved Apple silicon fleet in us-west-2); no Zuno workflow job runs on a GitHub-hosted runner.",
   "On an upstream-sync/* pull request the gate withdraws a queued auto-merge whose head is not the Zuno-Candidate-Commit recorded by the watcher before the gate can pass.",
   "OpenAI-only CI remains manually available but does not run automatically in the Zuno repository.",
-  "zuno-vX.Y.Z builds, natively smokes, attests, hashes, and publishes canonical Zuno packages for six OS/architecture targets.",
+  "zuno-vX.Y.Z builds, smokes, attests, hashes, and publishes canonical Zuno packages for six OS/architecture targets. Five are executed on the packaging runner (x86_64-apple-darwin is cross-built on Apple silicon and executed under Rosetta 2); aarch64-pc-windows-msvc is cross-built on x86_64 Windows, verified by archive layout and PE machine type only, and its smoke report records executed = false.",
   "A merged same-repository upstream-sync/* pull request is promoted automatically from its sealed PR-gate bytes; every other promotion is an explicit dispatch.",
   "All inherited Codex installers, daemon updaters, and tag publishers fail closed in the independent Zuno repository.",
 ]

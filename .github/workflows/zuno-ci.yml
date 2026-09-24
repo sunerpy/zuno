@@ -1,5 +1,14 @@
 name: Zuno CI
 
+# Every job runs on a CodeBuild-hosted GitHub Actions runner in the Zuno AWS
+# account (projects zuno-runner and zuno-runner-windows in us-east-2,
+# zuno-runner-macos on the reserved Mac fleet in us-west-2), so the gate
+# consumes no GitHub-hosted runner minutes. The first `runs-on` label names the
+# project; `image:`/`instance-size:` labels override its environment; the last
+# label is unique per job so GitHub never hands one job's runner to another.
+# aarch64-pc-windows-msvc is cross-built on the x86_64 Windows runner and only
+# layout-checked: CodeBuild has no ARM Windows compute that could execute it.
+
 on:
   pull_request:
     branches: [main]
@@ -20,7 +29,10 @@ env:
 jobs:
   static:
     name: Zuno static and runtime tests
-    runs-on: ubuntu-24.04
+    runs-on:
+      - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - image-default
+      - zuno-static
     timeout-minutes: 60
     defaults:
       run:
@@ -58,6 +70,7 @@ jobs:
         run: |
           python3 scripts/test_zuno_upstream.py
           python3 scripts/test_zuno_rebrand.py
+          python3 scripts/test_smoke_zuno_package.py
           CODEX_REPO_ROOT="$PWD" PYTHONPATH="$PWD/scripts" \
             python3 -m unittest \
               codex_package.test_cargo \
@@ -116,7 +129,10 @@ jobs:
 
   package:
     name: Package ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
+    runs-on:
+      - codebuild-${{ matrix.project }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - ${{ matrix.image }}
+      - zuno-package
     # Cold release LTO on Intel macOS and x86_64 Windows exceeds 90 minutes.
     # Keep every native target and capability; allow the build to finish instead
     # of substituting cross compilation or dropping package companions.
@@ -128,25 +144,43 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Every entry carries the same number of labels (project, image
+        # override or the inert `image-default`, job label) so GitHub routes each
+        # expansion to the runner CodeBuild created for it. `smoke: layout` marks
+        # a cross-built target the runner cannot execute.
         include:
-          - runner: ubuntu-24.04
+          - project: zuno-runner
+            image: image-default
             target: x86_64-unknown-linux-gnu
             os: linux
-          - runner: ubuntu-24.04-arm
+            smoke: native
+          - project: zuno-runner
+            image: image:arm-3.0
             target: aarch64-unknown-linux-gnu
             os: linux
-          - runner: macos-15-intel
+            smoke: native
+          - project: zuno-runner-macos
+            image: image-default
             target: x86_64-apple-darwin
             os: macos
-          - runner: macos-15
+            # Cross-built on the Apple silicon fleet and executed there under
+            # Rosetta 2, which the macOS image ships.
+            smoke: native
+          - project: zuno-runner-macos
+            image: image-default
             target: aarch64-apple-darwin
             os: macos
-          - runner: windows-2025
+            smoke: native
+          - project: zuno-runner-windows
+            image: image-default
             target: x86_64-pc-windows-msvc
             os: windows
-          - runner: windows-11-arm
+            smoke: native
+          - project: zuno-runner-windows
+            image: image-default
             target: aarch64-pc-windows-msvc
             os: windows
+            smoke: layout
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -169,8 +203,14 @@ jobs:
         if: matrix.os == 'linux'
         shell: bash
         run: |
-          sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
+          set -euo pipefail
+          # Ubuntu on the x86_64 runner image, Amazon Linux 2023 on the ARM one.
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
+          else
+            sudo dnf install -y pkgconf-pkg-config libcap-devel
+          fi
       - name: Configure V8 artifact
         uses: ./.github/actions/setup-rusty-v8
         with:
@@ -211,11 +251,20 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
+          SMOKE: ${{ matrix.smoke }}
         run: |
+          set -euo pipefail
+          extra=()
+          if [[ "$SMOKE" == layout ]]; then
+            # Cross-built for an architecture this runner cannot execute: verify
+            # the archive layout and the machine type of every binary instead.
+            extra=(--layout-only)
+          fi
           python3 scripts/smoke_zuno_package.py \
             --archive "codex-rs/dist/${TARGET}/zuno-package-${TARGET}.tar.gz" \
             --target "$TARGET" \
-            --report "codex-rs/dist/${TARGET}/smoke-${TARGET}.json"
+            --report "codex-rs/dist/${TARGET}/smoke-${TARGET}.json" \
+            "${extra[@]}"
       - name: Smoke external Agent host sandbox
         if: matrix.os == 'linux'
         working-directory: codex-rs
@@ -244,7 +293,11 @@ jobs:
 
   standalone:
     name: Standalone x86_64-unknown-linux-musl
-    runs-on: ubuntu-24.04
+    # zuno-runner runs privileged so the foreign-container smoke can use Docker.
+    runs-on:
+      - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - image-default
+      - zuno-standalone
     timeout-minutes: 120
     permissions:
       contents: read
@@ -340,7 +393,10 @@ jobs:
   seal:
     name: Seal exact candidate bytes
     needs: [static, package, standalone]
-    runs-on: ubuntu-24.04
+    runs-on:
+      - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - instance-size:medium
+      - zuno-seal
     timeout-minutes: 15
     permissions:
       contents: read
@@ -465,7 +521,10 @@ jobs:
     name: zuno/pr-gate
     if: always()
     needs: [static, package, standalone, seal]
-    runs-on: ubuntu-24.04
+    runs-on:
+      - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - instance-size:small
+      - zuno-required
     permissions:
       contents: read
       pull-requests: write
