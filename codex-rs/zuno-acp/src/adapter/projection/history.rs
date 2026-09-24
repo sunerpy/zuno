@@ -145,20 +145,37 @@ pub(in crate::adapter) fn notification_updates(method: &str, params: &Value) -> 
     }
 }
 
+/// App Server items that are conversation content or lifecycle markers, not
+/// tool invocations. Everything else is projected as an ACP `tool_call`.
+fn is_tool_item(item_type: &str) -> bool {
+    !matches!(
+        item_type,
+        "userMessage"
+            | "agentMessage"
+            | "reasoning"
+            | "plan"
+            | "hookPrompt"
+            | "functionCallOutput"
+            | "contextCompaction"
+            | "enteredReviewMode"
+            | "exitedReviewMode"
+    )
+}
+
 fn tool_call_started(item: &Value) -> Option<Value> {
     let item_type = item.get("type")?.as_str()?;
-    if matches!(
-        item_type,
-        "userMessage" | "agentMessage" | "reasoning" | "plan" | "hookPrompt"
-    ) {
+    if !is_tool_item(item_type) {
         return None;
     }
     let id = item.get("id")?.as_str()?;
-    let (kind, title) = tool_identity(item_type, item);
+    let (kind, title, name) = tool_identity(item_type, item);
+    // `name` is the ACP 1.8 first-class tool identifier; clients use it for
+    // fallback labels and to recognise sub-agent spawns (`spawn_agent`).
     Some(json!({
         "sessionUpdate": "tool_call",
         "toolCallId": id,
         "title": title,
+        "name": name,
         "kind": kind,
         "status": "in_progress",
         "rawInput": item,
@@ -167,10 +184,7 @@ fn tool_call_started(item: &Value) -> Option<Value> {
 
 fn tool_call_completed(item: &Value) -> Option<Value> {
     let item_type = item.get("type")?.as_str()?;
-    if matches!(
-        item_type,
-        "userMessage" | "agentMessage" | "reasoning" | "plan" | "hookPrompt"
-    ) {
+    if !is_tool_item(item_type) {
         return None;
     }
     let id = item.get("id")?.as_str()?;
@@ -187,7 +201,14 @@ fn tool_call_completed(item: &Value) -> Option<Value> {
     }))
 }
 
-fn tool_identity(item_type: &str, item: &Value) -> (&'static str, String) {
+/// ACP `kind`, human title, and first-class tool `name` for an App Server item.
+fn tool_identity(item_type: &str, item: &Value) -> (&'static str, String, String) {
+    let tool = |fallback: &str| {
+        item.get("tool")
+            .and_then(Value::as_str)
+            .unwrap_or(fallback)
+            .to_owned()
+    };
     match item_type {
         "commandExecution" => (
             "execute",
@@ -195,33 +216,57 @@ fn tool_identity(item_type: &str, item: &Value) -> (&'static str, String) {
                 .and_then(Value::as_str)
                 .unwrap_or("Run command")
                 .to_owned(),
+            "shell".to_owned(),
         ),
-        "fileChange" => ("edit", "Apply file changes".to_owned()),
-        "mcpToolCall" => (
-            "other",
-            format!(
-                "{}.{}",
-                item.get("server").and_then(Value::as_str).unwrap_or("MCP"),
-                item.get("tool").and_then(Value::as_str).unwrap_or("tool")
-            ),
+        "fileChange" => (
+            "edit",
+            "Apply file changes".to_owned(),
+            "apply_patch".to_owned(),
         ),
-        "dynamicToolCall" => (
-            "other",
-            item.get("tool")
-                .and_then(Value::as_str)
-                .unwrap_or("Tool")
-                .to_owned(),
-        ),
-        "collabAgentToolCall" | "subAgentActivity" => (
+        "mcpToolCall" => {
+            let server = item.get("server").and_then(Value::as_str).unwrap_or("MCP");
+            let tool = item.get("tool").and_then(Value::as_str).unwrap_or("tool");
+            ("other", format!("{server}.{tool}"), tool.to_owned())
+        }
+        "dynamicToolCall" => ("other", tool("Tool"), tool("tool")),
+        // The wire tool is camelCase (`spawnAgent`, `wait`, `closeAgent`, ...);
+        // the first-class name is the snake_case tool name, so only a real
+        // spawn is named `spawn_agent` (clients recognise sub-agents by it).
+        "collabAgentToolCall" => (
             "think",
-            item.get("tool")
-                .and_then(Value::as_str)
-                .unwrap_or("Sub-agent")
-                .to_owned(),
+            tool("Sub-agent"),
+            snake_case(&tool("collab_agent")),
         ),
-        "webSearch" => ("search", "Web search".to_owned()),
-        _ => ("other", item_type.to_owned()),
+        "subAgentActivity" => (
+            "think",
+            "Sub-agent activity".to_owned(),
+            "sub_agent_activity".to_owned(),
+        ),
+        "webSearch" => ("search", "Web search".to_owned(), "web_search".to_owned()),
+        "imageView" => ("read", "View image".to_owned(), "view_image".to_owned()),
+        "imageGeneration" => (
+            "other",
+            "Generate image".to_owned(),
+            "image_generation".to_owned(),
+        ),
+        "sleep" => ("other", "Wait".to_owned(), "sleep".to_owned()),
+        _ => ("other", item_type.to_owned(), item_type.to_owned()),
     }
+}
+
+fn snake_case(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 4);
+    for ch in value.chars() {
+        if ch.is_ascii_uppercase() {
+            if !out.is_empty() {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn item_failed(item: &Value) -> bool {

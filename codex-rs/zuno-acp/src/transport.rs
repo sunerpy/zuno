@@ -20,9 +20,15 @@ use frame::id_key;
 pub use server::serve_stdio;
 
 /// JSON-RPC code for a prompt admitted durably without owning its own turn.
-pub const SESSION_BUSY_CODE: i64 = -32001;
+///
+/// The value avoids every code with a defined meaning on either side of the
+/// bridge: ACP v1 reserves `-32000` (authentication required) and `-32002`
+/// (resource not found), and Codex App Server reports `-32001` when its request
+/// queue is full. Those downstream codes pass through unchanged, so the bridge's
+/// own outcomes must not alias them.
+pub const SESSION_BUSY_CODE: i64 = -32010;
 /// JSON-RPC code for a rejected `session/steer` extension request.
-pub const STEER_REJECTED_CODE: i64 = -32002;
+pub const STEER_REJECTED_CODE: i64 = -32011;
 
 /// Transport-owned identity of one accepted client request.
 ///

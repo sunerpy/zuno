@@ -17,4 +17,15 @@ branch = "legacy/v0.10"
 [sync]
 remote = "upstream"
 candidate_only = true
-automatic_merge = false
+# true: a candidate whose replay was fully automatic (no manual conflict
+# resolution, nothing carried over from a hand-resolved candidate) is queued for
+# GitHub auto-merge and merges (merge commit) once zuno/pr-gate passes, so every
+# clean Codex release becomes a Zuno release without a person. The watcher only
+# queues when the ZUNO_UPSTREAM_SYNC_TOKEN secret is configured (a merge
+# completed for a queue raised by the default GITHUB_TOKEN would not start the
+# promotion workflow) and when the main ruleset still requires zuno/pr-gate;
+# GitHub completes the merge only if the repository allows auto-merge and the
+# ruleset requires no human review. In every other case the watcher leaves a
+# comment and the candidate waits for a manual merge. false: every candidate PR
+# is merged by hand.
+automatic_merge = true

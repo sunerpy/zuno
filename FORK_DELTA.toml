@@ -88,18 +88,22 @@ shared_upstream_paths = [
 contracts = [
   "ACP clients do not own a private agent loop.",
   "Turn interrupt, ordinary input, goal resume, and protected gates remain distinct.",
+  "Bridged App Server requests (approvals, tool questions) wait for the client off the event loop; the transport keeps being read while any number of them are pending.",
 ]
 
 [[capabilities]]
 id = "upstream-sync"
 status = "implemented"
 ownership = "zuno-owned"
-summary = "Scheduled candidate-only replay of the reviewed Zuno delta onto each new exact Codex stable release, with automatic promotion after the human merge."
+summary = "Scheduled candidate-only replay of the reviewed Zuno delta onto each exact Codex stable release in order, gated by zuno/pr-gate, merged hands-off when fully automatic, and promoted automatically after the merge."
 zuno_paths = [
   "UPSTREAM_CODEX.toml",
   "FORK_DELTA.toml",
+  "FORK_REBRAND.toml",
   "scripts/zuno_upstream.py",
   "scripts/test_zuno_upstream.py",
+  "scripts/zuno_rebrand.py",
+  "scripts/test_zuno_rebrand.py",
   ".github/workflows/zuno-upstream-sync.yml",
   "docs/zuno-upstream-sync.md",
   "docs/zuno-upstream-sync.zh-CN.md",
@@ -108,9 +112,11 @@ shared_upstream_paths = []
 contracts = [
   "The active Zuno branch and worktree are never mutated by synchronization.",
   "A dirty source is rejected before candidate preparation.",
-  "The exact upstream tag, commit, and tree are verified before replay.",
-  "The watcher tracks only the newest stable Codex tag, is idempotent per main commit, and reports replay conflicts as an issue instead of pushing.",
-  "Merging the candidate PR with a merge commit is the only manual step; nothing is merged automatically.",
+  "The exact upstream tag, commit, and tree are verified before replay, and the chosen tag must point at the commit the openai/codex remote publishes for it; a rust-v* tag that exists only on the fork's origin is refused.",
+  "The watcher replays stable Codex tags in release order (policy next; newest skips ahead), never regresses an open candidate to an older tag, is idempotent per main commit, and reports replay conflicts as an issue instead of pushing.",
+  "A conflict hunk is resolved by automation only when FORK_REBRAND.toml reproduces the Zuno side from the Codex baseline byte for byte, or when it is solely the workspace version line of codex-rs/Cargo.toml (Zuno versions track Codex versions); every other hunk waits for a human. Source code is never renamed: lines upstream added to a .rs file are rebranded only inside string literals and comments.",
+  "Post-merge edits of a finalized candidate for the same release are reused for every path main has not changed since.",
+  "Merging the candidate PR with a merge commit is the review gate. With [sync].automatic_merge = true in UPSTREAM_CODEX.toml (the default) a candidate whose replay was fully automatic is queued for GitHub auto-merge behind zuno/pr-gate, only with the ZUNO_UPSTREAM_SYNC_TOKEN secret (a merge completed for a GITHUB_TOKEN queue starts no promotion) and only for the exact head the watcher pushed (zuno/pr-gate withdraws the queue from any other upstream-sync/* head before it can pass; the watcher repeats the check as a backstop); a candidate that needed manual resolution or reused hand-resolved edits, a candidate someone pushed to, or any candidate when the flag is false, waits for a person.",
   "A candidate is finalized as a merge whose first parent is the reviewed main commit and whose second parent is the exact upstream release commit recorded in UPSTREAM_CODEX.toml, even after manual conflict resolution.",
 ]
 
@@ -175,7 +181,7 @@ contracts = [
 id = "zuno-ci-release"
 status = "implemented"
 ownership = "zuno-owned"
-summary = "Public-runner PR gate and six-platform Zuno package release automation."
+summary = "PR gate, promotion and watcher on CodeBuild-hosted GitHub Actions runners, and six-platform Zuno package release automation."
 zuno_paths = [
   ".github/CODEOWNERS",
   ".github/workflows/zuno-ci.yml",
@@ -189,9 +195,10 @@ shared_upstream_paths = [
   ".github/workflows/v8-canary.yml",
 ]
 contracts = [
-  "The protected main branch receives the required zuno/pr-gate context from public GitHub-hosted infrastructure.",
+  "The protected main branch receives the required zuno/pr-gate context from CodeBuild-hosted GitHub Actions runners in the Zuno AWS account (zuno-runner and zuno-runner-windows in us-east-2, zuno-runner-macos on a reserved Apple silicon fleet in us-west-2); no Zuno workflow job runs on a GitHub-hosted runner.",
+  "On an upstream-sync/* pull request the gate withdraws a queued auto-merge whose head is not the Zuno-Candidate-Commit recorded by the watcher before the gate can pass.",
   "OpenAI-only CI remains manually available but does not run automatically in the Zuno repository.",
-  "zuno-vX.Y.Z builds, natively smokes, attests, hashes, and publishes canonical Zuno packages for six OS/architecture targets.",
+  "zuno-vX.Y.Z builds, smokes, attests, hashes, and publishes canonical Zuno packages for six OS/architecture targets. Five are executed on the packaging runner (x86_64-apple-darwin is cross-built on Apple silicon and executed under Rosetta 2); aarch64-pc-windows-msvc is cross-built on x86_64 Windows, verified by archive layout and PE machine type only, and its smoke report records executed = false.",
   "A merged same-repository upstream-sync/* pull request is promoted automatically from its sealed PR-gate bytes; every other promotion is an explicit dispatch.",
   "All inherited Codex installers, daemon updaters, and tag publishers fail closed in the independent Zuno repository.",
 ]

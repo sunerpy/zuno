@@ -1,0 +1,129 @@
+# Zuno rebrand rules replayed by the Codex upstream sync.
+#
+# `scripts/zuno_upstream.py prepare` uses this file to resolve the merge
+# conflicts that exist only because Zuno renamed Codex text. A conflict hunk (or
+# a modify/delete pair) is resolved automatically only when applying these rules
+# to the Codex baseline reproduces the current Zuno text byte for byte; the same
+# rules are then applied to the new upstream text. Anything the rules cannot
+# reproduce stays a conflict for a human. `scripts/zuno_rebrand.py audit`
+# reports how much of the Zuno delta the rules currently reproduce.
+#
+# Rules run per line, in order. `replace` is literal text (no regex group
+# references or escapes) and is never matched again by a later rule. Source code
+# is never renamed: in a `.rs` file the lines upstream added (which no predicate
+# vouches for) are rewritten only inside string literals and `//` comments, so a
+# new bare `Codex` type stays as upstream wrote it (reported as `guarded`).
+# Files that upstream adds under an `[[added]]` scope are rebranded without the
+# predicate (there is no Zuno text to compare against): they are rendered-text
+# snapshots whose source already says Zuno. The PR gate runs only a few targeted
+# TUI tests, so a wrong rewrite there is caught by the candidate diff review or
+# the next full `cargo test -p codex-tui`, not by the gate; keep `[[added]]`
+# scopes to rendered text. `${version}` in `replace` expands to the workspace
+# version of the tree being produced (`codex-rs/Cargo.toml`). When a rule
+# shortens or lengthens
+# a line that ends in padding (trailing spaces, spaces before a closing `"`,
+# `",` or `│`), the padding is adjusted so the rendered width is unchanged,
+# which is how the TUI snapshots were rebranded.
+
+schema_version = 1
+
+# Phrases restored verbatim after all rules ran. These are persistent identities
+# or upstream product names that Zuno deliberately keeps.
+protect = [
+  "Codex Desktop",
+  "Codex Cloud",
+  "Codex docs",
+  "Codex Apps",
+  "Codex Auth",
+  "## My request for Codex:",
+  "OAI-Product-Sku: codex",
+  "CodexSandboxService",
+  "Co-authored-by: Codex",
+  "Co-Authored-By: Codex",
+  ".codex-plugin",
+  "OpenAI's Codex CLI",
+  "Codex-optimized",
+  "old Codex language model",
+  "Codex now uses",
+  "codex home",
+  "Codex home",
+  "PATH codex entries",
+  "ProgramData\\\\OpenAI\\\\Codex",
+  "ProgramData%\\\\OpenAI\\\\Codex",
+]
+
+# Files upstream adds here are rebranded without the predicate (see above).
+[[added]]
+prefix = "codex-rs/tui/src/"
+suffix = ".snap"
+
+[[rule]]
+find = "https://github.com/openai/codex/releases/latest"
+replace = "https://github.com/sunerpy/zuno/releases/latest"
+
+[[rule]]
+regex = 'https://github\.com/openai/codex(?![\w/.-])'
+replace = "https://github.com/sunerpy/zuno"
+
+[[rule]]
+find = "an open source project led by OpenAI"
+replace = "an open source project forked from OpenAI's Codex CLI"
+
+# Test assertions look for the rendered session header, which Zuno renders as
+# `>_ Zuno` where upstream renders `>_ OpenAI Codex`.
+[[rule]]
+regex = '(?<=contains\(")OpenAI Codex(?=")'
+replace = ">_ Zuno"
+
+[[rule]]
+find = "OpenAI Codex"
+replace = "Zuno"
+
+[[rule]]
+find = "CODEX_HOME"
+replace = "ZUNO_HOME"
+
+[[rule]]
+find = "~/.codex"
+replace = "~/.zuno"
+
+[[rule]]
+find = "$HOME/.codex"
+replace = "$HOME/.zuno"
+
+# A product name right after an escaped line break inside a string literal
+# (`"...\nCodex exits"`): the generic rule below cannot see past the `n`.
+[[rule]]
+regex = '\\nCodex(?![A-Za-z0-9_:(])'
+replace = '\nZuno'
+
+# The product name in prose. Identifiers (`CodexAuth`, `Codex::`, `Codex(`) are
+# not touched.
+[[rule]]
+regex = '(?<![A-Za-z0-9_:.])Codex(?![A-Za-z0-9_:(])'
+replace = "Zuno"
+
+# Command examples such as `codex resume`, `codex -m <model>`, "approved codex
+# to run". Crate names, paths and model slugs (`codex-rs`, `openai/codex`,
+# `gpt-5-codex`, `.codex/`) are excluded by the surrounding characters.
+[[rule]]
+regex = '(?<![\w./-])codex(?= [a-z<-])'
+replace = "zuno"
+
+[[rule]]
+find = "`codex`"
+replace = "`zuno`"
+
+[[rule]]
+regex = '(?<=\$ )codex$'
+replace = "zuno"
+
+# Upstream keeps the workspace version at 0.0.0 on its development branch, so
+# its TUI snapshots render the real CLI version as `v0.0.0`; Zuno ships the real
+# version. Only `.snap` files: inline snapshots in `.rs` tests often inject a
+# literal `0.0.0` client version that stays `0.0.0` in Zuno too.
+[[rule]]
+regex = '(?<![\w.])v0\.0\.0(?!\w|\.\d)'
+replace = "v${version}"
+paths = ["codex-rs/tui/src/"]
+suffix = ".snap"

@@ -24,11 +24,13 @@ baseline.
   agent loop.
 - Model/provider/profile selection remains configuration. Workflows use logical
   routes instead of embedding credentials or mandatory model IDs.
-- Upstream Codex updates are replayed into an isolated candidate and never
-  merged automatically.
+- Upstream Codex updates are replayed into an isolated candidate whose merge
+  is gated by the PR gate: hands-off for fully automatic replays when
+  `UPSTREAM_CODEX.toml` opts in, manual otherwise.
 
 See [Zuno next architecture](ZUNO_ARCHITECTURE.md),
 [plugin-owned Agent backends](docs/zuno-plugin-agent-backends.md),
+[the enterprise agent design baseline](docs/zuno-enterprise-agent.md),
 [model profile examples](examples/zuno-config/README.md),
 [optional workflow templates](examples/zuno-workflows/README.md),
 [`UPSTREAM_CODEX.toml`](UPSTREAM_CODEX.toml), and
@@ -69,7 +71,8 @@ and `zuno`.
 ## Upstream update candidate
 
 ```sh
-# Fetch and report the newest stable Codex release without changing this branch.
+# Fetch and report the next stable Codex release to sync (--policy newest for the
+# latest) without changing this branch.
 python3 scripts/zuno_upstream.py --json check
 
 # After the current Zuno delta is reviewed and committed, merge it onto a new
@@ -83,10 +86,16 @@ python3 scripts/zuno_upstream.py prepare \
 **Prepare Codex upstream sync** runs every six hours in GitHub Actions and on
 demand. When openai/codex publishes a new stable `rust-vX.Y.Z`, it prepares the
 candidate, keeps the `upstream-sync/X.Y.Z` pull request current with `main`, and
-files an issue instead when the replay conflicts. Merging that PR with a merge
-commit is the only manual step: **Promote Zuno candidate** then tags
-`zuno-vX.Y.Z` from the sealed PR-gate bytes automatically. The workflow never
-merges the candidate. See [docs/zuno-upstream-sync.md](docs/zuno-upstream-sync.md)
+files an issue instead when the replay conflicts. Conflicts that exist only
+because Zuno renamed Codex text are resolved from
+[`FORK_REBRAND.toml`](FORK_REBRAND.toml) before anything is reported, and
+resolutions from an earlier candidate of the same release are reused when `main`
+moves. Releases are replayed in order, one candidate at a time. Merging that PR
+with a merge commit is the review gate: a fully automatic replay is queued for
+GitHub auto-merge behind the PR gate (`[sync].automatic_merge`, on by default),
+anything a person touched waits for a manual merge. **Promote Zuno candidate**
+then tags `zuno-vX.Y.Z` from the sealed PR-gate bytes automatically. See
+[docs/zuno-upstream-sync.md](docs/zuno-upstream-sync.md)
 ([中文](docs/zuno-upstream-sync.zh-CN.md)).
 
 For a server, use the statically linked single-file
@@ -99,11 +108,13 @@ Zuno reads its configuration and state from `ZUNO_HOME` (default `~/.zuno`)
 only. `CODEX_HOME` and `~/.codex` belong to a separately installed Codex and are
 never consulted.
 
-Zuno pull requests use the repository-owned `zuno/pr-gate`; OpenAI-specific
-Codex CI remains manual because it depends on upstream private runners and
-publishing credentials. The PR gate builds each of six platform packages once,
-runs native ACP/layout smoke, emits provenance attestations, and seals the exact
-bytes to the PR head and tree. After a merge-method-only cutover preserves both
+Zuno pull requests use the repository-owned `zuno/pr-gate`, which runs on
+CodeBuild-hosted GitHub Actions runners in the Zuno AWS account (no GitHub-hosted
+runner minutes); OpenAI-specific Codex CI remains manual because it depends on
+upstream private runners and publishing credentials. The PR gate builds each of
+six platform packages once, runs native ACP/layout smoke (the Windows ARM64
+package is cross-built and layout-checked only), emits provenance attestations,
+and seals the exact bytes to the PR head and tree. After a merge-method-only cutover preserves both
 histories, the promotion workflow accepts an explicit candidate run ID, verifies
 tree equality, creates `zuno-vX.Y.Z`, rechecks downloaded release bytes, and
 publishes a non-latest preview without rebuilding. The upstream `rust-v*`

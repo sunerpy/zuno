@@ -216,22 +216,36 @@ base. `DESIGN_SOURCES.toml` separately records targeted, non-ABI design referenc
 6. compute the exact binary-safe tree delta from the old Codex baseline to the
    reviewed Zuno source, apply only that delta to the candidate, and update its
    manifest. This deliberately excludes unrelated legacy-main parents retained
-   by the one-time source-history bridge.
+   by the one-time source-history bridge;
+7. replay the recorded rebrand (`FORK_REBRAND.toml`) onto every conflict hunk
+   whose Zuno side is provably just the rename of its Codex baseline, and reuse
+   the reviewed post-merge edits of an earlier candidate for the same release
+   for every path `main` has not changed since.
 
 The command never merges, resets, or updates the active Zuno branch. Conflicts
-remain in the candidate worktree for review. Tests, schema generation, native
+that automation cannot prove rename-only remain in the candidate worktree for
+review. Tests, schema generation, native
 platform checks, packaging, and runtime smoke are required before a candidate
 can replace the recorded baseline.
 
 ## CI and release ownership
 
 Zuno does not inherit OpenAI's private runner, signing, npm, or R2 authority.
-The protected `main` branch is gated by the public-runner `zuno/pr-gate`, while
-OpenAI-specific Codex workflows remain manually callable for compatibility
-research only. On a PR head, six native target jobs build the Zuno entrypoint
-and companion package once, run package-layout and native ACP smoke, emit GitHub
-provenance attestations, and seal all archives and checksums to the exact PR
-head, tree, workflow run, and attempt. Promotion accepts that immutable run ID,
+The protected `main` branch is gated by the repository-owned `zuno/pr-gate`,
+while OpenAI-specific Codex workflows remain manually callable for compatibility
+research only. Every Zuno workflow job (gate, promotion, upstream watcher) runs
+on a CodeBuild-hosted GitHub Actions runner in the Zuno AWS account rather than
+on GitHub-hosted runners: `zuno-runner` (Linux x86_64, and ARM64 through the
+`image:arm-3.0` label) and `zuno-runner-windows` in us-east-2, and
+`zuno-runner-macos` on a reserved Apple silicon fleet in us-west-2. On a PR
+head, six target jobs build the Zuno entrypoint and companion package once, run
+package-layout and native ACP smoke, emit GitHub provenance attestations, and
+seal all archives and checksums to the exact PR head, tree, workflow run, and
+attempt. Two targets are cross-built: `x86_64-apple-darwin` on the Apple silicon
+fleet, where its smoke still executes under Rosetta 2, and
+`aarch64-pc-windows-msvc` on x86_64 Windows, which CodeBuild cannot execute, so
+that package is verified by layout and PE machine type only and its smoke
+report says `executed: false`. Promotion accepts that immutable run ID,
 requires the merge commit tree to equal the certified tree, creates
 `zuno-vX.Y.Z`, verifies downloaded draft assets byte-for-byte, and publishes a
 non-latest preview without recompilation. Codex `rust-v*` automation is not a
@@ -249,7 +263,8 @@ staged installer proves lock, checksum, atomic switch, rollback, and
 installed-byte smoke on all six native targets.
 
 ```sh
-# Read-only report against the newest locally/freshly fetched stable tag.
+# Read-only report against the next stable tag after the recorded baseline
+# (--policy newest skips ahead to the latest).
 python3 scripts/zuno_upstream.py --json check
 
 # Prepare a separate candidate after the Zuno delta has been reviewed and

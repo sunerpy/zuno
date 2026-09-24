@@ -1,5 +1,14 @@
 name: Zuno CI
 
+# Every job runs on a CodeBuild-hosted GitHub Actions runner in the Zuno AWS
+# account (projects zuno-runner and zuno-runner-windows in us-east-2,
+# zuno-runner-macos on the reserved Mac fleet in us-west-2), so the gate
+# consumes no GitHub-hosted runner minutes. The first `runs-on` label names the
+# project; `image:`/`instance-size:` labels override its environment; the last
+# label is unique per job so GitHub never hands one job's runner to another.
+# aarch64-pc-windows-msvc is cross-built on the x86_64 Windows runner and only
+# layout-checked: CodeBuild has no ARM Windows compute that could execute it.
+
 on:
   pull_request:
     branches: [main]
@@ -20,8 +29,15 @@ env:
 jobs:
   static:
     name: Zuno static and runtime tests
-    runs-on: ubuntu-24.04
+    runs-on:
+      - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - image-default
+      - zuno-static
     timeout-minutes: 60
+    env:
+      # uv regenerates the Python SDK types; pin it to the same interpreter line
+      # setup-python installs below instead of the image default (3.14).
+      UV_PYTHON: "3.12"
     defaults:
       run:
         working-directory: codex-rs
@@ -31,6 +47,11 @@ jobs:
           ref: ${{ env.SOURCE_SHA }}
           fetch-depth: 0
           persist-credentials: false
+      # The runner image defaults to Python 3.14, which datamodel-code-generator
+      # (used to regenerate the Python SDK types) does not support yet.
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
       - uses: ./.github/actions/setup-ci
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
@@ -38,11 +59,12 @@ jobs:
       - name: Install actionlint
         shell: bash
         run: |
-          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.11
-          actionlint_bin="$(go env GOBIN)"
-          if [[ -z "$actionlint_bin" ]]; then
-            actionlint_bin="$(go env GOPATH)/bin"
-          fi
+          set -euo pipefail
+          # The CodeBuild image sets a multi-entry GOPATH, so pin GOBIN instead
+          # of deriving the install directory from `go env`.
+          actionlint_bin="${RUNNER_TEMP}/actionlint-bin"
+          mkdir -p "$actionlint_bin"
+          GOBIN="$actionlint_bin" go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.11
           "$actionlint_bin/actionlint" -version
           echo "$actionlint_bin" >> "$GITHUB_PATH"
       - name: Install Linux sandbox build dependencies
@@ -57,6 +79,8 @@ jobs:
         shell: bash
         run: |
           python3 scripts/test_zuno_upstream.py
+          python3 scripts/test_zuno_rebrand.py
+          python3 scripts/test_smoke_zuno_package.py
           CODEX_REPO_ROOT="$PWD" PYTHONPATH="$PWD/scripts" \
             python3 -m unittest \
               codex_package.test_cargo \
@@ -115,7 +139,11 @@ jobs:
 
   package:
     name: Package ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
+    runs-on:
+      - codebuild-${{ matrix.project }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - ${{ matrix.image }}
+      - ${{ matrix.size }}
+      - zuno-package
     # Cold release LTO on Intel macOS and x86_64 Windows exceeds 90 minutes.
     # Keep every native target and capability; allow the build to finish instead
     # of substituting cross compilation or dropping package companions.
@@ -124,41 +152,114 @@ jobs:
       contents: read
       id-token: write
       attestations: write
+    env:
+      # A single LTO rustc for codex_tui or codex_core needs several GB, so the
+      # parallelism is budgeted per instance size (see the matrix): the 15 GB
+      # large instances OOM-killed even four parallel jobs.
+      CARGO_BUILD_JOBS: ${{ matrix.jobs }}
     strategy:
       fail-fast: false
       matrix:
+        # Every entry carries the same number of labels (project, image
+        # override or the inert `image-default`, size override or the inert
+        # `size-default`, job label) so GitHub routes each expansion to the
+        # runner CodeBuild created for it. `smoke: layout` marks a cross-built
+        # target the runner cannot execute. Linux builds use xlarge (72 GB): the
+        # 15 GB large instances OOM-kill the LTO compile of codex_tui even at
+        # four jobs. The Mac fleet and the Windows containers only offer large,
+        # so their parallelism is capped instead.
         include:
-          - runner: ubuntu-24.04
+          - project: zuno-runner
+            image: image-default
+            size: instance-size:xlarge
+            jobs: "8"
             target: x86_64-unknown-linux-gnu
             os: linux
-          - runner: ubuntu-24.04-arm
+            smoke: native
+          - project: zuno-runner
+            image: image:arm-3.0
+            size: instance-size:xlarge
+            jobs: "8"
             target: aarch64-unknown-linux-gnu
             os: linux
-          - runner: macos-15-intel
+            smoke: native
+          - project: zuno-runner-macos
+            image: image-default
+            size: size-default
+            jobs: "4"
             target: x86_64-apple-darwin
             os: macos
-          - runner: macos-15
+            # Cross-built on the Apple silicon fleet and executed there under
+            # Rosetta 2, which the macOS image ships; the first launch translates
+            # the whole binary, so the smoke gets a long execution timeout.
+            smoke: rosetta
+          - project: zuno-runner-macos
+            image: image-default
+            size: size-default
+            jobs: "4"
             target: aarch64-apple-darwin
             os: macos
-          - runner: windows-2025
+            smoke: native
+          - project: zuno-runner-windows
+            image: image-default
+            size: size-default
+            jobs: "2"
             target: x86_64-pc-windows-msvc
             os: windows
-          - runner: windows-11-arm
+            smoke: native
+          - project: zuno-runner-windows
+            image: image-default
+            size: size-default
+            jobs: "2"
             target: aarch64-pc-windows-msvc
             os: windows
+            smoke: layout
     steps:
+      # The CodeBuild Windows work tree sits under a long prefix and the image
+      # does not enable long paths, so the checkout would fail on the TUI
+      # snapshot file names.
+      - name: Enable long paths for Git (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          git config --system core.longpaths true
+          git config --global core.longpaths true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ env.SOURCE_SHA }}
           persist-credentials: false
+      # setup-python has no builds for Amazon Linux, which is what the ARM64
+      # runner image is; install the distribution's Python 3.12 there instead.
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        if: matrix.image != 'image:arm-3.0'
         with:
           python-version: "3.13"
           architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+      - name: Install Python 3.12 from Amazon Linux
+        if: matrix.image == 'image:arm-3.0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo dnf install -y python3.12
+          sudo ln -sf /usr/bin/python3.12 /usr/local/bin/python3
+          sudo ln -sf /usr/bin/python3.12 /usr/local/bin/python
+          hash -r
+          python3 --version
       - uses: ./.github/actions/setup-ci
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
           targets: ${{ matrix.target }}
+      # The CodeBuild Windows image carries a Chocolatey Rust (1.84, GNU
+      # toolchain) early on the system PATH, and the runner appends rather than
+      # prepends the rustup bin directory there, so every later step would pick
+      # the wrong cargo, rustc and rust-lld. Put the rustup toolchain first.
+      - name: Prefer the rustup toolchain over the image's Chocolatey Rust (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
+          "PATH=$cargoBin;$env:PATH" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          & (Join-Path $cargoBin 'cargo.exe') --version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: zuno-candidate-${{ matrix.target }}
@@ -168,12 +269,70 @@ jobs:
         if: matrix.os == 'linux'
         shell: bash
         run: |
-          sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
+          set -euo pipefail
+          # Ubuntu on the x86_64 runner image, Amazon Linux 2023 on the ARM one.
+          # zstd writes the .tar.zst package archive; the Ubuntu image lacks it
+          # and the repository's DotSlash wrapper only covers Windows.
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev zstd
+          else
+            sudo dnf install -y pkgconf-pkg-config libcap-devel zstd
+          fi
+          zstd --version
       - name: Configure V8 artifact
         uses: ./.github/actions/setup-rusty-v8
         with:
           target: ${{ matrix.target }}
+      # The CodeBuild Windows image ships Visual Studio Build Tools with only the
+      # MSBuild workload: no VC++ compiler, linker or Windows SDK. Install the
+      # 2022 Build Tools C++ workload (plus the ARM64 cross tools for the
+      # aarch64 target) when no installation provides the component the target
+      # needs; GitHub-style images that already have it skip the download.
+      - name: Install MSVC build tools when the runner image lacks them
+        if: matrix.os == 'windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $component = if ($env:TARGET -eq 'aarch64-pc-windows-msvc') {
+            'Microsoft.VisualStudio.Component.VC.Tools.ARM64'
+          } else {
+            'Microsoft.VisualStudio.Component.VC.Tools.x86.x64'
+          }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if ((Test-Path $vswhere) -and (& $vswhere -latest -products * -requires $component -property installationPath 2>$null)) {
+            Write-Host "A Visual Studio installation already provides $component"
+            exit 0
+          }
+          $bootstrapper = Join-Path $env:RUNNER_TEMP 'vs_BuildTools.exe'
+          Invoke-WebRequest -Uri 'https://aka.ms/vs/17/release/vs_BuildTools.exe' -OutFile $bootstrapper
+          $installPath = 'C:\BuildTools2022'
+          # Clang is what aws-lc-sys assembles its ARM64 sources with (cl.exe
+          # cannot), and nasm assembles its x86_64 sources; GitHub's Windows
+          # images ship both, this one ships neither.
+          $arguments = @(
+            '--quiet', '--wait', '--norestart', '--nocache',
+            '--installPath', $installPath,
+            '--add', 'Microsoft.VisualStudio.Workload.VCTools', '--includeRecommended',
+            '--add', 'Microsoft.VisualStudio.Component.VC.Tools.ARM64',
+            '--add', 'Microsoft.VisualStudio.Component.VC.Llvm.Clang'
+          )
+          $process = Start-Process -FilePath $bootstrapper -ArgumentList $arguments -Wait -PassThru -NoNewWindow
+          if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010) {
+            throw "Visual Studio Build Tools installer exited with $($process.ExitCode)"
+          }
+          $found = & $vswhere -latest -products * -requires $component -property installationPath
+          if (-not $found) { throw "Build Tools installed but $component is still missing" }
+          Write-Host "Installed Visual Studio Build Tools at $found"
+          $clangDir = Join-Path $found 'VC\Tools\Llvm\x64\bin'
+          if (-not (Test-Path (Join-Path $clangDir 'clang.exe'))) { throw "clang.exe not found under $clangDir" }
+          $clangDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+            choco install nasm -y --no-progress | Out-Null
+            'C:\Program Files\NASM' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
       - name: Configure MSVC linker
         if: matrix.os == 'windows'
         uses: ./.github/actions/setup-msvc-env
@@ -210,11 +369,27 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
+          SMOKE: ${{ matrix.smoke }}
         run: |
+          set -euo pipefail
+          extra=()
+          if [[ "$SMOKE" == layout ]]; then
+            # Cross-built for an architecture this runner cannot execute: verify
+            # the archive layout and the machine type of every binary instead.
+            extra=(--layout-only)
+          elif [[ "$SMOKE" == rosetta ]]; then
+            # Executed through Rosetta 2 on the Apple silicon fleet: the first
+            # launch of each binary is translated ahead of time and can take
+            # minutes for a binary of this size.
+            extra=(--exec-timeout 900 --execution-note rosetta2-on-apple-silicon)
+          fi
+          # macOS ships bash 3.2, where "${extra[@]}" on an empty array trips
+          # `set -u`; the `+` expansion form is safe there.
           python3 scripts/smoke_zuno_package.py \
             --archive "codex-rs/dist/${TARGET}/zuno-package-${TARGET}.tar.gz" \
             --target "$TARGET" \
-            --report "codex-rs/dist/${TARGET}/smoke-${TARGET}.json"
+            --report "codex-rs/dist/${TARGET}/smoke-${TARGET}.json" \
+            ${extra[@]+"${extra[@]}"}
       - name: Smoke external Agent host sandbox
         if: matrix.os == 'linux'
         working-directory: codex-rs
@@ -243,7 +418,12 @@ jobs:
 
   standalone:
     name: Standalone x86_64-unknown-linux-musl
-    runs-on: ubuntu-24.04
+    # zuno-runner runs privileged so the foreign-container smoke can use Docker;
+    # xlarge for the same LTO memory reason as the Linux package legs.
+    runs-on:
+      - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - instance-size:xlarge
+      - zuno-standalone
     timeout-minutes: 120
     permissions:
       contents: read
@@ -251,6 +431,8 @@ jobs:
       attestations: write
     env:
       STANDALONE_TARGET: x86_64-unknown-linux-musl
+      # See the package job: budget the parallel LTO rustc jobs for 72 GB.
+      CARGO_BUILD_JOBS: "8"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -339,7 +521,10 @@ jobs:
   seal:
     name: Seal exact candidate bytes
     needs: [static, package, standalone]
-    runs-on: ubuntu-24.04
+    runs-on:
+      - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - instance-size:medium
+      - zuno-seal
     timeout-minutes: 15
     permissions:
       contents: read
@@ -464,8 +649,40 @@ jobs:
     name: zuno/pr-gate
     if: always()
     needs: [static, package, standalone, seal]
-    runs-on: ubuntu-24.04
+    runs-on:
+      - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - instance-size:small
+      - zuno-required
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
+      # A queued auto-merge on an upstream-sync/* candidate belongs to the exact
+      # head the watcher pushed (recorded as Zuno-Candidate-Commit in the PR
+      # body). GitHub keeps the queue when someone with write access pushes
+      # another head and the watcher only looks every six hours, so this gate
+      # withdraws the queue itself before it can turn green for a head nobody
+      # cleared. Only the watcher's own heads may merge hands-off; a person who
+      # pushed to the candidate merges it by hand. A failed probe or
+      # withdrawal fails the gate.
+      - name: Withdraw auto-merge from a head the watcher did not push
+        if: startsWith(github.event.pull_request.head.ref, 'upstream-sync/') && github.event.pull_request.head.repo.full_name == github.repository
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          pr_json="$(gh pr view "${PR_NUMBER}" --json body,headRefOid,autoMergeRequest)"
+          queued="$(jq -r '.autoMergeRequest != null' <<<"${pr_json}")"
+          head="$(jq -r '.headRefOid' <<<"${pr_json}")"
+          candidate="$(jq -r '.body // ""' <<<"${pr_json}" | sed -n 's/^Zuno-Candidate-Commit: \([0-9a-f]\{40\}\)$/\1/p' | head -n1)"
+          if [[ "${queued}" == true && "${head}" != "${candidate}" ]]; then
+            gh pr merge "${PR_NUMBER}" --disable-auto
+            gh pr comment "${PR_NUMBER}" --body "Auto-merge withdrawn by \`zuno/pr-gate\`: the branch head \`${head}\` is not the candidate the upstream watcher pushed (\`${candidate:-none recorded}\`). Only watcher-pushed heads merge hands-off; merge this candidate by hand once it is reviewed."
+            echo "Withdrew auto-merge from PR #${PR_NUMBER}: head ${head} is not the watcher's candidate ${candidate:-<none>}." >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Require exact candidate success
         shell: bash
         env:

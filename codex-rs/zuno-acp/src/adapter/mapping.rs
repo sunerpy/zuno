@@ -10,6 +10,31 @@ pub(super) fn initialize(params: &Value) -> Result<Value, RpcError> {
             "unsupported ACP protocol version {requested}"
         )));
     }
+    // The bridge calls no client-side method beyond `session/request_permission`
+    // and `session/update`, which every ACP client implements, so the advertised
+    // fs/terminal capabilities do not change its behaviour. They are still
+    // validated so a malformed handshake fails here instead of on a later call.
+    for (field, value) in [
+        ("clientCapabilities", params.get("clientCapabilities")),
+        ("clientInfo", params.get("clientInfo")),
+    ] {
+        match value {
+            None | Some(Value::Null) | Some(Value::Object(_)) => {}
+            Some(_) => {
+                return Err(RpcError::invalid_params(format!(
+                    "{field} must be an object"
+                )));
+            }
+        }
+    }
+    if let Some(info) = params.get("clientInfo").and_then(Value::as_object) {
+        let client = info
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let version = info.get("version").and_then(Value::as_str).unwrap_or("");
+        tracing::debug!(client, version, "ACP client initialized");
+    }
     Ok(json!({
         "protocolVersion": ACP_PROTOCOL_VERSION,
         "agentCapabilities": {
@@ -134,6 +159,12 @@ pub(super) fn config_options(route: &SessionRoute) -> Vec<Value> {
     ]
 }
 
+/// Translate ACP prompt blocks into App Server `UserInput` items.
+///
+/// The text shapes match the official `codex-acp` adapter (`[@name](uri)` links
+/// and `<context ref="uri">` wrappers) so a prompt means the same thing to the
+/// model whichever Codex ACP agent a client talks to. Only block types the
+/// `initialize` response advertises are accepted.
 pub(super) fn acp_prompt_to_codex(prompt: Option<&Value>) -> Result<Vec<Value>, RpcError> {
     let blocks = prompt
         .and_then(Value::as_array)
@@ -146,6 +177,9 @@ pub(super) fn acp_prompt_to_codex(prompt: Option<&Value>) -> Result<Vec<Value>, 
                 input.push(json!({ "type": "text", "text": text, "textElements": [] }));
             }
             Some("image") => {
+                // Always inline the client's bytes: App Server rejects remote
+                // image URLs (`validate_user_input_image_urls`), so an optional
+                // `uri` is informational only and must not replace `data`.
                 let mime = required_string(block, "mimeType")?;
                 let data = required_string(block, "data")?;
                 input.push(json!({
@@ -155,12 +189,8 @@ pub(super) fn acp_prompt_to_codex(prompt: Option<&Value>) -> Result<Vec<Value>, 
             }
             Some("resource_link") => {
                 let uri = required_string(block, "uri")?;
-                let name = block.get("name").and_then(Value::as_str).unwrap_or(&uri);
-                input.push(json!({
-                    "type": "text",
-                    "text": format!("Resource {name}: {uri}"),
-                    "textElements": [],
-                }));
+                let name = block.get("name").and_then(Value::as_str);
+                input.push(text_input(uri_as_link(name, &uri)));
             }
             Some("resource") => {
                 let resource = block
@@ -169,18 +199,33 @@ pub(super) fn acp_prompt_to_codex(prompt: Option<&Value>) -> Result<Vec<Value>, 
                     .ok_or_else(|| {
                         RpcError::invalid_params("resource block must contain resource")
                     })?;
+                let uri = resource
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .filter(|uri| !uri.is_empty())
+                    .ok_or_else(|| RpcError::invalid_params("resource must contain uri"))?;
+                let link = uri_as_link(None, uri);
                 if let Some(text) = resource.get("text").and_then(Value::as_str) {
-                    input.push(json!({ "type": "text", "text": text, "textElements": [] }));
-                } else if let (Some(mime), Some(blob)) = (
-                    resource.get("mimeType").and_then(Value::as_str),
-                    resource.get("blob").and_then(Value::as_str),
-                ) {
-                    input.push(json!({
-                        "type": "image", "url": format!("data:{mime};base64,{blob}"),
-                    }));
+                    input.push(text_input(format!(
+                        "{link}\n<context ref=\"{uri}\">\n{text}\n</context>"
+                    )));
+                } else if let Some(blob) = resource.get("blob").and_then(Value::as_str) {
+                    let mime = resource
+                        .get("mimeType")
+                        .and_then(Value::as_str)
+                        .unwrap_or("application/octet-stream");
+                    if mime.starts_with("image/") {
+                        input.push(json!({
+                            "type": "image", "url": format!("data:{mime};base64,{blob}"),
+                        }));
+                    } else {
+                        input.push(text_input(format!(
+                            "{link}\n<context ref=\"{uri}\" mimeType=\"{mime}\" encoding=\"base64\">\n{blob}\n</context>"
+                        )));
+                    }
                 } else {
                     return Err(RpcError::invalid_params(
-                        "resource must contain text or a typed blob",
+                        "resource must contain text or a blob",
                     ));
                 }
             }
@@ -198,6 +243,36 @@ pub(super) fn acp_prompt_to_codex(prompt: Option<&Value>) -> Result<Vec<Value>, 
         ));
     }
     Ok(input)
+}
+
+fn text_input(text: String) -> Value {
+    json!({ "type": "text", "text": text, "textElements": [] })
+}
+
+/// `[@name](uri)`, defaulting the label to the file name of a `file://` URI.
+fn uri_as_link(name: Option<&str>, uri: &str) -> String {
+    match name.filter(|name| !name.is_empty()) {
+        Some(name) => format!("[@{name}]({uri})"),
+        None => match uri.strip_prefix("file://") {
+            Some(path) => {
+                let file_name = path
+                    .rsplit('/')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(path);
+                format!("[@{file_name}]({uri})")
+            }
+            None => uri.to_owned(),
+        },
+    }
+}
+
+/// `session/set_mode` is the dedicated ACP v1 mode method; the same change is
+/// expressed through the `mode` config option, so it is translated to that call.
+pub(super) fn set_mode_as_config_option(params: &Value) -> Result<Value, RpcError> {
+    let session_id = required_string(params, "sessionId")?;
+    let mode_id = required_string(params, "modeId")?;
+    Ok(json!({ "sessionId": session_id, "configId": "mode", "value": mode_id }))
 }
 
 pub(super) fn mcp_server_config(value: Option<&Value>) -> Result<Map<String, Value>, RpcError> {
