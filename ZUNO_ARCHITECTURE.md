@@ -216,10 +216,15 @@ base. `DESIGN_SOURCES.toml` separately records targeted, non-ABI design referenc
 6. compute the exact binary-safe tree delta from the old Codex baseline to the
    reviewed Zuno source, apply only that delta to the candidate, and update its
    manifest. This deliberately excludes unrelated legacy-main parents retained
-   by the one-time source-history bridge.
+   by the one-time source-history bridge;
+7. replay the recorded rebrand (`FORK_REBRAND.toml`) onto every conflict hunk
+   whose Zuno side is provably just the rename of its Codex baseline, and reuse
+   the reviewed post-merge edits of an earlier candidate for the same release
+   for every path `main` has not changed since.
 
 The command never merges, resets, or updates the active Zuno branch. Conflicts
-remain in the candidate worktree for review. Tests, schema generation, native
+that automation cannot prove rename-only remain in the candidate worktree for
+review. Tests, schema generation, native
 platform checks, packaging, and runtime smoke are required before a candidate
 can replace the recorded baseline.
 

@@ -72,6 +72,110 @@ class Repository:
 
 
 class ZunoUpstreamTest(unittest.TestCase):
+    def test_target_policy_next_replays_releases_in_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Repository(Path(directory))
+            repo.write("file", "base\n")
+            repo.commit("base")
+            base, tree = repo.tag_baseline("rust-v0.9.0")
+            for tag in ["rust-v0.10.0", "rust-v0.10.1", "rust-v0.11.0", "rust-v0.11.0-alpha.3"]:
+                repo.write("file", f"{tag}\n")
+                repo.commit(tag)
+                git(repo.root, "tag", tag)
+            repo.manifest("rust-v0.10.0", base, tree)
+            baseline = zuno_upstream.read_baseline(repo.root / "UPSTREAM_CODEX.toml")
+            self.assertEqual(
+                zuno_upstream.exact_target(repo.root, None, baseline, "next"), "rust-v0.10.1"
+            )
+            self.assertEqual(
+                zuno_upstream.exact_target(repo.root, None, baseline, "newest"), "rust-v0.11.0"
+            )
+            # Nothing newer than the baseline: both policies report the newest tag
+            # so `check --allow-current` can say the baseline is current.
+            repo.manifest("rust-v0.11.0", base, tree)
+            current = zuno_upstream.read_baseline(repo.root / "UPSTREAM_CODEX.toml")
+            self.assertEqual(
+                zuno_upstream.exact_target(repo.root, None, current, "next"), "rust-v0.11.0"
+            )
+            self.assertEqual(
+                zuno_upstream.exact_target(repo.root, "rust-v0.10.0", baseline, "next"),
+                "rust-v0.10.0",
+            )
+            with self.assertRaises(zuno_upstream.SyncError):
+                zuno_upstream.exact_target(repo.root, None, baseline, "latest")
+            # An open candidate for a newer release is kept (releases between the
+            # baseline and it are superseded); an older or unknown one is ignored.
+            self.assertEqual(
+                zuno_upstream.exact_target(
+                    repo.root, None, baseline, "next", ["rust-v0.11.0"]
+                ),
+                "rust-v0.11.0",
+            )
+            self.assertEqual(
+                zuno_upstream.exact_target(
+                    repo.root, None, baseline, "next", ["rust-v0.9.0", "rust-v0.99.0"]
+                ),
+                "rust-v0.10.1",
+            )
+            self.assertEqual(
+                zuno_upstream.exact_target(
+                    repo.root, "rust-v0.10.1", baseline, "next", ["rust-v0.11.0"]
+                ),
+                "rust-v0.10.1",
+            )
+            with self.assertRaises(zuno_upstream.SyncError):
+                zuno_upstream.exact_target(repo.root, None, baseline, "next", ["0.11.0"])
+
+    def test_open_candidates_come_from_unmerged_remote_branches(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "origin").mkdir()
+            origin = Repository(root / "origin")
+            origin.write("file", "base\n")
+            origin.commit("base")
+            base, tree = origin.tag_baseline("rust-v0.9.0")
+            for tag in ["rust-v0.10.0", "rust-v0.10.1", "rust-v0.11.0"]:
+                origin.write("file", f"{tag}\n")
+                origin.commit(tag)
+                git(origin.root, "tag", tag)
+            baseline_commit = git(origin.root, "rev-parse", "rust-v0.10.0^{commit}")
+            baseline_tree = git(origin.root, "rev-parse", "rust-v0.10.0^{tree}")
+            git(origin.root, "checkout", "-q", "-b", "zuno", baseline_commit)
+            origin.manifest("rust-v0.10.0", baseline_commit, baseline_tree)
+            source = origin.commit("zuno")
+            # A merged candidate (ancestor of zuno), an open one, and noise.
+            git(origin.root, "branch", "upstream-sync/0.10.0", source)
+            git(origin.root, "checkout", "-q", "-b", "upstream-sync/0.11.0", "rust-v0.11.0")
+            origin.write("file", "candidate\n")
+            origin.commit("candidate 0.11.0")
+            git(origin.root, "branch", "upstream-sync/not-a-version", "rust-v0.10.1")
+            git(origin.root, "checkout", "-q", "zuno")
+
+            clone = root / "clone"
+            subprocess.run(["git", "clone", "-q", str(origin.root), str(clone)], check=True)
+            git(clone, "fetch", "-q", "--tags", "origin")
+            self.assertEqual(
+                zuno_upstream.open_candidates_on_remote(clone, "origin", source),
+                ["rust-v0.11.0"],
+            )
+            baseline = zuno_upstream.read_baseline(clone / "UPSTREAM_CODEX.toml")
+            # Without the remote the next release is 0.10.1; the open 0.11.0
+            # candidate wins through the CLI wiring.
+            plain = subprocess.run(
+                [sys.executable, str(SCRIPT), "--repo", str(clone), "--no-fetch", "--json",
+                 "check", "--source", "origin/zuno", "--policy", "next"],
+                text=True, check=True, stdout=subprocess.PIPE,
+            ).stdout
+            self.assertEqual(json.loads(plain)["target_tag"], "rust-v0.10.1")
+            with_remote = subprocess.run(
+                [sys.executable, str(SCRIPT), "--repo", str(clone), "--no-fetch", "--json",
+                 "check", "--source", "origin/zuno", "--policy", "next",
+                 "--open-candidates-remote", "origin"],
+                text=True, check=True, stdout=subprocess.PIPE,
+            ).stdout
+            self.assertEqual(json.loads(with_remote)["target_tag"], "rust-v0.11.0")
+            self.assertEqual(baseline.release_tag, "rust-v0.10.0")
+
     def test_latest_stable_ignores_alpha_and_sorts_semver(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Repository(Path(directory))
@@ -796,6 +900,256 @@ class ZunoUpstreamTest(unittest.TestCase):
                 git(worktree, "show", "-s", "--format=%s", payload["commit"]),
                 "chore(upstream): custom subject",
             )
+
+
+REBRAND_RULES = "\n".join(
+    [
+        "schema_version = 1",
+        'protect = ["Codex Desktop"]',
+        "[[added]]",
+        'prefix = "snapshots/"',
+        'suffix = ".snap"',
+        "[[rule]]",
+        'find = "Codex"',
+        'replace = "Zuno"',
+        "[[rule]]",
+        'regex = \'\\(v0\\.0\\.0\\)\'',
+        'replace = "(v${version})"',
+        'paths = ["snapshots/"]',
+        "",
+    ]
+)
+
+
+def workspace_manifest(version: str) -> str:
+    return f'[workspace.package]\nversion = "{version}"\n'
+
+
+class RebrandReplayTest(unittest.TestCase):
+    """``prepare`` replays FORK_REBRAND.toml onto rename-only conflicts."""
+
+    def build(self, root: Path) -> tuple[Repository, str, str]:
+        repo_path = root / "repo"
+        repo_path.mkdir()
+        repo = Repository(repo_path)
+        repo.write("codex-rs/Cargo.toml", workspace_manifest("0.1.0"))
+        repo.write("greeting.md", "Restart Codex to continue.\n")
+        repo.write("semantic.rs", "fn run() { Codex::start(); }\nlet timeout = 1;\n")
+        repo.write("mixed.md", "Codex docs\n\nunrelated\n\nlimit = 5\n")
+        repo.write("gone.md", "Codex leaves.\n")
+        repo.write("snapshots/status.snap", "│ >_ Codex (v0.0.0)   │\n")
+        repo.write("clean.md", "Codex is clean.\n\n\n\nfooter\n")
+        repo.commit("base")
+        base, tree = repo.tag_baseline("rust-v0.1.0")
+
+        git(repo.root, "checkout", "-q", "-b", "release-next")
+        repo.write("codex-rs/Cargo.toml", workspace_manifest("0.2.0"))
+        repo.write("greeting.md", "Restart Codex to continue; Codex Desktop stays.\n")
+        repo.write("semantic.rs", "fn run() { Codex::start(); }\nlet timeout = 2;\n")
+        repo.write("mixed.md", "Codex docs v2\n\nunrelated\n\nlimit = 6\n")
+        (repo.root / "gone.md").unlink()
+        repo.write("clean.md", "Codex is clean.\n\n\n\nfooter\nCodex is new.\n")
+        # New upstream files: a rendered snapshot inside the `added` scope and a
+        # source file outside it.
+        repo.write("snapshots/new_popup.snap", "│ >_ Codex (v0.0.0) │\nAsk Codex\n")
+        repo.write("new_module.rs", "// Codex keeps this\n")
+        repo.commit("upstream next")
+        git(repo.root, "tag", "rust-v0.2.0")
+        target = git(repo.root, "rev-parse", "HEAD")
+
+        git(repo.root, "checkout", "-q", "-b", "zuno", base)
+        repo.manifest("rust-v0.1.0", base, tree)
+        repo.write("FORK_REBRAND.toml", REBRAND_RULES)
+        repo.write("codex-rs/Cargo.toml", workspace_manifest("0.1.3"))
+        repo.write("greeting.md", "Restart Zuno to continue.\n")
+        repo.write("semantic.rs", "fn run() { Codex::start(); }\nlet timeout = 9;\n")
+        repo.write("mixed.md", "Zuno docs\n\nunrelated\n\nlimit = 7\n")
+        repo.write("gone.md", "Zuno leaves.\n")
+        repo.write("snapshots/status.snap", "│ >_ Zuno (v0.1.3)    │\n")
+        repo.write("clean.md", "Zuno is clean.\n\n\n\nfooter\n")
+        source = repo.commit("zuno delta")
+        return repo, source, target
+
+    def test_prepare_replays_rename_only_conflicts_and_refreshes_clean_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, source, _ = self.build(root)
+            baseline = zuno_upstream.read_baseline(repo.root / "UPSTREAM_CODEX.toml")
+            plan = zuno_upstream.make_plan(repo.root, baseline, "zuno", "rust-v0.2.0")
+            worktree = root / "candidate"
+            with self.assertRaises(zuno_upstream.SyncError) as raised:
+                zuno_upstream.prepare(
+                    repo.root, "UPSTREAM_CODEX.toml", plan, "upstream-sync/0.2.0", worktree
+                )
+            details = raised.exception.details
+            self.assertEqual(details["status"], "conflict")
+            # Only the semantic conflict is left; the mixed file lost its rename hunk.
+            self.assertEqual(details["conflicting_files"], ["mixed.md", "semantic.rs"])
+            replay = details["rebrand"]
+            self.assertEqual(replay["resolved"], ["codex-rs/Cargo.toml", "greeting.md"])
+            self.assertEqual(replay["deleted"], ["gone.md"])
+            self.assertEqual(replay["partial"], ["mixed.md"])
+            self.assertEqual(replay["refreshed"], ["clean.md", "snapshots/status.snap"])
+            self.assertEqual(replay["added"], ["snapshots/new_popup.snap"])
+            self.assertEqual(replay["drift"], ["new_module.rs"])
+            self.assertEqual(replay["reused"], [])
+            self.assertEqual(
+                (worktree / "snapshots/new_popup.snap").read_text(), "│ >_ Zuno (v0.2.0)  │\nAsk Zuno\n"
+            )
+            self.assertEqual((worktree / "new_module.rs").read_text(), "// Codex keeps this\n")
+            self.assertEqual(
+                (worktree / "greeting.md").read_text(),
+                "Restart Zuno to continue; Codex Desktop stays.\n",
+            )
+            self.assertEqual((worktree / "codex-rs/Cargo.toml").read_text(), workspace_manifest("0.2.0"))
+            self.assertFalse((worktree / "gone.md").exists())
+            self.assertEqual((worktree / "clean.md").read_text(), "Zuno is clean.\n\n\n\nfooter\nZuno is new.\n")
+            # The version placeholder tracks the release and the border stays aligned.
+            self.assertEqual((worktree / "snapshots/status.snap").read_text(), "│ >_ Zuno (v0.2.0)    │\n")
+            mixed = (worktree / "mixed.md").read_text()
+            self.assertTrue(mixed.startswith("Zuno docs v2\n\nunrelated\n\n<<<<<<< "), mixed)
+            self.assertIn("||||||| ", mixed)
+            semantic = (worktree / "semantic.rs").read_text()
+            self.assertIn("<<<<<<< ", semantic)
+            self.assertIn("let timeout = 9;", semantic)
+            self.assertEqual(git(repo.root, "rev-parse", "zuno"), source)
+
+    def test_prepare_without_rebrand_keeps_every_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, _, _ = self.build(root)
+            baseline = zuno_upstream.read_baseline(repo.root / "UPSTREAM_CODEX.toml")
+            plan = zuno_upstream.make_plan(repo.root, baseline, "zuno", "rust-v0.2.0")
+            with self.assertRaises(zuno_upstream.SyncError) as raised:
+                zuno_upstream.prepare(
+                    repo.root,
+                    "UPSTREAM_CODEX.toml",
+                    plan,
+                    "upstream-sync/0.2.0",
+                    root / "candidate",
+                    replay_rebrand=False,
+                )
+            self.assertEqual(
+                raised.exception.details["conflicting_files"],
+                ["codex-rs/Cargo.toml", "gone.md", "greeting.md", "mixed.md", "semantic.rs"],
+            )
+            self.assertEqual(raised.exception.details["rebrand"]["resolved"], [])
+
+    def test_prepare_reuses_resolutions_from_a_finalized_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, source, target = self.build(root)
+            baseline = zuno_upstream.read_baseline(repo.root / "UPSTREAM_CODEX.toml")
+            plan = zuno_upstream.make_plan(repo.root, baseline, "zuno", "rust-v0.2.0")
+            first = root / "first"
+            with self.assertRaises(zuno_upstream.SyncError):
+                zuno_upstream.prepare(repo.root, "UPSTREAM_CODEX.toml", plan, "upstream-sync/0.2.0", first)
+            (first / "semantic.rs").write_text("fn run() { Codex::start(); }\nlet timeout = 92;\n")
+            (first / "mixed.md").write_text("Zuno docs v2\n\nunrelated\n\nlimit = 76\n")
+            # Post-merge edits outside any conflict: an API adaptation in a file
+            # that merged cleanly, and the removal of an orphaned file.
+            (first / "clean.md").write_text("Zuno is clean.\n\n\n\nfooter\nZuno is new.\nadapted to v2\n")
+            (first / "snapshots" / "status.snap").unlink()
+            finalized = zuno_upstream.finalize(first, "UPSTREAM_CODEX.toml", None, None)
+            self.assertEqual(
+                git(repo.root, "show", "-s", "--format=%P", finalized.commit).split(), [source, target]
+            )
+
+            # main moves without touching the conflicted paths: the old
+            # resolutions carry over and the replay is clean.
+            git(repo.root, "checkout", "-q", "zuno")
+            repo.write("zuno-only.md", "new zuno file\n")
+            moved = repo.commit("zuno moves")
+            plan = zuno_upstream.make_plan(repo.root, baseline, "zuno", "rust-v0.2.0")
+            second = root / "second"
+            candidate = zuno_upstream.prepare(
+                repo.root,
+                "UPSTREAM_CODEX.toml",
+                plan,
+                "upstream-sync/0.2.0-again",
+                second,
+                reuse=finalized.commit,
+            )
+            self.assertEqual(
+                candidate.rebrand.reused,
+                ["clean.md", "mixed.md", "semantic.rs", "snapshots/status.snap"],
+            )
+            self.assertIn("let timeout = 92;", (second / "semantic.rs").read_text())
+            self.assertEqual((second / "mixed.md").read_text(), "Zuno docs v2\n\nunrelated\n\nlimit = 76\n")
+            self.assertTrue((second / "clean.md").read_text().endswith("adapted to v2\n"))
+            self.assertFalse((second / "snapshots" / "status.snap").exists())
+            # Files the replay already produced identically are not reported.
+            self.assertNotIn("greeting.md", candidate.rebrand.reused)
+            self.assertEqual((second / "zuno-only.md").read_text(), "new zuno file\n")
+            refinalized = zuno_upstream.finalize(second, "UPSTREAM_CODEX.toml", None, None)
+            self.assertEqual(
+                git(repo.root, "show", "-s", "--format=%P", refinalized.commit).split(), [moved, target]
+            )
+
+            # A path Zuno changed since the old candidate is not reused, whether
+            # it was a conflict (semantic.rs) or a clean adaptation (clean.md).
+            git(repo.root, "checkout", "-q", "zuno")
+            repo.write("semantic.rs", "fn run() { Codex::start(); }\nlet timeout = 10;\n")
+            repo.write("clean.md", "Zuno is very clean.\n\n\n\nfooter\n")
+            repo.commit("zuno edits semantic")
+            plan = zuno_upstream.make_plan(repo.root, baseline, "zuno", "rust-v0.2.0")
+            with self.assertRaises(zuno_upstream.SyncError) as raised:
+                zuno_upstream.prepare(
+                    repo.root,
+                    "UPSTREAM_CODEX.toml",
+                    plan,
+                    "upstream-sync/0.2.0-third",
+                    root / "third",
+                    reuse=finalized.commit,
+                )
+            self.assertEqual(raised.exception.details["conflicting_files"], ["semantic.rs"])
+            self.assertEqual(
+                raised.exception.details["rebrand"]["reused"], ["mixed.md", "snapshots/status.snap"]
+            )
+            self.assertNotIn("adapted to v2", (root / "third" / "clean.md").read_text())
+
+    def test_prepare_rejects_reuse_of_a_foreign_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, source, _ = self.build(root)
+            baseline = zuno_upstream.read_baseline(repo.root / "UPSTREAM_CODEX.toml")
+            plan = zuno_upstream.make_plan(repo.root, baseline, "zuno", "rust-v0.2.0")
+            with self.assertRaises(zuno_upstream.SyncError) as raised:
+                zuno_upstream.prepare(
+                    repo.root, "UPSTREAM_CODEX.toml", plan, "upstream-sync/0.2.0", root / "candidate", reuse=source
+                )
+            self.assertIn("not a finalized candidate", str(raised.exception))
+
+    def test_cli_prepare_reports_rebrand_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, _, _ = self.build(root)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--repo",
+                    str(repo.root),
+                    "--no-fetch",
+                    "--json",
+                    "prepare",
+                    "--source",
+                    "zuno",
+                    "--target",
+                    "rust-v0.2.0",
+                    "--worktree",
+                    str(root / "candidate"),
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["conflicting_files"], ["mixed.md", "semantic.rs"])
+            self.assertEqual(payload["rebrand"]["resolved"], ["codex-rs/Cargo.toml", "greeting.md"])
+            self.assertEqual(payload["rebrand"]["deleted"], ["gone.md"])
 
 
 if __name__ == "__main__":

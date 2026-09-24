@@ -17,6 +17,9 @@ import subprocess
 import sys
 from typing import Sequence
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import zuno_rebrand  # noqa: E402
+
 
 STABLE_TAG = re.compile(
     r"^rust-v(?P<major>0|[1-9][0-9]*)\.(?P<minor>0|[1-9][0-9]*)\.(?P<patch>0|[1-9][0-9]*)$"
@@ -111,6 +114,37 @@ CONFLICT_MARKERS = ("<<<<<<< ", "=======", ">>>>>>> ")
 
 
 @dataclass(frozen=True)
+class RebrandReplay:
+    """What the rebrand replay changed in a candidate (see FORK_REBRAND.toml)."""
+
+    # Conflicted paths whose every hunk was the rebrand of its base; rewritten as
+    # the rebrand of the upstream text.
+    resolved: list[str]
+    # Paths upstream deleted that Zuno had only rebranded; removed.
+    deleted: list[str]
+    # Zuno-rebranded paths that merged cleanly but whose replayed text differs
+    # (new upstream wording, or the ${version} placeholder); rewritten.
+    refreshed: list[str]
+    # Paths taken from a previous candidate of the same release: its conflict
+    # resolutions, adaptations in cleanly merged files, and deletions.
+    reused: list[str]
+    # Conflicted paths where only some hunks were rebrand; markers remain.
+    partial: list[str]
+    # Files upstream added inside an `[[added]]` scope of FORK_REBRAND.toml
+    # (rendered-text snapshots); rebranded without a predicate.
+    added: list[str]
+    # Upstream-changed paths outside the Zuno delta that the rules would alter;
+    # reported for review, never rewritten.
+    drift: list[str]
+
+
+def empty_replay() -> RebrandReplay:
+    return RebrandReplay(
+        resolved=[], deleted=[], refreshed=[], reused=[], partial=[], added=[], drift=[]
+    )
+
+
+@dataclass(frozen=True)
 class PreparedCandidate:
     branch: str
     worktree: str
@@ -119,6 +153,7 @@ class PreparedCandidate:
     candidate_base_commit: str
     manifest_updated: bool
     regenerate_paths: list[str]
+    rebrand: RebrandReplay
 
 
 def run(
@@ -205,7 +240,29 @@ def stable_tags(repo: Path) -> list[str]:
     return [tag for _, tag in tagged]
 
 
-def exact_target(repo: Path, requested: str | None) -> str:
+TARGET_POLICIES = ("next", "newest")
+
+
+def exact_target(
+    repo: Path,
+    requested: str | None,
+    baseline: Baseline | None = None,
+    policy: str = "next",
+    open_candidates: Sequence[str] = (),
+) -> str:
+    """Pick the stable Codex tag to sync.
+
+    An explicit ``requested`` tag always wins. Otherwise ``policy`` decides:
+    ``next`` (default) returns the oldest stable tag newer than the recorded
+    baseline so every release is replayed in order and gets its own Zuno
+    version; ``newest`` returns the newest stable tag and skips intermediate
+    releases. ``open_candidates`` are the stable tags of candidates that are
+    already open (unmerged) for this source: an open candidate newer than the
+    policy's pick wins, so a release someone already resolved by hand is never
+    regressed to an older tag; releases between the baseline and that candidate
+    are superseded by it. When no tag is newer than the baseline, the newest tag
+    is returned so the caller can report an up-to-date baseline.
+    """
     if requested:
         if not STABLE_TAG.fullmatch(requested):
             raise SyncError(
@@ -213,10 +270,55 @@ def exact_target(repo: Path, requested: str | None) -> str:
             )
         resolve_commit(repo, requested)
         return requested
+    if policy not in TARGET_POLICIES:
+        raise SyncError(f"unknown target policy {policy!r}; expected one of {TARGET_POLICIES}")
     tags = stable_tags(repo)
     if not tags:
         raise SyncError("no stable Codex rust-vX.Y.Z tag is available locally")
-    return tags[-1]
+    chosen = tags[-1]
+    if policy == "next" and baseline is not None:
+        floor = stable_tag_version(baseline.release_tag)
+        for tag in tags:
+            if stable_tag_version(tag) > floor:
+                chosen = tag
+                break
+    for candidate in open_candidates:
+        if not STABLE_TAG.fullmatch(candidate):
+            raise SyncError(f"open candidate must be an exact stable tag like rust-v0.154.0: {candidate}")
+        if candidate in tags and stable_tag_version(candidate) > stable_tag_version(chosen):
+            chosen = candidate
+    return chosen
+
+
+CANDIDATE_BRANCH_PREFIX = "upstream-sync/"
+
+
+def open_candidates_on_remote(repo: Path, remote: str, source_commit: str) -> list[str]:
+    """Stable tags of candidate branches on ``remote`` that are not yet merged into ``source_commit``.
+
+    A candidate branch ``upstream-sync/X.Y.Z`` counts as open while its tip is
+    not an ancestor of the source: merged candidates are ancestors and drop out,
+    so only unmerged work influences target selection. Abandoned candidates must
+    be deleted from the remote (the watcher deletes the ones it supersedes).
+    """
+    listing = run(repo, ["ls-remote", "--heads", remote, f"refs/heads/{CANDIDATE_BRANCH_PREFIX}*"])
+    open_tags: list[str] = []
+    for line in listing.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        sha, ref = parts
+        version = ref.removeprefix(f"refs/heads/{CANDIDATE_BRANCH_PREFIX}")
+        tag = f"rust-v{version}"
+        if not STABLE_TAG.fullmatch(tag):
+            continue
+        if run(repo, ["cat-file", "-e", f"{sha}^{{commit}}"], check=False).returncode != 0:
+            if run(repo, ["fetch", "--quiet", remote, ref], check=False).returncode != 0:
+                continue
+        if is_ancestor(repo, sha, source_commit):
+            continue
+        open_tags.append(tag)
+    return sorted(open_tags, key=stable_tag_version)
 
 
 def merge_base(repo: Path, left: str, right: str) -> str | None:
@@ -395,6 +497,9 @@ def prepare(
     plan: SyncPlan,
     branch: str,
     worktree: Path,
+    *,
+    replay_rebrand: bool = True,
+    reuse: str | None = None,
 ) -> PreparedCandidate:
     if plan.source_dirty:
         raise SyncError(
@@ -416,9 +521,13 @@ def prepare(
     # the exact upstream release, theirs is the reviewed Zuno source. Unlike
     # `git apply --3way`, the ort merge follows upstream renames and reports
     # modify/delete pairs as conflicts instead of aborting. Requires git >= 2.40.
+    # diff3 markers keep the baseline text of every hunk, which is what lets
+    # the rebrand replay prove a hunk is rename-only before resolving it.
     merge = run(
         repo,
         [
+            "-c",
+            "merge.conflictStyle=diff3",
             "merge-tree",
             "--write-tree",
             f"--merge-base={plan.baseline_commit}",
@@ -450,6 +559,13 @@ def prepare(
     )
     run(worktree, ["add", "--", manifest_name])
     run(repo, ["update-ref", f"{SOURCE_REF_PREFIX}{branch}", plan.source_commit])
+    replay = empty_replay()
+    if replay_rebrand:
+        source_conflicts = replay_rebrand_into(repo, worktree, plan, source_conflicts, replay)
+    if reuse is not None:
+        source_conflicts = reuse_resolutions(
+            repo, worktree, plan, manifest_name, tree, source_conflicts, reuse, replay
+        )
     if source_conflicts:
         raise SyncError(
             "candidate merge has conflicts; source branch is untouched and the candidate "
@@ -466,6 +582,7 @@ def prepare(
                 "generated_conflicts": regenerate,
                 "conflict_messages": messages,
                 "manifest_updated": True,
+                "rebrand": asdict(replay),
             },
         )
     return PreparedCandidate(
@@ -476,7 +593,258 @@ def prepare(
         candidate_base_commit=resolve_commit(worktree, "HEAD"),
         manifest_updated=True,
         regenerate_paths=regenerate,
+        rebrand=replay,
     )
+
+
+WORKSPACE_VERSION = re.compile(r'^version = "(?P<version>[0-9]+\.[0-9]+\.[0-9]+)"$', re.M)
+
+
+def blob(repo: Path, revision: str, path: str) -> str | None:
+    """Return the UTF-8 text of ``path`` at ``revision``; ``None`` when absent or binary."""
+    result = subprocess.run(
+        ["git", "show", f"{revision}:{path}"],
+        cwd=repo,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return result.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def workspace_version(repo: Path, revision: str) -> str | None:
+    text = blob(repo, revision, zuno_rebrand.WORKSPACE_MANIFEST)
+    if text is None:
+        return None
+    match = WORKSPACE_VERSION.search(text)
+    return match.group("version") if match else None
+
+
+def read_worktree_text(worktree: Path, path: str) -> str | None:
+    candidate = worktree / path
+    if not candidate.is_file():
+        return None
+    try:
+        return candidate.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def load_rebrand(repo: Path, revision: str) -> zuno_rebrand.Rebrand | None:
+    """Load the rebrand rules recorded in the Zuno source being replayed."""
+    text = blob(repo, revision, zuno_rebrand.MANIFEST_NAME)
+    if text is None:
+        return None
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False, encoding="utf-8") as handle:
+        handle.write(text)
+        temporary = Path(handle.name)
+    try:
+        return zuno_rebrand.Rebrand.load(temporary)
+    except zuno_rebrand.RebrandError as error:
+        raise SyncError(f"{zuno_rebrand.MANIFEST_NAME} at {revision} is invalid: {error}") from error
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def replay_rebrand_into(
+    repo: Path,
+    worktree: Path,
+    plan: SyncPlan,
+    conflicts: list[str],
+    replay: RebrandReplay,
+) -> list[str]:
+    """Resolve rename-only conflicts and refresh rename-only files in ``worktree``.
+
+    A path is touched only when applying the rules of ``FORK_REBRAND.toml`` (as
+    recorded in the Zuno source) to the Codex baseline reproduces the Zuno text
+    exactly; the same rules are then applied to the upstream release text.
+    Returns the conflicts that remain.
+    """
+    rebrand = load_rebrand(repo, plan.source_commit)
+    if rebrand is None:
+        return conflicts
+    source_version = workspace_version(repo, plan.source_commit)
+    target_version = plan.target_tag.removeprefix("rust-v")
+    remaining: list[str] = []
+    for path in conflicts:
+        current = read_worktree_text(worktree, path)
+        base = blob(repo, plan.baseline_commit, path)
+        zuno = blob(repo, plan.source_commit, path)
+        upstream = blob(repo, plan.target_commit, path)
+        if current is not None and zuno_rebrand.has_conflict_markers(current):
+            resolved, report = zuno_rebrand.resolve_conflicts(
+                current,
+                rebrand,
+                path=path,
+                source_version=source_version,
+                target_version=target_version,
+            )
+            if report.remaining == 0:
+                (worktree / path).write_text(resolved, encoding="utf-8")
+                replay.resolved.append(path)
+                continue
+            if report.resolved:
+                (worktree / path).write_text(resolved, encoding="utf-8")
+                replay.partial.append(path)
+            remaining.append(path)
+            continue
+        # No markers: a modify/delete pair (the merge kept the Zuno copy) or a
+        # rename/add collision. Only the rename-only modify/delete case is safe.
+        if (
+            base is not None
+            and zuno is not None
+            and upstream is None
+            and current == zuno
+            and rebrand.apply(base, version=source_version, path=path) == zuno
+        ):
+            (worktree / path).unlink()
+            replay.deleted.append(path)
+            continue
+        remaining.append(path)
+    conflicted = set(conflicts)
+    zuno_delta = sorted(changed_files(repo, plan.baseline_commit, plan.source_commit))
+    for path in zuno_delta:
+        if path in conflicted or is_generated_path(path):
+            continue
+        current = read_worktree_text(worktree, path)
+        if current is None:
+            continue
+        base = blob(repo, plan.baseline_commit, path)
+        zuno = blob(repo, plan.source_commit, path)
+        if base is None or zuno is None:
+            continue
+        if rebrand.apply(base, version=source_version, path=path) != zuno:
+            continue
+        upstream = blob(repo, plan.target_commit, path)
+        expected = rebrand.apply(upstream if upstream is not None else base, version=target_version, path=path)
+        if expected != current:
+            (worktree / path).write_text(expected, encoding="utf-8")
+            replay.refreshed.append(path)
+    zuno_touched = set(zuno_delta) | conflicted
+    baseline_paths = set(run(repo, ["ls-tree", "-r", "--name-only", plan.baseline_commit]).stdout.split("\n"))
+    for path in sorted(changed_files(repo, plan.baseline_commit, plan.target_commit)):
+        if path in zuno_touched or is_generated_path(path):
+            continue
+        upstream = blob(repo, plan.target_commit, path)
+        if upstream is None:
+            continue
+        rebranded = rebrand.apply(upstream, version=target_version, path=path)
+        if rebranded == upstream:
+            continue
+        if path not in baseline_paths and rebrand.applies_to_added(path):
+            current = read_worktree_text(worktree, path)
+            if current is not None and current != rebranded:
+                (worktree / path).write_text(rebranded, encoding="utf-8")
+                replay.added.append(path)
+            continue
+        replay.drift.append(path)
+    return remaining
+
+
+def blob_object_id(content: bytes) -> str:
+    """Git blob id of ``content`` (sha1 over the ``blob <len>\\0`` header and bytes)."""
+    import hashlib
+
+    digest = hashlib.sha1(f"blob {len(content)}\0".encode() + content)
+    return digest.hexdigest()
+
+
+def tree_entries(repo: Path, revision: str) -> dict[str, str]:
+    """Map every path in ``revision`` to its blob id."""
+    output = run(repo, ["ls-tree", "-r", "-z", revision]).stdout
+    entries: dict[str, str] = {}
+    for record in output.split("\0"):
+        if not record:
+            continue
+        meta, path = record.split("\t", 1)
+        entries[path] = meta.split(" ")[2]
+    return entries
+
+
+def reuse_resolutions(
+    repo: Path,
+    worktree: Path,
+    plan: SyncPlan,
+    manifest_name: str,
+    merge_tree: str,
+    conflicts: list[str],
+    reuse: str,
+    replay: RebrandReplay,
+) -> list[str]:
+    """Carry the previous candidate's post-merge edits into this candidate.
+
+    ``reuse`` must be a finalized candidate for the same release: a merge commit
+    whose second parent is the release commit. Everything that differs between
+    that candidate and the raw merge of its own source is a human (or replay)
+    edit made after the merge: a conflict resolution, an API adaptation in a file
+    that merged cleanly, or a deletion. For every path whose Zuno side is
+    unchanged since that candidate's source the raw merge result is identical,
+    so the edit is copied as-is; paths Zuno changed since are left to this run.
+    Returns the conflicts that remain.
+    """
+    candidate = run(repo, ["rev-parse", "--verify", "--quiet", f"{reuse}^{{commit}}"], check=False)
+    if candidate.returncode != 0:
+        raise SyncError(f"--reuse {reuse} does not name a commit")
+    candidate_commit = candidate.stdout.strip()
+    parents = run(repo, ["rev-list", "--parents", "-n", "1", candidate_commit]).stdout.split()[1:]
+    if len(parents) != 2 or parents[1] != plan.target_commit:
+        raise SyncError(
+            f"--reuse {reuse} is not a finalized candidate for {plan.target_tag}; "
+            "its second parent must be the release commit"
+        )
+    previous_source = parents[0]
+    old_candidate = tree_entries(repo, candidate_commit)
+    merged = tree_entries(repo, merge_tree)
+    old_source = tree_entries(repo, previous_source)
+    new_source = tree_entries(repo, plan.source_commit)
+    manifest_path = Path(manifest_name).as_posix()
+    remaining = set(conflicts)
+    for path in sorted(set(old_candidate) | set(merged)):
+        if path == manifest_path or is_generated_path(path):
+            continue
+        if old_candidate.get(path) == merged.get(path):
+            continue
+        if old_source.get(path) != new_source.get(path):
+            # Zuno changed this path after the candidate was reviewed; the old
+            # edit may no longer apply, so this run's merge result stands.
+            continue
+        target = worktree / path
+        blob_id = old_candidate.get(path)
+        if blob_id is None:
+            if target.exists():
+                target.unlink()
+                remaining.discard(path)
+                replay.reused.append(path)
+            continue
+        if target.is_file() and blob_object_id(target.read_bytes()) == blob_id:
+            # The rebrand replay already produced this exact text.
+            remaining.discard(path)
+            continue
+        raw = subprocess.run(
+            ["git", "cat-file", "blob", blob_id],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+        ).stdout
+        try:
+            if zuno_rebrand.has_conflict_markers(raw.decode("utf-8")):
+                continue
+        except UnicodeDecodeError:
+            pass
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(raw)
+        mode = run(repo, ["ls-tree", candidate_commit, "--", path]).stdout.split(" ")[0]
+        if mode == "100755":
+            target.chmod(target.stat().st_mode | 0o111)
+        remaining.discard(path)
+        replay.reused.append(path)
+    return sorted(remaining)
 
 
 def finalize(
@@ -610,6 +978,32 @@ def parser() -> argparse.ArgumentParser:
         command = subparsers.add_parser(name)
         command.add_argument("--source", default="HEAD")
         command.add_argument("--target")
+        command.add_argument(
+            "--policy",
+            choices=TARGET_POLICIES,
+            default="next",
+            help=(
+                "which stable tag to sync when --target is omitted: 'next' replays releases "
+                "in order (the oldest tag newer than the baseline), 'newest' jumps to the latest"
+            ),
+        )
+        command.add_argument(
+            "--open-candidate",
+            action="append",
+            metavar="TAG",
+            help=(
+                "stable tag of a candidate that is already open for this source; an open "
+                "candidate newer than the policy's pick is kept instead of regressing to an older tag"
+            ),
+        )
+        command.add_argument(
+            "--open-candidates-remote",
+            metavar="REMOTE",
+            help=(
+                "discover open candidates from this remote's upstream-sync/* branches whose tip "
+                "is not yet merged into --source"
+            ),
+        )
         if name == "check":
             command.add_argument(
                 "--allow-current",
@@ -622,6 +1016,19 @@ def parser() -> argparse.ArgumentParser:
         if name == "prepare":
             command.add_argument("--branch")
             command.add_argument("--worktree", type=Path, required=True)
+            command.add_argument(
+                "--no-rebrand",
+                action="store_true",
+                help="keep every conflict for manual resolution instead of replaying FORK_REBRAND.toml",
+            )
+            command.add_argument(
+                "--reuse",
+                help=(
+                    "finalized candidate commit for the same release whose post-merge edits "
+                    "(conflict resolutions, adaptations, deletions) are copied for every path "
+                    "the Zuno source has not changed since"
+                ),
+            )
     finalize_command = subparsers.add_parser(
         "finalize",
         help="commit a prepared candidate worktree as a merge of the Zuno source and the upstream release",
@@ -629,7 +1036,72 @@ def parser() -> argparse.ArgumentParser:
     finalize_command.add_argument("--worktree", type=Path, required=True)
     finalize_command.add_argument("--source", help="Zuno source commit (defaults to the one recorded by prepare)")
     finalize_command.add_argument("--message", help="commit subject (trailers are appended automatically)")
+    describe_command = subparsers.add_parser(
+        "describe-rebrand",
+        help="render the rebrand replay recorded in a prepare report as Markdown",
+    )
+    describe_command.add_argument("--report", type=Path, required=True, help="JSON written by `prepare --json`")
     return result
+
+
+def describe_rebrand(report: dict[str, object]) -> str:
+    """Markdown summary of the rebrand replay for the candidate PR or conflict issue."""
+    replay = report.get("rebrand")
+    if not isinstance(replay, dict):
+        return "## Rebrand replay\n\nNot run (no `FORK_REBRAND.toml` in the source)."
+    counts = {
+        key: len(replay.get(key, []))
+        for key in ("resolved", "deleted", "refreshed", "reused", "partial", "added")
+    }
+    lines = [
+        "## Rebrand replay",
+        "",
+        f"`{zuno_rebrand.MANIFEST_NAME}` resolved {counts['resolved']} rename-only conflicted "
+        f"paths, removed {counts['deleted']} paths that upstream deleted, refreshed "
+        f"{counts['refreshed']} rebranded paths with new upstream text, rebranded "
+        f"{counts['added']} new upstream snapshots, and reused {counts['reused']} edits from "
+        f"the previous candidate. {counts['partial']} paths still carry markers for hunks it "
+        "could not prove rename-only.",
+    ]
+    titles = {
+        "resolved": "Resolved conflicts",
+        "deleted": "Deleted with upstream",
+        "refreshed": "Refreshed rebranded files",
+        "added": "New upstream snapshots rebranded",
+        "reused": "Reused from previous candidate",
+        "partial": "Partially resolved (markers remain)",
+    }
+    for key, title in titles.items():
+        paths = replay.get(key, [])
+        if not paths:
+            continue
+        lines += ["", "<details>", f"<summary>{title} ({len(paths)})</summary>", ""]
+        lines += [f"- `{path}`" for path in paths]
+        lines += ["", "</details>"]
+    drift = replay.get("drift", [])
+    visible = [path for path in drift if path.startswith(DRIFT_SURFACES) and path.endswith(".rs")]
+    if visible:
+        lines += [
+            "",
+            "<details>",
+            f"<summary>Possible rebrand drift in user-visible surfaces ({len(visible)} of {len(drift)} paths)</summary>",
+            "",
+            "Upstream changed or added these files outside the Zuno delta and the rebrand rules "
+            "would alter their text. They were not rewritten; review whether the new wording is "
+            "user-visible and rebrand it (with its snapshots) in the candidate.",
+            "",
+        ]
+        lines += [f"- `{path}`" for path in visible[:DRIFT_LIST_LIMIT]]
+        if len(visible) > DRIFT_LIST_LIMIT:
+            lines.append(f"- … {len(visible) - DRIFT_LIST_LIMIT} more in the `prepare --json` report")
+        lines += ["", "</details>"]
+    return "\n".join(lines)
+
+
+# Source directories whose text reaches users; drift elsewhere (workflows, docs,
+# comments in backend crates) is kept in the JSON report only.
+DRIFT_SURFACES = ("codex-rs/tui/", "codex-rs/cli/", "codex-rs/core/src/", "codex-rs/app-server/src/")
+DRIFT_LIST_LIMIT = 80
 
 
 def emit(value: object, as_json: bool) -> None:
@@ -642,6 +1114,14 @@ def emit(value: object, as_json: bool) -> None:
             print(f"{key}: {len(item)}")
             for entry in item:
                 print(f"  - {entry}")
+        elif isinstance(item, dict):
+            for nested_key, nested in item.items():
+                if isinstance(nested, list):
+                    print(f"{key}.{nested_key}: {len(nested)}")
+                    for entry in nested:
+                        print(f"  - {entry}")
+                else:
+                    print(f"{key}.{nested_key}: {nested}")
         else:
             print(f"{key}: {item}")
 
@@ -655,12 +1135,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.json,
             )
             return 0
+        if args.command == "describe-rebrand":
+            try:
+                report = json.loads(args.report.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise SyncError(f"cannot read prepare report {args.report}: {error}") from error
+            print(describe_rebrand(report))
+            return 0
         repo = repo_root(args.repo.resolve())
         manifest = repo / args.manifest
         baseline = read_baseline(manifest)
         if not args.no_fetch:
             run(repo, ["fetch", "--tags", "--prune", args.remote])
-        target_tag = exact_target(repo, args.target)
+        open_candidates = list(args.open_candidate or ())
+        if args.open_candidates_remote:
+            open_candidates += open_candidates_on_remote(
+                repo, args.open_candidates_remote, resolve_commit(repo, args.source)
+            )
+        target_tag = exact_target(repo, args.target, baseline, args.policy, open_candidates)
         if (
             args.command == "check"
             and args.allow_current
@@ -691,6 +1183,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             plan,
             branch,
             args.worktree.resolve(),
+            replay_rebrand=not args.no_rebrand,
+            reuse=args.reuse,
         )
         emit(candidate, args.json)
         return 0

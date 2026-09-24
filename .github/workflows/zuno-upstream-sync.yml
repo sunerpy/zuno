@@ -1,9 +1,11 @@
 name: Prepare Codex upstream sync
 
 # Watches openai/codex for new stable `rust-vX.Y.Z` releases and keeps exactly
-# one review PR per release current against `main`. It never merges anything:
-# the merge is the single human step, after which `zuno-release.yml` promotes
-# the already-built candidate bytes automatically.
+# one review PR per release current against `main`, replaying releases in
+# order so every Codex release becomes a Zuno release. Merging the candidate PR
+# is the review gate: manual by default, or queued for GitHub auto-merge behind
+# the PR gate when `[sync].automatic_merge = true` in UPSTREAM_CODEX.toml.
+# After the merge `zuno-release.yml` promotes the already-built candidate bytes.
 
 on:
   workflow_dispatch:
@@ -17,6 +19,12 @@ on:
         required: false
         type: boolean
         default: false
+      policy:
+        description: Which stable tag to sync when target is blank (next = every release in order, newest = skip to the latest)
+        required: false
+        type: choice
+        options: [next, newest]
+        default: next
   schedule:
     # Poll every six hours; upstream stable releases are irregular. Off the hour
     # to avoid the top-of-hour rush.
@@ -61,14 +69,21 @@ jobs:
       - name: Validate sync helper
         run: python3 -m unittest -v scripts/test_zuno_upstream.py
 
-      - name: Resolve newest stable release
+      - name: Resolve the stable release to sync
         id: plan
         env:
           REQUESTED_TARGET: ${{ inputs.target }}
+          POLICY: ${{ inputs.policy || 'next' }}
         run: |
           set -euo pipefail
           plan_path="${RUNNER_TEMP}/upstream-plan.json"
-          target_args=()
+          # Releases are replayed in order, but a candidate branch that is
+          # already open (pushed and not yet merged into main) for a newer
+          # release, for example one resolved by hand, is never regressed to an
+          # older tag; the helper discovers those from origin and ignores merged
+          # ones. Superseded candidates are deleted from origin (below), so a
+          # closed PR does not leave a branch that keeps steering the target.
+          target_args=(--policy "${POLICY}" --open-candidates-remote origin)
           if [[ -n "${REQUESTED_TARGET}" ]]; then
             target_args=(--target "${REQUESTED_TARGET}")
           fi
@@ -160,11 +175,29 @@ jobs:
           TARGET_VERSION: ${{ steps.plan.outputs.target_version }}
           SOURCE_SHA: ${{ steps.plan.outputs.source_sha }}
           BRANCH: ${{ steps.plan.outputs.branch }}
+          PLAN_PATH: ${{ steps.plan.outputs.plan_path }}
+          REMOTE_SHA: ${{ steps.state.outputs.remote_sha }}
         run: |
           set -euo pipefail
           # Nested inside the checkout so the Rust cache action can key on it.
           candidate="${GITHUB_WORKSPACE}/.zuno-candidate"
           candidate_report="${RUNNER_TEMP}/upstream-candidate.json"
+          # A candidate that was already finalized for this release (by an
+          # earlier run or by hand) carries reviewed post-merge edits: conflict
+          # resolutions, API adaptations, deletions. `prepare --reuse` copies
+          # them for every path main has not changed since, so a moving main
+          # does not undo that work.
+          reuse=()
+          if [[ -n "${REMOTE_SHA}" ]] && git fetch --quiet origin "refs/heads/${BRANCH}" && git cat-file -e "${REMOTE_SHA}^{commit}" 2>/dev/null; then
+            target_commit="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["target_commit"])' "${PLAN_PATH}")"
+            second_parent="$(git rev-parse --verify --quiet "${REMOTE_SHA}^2" || true)"
+            if [[ -n "${second_parent}" && "${second_parent}" == "${target_commit}" ]]; then
+              reuse=(--reuse "${REMOTE_SHA}")
+              echo "Reusing conflict resolutions from candidate ${REMOTE_SHA} (source $(git rev-parse "${REMOTE_SHA}^1"))."
+            else
+              echo "Existing branch head ${REMOTE_SHA} is not a finalized candidate for ${TARGET_TAG}; not reusing it."
+            fi
+          fi
           set +e
           python3 scripts/zuno_upstream.py \
             --no-fetch \
@@ -173,7 +206,8 @@ jobs:
             --source HEAD \
             --target "${TARGET_TAG}" \
             --branch "${BRANCH}" \
-            --worktree "${candidate}" > "${candidate_report}"
+            --worktree "${candidate}" \
+            "${reuse[@]}" > "${candidate_report}"
           prepare_exit=$?
           set -e
           cat "${candidate_report}"
@@ -284,6 +318,7 @@ jobs:
           SOURCE_SHA: ${{ steps.plan.outputs.source_sha }}
           UPSTREAM_COMMIT: ${{ steps.candidate.outputs.upstream_commit }}
           PLAN_PATH: ${{ steps.plan.outputs.plan_path }}
+          REPORT: ${{ steps.candidate.outputs.report }}
           EXISTING_PR: ${{ steps.state.outputs.pr_number }}
           CONFLICT_ISSUE: ${{ steps.state.outputs.issue_number }}
         run: |
@@ -298,7 +333,7 @@ jobs:
           if not paths:
               print("No path overlap was detected by the pre-replay comparison.")
           else:
-              print(f"{len(paths)} paths are modified on both sides (merged cleanly with the Codex baseline as merge base):")
+              print(f"{len(paths)} paths are modified on both sides (merged cleanly with the Codex baseline as merge base, or resolved by the rebrand replay below):")
               print("\n".join(f"- `{path}`" for path in paths))
           only = plan["baseline_only_commits"]
           if only:
@@ -307,12 +342,15 @@ jobs:
               print("\n".join(f"- `{entry}`" for entry in only))
           PY
           )"
+          replay="$(python3 scripts/zuno_upstream.py describe-rebrand --report "${REPORT}")"
           body="$(cat <<EOF
           This candidate merges exact Codex release \`${TARGET_TAG}\` (\`${UPSTREAM_COMMIT}\`) into the reviewed Zuno source \`main@${SOURCE_SHA}\`. The head commit's first parent is that \`main\` commit and its second parent is the release commit, so the diff below is exactly the upstream change plus regenerated derived artifacts.
 
-          It was prepared in an isolated CI worktree by the scheduled upstream watcher. Nothing was merged automatically; the watcher force-updates this branch whenever \`main\` moves so the candidate always builds on the current reviewed source.
+          It was prepared in an isolated CI worktree by the scheduled upstream watcher, which force-updates this branch whenever \`main\` moves so the candidate always builds on the current reviewed source. Merging is the review gate: manual, or queued for GitHub auto-merge behind \`zuno/pr-gate\` when \`UPSTREAM_CODEX.toml\` sets \`[sync].automatic_merge = true\` and this replay needed no manual resolution.
 
           ${overlap}
+
+          ${replay}
 
           ## Release flow
 
@@ -353,13 +391,57 @@ jobs:
             gh issue close "${CONFLICT_ISSUE}" --comment "Superseded: main@\`${SOURCE_SHA}\` now replays cleanly onto \`${TARGET_TAG}\` in ${pr_url}."
           fi
 
-          # Close superseded candidates for older releases; only the newest stable release is tracked.
+          # Close superseded candidates and conflict reports for OLDER releases
+          # (a candidate for a newer release is never superseded by this one).
           gh pr list --state open --label "${CANDIDATE_LABEL}" --base main --json number,headRefName \
-            --jq '.[] | select(.headRefName | startswith("upstream-sync/")) | select(.headRefName != env.HEAD_BRANCH) | .number' \
-            | while read -r stale; do
+            --jq '.[] | select(.headRefName | startswith("upstream-sync/")) | select(.headRefName != env.HEAD_BRANCH) | "\(.number) \(.headRefName)"' \
+            | while read -r stale branch; do
                 [[ -n "${stale}" ]] || continue
-                gh pr close "${stale}" --comment "Superseded by ${pr_url} (Codex ${TARGET_TAG} is now the newest stable release)."
+                python3 - "${branch#upstream-sync/}" "${TARGET_VERSION}" <<'PY' || continue
+          import sys
+          def key(v): return tuple(int(part) for part in v.split("."))
+          sys.exit(0 if key(sys.argv[1]) < key(sys.argv[2]) else 1)
+          PY
+                gh pr close "${stale}" --comment "Superseded by ${pr_url} (Codex ${TARGET_TAG} is now being synced)."
+                # Remove the branch too: an unmerged upstream-sync/* branch on
+                # origin would otherwise keep counting as an open candidate.
+                gh api -X DELETE "repos/${GH_REPO}/git/refs/heads/${branch}" >/dev/null || true
               done
+          gh issue list --state open --label "${CONFLICT_LABEL}" --json number,title \
+            --jq '.[] | select(.title | contains(env.TARGET_TAG) | not) | "\(.number) \(.title)"' \
+            | while read -r stale title; do
+                [[ -n "${stale}" ]] || continue
+                version="$(sed -n 's/.*rust-v\([0-9][0-9.]*[0-9]\).*/\1/p' <<<"${title}")"
+                [[ -n "${version}" ]] || continue
+                python3 - "${version}" "${TARGET_VERSION}" <<'PY' || continue
+          import sys
+          def key(v): return tuple(int(part) for part in v.split("."))
+          sys.exit(0 if key(sys.argv[1]) < key(sys.argv[2]) else 1)
+          PY
+                gh issue close "${stale}" --comment "Superseded: Codex ${TARGET_TAG} is now being synced; its candidate is ${pr_url}."
+              done
+
+          # Hands-off merge: with `[sync].automatic_merge = true` in
+          # UPSTREAM_CODEX.toml a candidate whose replay was fully automatic
+          # (rebrand replay only; nothing copied from a hand-resolved candidate)
+          # is queued for GitHub auto-merge, so it merges (as a merge commit)
+          # the moment zuno/pr-gate passes and promotion follows. The repository
+          # must allow auto-merge and its main ruleset must not require a human
+          # review for this to complete.
+          automatic_merge="$(python3 -c 'import tomllib; print(str(tomllib.load(open("UPSTREAM_CODEX.toml", "rb")).get("sync", {}).get("automatic_merge", False)).lower())')"
+          reused="$(python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1])).get("rebrand", {}).get("reused", [])))' "${REPORT}")"
+          if [[ "${automatic_merge}" == true && "${reused}" != 0 ]]; then
+            echo "Auto-merge not queued: ${reused} path(s) were carried over from a hand-resolved candidate, so this replay was not fully automatic." >> "${GITHUB_STEP_SUMMARY}"
+            gh pr comment "${pr_url}" --body "Auto-merge was not queued: ${reused} path(s) were carried over from a hand-resolved candidate (see the rebrand replay above), so this candidate waits for a manual merge."
+          elif [[ "${automatic_merge}" == true ]]; then
+            if gh pr merge "${pr_url}" --auto --merge; then
+              echo "Auto-merge queued: the candidate merges when zuno/pr-gate passes." >> "${GITHUB_STEP_SUMMARY}"
+              gh pr comment "${pr_url}" --body "Auto-merge is queued (\`[sync].automatic_merge = true\`): this candidate merges with a merge commit as soon as \`zuno/pr-gate\` passes, and \`zuno-release.yml\` then promotes it."
+            else
+              echo "Auto-merge could not be queued; the candidate waits for a manual merge." >> "${GITHUB_STEP_SUMMARY}"
+              gh pr comment "${pr_url}" --body "\`[sync].automatic_merge = true\` but GitHub refused to queue auto-merge. Enable **Allow auto-merge** in the repository settings and make sure the \`main\` ruleset does not require a human review; until then merge this candidate by hand."
+            fi
+          fi
 
       - name: Report replay conflicts
         if: steps.candidate.outputs.outcome == 'conflict'
@@ -385,22 +467,30 @@ jobs:
           print(len(json.load(open(os.environ["REPORT"]))["conflicting_files"]))
           PY
           )"
+          replay="$(python3 scripts/zuno_upstream.py describe-rebrand --report "${REPORT}")"
           body="$(cat <<EOF
-          Merging Codex \`${TARGET_TAG}\` into \`main@${SOURCE_SHA}\` leaves ${count} conflicting paths. The automation did not push anything; \`main\` is untouched.
+          Merging Codex \`${TARGET_TAG}\` into \`main@${SOURCE_SHA}\` leaves ${count} conflicting paths after the rebrand replay. The automation did not push anything; \`main\` is untouched.
 
           ${files}
+
+          ${replay}
 
           ## Resolve locally
 
           \`\`\`sh
           git fetch --tags --prune upstream
+          # If a finalized candidate for this release already exists on origin, add
+          #   --reuse origin/upstream-sync/${TARGET_VERSION}
+          # to copy its resolutions for every path main has not changed since.
           python3 scripts/zuno_upstream.py --no-fetch prepare \\
             --source main --target ${TARGET_TAG} \\
             --branch upstream-sync/${TARGET_VERSION} \\
             --worktree ../zuno-upstream-${TARGET_VERSION}
-          # Run from the repository root. Fix the conflict markers in the worktree above
-          # (the new baseline is already written to UPSTREAM_CODEX.toml), then regenerate
-          # derived artifacts:
+          # Run from the repository root. Only the paths listed above still carry
+          # conflict markers (diff3 style, with the Codex baseline in the middle);
+          # rename-only hunks were already replayed from FORK_REBRAND.toml. The new
+          # baseline is already written to UPSTREAM_CODEX.toml. Fix the markers, then
+          # regenerate derived artifacts:
           (cd ../zuno-upstream-${TARGET_VERSION}/codex-rs && cargo update --workspace \\
             && python3 app-server-protocol/scripts/write_schema_fixtures.py \\
             && python3 app-server-protocol/scripts/write_schema_fixtures.py --experimental \\
@@ -434,4 +524,13 @@ jobs:
             echo "${count} conflicting paths; tracked in ${issue_url}."
             echo
             echo "${files}"
+            echo
+            echo "${replay}"
           } >> "${GITHUB_STEP_SUMMARY}"
+          # Conflict reports for older releases are superseded by this one.
+          gh issue list --state open --label "${CONFLICT_LABEL}" --json number,title \
+            --jq '.[] | select(.title | contains(env.TARGET_TAG) | not) | .number' \
+            | while read -r stale; do
+                [[ -n "${stale}" ]] || continue
+                gh issue close "${stale}" --comment "Superseded by ${issue_url}: Codex ${TARGET_TAG} is now the newest stable release."
+              done

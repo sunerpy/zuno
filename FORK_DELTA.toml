@@ -98,8 +98,11 @@ summary = "Scheduled candidate-only replay of the reviewed Zuno delta onto each 
 zuno_paths = [
   "UPSTREAM_CODEX.toml",
   "FORK_DELTA.toml",
+  "FORK_REBRAND.toml",
   "scripts/zuno_upstream.py",
   "scripts/test_zuno_upstream.py",
+  "scripts/zuno_rebrand.py",
+  "scripts/test_zuno_rebrand.py",
   ".github/workflows/zuno-upstream-sync.yml",
   "docs/zuno-upstream-sync.md",
   "docs/zuno-upstream-sync.zh-CN.md",
@@ -109,8 +112,10 @@ contracts = [
   "The active Zuno branch and worktree are never mutated by synchronization.",
   "A dirty source is rejected before candidate preparation.",
   "The exact upstream tag, commit, and tree are verified before replay.",
-  "The watcher tracks only the newest stable Codex tag, is idempotent per main commit, and reports replay conflicts as an issue instead of pushing.",
-  "Merging the candidate PR with a merge commit is the only manual step; nothing is merged automatically.",
+  "The watcher replays stable Codex tags in release order (policy next; newest skips ahead), never regresses an open candidate to an older tag, is idempotent per main commit, and reports replay conflicts as an issue instead of pushing.",
+  "A conflict hunk is resolved by automation only when FORK_REBRAND.toml reproduces the Zuno side from the Codex baseline byte for byte; every other hunk waits for a human.",
+  "Post-merge edits of a finalized candidate for the same release are reused for every path main has not changed since.",
+  "Merging the candidate PR with a merge commit is the review gate. With [sync].automatic_merge = true in UPSTREAM_CODEX.toml (the default) a candidate whose replay was fully automatic is queued for GitHub auto-merge behind zuno/pr-gate; a candidate that needed manual resolution or reused hand-resolved edits, or any candidate when the flag is false, waits for a person.",
   "A candidate is finalized as a merge whose first parent is the reviewed main commit and whose second parent is the exact upstream release commit recorded in UPSTREAM_CODEX.toml, even after manual conflict resolution.",
 ]
 
