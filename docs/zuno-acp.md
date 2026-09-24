@@ -48,6 +48,35 @@ mode and configuration updates (`session/set_mode`, `session/set_model`, and
 close, and delete. Permission requests and turn/session updates are translated to
 and from App Server events.
 
+The session surface follows the reference `codex-acp` adapter so a client such
+as Zed sees the same things from Zuno:
+
+- **Modes are permission presets.** `session/new` advertises `read-only`,
+  `workspace-write`, `agent` (auto review), `strict` (Zuno's server mode:
+  every command and edit is approved first) and `agent-full-access`; the current
+  mode is derived from the thread's approval policy, reviewer and sandbox, and a
+  thread whose settings match no preset shows a read-only `custom` entry.
+  `session/set_mode` (or the `mode` config option) applies the preset through
+  `thread/settings/update`.
+- **The collaboration mode is a config option** (`collaboration_mode`:
+  `default` or `plan`), also toggled by `/plan`. Switching applies the server's
+  `collaborationMode/list` preset exactly as the TUI does, so plan mode runs at
+  the preset's reasoning effort (medium in the bundled catalog) with the
+  server's plan instructions; there is no separate ACP agent for it.
+- **Models come from the catalog.** `availableModels` and the `model` config
+  option list every visible entry of `model/list` (what the TUI's `/model`
+  picker offers), and the `reasoning_effort` options are the efforts the
+  selected model supports. A model that only exists in configuration stays
+  selectable.
+- **Slash commands** are pushed as `available_commands_update` right after each
+  session lifecycle response and handled by the bridge when a prompt starts with
+  `/`: `plan`, `compact`, `review [instructions]`, `review-branch <branch>`,
+  `review-commit <sha>`, `status`, `skills`, `mcp`, `goal <objective|clear|pause|resume>`,
+  `rename <name>`, `logout`, plus one `$skill` entry per discovered skill. A
+  command that runs a turn (`review*`, `compact`, `goal`) answers the prompt
+  with the turn's stop reason; the others answer with an `agent_message_chunk`
+  and `end_turn`. Unknown `/words` and `$skill` prompts go to the model as is.
+
 Prompt blocks map to App Server input the same way the reference `codex-acp`
 adapter maps them, so a prompt means the same thing to the model whichever Codex
 ACP agent a client talks to: `text` passes through and `image` is always inlined as a `data:` URL (App Server

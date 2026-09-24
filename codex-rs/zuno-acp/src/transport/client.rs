@@ -71,6 +71,20 @@ impl Drop for PendingRequestGuard {
 }
 
 impl ClientConnection {
+    /// A connection whose writer is never read; for unit tests that only build
+    /// values from a [`SessionRoute`](crate::adapter) and never send frames.
+    #[cfg(test)]
+    pub(crate) fn detached_for_tests() -> Self {
+        let (output, _receiver) = mpsc::channel(1);
+        Self {
+            output,
+            pending: Arc::new(Mutex::new(PendingState::default())),
+            next_id: Arc::new(AtomicU64::new(1)),
+            deferred: None,
+            scoped_requests: None,
+        }
+    }
+
     /// Clone for outbound RPCs supervised by the session rather than one prompt.
     ///
     /// Only prompt-owned pending-request tracking is cleared. The connection's

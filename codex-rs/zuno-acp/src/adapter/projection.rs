@@ -33,6 +33,30 @@ impl BridgeState {
         }
     }
 
+    /// Resolve when the next turn of `thread_id` settles (commands such as
+    /// `/compact` start a turn whose id the App Server does not return).
+    pub(super) fn wait_for_thread_turn(
+        &self,
+        thread_id: &str,
+    ) -> impl std::future::Future<Output = TurnOutcome> + Send + 'static {
+        let (sender, receiver) = oneshot::channel();
+        lock(&self.turns)
+            .thread_waiters
+            .insert(thread_id.to_owned(), sender);
+        async move {
+            receiver.await.unwrap_or(TurnOutcome {
+                status: "failed".to_owned(),
+                error: Some("Codex App Server closed before the turn settled".to_owned()),
+            })
+        }
+    }
+
+    fn settle_thread_turn(&self, thread_id: &str, outcome: TurnOutcome) {
+        if let Some(waiter) = lock(&self.turns).thread_waiters.remove(thread_id) {
+            let _ = waiter.send(outcome);
+        }
+    }
+
     fn route(&self, thread_id: &str) -> Option<SessionRoute> {
         lock(&self.sessions).get(thread_id).cloned()
     }
@@ -72,6 +96,24 @@ impl BridgeState {
             .get("effort")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        if let Some(mode) = settings
+            .pointer("/collaborationMode/mode")
+            .and_then(Value::as_str)
+        {
+            route.collaboration_mode = mode.to_owned();
+        }
+        if let Some(policy) = settings.get("approvalPolicy") {
+            route.approval_policy = approval_policy_id(Some(policy));
+        }
+        if let Some(reviewer) = settings.get("approvalsReviewer").and_then(Value::as_str) {
+            route.approvals_reviewer = reviewer.to_owned();
+        }
+        if let Some(sandbox) = settings
+            .pointer("/sandboxPolicy/type")
+            .and_then(Value::as_str)
+        {
+            route.sandbox_type = sandbox.to_owned();
+        }
     }
 }
 
@@ -173,6 +215,7 @@ async fn project_notification(state: &BridgeState, notification: &Value) {
                     .map(str::to_owned),
             };
             state.record_turn_settled(thread_id, turn_id);
+            state.settle_thread_turn(thread_id, outcome.clone());
             state.settle_turn(turn_id.to_owned(), outcome);
         }
         "thread/settings/updated" => state.apply_settings(params),

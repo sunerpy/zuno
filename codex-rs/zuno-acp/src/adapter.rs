@@ -29,10 +29,12 @@ use crate::transport::RpcError;
 use crate::transport::ServeError;
 use crate::transport::serve_stdio;
 
+mod commands;
 mod mapping;
 mod projection;
 mod session;
 
+use commands::*;
 use mapping::*;
 
 #[cfg(test)]
@@ -47,6 +49,9 @@ use projection::notification_updates;
 use projection::settle_server_request;
 
 const DEFAULT_LIST_LIMIT: u64 = 100;
+/// `model/list` page size and the page cap that bounds a runaway cursor.
+const MODEL_LIST_PAGE_SIZE: u64 = 200;
+const MODEL_LIST_MAX_PAGES: usize = 10;
 const ACP_PROTOCOL_VERSION: u64 = 1;
 
 #[derive(Debug, thiserror::Error)]
@@ -76,6 +81,33 @@ struct BridgeState {
     /// `clientCapabilities` from `initialize`; decides which client-side
     /// methods (for example `elicitation/create`) the bridge may call.
     client_capabilities: Mutex<Value>,
+    /// The App Server model catalog (`model/list`), refreshed on every session
+    /// lifecycle call so `availableModels` and the `model` / `reasoning_effort`
+    /// config options offer what the TUI's `/model` picker offers.
+    models: Mutex<Vec<ModelEntry>>,
+    /// `collaborationMode/list` presets: the effort (and model) a mode switches
+    /// to, so ACP applies the same preset the TUI applies when entering plan mode.
+    collaboration_presets: Mutex<Option<Vec<CollaborationPreset>>>,
+}
+
+/// A server collaboration-mode preset: what switching to `mode` changes.
+#[derive(Clone, Debug, PartialEq)]
+struct CollaborationPreset {
+    mode: String,
+    model: Option<String>,
+    /// `Some(None)` clears the effort, `Some(Some(e))` sets it, `None` keeps it.
+    effort: Option<Option<String>>,
+}
+
+/// One entry of the App Server model catalog as the bridge needs it.
+#[derive(Clone, Debug, PartialEq)]
+struct ModelEntry {
+    id: String,
+    name: String,
+    description: String,
+    /// `(effort id, description)` in catalog order.
+    efforts: Vec<(String, String)>,
+    hidden: bool,
 }
 
 impl BridgeState {
@@ -95,7 +127,12 @@ struct SessionRoute {
     model: String,
     model_provider: String,
     effort: Option<String>,
-    mode: String,
+    /// `default` or `plan` (Codex collaboration mode).
+    collaboration_mode: String,
+    /// Thread permission settings, matched against the ACP mode presets.
+    approval_policy: String,
+    approvals_reviewer: String,
+    sandbox_type: String,
     active_turn_id: Option<String>,
 }
 
@@ -103,6 +140,9 @@ struct SessionRoute {
 struct TurnRegistry {
     waiters: HashMap<String, oneshot::Sender<TurnOutcome>>,
     completed: HashMap<String, TurnOutcome>,
+    /// Waiters for "the next turn of this thread settles", used by commands
+    /// such as `/compact` whose turn id the App Server does not return.
+    thread_waiters: HashMap<String, oneshot::Sender<TurnOutcome>>,
 }
 
 #[derive(Debug, Clone)]
@@ -296,13 +336,315 @@ mod tests {
         assert_ne!(SESSION_BUSY_CODE, STEER_REJECTED_CODE);
     }
 
+    fn test_route(
+        model: &str,
+        effort: Option<&str>,
+        approval: &str,
+        reviewer: &str,
+        sandbox: &str,
+    ) -> SessionRoute {
+        route_from_lifecycle(
+            &json!({
+                "thread": { "id": "t1" },
+                "model": model,
+                "modelProvider": "kiro-local",
+                "cwd": "/work",
+                "reasoningEffort": effort,
+                "approvalPolicy": approval,
+                "approvalsReviewer": reviewer,
+                "sandbox": { "type": sandbox },
+            }),
+            "/fallback",
+            &ClientConnection::detached_for_tests(),
+        )
+        .expect("route")
+    }
+
+    fn sample_catalog() -> Vec<ModelEntry> {
+        catalog_from_model_list(&json!({
+            "data": [
+                {"id": "gpt-5.6-sol", "displayName": "GPT 5.6 Sol", "description": "Balanced", "hidden": false,
+                 "supportedReasoningEfforts": [
+                    {"reasoningEffort": "medium", "description": "Default"},
+                    {"reasoningEffort": "ultra", "description": "Deepest"}]},
+                {"id": "gpt-6-astra", "displayName": "GPT 6 Astra", "description": "Frontier", "hidden": false,
+                 "supportedReasoningEfforts": [{"reasoningEffort": "xhigh", "description": ""}]},
+                {"id": "gpt-5.6-sol-hidden", "displayName": "Hidden", "description": "", "hidden": true,
+                 "supportedReasoningEfforts": []},
+            ],
+            "nextCursor": null,
+        }))
+    }
+
+    #[test]
+    fn session_advertises_the_model_catalog_and_the_models_efforts() {
+        let catalog = sample_catalog();
+        assert_eq!(catalog.len(), 3);
+        let route = test_route(
+            "gpt-5.6-sol",
+            Some("ultra"),
+            "on-request",
+            "user",
+            "workspaceWrite",
+        );
+        let response = lifecycle_response("t1", &route, &catalog);
+        let models = response["models"]["availableModels"]
+            .as_array()
+            .expect("models");
+        assert_eq!(
+            models
+                .iter()
+                .map(|m| m["modelId"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["gpt-5.6-sol", "gpt-6-astra"],
+            "hidden models are not offered"
+        );
+        assert_eq!(models[0]["name"], "GPT 5.6 Sol");
+        assert_eq!(response["models"]["currentModelId"], "gpt-5.6-sol");
+        let options = config_options(&route, &catalog);
+        let model_option = options
+            .iter()
+            .find(|o| o["id"] == "model")
+            .expect("model option");
+        assert_eq!(model_option["options"].as_array().unwrap().len(), 2);
+        let effort_option = options
+            .iter()
+            .find(|o| o["id"] == "reasoning_effort")
+            .expect("effort");
+        assert_eq!(
+            effort_option["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|o| o["value"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["medium", "ultra"],
+            "efforts come from the catalog entry of the current model"
+        );
+        assert_eq!(effort_option["currentValue"], "ultra");
+
+        // A model the catalog does not know (config-only) stays selectable and
+        // gets the generic effort list; a current effort outside the catalog's
+        // list is kept as an option so the client can display it.
+        let custom = test_route(
+            "my-gateway/custom",
+            Some("max"),
+            "on-request",
+            "user",
+            "workspaceWrite",
+        );
+        let response = lifecycle_response("t1", &custom, &catalog);
+        assert_eq!(
+            response["models"]["availableModels"][0]["modelId"],
+            "my-gateway/custom"
+        );
+        let options = config_options(&custom, &catalog);
+        let efforts = options
+            .iter()
+            .find(|o| o["id"] == "reasoning_effort")
+            .unwrap();
+        assert!(
+            efforts["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o["value"] == "max")
+        );
+        // An empty catalog (model/list failed) still yields the current model.
+        let response = lifecycle_response("t1", &route, &[]);
+        assert_eq!(
+            response["models"]["availableModels"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn session_modes_are_permission_presets_and_collaboration_is_a_config_option() {
+        let route = test_route("gpt-5.6-sol", None, "on-request", "user", "workspaceWrite");
+        let modes = session_modes(&route);
+        assert_eq!(modes["currentModeId"], "workspace-write");
+        let ids: Vec<&str> = modes["availableModes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "read-only",
+                "workspace-write",
+                "agent",
+                "strict",
+                "agent-full-access"
+            ]
+        );
+        assert_eq!(
+            permission_mode_id(&test_route("m", None, "never", "user", "dangerFullAccess")),
+            "agent-full-access"
+        );
+        assert_eq!(
+            permission_mode_id(&test_route(
+                "m",
+                None,
+                "on-request",
+                "auto_review",
+                "workspaceWrite"
+            )),
+            "agent"
+        );
+        assert_eq!(
+            permission_mode_id(&test_route(
+                "m",
+                None,
+                "untrusted",
+                "user",
+                "workspaceWrite"
+            )),
+            "strict"
+        );
+        // Settings that match no preset show up as a custom entry the client can
+        // display but not select again.
+        let granular = route_from_lifecycle(
+            &json!({"thread": {"id": "t"}, "model": "m", "approvalPolicy": {"granular": {}}, "sandbox": {"type": "externalSandbox"}}),
+            "/w",
+            &ClientConnection::detached_for_tests(),
+        )
+        .unwrap();
+        let modes = session_modes(&granular);
+        assert_eq!(modes["currentModeId"], "custom");
+        assert_eq!(modes["availableModes"][0]["id"], "custom");
+        assert!(permission_preset("custom").is_none());
+        let options = config_options(&route, &[]);
+        let collaboration = options
+            .iter()
+            .find(|o| o["id"] == "collaboration_mode")
+            .expect("collaboration option");
+        assert_eq!(collaboration["currentValue"], "default");
+        assert_eq!(
+            collaboration["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|o| o["value"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["default", "plan"]
+        );
+        assert_eq!(sandbox_policy_json("readOnly")["type"], "readOnly");
+        assert_eq!(
+            sandbox_policy_json("dangerFullAccess"),
+            json!({"type": "dangerFullAccess"})
+        );
+        assert_eq!(
+            sandbox_policy_json("workspaceWrite")["writableRoots"],
+            json!([])
+        );
+    }
+
+    #[test]
+    fn slash_commands_are_parsed_and_advertised() {
+        assert_eq!(
+            parse_slash_command(Some(
+                &json!([{"type": "text", "text": "  /Review-Branch  main  "}])
+            )),
+            Some(("review-branch".to_owned(), "main".to_owned()))
+        );
+        assert_eq!(
+            parse_slash_command(Some(&json!([{"type": "text", "text": "/status"}]))),
+            Some(("status".to_owned(), String::new()))
+        );
+        assert_eq!(
+            parse_slash_command(Some(&json!([{"type": "text", "text": "$deploy prod"}]))),
+            None
+        );
+        assert_eq!(
+            parse_slash_command(Some(&json!([{"type": "text", "text": "/"}]))),
+            None
+        );
+        assert_eq!(
+            parse_slash_command(Some(
+                &json!([{"type": "image", "data": "x"}, {"type": "text", "text": "/plan"}])
+            )),
+            None
+        );
+        assert_eq!(parse_slash_command(None), None);
+
+        let update = available_commands_update(&[
+            ("deploy".to_owned(), "Ship it".to_owned()),
+            ("plan".to_owned(), "a skill named like a command".to_owned()),
+        ]);
+        assert_eq!(update["sessionUpdate"], "available_commands_update");
+        let names: Vec<&str> = update["availableCommands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        for builtin in [
+            "plan",
+            "compact",
+            "review",
+            "review-branch",
+            "review-commit",
+            "status",
+            "skills",
+            "mcp",
+            "goal",
+            "rename",
+            "logout",
+        ] {
+            assert!(names.contains(&builtin), "{builtin} missing from {names:?}");
+        }
+        assert!(names.contains(&"$deploy"));
+        assert!(
+            names.contains(&"$plan"),
+            "skills are namespaced with $ so they never shadow a command"
+        );
+        let review = update["availableCommands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "review")
+            .unwrap();
+        assert_eq!(review["input"]["hint"], "optional review instructions");
+        let skills = skills_from_list(&json!({"data": [{"cwd": "/w", "skills": [
+            {"name": "deploy", "description": "Long", "shortDescription": "Ship it", "enabled": true},
+            {"name": "off", "description": "disabled", "enabled": false}
+        ], "errors": []}]}));
+        assert_eq!(skills, vec![("deploy".to_owned(), "Ship it".to_owned())]);
+    }
+
+    #[test]
+    fn collaboration_presets_carry_the_servers_effort_for_plan_mode() {
+        let presets = collaboration_presets_from_list(&json!({"data": [
+            {"name": "Plan", "mode": "plan", "model": null, "reasoningEffort": "medium"},
+            {"name": "Default", "mode": "default", "model": null, "reasoningEffort": null},
+        ]}));
+        assert_eq!(presets.len(), 2);
+        assert_eq!(
+            presets[0].effort,
+            Some(Some("medium".to_owned())),
+            "plan switches to medium like the TUI preset"
+        );
+        assert_eq!(
+            presets[1].effort,
+            Some(None),
+            "default clears the preset effort"
+        );
+        assert_eq!(presets[0].model, None);
+    }
+
     #[test]
     fn set_mode_translates_to_the_mode_config_option() {
-        let translated = set_mode_as_config_option(&json!({"sessionId":"s","modeId":"plan"}))
-            .expect("translates");
+        let translated =
+            set_mode_as_config_option(&json!({"sessionId":"s","modeId":"agent-full-access"}))
+                .expect("translates");
         assert_eq!(translated["sessionId"], "s");
         assert_eq!(translated["configId"], "mode");
-        assert_eq!(translated["value"], "plan");
+        assert_eq!(translated["value"], "agent-full-access");
         let error =
             set_mode_as_config_option(&json!({"sessionId":"s"})).expect_err("modeId required");
         assert_eq!(error.code, -32602);

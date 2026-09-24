@@ -48,6 +48,37 @@ impl CodexAcpAgent {
         }
     }
 
+    /// Refresh the model catalog from the App Server (`model/list`, all pages)
+    /// and return it. A failure keeps the previous catalog: the session still
+    /// works with its current model, it just offers fewer alternatives.
+    pub(super) async fn refresh_model_catalog(&self) -> Vec<ModelEntry> {
+        let mut catalog = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _page in 0..MODEL_LIST_MAX_PAGES {
+            let mut request = json!({ "limit": MODEL_LIST_PAGE_SIZE });
+            if let Some(cursor) = &cursor {
+                request["cursor"] = Value::String(cursor.clone());
+            }
+            let response = match self.app_request("model/list", request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::warn!(
+                        message = %error.message,
+                        "model/list failed; keeping the previous ACP model catalog"
+                    );
+                    return lock(&self.state.models).clone();
+                }
+            };
+            catalog.extend(catalog_from_model_list(&response));
+            match response.get("nextCursor").and_then(Value::as_str) {
+                Some(next) if !next.is_empty() => cursor = Some(next.to_owned()),
+                _ => break,
+            }
+        }
+        *lock(&self.state.models) = catalog.clone();
+        catalog
+    }
+
     pub(super) async fn new_session(
         &self,
         params: &Value,
@@ -86,7 +117,10 @@ impl CodexAcpAgent {
             .ok_or_else(|| RpcError::internal("thread/start response omitted thread.id"))?
             .to_owned();
         lock(&self.state.sessions).insert(session_id.clone(), route.clone());
-        Ok(lifecycle_response(&session_id, &route))
+        let catalog = self.refresh_model_catalog().await;
+        self.publish_available_commands(&session_id, &route.cwd, client)
+            .await;
+        Ok(lifecycle_response(&session_id, &route, &catalog))
     }
 
     pub(super) async fn resume_session(
@@ -105,7 +139,10 @@ impl CodexAcpAgent {
         let route = route_from_lifecycle(&response, &cwd, client)?;
         lock(&self.state.sessions).insert(session_id.clone(), route.clone());
         replay_thread(&response, &session_id, client).await?;
-        Ok(lifecycle_response(&session_id, &route))
+        let catalog = self.refresh_model_catalog().await;
+        self.publish_available_commands(&session_id, &route.cwd, client)
+            .await;
+        Ok(lifecycle_response(&session_id, &route, &catalog))
     }
 
     pub(super) async fn fork_session(
@@ -126,7 +163,10 @@ impl CodexAcpAgent {
         let route = route_from_lifecycle(&response, &cwd, client)?;
         lock(&self.state.sessions).insert(session_id.clone(), route.clone());
         replay_thread(&response, &session_id, client).await?;
-        Ok(lifecycle_response(&session_id, &route))
+        let catalog = self.refresh_model_catalog().await;
+        self.publish_available_commands(&session_id, &route.cwd, client)
+            .await;
+        Ok(lifecycle_response(&session_id, &route, &catalog))
     }
 
     pub(super) async fn list_sessions(&self, params: &Value) -> Result<Value, RpcError> {
@@ -161,8 +201,30 @@ impl CodexAcpAgent {
     ) -> Result<Value, RpcError> {
         let (session_id, route) = self.require_session(params)?;
         self.bind_client(&session_id, client);
-        let input = acp_prompt_to_codex(params.get("prompt"))?;
         let client_user_message_id = message_id(params)?;
+        // Slash commands never start an ordinary turn; a command may substitute
+        // the input that does (for example `/goal`).
+        let mut input = None;
+        if route.active_turn_id.is_none() {
+            match self
+                .handle_slash_command(
+                    &session_id,
+                    &route,
+                    client,
+                    params,
+                    client_user_message_id.clone(),
+                )
+                .await?
+            {
+                Some(SlashOutcome::Handled(response)) => return Ok(response),
+                Some(SlashOutcome::Prompt(replacement)) => input = Some(replacement),
+                None => {}
+            }
+        }
+        let input = match input {
+            Some(input) => input,
+            None => acp_prompt_to_codex(params.get("prompt"))?,
+        };
         if let Some(active_turn_id) = route.active_turn_id {
             let response = self
                 .app_request(
@@ -296,6 +358,9 @@ impl CodexAcpAgent {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| RpcError::invalid_params("value must be a non-empty string"))?;
         let mut update = json!({ "threadId": session_id });
+        // The collaboration switch applies the server preset (plan mode runs at
+        // the preset's effort, as in the TUI) and is recorded after the update.
+        let mut collaboration_effort: Option<Option<String>> = None;
         match config_id.as_str() {
             "model" => update["model"] = Value::String(value.to_owned()),
             "reasoning_effort" => {
@@ -304,16 +369,43 @@ impl CodexAcpAgent {
             }
             "permissions" => update["permissions"] = Value::String(value.to_owned()),
             "mode" => {
-                let mode = match value {
-                    "build" => "default",
-                    "plan" => "plan",
-                    _ => return Err(RpcError::invalid_params("mode must be build or plan")),
+                let preset = permission_preset(value).ok_or_else(|| {
+                    RpcError::invalid_params(format!(
+                        "mode must be one of {}",
+                        PERMISSION_PRESETS
+                            .iter()
+                            .map(|preset| preset.id)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                })?;
+                update["approvalPolicy"] = Value::String(preset.approval_policy.to_owned());
+                update["approvalsReviewer"] = Value::String(preset.approvals_reviewer.to_owned());
+                update["sandboxPolicy"] = sandbox_policy_json(preset.sandbox_type);
+            }
+            "collaboration_mode" => {
+                if !COLLABORATION_MODES.iter().any(|(id, _, _)| *id == value) {
+                    return Err(RpcError::invalid_params(
+                        "collaboration_mode must be default or plan",
+                    ));
+                }
+                let preset = self.collaboration_preset(value).await;
+                let effort = match preset.as_ref().and_then(|preset| preset.effort.clone()) {
+                    Some(effort) => {
+                        collaboration_effort = Some(effort.clone());
+                        effort
+                    }
+                    None => route.effort.clone(),
                 };
+                let model = preset
+                    .as_ref()
+                    .and_then(|preset| preset.model.clone())
+                    .unwrap_or_else(|| route.model.clone());
                 update["collaborationMode"] = json!({
-                    "mode": mode,
+                    "mode": value,
                     "settings": {
-                        "model": route.model,
-                        "reasoning_effort": route.effort,
+                        "model": model,
+                        "reasoning_effort": effort,
                         "developer_instructions": null,
                     },
                 });
@@ -325,6 +417,7 @@ impl CodexAcpAgent {
             }
         }
         let _response = self.app_request("thread/settings/update", update).await?;
+        let catalog = lock(&self.state.models).clone();
         let mut sessions = lock(&self.state.sessions);
         let route = sessions
             .get_mut(&session_id)
@@ -332,11 +425,42 @@ impl CodexAcpAgent {
         match config_id.as_str() {
             "model" => route.model = value.to_owned(),
             "reasoning_effort" => route.effort = Some(value.to_owned()),
-            "mode" => route.mode = value.to_owned(),
+            "mode" => {
+                if let Some(preset) = permission_preset(value) {
+                    route.approval_policy = preset.approval_policy.to_owned();
+                    route.approvals_reviewer = preset.approvals_reviewer.to_owned();
+                    route.sandbox_type = preset.sandbox_type.to_owned();
+                }
+            }
+            "collaboration_mode" => {
+                route.collaboration_mode = value.to_owned();
+                if let Some(effort) = collaboration_effort {
+                    route.effort = effort;
+                }
+            }
             "permissions" => {}
             _ => unreachable!(),
         }
-        Ok(json!({ "configOptions": config_options(route) }))
+        Ok(json!({ "configOptions": config_options(route, &catalog) }))
+    }
+
+    /// The server preset for a collaboration mode (`collaborationMode/list`),
+    /// fetched once per bridge. `None` when discovery is unavailable: the mode
+    /// then keeps the session's model and effort.
+    async fn collaboration_preset(&self, mode: &str) -> Option<CollaborationPreset> {
+        if lock(&self.state.collaboration_presets).is_none() {
+            let presets = match self.app_request("collaborationMode/list", json!({})).await {
+                Ok(response) => collaboration_presets_from_list(&response),
+                Err(error) => {
+                    tracing::debug!(message = %error.message, "collaborationMode/list unavailable");
+                    Vec::new()
+                }
+            };
+            *lock(&self.state.collaboration_presets) = Some(presets);
+        }
+        lock(&self.state.collaboration_presets)
+            .as_ref()
+            .and_then(|presets| presets.iter().find(|preset| preset.mode == mode).cloned())
     }
 
     pub(super) async fn set_mode(&self, params: &Value) -> Result<Value, RpcError> {
