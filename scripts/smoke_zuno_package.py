@@ -72,6 +72,21 @@ def main() -> int:
     parser.add_argument("--target", required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument(
+        "--exec-timeout",
+        type=float,
+        default=30.0,
+        help=(
+            "seconds allowed for each execution of the packaged binaries (default 30); "
+            "raise it when the target runs under Rosetta 2, whose first launch translates "
+            "the whole binary"
+        ),
+    )
+    parser.add_argument(
+        "--execution-note",
+        default=None,
+        help="recorded in the report as executionNote, e.g. how a cross-built target was executed",
+    )
+    parser.add_argument(
         "--layout-only",
         action="store_true",
         help=(
@@ -170,7 +185,7 @@ def main() -> int:
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=30,
+                timeout=args.exec_timeout,
                 env=runtime_env,
                 check=False,
             )
@@ -187,7 +202,7 @@ def main() -> int:
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=30,
+                timeout=args.exec_timeout,
                 env=runtime_env,
                 check=False,
             )
@@ -202,7 +217,7 @@ def main() -> int:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=30,
+            timeout=args.exec_timeout,
             env=runtime_env,
             check=True,
         ).stdout.strip()
@@ -227,7 +242,7 @@ def main() -> int:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=30,
+            timeout=args.exec_timeout,
             env=runtime_env,
             check=True,
         )
@@ -249,7 +264,7 @@ def main() -> int:
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    timeout=30,
+                    timeout=args.exec_timeout,
                     env=runtime_env,
                     check=False,
                 )
@@ -263,7 +278,7 @@ def main() -> int:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=30,
+            timeout=args.exec_timeout,
             env=runtime_env,
             check=False,
         )
@@ -278,7 +293,7 @@ def main() -> int:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=30,
+            timeout=args.exec_timeout,
             env=runtime_env,
             check=False,
         )
@@ -292,6 +307,7 @@ def main() -> int:
             "target": args.target,
             "version": version,
             "executed": True,
+            "executionNote": args.execution_note,
             "binaryMachines": machines,
             "nativeAcp": True,
             "automaticUpdateBlocked": True,
