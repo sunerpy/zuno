@@ -1,27 +1,26 @@
 ---
 source: tui/src/startup_draft_tests.rs
+assertion_line: 285
 expression: "snapshots.join(\"\\n---\\n\")"
 ---
 resume lookup fallback:
 before:
-╭───────────────────────────────────────╮
-│ >_ Zuno (v<VERSION>)                    │
-│                                       │
-│ model:     loading   /model to change │
-│ directory: loading                    │
-╰───────────────────────────────────────╯
+
+  >_ Zuno (v<VERSION>)
+     loading
+
+  Pull up a prompt.
   Resuming session…
 
 › draft while loading
 
 
 after:
-╭───────────────────────────────────────╮
-│ >_ Zuno (v<VERSION>)                    │
-│                                       │
-│ model:     loading   /model to change │
-│ directory: loading                    │
-╰───────────────────────────────────────╯
+
+  >_ Zuno (v<VERSION>)
+     loading
+
+  Pull up a prompt.
 
 
 › draft while loading
@@ -30,24 +29,22 @@ after:
 ---
 fork lookup fallback:
 before:
-╭───────────────────────────────────────╮
-│ >_ Zuno (v<VERSION>)                    │
-│                                       │
-│ model:     loading   /model to change │
-│ directory: loading                    │
-╰───────────────────────────────────────╯
+
+  >_ Zuno (v<VERSION>)
+     loading
+
+  Pull up a prompt.
   Forking session…
 
 › draft while loading
 
 
 after:
-╭───────────────────────────────────────╮
-│ >_ Zuno (v<VERSION>)                    │
-│                                       │
-│ model:     loading   /model to change │
-│ directory: loading                    │
-╰───────────────────────────────────────╯
+
+  >_ Zuno (v<VERSION>)
+     loading
+
+  Pull up a prompt.
 
 
 › draft while loading
@@ -58,12 +55,11 @@ resume picker cancellation:
 before:
 hidden while picker owns input
 after:
-╭───────────────────────────────────────╮
-│ >_ Zuno (v<VERSION>)                    │
-│                                       │
-│ model:     loading   /model to change │
-│ directory: loading                    │
-╰───────────────────────────────────────╯
+
+  >_ Zuno (v<VERSION>)
+     loading
+
+  Pull up a prompt.
 
 
 › Ask Zuno to do anything
@@ -74,12 +70,11 @@ fork picker cancellation:
 before:
 hidden while picker owns input
 after:
-╭───────────────────────────────────────╮
-│ >_ Zuno (v<VERSION>)                    │
-│                                       │
-│ model:     loading   /model to change │
-│ directory: loading                    │
-╰───────────────────────────────────────╯
+
+  >_ Zuno (v<VERSION>)
+     loading
+
+  Pull up a prompt.
 
 
 › Ask Zuno to do anything

@@ -194,6 +194,7 @@ impl codex_code_mode::CodeModeSession for FakeV8Session {
         &'a self,
         request: codex_code_mode::ExecuteRequest,
         delegate: std::sync::Arc<dyn codex_code_mode::CodeModeSessionDelegate>,
+        _preempt: Option<tokio_util::sync::CancellationToken>,
     ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::StartedCell> {
         Box::pin(async move {
             let missing = request.source.contains("route: 'missing'");
@@ -237,6 +238,7 @@ impl codex_code_mode::CodeModeSession for FakeV8Session {
     fn wait<'a>(
         &'a self,
         request: codex_code_mode::WaitRequest,
+        _preempt: Option<tokio_util::sync::CancellationToken>,
     ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::WaitOutcome> {
         Box::pin(async move {
             Ok(codex_code_mode::WaitOutcome::MissingCell(

@@ -1,9 +1,6 @@
 use super::CHANNEL_CAPACITY;
 use super::ConnectionOrigin;
 use super::TransportEvent;
-use super::auth::WebsocketAuthPolicy;
-use super::auth::authorize_upgrade;
-use super::auth::is_unauthenticated_non_loopback_listener;
 use super::forward_incoming_message;
 use super::next_connection_id;
 use super::serialize_outgoing_message;
@@ -26,6 +23,9 @@ use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::routing::any;
 use axum::routing::get;
+use codex_websocket_auth::WebsocketAuthPolicy;
+use codex_websocket_auth::authorize_upgrade;
+use codex_websocket_auth::is_unauthenticated_non_loopback_listener;
 use futures::SinkExt;
 use futures::StreamExt;
 use owo_colors::OwoColorize;
@@ -55,7 +55,7 @@ fn colorize(text: &str, style: Style) -> String {
 
 #[allow(clippy::print_stderr)]
 fn print_websocket_startup_banner(addr: SocketAddr) {
-    let title = colorize("codex app-server (WebSockets)", Style::new().bold().cyan());
+    let title = colorize("zuno app-server (WebSockets)", Style::new().bold().cyan());
     let listening_label = colorize("listening on:", Style::new().dimmed());
     let listen_url = colorize(&format!("ws://{addr}"), Style::new().green());
     let ready_label = colorize("readyz:", Style::new().dimmed());

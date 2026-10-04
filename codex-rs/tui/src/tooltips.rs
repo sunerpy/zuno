@@ -49,12 +49,8 @@ fn experimental_tooltips(
 ///
 /// Zuno deliberately does not fetch inherited upstream announcements or select
 /// subscription and Desktop-app marketing based on the account plan, so the plan
-/// and Fast mode inputs are accepted for signature parity and otherwise ignored.
-pub(crate) fn get_tooltip(
-    _plan: Option<PlanType>,
-    _fast_mode_enabled: bool,
-    keymap: &TuiKeymap,
-) -> Option<String> {
+/// input is accepted for signature parity and otherwise ignored.
+pub(crate) fn get_tooltip(_plan: Option<PlanType>, keymap: &TuiKeymap) -> Option<String> {
     pick_tooltip(&mut rand::rng(), keymap)
 }
 
@@ -87,9 +83,13 @@ pub(crate) fn resolved_tooltips(
         .filter_map(move |tip| render_tooltip(tip, keymap))
 }
 
+pub(crate) fn tooltip_templates() -> impl Iterator<Item = &'static str> {
+    ALL_TOOLTIPS.iter().copied()
+}
+
 /// Substitute `{key:context.action}` with the current primary shortcut in a Markdown code span.
 /// Skip the tip if a placeholder is invalid or its action has no binding.
-fn render_tooltip(mut template: &str, keymap: Option<&RuntimeKeymap>) -> Option<String> {
+pub(crate) fn render_tooltip(mut template: &str, keymap: Option<&RuntimeKeymap>) -> Option<String> {
     let mut rendered = String::new();
     while let Some((prefix, rest)) = template.split_once("{key:") {
         let (action, suffix) = rest.split_once('}')?;
@@ -103,19 +103,6 @@ fn render_tooltip(mut template: &str, keymap: Option<&RuntimeKeymap>) -> Option<
     }
     rendered.push_str(template);
     Some(rendered)
-}
-
-/// Upstream Codex prewarms and reads a remote announcement feed here. Zuno keeps the
-/// call site so the composer hint policy stays structurally identical, but never
-/// fetches inherited upstream announcements, so there is nothing to prefer over the
-/// locally bundled tips.
-pub(crate) mod announcement {
-    use codex_protocol::account::PlanType;
-
-    /// Always `None`: Zuno has no announcement feed to consult.
-    pub(crate) fn fetch_announcement_tip(_plan: Option<PlanType>) -> Option<String> {
-        None
-    }
 }
 
 #[cfg(test)]

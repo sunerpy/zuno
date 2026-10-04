@@ -128,7 +128,7 @@ pub(crate) async fn materialize_goal_draft(
             Ok(reference) => reference,
             Err(err) => {
                 if let Some(output_dir) = output_dir.as_ref() {
-                    let _ = app_server.fs_remove_path(output_dir).await;
+                    let _ = app_server.file_system().fs_remove_path(output_dir).await;
                 }
                 return Err(err);
             }
@@ -148,6 +148,7 @@ pub(crate) async fn objective_text_for_edit(
         return Ok(objective.to_string());
     };
     let bytes = app_server
+        .file_system()
         .fs_read_file_path(&path)
         .await
         .map_err(|err| anyhow::anyhow!("{err}"))
@@ -199,6 +200,7 @@ async fn ensure_goal_output_dir(
         .join(GOAL_ATTACHMENT_DIR)
         .join(Uuid::new_v4().to_string());
     app_server
+        .file_system()
         .fs_create_directory_all_path(&path)
         .await
         .map_err(|err| anyhow::anyhow!("{err}"))
@@ -213,6 +215,7 @@ async fn write_goal_file(
     bytes: Vec<u8>,
 ) -> Result<()> {
     app_server
+        .file_system()
         .fs_write_file_path(&path, bytes)
         .await
         .map_err(|err| anyhow::anyhow!("{err}"))

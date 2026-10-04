@@ -209,6 +209,7 @@ pub(super) fn host_tools() -> Vec<ToolDefinition> {
         description: description.to_string(),
         kind: CodeModeToolKind::Function,
         input_schema: Some(input_schema),
+        input_schema_max_bytes: None,
         output_schema: None,
     })
     .collect()

@@ -1,16 +1,16 @@
 ---
 source: tui/src/startup_draft_tests.rs
+assertion_line: 802
 expression: frames
 ---
 before onboarding: hidden (0x0 viewport)
 ---
 after onboarding:
-╭───────────────────────────────────────╮
-│ >_ Zuno (v<VERSION>)                    │
-│                                       │
-│ model:     loading   /model to change │
-│ directory: loading                    │
-╰───────────────────────────────────────╯
+
+  >_ Zuno (v<VERSION>)
+     loading
+
+  Pull up a prompt.
 
 
 › Ask Zuno to do anything
