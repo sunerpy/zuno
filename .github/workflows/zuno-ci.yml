@@ -21,8 +21,7 @@ jobs:
   static:
     name: Zuno static and runtime tests
     runs-on: ubuntu-24.04
-    # The static job took 52 minutes on a 4-vCPU hosted runner at 0.156.1.
-    timeout-minutes: 120
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: codex-rs
@@ -118,11 +117,10 @@ jobs:
   package:
     name: Package ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
-    # Cold release LTO on Intel macOS and x86_64 Windows exceeds 90 minutes, and
-    # Intel macOS took 155 minutes at 0.156.1. Keep every native target and
-    # capability; allow the build to finish instead of substituting cross
-    # compilation or dropping package companions.
-    timeout-minutes: 300
+    # Cold release LTO on Intel macOS and x86_64 Windows exceeds 90 minutes.
+    # Keep every native target and capability; allow the build to finish instead
+    # of substituting cross compilation or dropping package companions.
+    timeout-minutes: 180
     permissions:
       contents: read
       id-token: write
