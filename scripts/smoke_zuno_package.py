@@ -13,6 +13,51 @@ import tarfile
 import tempfile
 
 
+# Machine identity of each target's executables, checked from the file headers
+# so a cross-built archive is proven to hold binaries for the target it claims
+# even when this host cannot execute them.
+PE_MACHINES = {"x86_64": 0x8664, "aarch64": 0xAA64}
+MACHO_CPUTYPES = {"x86_64": 0x01000007, "aarch64": 0x0100000C}
+ELF_MACHINES = {"x86_64": 0x3E, "aarch64": 0xB7}
+
+
+def binary_machine(path: Path) -> str:
+    """Return ``<format>:<machine>`` for a PE, Mach-O or ELF executable."""
+    with path.open("rb") as stream:
+        header = stream.read(64)
+        if header[:2] == b"MZ":
+            offset = int.from_bytes(header[0x3C:0x40], "little")
+            stream.seek(offset)
+            signature = stream.read(4)
+            if signature != b"PE\0\0":
+                raise RuntimeError(f"{path.name}: missing PE signature")
+            machine = int.from_bytes(stream.read(2), "little")
+            return f"pe:{machine:#06x}"
+        if header[:4] == b"\x7fELF":
+            little = header[5] == 1
+            machine = int.from_bytes(header[18:20], "little" if little else "big")
+            return f"elf:{machine:#04x}"
+        magic = header[:4]
+        if magic in (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe"):
+            cputype = int.from_bytes(header[4:8], "little")
+            return f"macho:{cputype:#010x}"
+        if magic in (b"\xfe\xed\xfa\xcf", b"\xfe\xed\xfa\xce"):
+            cputype = int.from_bytes(header[4:8], "big")
+            return f"macho:{cputype:#010x}"
+        if magic in (b"\xca\xfe\xba\xbe",):
+            return "macho:universal"
+    raise RuntimeError(f"{path.name}: not a PE, ELF or Mach-O executable")
+
+
+def expected_machine(target: str) -> str:
+    arch = target.split("-", 1)[0]
+    if "windows" in target:
+        return f"pe:{PE_MACHINES[arch]:#06x}"
+    if "apple" in target:
+        return f"macho:{MACHO_CPUTYPES[arch]:#010x}"
+    return f"elf:{ELF_MACHINES[arch]:#04x}"
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -26,6 +71,30 @@ def main() -> int:
     parser.add_argument("--archive", type=Path, required=True)
     parser.add_argument("--target", required=True)
     parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument(
+        "--exec-timeout",
+        type=float,
+        default=30.0,
+        help=(
+            "seconds allowed for each execution of the packaged binaries (default 30); "
+            "raise it when the target runs under Rosetta 2, whose first launch translates "
+            "the whole binary"
+        ),
+    )
+    parser.add_argument(
+        "--execution-note",
+        default=None,
+        help="recorded in the report as executionNote, e.g. how a cross-built target was executed",
+    )
+    parser.add_argument(
+        "--layout-only",
+        action="store_true",
+        help=(
+            "verify the archive layout and the machine type of every executable "
+            "without running anything; for a target this host cannot execute "
+            "(the report says so instead of claiming a native smoke)"
+        ),
+    )
     args = parser.parse_args()
 
     is_windows = "windows" in args.target
@@ -73,6 +142,39 @@ def main() -> int:
         if missing:
             raise RuntimeError(f"package is missing required files: {missing}")
 
+        # Every shipped executable must be built for the target the archive names.
+        wanted = expected_machine(args.target)
+        machines = {}
+        for path in required:
+            machine = binary_machine(path)
+            machines[str(path.relative_to(root))] = machine
+            if machine != wanted and machine != "macho:universal":
+                raise RuntimeError(
+                    f"{path.relative_to(root)} is built for {machine}, expected {wanted} for {args.target}"
+                )
+
+        if args.layout_only:
+            report = {
+                "archive": str(args.archive),
+                "archiveSha256": sha256(args.archive),
+                "target": args.target,
+                "executed": False,
+                "executionSkipped": (
+                    "cross-built for an architecture the packaging runner cannot execute; "
+                    "layout and machine types verified, no binary was run"
+                ),
+                "nativeAcp": False,
+                "automaticUpdateBlocked": None,
+                "managedDaemonBlocked": None,
+                "companionExecutableChecks": [],
+                "binaryMachines": machines,
+                "requiredFiles": [str(path.relative_to(root)) for path in required],
+            }
+            args.report.parent.mkdir(parents=True, exist_ok=True)
+            args.report.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return 0
+
         companion_checks = []
         for name, command in (
             ("codeModeHost", [str(host), "--help"]),
@@ -83,7 +185,7 @@ def main() -> int:
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=30,
+                timeout=args.exec_timeout,
                 env=runtime_env,
                 check=False,
             )
@@ -100,7 +202,7 @@ def main() -> int:
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=30,
+                timeout=args.exec_timeout,
                 env=runtime_env,
                 check=False,
             )
@@ -115,7 +217,7 @@ def main() -> int:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=30,
+            timeout=args.exec_timeout,
             env=runtime_env,
             check=True,
         ).stdout.strip()
@@ -140,7 +242,7 @@ def main() -> int:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=30,
+            timeout=args.exec_timeout,
             env=runtime_env,
             check=True,
         )
@@ -162,7 +264,7 @@ def main() -> int:
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    timeout=30,
+                    timeout=args.exec_timeout,
                     env=runtime_env,
                     check=False,
                 )
@@ -176,7 +278,7 @@ def main() -> int:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=30,
+            timeout=args.exec_timeout,
             env=runtime_env,
             check=False,
         )
@@ -191,7 +293,7 @@ def main() -> int:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=30,
+            timeout=args.exec_timeout,
             env=runtime_env,
             check=False,
         )
@@ -204,6 +306,9 @@ def main() -> int:
             "archiveSha256": sha256(args.archive),
             "target": args.target,
             "version": version,
+            "executed": True,
+            "executionNote": args.execution_note,
+            "binaryMachines": machines,
             "nativeAcp": True,
             "automaticUpdateBlocked": True,
             "companionExecutableChecks": companion_checks,
