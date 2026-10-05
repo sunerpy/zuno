@@ -213,50 +213,19 @@ def main() -> int:
 
     zuno_ci = ".github/workflows/zuno-ci.yml"
     require(zuno_ci, "name: zuno/pr-gate")
-    # Every Zuno workflow job runs on a CodeBuild-hosted runner (projects
-    # zuno-runner / zuno-runner-windows / zuno-runner-macos) so the gate,
-    # promotion and watcher consume no GitHub-hosted runner minutes. Each job's
-    # last label is unique within its workflow so GitHub cannot hand one job's
-    # runner to another.
-    hosted = re.compile(
-        r"^\s*(?:-\s*)?(?:runs-on:\s*|runner:\s*)?(ubuntu|windows|macos)-[a-z0-9.-]+\s*$",
-        re.MULTILINE,
-    )
-    for path in (
-        zuno_ci,
-        ".github/workflows/zuno-release.yml",
-        ".github/workflows/zuno-upstream-sync.yml",
-    ):
+    # Promotion verifies every sealed byte with --deny-self-hosted-runners, so a
+    # gate job on a self-hosted or CodeBuild runner could never be released.
+    release_workflow = ".github/workflows/zuno-release.yml"
+    for path in (zuno_ci, release_workflow, ".github/workflows/zuno-upstream-sync.yml"):
         body = text(path)
-        hits = [m.group(0).strip() for m in hosted.finditer(body)]
-        if (
-            hits
-            or "runs-on: ubuntu" in body
-            or "runs-on: windows" in body
-            or "runs-on: macos" in body
+        if "codebuild-" in body or re.search(
+            r"^\s*(?:runs-on:\s*\[?\s*|-\s*)self-hosted\b", body, re.MULTILINE
         ):
-            raise SystemExit(f"{path} still names a GitHub-hosted runner: {hits}")
-        labels = re.findall(r"^\s+- (zuno-[a-z-]+)\s*$", body, re.MULTILINE)
-        if not labels or len(labels) != len(set(labels)):
-            raise SystemExit(
-                f"{path} must give every job one unique zuno-* runner label: {labels}"
-            )
-        for label in re.findall(
-            r"codebuild-([a-z${}. -]+?)-\$\{\{ github\.run_id", body
-        ):
-            if label.startswith("${{ matrix.project }}"):
-                continue
-            if label not in ("zuno-runner", "zuno-runner-windows", "zuno-runner-macos"):
-                raise SystemExit(f"{path} names an unknown CodeBuild project: {label}")
-    require(zuno_ci, "project: zuno-runner-macos")
-    require(zuno_ci, "project: zuno-runner-windows")
-    # aarch64-pc-windows-msvc is cross-built on x86_64 Windows and cannot run
-    # there; its smoke is layout-only and the report must say so.
-    require(zuno_ci, "smoke: layout")
-    require(zuno_ci, 'if [[ "$SMOKE" == layout ]]; then')
-    require("scripts/smoke_zuno_package.py", '"executed": False')
-    require("scripts/smoke_zuno_package.py", "def binary_machine(path: Path) -> str:")
-    require(".github/actionlint.yaml", "codebuild-zuno-runner-*")
+            raise SystemExit(f"{path} must run every job on a GitHub-hosted runner")
+    if text(release_workflow).count("--deny-self-hosted-runners") < 3:
+        raise SystemExit(
+            f"{release_workflow} must deny self-hosted provenance for the manifest, packages, and standalone binary"
+        )
     reject(zuno_ci, "workflow_dispatch:")
     reject(zuno_ci, "  push:")
     require(
