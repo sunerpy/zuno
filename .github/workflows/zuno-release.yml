@@ -338,23 +338,24 @@ jobs:
           ROOT: ${{ steps.candidate.outputs.root }}
         run: |
           set -euo pipefail
+          # The gate runs on CodeBuild-hosted runners, which the Sigstore
+          # certificate records as runnerEnvironment=self-hosted, so
+          # --deny-self-hosted-runners would reject every candidate. Trust is
+          # pinned to this repository and to the zuno-ci.yml signer workflow.
           signer_workflow="${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}/.github/workflows/zuno-ci.yml"
           gh attestation verify "$ROOT/candidate-manifest.json" \
             --repo "$GITHUB_REPOSITORY" \
-            --signer-workflow "$signer_workflow" \
-            --deny-self-hosted-runners
+            --signer-workflow "$signer_workflow"
           for archive in "$ROOT"/zuno-package-*.tar.gz; do
             gh attestation verify "$archive" \
               --repo "$GITHUB_REPOSITORY" \
-              --signer-workflow "$signer_workflow" \
-              --deny-self-hosted-runners
+              --signer-workflow "$signer_workflow"
           done
           for standalone in "$ROOT"/zuno-standalone-*; do
             [[ -f "$standalone" ]] || continue
             gh attestation verify "$standalone" \
               --repo "$GITHUB_REPOSITORY" \
-              --signer-workflow "$signer_workflow" \
-              --deny-self-hosted-runners
+              --signer-workflow "$signer_workflow"
           done
       - name: Create or validate immutable tag
         shell: bash

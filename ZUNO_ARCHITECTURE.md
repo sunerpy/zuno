@@ -245,7 +245,11 @@ attempt. Two targets are cross-built: `x86_64-apple-darwin` on the Apple silicon
 fleet, where its smoke still executes under Rosetta 2, and
 `aarch64-pc-windows-msvc` on x86_64 Windows, which CodeBuild cannot execute, so
 that package is verified by layout and PE machine type only and its smoke
-report says `executed: false`. Promotion accepts that immutable run ID,
+report says `executed: false`. The Sigstore certificate records these runners
+as self-hosted, so promotion pins every attestation to this repository and the
+`zuno-ci.yml` signer workflow instead of denying self-hosted runners. Zuno takes
+dependency updates only through upstream syncs; the inherited Dependabot
+configuration is removed. Promotion accepts that immutable run ID,
 requires the merge commit tree to equal the certified tree, creates
 `zuno-vX.Y.Z`, verifies downloaded draft assets byte-for-byte, and publishes a
 non-latest preview without recompilation. Codex `rust-v*` automation is not a

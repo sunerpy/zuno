@@ -257,6 +257,38 @@ def main() -> int:
     require("scripts/smoke_zuno_package.py", '"executed": False')
     require("scripts/smoke_zuno_package.py", "def binary_machine(path: Path) -> str:")
     require(".github/actionlint.yaml", "codebuild-zuno-runner-*")
+    # CodeBuild runners are self-hosted in the Sigstore certificate, so
+    # promotion cannot deny self-hosted provenance (every candidate would fail);
+    # each verification is pinned to this repository and the zuno-ci.yml signer.
+    release_workflow = ".github/workflows/zuno-release.yml"
+    require(
+        release_workflow,
+        'signer_workflow="${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}/.github/workflows/zuno-ci.yml"',
+    )
+    release_lines = text(release_workflow).splitlines()
+    verifications = []
+    for index, line in enumerate(release_lines):
+        if "gh attestation verify " not in line:
+            continue
+        command = [line]
+        while command[-1].rstrip().endswith("\\") and index + len(command) < len(release_lines):
+            command.append(release_lines[index + len(command)])
+        verifications.append(" ".join(command))
+    if len(verifications) != 3 or not all(
+        '--repo "$GITHUB_REPOSITORY"' in command
+        and '--signer-workflow "$signer_workflow"' in command
+        and "--deny-self-hosted-runners" not in command
+        for command in verifications
+    ):
+        raise SystemExit(
+            f"{release_workflow} must verify the manifest, packages, and standalone binary against "
+            "this repository and the zuno-ci.yml signer, without --deny-self-hosted-runners"
+        )
+    # Dependencies arrive through upstream Codex syncs. Dependabot version updates
+    # open PRs against upstream-owned files, and every rebase reruns the whole gate.
+    for name in ("dependabot.yaml", "dependabot.yml"):
+        if (ROOT / ".github" / name).exists():
+            raise SystemExit(f".github/{name} re-enables Dependabot version updates in Zuno")
     reject(zuno_ci, "workflow_dispatch:")
     reject(zuno_ci, "  push:")
     require(
