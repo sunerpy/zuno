@@ -236,8 +236,8 @@ while OpenAI-specific Codex workflows remain manually callable for compatibility
 research only. Every Zuno workflow job (gate, promotion, upstream watcher) runs
 on a CodeBuild-hosted GitHub Actions runner in the Zuno AWS account rather than
 on GitHub-hosted runners: `zuno-runner` (Linux x86_64, and ARM64 through the
-`image:arm-3.0` label) and `zuno-runner-windows` in us-east-2, and
-`zuno-runner-macos` on a reserved Apple silicon fleet in us-west-2. On a PR
+`image:arm-3.0` label), `zuno-runner-windows`, and `zuno-runner-macos` on a
+reserved Apple silicon fleet, all in us-east-2. On a PR
 head, six target jobs build the Zuno entrypoint and companion package once, run
 package-layout and native ACP smoke, emit GitHub provenance attestations, and
 seal all archives and checksums to the exact PR head, tree, workflow run, and

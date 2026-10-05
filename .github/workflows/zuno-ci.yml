@@ -1,8 +1,8 @@
 name: Zuno CI
 
 # Every job runs on a CodeBuild-hosted GitHub Actions runner in the Zuno AWS
-# account (projects zuno-runner and zuno-runner-windows in us-east-2,
-# zuno-runner-macos on the reserved Mac fleet in us-west-2), so the gate
+# account (projects zuno-runner, zuno-runner-windows and zuno-runner-macos,
+# all in us-east-2; macOS uses a reserved Apple silicon fleet), so the gate
 # consumes no GitHub-hosted runner minutes. The first `runs-on` label names the
 # project; `image:`/`instance-size:` labels override its environment; the last
 # label is unique per job so GitHub never hands one job's runner to another.

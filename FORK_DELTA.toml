@@ -199,7 +199,7 @@ shared_upstream_paths = [
   "codex-rs/features/src/lib.rs",
 ]
 contracts = [
-  "The protected main branch receives the required zuno/pr-gate context from CodeBuild-hosted GitHub Actions runners in the Zuno AWS account (zuno-runner and zuno-runner-windows in us-east-2, zuno-runner-macos on a reserved Apple silicon fleet in us-west-2); no Zuno workflow job runs on a GitHub-hosted runner.",
+  "The protected main branch receives the required zuno/pr-gate context from CodeBuild-hosted GitHub Actions runners in the Zuno AWS account (zuno-runner, zuno-runner-windows and zuno-runner-macos, all in us-east-2; zuno-runner-macos runs on a reserved Apple silicon fleet); no Zuno workflow job runs on a GitHub-hosted runner.",
   "The Sigstore certificate records CodeBuild runners as self-hosted, so promotion verifies the manifest, every package and the standalone binary with gh attestation verify pinned to this repository and the zuno-ci.yml signer workflow, without --deny-self-hosted-runners.",
   "Dependencies arrive only through upstream Codex syncs: the inherited .github/dependabot.yaml is removed, so Dependabot opens no version-update pull requests against upstream-owned files.",
   "On an upstream-sync/* pull request the gate withdraws a queued auto-merge whose head is not the Zuno-Candidate-Commit recorded by the watcher before the gate can pass.",
