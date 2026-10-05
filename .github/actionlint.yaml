@@ -1,0 +1,15 @@
+# Labels of the CodeBuild-hosted GitHub Actions runners the Zuno workflows use
+# (see the header of .github/workflows/zuno-ci.yml). The first label names the
+# CodeBuild project, `image:`/`instance-size:` labels override its environment,
+# `image-default` is an inert placeholder that keeps every matrix entry at the
+# same label count, and the `zuno-*` labels are unique per job.
+self-hosted-runner:
+  labels:
+    - codebuild-zuno-runner-*
+    - codebuild-zuno-runner-windows-*
+    - codebuild-zuno-runner-macos-*
+    - image-default
+    - size-default
+    - image:*
+    - instance-size:*
+    - zuno-*

@@ -231,12 +231,21 @@ can replace the recorded baseline.
 ## CI and release ownership
 
 Zuno does not inherit OpenAI's private runner, signing, npm, or R2 authority.
-The protected `main` branch is gated by the public-runner `zuno/pr-gate`, while
-OpenAI-specific Codex workflows remain manually callable for compatibility
-research only. On a PR head, six native target jobs build the Zuno entrypoint
-and companion package once, run package-layout and native ACP smoke, emit GitHub
-provenance attestations, and seal all archives and checksums to the exact PR
-head, tree, workflow run, and attempt. Promotion accepts that immutable run ID,
+The protected `main` branch is gated by the repository-owned `zuno/pr-gate`,
+while OpenAI-specific Codex workflows remain manually callable for compatibility
+research only. Every Zuno workflow job (gate, promotion, upstream watcher) runs
+on a CodeBuild-hosted GitHub Actions runner in the Zuno AWS account rather than
+on GitHub-hosted runners: `zuno-runner` (Linux x86_64, and ARM64 through the
+`image:arm-3.0` label) and `zuno-runner-windows` in us-east-2, and
+`zuno-runner-macos` on a reserved Apple silicon fleet in us-west-2. On a PR
+head, six target jobs build the Zuno entrypoint and companion package once, run
+package-layout and native ACP smoke, emit GitHub provenance attestations, and
+seal all archives and checksums to the exact PR head, tree, workflow run, and
+attempt. Two targets are cross-built: `x86_64-apple-darwin` on the Apple silicon
+fleet, where its smoke still executes under Rosetta 2, and
+`aarch64-pc-windows-msvc` on x86_64 Windows, which CodeBuild cannot execute, so
+that package is verified by layout and PE machine type only and its smoke
+report says `executed: false`. Promotion accepts that immutable run ID,
 requires the merge commit tree to equal the certified tree, creates
 `zuno-vX.Y.Z`, verifies downloaded draft assets byte-for-byte, and publishes a
 non-latest preview without recompilation. Codex `rust-v*` automation is not a

@@ -53,8 +53,12 @@ env:
 
 jobs:
   prepare:
-    runs-on: ubuntu-latest
-    # Regenerating schema fixtures compiles the protocol and config crates.
+    # CodeBuild-hosted runner (see zuno-ci.yml); regenerating the schema
+    # fixtures compiles the protocol and config crates, so keep the large size.
+    runs-on:
+      - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - image-default
+      - zuno-upstream-sync
     timeout-minutes: 90
     steps:
       - name: Check out exact Zuno source

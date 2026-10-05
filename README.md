@@ -108,11 +108,13 @@ Zuno reads its configuration and state from `ZUNO_HOME` (default `~/.zuno`)
 only. `CODEX_HOME` and `~/.codex` belong to a separately installed Codex and are
 never consulted.
 
-Zuno pull requests use the repository-owned `zuno/pr-gate`; OpenAI-specific
-Codex CI remains manual because it depends on upstream private runners and
-publishing credentials. The PR gate builds each of six platform packages once,
-runs native ACP/layout smoke, emits provenance attestations, and seals the exact
-bytes to the PR head and tree. After a merge-method-only cutover preserves both
+Zuno pull requests use the repository-owned `zuno/pr-gate`, which runs on
+CodeBuild-hosted GitHub Actions runners in the Zuno AWS account (no GitHub-hosted
+runner minutes); OpenAI-specific Codex CI remains manual because it depends on
+upstream private runners and publishing credentials. The PR gate builds each of
+six platform packages once, runs native ACP/layout smoke (the Windows ARM64
+package is cross-built and layout-checked only), emits provenance attestations,
+and seals the exact bytes to the PR head and tree. After a merge-method-only cutover preserves both
 histories, the promotion workflow accepts an explicit candidate run ID, verifies
 tree equality, creates `zuno-vX.Y.Z`, rechecks downloaded release bytes, and
 publishes a non-latest preview without rebuilding. The upstream `rust-v*`
