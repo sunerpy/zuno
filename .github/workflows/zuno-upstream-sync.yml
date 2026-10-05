@@ -292,6 +292,15 @@ jobs:
           shared-key: zuno-upstream-sync
           cache-bin: false
 
+      # The runner image defaults to Python 3.14, which datamodel-code-generator
+      # (used to regenerate the Python SDK types) does not support yet; the PR
+      # gate's static job pins the same interpreter.
+      - name: Install Python for SDK type generation
+        if: steps.candidate.outputs.outcome == 'candidate'
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
       # write_schema_fixtures.py regenerates the Python SDK types through uv.
       - name: Install uv for SDK type generation
         if: steps.candidate.outputs.outcome == 'candidate'
@@ -306,6 +315,7 @@ jobs:
           CANDIDATE: ${{ steps.candidate.outputs.candidate }}
           TARGET_VERSION: ${{ steps.plan.outputs.target_version }}
           SOURCE_SHA: ${{ steps.plan.outputs.source_sha }}
+          UV_PYTHON: "3.12"
         run: |
           set -euo pipefail
           # Derived artifacts (Cargo.lock, App Server schema fixtures, config

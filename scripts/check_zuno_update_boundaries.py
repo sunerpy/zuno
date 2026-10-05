@@ -328,6 +328,11 @@ def main() -> int:
     require(release, "-c credential.helper= \\")
     require(release, '-c credential.helper="store --file=${credential_file}"')
     upstream_sync = ".github/workflows/zuno-upstream-sync.yml"
+    # The CodeBuild image defaults to Python 3.14, which the SDK type generator
+    # does not support; both jobs that regenerate schema fixtures pin uv to 3.12.
+    for path in (zuno_ci, upstream_sync):
+        require(path, 'UV_PYTHON: "3.12"')
+        require(path, 'python-version: "3.12"')
     require(upstream_sync, 'plan_path="${RUNNER_TEMP}/upstream-plan.json"')
     reject(upstream_sync, "> upstream-plan.json")
     reject(upstream_sync, "base_branch:")
