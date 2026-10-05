@@ -66,15 +66,19 @@ def main() -> int:
             "read-only daemon Version was accidentally blocked as a mutation"
         )
     require(daemon, "zuno_blocks_managed_daemon_mutations_before_filesystem_access")
-    for signature in [
-        "pub async fn bootstrap(",
-        "pub async fn ensure_remote_control_ready(",
-        "pub async fn start_remote_control_pairing(",
-        "pub async fn set_remote_control(",
-        "pub async fn run_pid_update_loop(",
-        "pub async fn update(",
+    launch = "codex-rs/app-server-daemon/src/launch.rs"
+    for path, signature in [
+        (daemon, "pub async fn bootstrap("),
+        (daemon, "pub async fn ensure_remote_control_ready("),
+        (daemon, "pub async fn start_remote_control_pairing("),
+        (daemon, "pub async fn set_remote_control("),
+        (daemon, "pub async fn run_pid_update_loop("),
+        (daemon, "pub async fn update("),
+        # The TUI auto-start and recovery paths start or restart the daemon here.
+        (launch, "pub async fn start_with_features("),
+        (launch, "pub async fn restart_with_features("),
     ]:
-        body = function_body(daemon, signature)
+        body = function_body(path, signature)
         disabled = body.find("zuno_managed_daemon_disabled()")
         mutation = min(
             (
@@ -91,6 +95,10 @@ def main() -> int:
         )
         if disabled < 0 or disabled > mutation:
             raise SystemExit(f"{signature} does not fail closed before daemon mutation")
+    features = text("codex-rs/features/src/lib.rs")
+    auto_start = features.split("id: Feature::DaemonAutoStart,", 1)[1].split("},", 1)[0]
+    if "default_enabled: false" not in auto_start:
+        raise SystemExit("daemon_auto_start must stay disabled by default in Zuno")
 
     app_cmd = "codex-rs/cli/src/app_cmd.rs"
     app_body = function_body(app_cmd, "pub async fn run_app(")

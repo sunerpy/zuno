@@ -134,6 +134,8 @@ pub struct ConnectorMetadataReadResult {
 ///
 /// The store is created before awaiting the backend request, so a response that arrives after an
 /// account or backend change can only commit to the scope under which it was requested.
+/// Capture `auth` and `config.application_network_policy` together using
+/// `AuthManager::auth_with_http_client_factory` so the request retains that account's policy.
 pub async fn read_connector_metadata(
     config: &Config,
     auth: &CodexAuth,
@@ -146,7 +148,7 @@ pub async fn read_connector_metadata(
     );
     anyhow::ensure!(
         auth.get_account_id().is_some(),
-        "ChatGPT account ID not available, please re-run codex login"
+        "ChatGPT account ID not available, please re-run zuno login"
     );
 
     let store = ConnectorMetadataStore::new(

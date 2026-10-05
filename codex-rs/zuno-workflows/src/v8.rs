@@ -182,6 +182,7 @@ impl WorkflowEngineProvider for V8WorkflowEngine {
                         max_output_tokens: Some(MAX_SCRIPT_OUTPUT_TOKENS),
                     },
                     delegate,
+                    /*preempt*/ None,
                 )
                 .await
                 .map_err(engine_error)?;
@@ -331,10 +332,13 @@ async fn wait_for_result(
                     return failed_result(message);
                 }
                 response = match session
-                    .wait(WaitRequest {
-                        cell_id: cell_id.clone(),
-                        yield_time_ms: WAIT_YIELD_TIME_MS,
-                    })
+                    .wait(
+                        WaitRequest {
+                            cell_id: cell_id.clone(),
+                            yield_time_ms: WAIT_YIELD_TIME_MS,
+                        },
+                        /*preempt*/ None,
+                    )
                     .await
                 {
                     Ok(WaitOutcome::LiveCell(response) | WaitOutcome::MissingCell(response)) => {

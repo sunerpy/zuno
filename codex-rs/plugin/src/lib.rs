@@ -8,7 +8,7 @@ mod agent_backend;
 mod bundled_hooks;
 mod load_outcome;
 pub mod manifest;
-mod plugin_id;
+use codex_core_plugin_common::plugin_id;
 mod provider;
 
 pub use agent_backend::EffectivePluginAgentBackend;

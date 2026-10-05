@@ -1,7 +1,8 @@
 use anyhow::Context;
 use codex_app_server_client::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
+use codex_app_server_client::EmbeddedNetworkPolicy;
 use codex_app_server_client::EnvironmentManager;
-use codex_app_server_client::ExecServerRuntimePaths;
+use codex_app_server_client::ExecServerRuntimeOptions;
 use codex_app_server_client::InProcessClientStartArgs;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_arg0::Arg0DispatchPaths;
@@ -72,6 +73,7 @@ pub(crate) async fn run(
     }
     .context("failed to resolve ACP working directory")?;
     let codex_home = find_codex_home().context("failed to resolve Zuno home")?;
+    let embedded_network_policy = EmbeddedNetworkPolicy::load(&loader_overrides).await;
     let bootstrap_config = load_config_toml_with_layer_stack(
         codex_home.as_path(),
         Some(&cwd),
@@ -85,14 +87,16 @@ pub(crate) async fn run(
     .await
     .context("failed to load bootstrap configuration for ACP")?;
     let cloud_config_bundle = cloud_config_bundle_loader_for_storage(
-        bootstrap_auth_config(codex_home.as_path(), &bootstrap_config)
-            .context("failed to resolve ACP cloud configuration authentication")?,
+        embedded_network_policy.bind_bootstrap_auth(
+            bootstrap_auth_config(codex_home.as_path(), &bootstrap_config)
+                .context("failed to resolve ACP cloud configuration authentication")?,
+        ),
         /*enable_codex_api_key_env*/ false,
     )
     .await
     .context("failed to initialize ACP cloud configuration authentication")?;
 
-    let config = ConfigBuilder::default()
+    let mut config = ConfigBuilder::default()
         .codex_home(codex_home.to_path_buf())
         .cli_overrides(cli_overrides.clone())
         .loader_overrides(loader_overrides.clone())
@@ -114,6 +118,7 @@ pub(crate) async fn run(
         .build()
         .await
         .context("failed to load ACP configuration")?;
+    embedded_network_policy.activate(&mut config);
 
     let config_warnings = config
         .startup_warnings
@@ -126,7 +131,7 @@ pub(crate) async fn run(
         })
         .collect();
     let state_db = codex_core::init_state_db(&config).await;
-    let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
+    let local_runtime_paths = ExecServerRuntimeOptions::from_optional_paths(
         arg0_paths.codex_self_exe.clone(),
         arg0_paths.codex_linux_sandbox_exe.clone(),
     )?;
@@ -137,7 +142,7 @@ pub(crate) async fn run(
     let environment_manager = EnvironmentManager::from_codex_home(
         &config.codex_home,
         Some(local_runtime_paths),
-        config.http_client_factory(),
+        embedded_network_policy.bind(config.http_client_factory()),
     )
     .await
     .context("failed to initialize ACP execution environments")?;
@@ -149,6 +154,7 @@ pub(crate) async fn run(
         loader_overrides,
         strict_config,
         cloud_config_bundle,
+        embedded_network_policy,
         feedback: CodexFeedback::new(),
         log_db: None,
         state_db,
