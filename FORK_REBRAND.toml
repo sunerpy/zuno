@@ -2,11 +2,15 @@
 #
 # `scripts/zuno_upstream.py prepare` uses this file to resolve the merge
 # conflicts that exist only because Zuno renamed Codex text. A conflict hunk (or
-# a modify/delete pair) is resolved automatically only when applying these rules
-# to the Codex baseline reproduces the current Zuno text byte for byte; the same
-# rules are then applied to the new upstream text. Anything the rules cannot
-# reproduce stays a conflict for a human. `scripts/zuno_rebrand.py audit`
-# reports how much of the Zuno delta the rules currently reproduce.
+# a modify/delete pair) is resolved as rename-only when applying these rules to
+# the Codex baseline reproduces the current Zuno text byte for byte; the same
+# rules are then applied to the new upstream text. Other hunks are merged line
+# by line once the base lines Zuno renamed are normalised, when that has one
+# mechanical answer (see docs/zuno-upstream-sync.md); anything else stays a
+# conflict for a human. Lines only upstream wrote are rebranded after the merge
+# (string literals in `.rs`, rendered `.snap` text) and, outside the `[[added]]`
+# scopes, held for review. `scripts/zuno_rebrand.py audit` reports how much of
+# the Zuno delta the rules currently reproduce.
 #
 # Rules run per line, in order. `replace` is literal text (no regex group
 # references or escapes) and is never matched again by a later rule. Source code

@@ -163,6 +163,63 @@ class ApplyTest(unittest.TestCase):
             "Restart Zuno.\n",
         )
 
+    def test_text_only_follows_string_literals_across_lines(self) -> None:
+        # Continuation lines of a multi-line literal (an inline insta snapshot, a
+        # raw string) are text; a quote inside a block comment opens nothing.
+        text = (
+            "insta::assert_snapshot!(\n"
+            "    render(),\n"
+            '    @"\n'
+            "    › Ask Codex to do anything\n"
+            '    "\n'
+            ");\n"
+            "let agent: Codex = spawn();\n"
+            'let raw = r#"\n'
+            'Restart Codex now "please"\n'
+            '"#;\n'
+            '/* a "quote in a block comment */ let other: Codex = spawn();\n'
+            "/* a block comment\n"
+            '   with a "quote */ let third: Codex = spawn();\n'
+        )
+        self.assertEqual(
+            rules().apply(text, version=None, path="codex-rs/tui/src/x.rs", text_only=True),
+            "insta::assert_snapshot!(\n"
+            "    render(),\n"
+            '    @"\n'
+            "    › Ask Zuno to do anything\n"
+            '    "\n'
+            ");\n"
+            "let agent: Codex = spawn();\n"
+            'let raw = r#"\n'
+            'Restart Zuno now "please"\n'
+            '"#;\n'
+            '/* a "quote in a block comment */ let other: Codex = spawn();\n'
+            "/* a block comment\n"
+            '   with a "quote */ let third: Codex = spawn();\n',
+        )
+
+    def test_apply_to_lines_rewrites_only_selected_lines(self) -> None:
+        current = (
+            'let old = "Codex stays";\n'
+            "insta::assert_snapshot!(out, @\"\n"
+            "    › Ask Codex to do anything\n"
+            '");\n'
+            "let agent: Codex = spawn();\n"
+        )
+        base = 'let old = "Codex stays";\n'
+        upstream = current
+        selected = zuno_rebrand.upstream_new_lines(current, base, upstream, base)
+        # The trailing empty line is in the base too.
+        self.assertEqual(selected, {1, 2, 3, 4})
+        self.assertEqual(
+            rules().apply_to_lines(current, selected, version=None, path="codex-rs/tui/src/x.rs"),
+            'let old = "Codex stays";\n'
+            "insta::assert_snapshot!(out, @\"\n"
+            "    › Ask Zuno to do anything\n"
+            '");\n'
+            "let agent: Codex = spawn();\n",
+        )
+
     def test_rebrand_new_text_guards_only_lines_upstream_added(self) -> None:
         base = 'const A: u8 = 1;\nlet banner = "Codex is ready";\nRestart Codex.\n'
         upstream = (
@@ -279,6 +336,94 @@ class ResolveTest(unittest.TestCase):
     def test_unterminated_hunk_is_an_error(self) -> None:
         with self.assertRaises(zuno_rebrand.RebrandError):
             zuno_rebrand.split_conflicts("<<<<<<< up\nx\n")
+
+
+class StructuralMergeTest(unittest.TestCase):
+    """Hunks that are not rename-only but still have exactly one mechanical answer."""
+
+    def resolve(self, text: str, path: str) -> tuple[str, "zuno_rebrand.ResolutionReport"]:
+        return zuno_rebrand.resolve_conflicts(
+            text, rules(), path=path, source_version=None, target_version=None
+        )
+
+    def test_adjacent_edits_merge_once_the_rebrand_is_normalised(self) -> None:
+        # Upstream dropped the period; Zuno renamed the text and deleted the helper
+        # right below it. git conflicts on adjacent edits; after rebranding the base
+        # the two edits touch different lines.
+        text = "use x;\n" + hunk(
+            'const SUMMARY: &str = "Codex rebuilt its local database";\n\nfn helper() -> bool {\n    true\n}\n',
+            'const SUMMARY: &str = "Codex rebuilt its local database.";\n\nfn helper() -> bool {\n    true\n}\n',
+            'const SUMMARY: &str = "Zuno rebuilt its local database.";\n',
+        ) + "\nmod rest;\n"
+        resolved, report = self.resolve(text, "codex-rs/app-server/src/lib.rs")
+        self.assertEqual(
+            resolved, 'use x;\nconst SUMMARY: &str = "Zuno rebuilt its local database";\n\nmod rest;\n'
+        )
+        self.assertEqual((report.resolved, report.merged, report.remaining), (0, 1, 0))
+        self.assertEqual(report.reasons, ["merged adjacent edits"])
+
+    def test_rename_and_semantic_edit_merge_with_an_upstream_edit_nearby(self) -> None:
+        text = hunk("Run codex now, please\nlimit = 1\n", "Run codex now\nlimit = 1\n", "Run zuno now\nlimit = 2\n")
+        resolved, report = self.resolve(text, "docs/x.md")
+        self.assertEqual(resolved, "Run zuno now, please\nlimit = 2\n")
+        self.assertEqual((report.merged, report.remaining), (1, 0))
+
+    def test_insertions_on_both_sides_at_one_point_keep_both(self) -> None:
+        text = "[workspace.dependencies]\n" + hunk(
+            'codex-test-support = { path = "test-support" }\n',
+            "",
+            'zuno-workflows = { path = "zuno-workflows" }\nzuno-acp = { path = "zuno-acp" }\n',
+        )
+        resolved, report = self.resolve(text, "codex-rs/Cargo.toml")
+        self.assertEqual(
+            resolved,
+            "[workspace.dependencies]\n"
+            'codex-test-support = { path = "test-support" }\n'
+            'zuno-workflows = { path = "zuno-workflows" }\n'
+            'zuno-acp = { path = "zuno-acp" }\n',
+        )
+        self.assertEqual((report.merged, report.remaining), (1, 0))
+        self.assertEqual(report.reasons, ["united insertions"])
+
+    def test_identical_insertions_are_kept_once(self) -> None:
+        resolved, report = self.resolve(hunk("same\nup\n", "", "same\n"), "x.md")
+        self.assertEqual(report.remaining, 1)
+        resolved, report = self.resolve(hunk("same\n", "", "same\n"), "x.md")
+        self.assertEqual(resolved, "same\n")
+        self.assertEqual(report.merged, 1)
+
+    def test_edits_that_overlap_stay_conflicted(self) -> None:
+        for ours, base, theirs in (
+            # Both sides rewrote the same line differently.
+            ("limit = 2\n", "limit = 1\n", "limit = 3\n"),
+            # Zuno deleted a line upstream changed.
+            ("limit = 2\n", "limit = 1\n", ""),
+            # Upstream inserted inside the block Zuno replaced.
+            ("a\nnew\nb\nc\n", "a\nb\nc\n", "x\n"),
+        ):
+            text = hunk(ours, base, theirs)
+            resolved, report = self.resolve(text, "x.rs")
+            self.assertEqual(resolved, text)
+            self.assertEqual((report.merged, report.remaining), (0, 1))
+
+    def test_snapshot_assertion_line_takes_upstream(self) -> None:
+        text = (
+            "---\nsource: tui/src/x.rs\n"
+            + hunk("assertion_line: 144\n", "assertion_line: 154\n", "")
+            + "expression: frames\n---\nbody\n"
+        )
+        resolved, report = self.resolve(text, "codex-rs/tui/src/snapshots/x.snap")
+        self.assertEqual(resolved, "---\nsource: tui/src/x.rs\nassertion_line: 144\nexpression: frames\n---\nbody\n")
+        self.assertEqual((report.merged, report.remaining), (1, 0))
+        self.assertEqual(report.reasons, ["snapshot metadata"])
+        # The same hunk outside a snapshot is a real conflict.
+        _, report = self.resolve(text, "codex-rs/tui/src/x.rs")
+        self.assertEqual(report.remaining, 1)
+
+    def test_rename_only_hunks_still_count_as_resolved(self) -> None:
+        resolved, report = self.resolve(hunk("Codex v2\n", "Codex\n", "Zuno\n"), "x.md")
+        self.assertEqual(resolved, "Zuno v2\n")
+        self.assertEqual((report.resolved, report.merged), (1, 0))
 
 
 class AuditTest(unittest.TestCase):

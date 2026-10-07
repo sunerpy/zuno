@@ -416,7 +416,7 @@ jobs:
           body="$(cat <<EOF
           This candidate merges exact Codex release \`${TARGET_TAG}\` (\`${UPSTREAM_COMMIT}\`) into the reviewed Zuno source \`main@${SOURCE_SHA}\`. The head commit's first parent is that \`main\` commit and its second parent is the release commit, so the diff below is exactly the upstream change plus regenerated derived artifacts.
 
-          It was prepared in an isolated CI worktree by the scheduled upstream watcher, which force-updates this branch whenever \`main\` moves so the candidate always builds on the current reviewed source. Merging is the review gate: manual, or queued for GitHub auto-merge behind \`zuno/pr-gate\` when \`UPSTREAM_CODEX.toml\` sets \`[sync].automatic_merge = true\` and this replay needed no manual resolution.
+          It was prepared in an isolated CI worktree by the scheduled upstream watcher, which force-updates this branch whenever \`main\` moves so the candidate always builds on the current reviewed source. Merging is the review gate: manual, or queued for GitHub auto-merge behind \`zuno/pr-gate\` when \`UPSTREAM_CODEX.toml\` sets \`[sync].automatic_merge = true\`, this replay needed no manual resolution, and no rebranded text is held for review.
 
           ${overlap}
 
@@ -506,8 +506,9 @@ jobs:
 
           # Hands-off merge: with `[sync].automatic_merge = true` in
           # UPSTREAM_CODEX.toml a candidate whose replay was fully automatic
-          # (rebrand replay only; nothing copied from a hand-resolved candidate)
-          # is queued for GitHub auto-merge, so it merges (as a merge commit)
+          # (rename-only and structural resolutions only; nothing copied from a
+          # hand-resolved candidate, and no rebranded new upstream text held
+          # for review) is queued for GitHub auto-merge, so it merges (as a merge commit)
           # the moment zuno/pr-gate passes and promotion follows. The repository
           # must allow auto-merge and its main ruleset must not require a human
           # review for this to complete, and the queue must be raised with the
@@ -519,12 +520,18 @@ jobs:
           # false) cannot ride a stale queue into main.
           automatic_merge="$(python3 -c 'import tomllib; print(str(tomllib.load(open("UPSTREAM_CODEX.toml", "rb")).get("sync", {}).get("automatic_merge", False)).lower())')"
           reused="$(python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1])).get("rebrand", {}).get("reused", [])))' "${REPORT}")"
+          # New upstream strings the rules rewrote without a predicate (source
+          # literals, snapshots outside the rendered-text scopes) need a person.
+          review="$(python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1])).get("rebrand", {}).get("review", [])))' "${REPORT}")"
           # Auto-merge is only safe while the main ruleset still requires the
           # zuno/pr-gate check; without it `--auto` would merge immediately.
           gate_required="$(gh api "repos/${GH_REPO}/rules/branches/main" --jq '[.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[]?.context] | index("zuno/pr-gate") != null' 2>/dev/null || echo false)"
           if [[ "${automatic_merge}" == true && "${reused}" != 0 ]]; then
             echo "Auto-merge not queued: ${reused} path(s) were carried over from a hand-resolved candidate, so this replay was not fully automatic." >> "${GITHUB_STEP_SUMMARY}"
             gh pr comment "${pr_url}" --body "Auto-merge was not queued: ${reused} path(s) were carried over from a hand-resolved candidate (see the rebrand replay above), so this candidate waits for a manual merge."
+          elif [[ "${automatic_merge}" == true && "${review}" != 0 ]]; then
+            echo "Auto-merge not queued: the replay rebranded new upstream text in ${review} path(s) that no rule proves; a person checks them first." >> "${GITHUB_STEP_SUMMARY}"
+            gh pr comment "${pr_url}" --body "Auto-merge was not queued: the replay rebranded lines only upstream wrote in ${review} path(s) (see *New upstream text rebranded, held for review* above). Check them, restore any that must stay Codex, then merge this candidate by hand."
           elif [[ "${automatic_merge}" == true && "${gate_required}" != true ]]; then
             echo "Auto-merge not queued: the main ruleset does not require zuno/pr-gate, so auto-merge would merge without the gate." >> "${GITHUB_STEP_SUMMARY}"
             gh pr comment "${pr_url}" --body "Auto-merge was not queued: the \`main\` ruleset does not require the \`zuno/pr-gate\` status check, so GitHub would merge immediately instead of behind the gate. Restore the required check or merge this candidate by hand."

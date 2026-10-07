@@ -145,14 +145,40 @@ with one safety predicate:
 Concretely, per conflicted path:
 
 - **Content conflict** (`diff3` hunks with the baseline in the middle): each
-  rename-only hunk is replaced by the rebranded upstream text; a hunk the rules
-  cannot reproduce keeps its markers. A file is reported as *resolved* only
-  when no marker remains, otherwise as *partial*.
+  rename-only hunk is replaced by the rebranded upstream text. A hunk that is
+  not rename-only is still resolved when it has exactly one mechanical answer
+  (`zuno_rebrand.merge_lines`): once the base lines Zuno renamed are replaced by
+  their rebrand, the Zuno edit and the upstream edit touch different lines
+  (git conflicts on *adjacent* edits; this merge does not), or both sides only
+  inserted lines at the same point and share no content line (kept upstream
+  first, then Zuno), or the hunk is only the `assertion_line:` header of an
+  insta snapshot (upstream's value; insta never compares it). Edits to the same
+  line, an insertion inside a block the other side changed, and overlapping
+  insertions keep their markers. A file is *resolved* when every hunk was
+  rename-only, *merged* when at least one needed a structural merge (listed for
+  review in the PR body), otherwise *partial*.
 - **Modify/delete** (upstream deleted a file Zuno only renamed): the file is
-  deleted with upstream.
+  deleted with upstream. A `.md` document Zuno changed beyond the rename (its
+  own section) is *kept* as a Zuno-owned file; a source file still needs a
+  person, because upstream may have moved what it defined.
 - **Workspace version** (`codex-rs/Cargo.toml`): a hunk consisting solely of the
   `version = "…"` line takes the release version, because Zuno versions track
   Codex versions.
+
+Replayed on the real releases, the structural rules took the residual
+conflicts of `rust-v0.157.0` from 6 to 3 and of `rust-v0.161.0` from 4 to 0, and
+the merged files matched the hand resolutions apart from insta metadata.
+
+After the merge, lines only upstream wrote (by position against the baseline,
+and absent from the Zuno source) are rebranded wherever the merge left them, in
+the files the replay finished, in Zuno-changed files that merged cleanly, and
+in user-visible drift files (`codex-rs/{tui,cli,core/src,app-server/src}`):
+inside string literals of `.rs` files, and as rendered text in `.snap` files.
+The JSON report lists them as `new_text`. TUI snapshots (the `[[added]]` scope)
+follow the policy for new snapshots; every other entry is also listed in
+`review` and holds back auto-merge, because no predicate vouches for it: a
+fixture that mirrors a server response, or a message another crate still writes
+as Codex, must stay as upstream wrote it.
 
 Rename-only files that merged cleanly are also **refreshed**: if the upstream
 release added new wording to a file Zuno had already rebranded, the new wording
@@ -172,8 +198,8 @@ file outside the Zuno
 delta is never rewritten; paths whose new upstream text the rules would change
 are listed as `drift` in the JSON report for review.
 
-Rules never run without the predicate, so an incomplete rule set costs coverage,
-not correctness. Measure coverage with
+Outside those two passes the rules never run without the predicate, so an
+incomplete rule set costs coverage, not correctness. Measure coverage with
 
 ```sh
 python3 scripts/zuno_rebrand.py audit --baseline rust-vX.Y.Z --source main \
