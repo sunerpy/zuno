@@ -747,6 +747,23 @@ def replay_rebrand_into(
         zuno = blob(repo, plan.source_commit, path)
         upstream = blob(repo, plan.target_commit, path)
         if current is not None and zuno_rebrand.has_conflict_markers(current):
+            # A file Zuno only renamed is replayed as a whole, exactly like a
+            # rename-only file that merged cleanly: its clean regions need the
+            # rebrand too (a `${version}` line no conflict hunk covered, say).
+            if (
+                base is not None
+                and zuno is not None
+                and upstream is not None
+                and rebrand.apply(base, version=source_version, path=path) == zuno
+            ):
+                expected, guarded = zuno_rebrand.rebrand_new_text(
+                    rebrand, base, upstream, version=target_version, path=path
+                )
+                (worktree / path).write_text(expected, encoding="utf-8")
+                replay.resolved.append(path)
+                if guarded:
+                    replay.guarded.append(path)
+                continue
             resolved, report = zuno_rebrand.resolve_conflicts(
                 current,
                 rebrand,

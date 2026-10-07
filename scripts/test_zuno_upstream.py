@@ -1026,6 +1026,42 @@ class StructuralReplayTest(unittest.TestCase):
             self.assertIn("Merged structurally (review) (2)", rendered)
             self.assertIn("Kept Zuno documents upstream deleted (1)", rendered)
 
+    def test_prepare_replays_a_conflicted_rename_only_file_as_a_whole(self) -> None:
+        # The conflict is the last line; the version line merged cleanly with the
+        # old Zuno version and must still move to the new release.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo_path = root / "repo"
+            repo_path.mkdir()
+            repo = Repository(repo_path)
+            snapshot = "snapshots/frames.snap"
+            repo.write("codex-rs/Cargo.toml", workspace_manifest("0.1.0"))
+            repo.write(snapshot, "│ >_ Codex (v0.0.0) │\n\n\n\nCodex old\n")
+            repo.commit("base")
+            base, tree = repo.tag_baseline("rust-v0.1.0")
+
+            git(repo.root, "checkout", "-q", "-b", "release-next")
+            repo.write(snapshot, "│ >_ Codex (v0.0.0) │\n\n\n\nCodex new\n")
+            repo.commit("upstream next")
+            git(repo.root, "tag", "rust-v0.2.0")
+
+            git(repo.root, "checkout", "-q", "-b", "zuno", base)
+            repo.manifest("rust-v0.1.0", base, tree)
+            repo.write("FORK_REBRAND.toml", REBRAND_RULES)
+            repo.write("codex-rs/Cargo.toml", workspace_manifest("0.1.3"))
+            # Exactly the rebrand of the base: one character shorter, padded back.
+            repo.write(snapshot, "│ >_ Zuno (v0.1.3)  │\n\n\n\nZuno old\n")
+            repo.commit("zuno delta")
+
+            baseline = zuno_upstream.read_baseline(repo.root / "UPSTREAM_CODEX.toml")
+            plan = zuno_upstream.make_plan(repo.root, baseline, "zuno", "rust-v0.2.0")
+            worktree = root / "candidate"
+            candidate = zuno_upstream.prepare(
+                repo.root, "UPSTREAM_CODEX.toml", plan, "upstream-sync/0.2.0", worktree
+            )
+            self.assertIn(snapshot, candidate.rebrand.resolved)
+            self.assertEqual((worktree / snapshot).read_text(), "│ >_ Zuno (v0.2.0)  │\n\n\n\nZuno new\n")
+
     def test_prepare_rebrands_lines_only_upstream_wrote(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

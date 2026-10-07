@@ -144,8 +144,10 @@ with one safety predicate:
 
 Concretely, per conflicted path:
 
-- **Content conflict** (`diff3` hunks with the baseline in the middle): each
-  rename-only hunk is replaced by the rebranded upstream text. A hunk that is
+- **Content conflict** (`diff3` hunks with the baseline in the middle): a file
+  whose whole Zuno text is the rebrand of its base is replayed as a whole, like a
+  refreshed file, so a `${version}` line in a cleanly merged region moves too.
+  Otherwise each rename-only hunk is replaced by the rebranded upstream text. A hunk that is
   not rename-only is still resolved when it has exactly one mechanical answer
   (`zuno_rebrand.merge_lines`): once the base lines Zuno renamed are replaced by
   their rebrand, the Zuno edit and the upstream edit touch different lines
