@@ -7,7 +7,15 @@ empty (48 columns):
   >_ Zuno (v<VERSION>)
      loading
 
-  Pull up a prompt.
+
+› Ask Zuno to do anything
+
+  ? for shortcuts
+---
+configured (48 columns):
+
+  >_ Zuno (v<VERSION>)
+     workspace
 
 
 › Ask Zuno to do anything
@@ -39,8 +47,6 @@ multiline (48 columns):
   >_ Zuno (v<VERSION>)
      loading
 
-  Pull up a prompt.
-
 
 › first startup line
   second startup line
@@ -49,10 +55,8 @@ multiline (48 columns):
 ---
 narrow (18 columns):
 
-  >_ Zuno (v0.160…
+  >_ Zuno (v0.161…
      loading
-
-  Pull up a promp…
 
 
 › first startup

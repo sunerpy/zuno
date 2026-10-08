@@ -58,6 +58,9 @@ mod daemon_install;
 mod daemon_telemetry;
 mod doctor;
 #[cfg(test)]
+#[path = "exec_args_tests.rs"]
+mod exec_args_tests;
+#[cfg(test)]
 #[path = "exec_server_args_tests.rs"]
 mod exec_server_args_tests;
 mod exec_server_auth;
