@@ -776,6 +776,8 @@ def replay_rebrand_into(
                 (replay.merged if report.merged else replay.resolved).append(path)
                 if report.guarded:
                     replay.guarded.append(path)
+                if report.rewritten:
+                    record_new_text(replay, rebrand, path, report.rewritten)
                 continue
             if report.resolved or report.merged:
                 (worktree / path).write_text(resolved, encoding="utf-8")
@@ -877,15 +879,35 @@ def replay_rebrand_into(
         if rewritten == current:
             continue
         (worktree / path).write_text(rewritten, encoding="utf-8")
-        replay.new_text[path] = [
-            line.strip()
-            for old, line in zip(current.split("\n"), rewritten.split("\n"), strict=True)
-            if old != line
-        ][:NEW_TEXT_SAMPLE]
-        if path.endswith(zuno_rebrand.CODE_SUFFIXES) or not rebrand.applies_to_added(path):
-            replay.review.append(path)
+        record_new_text(
+            replay,
+            rebrand,
+            path,
+            [
+                line
+                for old, line in zip(current.split("\n"), rewritten.split("\n"), strict=True)
+                if old != line
+            ],
+        )
+    replay.review.sort()
     replay.drift[:] = [path for path in replay.drift if path not in replay.new_text]
     return remaining
+
+
+def record_new_text(
+    replay: RebrandReplay, rebrand: zuno_rebrand.Rebrand, path: str, lines: list[str]
+) -> None:
+    """Record upstream lines of ``path`` the rules rebranded without a predicate.
+
+    Structural merges and the post-merge pass both land here. Outside the
+    ``[[added]]`` scopes, and in any source file, the path also goes to
+    ``review``, which holds back auto-merge."""
+    sample = replay.new_text.setdefault(path, [])
+    sample.extend(line.strip() for line in lines)
+    del sample[NEW_TEXT_SAMPLE:]
+    held = path.endswith(zuno_rebrand.CODE_SUFFIXES) or not rebrand.applies_to_added(path)
+    if held and path not in replay.review:
+        replay.review.append(path)
 
 
 # Files whose lines only upstream wrote are rebranded after the merge: source
@@ -1254,8 +1276,9 @@ def describe_rebrand(report: dict[str, object]) -> str:
             (
                 True,
                 "New upstream text rebranded, held for review",
-                "Lines only upstream wrote, rebranded by the rules (string literals in source "
-                "files). No predicate vouches for them, so this candidate is not merged "
+                "Lines only upstream wrote or changed, rebranded by the rules in a structural "
+                "merge or after the merge (only string literals in source files). No predicate "
+                "vouches for them, so this candidate is not merged "
                 "automatically: check each one is Zuno-facing text, and that the code or test "
                 "on the other end of the string agrees (a fixture that mirrors a server "
                 "response, or a message another crate still writes as Codex, must stay).",

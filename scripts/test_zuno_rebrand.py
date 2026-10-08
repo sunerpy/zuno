@@ -361,12 +361,15 @@ class StructuralMergeTest(unittest.TestCase):
         )
         self.assertEqual((report.resolved, report.merged, report.remaining), (0, 1, 0))
         self.assertEqual(report.reasons, ["merged adjacent edits"])
+        # Upstream's new wording was rebranded with no predicate behind it.
+        self.assertEqual(report.rewritten, ['const SUMMARY: &str = "Zuno rebuilt its local database";'])
 
     def test_rename_and_semantic_edit_merge_with_an_upstream_edit_nearby(self) -> None:
         text = hunk("Run codex now, please\nlimit = 1\n", "Run codex now\nlimit = 1\n", "Run zuno now\nlimit = 2\n")
         resolved, report = self.resolve(text, "docs/x.md")
         self.assertEqual(resolved, "Run zuno now, please\nlimit = 2\n")
         self.assertEqual((report.merged, report.remaining), (1, 0))
+        self.assertEqual(report.rewritten, ["Run zuno now, please"])
 
     def test_insertions_on_both_sides_at_one_point_keep_both(self) -> None:
         text = "[workspace.dependencies]\n" + hunk(
@@ -384,6 +387,13 @@ class StructuralMergeTest(unittest.TestCase):
         )
         self.assertEqual((report.merged, report.remaining), (1, 0))
         self.assertEqual(report.reasons, ["united insertions"])
+        self.assertEqual(report.rewritten, [])
+
+    def test_upstream_insertion_that_matches_zuno_after_the_rebrand_is_not_rewritten_text(self) -> None:
+        # Zuno already wrote the rebranded line itself, so it vouches for it.
+        resolved, report = self.resolve(hunk("Codex same\n", "", "Zuno same\n"), "x.md")
+        self.assertEqual(resolved, "Zuno same\n")
+        self.assertEqual((report.merged, report.rewritten), (1, []))
 
     def test_identical_insertions_are_kept_once(self) -> None:
         resolved, report = self.resolve(hunk("same\nup\n", "", "same\n"), "x.md")
@@ -424,6 +434,8 @@ class StructuralMergeTest(unittest.TestCase):
         resolved, report = self.resolve(hunk("Codex v2\n", "Codex\n", "Zuno\n"), "x.md")
         self.assertEqual(resolved, "Zuno v2\n")
         self.assertEqual((report.resolved, report.merged), (1, 0))
+        # The predicate vouches for a rename-only hunk, so its new text is not held.
+        self.assertEqual(report.rewritten, [])
 
 
 class AuditTest(unittest.TestCase):

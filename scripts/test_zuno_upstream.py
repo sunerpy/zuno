@@ -984,6 +984,7 @@ class StructuralReplayTest(unittest.TestCase):
             repo.write("banner.md", "Codex says hi\nlimit = 1\nend\n")
             repo.write("deps.toml", "[deps]\na = 1\n")
             repo.write("gone.rs", "fn old() {}\n")
+            repo.write("lib.rs", 'const S: &str = "Codex rebuilt.";\n\nfn helper() {}\n')
             repo.commit("base")
             base, tree = repo.tag_baseline("rust-v0.1.0")
 
@@ -992,6 +993,8 @@ class StructuralReplayTest(unittest.TestCase):
             repo.write("banner.md", "Codex says hello\nlimit = 1\nend\n")
             repo.write("deps.toml", "[deps]\na = 1\nupstream = 2\n")
             (repo.root / "gone.rs").unlink()
+            # Upstream rewords the string Zuno renamed (the 0.161.0 lib.rs shape).
+            repo.write("lib.rs", 'const S: &str = "Codex rebuilt";\n\nfn helper() {}\n')
             repo.commit("upstream next")
             git(repo.root, "tag", "rust-v0.2.0")
 
@@ -1004,6 +1007,7 @@ class StructuralReplayTest(unittest.TestCase):
             repo.write("banner.md", "Zuno says hi\nlimit = 2\nend\n")
             repo.write("deps.toml", "[deps]\na = 1\nzuno = 3\n")
             repo.write("gone.rs", "fn old() { zuno(); }\n")
+            repo.write("lib.rs", 'const S: &str = "Zuno rebuilt.";\n')
             repo.commit("zuno delta")
 
             baseline = zuno_upstream.read_baseline(repo.root / "UPSTREAM_CODEX.toml")
@@ -1015,16 +1019,26 @@ class StructuralReplayTest(unittest.TestCase):
             # Only the source file Zuno changed and upstream deleted needs a person.
             self.assertEqual(details["conflicting_files"], ["gone.rs"])
             replay = details["rebrand"]
-            self.assertEqual(replay["merged"], ["banner.md", "deps.toml"])
+            self.assertEqual(replay["merged"], ["banner.md", "deps.toml", "lib.rs"])
             self.assertEqual(replay["kept"], ["notes.md"])
             self.assertEqual(replay["resolved"], [])
             self.assertEqual((worktree / "banner.md").read_text(), "Zuno says hello\nlimit = 2\nend\n")
             self.assertEqual((worktree / "deps.toml").read_text(), "[deps]\na = 1\nupstream = 2\nzuno = 3\n")
             self.assertEqual((worktree / "notes.md").read_text(), "# Zuno rules\n\nUpstream guidance.\n")
+            self.assertEqual((worktree / "lib.rs").read_text(), 'const S: &str = "Zuno rebuilt";\n')
+            # The structural merges rebranded upstream's new wording without a
+            # predicate, so they hold back auto-merge; the dependency union
+            # rewrote nothing and does not.
+            self.assertEqual(
+                replay["new_text"],
+                {"banner.md": ["Zuno says hello"], "lib.rs": ['const S: &str = "Zuno rebuilt";']},
+            )
+            self.assertEqual(replay["review"], ["banner.md", "lib.rs"])
             # The report renders the new sections for the PR body.
             rendered = zuno_upstream.describe_rebrand({"rebrand": replay})
-            self.assertIn("Merged structurally (review) (2)", rendered)
+            self.assertIn("Merged structurally (review) (3)", rendered)
             self.assertIn("Kept Zuno documents upstream deleted (1)", rendered)
+            self.assertIn("New upstream text rebranded, held for review (2)", rendered)
 
     def test_prepare_replays_a_conflicted_rename_only_file_as_a_whole(self) -> None:
         # The conflict is the last line; the version line merged cleanly with the
