@@ -47,7 +47,14 @@ impl WorkflowLedger {
             .await
             .map_err(|error| WorkflowLedgerError::InvalidValue(error.to_string()))?;
         let path = sqlite.home().join(WORKFLOW_LEDGER_DB_FILENAME);
-        let pool = sqlite.open_read_write_pool(&path).await?;
+        // `open_read_write_pool` reports failures as `anyhow::Error`; keep the
+        // typed database variant when SQLite itself refused the open.
+        let pool = sqlite.open_read_write_pool(&path).await.map_err(|error| {
+            match error.downcast::<sqlx::Error>() {
+                Ok(error) => WorkflowLedgerError::Database(error),
+                Err(error) => WorkflowLedgerError::InvalidValue(error.to_string()),
+            }
+        })?;
         match Self::from_pool(pool, path.clone()).await {
             Ok(ledger) => Ok(ledger),
             Err(error) => Err(error),

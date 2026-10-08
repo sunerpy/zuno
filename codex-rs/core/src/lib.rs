@@ -4,6 +4,9 @@
 // user-visible output must go through the appropriate abstraction (e.g.,
 // the TUI or the tracing stack).
 #![deny(clippy::print_stdout, clippy::print_stderr)]
+// Release builds of the Zuno entrypoint compute layouts of deeply nested async
+// handler futures (request_plugin_install) past the default limit of 128.
+#![recursion_limit = "256"]
 
 mod apply_patch;
 mod apps;
@@ -31,6 +34,8 @@ pub use codex_protocol::turn_input::TurnStartOptions;
 pub use responses_metadata::CodexResponsesMetadata;
 pub use turn_metadata::detached_memory_responses_metadata;
 mod codex_thread;
+mod turn_extension_data;
+pub use turn_extension_data::WithTurnExtensionData;
 mod compact_model_fallback;
 mod compact_remote_history;
 mod compact_remote_v2;
@@ -47,6 +52,7 @@ pub use codex_protocol::protocol::EnvironmentConfig;
 pub use codex_thread::BackgroundTerminalInfo;
 pub use codex_thread::CodexThread;
 pub use codex_thread::CodexThreadSettingsOverrides;
+pub use codex_thread::ConfigRefreshOutcome;
 pub use codex_thread::GuardianAuthorizationVersion;
 pub use codex_thread::GuardianRootMessage;
 pub use codex_thread::GuardianRootSnapshot;
@@ -144,6 +150,7 @@ pub use codex_prompts as review_prompts;
 mod thread_manager;
 pub(crate) mod web_search;
 pub(crate) mod windows_sandbox_read_grants;
+pub use thread_manager::AgentTreeShutdown;
 pub use thread_manager::ForkSnapshot;
 pub use thread_manager::InternalSessionParent;
 pub use thread_manager::NewThread;
