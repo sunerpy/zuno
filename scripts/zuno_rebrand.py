@@ -484,6 +484,9 @@ class ResolutionReport:
     # Resolved hunks in which a new upstream code line kept an identifier the
     # rules would otherwise have renamed (see ``rebrand_new_text``).
     guarded: int = 0
+    # Upstream lines a structural merge rebranded and kept: unlike a rename-only
+    # hunk, no predicate vouches for them (Zuno did not write them either).
+    rewritten: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
 
 
@@ -578,12 +581,13 @@ def resolve_conflicts(
             report.remaining += 1
             output.append(_render_hunk(segment))
             continue
-        replacement, guarded, structural = resolution
+        replacement, guarded, structural, rewritten = resolution
         if structural is None:
             report.resolved += 1
         else:
             report.merged += 1
             report.reasons.append(structural)
+            report.rewritten.extend(rewritten)
         if guarded:
             report.guarded += 1
         if replacement:
@@ -599,30 +603,34 @@ def _resolve_hunk(
     path: str,
     source_version: str | None,
     target_version: str | None,
-) -> tuple[list[str], bool, str | None] | None:
-    """Return the resolved lines of ``hunk``, whether the code guard fired, and
-    the structural rule that resolved it (``None`` for a rename-only hunk), or
-    ``None`` when it needs a human."""
+) -> tuple[list[str], bool, str | None, list[str]] | None:
+    """Return the resolved lines of ``hunk``, whether the code guard fired, the
+    structural rule that resolved it (``None`` for a rename-only hunk) and the
+    upstream lines that rule rebranded, or ``None`` when it needs a human."""
     if hunk.base is None:
         return None
     if path == WORKSPACE_MANIFEST and _is_version_hunk(hunk):
-        return list(hunk.ours), False, None
+        return list(hunk.ours), False, None, []
     if rebrand.apply(hunk.text("base"), version=source_version, path=path) == hunk.text("theirs"):
         if not hunk.ours:
-            return [], False, None
+            return [], False, None, []
         resolved, guarded = rebrand_new_text(
             rebrand, hunk.text("base"), hunk.text("ours"), version=target_version, path=path
         )
-        return resolved.split("\n"), guarded, None
+        return resolved.split("\n"), guarded, None, []
     if path.endswith(SNAPSHOT_SUFFIX) and _is_snapshot_metadata_hunk(hunk):
         # insta never compares `assertion_line`; upstream's value is the current one.
-        return list(hunk.ours), False, "snapshot metadata"
-    base, upstream, guarded = _normalised_sides(hunk, rebrand, path, source_version, target_version)
+        return list(hunk.ours), False, "snapshot metadata", []
+    base, upstream, guarded, rewritten = _normalised_sides(
+        hunk, rebrand, path, source_version, target_version
+    )
     merged = merge_lines(base, upstream, list(hunk.theirs))
     if merged is None:
         return None
     lines, kind = merged
-    return lines, guarded, kind
+    # A rewrite Zuno wrote itself on its side of the hunk is vouched for.
+    kept = [line for line in rewritten if line in lines and line not in hunk.theirs]
+    return lines, guarded, kind, kept
 
 
 SNAPSHOT_SUFFIX = ".snap"
@@ -643,7 +651,7 @@ def _normalised_sides(
     path: str,
     source_version: str | None,
     target_version: str | None,
-) -> tuple[list[str], list[str], bool]:
+) -> tuple[list[str], list[str], bool, list[str]]:
     """The base and upstream sides of ``hunk`` with the Zuno renames applied.
 
     A base line is replaced by its rebrand only where Zuno carries exactly that
@@ -651,7 +659,8 @@ def _normalised_sides(
     mistaken for a Zuno edit. Upstream lines equal to a base line take that
     line's normalised form; lines upstream changed or added are rebranded the
     way ``rebrand_new_text`` treats new lines (text positions only in source
-    files). Returns whether that code guard fired."""
+    files). Also returns whether that code guard fired and the upstream lines
+    the rules changed."""
     base = list(hunk.base or [])
     zuno = list(hunk.theirs)
     upstream = list(hunk.ours)
@@ -674,6 +683,7 @@ def _normalised_sides(
                     cursor = offset + 1
                     break
     result: list[str] = []
+    rewritten: list[str] = []
     guarded = False
     matcher = difflib.SequenceMatcher(a=base, b=upstream, autojunk=False)
     for tag, base_start, base_end, upstream_start, upstream_end in matcher.get_opcodes():
@@ -689,8 +699,10 @@ def _normalised_sides(
             safe = rebrand.apply(text, version=target_version, path=path, text_only=True)
             guarded = guarded or safe != full
             full = safe
-        result.extend(full.split("\n"))
-    return normalised, result, guarded
+        lines = full.split("\n")
+        rewritten += [new for old, new in zip(added, lines, strict=True) if old != new]
+        result.extend(lines)
+    return normalised, result, guarded, rewritten
 
 
 # Lines that carry no content of their own: two insertions that share only

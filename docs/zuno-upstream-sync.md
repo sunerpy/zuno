@@ -156,9 +156,13 @@ Concretely, per conflicted path:
   first, then Zuno), or the hunk is only the `assertion_line:` header of an
   insta snapshot (upstream's value; insta never compares it). Edits to the same
   line, an insertion inside a block the other side changed, and overlapping
-  insertions keep their markers. A file is *resolved* when every hunk was
-  rename-only, *merged* when at least one needed a structural merge (listed for
-  review in the PR body), otherwise *partial*.
+  insertions keep their markers. A structural merge rebrands upstream's
+  changed and added lines in the hunk the way new text is rebranded (text
+  positions only in `.rs`); no predicate vouches for those rewrites, so every
+  one Zuno did not write itself is reported in `new_text` and, outside the
+  `[[added]]` scopes, in `review`, which holds back auto-merge. A file is
+  *resolved* when every hunk was rename-only, *merged* when at least one needed
+  a structural merge (listed in the PR body), otherwise *partial*.
 - **Modify/delete** (upstream deleted a file Zuno only renamed): the file is
   deleted with upstream. A `.md` document Zuno changed beyond the rename (its
   own section) is *kept* as a Zuno-owned file; a source file still needs a
@@ -200,8 +204,10 @@ file outside the Zuno
 delta is never rewritten; paths whose new upstream text the rules would change
 are listed as `drift` in the JSON report for review.
 
-Outside those two passes the rules never run without the predicate, so an
-incomplete rule set costs coverage, not correctness. Measure coverage with
+Outside these passes and the structural merges above the rules never run
+without the predicate, and a rewrite no predicate vouches for is either inside
+an `[[added]]` scope or listed in `review`, so an incomplete rule set costs
+coverage, not correctness. Measure coverage with
 
 ```sh
 python3 scripts/zuno_rebrand.py audit --baseline rust-vX.Y.Z --source main \
