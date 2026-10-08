@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
+import difflib
 import json
 from pathlib import Path
 import re
@@ -155,10 +156,49 @@ class Rebrand:
             return text
         guard = text_only and path is not None and path.endswith(CODE_SUFFIXES)
         parts = text.split("\n")
-        return "\n".join(
-            self._apply_line(line, rules, version, rust_text_spans(line) if guard else None)
-            for line in parts
-        )
+        if not guard:
+            return "\n".join(self._apply_line(line, rules, version) for line in parts)
+        # String literals and block comments can span lines, so the lexer state
+        # carries from one line to the next.
+        state = RustLexState()
+        rewritten: list[str] = []
+        for line in parts:
+            spans, state = rust_text_spans_from(line, state)
+            rewritten.append(self._apply_line(line, rules, version, spans))
+        return "\n".join(rewritten)
+
+    def apply_to_lines(
+        self,
+        text: str,
+        selected: set[int],
+        *,
+        version: str | None,
+        path: str,
+    ) -> str:
+        """Rewrite only the lines of ``text`` whose indices are in ``selected``.
+
+        In a source file (``CODE_SUFFIXES``) those lines are rewritten inside
+        string literals only (not code, not comments), with the lexer state
+        carried across every line, so a selected line inside a multi-line
+        literal counts as text."""
+        rules = [
+            rule
+            for rule in self.rules
+            if rule.applies_to(path) and (version is not None or not rule.needs_version)
+        ]
+        if not rules or not selected:
+            return text
+        code = path.endswith(CODE_SUFFIXES)
+        state = RustLexState()
+        rewritten: list[str] = []
+        for index, line in enumerate(text.split("\n")):
+            spans: list[tuple[int, int]] | None = None
+            if code:
+                spans, state = rust_text_spans_from(line, state)
+                # A trailing `//` comment is a text span too; leave it alone.
+                spans = [(start, end) for start, end in spans if not line.startswith("//", start)]
+            rewritten.append(self._apply_line(line, rules, version, spans) if index in selected else line)
+        return "\n".join(rewritten)
 
     def _apply_line(
         self,
@@ -228,30 +268,63 @@ CODE_SUFFIXES = (".rs",)
 RAW_STRING_START = re.compile(r'(?:b|c)?r(#*)"')
 
 
+@dataclass(frozen=True)
+class RustLexState:
+    """Lexer state carried across lines: the terminator of the string literal
+    the line starts inside (``"`` or ``"#…`` for raw literals), and how deep
+    inside nested block comments it starts."""
+
+    string_terminator: str | None = None
+    raw_string: bool = False
+    block_comment_depth: int = 0
+
+
 def rust_text_spans(line: str) -> list[tuple[int, int]]:
-    """Spans of a Rust source line that are text: string literal contents and a
-    trailing ``//`` comment. Everything else is code and is never rebranded when
-    the rules run in ``text_only`` mode. Ordinary literals honour backslash
-    escapes; raw literals (``r"..."``, ``r#"..."#``, ``br"..."``) do not and end
-    at a quote followed by the same number of ``#``. A string left open at the
-    end of the line (a multi-line literal) counts as text to the end of the line;
-    a line that continues such a literal has no quote and counts as code, which
-    only loses a rename, never adds one."""
+    """Spans of a single Rust source line that are text, lexed from a fresh state.
+
+    See ``rust_text_spans_from`` for the rules; this form treats the line as if
+    it started outside any string or comment."""
+    return rust_text_spans_from(line, RustLexState())[0]
+
+
+def rust_text_spans_from(line: str, state: RustLexState) -> tuple[list[tuple[int, int]], RustLexState]:
+    """Spans of a Rust source line that are text, and the state the next line
+    starts in.
+
+    Text is string literal contents and a trailing ``//`` comment. Everything
+    else is code and is never rebranded when the rules run in ``text_only`` mode;
+    block comments count as code too, but their quotes open no string. Ordinary
+    literals honour backslash escapes; raw literals (``r"..."``, ``r#"..."#``,
+    ``br"..."``) do not and end at a quote followed by the same number of ``#``.
+    A literal left open at the end of the line continues on the next one, so
+    the lines of a multi-line literal (an inline insta snapshot ``@"…"``) are
+    text as well."""
     spans: list[tuple[int, int]] = []
     length = len(line)
     index = 0
-    in_string = False
-    raw_terminator: str | None = None
+    terminator = state.string_terminator
+    raw = state.raw_string
+    depth = state.block_comment_depth
     start = 0
     while index < length:
+        if depth:
+            if line.startswith("*/", index):
+                depth -= 1
+                index += 2
+            elif line.startswith("/*", index):
+                depth += 1
+                index += 2
+            else:
+                index += 1
+            continue
         char = line[index]
-        if in_string:
-            if raw_terminator is not None:
-                if line.startswith(raw_terminator, index):
+        if terminator is not None:
+            if raw:
+                if line.startswith(terminator, index):
                     spans.append((start, index))
-                    in_string = False
-                    raw_terminator = None
-                    index += len(raw_terminator or '"')
+                    index += len(terminator)
+                    terminator = None
+                    raw = False
                     continue
                 index += 1
                 continue
@@ -260,18 +333,19 @@ def rust_text_spans(line: str) -> list[tuple[int, int]]:
                 continue
             if char == '"':
                 spans.append((start, index))
-                in_string = False
+                terminator = None
             index += 1
             continue
-        raw = RAW_STRING_START.match(line, index)
-        if raw is not None and (index == 0 or not (line[index - 1].isalnum() or line[index - 1] == "_")):
-            in_string = True
-            raw_terminator = '"' + raw.group(1)
-            start = raw.end()
-            index = raw.end()
+        raw_start = RAW_STRING_START.match(line, index)
+        if raw_start is not None and (index == 0 or not (line[index - 1].isalnum() or line[index - 1] == "_")):
+            terminator = '"' + raw_start.group(1)
+            raw = True
+            start = raw_start.end()
+            index = raw_start.end()
             continue
         if char == '"':
-            in_string = True
+            terminator = '"'
+            raw = False
             start = index + 1
             index += 1
             continue
@@ -286,11 +360,15 @@ def rust_text_spans(line: str) -> list[tuple[int, int]]:
                 continue
         if char == "/" and line.startswith("//", index):
             spans.append((index, length))
-            return spans
+            return spans, RustLexState()
+        if char == "/" and line.startswith("/*", index):
+            depth = 1
+            index += 2
+            continue
         index += 1
-    if in_string:
+    if terminator is not None:
         spans.append((start, length))
-    return spans
+    return spans, RustLexState(string_terminator=terminator, raw_string=raw, block_comment_depth=depth)
 
 
 def rebrand_new_text(
@@ -327,6 +405,36 @@ def rebrand_new_text(
         result.append(safe)
         fired = True
     return "\n".join(result), fired
+
+
+def upstream_new_lines(current: str, base: str | None, upstream: str, zuno: str | None) -> set[int]:
+    """Indices of the lines of ``current`` that only the upstream release wrote.
+
+    A line is new where upstream inserted or rewrote it relative to the Codex
+    baseline (by position, so a new copy of a line the baseline already had
+    counts), and it survives into ``current`` unchanged. Lines the Zuno source
+    also has are left out: Zuno already decided on them. These are the lines no
+    rule has been applied to yet, wherever the merge put them (a cleanly merged
+    region of a conflicted file included)."""
+    base_lines = base.split("\n") if base is not None else []
+    upstream_lines = upstream.split("\n")
+    current_lines = current.split("\n")
+    zuno_lines = set(zuno.split("\n")) if zuno is not None else set()
+    written: set[int] = set()
+    matcher = difflib.SequenceMatcher(a=base_lines, b=upstream_lines, autojunk=False)
+    for tag, _, _, upstream_start, upstream_end in matcher.get_opcodes():
+        if tag in ("insert", "replace"):
+            written.update(range(upstream_start, upstream_end))
+    selected: set[int] = set()
+    matcher = difflib.SequenceMatcher(a=upstream_lines, b=current_lines, autojunk=False)
+    for tag, upstream_start, upstream_end, current_start, _ in matcher.get_opcodes():
+        if tag != "equal":
+            continue
+        for offset in range(upstream_end - upstream_start):
+            index = current_start + offset
+            if upstream_start + offset in written and current_lines[index] not in zuno_lines:
+                selected.add(index)
+    return selected
 
 
 def display_width(text: str) -> int:
@@ -366,7 +474,12 @@ class ConflictHunk:
 
 @dataclass
 class ResolutionReport:
+    # Hunks proven rename-only (or the workspace version line).
     resolved: int = 0
+    # Hunks that were not rename-only but had one mechanical answer: edits that
+    # only touch different lines once the rebrand is normalised, insertions on
+    # both sides at one point, or snapshot metadata (see ``merge_lines``).
+    merged: int = 0
     remaining: int = 0
     # Resolved hunks in which a new upstream code line kept an identifier the
     # rules would otherwise have renamed (see ``rebrand_new_text``).
@@ -442,13 +555,17 @@ def resolve_conflicts(
     source_version: str | None,
     target_version: str | None,
 ) -> tuple[str, ResolutionReport]:
-    """Resolve every hunk whose Zuno side is the rebrand of its base.
+    """Resolve every hunk whose Zuno side is the rebrand of its base, and every
+    hunk that has one mechanical answer.
 
     ``ours`` is the upstream release, ``theirs`` the Zuno source (the argument
     order ``git merge-tree`` was given). A hunk is resolved to the rebrand of the
     upstream side when ``rebrand(base, source_version) == theirs``. In
     ``codex-rs/Cargo.toml`` a hunk made only of the workspace ``version`` line
     resolves to the upstream side, because Zuno versions track Codex versions.
+    Any other hunk is merged line by line once the Zuno renames are normalised
+    (``merge_lines``); it stays a conflict when the two sides edit the same
+    lines.
     """
     report = ResolutionReport()
     output: list[str] = []
@@ -461,8 +578,12 @@ def resolve_conflicts(
             report.remaining += 1
             output.append(_render_hunk(segment))
             continue
-        replacement, guarded = resolution
-        report.resolved += 1
+        replacement, guarded, structural = resolution
+        if structural is None:
+            report.resolved += 1
+        else:
+            report.merged += 1
+            report.reasons.append(structural)
         if guarded:
             report.guarded += 1
         if replacement:
@@ -478,21 +599,182 @@ def _resolve_hunk(
     path: str,
     source_version: str | None,
     target_version: str | None,
-) -> tuple[list[str], bool] | None:
-    """Return the resolved lines of ``hunk`` (and whether the code guard fired)
-    or ``None`` when it needs a human."""
+) -> tuple[list[str], bool, str | None] | None:
+    """Return the resolved lines of ``hunk``, whether the code guard fired, and
+    the structural rule that resolved it (``None`` for a rename-only hunk), or
+    ``None`` when it needs a human."""
     if hunk.base is None:
         return None
     if path == WORKSPACE_MANIFEST and _is_version_hunk(hunk):
-        return list(hunk.ours), False
-    if rebrand.apply(hunk.text("base"), version=source_version, path=path) != hunk.text("theirs"):
+        return list(hunk.ours), False, None
+    if rebrand.apply(hunk.text("base"), version=source_version, path=path) == hunk.text("theirs"):
+        if not hunk.ours:
+            return [], False, None
+        resolved, guarded = rebrand_new_text(
+            rebrand, hunk.text("base"), hunk.text("ours"), version=target_version, path=path
+        )
+        return resolved.split("\n"), guarded, None
+    if path.endswith(SNAPSHOT_SUFFIX) and _is_snapshot_metadata_hunk(hunk):
+        # insta never compares `assertion_line`; upstream's value is the current one.
+        return list(hunk.ours), False, "snapshot metadata"
+    base, upstream, guarded = _normalised_sides(hunk, rebrand, path, source_version, target_version)
+    merged = merge_lines(base, upstream, list(hunk.theirs))
+    if merged is None:
         return None
-    if not hunk.ours:
-        return [], False
-    resolved, guarded = rebrand_new_text(
-        rebrand, hunk.text("base"), hunk.text("ours"), version=target_version, path=path
+    lines, kind = merged
+    return lines, guarded, kind
+
+
+SNAPSHOT_SUFFIX = ".snap"
+SNAPSHOT_ASSERTION_LINE = re.compile(r"^assertion_line: [0-9]+$")
+
+
+def _is_snapshot_metadata_hunk(hunk: ConflictHunk) -> bool:
+    return all(
+        SNAPSHOT_ASSERTION_LINE.match(line) is not None
+        for side in (hunk.ours, hunk.base or [], hunk.theirs)
+        for line in side
     )
-    return resolved.split("\n"), guarded
+
+
+def _normalised_sides(
+    hunk: ConflictHunk,
+    rebrand: Rebrand,
+    path: str,
+    source_version: str | None,
+    target_version: str | None,
+) -> tuple[list[str], list[str], bool]:
+    """The base and upstream sides of ``hunk`` with the Zuno renames applied.
+
+    A base line is replaced by its rebrand only where Zuno carries exactly that
+    rebrand, so a line Zuno deliberately kept (a ``Codex`` identifier) is not
+    mistaken for a Zuno edit. Upstream lines equal to a base line take that
+    line's normalised form; lines upstream changed or added are rebranded the
+    way ``rebrand_new_text`` treats new lines (text positions only in source
+    files). Returns whether that code guard fired."""
+    base = list(hunk.base or [])
+    zuno = list(hunk.theirs)
+    upstream = list(hunk.ours)
+    normalised = list(base)
+    matcher = difflib.SequenceMatcher(a=base, b=zuno, autojunk=False)
+    for tag, base_start, base_end, zuno_start, zuno_end in matcher.get_opcodes():
+        if tag != "replace":
+            continue
+        candidates = zuno[zuno_start:zuno_end]
+        cursor = 0
+        for index in range(base_start, base_end):
+            rebranded = rebrand.apply(base[index], version=source_version, path=path)
+            if rebranded == base[index]:
+                continue
+            # Zuno lines are matched in order, so a rename is never paired
+            # with a Zuno line that comes before an earlier pairing.
+            for offset in range(cursor, len(candidates)):
+                if candidates[offset] == rebranded:
+                    normalised[index] = rebranded
+                    cursor = offset + 1
+                    break
+    result: list[str] = []
+    guarded = False
+    matcher = difflib.SequenceMatcher(a=base, b=upstream, autojunk=False)
+    for tag, base_start, base_end, upstream_start, upstream_end in matcher.get_opcodes():
+        if tag == "equal":
+            result.extend(normalised[base_start:base_end])
+            continue
+        added = upstream[upstream_start:upstream_end]
+        if not added:
+            continue
+        text = "\n".join(added)
+        full = rebrand.apply(text, version=target_version, path=path)
+        if path.endswith(CODE_SUFFIXES):
+            safe = rebrand.apply(text, version=target_version, path=path, text_only=True)
+            guarded = guarded or safe != full
+            full = safe
+        result.extend(full.split("\n"))
+    return normalised, result, guarded
+
+
+# Lines that carry no content of their own: two insertions that share only
+# these still count as disjoint.
+STRUCTURAL_LINE = re.compile(r"^[\s{}()\[\],;]*$")
+
+
+def merge_lines(
+    base: list[str], upstream: list[str], zuno: list[str]
+) -> tuple[list[str], str] | None:
+    """Three-way merge of one conflict hunk at line granularity.
+
+    Unlike git, edits on adjacent lines merge: after the Zuno renames are
+    normalised, the conflict hunks git reports are mostly a Zuno edit next to an
+    upstream edit. Two insertions at the same point are kept in upstream-then-Zuno
+    order when they share no content line (``STRUCTURAL_LINE`` lines aside), or
+    once when identical. Returns ``None`` when the sides change the same line,
+    when one side inserts inside a block the other side changed, or when two
+    insertions at one point overlap without being identical."""
+    upstream_changes = _line_changes(base, upstream)
+    zuno_changes = _line_changes(base, zuno)
+    if not upstream_changes or not zuno_changes:
+        # git only reports a conflict when both sides changed something here;
+        # a side that normalises back to the base is a rename this rule did not see.
+        return None
+    kind = "merged adjacent edits"
+    accepted: list[tuple[int, int, list[str], int]] = [
+        (start, end, lines, 0) for start, end, lines in upstream_changes
+    ]
+    for change in zuno_changes:
+        keep = True
+        for other in upstream_changes:
+            relation = _change_relation(change, other)
+            if relation == "conflict":
+                return None
+            if relation in ("duplicate", "united"):
+                if change[0] == change[1]:
+                    kind = "united insertions"
+                keep = keep and relation != "duplicate"
+        if keep:
+            start, end, lines = change
+            accepted.append((start, end, lines, 1))
+    merged: list[str] = []
+    position = 0
+    # Insertions come before a block that starts at the same line; at one point
+    # upstream's insertion precedes Zuno's.
+    for start, end, lines, side in sorted(accepted, key=lambda change: (change[0], change[1] > change[0], change[3])):
+        merged.extend(base[position:start])
+        merged.extend(lines)
+        position = max(position, end)
+    merged.extend(base[position:])
+    return merged, kind
+
+
+def _change_relation(
+    change: tuple[int, int, list[str]], other: tuple[int, int, list[str]]
+) -> str:
+    """How a Zuno change relates to an upstream change of the same base:
+    ``duplicate`` (the same edit), ``united`` (insertions at one point that share
+    no content line), ``conflict``, or ``independent``."""
+    start, end, lines = change
+    other_start, other_end, other_lines = other
+    if (start, end, lines) == (other_start, other_end, other_lines):
+        return "duplicate"
+    inserts, other_inserts = start == end, other_start == other_end
+    if not inserts and not other_inserts:
+        return "conflict" if start < other_end and other_start < end else "independent"
+    if inserts and other_inserts:
+        if start != other_start:
+            return "independent"
+        content = {line for line in lines if not STRUCTURAL_LINE.match(line)}
+        other_content = {line for line in other_lines if not STRUCTURAL_LINE.match(line)}
+        return "conflict" if content & other_content else "united"
+    point, block_start, block_end = (start, other_start, other_end) if inserts else (other_start, start, end)
+    return "conflict" if block_start < point < block_end else "independent"
+
+
+def _line_changes(old: list[str], new: list[str]) -> list[tuple[int, int, list[str]]]:
+    matcher = difflib.SequenceMatcher(a=old, b=new, autojunk=False)
+    return [
+        (old_start, old_end, new[new_start:new_end])
+        for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes()
+        if tag != "equal"
+    ]
 
 
 def _is_version_hunk(hunk: ConflictHunk) -> bool:

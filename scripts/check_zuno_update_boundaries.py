@@ -389,6 +389,8 @@ def main() -> int:
         )
     for needle in [
         '"${reused}" != 0',
+        # Rebranded new upstream text that no predicate proves waits for a person.
+        '"${review}" != 0',
         '"${gate_required}" != true',
         'elif [[ "${automatic_merge}" == true && "${USING_DEFAULT_TOKEN}" == true ]]',
         'gh pr merge "${pr_url}" --disable-auto',

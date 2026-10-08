@@ -140,11 +140,39 @@ class RebrandReplay:
     # identifier the rules would have renamed: only string literals and comments
     # of new code lines are rebranded, never the code itself.
     guarded: list[str] = field(default_factory=list)
+    # Conflicted paths whose every hunk resolved, at least one of them by a
+    # structural merge rather than a rename proof (``zuno_rebrand.merge_lines``:
+    # adjacent edits, insertions on both sides, snapshot metadata). Listed for
+    # review in the PR body.
+    merged: list[str] = field(default_factory=list)
+    # Zuno-changed documents (`.md`) that upstream deleted; the Zuno copy is
+    # kept as a Zuno-owned file.
+    kept: list[str] = field(default_factory=list)
+    # Lines only upstream wrote, rebranded where the merge left them: in
+    # conflicted files the replay finished, in Zuno-changed files that merged
+    # cleanly, and in user-visible drift files (`.rs` string literals, `.snap`
+    # rendered text). Maps each path to the rewritten lines.
+    new_text: dict[str, list[str]] = field(default_factory=dict)
+    # The `new_text` paths no predicate or `[[added]]` scope vouches for: source
+    # strings, and snapshots outside the rendered-text scopes. A person checks
+    # them, so they hold back auto-merge.
+    review: list[str] = field(default_factory=list)
 
 
 def empty_replay() -> RebrandReplay:
     return RebrandReplay(
-        resolved=[], deleted=[], refreshed=[], reused=[], partial=[], added=[], drift=[], guarded=[]
+        resolved=[],
+        deleted=[],
+        refreshed=[],
+        reused=[],
+        partial=[],
+        added=[],
+        drift=[],
+        guarded=[],
+        merged=[],
+        kept=[],
+        new_text={},
+        review=[],
     )
 
 
@@ -719,6 +747,23 @@ def replay_rebrand_into(
         zuno = blob(repo, plan.source_commit, path)
         upstream = blob(repo, plan.target_commit, path)
         if current is not None and zuno_rebrand.has_conflict_markers(current):
+            # A file Zuno only renamed is replayed as a whole, exactly like a
+            # rename-only file that merged cleanly: its clean regions need the
+            # rebrand too (a `${version}` line no conflict hunk covered, say).
+            if (
+                base is not None
+                and zuno is not None
+                and upstream is not None
+                and rebrand.apply(base, version=source_version, path=path) == zuno
+            ):
+                expected, guarded = zuno_rebrand.rebrand_new_text(
+                    rebrand, base, upstream, version=target_version, path=path
+                )
+                (worktree / path).write_text(expected, encoding="utf-8")
+                replay.resolved.append(path)
+                if guarded:
+                    replay.guarded.append(path)
+                continue
             resolved, report = zuno_rebrand.resolve_conflicts(
                 current,
                 rebrand,
@@ -728,11 +773,11 @@ def replay_rebrand_into(
             )
             if report.remaining == 0:
                 (worktree / path).write_text(resolved, encoding="utf-8")
-                replay.resolved.append(path)
+                (replay.merged if report.merged else replay.resolved).append(path)
                 if report.guarded:
                     replay.guarded.append(path)
                 continue
-            if report.resolved:
+            if report.resolved or report.merged:
                 (worktree / path).write_text(resolved, encoding="utf-8")
                 replay.partial.append(path)
             remaining.append(path)
@@ -749,9 +794,23 @@ def replay_rebrand_into(
             (worktree / path).unlink()
             replay.deleted.append(path)
             continue
+        # A document Zuno changed beyond the rename (its own section, say) and
+        # upstream deleted stays as a Zuno-owned file; source files still need
+        # a person, because upstream may have moved what they define.
+        if (
+            path.endswith(".md")
+            and base is not None
+            and zuno is not None
+            and upstream is None
+            and current == zuno
+        ):
+            replay.kept.append(path)
+            continue
         remaining.append(path)
     conflicted = set(conflicts)
     zuno_delta = sorted(changed_files(repo, plan.baseline_commit, plan.source_commit))
+    # Zuno-changed paths that merged cleanly but are more than a rename.
+    mixed: list[str] = []
     for path in zuno_delta:
         if path in conflicted or is_generated_path(path):
             continue
@@ -763,6 +822,7 @@ def replay_rebrand_into(
         if base is None or zuno is None:
             continue
         if rebrand.apply(base, version=source_version, path=path) != zuno:
+            mixed.append(path)
             continue
         upstream = blob(repo, plan.target_commit, path)
         expected, guarded = zuno_rebrand.rebrand_new_text(
@@ -798,7 +858,40 @@ def replay_rebrand_into(
                 replay.added.append(path)
             continue
         replay.drift.append(path)
+    finished = set(replay.resolved) | set(replay.merged)
+    visible_drift = {path for path in replay.drift if path.startswith(DRIFT_SURFACES)}
+    for path in sorted(finished | set(mixed) | visible_drift):
+        if not path.endswith(NEW_TEXT_SUFFIXES):
+            continue
+        current = read_worktree_text(worktree, path)
+        upstream = blob(repo, plan.target_commit, path)
+        if current is None or upstream is None:
+            continue
+        selected = zuno_rebrand.upstream_new_lines(
+            current,
+            blob(repo, plan.baseline_commit, path),
+            upstream,
+            blob(repo, plan.source_commit, path),
+        )
+        rewritten = rebrand.apply_to_lines(current, selected, version=target_version, path=path)
+        if rewritten == current:
+            continue
+        (worktree / path).write_text(rewritten, encoding="utf-8")
+        replay.new_text[path] = [
+            line.strip()
+            for old, line in zip(current.split("\n"), rewritten.split("\n"), strict=True)
+            if old != line
+        ][:NEW_TEXT_SAMPLE]
+        if path.endswith(zuno_rebrand.CODE_SUFFIXES) or not rebrand.applies_to_added(path):
+            replay.review.append(path)
+    replay.drift[:] = [path for path in replay.drift if path not in replay.new_text]
     return remaining
+
+
+# Files whose lines only upstream wrote are rebranded after the merge: source
+# text positions and rendered snapshots.
+NEW_TEXT_SUFFIXES = (".rs", ".snap")
+NEW_TEXT_SAMPLE = 8
 
 
 def blob_object_id(content: bytes) -> str:
@@ -1110,20 +1203,23 @@ def describe_rebrand(report: dict[str, object]) -> str:
         return "## Rebrand replay\n\nNot run (no `FORK_REBRAND.toml` in the source)."
     counts = {
         key: len(replay.get(key, []))
-        for key in ("resolved", "deleted", "refreshed", "reused", "partial", "added")
+        for key in ("resolved", "merged", "kept", "deleted", "refreshed", "reused", "partial", "added")
     }
     lines = [
         "## Rebrand replay",
         "",
         f"`{zuno_rebrand.MANIFEST_NAME}` resolved {counts['resolved']} rename-only conflicted "
-        f"paths, removed {counts['deleted']} paths that upstream deleted, refreshed "
-        f"{counts['refreshed']} rebranded paths with new upstream text, rebranded "
-        f"{counts['added']} new upstream snapshots, and reused {counts['reused']} edits from "
-        f"the previous candidate. {counts['partial']} paths still carry markers for hunks it "
-        "could not prove rename-only.",
+        f"paths, merged {counts['merged']} more structurally, kept {counts['kept']} Zuno "
+        f"documents that upstream deleted, removed {counts['deleted']} paths that upstream "
+        f"deleted, refreshed {counts['refreshed']} rebranded paths with new upstream text, "
+        f"rebranded {counts['added']} new upstream snapshots, and reused {counts['reused']} "
+        f"edits from the previous candidate. {counts['partial']} paths still carry markers "
+        "for hunks it could not resolve.",
     ]
     titles = {
         "resolved": "Resolved conflicts",
+        "merged": "Merged structurally (review)",
+        "kept": "Kept Zuno documents upstream deleted",
         "deleted": "Deleted with upstream",
         "refreshed": "Refreshed rebranded files",
         "added": "New upstream snapshots rebranded",
@@ -1151,6 +1247,33 @@ def describe_rebrand(report: dict[str, object]) -> str:
         ]
         lines += [f"- `{path}`" for path in guarded]
         lines += ["", "</details>"]
+    new_text = replay.get("new_text", {})
+    review = set(replay.get("review", []))
+    if isinstance(new_text, dict) and new_text:
+        for held, title, note in (
+            (
+                True,
+                "New upstream text rebranded, held for review",
+                "Lines only upstream wrote, rebranded by the rules (string literals in source "
+                "files). No predicate vouches for them, so this candidate is not merged "
+                "automatically: check each one is Zuno-facing text, and that the code or test "
+                "on the other end of the string agrees (a fixture that mirrors a server "
+                "response, or a message another crate still writes as Codex, must stay).",
+            ),
+            (
+                False,
+                "New upstream snapshot text rebranded",
+                "Rendered lines only upstream wrote, rebranded like new upstream snapshots.",
+            ),
+        ):
+            paths = sorted(path for path in new_text if (path in review) == held)
+            if not paths:
+                continue
+            lines += ["", "<details>", f"<summary>{title} ({len(paths)})</summary>", "", note, ""]
+            for path in paths:
+                lines.append(f"- `{path}`")
+                lines += [f"  - `{line}`" for line in new_text[path]]
+            lines += ["", "</details>"]
     drift = replay.get("drift", [])
     visible = [path for path in drift if path.startswith(DRIFT_SURFACES) and path.endswith(".rs")]
     if visible:

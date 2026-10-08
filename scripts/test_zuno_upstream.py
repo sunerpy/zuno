@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+from dataclasses import asdict
 import importlib.util
 import json
 from pathlib import Path
@@ -967,6 +968,162 @@ REBRAND_RULES = "\n".join(
 
 def workspace_manifest(version: str) -> str:
     return f'[workspace.package]\nversion = "{version}"\n'
+
+
+class StructuralReplayTest(unittest.TestCase):
+    """``prepare`` resolves mechanical conflicts that are not rename-only."""
+
+    def test_prepare_merges_structural_conflicts_and_keeps_zuno_documents(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo_path = root / "repo"
+            repo_path.mkdir()
+            repo = Repository(repo_path)
+            repo.write("codex-rs/Cargo.toml", workspace_manifest("0.1.0"))
+            repo.write("notes.md", "Upstream guidance.\n")
+            repo.write("banner.md", "Codex says hi\nlimit = 1\nend\n")
+            repo.write("deps.toml", "[deps]\na = 1\n")
+            repo.write("gone.rs", "fn old() {}\n")
+            repo.commit("base")
+            base, tree = repo.tag_baseline("rust-v0.1.0")
+
+            git(repo.root, "checkout", "-q", "-b", "release-next")
+            (repo.root / "notes.md").unlink()
+            repo.write("banner.md", "Codex says hello\nlimit = 1\nend\n")
+            repo.write("deps.toml", "[deps]\na = 1\nupstream = 2\n")
+            (repo.root / "gone.rs").unlink()
+            repo.commit("upstream next")
+            git(repo.root, "tag", "rust-v0.2.0")
+
+            git(repo.root, "checkout", "-q", "-b", "zuno", base)
+            repo.manifest("rust-v0.1.0", base, tree)
+            repo.write("FORK_REBRAND.toml", REBRAND_RULES)
+            # A Zuno-owned section on top of the upstream document.
+            repo.write("notes.md", "# Zuno rules\n\nUpstream guidance.\n")
+            # A rename next to a semantic edit; upstream edited the renamed line.
+            repo.write("banner.md", "Zuno says hi\nlimit = 2\nend\n")
+            repo.write("deps.toml", "[deps]\na = 1\nzuno = 3\n")
+            repo.write("gone.rs", "fn old() { zuno(); }\n")
+            repo.commit("zuno delta")
+
+            baseline = zuno_upstream.read_baseline(repo.root / "UPSTREAM_CODEX.toml")
+            plan = zuno_upstream.make_plan(repo.root, baseline, "zuno", "rust-v0.2.0")
+            worktree = root / "candidate"
+            with self.assertRaises(zuno_upstream.SyncError) as raised:
+                zuno_upstream.prepare(repo.root, "UPSTREAM_CODEX.toml", plan, "upstream-sync/0.2.0", worktree)
+            details = raised.exception.details
+            # Only the source file Zuno changed and upstream deleted needs a person.
+            self.assertEqual(details["conflicting_files"], ["gone.rs"])
+            replay = details["rebrand"]
+            self.assertEqual(replay["merged"], ["banner.md", "deps.toml"])
+            self.assertEqual(replay["kept"], ["notes.md"])
+            self.assertEqual(replay["resolved"], [])
+            self.assertEqual((worktree / "banner.md").read_text(), "Zuno says hello\nlimit = 2\nend\n")
+            self.assertEqual((worktree / "deps.toml").read_text(), "[deps]\na = 1\nupstream = 2\nzuno = 3\n")
+            self.assertEqual((worktree / "notes.md").read_text(), "# Zuno rules\n\nUpstream guidance.\n")
+            # The report renders the new sections for the PR body.
+            rendered = zuno_upstream.describe_rebrand({"rebrand": replay})
+            self.assertIn("Merged structurally (review) (2)", rendered)
+            self.assertIn("Kept Zuno documents upstream deleted (1)", rendered)
+
+    def test_prepare_replays_a_conflicted_rename_only_file_as_a_whole(self) -> None:
+        # The conflict is the last line; the version line merged cleanly with the
+        # old Zuno version and must still move to the new release.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo_path = root / "repo"
+            repo_path.mkdir()
+            repo = Repository(repo_path)
+            snapshot = "snapshots/frames.snap"
+            repo.write("codex-rs/Cargo.toml", workspace_manifest("0.1.0"))
+            repo.write(snapshot, "│ >_ Codex (v0.0.0) │\n\n\n\nCodex old\n")
+            repo.commit("base")
+            base, tree = repo.tag_baseline("rust-v0.1.0")
+
+            git(repo.root, "checkout", "-q", "-b", "release-next")
+            repo.write(snapshot, "│ >_ Codex (v0.0.0) │\n\n\n\nCodex new\n")
+            repo.commit("upstream next")
+            git(repo.root, "tag", "rust-v0.2.0")
+
+            git(repo.root, "checkout", "-q", "-b", "zuno", base)
+            repo.manifest("rust-v0.1.0", base, tree)
+            repo.write("FORK_REBRAND.toml", REBRAND_RULES)
+            repo.write("codex-rs/Cargo.toml", workspace_manifest("0.1.3"))
+            # Exactly the rebrand of the base: one character shorter, padded back.
+            repo.write(snapshot, "│ >_ Zuno (v0.1.3)  │\n\n\n\nZuno old\n")
+            repo.commit("zuno delta")
+
+            baseline = zuno_upstream.read_baseline(repo.root / "UPSTREAM_CODEX.toml")
+            plan = zuno_upstream.make_plan(repo.root, baseline, "zuno", "rust-v0.2.0")
+            worktree = root / "candidate"
+            candidate = zuno_upstream.prepare(
+                repo.root, "UPSTREAM_CODEX.toml", plan, "upstream-sync/0.2.0", worktree
+            )
+            self.assertIn(snapshot, candidate.rebrand.resolved)
+            self.assertEqual((worktree / snapshot).read_text(), "│ >_ Zuno (v0.2.0)  │\n\n\n\nZuno new\n")
+
+    def test_prepare_rebrands_lines_only_upstream_wrote(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo_path = root / "repo"
+            repo_path.mkdir()
+            repo = Repository(repo_path)
+            snapshot = "codex-rs/tui/src/snapshots/frames.snap"
+            warning = "codex-rs/tui/src/startup.rs"
+            repo.write("codex-rs/Cargo.toml", workspace_manifest("0.1.0"))
+            repo.write(snapshot, "---\nassertion_line: 154\n---\n>_ Codex\n\n\n\nfooter\n")
+            repo.write(warning, "fn start() {}\n")
+            repo.commit("base")
+            base, tree = repo.tag_baseline("rust-v0.1.0")
+
+            git(repo.root, "checkout", "-q", "-b", "release-next")
+            # Upstream moved the assertion and added a rendered line far from it.
+            repo.write(snapshot, "---\nassertion_line: 144\n---\n>_ Codex\n\n\n\nfooter\n› Ask Codex anything\n")
+            repo.write(
+                warning,
+                'fn start() {}\nconst WARNING: &str = "restart Codex now"; // Codex note\nstruct Codex;\n',
+            )
+            repo.commit("upstream next")
+            git(repo.root, "tag", "rust-v0.2.0")
+
+            git(repo.root, "checkout", "-q", "-b", "zuno", base)
+            repo.manifest("rust-v0.1.0", base, tree)
+            repo.write("FORK_REBRAND.toml", REBRAND_RULES)
+            # Zuno renamed the header and dropped the assertion line (a newer insta).
+            repo.write(snapshot, "---\n---\n>_ Zuno\n\n\n\nfooter\n")
+            repo.commit("zuno delta")
+
+            baseline = zuno_upstream.read_baseline(repo.root / "UPSTREAM_CODEX.toml")
+            plan = zuno_upstream.make_plan(repo.root, baseline, "zuno", "rust-v0.2.0")
+            worktree = root / "candidate"
+            candidate = zuno_upstream.prepare(
+                repo.root, "UPSTREAM_CODEX.toml", plan, "upstream-sync/0.2.0", worktree
+            )
+            replay = candidate.rebrand
+            self.assertEqual(replay.merged, [snapshot])
+            self.assertEqual(
+                (worktree / snapshot).read_text(),
+                "---\nassertion_line: 144\n---\n>_ Zuno\n\n\n\nfooter\n› Ask Zuno anything\n",
+            )
+            # Outside the Zuno delta, in a user-visible surface: the new string is
+            # rebranded; its comment and the new type are left as upstream wrote them.
+            self.assertEqual(
+                (worktree / warning).read_text(),
+                'fn start() {}\nconst WARNING: &str = "restart Zuno now"; // Codex note\nstruct Codex;\n',
+            )
+            self.assertEqual(
+                replay.new_text,
+                {
+                    snapshot: ["› Ask Zuno anything"],
+                    warning: ['const WARNING: &str = "restart Zuno now"; // Codex note'],
+                },
+            )
+            # The source string holds back auto-merge; the TUI snapshot is in the
+            # `added` scope of the fixture rules only under snapshots/, so it is held too.
+            self.assertEqual(replay.review, [snapshot, warning])
+            self.assertNotIn(warning, replay.drift)
+            rendered = zuno_upstream.describe_rebrand({"rebrand": asdict(replay)})
+            self.assertIn("New upstream text rebranded, held for review (2)", rendered)
 
 
 class RebrandReplayTest(unittest.TestCase):
