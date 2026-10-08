@@ -2,6 +2,7 @@
 """Fail if Zuno can reach inherited Codex updater or publisher entrypoints."""
 
 import re
+import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -474,6 +475,23 @@ def main() -> int:
     acp_start = smoke.index('[str(binary), "acp"]')
     if "env=runtime_env" not in smoke[acp_start : acp_start + 500]:
         raise SystemExit("Zuno ACP smoke does not use the isolated environment")
+
+    # Zuno's home is ZUNO_HOME or ~/.zuno (codex-rs/utils/home-dir). The rebrand
+    # replay never touches files upstream adds, so a CODEX_HOME read can arrive
+    # with any sync; tests may still set CODEX_HOME to prove it is ignored.
+    home_read = re.compile(r'env::var(?:_os)?\(\s*"CODEX_HOME"')
+    sources = subprocess.run(
+        ["git", "ls-files", "-z", "--", "codex-rs/*.rs"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split("\0")
+    for source in filter(None, sources):
+        if "/tests/" in source or source.endswith(("_tests.rs", "/tests.rs")):
+            continue
+        if home_read.search(runtime_text(source)):
+            raise SystemExit(f"{source} reads CODEX_HOME; Zuno reads only ZUNO_HOME")
     print("ZUNO_UPDATE_BOUNDARIES_OK")
     return 0
 

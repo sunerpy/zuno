@@ -142,6 +142,7 @@ contracts = [
   "The shipped product entrypoint, version identity, help, and shell completions are named Zuno.",
   "Zuno package archives contain bin/zuno and retain the proven Codex-derived companion layout.",
   "The Codex binary and release filegroup remain compatibility-only sync validation paths.",
+  "Zuno's home is ZUNO_HOME or ~/.zuno; runtime code never reads CODEX_HOME, and scripts/check_zuno_update_boundaries.py rejects any non-test read because the rebrand replay does not touch files upstream adds.",
 ]
 
 [[capabilities]]
