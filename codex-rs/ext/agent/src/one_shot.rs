@@ -444,6 +444,7 @@ fn prepare_windows_sandbox_command(
             permission_profile,
             cwd,
             use_elevated,
+            &environment,
         )
     } else {
         codex_sandboxing::resolve_windows_restricted_token_filesystem_overrides(
