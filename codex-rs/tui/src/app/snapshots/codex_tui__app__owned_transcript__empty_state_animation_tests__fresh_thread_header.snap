@@ -4,7 +4,7 @@ expression: "format!(\"enabled:\\n{}\\n---\\ndisabled:\\n{}\", text(after), text
 ---
 enabled:
 
-  >_ Zuno (v0.161.0)
+  >_ Zuno (v0.162.1)
      /tmp/project
 
 
@@ -50,7 +50,7 @@ enabled:
 ---
 disabled:
 
-  >_ Zuno (v0.161.0)
+  >_ Zuno (v0.162.1)
      /tmp/project
 
 
