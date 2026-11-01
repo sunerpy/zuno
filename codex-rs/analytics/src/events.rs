@@ -1,5 +1,5 @@
 use std::sync::LazyLock;
-use std::time::Instant;
+use std::time::Duration;
 
 use crate::facts::AppInvocation;
 use crate::facts::ArtifactOperation;
@@ -85,6 +85,7 @@ pub(crate) enum TrackEventRequest {
     CommandExecution(CodexCommandExecutionEventRequest),
     PluginMeasurement(CodexPluginMeasurementEventRequest),
     FileChange(CodexFileChangeEventRequest),
+    CuaToolCallStarted(CodexCuaToolCallStartedEventRequest),
     McpToolCall(CodexMcpToolCallEventRequest),
     DynamicToolCall(CodexDynamicToolCallEventRequest),
     ControlToolCall(CodexControlToolCallEventRequest),
@@ -167,6 +168,7 @@ impl TrackEventRequest {
         match self {
             Self::PluginUsed(event) => event.event_params.plugin.plugin_id.is_some(),
             Self::SkillInvocation(event) => event.event_params.plugin_id.is_some(),
+            Self::CuaToolCallStarted(event) => event.event_params.plugin_id.is_some(),
             Self::McpToolCall(event) => event.event_params.plugin_id.is_some(),
             Self::ArtifactOperation(event) => !event.event_params.plugin_id.is_empty(),
             Self::PluginMeasurement(event) => !event.event_params.plugin_id.is_empty(),
@@ -367,6 +369,7 @@ impl From<&AdditionalPermissionProfile> for GuardianAdditionalPermissions {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GuardianReviewedAction {
+    NativeToolCall {},
     Shell {
         sandbox_permissions: SandboxPermissions,
         additional_permissions: Option<GuardianAdditionalPermissions>,
@@ -425,6 +428,7 @@ pub struct GuardianReviewEventParams {
     pub guardian_review_model_override: Option<String>,
     pub guardian_model_provider_id: Option<String>,
     pub had_prior_review_context: Option<bool>,
+    /// Configured overall review budget in milliseconds; zero means unlimited.
     pub review_timeout_ms: u64,
     pub tool_call_count: Option<u64>,
     pub time_to_first_token_ms: Option<u64>,
@@ -448,7 +452,6 @@ pub struct GuardianReviewTrackContext {
     reviewed_action: GuardianReviewedAction,
     review_timeout_ms: u64,
     pub started_at_ms: u64,
-    started_instant: Instant,
 }
 
 impl GuardianReviewTrackContext {
@@ -470,7 +473,6 @@ impl GuardianReviewTrackContext {
             reviewed_action,
             review_timeout_ms,
             started_at_ms: now_unix_millis(),
-            started_instant: Instant::now(),
         }
     }
 
@@ -478,7 +480,9 @@ impl GuardianReviewTrackContext {
         &self,
         result: GuardianReviewAnalyticsResult,
         completed_at_ms: u64,
+        elapsed: Duration,
     ) -> GuardianReviewEventParams {
+        let completion_latency_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         GuardianReviewEventParams {
             guardian_context_mode: result.guardian_context_mode,
             thread_id: self.thread_id.clone(),
@@ -509,7 +513,7 @@ impl GuardianReviewTrackContext {
             // TODO(rhan-oai): plumb nested Guardian review session tool-call counts.
             tool_call_count: None,
             time_to_first_token_ms: result.time_to_first_token_ms,
-            completion_latency_ms: Some(self.started_instant.elapsed().as_millis() as u64),
+            completion_latency_ms: Some(completion_latency_ms),
             started_at: self.started_at_ms / 1_000,
             completed_at: Some(completed_at_ms / 1_000),
             input_tokens: result.token_usage.as_ref().map(|usage| usage.input_tokens),
@@ -538,6 +542,9 @@ pub struct GuardianReviewAnalyticsResult {
     pub terminal_status: GuardianReviewTerminalStatus,
     pub failure_reason: Option<GuardianReviewFailureReason>,
     pub attempt_count: i64,
+    /// An allow was validated against changed parent/root authorization or review context.
+    /// Retained across attempts; this does not identify the cause of a later cancellation.
+    pub context_changed: bool,
     pub risk_level: Option<GuardianRiskLevel>,
     pub user_authorization: Option<GuardianUserAuthorization>,
     pub outcome: Option<GuardianAssessmentOutcome>,
@@ -564,6 +571,7 @@ impl GuardianReviewAnalyticsResult {
             terminal_status: GuardianReviewTerminalStatus::FailedClosed,
             failure_reason: None,
             attempt_count: 1,
+            context_changed: false,
             risk_level: None,
             user_authorization: None,
             outcome: None,
@@ -707,6 +715,35 @@ pub(crate) struct CodexToolItemEventBase {
     pub(crate) failure_kind: Option<ToolItemFailureKind>,
     pub(crate) requested_additional_permissions: bool,
     pub(crate) requested_network_access: bool,
+}
+
+#[derive(Serialize)]
+pub(crate) struct CodexCuaToolCallStartedEventParams {
+    pub(crate) thread_id: String,
+    pub(crate) session_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) root_turn_id: Option<String>,
+    pub(crate) item_id: String,
+    pub(crate) cell_id: Option<String>,
+    pub(crate) parent_call_id: Option<String>,
+    pub(crate) originating_response_id: Option<String>,
+    pub(crate) app_server_client: CodexAppServerClientMetadata,
+    pub(crate) runtime: CodexRuntimeMetadata,
+    pub(crate) thread_source: Option<ThreadSource>,
+    pub(crate) subagent_source: Option<String>,
+    pub(crate) parent_thread_id: Option<String>,
+    pub(crate) tool_event_type: Option<ToolEventType>,
+    pub(crate) started_at_ms: u64,
+    pub(crate) mcp_server_name: String,
+    pub(crate) mcp_tool_name: String,
+    pub(crate) plugin_id: Option<String>,
+    pub(crate) connector_id: Option<String>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct CodexCuaToolCallStartedEventRequest {
+    pub(crate) event_type: &'static str,
+    pub(crate) event_params: CodexCuaToolCallStartedEventParams,
 }
 
 #[allow(dead_code)]
@@ -1027,6 +1064,7 @@ pub(crate) struct CodexCompactionEventParams {
     pub(crate) phase: CompactionPhase,
     pub(crate) strategy: CompactionStrategy,
     pub(crate) status: CompactionStatus,
+    pub(crate) voice_session_id: Option<String>,
     pub(crate) codex_error_kind: Option<CodexErrKind>,
     pub(crate) codex_error_http_status_code: Option<u16>,
     pub(crate) usage_limit_window_minutes: Option<u16>,
@@ -1073,6 +1111,8 @@ pub(crate) struct CodexGoalEventRequest {
 
 #[derive(Serialize)]
 pub(crate) struct CodexTurnEventParams {
+    #[serde(flatten)]
+    pub(crate) critical_path: crate::turn_critical_path::CriticalPathEventParams,
     pub(crate) thread_id: String,
     pub(crate) session_id: String,
     pub(crate) turn_id: String,
@@ -1396,6 +1436,7 @@ pub(crate) fn codex_compaction_event_params(
         phase: input.phase,
         strategy: input.strategy,
         status: input.status,
+        voice_session_id: None,
         codex_error_kind: input.codex_error_kind,
         codex_error_http_status_code: input.codex_error_http_status_code,
         usage_limit_window_minutes: input.usage_limit_window_minutes,
@@ -1482,6 +1523,8 @@ fn analytics_hook_event_name(event_name: HookEventName) -> &'static str {
         HookEventName::PostToolUse => "PostToolUse",
         HookEventName::PreCompact => "PreCompact",
         HookEventName::PostCompact => "PostCompact",
+        HookEventName::PreModelRequest => "PreModelRequest",
+        HookEventName::PostModelRequest => "PostModelRequest",
         HookEventName::SessionStart => "SessionStart",
         HookEventName::SessionEnd => "SessionEnd",
         HookEventName::UserPromptSubmit => "UserPromptSubmit",

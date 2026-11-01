@@ -113,41 +113,11 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-bazel-ci
+      - name: Run argument comment lint on codex-rs via Bazel
+        uses: ./.github/actions/run-argument-comment-lint
         with:
           target: ${{ runner.os }}
-      - name: Install Linux sandbox build dependencies
-        if: ${{ runner.os == 'Linux' }}
-        shell: bash
-        run: |
-          sudo DEBIAN_FRONTEND=noninteractive apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
-      - name: Run argument comment lint on codex-rs via Bazel
-        if: ${{ runner.os != 'Windows' }}
-        env:
-          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
-        shell: bash
-        run: |
-          bazel_targets="$(./tools/argument-comment-lint/list-bazel-targets.sh)"
-          ./.github/scripts/run-bazel-ci.sh \
-            -- \
-            build \
-            --config=argument-comment-lint \
-            --keep_going \
-            --build_metadata=COMMIT_SHA=${GITHUB_SHA} \
-            -- \
-            ${bazel_targets}
-      - name: Run argument comment lint on codex-rs via Bazel
-        if: ${{ runner.os == 'Windows' }}
-        env:
-          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
-        shell: bash
-        run: |
-          ./.github/scripts/run-argument-comment-lint-bazel.sh \
-            --config=argument-comment-lint \
-            --platforms=//:local_windows \
-            --keep_going \
-            --build_metadata=COMMIT_SHA=${GITHUB_SHA}
+          buildbuddy-api-key: ${{ secrets.BUILDBUDDY_API_KEY }}
 
   # --- CI to validate on different os/targets --------------------------------
   lint_build:

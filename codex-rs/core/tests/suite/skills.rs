@@ -225,6 +225,8 @@ async fn history_injection_skips_skill_discovery_after_initial_context() -> Resu
     });
     let test = builder.build_with_auto_env(&server).await?;
     let developer_message = |text: &str| ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "developer".to_string(),
         content: vec![ContentItem::InputText {
@@ -323,6 +325,10 @@ async fn user_turn_selects_symlinked_skill_by_advertised_discovery_path() -> Res
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
     install(&mut extensions, |config: &Config| SkillsExtensionConfig {
         include_instructions: config.include_skill_instructions,
+        catalog_deltas_enabled: config
+            .features
+            .enabled(codex_features::Feature::SkillCatalogDeltas),
+        omit_descriptions: false,
         max_context_tokens: config.skill_max_context_tokens,
         bundled_skills_enabled: false,
         cloud_skill_enabled: false,

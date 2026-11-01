@@ -206,6 +206,7 @@ async fn execute_to_terminal(
                         WaitRequest {
                             cell_id,
                             yield_time_ms: 60_000,
+                            max_output_tokens: None,
                         },
                         /*preempt*/ None,
                     )
@@ -270,6 +271,7 @@ async fn interrupt_yields_observations_without_stopping_the_cell() {
     let request = WaitRequest {
         cell_id: cell_id.clone(),
         yield_time_ms: 60_000,
+        max_output_tokens: None,
     };
     let response =
         tokio::time::timeout(Duration::from_secs(5), session.wait(request, Some(signal)))
@@ -288,6 +290,7 @@ async fn interrupt_yields_observations_without_stopping_the_cell() {
             WaitRequest {
                 cell_id,
                 yield_time_ms: 60_000,
+                max_output_tokens: None,
             },
             /*preempt*/ None,
         ),
@@ -350,6 +353,7 @@ async fn session_execution_limits_are_isolated_on_a_shared_process_host() {
             WaitRequest {
                 cell_id: cell_id("1"),
                 yield_time_ms: 60_000,
+                max_output_tokens: None,
             },
             /*preempt*/ None,
         ),
@@ -367,7 +371,7 @@ async fn session_execution_limits_are_isolated_on_a_shared_process_host() {
     );
 
     limited
-        .terminate(cell_id("1"))
+        .terminate(cell_id("1").into())
         .await
         .expect("terminate cell");
     limited.shutdown().await.expect("shutdown limited session");
@@ -391,8 +395,8 @@ async fn remote_session_persists_values_forwards_delegates_and_controls_cells() 
 
     let actual = execute(
         &session,
-        execute_request(r#"store("key", "persisted");"#),
-        first_delegate.clone(),
+        execute_request(""),
+        Arc::new(RecordingDelegate::default()),
     )
     .await;
     assert_eq!(
@@ -401,6 +405,30 @@ async fn remote_session_persists_values_forwards_delegates_and_controls_cells() 
             code_mode_host_duration: actual.code_mode_host_duration(),
             cell_id: cell_id("1"),
             content_items: Vec::new(),
+            result_buffered_for: Duration::ZERO,
+            error_text: None,
+        }
+    );
+    session.shutdown().await.expect("shutdown before reload");
+    // Reloading a thread must not reuse cell IDs from its previous session.
+    let session = provider
+        .create_session()
+        .await
+        .expect("create replacement session");
+
+    let actual = execute(
+        &session,
+        execute_request(r#"store("key", "persisted");"#),
+        first_delegate.clone(),
+    )
+    .await;
+    assert_eq!(
+        actual,
+        RuntimeResponse::Result {
+            code_mode_host_duration: actual.code_mode_host_duration(),
+            cell_id: cell_id("g2:1"),
+            content_items: Vec::new(),
+            result_buffered_for: Duration::ZERO,
             error_text: None,
         }
     );
@@ -427,17 +455,18 @@ text(result.value);
         actual,
         RuntimeResponse::Result {
             code_mode_host_duration: actual.code_mode_host_duration(),
-            cell_id: cell_id("2"),
+            cell_id: cell_id("g2:2"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "output".to_string(),
             }],
+            result_buffered_for: Duration::ZERO,
             error_text: None,
         }
     );
     assert_eq!(
         *delegate.invocations.lock().expect("invocations lock"),
         vec![CodeModeNestedToolCall {
-            cell_id: cell_id("2"),
+            cell_id: cell_id("g2:2"),
             runtime_tool_call_id: "tool-1".to_string(),
             tool_name: ToolName::plain("echo"),
             tool_kind: CodeModeToolKind::Function,
@@ -446,7 +475,7 @@ text(result.value);
     );
     assert_eq!(
         *delegate.notifications.lock().expect("notifications lock"),
-        vec![("call-2".to_string(), cell_id("2"), "notice".to_string())]
+        vec![("call-2".to_string(), cell_id("g2:2"), "notice".to_string())]
     );
 
     let mut pending_request = execute_request("await new Promise(() => {});");
@@ -457,15 +486,16 @@ text(result.value);
         actual,
         RuntimeResponse::Yielded {
             code_mode_host_duration: actual.code_mode_host_duration(),
-            cell_id: cell_id("3"),
+            cell_id: cell_id("g2:3"),
             content_items: Vec::new(),
         }
     );
     let actual = session
         .wait(
             WaitRequest {
-                cell_id: cell_id("3"),
+                cell_id: cell_id("g2:3"),
                 yield_time_ms: 1,
+                max_output_tokens: None,
             },
             /*preempt*/ None,
         )
@@ -475,19 +505,19 @@ text(result.value);
         actual,
         WaitOutcome::LiveCell(RuntimeResponse::Yielded {
             code_mode_host_duration: actual.code_mode_host_duration(),
-            cell_id: cell_id("3"),
+            cell_id: cell_id("g2:3"),
             content_items: Vec::new(),
         })
     );
     let actual = session
-        .terminate(cell_id("3"))
+        .terminate(cell_id("g2:3").into())
         .await
         .expect("terminate cell");
     assert_eq!(
         actual,
         WaitOutcome::LiveCell(RuntimeResponse::Terminated {
             code_mode_host_duration: actual.code_mode_host_duration(),
-            cell_id: cell_id("3"),
+            cell_id: cell_id("g2:3"),
             content_items: Vec::new(),
         })
     );
@@ -495,14 +525,14 @@ text(result.value);
     session.shutdown().await.expect("shutdown remote session");
     assert_eq!(
         *delegate.closed_cells.lock().expect("closed cells lock"),
-        vec![cell_id("2"), cell_id("3")]
+        vec![cell_id("g2:2"), cell_id("g2:3")]
     );
     assert_eq!(
         *first_delegate
             .closed_cells
             .lock()
             .expect("closed cells lock"),
-        vec![cell_id("1")]
+        vec![cell_id("g2:1")]
     );
 }
 
@@ -544,6 +574,7 @@ async fn dropping_long_wait_releases_observer_before_next_wait() {
                 WaitRequest {
                     cell_id: wait_cell_id,
                     yield_time_ms: 60_000,
+                    max_output_tokens: None,
                 },
                 /*preempt*/ None,
             )
@@ -559,6 +590,7 @@ async fn dropping_long_wait_releases_observer_before_next_wait() {
             WaitRequest {
                 cell_id: running_cell_id.clone(),
                 yield_time_ms: 1,
+                max_output_tokens: None,
             },
             /*preempt*/ None,
         ),
@@ -575,7 +607,7 @@ async fn dropping_long_wait_releases_observer_before_next_wait() {
         })
     );
     session
-        .terminate(running_cell_id)
+        .terminate(running_cell_id.into())
         .await
         .expect("terminate cell");
     session.shutdown().await.expect("shutdown remote session");
@@ -650,6 +682,7 @@ return;
                 WaitRequest {
                     cell_id: wait_cell_id,
                     yield_time_ms: 60_000,
+                    max_output_tokens: None,
                 },
                 /*preempt*/ None,
             )
@@ -698,6 +731,7 @@ return;
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "hello".to_string(),
             }],
+            result_buffered_for: Duration::ZERO,
             error_text: None,
         })
     );
@@ -741,6 +775,7 @@ async fn oversized_execute_request_does_not_close_the_shared_host() {
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "still alive".to_string(),
             }],
+            result_buffered_for: Duration::ZERO,
             error_text: None,
         }
     );
@@ -791,6 +826,7 @@ try {{
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "argument rejected".to_string(),
             }],
+            result_buffered_for: Duration::ZERO,
             error_text: None,
         }
     );
@@ -820,6 +856,7 @@ try {
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "result rejected".to_string(),
             }],
+            result_buffered_for: Duration::ZERO,
             error_text: None,
         }
     );
@@ -838,6 +875,7 @@ try {
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "still alive".to_string(),
             }],
+            result_buffered_for: Duration::ZERO,
             error_text: None,
         }
     );
@@ -884,6 +922,7 @@ async fn oversized_initial_response_does_not_close_the_shared_host() {
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "still alive".to_string(),
             }],
+            result_buffered_for: Duration::ZERO,
             error_text: None,
         }
     );
@@ -987,6 +1026,7 @@ async fn child_process_loss_cleans_up_and_rebuilds_the_shared_host() {
                 WaitRequest {
                     cell_id: wait_a_cell,
                     yield_time_ms: 60_000,
+                    max_output_tokens: None,
                 },
                 /*preempt*/ None,
             )
@@ -1000,6 +1040,7 @@ async fn child_process_loss_cleans_up_and_rebuilds_the_shared_host() {
                 WaitRequest {
                     cell_id: wait_b_cell,
                     yield_time_ms: 60_000,
+                    max_output_tokens: None,
                 },
                 /*preempt*/ None,
             )
@@ -1071,10 +1112,11 @@ async fn child_process_loss_cleans_up_and_rebuilds_the_shared_host() {
         actual,
         RuntimeResponse::Result {
             code_mode_host_duration: actual.code_mode_host_duration(),
-            cell_id: cell_id("g2:1"),
+            cell_id: cell_id("g3:1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "replacement".to_string(),
             }],
+            result_buffered_for: Duration::ZERO,
             error_text: None,
         }
     );
@@ -1083,6 +1125,7 @@ async fn child_process_loss_cleans_up_and_rebuilds_the_shared_host() {
             WaitRequest {
                 cell_id: cell_b.clone(),
                 yield_time_ms: 1,
+                max_output_tokens: None,
             },
             /*preempt*/ None,
         )

@@ -17,6 +17,7 @@ use codex_config::McpServerConfig;
 use codex_config::McpServerTransportConfig;
 use codex_exec_server::Environment;
 use codex_protocol::mcp::ClientMcpExtensions;
+use codex_rmcp_client::ToolListRevision;
 use lru::LruCache;
 use rmcp::model::ElicitationCapability;
 use sha1::Digest;
@@ -69,15 +70,19 @@ struct OptionalStartupDeadline {
 
 struct ToolCatalogSnapshot {
     tools: Vec<ToolInfo>,
+    meta: Option<Arc<serde_json::Value>>,
     published_at: Instant,
+    tool_list_revision: Option<ToolListRevision>,
 }
 
 #[derive(Clone)]
 pub(crate) struct McpToolCatalogCacheContext {
+    pub(crate) track_tool_list_changes: bool,
     entry: Arc<ToolCatalogCacheEntry>,
 }
 
 pub(crate) struct McpToolCatalogFetchTicket {
+    pub(crate) tool_list_revision: Option<ToolListRevision>,
     generation: u64,
 }
 
@@ -102,7 +107,10 @@ impl McpToolCatalogCache {
         let entry = lock_unpoisoned(&self.entries)
             .get_or_insert(identity, || Arc::new(ToolCatalogCacheEntry::default()))
             .clone();
-        Some(McpToolCatalogCacheContext { entry })
+        Some(McpToolCatalogCacheContext {
+            entry,
+            track_tool_list_changes: false,
+        })
     }
 }
 
@@ -116,6 +124,16 @@ impl Default for ToolCatalogCacheEntry {
 }
 
 impl McpToolCatalogCacheContext {
+    fn accepts_snapshot(&self, snapshot: &ToolCatalogSnapshot) -> bool {
+        // Enabling refresh must not reuse a catalog published without notification tracking.
+        snapshot
+            .tool_list_revision
+            .as_ref()
+            .map_or(!self.track_tool_list_changes, |revision| {
+                revision.current() == 0
+            })
+    }
+
     pub(crate) fn has_tools(&self) -> bool {
         self.current_revision_if(|_| true).is_some()
     }
@@ -129,6 +147,7 @@ impl McpToolCatalogCacheContext {
         let state = lock_unpoisoned(&self.entry.state);
         let snapshot = state.snapshot.as_ref()?;
         (!state.disabled_by_server
+            && self.accepts_snapshot(snapshot)
             && !snapshot.tools.is_empty()
             && snapshot.published_at.elapsed() <= TOOL_CATALOG_CACHE_TTL
             && accepts_tools(&snapshot.tools))
@@ -142,10 +161,10 @@ impl McpToolCatalogCacheContext {
     ) -> Instant {
         let mut state = lock_unpoisoned(&self.entry.state);
         if state.disabled_by_server
-            || state
-                .snapshot
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.published_at.elapsed() <= TOOL_CATALOG_CACHE_TTL)
+            || state.snapshot.as_ref().is_some_and(|snapshot| {
+                self.accepts_snapshot(snapshot)
+                    && snapshot.published_at.elapsed() <= TOOL_CATALOG_CACHE_TTL
+            })
         {
             return default_deadline;
         }
@@ -165,6 +184,7 @@ impl McpToolCatalogCacheContext {
         cached_deadline.deadline
     }
 
+    #[cfg(test)]
     pub(crate) fn current_tools(&self) -> Option<Vec<ToolInfo>> {
         self.current_tools_or(/*fallback*/ None)
     }
@@ -174,20 +194,34 @@ impl McpToolCatalogCacheContext {
         &self,
         fallback: Option<Vec<ToolInfo>>,
     ) -> Option<Vec<ToolInfo>> {
+        self.current_catalog_or(fallback.map(|tools| (tools, None)))
+            .map(|(tools, _)| tools)
+    }
+
+    pub(crate) fn current_catalog_or(
+        &self,
+        fallback: Option<(Vec<ToolInfo>, Option<Arc<serde_json::Value>>)>,
+    ) -> Option<(Vec<ToolInfo>, Option<Arc<serde_json::Value>>)> {
         let state = lock_unpoisoned(&self.entry.state);
-        if state.disabled_by_server {
+        if state.disabled_by_server
+            || state
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| !self.accepts_snapshot(snapshot))
+        {
             return None;
         }
         state
             .snapshot
             .as_ref()
             .filter(|snapshot| snapshot.published_at.elapsed() <= TOOL_CATALOG_CACHE_TTL)
-            .map(|snapshot| snapshot.tools.clone())
+            .map(|snapshot| (snapshot.tools.clone(), snapshot.meta.clone()))
             .or(fallback)
     }
 
     pub(crate) fn begin_fetch(&self) -> McpToolCatalogFetchTicket {
         McpToolCatalogFetchTicket {
+            tool_list_revision: None,
             generation: self
                 .entry
                 .next_fetch_generation
@@ -202,24 +236,44 @@ impl McpToolCatalogCacheContext {
         state.snapshot = None;
     }
 
-    pub(crate) fn publish_if_newest(&self, ticket: McpToolCatalogFetchTicket, tools: &[ToolInfo]) {
-        let mut state = lock_unpoisoned(&self.entry.state);
-        if state.disabled_by_server || ticket.generation <= state.last_accepted_generation {
-            return;
+    /// An observed protocol change invalidates a legacy catalog, including any older fetch in flight.
+    pub(crate) fn invalidate_if_newest(&self, ticket: &McpToolCatalogFetchTicket) {
+        if let Some(mut state) = self.accept_generation(ticket.generation) {
+            state.snapshot = None;
         }
+    }
 
+    pub(crate) fn publish_if_newest(
+        &self,
+        ticket: McpToolCatalogFetchTicket,
+        tools: &[ToolInfo],
+        meta: Option<Arc<serde_json::Value>>,
+    ) {
+        let Some(mut state) = self.accept_generation(ticket.generation) else {
+            return;
+        };
         let mut tools = tools.to_vec();
         for tool in &mut tools {
             // Tool annotations affect approval and parallelism decisions, so only the live
             // connection may supply them.
             tool.tool.annotations = None;
         }
-        state.last_accepted_generation = ticket.generation;
-        state.optional_startup_deadline = None;
         state.snapshot = Some(ToolCatalogSnapshot {
             tools,
+            meta,
             published_at: Instant::now(),
+            tool_list_revision: ticket.tool_list_revision,
         });
+    }
+
+    fn accept_generation(&self, generation: u64) -> Option<MutexGuard<'_, ToolCatalogCacheState>> {
+        let mut state = lock_unpoisoned(&self.entry.state);
+        if state.disabled_by_server || generation <= state.last_accepted_generation {
+            return None;
+        }
+        state.last_accepted_generation = generation;
+        state.optional_startup_deadline = None;
+        Some(state)
     }
 }
 
@@ -377,6 +431,13 @@ impl ToolCatalogTransportIdentity {
         else {
             return None;
         };
+        // An unmarked helper can expose different tools after a legacy fallback.
+        if matches!(
+            connection_identity,
+            Some((_, McpProtocolMode::DiscoverLocalStdio, _))
+        ) {
+            return None;
+        }
         if env_vars
             .iter()
             .any(codex_config::McpServerEnvVar::is_remote_source)
@@ -398,6 +459,7 @@ impl ToolCatalogTransportIdentity {
                 env_vars,
                 cwd,
                 &config.environment_id,
+                connection_identity.map(|(_, mode, _)| mode.preferred_protocol_version()),
                 client_elicitation_capability,
                 client_mcp_extensions.iter().collect::<BTreeMap<_, _>>(),
             ))

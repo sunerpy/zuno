@@ -71,7 +71,9 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev bubblewrap
+          # zstd: the codex_package layout tests write .tar.zst archives, and the
+          # repository's zstd DotSlash manifest only covers Windows.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev bubblewrap zstd
       - name: Check Rust formatting
         run: cargo fmt --all -- --config imports_granularity=Item --check
       - name: Validate workflow and packaging tooling
@@ -353,6 +355,11 @@ jobs:
             binaries+=(--bin codex-command-runner --bin codex-windows-sandbox-setup)
           fi
           cargo build --locked --release --target "$TARGET" "${binaries[@]}"
+          # The standalone executor links nearly everything zuno links, and linking
+          # both at once ran the 15 GB Windows containers out of memory. The second
+          # pass selects the same packages, so it reuses the first pass's artifacts
+          # and only links codex-exec-server.
+          cargo build --locked --release --target "$TARGET" "${binaries[@]}" --bin codex-exec-server
       - name: Build canonical Zuno package archives
         shell: bash
         env:

@@ -103,7 +103,7 @@ delivery = {{ kind = "header", name = "X-Gateway-Authorization" }}
         Some(Arc::clone(&auth_manager)),
     );
     assert_eq!(
-        provider.api_auth().await?.to_auth_headers()["x-gateway-authorization"],
+        provider.api_auth().await?.to_auth_headers().unwrap()["x-gateway-authorization"],
         "Bearer old-access"
     );
     let (processor, mut outgoing) = build_test_processor(config, auth_manager).await;
@@ -182,7 +182,7 @@ delivery = {{ kind = "header", name = "X-Gateway-Authorization" }}
     );
     assert_eq!(observer.resolve_access_token().await?, "new-access");
     assert_eq!(
-        provider.api_auth().await?.to_auth_headers()["x-gateway-authorization"],
+        provider.api_auth().await?.to_auth_headers().unwrap()["x-gateway-authorization"],
         "Bearer new-access"
     );
     processor.shutdown_threads().await;
@@ -266,11 +266,23 @@ delivery = {{ kind = "header", name = "X-Gateway-Authorization" }}
         }
     })
     .await?;
-    assert_eq!(error, JSONRPCErrorError {
-        code: -32600,
-        message: "failed to load configuration: Your organization's required model provider settings changed. Restart Codex to apply them; this request was not sent".to_string(),
-        data: None,
-    });
+    assert_eq!(
+        error,
+        JSONRPCErrorError {
+            code: -32600,
+            message: codex_app_server_protocol::ModelProviderError::ModelProviderPolicyConflict {
+                model_provider: "gateway".into(),
+                required_model_provider: "openai".into(),
+            }
+            .to_string(),
+            data: Some(serde_json::to_value(
+                codex_app_server_protocol::ModelProviderError::ModelProviderPolicyConflict {
+                    model_provider: "gateway".into(),
+                    required_model_provider: "openai".into(),
+                }
+            )?),
+        }
+    );
     assert!(server.received_requests().await.unwrap().is_empty());
     processor.shutdown_threads().await;
     processor.drain_background_tasks().await;

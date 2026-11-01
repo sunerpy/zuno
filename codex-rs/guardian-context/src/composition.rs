@@ -1,12 +1,13 @@
 //! Composes collected evidence into ordered sections with explicit delivery.
-//! Profiles retain the host-selected transcript slice; composition owns
-//! framing, message boundaries and section placement, without retaining history.
+//! Preparation owns request selection; composition adds framing, message boundaries
+//! and placement without selecting or shortening synchronous evidence.
 //! Each content item keeps its selection policy until transport conversion.
 //! Long text splits losslessly only after admission, preserving whole-entry selection.
 //! Action-specific attestations follow the transcript so they do not invalidate
 //! the reusable history prefix when previous decisions or tool evidence change.
-//! Async retained context also follows the transcript so its rolling window cannot
-//! invalidate that prefix. Sync retains its existing section order.
+//! Async retained context initially follows the transcript. Independent snapshot
+//! preparation moves retained user instructions ahead of it, leaving assistant context here.
+//! Stateful reviewers retain their existing section order.
 
 use codex_context_fragments::ContextualUserFragment;
 use codex_history::CodexHarnessMetadata;
@@ -22,11 +23,13 @@ use crate::BudgetPriority;
 use crate::Budgeted;
 use crate::ContextSection;
 use crate::ConversationTranscriptEntry;
+use crate::Retention;
 use crate::SectionError;
 use crate::TranscriptContent;
 use crate::TranscriptFormat;
 use crate::TranscriptRecord;
 use crate::TruncationObservation;
+use crate::retained_instructions::RetainedInstructionKind;
 
 /// Consumer framing after the host has selected a full or delta transcript.
 pub enum ContextPresentation<'a> {
@@ -134,6 +137,41 @@ pub struct ComposedContext {
 }
 
 impl CollectedContext {
+    /// Reports captured images without preparing or copying their payloads.
+    pub fn has_images(&self) -> bool {
+        let has_inline_image = |items: &[UserInput]| {
+            items.iter().any(|item| {
+                matches!(item, UserInput::Image { image, .. } if matches!(image, ImageReference::Inline { .. }))
+            })
+        };
+        self.sections.iter().any(|section| match section {
+            ContextSection::TranscriptImages(images) => !images.images.is_empty(),
+            ContextSection::NodeReplEvidence(evidence) => match &evidence.content {
+                crate::node_repl::NodeReplEvidenceContent::Collected {
+                    responses, mode, ..
+                } => {
+                    *mode == crate::NodeReplReviewEvidenceMode::Multimodal
+                        && responses
+                            .iter()
+                            .any(|response| has_inline_image(&response.items))
+                }
+                crate::node_repl::NodeReplEvidenceContent::Prepared(items) => {
+                    has_inline_image(items)
+                }
+            },
+            ContextSection::ConversationTranscript { .. }
+            | ContextSection::RootConversation { .. }
+            | ContextSection::TrustedUserAnswers { .. }
+            | ContextSection::RetainedUserInstructions { .. }
+            | ContextSection::SenderUserMessages { .. }
+            | ContextSection::PlannedAction(_)
+            | ContextSection::PreviousReviews(_)
+            | ContextSection::TrustedTool(_)
+            | ContextSection::TrustedSkills(_)
+            | ContextSection::PermissionContext { .. } => false,
+        })
+    }
+
     /// All collected entries, before the host applies retention or a delta cursor.
     pub fn transcript_entries(&self) -> &[ConversationTranscriptEntry] {
         self.sections
@@ -145,8 +183,35 @@ impl CollectedContext {
             .unwrap_or_default()
     }
 
-    /// Frames the selected transcript while preserving structured text through admission.
+    /// Compatibility entrypoint for callers without unprepared scheduled messages.
+    /// Synchronous scheduler evidence requires `prepare_sync_context` before slicing.
     pub fn compose(
+        mut self,
+        presentation: ContextPresentation<'_>,
+        transcript: PreparedTranscript,
+    ) -> Result<ComposedContext, SectionError> {
+        match presentation {
+            ContextPresentation::SyncFull { .. } | ContextPresentation::SyncDelta { .. } => {
+                if self
+                    .transcript_entries()
+                    .iter()
+                    .any(|entry| matches!(entry.content, TranscriptContent::ScheduledMessage(_)))
+                {
+                    return Err(SectionError::UnsupportedDelivery {
+                        section: "sync_preparation",
+                    });
+                }
+                crate::preparation::prepare_sync_sections(&mut self);
+                self.compose_prepared(presentation, transcript)
+            }
+            ContextPresentation::Async | ContextPresentation::AsyncDelta => {
+                self.compose_prepared(presentation, transcript)
+            }
+        }
+    }
+
+    /// Frames prepared sections in their existing delivery order.
+    pub(crate) fn compose_prepared(
         self,
         presentation: ContextPresentation<'_>,
         mut transcript: PreparedTranscript,
@@ -222,7 +287,12 @@ impl CollectedContext {
                         ResponseItemEnvelope::new(ContextualUserFragment::into(skills)),
                     ))),
                 ),
-                ContextSection::RootConversation { items } => {
+                ContextSection::RootConversation { content } => {
+                    let crate::RootConversationContent::Prepared(items) = content else {
+                        return Err(SectionError::UnsupportedDelivery {
+                            section: "root_conversation",
+                        });
+                    };
                     (1, "root_conversation", text_content(items))
                 }
                 ContextSection::SenderUserMessages { items } => {
@@ -238,15 +308,24 @@ impl CollectedContext {
                                 content: ContentItem::InputText {
                                     text: format!("{}\n", item.content),
                                 },
-                                retention: item.retention,
+                                retention: match item.kind {
+                                    RetainedInstructionKind::UserInstruction
+                                    | RetainedInstructionKind::HostNotice
+                                    | RetainedInstructionKind::Framing => Retention::Required,
+                                    RetainedInstructionKind::AssistantContext => {
+                                        Retention::Optional(BudgetPriority::Commentary)
+                                    }
+                                },
                                 source: item.source,
                             })
                             .collect(),
                     ),
                 ),
-                ContextSection::TrustedUserAnswers { items } => {
-                    (3, "trusted_user_answers", text_content(items))
-                }
+                ContextSection::TrustedUserAnswers { items } => (
+                    3,
+                    "trusted_user_answers",
+                    text_content(items.into_iter().map(|item| item.text).collect()),
+                ),
                 ContextSection::ConversationTranscript { .. } => {
                     let transcript =
                         transcript.take().ok_or(SectionError::UnsupportedDelivery {
@@ -255,7 +334,7 @@ impl CollectedContext {
                     let mut items = vec![Budgeted::required(start.to_owned().into())];
                     for (index, entry) in transcript.items.into_iter().enumerate() {
                         let content = match entry.content {
-                            TranscriptContent::AgentMessage(message) => {
+                            TranscriptContent::NativeMessage(message) => {
                                 sections.push((
                                     4,
                                     SectionOutput {
@@ -277,6 +356,11 @@ impl CollectedContext {
                                     },
                                 ));
                                 continue;
+                            }
+                            TranscriptContent::ScheduledMessage(_) => {
+                                return Err(SectionError::UnsupportedDelivery {
+                                    section: "sync_preparation",
+                                });
                             }
                             TranscriptContent::Text(text) => ContentItem::InputText {
                                 text: if session_id.is_some() {
@@ -338,8 +422,14 @@ impl CollectedContext {
                     )
                 }
                 ContextSection::NodeReplEvidence(evidence) => {
-                    let items = evidence
-                        .items
+                    let crate::node_repl::NodeReplEvidenceContent::Prepared(items) =
+                        evidence.content
+                    else {
+                        return Err(SectionError::UnsupportedDelivery {
+                            section: "node_repl_evidence",
+                        });
+                    };
+                    let items = items
                         .into_iter()
                         .filter_map(|item| match item {
                             UserInput::Text { text, .. } => {
@@ -371,12 +461,37 @@ impl CollectedContext {
                     )
                 }
                 ContextSection::PlannedAction(planned) => {
+                    if let crate::PlannedActionKind::ToolCall(call) = &planned.kind {
+                        sections.push((
+                            11,
+                            SectionOutput {
+                                id: "planned_action",
+                                delivery: text_content(planned.render(action)),
+                            },
+                        ));
+                        sections.push((
+                            11,
+                            SectionOutput {
+                                id: "planned_action",
+                                delivery: SectionDelivery::Message(Budgeted::required(Box::new(
+                                    ResponseItemEnvelope::new(call.as_ref().clone()),
+                                ))),
+                            },
+                        ));
+                        continue;
+                    }
                     let mut items = planned
                         .render(action)
                         .into_iter()
                         .map(|text| Budgeted::required(ContentItem::InputText { text }))
                         .collect::<Vec<_>>();
-                    if let Some(text) = planned.tool_descriptions {
+                    if let Some(descriptions) = planned.tool_descriptions {
+                        if descriptions.text.is_empty() {
+                            return Err(SectionError::UnsupportedDelivery {
+                                section: "guardian_tool_descriptions",
+                            });
+                        }
+                        let text = descriptions.render().into_text().unwrap_or_default();
                         items.push(Budgeted::optional(
                             ContentItem::InputText { text },
                             BudgetPriority::ToolDescription,
@@ -485,7 +600,11 @@ impl ComposedContext {
                             std::mem::take(&mut metadata),
                         ));
                     }
+                    let output = crate::native_tool_call::evidence_output(&message.content.item);
                     messages.push(*message.content);
+                    if let Some(output) = output {
+                        messages.push(ResponseItemEnvelope::new(output));
+                    }
                 }
             }
         }
@@ -551,6 +670,8 @@ pub(super) fn bounded_text_parts(text: &str) -> impl Iterator<Item = &str> {
 
 pub(super) fn user_message(content: Vec<ContentItem>) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_owned(),
         content,

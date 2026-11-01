@@ -154,6 +154,8 @@ fn check_legacy_model_safety(
                     .as_ref()
                     .and_then(|messages| messages.guardian_v2.clone())
                     .unwrap_or_default();
+                // The legacy mode is accepted for compatibility but no longer selects behavior.
+                settings.async_classifier_mode = None;
                 // Missing and empty transcript records supply the same defaults.
                 if settings.transcript.as_ref().is_some_and(|transcript| {
                     *transcript == GuardianV2TranscriptModelConfig::default()
@@ -303,8 +305,9 @@ impl Session {
         };
 
         // Validate the environment configuration supplied in the update.
-        let environment_config_validation =
-            environments.as_deref().map(validate_environment_configs);
+        let environment_config_validation = environments
+            .as_deref()
+            .map(|environments| validate_environment_configs(environments, &self.features));
 
         // Confirm the task we originally targeted is still running.
         let active = self.active_turn.lock().await;

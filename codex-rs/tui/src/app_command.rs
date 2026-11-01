@@ -9,6 +9,7 @@ use codex_app_server_protocol::RequestId as AppServerRequestId;
 use codex_app_server_protocol::ReviewTarget;
 use codex_app_server_protocol::ToolRequestUserInputResponse;
 use codex_app_server_protocol::UserInput;
+use codex_app_server_protocol::UserVerificationErrorDetails;
 use codex_app_server_protocol::UserVerificationProof;
 use codex_config::types::ApprovalsReviewer;
 use codex_protocol::ThreadId;
@@ -116,6 +117,7 @@ pub(crate) enum AppCommand {
         command: String,
     },
     UserTurn {
+        turn_trigger: &'static str,
         client_user_message_id: String,
         items: Vec<UserInput>,
         cwd: PathBuf,
@@ -196,6 +198,16 @@ pub(crate) enum UserVerificationResponse {
         proof: UserVerificationProof,
     },
     Cancel,
+    Failed {
+        error: UserVerificationErrorDetails,
+    },
+}
+
+/// Carries only a safe display message and the closed native error category.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UserVerificationFailure {
+    pub(crate) message: &'static str,
+    pub(crate) details: UserVerificationErrorDetails,
 }
 
 impl AppCommand {
@@ -213,6 +225,7 @@ impl AppCommand {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn user_turn(
+        turn_trigger: &'static str,
         client_user_message_id: String,
         items: Vec<UserInput>,
         cwd: PathBuf,
@@ -226,6 +239,7 @@ impl AppCommand {
         collaboration_mode: Option<CollaborationMode>,
     ) -> Self {
         Self::UserTurn {
+            turn_trigger,
             client_user_message_id,
             items,
             cwd,

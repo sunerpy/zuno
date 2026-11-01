@@ -78,9 +78,10 @@ pub fn install_alias(arg0_paths: &Arg0DispatchPaths) -> Option<PathBuf> {
     Some(alias)
 }
 
-/// The arg0 alias directory, identified through helpers that only ever live there.
+/// The arg0 alias directory, identified through the `codex-linux-sandbox` alias that
+/// arg0 only ever creates there (the execve wrapper it used to create is retired).
 fn alias_directory(arg0_paths: &Arg0DispatchPaths) -> Option<PathBuf> {
-    let helper = arg0_paths.main_execve_wrapper_exe.as_deref()?;
+    let helper = arg0_paths.codex_linux_sandbox_exe.as_deref()?;
     let helper_dir = helper.parent()?;
     // The sandbox helper falls back to the executable itself when no alias
     // directory could be created; never write next to the real binary.

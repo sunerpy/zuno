@@ -117,7 +117,6 @@ def main() -> int:
     require("scripts/install/install.ps1", "ZUNO_ALLOW_UPSTREAM_CODEX_INSTALLER")
     for workflow in [
         ".github/workflows/rust-release.yml",
-        ".github/workflows/rust-release-zsh.yml",
         ".github/workflows/rusty-v8-release.yml",
     ]:
         require(workflow, "if: github.repository == 'openai/codex'")

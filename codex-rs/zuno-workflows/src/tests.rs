@@ -221,12 +221,14 @@ impl codex_code_mode::CodeModeSession for FakeV8Session {
                                 },
                             ],
                             error_text: None,
+                            result_buffered_for: std::time::Duration::ZERO,
                             code_mode_host_duration: None,
                         }),
                         Err(error) => Ok(codex_code_mode::RuntimeResponse::Result {
                             cell_id: codex_code_mode::CellId::new("cell-1".to_string()),
                             content_items: Vec::new(),
                             error_text: Some(error),
+                            result_buffered_for: std::time::Duration::ZERO,
                             code_mode_host_duration: None,
                         }),
                     }
@@ -253,12 +255,12 @@ impl codex_code_mode::CodeModeSession for FakeV8Session {
 
     fn terminate<'a>(
         &'a self,
-        cell_id: codex_code_mode::CellId,
+        request: codex_code_mode::TerminateRequest,
     ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::WaitOutcome> {
         Box::pin(async move {
             Ok(codex_code_mode::WaitOutcome::LiveCell(
                 codex_code_mode::RuntimeResponse::Terminated {
-                    cell_id,
+                    cell_id: request.cell_id,
                     content_items: Vec::new(),
                     code_mode_host_duration: None,
                 },

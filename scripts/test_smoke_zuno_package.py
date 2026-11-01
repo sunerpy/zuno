@@ -61,7 +61,7 @@ class LayoutOnlyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             package = root / "pkg"
-            for relative in ("bin/zuno.exe", "bin/codex-code-mode-host.exe", "codex-path/rg.exe",
+            for relative in ("bin/zuno.exe", "bin/codex-code-mode-host.exe", "bin/codex-exec-server.exe", "codex-path/rg.exe",
                              "codex-resources/codex-command-runner.exe", "codex-resources/codex-windows-sandbox-setup.exe"):
                 path = package / relative
                 path.parent.mkdir(parents=True, exist_ok=True)

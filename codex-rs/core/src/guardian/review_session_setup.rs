@@ -1,21 +1,19 @@
 //! Captures action-time parent context and starts or recovers its Guardian reviewer.
 //! Checkpoint recovery allows one fresh attempt under the original review deadline.
 //! Both attempts share captured context and use separate recovery flags.
+//! Checkpoints are captured before final authorization validation and published without yielding.
+//! Recorded reviewer items and interruptions are forwarded to the parent's raw-event subscription.
 
+use codex_guardian_reviewer::ReviewDeadline;
 use std::sync::atomic::AtomicBool;
 
 use super::*;
 use crate::guardian::input_budget::CheckpointRecovery;
+use codex_features::Feature;
 use codex_guardian_reviewer::ReviewerPool;
 use codex_guardian_reviewer::ReviewerRequest;
+use codex_guardian_reviewer::ReviewerSelection;
 use codex_protocol::protocol::TurnEnvironmentSelection;
-
-/// Controls whether selection may reuse a session or must start from the parent checkpoint.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ReviewerSelection {
-    ReuseIfAvailable,
-    FreshParentCheckpoint,
-}
 
 #[derive(Clone)]
 pub struct PreparedGuardianContext {
@@ -32,7 +30,7 @@ pub struct PreparedGuardianContext {
 impl PreparedGuardianContext {
     async fn prepare(
         parent: Arc<Session>,
-        context: GuardianReviewContext,
+        mut context: GuardianReviewContext,
         config: Config,
         history: &ContextManager,
         node_repl_policy: &GuardianNodeReplPolicy,
@@ -45,11 +43,15 @@ impl PreparedGuardianContext {
         let context_mode =
             GuardianContextMode::from_history(history.conversation_history_snapshot().as_ref());
         let context_policy = ReviewContextPolicy::for_context(context_mode, &config.features);
-        let root_review_version = context_policy.root_review_version(&parent).await;
-        let parent_compaction = context_policy.parent_compaction(history)?;
+        let root_review_version =
+            context_policy::root_review_version(context_policy, &parent).await;
+        let parent_compaction = context_policy.parent_compaction(history.annotated_items())?;
+        let mut instructions = parent.inherited_instructions().await;
+        context.capture_project_instructions(&parent).await;
+        instructions.project_snapshot = context.project_instructions.clone();
         let mut key = GuardianReviewSessionReuseKey::from_spawn_config(
             &config,
-            parent.inherited_instructions().await,
+            instructions,
             history.history_version(),
             context_mode,
         )
@@ -88,42 +90,19 @@ impl PreparedGuardianContext {
         key
     }
 
-    /// Moves fork history into startup options and retains only its context bookkeeping.
+    /// Moves fork history into startup options; only reusable reviewers retain a rollback checkpoint.
     /// Guardian selects the agent's identity and lifecycle.
     pub async fn thread_options(
         &self,
+        kind: GuardianReviewSessionKind,
         snapshot: Option<GuardianReviewForkSnapshot>,
     ) -> (crate::StartThreadOptions, GuardianReviewState) {
-        let snapshot =
-            snapshot.filter(|_| self.reviewer_selection == ReviewerSelection::ReuseIfAvailable);
-        let (mut conversation, mut history) = snapshot.map(ConversationState::fork).unzip();
-        if self.parent_compaction.is_some()
-            && conversation
-                .as_ref()
-                .is_some_and(|state| state.cursor().is_none())
-        {
-            // A compacted fork has no valid transcript progress. Prefer the
-            // captured parent checkpoint to its lossy reviewer summary.
-            conversation = None;
-            history = None;
-        }
-        let state = GuardianReviewState {
-            conversation: conversation.unwrap_or_default(),
-            fresh_parent_checkpoint: history.is_none() && self.parent_compaction.is_some(),
-            transcript_history_version: 0,
-            transcript_source: history
-                .as_ref()
-                .and_then(|history| history.transcript_source),
-            last_admitted_node_repl_response_sequence: history.as_ref().map_or(0, |history| {
-                history.last_admitted_node_repl_response_sequence
-            }),
-            pending_node_repl_evidence_admission: None,
-        };
-        let initial_history = history.map(|history| history.initial_history).or_else(|| {
-            self.parent_compaction
-                .clone()
-                .map(|item| InitialHistory::Forked(vec![RolloutItem::ResponseItem(item.into())]))
-        });
+        let (state, initial_history) = GuardianReviewState::for_session(
+            kind,
+            snapshot,
+            self.reviewer_selection,
+            self.parent_compaction.as_ref(),
+        );
         let mut config = self.config.clone();
         config.model_provider.supports_websockets &= self
             .parent
@@ -131,6 +110,7 @@ impl PreparedGuardianContext {
             .model_client
             .responses_websocket_enabled();
         let options = crate::StartThreadOptions {
+            prompt_cache_key: self.parent.services.model_client.prompt_cache_key_policy(),
             history_mode: Some(codex_protocol::protocol::ThreadHistoryMode::Paginated),
             internal_parent: Some(crate::thread_manager::InternalSessionParent {
                 thread_id: self.parent.thread_id(),
@@ -145,6 +125,7 @@ impl PreparedGuardianContext {
                 inherited_instructions: Some(SessionInstructions {
                     user: self.key.user_instructions.clone(),
                     thread: self.key.thread_instructions.clone(),
+                    project_snapshot: self.key.project_instructions.clone(),
                     ..Default::default()
                 }),
             }),
@@ -173,6 +154,11 @@ impl PreparedGuardianContext {
         cancellation: CancellationToken,
     ) -> GuardianReviewSession {
         let session = Arc::clone(&thread.session);
+        if self.parent.enabled(Feature::GuardianRecordedItems) {
+            session
+                .parent_observer_event_tx
+                .get_or_init(|| self.parent.get_tx_event());
+        }
         let io = SessionIo {
             tx_sub: thread.io.tx_sub.clone(),
             rx_event: thread.io.rx_event.clone(),
@@ -217,7 +203,7 @@ impl PreparedGuardianContext {
 }
 
 #[derive(Clone)]
-pub(super) struct PreparedReview {
+pub(in crate::guardian) struct PreparedReview {
     context: Arc<PreparedGuardianContext>,
     params: Arc<GuardianReviewSessionParams>,
     recovery_requested: Arc<AtomicBool>,
@@ -235,7 +221,7 @@ impl ReviewerRequest for PreparedReview {
     fn requires_fresh_session(&self) -> bool {
         self.context.reviewer_selection == ReviewerSelection::FreshParentCheckpoint
     }
-    fn deadline(&self) -> tokio::time::Instant {
+    fn deadline(&self) -> ReviewDeadline {
         self.params.deadline
     }
     fn cancellation(&self) -> Option<&CancellationToken> {
@@ -284,6 +270,56 @@ impl ReviewerRequest for PreparedReview {
         {
             record_failed_review(&session.session, &self.params, &result.outcome).await;
         }
+        let checkpoint = if result.disposition == SessionDisposition::Reusable
+            && matches!(result.outcome, GuardianReviewSessionOutcome::Completed(_))
+            && !matches!(kind, GuardianReviewSessionKind::EphemeralForked)
+        {
+            let items = session.session.guardian_fork_history().await;
+            let history_version = session.session.clone_history().await.history_version();
+            Some((items, history_version, session.state.lock().await))
+        } else {
+            None
+        };
+        // All checkpoint capture and lock acquisition must precede validation. No await
+        // may follow a valid allow before publication; new guidance during capture must
+        // invalidate the attempt without overwriting the last committed review.
+        if let GuardianReviewSessionOutcome::Completed(Ok(Some(message))) = &result.outcome
+            && codex_guardian_reviewer::parse_guardian_assessment(message).is_ok_and(|assessment| {
+                assessment.outcome == super::super::GuardianAssessmentOutcome::Allow
+            })
+            && let Some(authorization) = &self.params.authorization
+            && let Some(invalidation) = authorization
+                .invalidation(
+                    &self.params.parent_session,
+                    self.params.external_cancel.as_ref(),
+                )
+                .await
+        {
+            let outcome = invalidation.outcome;
+            result.analytics.context_changed |= invalidation.context_changed;
+            result.disposition =
+                if matches!(outcome, GuardianReviewSessionOutcome::StaleAuthorization)
+                    && result.disposition == SessionDisposition::Reusable
+                {
+                    SessionDisposition::Rollback
+                } else {
+                    SessionDisposition::Discard
+                };
+            result.outcome = outcome;
+            return result;
+        }
+        if let Some((items, history_version, mut state)) = checkpoint {
+            state.commit_snapshot(
+                items,
+                history_version,
+                session
+                    .session
+                    .services
+                    .thread_extension_data
+                    .get::<CheckpointRecovery>()
+                    .as_deref(),
+            );
+        }
         result
     }
 }
@@ -307,7 +343,9 @@ pub(crate) async fn run_guardian_review_session(
                 Arc::make_mut(&mut prepared.context).reviewer_selection =
                     ReviewerSelection::FreshParentCheckpoint;
                 prepared.recovery_requested = Arc::default();
-                pool.review(prepared).await
+                let (outcome, mut analytics) = pool.review(prepared).await;
+                analytics.context_changed |= result.1.context_changed;
+                (outcome, analytics)
             } else {
                 result
             }
@@ -322,7 +360,7 @@ pub(crate) async fn run_guardian_review_session(
     (outcome, analytics)
 }
 
-pub(super) async fn prepare_review(
+pub(in crate::guardian) async fn prepare_review(
     params: GuardianReviewSessionParams,
 ) -> anyhow::Result<PreparedReview> {
     let context = PreparedGuardianContext::prepare(

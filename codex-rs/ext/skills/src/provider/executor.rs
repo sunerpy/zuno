@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use codex_exec_server::EnvironmentAccess;
+mod discovery_v2;
+
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::FileSystemEnvironmentAccessor;
 use codex_extension_api::SelectedPluginSnapshot;
@@ -78,7 +80,7 @@ pub(crate) fn attribute_executor_plugins(
             .iter()
             .find(|plugin| plugin.selected_root_id.as_ref() == Some(&skill.authority.id))
         {
-            skill.plugin_id = Some(plugin.plugin_id.clone());
+            skill.plugin_id = Some(plugin.plugin_id.as_str().to_string());
             skill.analytics_scope = Some(SkillScope::User);
         }
     }
@@ -87,6 +89,9 @@ pub(crate) fn attribute_executor_plugins(
 impl SkillProvider for ExecutorSkillProvider {
     fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
         Box::pin(async move {
+            if let Some(snapshots) = &query.executor_capability_discovery_v2 {
+                return Ok(self.list_from_discovery_v2(snapshots));
+            }
             if let Some(discovery) = query.executor_capability_discovery {
                 return Ok(self.list_from_discovery(&discovery));
             }
@@ -208,12 +213,14 @@ impl ExecutorSkillProvider {
             let discovery = match &root.result {
                 Ok(discovery) => discovery.as_ref(),
                 Err(error) => {
+                    catalog.is_partial = true;
                     catalog.warnings.push(format!(
                         "Selected capability root `{selected_root_id}` discovery failed: {error}"
                     ));
                     continue;
                 }
             };
+            catalog.is_partial |= discovery.error.is_some();
             let outcome =
                 load_environment_skills_from_discovery(discovery, self.restriction_product);
             catalog.warnings.extend(outcome.warnings);

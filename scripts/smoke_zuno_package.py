@@ -127,8 +127,9 @@ def main() -> int:
 
         binary = root / f"bin/zuno{suffix}"
         host = root / f"bin/codex-code-mode-host{suffix}"
+        exec_server = root / f"bin/codex-exec-server{suffix}"
         ripgrep = root / f"codex-path/rg{suffix}"
-        required = [binary, host, ripgrep]
+        required = [binary, host, exec_server, ripgrep]
         if is_linux:
             required.append(root / "codex-resources/bwrap")
         if is_windows:
@@ -178,6 +179,7 @@ def main() -> int:
         companion_checks = []
         for name, command in (
             ("codeModeHost", [str(host), "--help"]),
+            ("execServer", [str(exec_server), "--version"]),
             ("ripgrep", [str(ripgrep), "--version"]),
         ):
             result = subprocess.run(

@@ -19,12 +19,8 @@ use ts_rs::TS;
 /// Result of stopping an unfinished root turn so another worker can recover it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SuspendTurnOutcome {
-    Suspended {
-        turn_id: String,
-    },
+    Suspended { turn_id: String },
     NotActive,
-    /// A currently loaded descendant would remain running after root handoff.
-    HasLiveDescendants,
     UnsupportedTask,
 }
 
@@ -36,7 +32,24 @@ pub enum TurnInput {
         client_id: Option<String>,
     },
     ResponseItem(ResponseItem),
+    AnnotatedResponseItem(AnnotatedResponseItem),
     InterAgentCommunication(InterAgentCommunication),
+}
+
+/// A Responses API item with caller-supplied, harness-only annotations.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AnnotatedResponseItem {
+    pub item: ResponseItem,
+    #[serde(default)]
+    pub annotations: ResponseItemAnnotations,
+}
+
+/// Public annotations accepted by Core; internal history metadata stays private.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseItemAnnotations {
+    /// Request compaction retention for a function-call output.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retain: bool,
 }
 
 /// One turn input and the context that follows it through submission.
@@ -46,11 +59,23 @@ pub enum TurnInput {
 #[derive(Clone, Debug)]
 pub struct TurnInputRequest {
     pub input: TurnInput,
+    /// Optional host-assigned UUID for the Responses message created from [`TurnInput::UserInput`].
+    /// Ignored for all other inputs, including raw user-role Responses items.
+    pub user_item_uuid: Option<uuid::Uuid>,
     pub thread_settings: ThreadSettingsOverrides,
     pub start: TurnStartOptions,
     pub additional_context: BTreeMap<String, AdditionalContextEntry>,
-    pub responsesapi_client_metadata: Option<HashMap<String, String>>,
+    pub responsesapi_client_metadata: ResponsesApiClientMetadataUpdate,
     pub trace: Option<W3cTraceContext>,
+}
+
+/// An optional replacement followed by a patch to the turn's client metadata.
+#[derive(Clone, Debug, Default)]
+pub struct ResponsesApiClientMetadataUpdate {
+    /// Replaces the existing map, including when empty.
+    pub replacement: Option<HashMap<String, String>>,
+    /// Adds or overwrites keys without removing other entries.
+    pub patch: Option<HashMap<String, String>>,
 }
 
 /// Attribution retained across recovery, sleep, and model-context compaction.
@@ -94,10 +119,11 @@ impl TurnInputRequest {
     pub fn new(input: TurnInput) -> Self {
         Self {
             input,
+            user_item_uuid: None,
             thread_settings: ThreadSettingsOverrides::default(),
             start: TurnStartOptions::default(),
             additional_context: BTreeMap::new(),
-            responsesapi_client_metadata: None,
+            responsesapi_client_metadata: ResponsesApiClientMetadataUpdate::default(),
             trace: None,
         }
     }
@@ -136,12 +162,21 @@ impl TurnInputRequest {
         self
     }
 
-    /// Responses metadata attached whether this request starts or steers.
+    /// Replaces Responses client metadata whether this request starts or steers.
     pub fn with_responses_metadata(
         mut self,
         responsesapi_client_metadata: Option<HashMap<String, String>>,
     ) -> Self {
-        self.responsesapi_client_metadata = responsesapi_client_metadata;
+        self.responsesapi_client_metadata.replacement = responsesapi_client_metadata;
+        self
+    }
+
+    /// Adds or overwrites Responses client metadata entries after any replacement.
+    pub fn with_responses_metadata_patch(
+        mut self,
+        responsesapi_client_metadata_patch: Option<HashMap<String, String>>,
+    ) -> Self {
+        self.responsesapi_client_metadata.patch = responsesapi_client_metadata_patch;
         self
     }
 
