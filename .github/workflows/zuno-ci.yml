@@ -71,7 +71,9 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev bubblewrap
+          # zstd: the codex_package layout tests write .tar.zst archives, and the
+          # repository's zstd DotSlash manifest only covers Windows.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev bubblewrap zstd
       - name: Check Rust formatting
         run: cargo fmt --all -- --config imports_granularity=Item --check
       - name: Validate workflow and packaging tooling
