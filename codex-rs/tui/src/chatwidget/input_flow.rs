@@ -28,8 +28,10 @@ impl ChatWidget {
             // Inline commands still follow so their output (including usage errors) is visible.
             InputResult::Command(
                 SlashCommand::Model
+                | SlashCommand::Presets
                 | SlashCommand::Keymap
                 | SlashCommand::Memories
+                | SlashCommand::Config
                 | SlashCommand::Title
                 | SlashCommand::Statusline
                 | SlashCommand::Theme,
@@ -123,6 +125,12 @@ impl ChatWidget {
     }
 
     pub(super) fn on_modal_or_popup_closed(&mut self) {
+        if self.apply_pending_permission_profile() {
+            return;
+        }
+        if self.cancel_pending_permission_profile_selection() {
+            return;
+        }
         if self.input_queue.suppress_queue_autosend {
             self.app_event_tx.send(AppEvent::SettingsSelectionClosed);
         } else {
@@ -205,6 +213,7 @@ impl ChatWidget {
                 .queued_user_messages
                 .push_back(QueuedUserMessage {
                     user_message,
+                    prepared_images: None,
                     action,
                     delivery: MessageDelivery::Unsent,
                     pending_pastes,
@@ -271,6 +280,7 @@ impl ChatWidget {
                 QueuedInputAction::Literal => {
                     let QueuedUserMessage {
                         user_message,
+                        prepared_images,
                         pending_pastes,
                         source,
                         ..
@@ -299,11 +309,12 @@ impl ChatWidget {
                             );
                     }
                     submitted_follow_up = self
-                        .submit_user_message_with_history_and_shell_escape_policy(
+                        .submit_user_message_with_prepared_images(
                             user_message,
                             history_record,
                             ShellEscapePolicy::Disallow,
                             source,
+                            prepared_images,
                         )
                         .0;
                     if !submitted_follow_up {

@@ -325,6 +325,7 @@ async fn parent_owned_thread_blocks_settings_shortcuts() {
         event,
         AppEvent::SubmitThreadOp { .. }
             | AppEvent::UpdateModel(_)
+            | AppEvent::ApplyModelSelection { .. }
             | AppEvent::UpdateReasoningEffort(_)
             | AppEvent::UpdatePlanModeReasoningEffort(_)
     )));
@@ -388,6 +389,7 @@ async fn parent_owned_thread_preserves_queued_input_before_draining() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ Some("gpt-5")).await;
     let queued_message = QueuedUserMessage {
         user_message: UserMessage::from("keep this queued prompt"),
+        prepared_images: None,
         action: QueuedInputAction::Plain,
         delivery: MessageDelivery::Unsent,
         pending_pastes: vec![("[Image 1]".to_string(), "pasted contents".to_string())],
@@ -1009,6 +1011,68 @@ async fn submission_prefers_selected_duplicate_skill_path() {
         })
         .collect::<Vec<_>>();
     assert_eq!(selected_skill_paths, vec![user_skill_path.to_path_buf()]);
+}
+
+#[tokio::test]
+async fn plugin_mention_does_not_suppress_same_name_skill() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.set_feature_enabled(Feature::Plugins, /*enabled*/ true);
+    chat.bottom_pane
+        .set_plugin_mentions(Some(vec![PluginCapabilitySummary {
+            config_name: "app-0123456789abcdef0123456789abcdef@test".to_string(),
+            display_name: "foo".to_string(),
+            plugin_namespace: None,
+            description: None,
+            has_skills: true,
+            mcp_server_names: Vec::new(),
+            app_connector_ids: Vec::new(),
+        }]));
+    let skill_path = test_path_buf("/tmp/foo/SKILL.md").abs();
+    chat.set_skills(Some(vec![SkillMetadata {
+        name: "foo".to_string(),
+        description: "Foo skill".to_string(),
+        short_description: None,
+        interface: None,
+        dependencies: None,
+        path: skill_path.clone().into(),
+        scope: crate::test_support::skill_scope_user(),
+        enabled: true,
+        plugin_id: None,
+    }]));
+
+    chat.submit_user_message(UserMessage {
+        text: "@foo $foo".to_string(),
+        local_images: Vec::new(),
+        remote_image_urls: Vec::new(),
+        text_elements: Vec::new(),
+        mention_bindings: vec![MentionBinding {
+            sigil: '@',
+            mention: "foo".to_string(),
+            path: "plugin://app-0123456789abcdef0123456789abcdef@test".to_string(),
+        }],
+    });
+
+    let Op::UserTurn { items, .. } = next_submit_op(&mut op_rx) else {
+        panic!("expected Op::UserTurn");
+    };
+    assert_eq!(
+        items,
+        vec![
+            UserInput::Text {
+                text: "@foo $foo".to_string(),
+                text_elements: Vec::new(),
+            },
+            UserInput::Skill {
+                name: "foo".to_string(),
+                path: skill_path.to_path_buf(),
+            },
+            UserInput::Mention {
+                name: "foo".to_string(),
+                path: "plugin://app-0123456789abcdef0123456789abcdef@test".to_string(),
+            },
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1810,6 +1874,8 @@ async fn restore_thread_input_state_applies_running_state_policy() {
     let input_state = ThreadInputState {
         questions: None,
         pending_thread_settings: None,
+        initial_user_message: None,
+        startup_submission: None,
         composer: Some(ThreadComposerState {
             text: "composer draft".to_string(),
             ..Default::default()
@@ -1833,6 +1899,7 @@ async fn restore_thread_input_state_applies_running_state_policy() {
         current_collaboration_mode: chat.current_collaboration_mode.clone(),
         active_collaboration_mask: chat.active_collaboration_mask.clone(),
         plan_mode_reasoning_effort: chat.config.plan_mode_reasoning_effort.clone(),
+        status_surface_overrides: StatusSurfaceOverrides::default(),
         task_running: true,
         agent_turn_running: true,
     };
@@ -2366,10 +2433,13 @@ async fn reconnect_resumes_unsent_input_and_reconciles_confirmed_submissions() {
     for pending_start in [false, true] {
         let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
         chat.thread_id = Some(ThreadId::new());
-        if !pending_start {
+        if pending_start {
+            chat.prepare_safety_recourse_rewrite("first message")
+                .unwrap();
+        } else {
             handle_turn_started(&mut chat, "turn-1");
+            chat.submit_user_message("first message".into());
         }
-        chat.submit_user_message("first message".into());
         let client_id = if pending_start {
             chat.input_queue
                 .pending_user_message_client_id
@@ -2383,6 +2453,8 @@ async fn reconnect_resumes_unsent_input_and_reconciles_confirmed_submissions() {
             .push_back(UserMessage::from("follow-up").into());
         chat.pause_for_disconnect();
         let mut input = chat.capture_thread_input_state();
+        let saved_source = input.as_ref().unwrap().safety_buffering_source;
+        assert_eq!(saved_source, UserMessageSource::Prompt);
         // Missing history and unrelated receipts never authorize resubmitting uncertain input.
         for ids in [
             vec![],
@@ -2760,6 +2832,7 @@ fn image_preparation_keeps_input_responsive_and_preserves_pending_input() {
                 if scenario == "rate_limit_recovery" {
                     chat.input_queue.rate_limit_recovery_pending = true;
                     chat.on_images_prepared(id);
+                    std::fs::remove_file(&message.local_images[0].path).unwrap();
                     assert_eq!(
                         chat.input_queue
                             .queued_user_messages
@@ -2768,6 +2841,10 @@ fn image_preparation_keeps_input_responsive_and_preserves_pending_input() {
                             .collect::<Vec<_>>(),
                         vec![message, UserMessage::from("x")],
                     );
+                    chat.input_queue.rate_limit_recovery_pending = false;
+                    assert!(chat.maybe_send_next_queued_input());
+                    assert_matches!(next_submit_op(&mut ops), Op::UserTurn { items, .. }
+                        if matches!(items.first(), Some(UserInput::Image { .. })));
                 } else if scenario == "model_change" {
                     chat.handle_paste("new draft".into());
                     let mut models = chat.model_catalog.try_list_models().unwrap();

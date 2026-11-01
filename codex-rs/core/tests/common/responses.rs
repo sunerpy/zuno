@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -103,6 +104,19 @@ fn assert_turn_id(body: &Value, key: &str, expected: Option<&str>) -> Result<()>
 
 #[derive(Debug, Clone)]
 pub struct ResponsesRequest(wiremock::Request);
+
+pub async fn received_analytics_events(server: &MockServer, event_type: &str) -> Vec<Value> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| request.url.path() == "/codex/analytics-events/events")
+        .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+        .flat_map(|payload| payload["events"].as_array().cloned().unwrap_or_default())
+        .filter(|event| event["event_type"] == event_type)
+        .collect()
+}
 
 pub async fn received_responses_requests(server: &MockServer) -> Vec<ResponsesRequest> {
     server
@@ -588,6 +602,7 @@ pub struct WebSocketConnectionConfig {
 
 pub struct WebSocketTestServer {
     uri: String,
+    response_gates: Arc<Mutex<HashMap<String, oneshot::Receiver<()>>>>,
     connections: Arc<Mutex<Vec<Vec<WebSocketRequest>>>>,
     handshakes: Arc<Mutex<Vec<WebSocketHandshake>>>,
     request_log_updated: Arc<Notify>,
@@ -597,6 +612,20 @@ pub struct WebSocketTestServer {
 }
 
 impl WebSocketTestServer {
+    /// Pause before the next matching event until the sender is released.
+    /// Install the gate before submitting the request that produces the event.
+    pub fn gate_response_event(&self, event: &Value) -> oneshot::Sender<()> {
+        let (release, gate) = oneshot::channel();
+        assert!(
+            self.response_gates
+                .lock()
+                .unwrap()
+                .insert(event.to_string(), gate)
+                .is_none()
+        );
+        release
+    }
+
     pub fn uri(&self) -> &str {
         &self.uri
     }
@@ -832,6 +861,8 @@ pub fn ev_assistant_message(id: &str, text: &str) -> Value {
 
 pub fn user_message_item(text: &str) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -1242,6 +1273,8 @@ pub async fn start_websocket_server_with_headers(
     let connections_log = Arc::new(Mutex::new(Vec::new()));
     let handshakes_log = Arc::new(Mutex::new(Vec::new()));
     let request_log_updated = Arc::new(Notify::new());
+    let response_gates = Arc::new(Mutex::new(HashMap::new()));
+    let gates = Arc::clone(&response_gates);
     let (closed_tx, closed_connections) = watch::channel(0);
     let requests = Arc::clone(&connections_log);
     let handshakes = Arc::clone(&handshakes_log);
@@ -1323,7 +1356,9 @@ pub async fn start_websocket_server_with_headers(
                 log.len() - 1
             };
             let close_after_requests = connection.close_after_requests;
-            for request_events in connection.requests {
+            let mut response_complete = false;
+            let mut batches = connection.requests.into_iter().peekable();
+            while let Some(request_events) = batches.peek() {
                 let message = tokio::select! {
                     _ = &mut shutdown_rx => return,
                     message = ws_stream.next() => message,
@@ -1332,6 +1367,7 @@ pub async fn start_websocket_server_with_headers(
                     break;
                 };
                 if let Some(body) = parse_ws_request_body(message) {
+                    let late_interrupt = response_complete && body["type"] == "response.interrupt";
                     let mut log = requests.lock().unwrap();
                     if let Some(connection_log) = log.get_mut(connection_index) {
                         connection_log.push(WebSocketRequest { body });
@@ -1365,6 +1401,10 @@ pub async fn start_websocket_server_with_headers(
                         );
                     }
                     request_log.notify_waiters();
+                    // A late interrupt cannot consume the next response's script.
+                    if late_interrupt {
+                        continue;
+                    }
                 }
 
                 eprintln!(
@@ -1380,14 +1420,26 @@ pub async fn start_websocket_server_with_headers(
                         .iter()
                         .find_map(|event| event.get("delta").and_then(Value::as_str)),
                 );
-                for event in &request_events {
+                for event in request_events {
                     let Ok(payload) = serde_json::to_string(event) else {
                         continue;
                     };
+                    let gate = gates.lock().unwrap().remove(&payload);
+                    if let Some(gate) = gate {
+                        tokio::select! {
+                            _ = &mut shutdown_rx => return,
+                            _ = gate => {},
+                        }
+                    }
                     if ws_stream.send(Message::Text(payload.into())).await.is_err() {
                         break;
                     }
+                    response_complete = matches!(
+                        event["type"].as_str(),
+                        Some("response.completed" | "response.incomplete" | "response.failed")
+                    );
                 }
+                batches.next();
             }
 
             if close_after_requests {
@@ -1406,6 +1458,7 @@ pub async fn start_websocket_server_with_headers(
 
     WebSocketTestServer {
         uri,
+        response_gates,
         connections: connections_log,
         handshakes: handshakes_log,
         request_log_updated,

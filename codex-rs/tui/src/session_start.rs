@@ -38,6 +38,7 @@ impl SessionStartAction {
         local_settings: &LocalSettings,
         target: &SessionTarget,
     ) -> Result<AppServerStartedThread> {
+        target.ensure_backend(app_server.backend_id())?;
         match self {
             Self::Resume(settings, permissions) => {
                 app_server
@@ -87,6 +88,7 @@ pub(crate) async fn complete_session_start(
     initial_result: Result<AppServerStartedThread>,
     confirm: impl AsyncFnOnce() -> Result<UnarchiveChoice>,
 ) -> Result<SessionStartOutcome> {
+    target.ensure_backend(app_server.backend_id())?;
     match initial_result {
         Ok(started) => return Ok(SessionStartOutcome::Started(Box::new(started))),
         Err(err) => {
@@ -103,10 +105,10 @@ pub(crate) async fn complete_session_start(
 
     match confirm().await? {
         UnarchiveChoice::Cancel => {
-            return Ok(match app_server_target {
-                crate::AppServerTarget::LocalDaemon { .. }
-                | crate::AppServerTarget::Remote { .. } => SessionStartOutcome::CommandCenter,
-                crate::AppServerTarget::Embedded => SessionStartOutcome::Exit,
+            return Ok(if app_server_target.supports_command_center() {
+                SessionStartOutcome::CommandCenter
+            } else {
+                SessionStartOutcome::Exit
             });
         }
         UnarchiveChoice::Quit => return Ok(SessionStartOutcome::Exit),

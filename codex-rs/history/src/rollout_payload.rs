@@ -34,6 +34,9 @@ pub(super) enum RolloutItemWire<'a> {
     SessionMeta {
         payload: Cow<'a, SessionMetaLine>,
     },
+    DynamicToolsUpdated {
+        payload: DynamicToolsUpdatedPayload<'a>,
+    },
     ResponseItem {
         payload: Cow<'a, ResponseItem>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -71,11 +74,23 @@ pub(super) enum RolloutItemWire<'a> {
     },
 }
 
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub(super) struct DynamicToolsUpdatedPayload<'a> {
+    thread_id: codex_protocol::ThreadId,
+    tools: Cow<'a, [codex_protocol::dynamic_tools::DynamicToolSpec]>,
+}
+
 impl<'a> From<&'a RolloutItem> for RolloutItemWire<'a> {
     fn from(item: &'a RolloutItem) -> Self {
         match item {
             RolloutItem::SessionMeta(payload) => Self::SessionMeta {
                 payload: Cow::Borrowed(payload),
+            },
+            RolloutItem::DynamicToolsUpdated { thread_id, tools } => Self::DynamicToolsUpdated {
+                payload: DynamicToolsUpdatedPayload {
+                    thread_id: *thread_id,
+                    tools: Cow::Borrowed(tools),
+                },
             },
             RolloutItem::ResponseItem(envelope) => Self::ResponseItem {
                 payload: Cow::Borrowed(&envelope.item),
@@ -120,9 +135,15 @@ impl<'a> From<&'a RolloutItem> for RolloutItemWire<'a> {
                 };
                 Self::ResponseItem {
                     payload: Cow::Owned(ResponseItem::Message {
+                        status: None,
+                        encrypted_content: None,
                         id: message.message_id.clone().map(ResponseItemId::from_server),
                         role: "assistant".to_owned(),
-                        content: vec![ContentItem::OutputText { text }],
+                        content: vec![ContentItem::OutputText {
+                            annotations: None,
+                            logprobs: None,
+                            text,
+                        }],
                         // Older Guardian clients exclude commentary from root-to-worker
                         // review. Keep the phase unspecified so they can review this
                         // confirmed delivery without claiming it ended the turn.
@@ -160,7 +181,13 @@ impl<'a> From<&'a RolloutItem> for RolloutItemWire<'a> {
 impl From<RolloutItemWire<'_>> for RolloutItem {
     fn from(item: RolloutItemWire<'_>) -> Self {
         match item {
-            RolloutItemWire::SessionMeta { payload } => Self::SessionMeta(payload.into_owned()),
+            RolloutItemWire::SessionMeta { payload } => {
+                Self::SessionMeta(Box::new(payload.into_owned()))
+            }
+            RolloutItemWire::DynamicToolsUpdated { payload } => Self::DynamicToolsUpdated {
+                thread_id: payload.thread_id,
+                tools: payload.tools.into_owned(),
+            },
             RolloutItemWire::ResponseItem { payload, metadata } => {
                 if let (
                     ResponseItem::Message {
@@ -173,7 +200,7 @@ impl From<RolloutItemWire<'_>> for RolloutItem {
                     Some(metadata),
                 ) = (payload.as_ref(), metadata.as_deref())
                     && role == "assistant"
-                    && let [ContentItem::OutputText { text }] = content.as_slice()
+                    && let [ContentItem::OutputText { text, .. }] = content.as_slice()
                     && let Some(turn_id) = passthrough.turn_id.as_ref()
                     && let Some(acceptance_order) = metadata.user_input_order
                     && let Some(marker) = metadata.delivered_assistant_message.as_deref()
@@ -212,7 +239,9 @@ impl From<RolloutItemWire<'_>> for RolloutItem {
                     trigger_turn: payload.trigger_turn,
                 }
             }
-            RolloutItemWire::Compacted { payload } => Self::Compacted(payload.into_owned()),
+            RolloutItemWire::Compacted { payload } => {
+                Self::Compacted(Box::new(payload.into_owned()))
+            }
             RolloutItemWire::TurnContext { payload } => Self::TurnContext(payload.into_owned()),
             RolloutItemWire::TokenUsageRecord { payload } => {
                 Self::TokenUsageRecord(payload.into_owned())

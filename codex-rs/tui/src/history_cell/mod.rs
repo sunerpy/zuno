@@ -104,6 +104,8 @@ const RAW_DIFF_SUMMARY_WIDTH: usize = 10_000;
 mod activity_details;
 pub(crate) mod activity_preview;
 mod approvals;
+mod async_questions;
+mod async_replies;
 mod base;
 mod dynamic;
 mod exec;
@@ -223,6 +225,11 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
 
     /// Returns copy-friendly plain logical lines for raw scrollback mode.
     fn raw_lines(&self) -> Vec<Line<'static>>;
+
+    /// A local artifact the owned fullscreen viewport may preview. Text surfaces ignore it.
+    fn image_path(&self) -> Option<AbsolutePathBuf> {
+        None
+    }
 
     /// Raw live presentation may omit transcript-only diagnostics without losing their source.
     fn live_raw_lines(&self) -> Vec<Line<'static>> {

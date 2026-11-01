@@ -336,6 +336,7 @@ async fn wait_for_result(
                         WaitRequest {
                             cell_id: cell_id.clone(),
                             yield_time_ms: WAIT_YIELD_TIME_MS,
+                            max_output_tokens: None,
                         },
                         /*preempt*/ None,
                     )
@@ -389,7 +390,7 @@ async fn terminate_run(
     stop_reason: WorkflowStopReason,
     message: String,
 ) -> WorkflowResult {
-    match session.terminate(cell_id.clone()).await {
+    match session.terminate(cell_id.clone().into()).await {
         Ok(_) => WorkflowResult {
             value: JsonValue::Null,
             stop_reason,

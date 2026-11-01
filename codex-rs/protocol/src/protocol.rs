@@ -19,6 +19,7 @@ use crate::ResponseItemId;
 use crate::SanitizedGitUrl;
 use crate::SessionId;
 use crate::ThreadId;
+use crate::approvals::ElicitationAbandonedEvent;
 use crate::approvals::ElicitationRequestEvent;
 use crate::capabilities::SelectedCapabilityRoot;
 use crate::config_types::ApprovalsReviewer;
@@ -64,8 +65,11 @@ use crate::turn_input::TurnInputMode;
 use crate::turn_input::TurnInputRequest;
 use crate::turn_input::TurnInputSubmission;
 use crate::turn_input::TurnStartOptions;
+use codex_extension_items::image_generation::GeneratedImageRef;
 use codex_extension_items::image_generation::ImageGenerationFailure;
+use codex_extension_items::image_generation::ImageGenerationInputImage;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -177,7 +181,7 @@ pub struct W3cTraceContext {
     pub tracestate: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct ConversationStartParams {
     /// Whether Codex response handoffs are managed through explicit client append calls.
     pub client_managed_handoffs: bool,
@@ -212,10 +216,24 @@ pub struct ConversationStartParams {
     pub realtime_end_instructions: Option<String>,
     pub prompt: Option<Option<String>>,
     pub realtime_session_id: Option<String>,
+    /// Client-generated identifier for the product voice session. This is distinct from the
+    /// Realtime API session identifier.
+    pub voice_session_id: Option<String>,
     pub transport: Option<ConversationStartTransport>,
     /// Overrides the configured realtime protocol version for this session only.
     pub version: Option<RealtimeConversationVersion>,
     pub voice: Option<RealtimeVoice>,
+}
+
+impl fmt::Debug for ConversationStartParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Text, instructions, and transport endpoints can contain credentials.
+        f.debug_struct("ConversationStartParams")
+            .field("output_modality", &self.output_modality)
+            .field("initial_items_count", &self.initial_items.len())
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -249,22 +267,38 @@ pub enum RealtimeVoice {
     Alloy,
     Arbor,
     Ash,
+    Aube,
     Ballad,
     Breeze,
+    Bubbie,
     Cedar,
     Coral,
     Cove,
     Echo,
     Ember,
+    Haetsal,
+    Hanul,
+    Himari,
     Juniper,
+    Leher,
     Maple,
     Marin,
+    Miko,
+    Neer,
+    Porto,
+    Rindo,
+    Rio,
+    Rivage,
     Sage,
+    Selva,
     Shimmer,
     Sol,
+    Sonna,
     Spruce,
+    Tinta,
     Vale,
     Verse,
+    Viola,
 }
 
 impl RealtimeVoice {
@@ -273,22 +307,38 @@ impl RealtimeVoice {
             Self::Alloy => "alloy",
             Self::Arbor => "arbor",
             Self::Ash => "ash",
+            Self::Aube => "aube",
             Self::Ballad => "ballad",
             Self::Breeze => "breeze",
+            Self::Bubbie => "bubbie",
             Self::Cedar => "cedar",
             Self::Coral => "coral",
             Self::Cove => "cove",
             Self::Echo => "echo",
             Self::Ember => "ember",
+            Self::Haetsal => "haetsal",
+            Self::Hanul => "hanul",
+            Self::Himari => "himari",
             Self::Juniper => "juniper",
+            Self::Leher => "leher",
             Self::Maple => "maple",
             Self::Marin => "marin",
+            Self::Miko => "miko",
+            Self::Neer => "neer",
+            Self::Porto => "porto",
+            Self::Rindo => "rindo",
+            Self::Rio => "rio",
+            Self::Rivage => "rivage",
             Self::Sage => "sage",
+            Self::Selva => "selva",
             Self::Shimmer => "shimmer",
             Self::Sol => "sol",
+            Self::Sonna => "sonna",
             Self::Spruce => "spruce",
+            Self::Tinta => "tinta",
             Self::Vale => "vale",
             Self::Verse => "verse",
+            Self::Viola => "viola",
         }
     }
 }
@@ -299,6 +349,9 @@ impl RealtimeVoice {
 pub struct RealtimeVoicesList {
     pub v1: Vec<RealtimeVoice>,
     pub v2: Vec<RealtimeVoice>,
+    #[serde(default)]
+    #[ts(as = "Option<_>", optional)]
+    pub v3: Vec<RealtimeVoice>,
     pub default_v1: RealtimeVoice,
     pub default_v2: RealtimeVoice,
 }
@@ -328,6 +381,33 @@ impl RealtimeVoicesList {
                 RealtimeVoice::Verse,
                 RealtimeVoice::Marin,
                 RealtimeVoice::Cedar,
+            ],
+            v3: vec![
+                RealtimeVoice::Juniper,
+                RealtimeVoice::Maple,
+                RealtimeVoice::Spruce,
+                RealtimeVoice::Ember,
+                RealtimeVoice::Vale,
+                RealtimeVoice::Breeze,
+                RealtimeVoice::Arbor,
+                RealtimeVoice::Sol,
+                RealtimeVoice::Cove,
+                RealtimeVoice::Aube,
+                RealtimeVoice::Bubbie,
+                RealtimeVoice::Haetsal,
+                RealtimeVoice::Hanul,
+                RealtimeVoice::Himari,
+                RealtimeVoice::Leher,
+                RealtimeVoice::Miko,
+                RealtimeVoice::Neer,
+                RealtimeVoice::Porto,
+                RealtimeVoice::Rindo,
+                RealtimeVoice::Rio,
+                RealtimeVoice::Rivage,
+                RealtimeVoice::Selva,
+                RealtimeVoice::Sonna,
+                RealtimeVoice::Tinta,
+                RealtimeVoice::Viola,
             ],
             default_v1: RealtimeVoice::Cove,
             default_v2: RealtimeVoice::Marin,
@@ -570,6 +650,45 @@ pub enum AdditionalContextKind {
 pub struct AdditionalContextEntry {
     pub value: String,
     pub kind: AdditionalContextKind,
+    /// Optional name for untrusted context, used to label its tool output.
+    pub name: Option<String>,
+}
+
+impl AdditionalContextEntry {
+    /// Creates an unnamed context entry.
+    pub fn new(value: String, kind: AdditionalContextKind) -> Self {
+        Self {
+            value,
+            kind,
+            name: None,
+        }
+    }
+
+    /// Sets the name for untrusted context.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Validates the optional untrusted-context name before input admission.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let Some(name) = &self.name else {
+            return Ok(());
+        };
+        if self.kind == AdditionalContextKind::Application {
+            return Err("additional context name is only supported for untrusted context");
+        }
+        if name.is_empty()
+            || name.len() > 64
+            || !name.as_bytes()[0].is_ascii_lowercase()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return Err("additional context name must match [a-z][a-z0-9_]{0,63}");
+        }
+        Ok(())
+    }
 }
 
 /// Submission operation
@@ -598,6 +717,12 @@ pub enum Op {
     #[debug("RealtimeConversationStart {{ session_id: {:?}, version: {:?}, output_modality: {:?} }}", _0.realtime_session_id, _0.version, _0.output_modality)]
     RealtimeConversationStart(ConversationStartParams),
 
+    /// Start a realtime conversation and report completion of the connection attempt.
+    RealtimeConversationAttach {
+        params: ConversationStartParams,
+        reply: oneshot::Sender<CodexResult<()>>,
+    },
+
     /// Send audio input to the running realtime conversation stream.
     #[debug("RealtimeConversationAudio {{ item_id: {:?}, sample_rate: {}, num_channels: {}, samples_per_channel: {:?} }}", _0.frame.item_id, _0.frame.sample_rate, _0.frame.num_channels, _0.frame.samples_per_channel)]
     RealtimeConversationAudio(ConversationAudioParams),
@@ -612,6 +737,12 @@ pub enum Op {
 
     /// Close the running realtime conversation stream.
     RealtimeConversationClose,
+
+    /// Close only the matching session after earlier start operations finish.
+    RealtimeConversationDetach {
+        realtime_session_id: String,
+        reply: oneshot::Sender<CodexResult<()>>,
+    },
 
     /// Request the list of voices supported by realtime conversation streams.
     RealtimeConversationListVoices,
@@ -649,6 +780,13 @@ pub enum Op {
         /// When present, report validation errors here instead of emitting an error event.
         /// Successful updates still emit `ThreadSettingsApplied` for all callers.
         reply: Option<oneshot::Sender<CodexResult<()>>>,
+    },
+
+    /// Replace the dynamic tool catalog without starting a turn.
+    #[debug("ReplaceDynamicTools")]
+    ReplaceDynamicTools {
+        tools: Vec<DynamicToolSpec>,
+        reply: oneshot::Sender<CodexResult<()>>,
     },
 
     /// Update only the named running turn, without changing future settings.
@@ -894,6 +1032,8 @@ impl InterAgentCommunication {
         ResponseInputItem::Message {
             role: "assistant".to_string(),
             content: vec![ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
                 text: serde_json::to_string(&communication).unwrap_or_default(),
             }],
             phase: Some(MessagePhase::Commentary),
@@ -941,7 +1081,7 @@ impl InterAgentCommunication {
 
     pub fn from_message_content(content: &[ContentItem]) -> Option<Self> {
         match content {
-            [ContentItem::InputText { text }] | [ContentItem::OutputText { text }] => {
+            [ContentItem::InputText { text }] | [ContentItem::OutputText { text, .. }] => {
                 serde_json::from_str(text).ok()
             }
             _ => None,
@@ -956,15 +1096,18 @@ impl Op {
             Self::InterruptIfNoPendingInput { .. } => "interrupt_if_no_pending_input",
             Self::CleanBackgroundTerminals => "clean_background_terminals",
             Self::RealtimeConversationStart(_) => "realtime_conversation_start",
+            Self::RealtimeConversationAttach { .. } => "realtime_conversation_attach",
             Self::RealtimeConversationAudio(_) => "realtime_conversation_audio",
             Self::RealtimeConversationText(_) => "realtime_conversation_text",
             Self::RealtimeConversationSpeech(_) => "realtime_conversation_speech",
             Self::RealtimeConversationClose => "realtime_conversation_close",
+            Self::RealtimeConversationDetach { .. } => "realtime_conversation_detach",
             Self::RealtimeConversationListVoices => "realtime_conversation_list_voices",
             Self::TurnInput { .. } => "turn_input",
             Self::RecoverTurn { .. } => "recover_turn",
             Self::SuspendTurnAndShutdown { .. } => "suspend_turn_and_shutdown",
             Self::ThreadSettings { .. } => "thread_settings",
+            Self::ReplaceDynamicTools { .. } => "replace_dynamic_tools",
             Self::TurnSettings { .. } => "turn_settings",
             Self::InterAgentCommunication { .. } => "inter_agent_communication",
             Self::ExecApproval { .. } => "exec_approval",
@@ -1517,6 +1660,9 @@ pub enum EventMsg {
 
     ElicitationRequest(ElicitationRequestEvent),
 
+    /// An unanswered MCP responder was abandoned at its original unbounded source.
+    ElicitationAbandoned(ElicitationAbandonedEvent),
+
     ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent),
 
     /// Structured lifecycle event for a guardian-reviewed approval request.
@@ -1561,6 +1707,12 @@ pub enum EventMsg {
     RawResponseItem(RawResponseItemEvent),
     RawResponseCompleted(RawResponseCompletedEvent),
 
+    /// In-process delivery from a private reviewer through its parent's subscription.
+    #[serde(skip)]
+    #[schemars(skip)]
+    #[ts(skip)]
+    PrivateSessionEvent(PrivateSessionEvent),
+
     ItemStarted(ItemStartedEvent),
     ItemCompleted(ItemCompletedEvent),
     HookStarted(HookStartedEvent),
@@ -1596,6 +1748,34 @@ pub enum EventMsg {
     SubAgentActivity(SubAgentActivityEvent),
 }
 
+impl EventMsg {
+    /// Returns the ID and start time of the command this approval opens.
+    /// Stdin and network reviews have their own prompts for an existing operation.
+    pub fn command_approval_start(&self) -> Option<(&str, i64)> {
+        match self {
+            Self::ExecApprovalRequest(request)
+                if request.approval_id.is_none() && request.network_approval_context.is_none() =>
+            {
+                Some((&request.call_id, request.started_at_ms))
+            }
+            Self::GuardianAssessment(assessment)
+                if assessment.status == GuardianAssessmentStatus::InProgress
+                    && matches!(
+                        assessment.action,
+                        GuardianAssessmentAction::Command { .. }
+                            | GuardianAssessmentAction::Execve { .. }
+                    ) =>
+            {
+                Some((
+                    assessment.target_item_id.as_deref()?,
+                    assessment.started_at_ms,
+                ))
+            }
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS, EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum HookEventName {
@@ -1611,6 +1791,8 @@ pub enum HookEventName {
     SubagentStop,
     Stop,
     Interrupt,
+    PreModelRequest,
+    PostModelRequest,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -1702,7 +1884,7 @@ pub struct HookRunSummary {
     pub handler_type: HookHandlerType,
     pub execution_mode: HookExecutionMode,
     pub scope: HookScope,
-    pub source_path: AbsolutePathBuf,
+    pub source_path: LegacyAppPathString,
     #[serde(default)]
     pub source: HookSource,
     pub display_order: i64,
@@ -1880,6 +2062,9 @@ pub enum CodexErrorInfo {
     RateLimitExceeded,
     FlexUnavailable,
     ServerOverloaded,
+    ModelNotFound,
+    /// Capacity is unavailable on a route restricted by server policy.
+    PolicyCapacityUnavailable,
     CyberPolicy,
     BioPolicy,
     MisalignmentPolicyViolation,
@@ -1925,6 +2110,8 @@ impl CodexErrorInfo {
             | Self::RateLimitExceeded
             | Self::FlexUnavailable
             | Self::ServerOverloaded
+            | Self::ModelNotFound
+            | Self::PolicyCapacityUnavailable
             | Self::CyberPolicy
             | Self::BioPolicy
             | Self::MisalignmentPolicyViolation
@@ -1946,6 +2133,20 @@ impl CodexErrorInfo {
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
 pub struct RawResponseItemEvent {
     pub item: ResponseItem,
+}
+
+/// Observer events that a private session forwards without modifying its parent's history.
+#[derive(Debug, Clone)]
+pub struct PrivateSessionEvent {
+    pub thread_id: ThreadId,
+    pub event: PrivateSessionEventPayload,
+}
+
+/// Recorded state and cancellation needed by observers awaiting response acceptance.
+#[derive(Debug, Clone)]
+pub enum PrivateSessionEventPayload {
+    RecordedItem(RawResponseItemEvent),
+    TurnAborted(TurnAbortedEvent),
 }
 
 /// Exact usage and metadata reported by one upstream Responses API completion.
@@ -2311,6 +2512,10 @@ pub struct TokenUsageRecord {
 pub struct TokenUsageInfo {
     pub total_token_usage: TokenUsage,
     pub last_token_usage: TokenUsage,
+    /// Whether the last context count includes reasoning retained from earlier turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub last_usage_includes_reasoning: Option<bool>,
     // TODO(aibrahim): make this not optional
     #[ts(type = "number | null")]
     pub model_context_window: Option<i64>,
@@ -2319,33 +2524,26 @@ pub struct TokenUsageInfo {
 impl TokenUsageInfo {
     pub fn new_or_append(
         info: &Option<TokenUsageInfo>,
-        last: &Option<TokenUsage>,
+        last: &TokenUsage,
+        includes_reasoning: bool,
         model_context_window: Option<i64>,
-    ) -> Option<Self> {
-        if info.is_none() && last.is_none() {
-            return None;
-        }
-
+    ) -> Self {
         let mut info = match info {
             Some(info) => info.clone(),
             None => Self {
                 total_token_usage: TokenUsage::default(),
+                last_usage_includes_reasoning: None,
                 last_token_usage: TokenUsage::default(),
                 model_context_window,
             },
         };
-        if let Some(last) = last {
-            info.append_last_usage(last);
-        }
+        info.total_token_usage.add_assign(last);
+        info.last_token_usage = last.clone();
+        info.last_usage_includes_reasoning = Some(includes_reasoning);
         if let Some(model_context_window) = model_context_window {
             info.model_context_window = Some(model_context_window);
         }
-        Some(info)
-    }
-
-    pub fn append_last_usage(&mut self, last: &TokenUsage) {
-        self.total_token_usage.add_assign(last);
-        self.last_token_usage = last.clone();
+        info
     }
 
     pub fn fill_to_context_window(&mut self, context_window: i64) {
@@ -2357,6 +2555,7 @@ impl TokenUsageInfo {
             total_tokens: context_window,
             ..TokenUsage::default()
         };
+        self.last_usage_includes_reasoning = None;
         self.last_token_usage = TokenUsage {
             total_tokens: delta,
             ..TokenUsage::default()
@@ -2366,6 +2565,7 @@ impl TokenUsageInfo {
     pub fn full_context_window(context_window: i64) -> Self {
         let mut info = Self {
             total_token_usage: TokenUsage::default(),
+            last_usage_includes_reasoning: None,
             last_token_usage: TokenUsage::default(),
             model_context_window: Some(context_window),
         };
@@ -2834,7 +3034,8 @@ pub struct ImageGenerationEndEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub revised_prompt: Option<String>,
-    pub result: String,
+    #[serde(flatten)]
+    pub image: GeneratedImageRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub transparent_background: Option<bool>,
@@ -2844,6 +3045,12 @@ pub struct ImageGenerationEndEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub saved_path: Option<AbsolutePathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<_>", optional)]
+    pub input_images: Vec<ImageGenerationInputImage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub generation_id: Option<String>,
 }
 
 // Conversation kept for backward compatibility.
@@ -3167,6 +3374,9 @@ pub struct SessionMeta {
     pub id: ThreadId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub forked_from_id: Option<ThreadId>,
+    /// Marks a persisted fork as attached to `forked_from_id`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attached_thread: bool,
     /// Exclusive ordinal inherited from the logical fork parent, independent of `history_base`.
     /// Revert may replace the physical history base while retaining this fork boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3241,6 +3451,7 @@ impl Default for SessionMeta {
             session_id: id.into(),
             id,
             forked_from_id: None,
+            attached_thread: false,
             forked_from_ordinal_exclusive: None,
             parent_thread_id: None,
             timestamp: String::new(),
@@ -3393,6 +3604,19 @@ impl TurnContextItem {
     }
 }
 
+/// Estimate the model-visible content length of an encrypted compaction.
+///
+/// The payload can contain summary text, sampled-token replay caches, and
+/// encryption/base64 overhead. Normalize the roughly threefold payload growth
+/// observed with replay caches before applying the usual four-byte text
+/// heuristic: twelve ciphertext bytes per estimated token, rounded up.
+/// This restores the earlier budgeting scale, not exact tokenizer counts, and
+/// can underestimate legacy checkpoints without caches. Callers must enforce
+/// transport-size limits separately.
+pub fn estimate_compaction_content_length(encoded_len: usize) -> usize {
+    encoded_len.div_ceil(3)
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(tag = "mode", content = "limit", rename_all = "snake_case")]
 pub enum TruncationPolicy {
@@ -3461,13 +3685,6 @@ pub struct GitInfo {
     )]
     #[schemars(with = "Option<String>")]
     pub repository_url: Option<SanitizedGitUrl>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "snake_case")]
-pub enum ReviewDelivery {
-    Inline,
-    Detached,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema, TS)]
@@ -4522,6 +4739,10 @@ pub struct CollabResumeEndEvent {
 }
 
 #[cfg(test)]
+#[path = "conversation_start_params_tests.rs"]
+mod conversation_start_params_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::items::CommandExecutionItem;
@@ -4759,6 +4980,8 @@ mod tests {
             ResponseInputItem::Message {
                 role: "assistant".to_string(),
                 content: vec![ContentItem::OutputText {
+                    annotations: None,
+                    logprobs: None,
                     text: serde_json::to_string(&serialized_communication)
                         .expect("serialize communication"),
                 }],
@@ -5501,7 +5724,12 @@ mod tests {
                 assert_eq!(event.call_id, "ig-1");
                 assert_eq!(event.status, "completed");
                 assert_eq!(event.revised_prompt.as_deref(), Some("A tiny blue square"));
-                assert_eq!(event.result, "Zm9v");
+                assert_eq!(
+                    event.image,
+                    GeneratedImageRef::Inline {
+                        result: "Zm9v".to_string(),
+                    }
+                );
                 assert_eq!(
                     event.saved_path.as_ref().map(AbsolutePathBuf::as_path),
                     Some(test_path_buf("/tmp/ig-1.png").as_path())
@@ -5974,6 +6202,7 @@ mod tests {
                     RealtimeVoice::Marin,
                     RealtimeVoice::Cedar,
                 ],
+                v3: RealtimeVoicesList::builtin().v3,
                 default_v1: RealtimeVoice::Cove,
                 default_v2: RealtimeVoice::Marin,
             }
@@ -6419,10 +6648,11 @@ mod tests {
     fn token_usage_info_new_or_append_updates_context_window_when_provided() {
         let initial = Some(TokenUsageInfo {
             total_token_usage: TokenUsage::default(),
+            last_usage_includes_reasoning: None,
             last_token_usage: TokenUsage::default(),
             model_context_window: Some(258_400),
         });
-        let last = Some(TokenUsage {
+        let last = TokenUsage {
             input_tokens: 10,
             cached_input_tokens: 0,
             cache_write_input_tokens: 0,
@@ -6430,10 +6660,14 @@ mod tests {
             reasoning_output_tokens: 0,
             total_tokens: 10,
             codex_rollout_budget_units: None,
-        });
+        };
 
-        let info = TokenUsageInfo::new_or_append(&initial, &last, Some(128_000))
-            .expect("new_or_append should return info");
+        let info = TokenUsageInfo::new_or_append(
+            &initial,
+            &last,
+            /*includes_reasoning*/ true,
+            Some(128_000),
+        );
 
         assert_eq!(info.model_context_window, Some(128_000));
     }
@@ -6442,10 +6676,11 @@ mod tests {
     fn token_usage_info_new_or_append_preserves_context_window_when_not_provided() {
         let initial = Some(TokenUsageInfo {
             total_token_usage: TokenUsage::default(),
+            last_usage_includes_reasoning: None,
             last_token_usage: TokenUsage::default(),
             model_context_window: Some(258_400),
         });
-        let last = Some(TokenUsage {
+        let last = TokenUsage {
             input_tokens: 10,
             cached_input_tokens: 0,
             cache_write_input_tokens: 0,
@@ -6453,11 +6688,11 @@ mod tests {
             reasoning_output_tokens: 0,
             total_tokens: 10,
             codex_rollout_budget_units: None,
-        });
+        };
 
-        let info =
-            TokenUsageInfo::new_or_append(&initial, &last, /*model_context_window*/ None)
-                .expect("new_or_append should return info");
+        let info = TokenUsageInfo::new_or_append(
+            &initial, &last, /*includes_reasoning*/ true, /*model_context_window*/ None,
+        );
 
         assert_eq!(info.model_context_window, Some(258_400));
     }

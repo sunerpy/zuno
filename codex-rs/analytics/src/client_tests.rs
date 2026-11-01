@@ -76,7 +76,9 @@ use codex_app_server_protocol::ThreadArchiveParams;
 use codex_app_server_protocol::ThreadArchiveResponse;
 use codex_app_server_protocol::ThreadArchivedNotification;
 use codex_app_server_protocol::ThreadForkResponse;
+use codex_app_server_protocol::ThreadRealtimeClosedNotification;
 use codex_app_server_protocol::ThreadRealtimeItemAddedNotification;
+use codex_app_server_protocol::ThreadRealtimeStartedNotification;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus as AppServerThreadStatus;
@@ -93,6 +95,8 @@ use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 #[cfg(debug_assertions)]
 use codex_login::AuthManager;
+use codex_model_provider::ChatgptBaseUrl;
+use codex_protocol::protocol::RealtimeConversationVersion;
 use codex_utils_absolute_path::test_support::PathBufExt;
 use codex_utils_absolute_path::test_support::test_path_buf;
 use pretty_assertions::assert_eq;
@@ -305,7 +309,7 @@ fn client_with_receiver() -> (
 fn analytics_destination_uses_explicit_capture_file() {
     let capture_path = unique_capture_path("destination");
     let destination = AnalyticsEventsDestination::from_base_url_and_capture_file(
-        "https://chatgpt.com/backend-api/".to_string(),
+        "https://chatgpt.com/backend-api/".into(),
         Some(capture_path.clone()),
     );
 
@@ -334,31 +338,53 @@ fn analytics_destination_uses_explicit_capture_file() {
 
 #[test]
 fn analytics_destination_uses_http_without_capture_file() {
-    let destination = AnalyticsEventsDestination::from_base_url_and_capture_file(
-        "https://chatgpt.com/backend-api/".to_string(),
-        /*capture_file*/ None,
-    );
+    let commercial_url = "https://chatgpt.com/backend-api/codex/analytics-events/events";
+    let gov_url = "https://gov.chatgpt.com/backend-api/codex/analytics-events/events";
+    for (base_url, expected_urls) in [
+        (
+            ChatgptBaseUrl::Default,
+            [commercial_url, gov_url, commercial_url],
+        ),
+        (
+            ChatgptBaseUrl::from("https://chatgpt.com/backend-api/"),
+            [commercial_url; 3],
+        ),
+        (
+            ChatgptBaseUrl::from("https://proxy.example/backend-api/"),
+            ["https://proxy.example/backend-api/codex/analytics-events/events"; 3],
+        ),
+    ] {
+        let destination = AnalyticsEventsDestination::from_base_url_and_capture_file(
+            base_url.clone(),
+            /*capture_file*/ None,
+        );
+        assert_eq!(destination, AnalyticsEventsDestination::Http { base_url });
 
-    assert_eq!(
-        destination,
-        AnalyticsEventsDestination::Http {
-            url: "https://chatgpt.com/backend-api/codex/analytics-events/events".to_string()
+        for (api_key, expected_url) in ["sk-test", "sk-proj-fedramp-test", "sk-test"]
+            .into_iter()
+            .zip(expected_urls)
+        {
+            let auth = codex_login::CodexAuth::from_api_key(api_key);
+            assert_eq!(
+                destination.url_for_auth(&auth).as_deref(),
+                Some(expected_url)
+            );
         }
-    );
+    }
 }
 
 #[test]
 #[cfg(not(debug_assertions))]
 fn analytics_destination_ignores_capture_file_in_release() {
     let destination = AnalyticsEventsDestination::from_base_url_and_capture_file(
-        "https://chatgpt.com/backend-api/".to_string(),
+        "https://chatgpt.com/backend-api/".into(),
         Some(std::path::PathBuf::from("ignored.jsonl")),
     );
 
     assert_eq!(
         destination,
         AnalyticsEventsDestination::Http {
-            url: "https://chatgpt.com/backend-api/codex/analytics-events/events".to_string()
+            base_url: "https://chatgpt.com/backend-api/".into()
         }
     );
 }
@@ -591,6 +617,7 @@ fn sample_turn_steer_request() -> ClientRequest {
             client_user_message_id: None,
             input: Vec::new(),
             responsesapi_client_metadata: None,
+            responsesapi_client_metadata_patch: None,
             additional_context: None,
         },
     }
@@ -1030,6 +1057,54 @@ fn track_notification_only_enqueues_analytics_relevant_notifications() {
 }
 
 #[test]
+fn track_notification_records_realtime_session_boundaries() {
+    let (client, mut receiver) = client_with_receiver();
+
+    client.track_notification(&ServerNotification::ThreadRealtimeStarted(
+        ThreadRealtimeStartedNotification {
+            thread_id: "thread-1".to_string(),
+            realtime_session_id: Some("voice-session-1".to_string()),
+            version: RealtimeConversationVersion::V2,
+        },
+    ));
+
+    let Ok(AnalyticsEventsQueueMessage::Fact(input)) = receiver.try_recv() else {
+        panic!("expected realtime session started fact");
+    };
+    let AnalyticsFact::RealtimeSessionStarted {
+        thread_id,
+        realtime_session_id,
+        started_at,
+    } = *input
+    else {
+        panic!("expected realtime session started fact");
+    };
+    assert_eq!(thread_id, "thread-1");
+    assert_eq!(realtime_session_id.as_deref(), Some("voice-session-1"));
+    assert!(started_at > 0);
+
+    client.track_notification(&ServerNotification::ThreadRealtimeClosed(
+        ThreadRealtimeClosedNotification {
+            thread_id: "thread-1".to_string(),
+            reason: Some("completed".to_string()),
+        },
+    ));
+
+    let Ok(AnalyticsEventsQueueMessage::Fact(input)) = receiver.try_recv() else {
+        panic!("expected realtime session closed fact");
+    };
+    let AnalyticsFact::RealtimeSessionClosed {
+        thread_id,
+        closed_at,
+    } = *input
+    else {
+        panic!("expected realtime session closed fact");
+    };
+    assert_eq!(thread_id, "thread-1");
+    assert!(closed_at >= started_at);
+}
+
+#[test]
 fn realtime_handoff_tracks_only_marker_without_transcript() {
     let (client, mut receiver) = client_with_receiver();
     client.track_notification(&ServerNotification::ThreadRealtimeItemAdded(
@@ -1120,7 +1195,7 @@ async fn account_switch_between_batches_does_not_send_old_credentials() {
     assert!(controller.publish(policy.revision(), DestinationPolicy::Unrestricted));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let destination = AnalyticsEventsDestination::Http {
-        url: format!("http://{}/events", listener.local_addr().unwrap()),
+        base_url: format!("http://{}", listener.local_addr().unwrap()).into(),
     };
     let requests = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&requests);

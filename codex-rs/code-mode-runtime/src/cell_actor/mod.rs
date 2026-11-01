@@ -184,7 +184,7 @@ async fn run_cell<H: CellHost>(
                 if response_tx.is_closed() {
                     continue;
                 }
-                let response_tx = match cell_state.route_observation(mode, response_tx) {
+                let response_tx = match cell_state.route_observation(response_tx) {
                     ObservationDelivery::Running(response_tx) => response_tx,
                     ObservationDelivery::Delivered => break,
                     ObservationDelivery::Buffered | ObservationDelivery::Closed => continue,
@@ -315,13 +315,13 @@ async fn run_cell<H: CellHost>(
                     .await;
                     let event = CellEvent::Completed {
                         content_items: std::mem::take(&mut content_items),
+                        result_buffered_for: std::time::Duration::ZERO,
                         error_text: Some("exec runtime ended unexpectedly".to_string()),
                     };
                     let rejected_event = match host
                         .commit_completion(
                             HashMap::new(),
                             event,
-                            /*pending_initial_yield_items*/ None,
                             Arc::clone(&cell_state),
                         )
                         .await
@@ -471,13 +471,13 @@ async fn run_cell<H: CellHost>(
                         .await;
                         let event = CellEvent::Completed {
                             content_items: std::mem::take(&mut content_items),
+                            result_buffered_for: std::time::Duration::ZERO,
                             error_text,
                         };
                         let rejected_event = match host
                             .commit_completion(
                                 stored_value_writes,
                                 event,
-                                /*pending_initial_yield_items*/ None,
                                 Arc::clone(&cell_state),
                             )
                             .await

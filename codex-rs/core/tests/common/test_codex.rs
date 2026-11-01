@@ -159,6 +159,7 @@ pub fn environment_config_for_selection(
         None => PermissionProfileSnapshot::legacy(profile),
     };
     EnvironmentConfig {
+        environment_hooks: Default::default(),
         allow_login_shell: permissions.allow_login_shell,
         workspace_roots: selection.workspace_roots.clone(),
         permission_profile,
@@ -404,6 +405,7 @@ impl TestAuth {
 }
 
 pub struct TestCodexBuilder {
+    apps_tools_cache: codex_core::CodexAppsToolsCache,
     config_mutators: Vec<Box<ConfigMutator>>,
     thread_manager_configurer: Option<Box<dyn FnOnce(ThreadManager) -> ThreadManager + Send>>,
     auth: TestAuth,
@@ -426,6 +428,11 @@ pub struct TestCodexBuilder {
 }
 
 impl TestCodexBuilder {
+    pub fn with_apps_tools_cache(mut self, cache: codex_core::CodexAppsToolsCache) -> Self {
+        self.apps_tools_cache = cache;
+        self
+    }
+
     pub fn with_thread_store(mut self, thread_store: Arc<dyn ThreadStore>) -> Self {
         self.thread_store = Some(thread_store);
         self
@@ -862,7 +869,7 @@ impl TestCodexBuilder {
                 &config,
                 auth_manager.clone(),
                 models_manager,
-                codex_core::CodexAppsToolsCache::default(),
+                self.apps_tools_cache.clone(),
                 SessionSource::Exec,
                 Arc::clone(&environment_manager),
                 Arc::new(extensions.build()),
@@ -1521,6 +1528,7 @@ fn function_call_output<'a>(bodies: &'a [Value], call_id: &str) -> &'a Value {
 
 pub fn test_codex() -> TestCodexBuilder {
     TestCodexBuilder {
+        apps_tools_cache: Default::default(),
         thread_manager_configurer: None,
         config_mutators: vec![Box::new(|config| {
             config

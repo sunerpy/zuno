@@ -6,7 +6,7 @@ use codex_app_server_client::ExecServerRuntimeOptions;
 use codex_app_server_client::InProcessClientStartArgs;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_arg0::Arg0DispatchPaths;
-use codex_cloud_config::cloud_config_bundle_loader_for_storage;
+use codex_cloud_config::managed_config_bundle_loader_for_storage;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::ConfigLoadOptions;
 use codex_config::LoaderOverrides;
@@ -86,11 +86,12 @@ pub(crate) async fn run(
     )
     .await
     .context("failed to load bootstrap configuration for ACP")?;
-    let cloud_config_bundle = cloud_config_bundle_loader_for_storage(
+    let cloud_config_bundle = managed_config_bundle_loader_for_storage(
         embedded_network_policy.bind_bootstrap_auth(
             bootstrap_auth_config(codex_home.as_path(), &bootstrap_config)
                 .context("failed to resolve ACP cloud configuration authentication")?,
         ),
+        bootstrap_config.config_layer_stack.requirements_toml(),
         /*enable_codex_api_key_env*/ false,
     )
     .await

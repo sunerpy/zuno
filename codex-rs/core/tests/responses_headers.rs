@@ -93,6 +93,9 @@ async fn responses_stream_includes_subagent_header_on_review() {
         supports_websockets: false,
         supports_standalone_web_search: false,
         capabilities: None,
+        project_id: None,
+        location: None,
+        credential_file: None,
         include_internal_metadata: false,
     };
 
@@ -139,6 +142,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
         /*concurrent_reasoning_summaries_enabled*/ false,
+        /*output_token_replay_enabled*/ false,
         /*attestation_provider*/ None,
         config.http_client_factory(),
         config.workspace_routing_context(),
@@ -149,6 +153,8 @@ async fn responses_stream_includes_subagent_header_on_review() {
 
     let mut prompt = Prompt::default();
     prompt.input = vec![ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".into(),
         content: vec![ContentItem::InputText {
@@ -237,6 +243,9 @@ async fn responses_stream_includes_subagent_header_on_other() {
         supports_websockets: false,
         supports_standalone_web_search: false,
         capabilities: None,
+        project_id: None,
+        location: None,
+        credential_file: None,
         include_internal_metadata: false,
     };
 
@@ -283,6 +292,7 @@ async fn responses_stream_includes_subagent_header_on_other() {
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
         /*concurrent_reasoning_summaries_enabled*/ false,
+        /*output_token_replay_enabled*/ false,
         /*attestation_provider*/ None,
         config.http_client_factory(),
         config.workspace_routing_context(),
@@ -293,6 +303,8 @@ async fn responses_stream_includes_subagent_header_on_other() {
 
     let mut prompt = Prompt::default();
     prompt.input = vec![ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".into(),
         content: vec![ContentItem::InputText {
@@ -362,6 +374,9 @@ async fn responses_respects_model_info_overrides_from_config() {
         supports_websockets: false,
         supports_standalone_web_search: false,
         capabilities: None,
+        project_id: None,
+        location: None,
+        credential_file: None,
         include_internal_metadata: false,
     };
 
@@ -412,6 +427,7 @@ async fn responses_respects_model_info_overrides_from_config() {
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
         /*concurrent_reasoning_summaries_enabled*/ false,
+        /*output_token_replay_enabled*/ false,
         /*attestation_provider*/ None,
         config.http_client_factory(),
         config.workspace_routing_context(),
@@ -422,6 +438,8 @@ async fn responses_respects_model_info_overrides_from_config() {
 
     let mut prompt = Prompt::default();
     prompt.input = vec![ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".into(),
         content: vec![ContentItem::InputText {

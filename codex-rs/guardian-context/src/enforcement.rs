@@ -3,12 +3,16 @@
 //! hosts may shorten historical instructions after compaction cannot make room.
 //! Every reduction reserves an omission notice and preserves source order.
 //! JSON recovery shortens only the body; line mode shortens the whole rendered entry.
+//! Native messages and tool calls are reconciled with current history before budgeting.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 
+use codex_history::ResponseItemEnvelope;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ImageReference;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TruncationPolicy;
 
 use crate::ComposedContext;
@@ -92,6 +96,94 @@ pub enum HistoryTruncation {
 }
 
 impl ComposedContext {
+    /// Omits native messages and tool calls already present in the effective reviewer history
+    /// or earlier in this input. Hosts must repeat this check after compaction;
+    /// missing evidence may be delivered again. Identity excludes host annotations.
+    /// Conflicting payloads under one ID reject the input without changing it.
+    pub fn retain_new_native_messages(
+        &mut self,
+        reviewer_history: &[ResponseItemEnvelope],
+    ) -> Result<(), SectionError> {
+        if !self.sections.iter().any(|section| {
+            matches!(
+                &section.delivery,
+                SectionDelivery::Message(message)
+                    if matches!(message.content.item,
+                        ResponseItem::AgentMessage { .. } | ResponseItem::FunctionCall { .. })
+            )
+        }) {
+            return Ok(());
+        }
+        let mut seen_messages = HashMap::new();
+        let mut seen_calls = HashMap::new();
+        let mut duplicates = HashSet::new();
+        let pending =
+            self.sections
+                .iter()
+                .enumerate()
+                .filter_map(|(index, section)| match &section.delivery {
+                    SectionDelivery::Message(message) => Some((Some(index), &message.content.item)),
+                    SectionDelivery::UserContent(_) => None,
+                });
+        for (index, item) in reviewer_history
+            .iter()
+            .map(|item| (None, &item.item))
+            .chain(pending)
+        {
+            let duplicate = match item {
+                ResponseItem::AgentMessage {
+                    id: Some(id),
+                    author,
+                    recipient,
+                    content,
+                    ..
+                } if !id.is_empty() => {
+                    let payload = (author, recipient, content);
+                    seen_messages
+                        .insert(id, payload)
+                        .map(|previous| previous == payload)
+                }
+                ResponseItem::FunctionCall {
+                    call_id,
+                    name,
+                    namespace,
+                    arguments,
+                    encrypted_content,
+                    encrypted_function_args,
+                    ..
+                } => {
+                    let payload = (
+                        name,
+                        namespace,
+                        arguments,
+                        encrypted_content,
+                        encrypted_function_args,
+                    );
+                    seen_calls
+                        .insert(call_id, payload)
+                        .map(|previous| previous == payload)
+                }
+                _ => None,
+            };
+            match duplicate {
+                Some(false) => return Err(SectionError::ConflictingNativeMessage),
+                Some(true) => {
+                    if let Some(index) = index {
+                        duplicates.insert(index);
+                    }
+                }
+                None => {}
+            }
+        }
+        let mut index = 0;
+        self.sections.retain(|_| {
+            let retain = !duplicates.contains(&index);
+            index += 1;
+            retain
+        });
+        Ok(())
+    }
+
     /// Applies host image admission before aggregate selection, preserving section
     /// identity and each retained item's selection policy.
     pub fn retain_images(
@@ -320,7 +412,7 @@ fn retain_content(
             let original_bytes = match &item.content {
                 SectionContent::Transcript(record) => record.rendered().text_bytes,
                 SectionContent::Other(
-                    ContentItem::InputText { text } | ContentItem::OutputText { text },
+                    ContentItem::InputText { text } | ContentItem::OutputText { text, .. },
                 ) => text.len(),
                 SectionContent::Other(ContentItem::InputImage {
                     image: ImageReference::Inline { image_url },

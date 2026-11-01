@@ -346,7 +346,7 @@ jobs:
           PLATFORM: ${{ matrix.os }}
         run: |
           set -euo pipefail
-          binaries=(--bin zuno --bin codex-code-mode-host)
+          binaries=(--bin zuno --bin codex-code-mode-host --bin codex-exec-server)
           if [[ "$PLATFORM" == linux ]]; then
             binaries+=(--bin bwrap)
           elif [[ "$PLATFORM" == windows ]]; then

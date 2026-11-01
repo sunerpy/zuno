@@ -86,7 +86,7 @@ impl RollbackPlan {
         // A rolled-back turn can still own the empty checkpoint that keeps cold resume from
         // replaying older history.
         if let Some(compacted) = self.compacted_items.get(&record_index) {
-            line.item = RolloutItem::Compacted(compacted.clone());
+            line.item = RolloutItem::Compacted(Box::new(compacted.clone()));
             return Ok(Some(line));
         }
         if boundary.is_some_and(|boundary| !self.boundary_alive[boundary]) {
@@ -159,7 +159,9 @@ impl RollbackPlanner {
         self.pending_delivery_boundary = None;
 
         match &line.item {
-            RolloutItem::SessionMeta(_) => self.record_boundaries[index] = None,
+            RolloutItem::DynamicToolsUpdated { .. } | RolloutItem::SessionMeta(_) => {
+                self.record_boundaries[index] = None
+            }
             RolloutItem::ResponseItem(response) => {
                 if matches!(&response.item, ResponseItem::Message { role, .. } if role == "assistant")
                     || matches!(&response.item, ResponseItem::FunctionCall { .. })
@@ -262,7 +264,7 @@ impl RollbackPlanner {
                     record_index: index,
                     boundary_depth: self.boundary_stack.len(),
                     owner,
-                    item: item.clone(),
+                    item: item.as_ref().clone(),
                 });
             }
             RolloutItem::TurnContext(_) => {

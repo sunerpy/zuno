@@ -254,6 +254,39 @@ impl ProcessEntry {
         let mut reason = permissions
             .approval_reason(sandbox_permissions)
             .map_err(approval_error)?;
+        // A scoped grant can authorize retained authority without permitting new
+        // sandbox escalations. Still review every input, and only recognize grants
+        // that remain active for this terminal's environment with the same policy.
+        let additional_permissions_preapproved = matches!(
+            context.step_context.turn.approval_policy(),
+            AskForApproval::Granular(policy) if !policy.sandbox_approval
+        ) && sandbox_permissions
+            == SandboxPermissions::WithAdditionalPermissions
+            && permissions
+                .additional_permissions
+                .as_ref()
+                .zip(
+                    context
+                        .step_context
+                        .turn
+                        .granted_permissions(&self.environment_id),
+                )
+                .is_some_and(|(retained, current_grants)| {
+                    // Root containment does not prove filesystem coverage: child
+                    // restrictions, protected metadata, and symlinks can differ.
+                    // Require the original filesystem grants, including their order.
+                    retained.file_system == current_grants.file_system
+                        && (retained
+                            .network
+                            .as_ref()
+                            .and_then(|network| network.enabled)
+                            != Some(true)
+                            || current_grants
+                                .network
+                                .as_ref()
+                                .and_then(|network| network.enabled)
+                                == Some(true))
+                });
         if strict_policy {
             reason = format!(
                 "Strict approval policy: every terminal input is reviewed before it runs. {reason}"
@@ -264,11 +297,13 @@ impl ProcessEntry {
             approval_id: context.call_id.clone(),
             environment_id: self.environment_id.clone(),
             process_id: self.process_id,
+            original_command: self.hook_command.clone(),
             input: input.to_string(),
             cwd: self.cwd.clone(),
             tty: self.tty,
             sandbox_permissions,
             additional_permissions: permissions.additional_permissions.clone(),
+            additional_permissions_preapproved,
         };
         Ok(Some((action, reason)))
     }

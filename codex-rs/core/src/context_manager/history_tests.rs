@@ -1,12 +1,16 @@
 use super::*;
 use crate::context::APPROVED_COMMAND_PREFIX_SAVED_MESSAGE_PREFIX;
+use crate::context::ApprovedCommandPrefixSaved;
+use crate::context::ContextualUserFragment;
 use crate::context::UserInstructions;
 use crate::context::world_state::SectionTransition;
 use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSection;
 use crate::context::world_state::WorldStateUpdateContent;
+use crate::image_preparation::tests::FailingAttachmentStore;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use codex_attachment_store::InlineAttachmentStore;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::AgentPath;
@@ -27,6 +31,7 @@ use codex_protocol::models::LocalShellExecAction;
 use codex_protocol::models::LocalShellStatus;
 use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ReasoningItemReasoningSummary;
+use codex_protocol::models::input_text;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::default_input_modalities;
@@ -37,6 +42,7 @@ use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::TurnContextItem;
+use codex_protocol_test_support::ContentItemTestExt;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::truncate_text;
@@ -46,6 +52,8 @@ use image::Luma;
 use image::Rgba;
 use pretty_assertions::assert_eq;
 use regex_lite::Regex;
+use serde_json::from_value;
+use serde_json::json;
 use test_case::test_case;
 
 const EXEC_FORMAT_MAX_BYTES: usize = 10_000;
@@ -85,9 +93,13 @@ fn pcm_wav_data_url(sample_count: u32) -> (String, usize) {
 
 fn assistant_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: text.to_string(),
         }],
         phase: None,
@@ -104,9 +116,13 @@ fn inter_agent_assistant_msg(text: &str) -> ResponseItem {
         /*trigger_turn*/ true,
     );
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: serde_json::to_string(&communication).unwrap(),
         }],
         phase: None,
@@ -591,7 +607,7 @@ fn world_state_transitions_persist_changed_state_and_skip_unchanged_state() {
                 return (None, None);
             }
             (Some(snapshot), Some(RenderedWorldStateFragment::new(
-                "developer", ("<test>", "</test>"), value,
+                "developer", ("<test>", "</test>"), input_text(value.to_string()),
             )))
         }));
         state
@@ -605,7 +621,7 @@ fn world_state_transitions_persist_changed_state_and_skip_unchanged_state() {
     let WorldStateUpdateContent::Fragment(fragment) = &fragments[0].content else {
         panic!("expected a text fragment");
     };
-    assert_eq!(fragment.body(), "after");
+    assert_eq!(fragment.body().expect_text(), "after");
     let patch = patch.expect("changed snapshot must be persisted");
     assert!(!patch.full);
     let mut replayed = WorldStateSnapshot::from(&full.state);
@@ -636,7 +652,7 @@ fn world_state_reconciles_matching_legacy_history_once() {
         fragments
             .into_iter()
             .map(|update| match update.content {
-                WorldStateUpdateContent::Fragment(fragment) => fragment.body(),
+                WorldStateUpdateContent::Fragment(fragment) => fragment.body().expect_text(),
                 WorldStateUpdateContent::Item(item) =>
                     panic!("expected a text fragment, got {item:?}"),
             })
@@ -651,9 +667,13 @@ fn world_state_reconciles_matching_legacy_history_once() {
 
 fn user_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: text.to_string(),
         }],
         phase: None,
@@ -663,6 +683,8 @@ fn user_msg(text: &str) -> ResponseItem {
 
 fn user_input_text_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -675,6 +697,8 @@ fn user_input_text_msg(text: &str) -> ResponseItem {
 
 fn developer_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "developer".to_string(),
         content: vec![ContentItem::InputText {
@@ -687,6 +711,8 @@ fn developer_msg(text: &str) -> ResponseItem {
 
 fn developer_msg_with_fragments(texts: &[&str]) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "developer".to_string(),
         content: texts
@@ -781,9 +807,13 @@ fn filters_non_api_messages() {
     let policy = TruncationPolicy::Tokens(10_000);
     // System message is not API messages; Other is ignored.
     let system = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "system".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: "ignored".to_string(),
         }],
         phase: None,
@@ -828,6 +858,8 @@ fn retains_only_harness_authored_configuration_updates() {
             },
             ResponseItemEnvelope {
                 item: ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
                     id: None,
                     role: "system".to_string(),
                     content: vec![ContentItem::InputText {
@@ -905,6 +937,33 @@ fn non_last_reasoning_tokens_ignore_entries_after_last_user() {
     assert_eq!(history.get_non_last_reasoning_items_tokens(), 32);
 }
 
+#[test_case(None, 125; "legacy count")]
+#[test_case(Some(false), 125; "exclusive count")]
+#[test_case(Some(true), 100; "inclusive count")]
+fn total_token_usage_respects_saved_reasoning_accounting(
+    includes_reasoning: Option<bool>,
+    expected: i64,
+) {
+    let mut history = create_history_with_items(vec![
+        reasoning_with_encrypted_content(/*len*/ 1_000),
+        user_msg("second"),
+        assistant_msg("counted reply"),
+    ]);
+    let usage = TokenUsage {
+        total_tokens: 100,
+        ..Default::default()
+    };
+    let mut saved = json!({ "last_token_usage": usage, "total_token_usage": usage });
+    if let Some(included) = includes_reasoning {
+        saved["last_usage_includes_reasoning"] = json!(included);
+    }
+    history.set_token_info(Some(
+        serde_json::from_value(saved).expect("saved token count"),
+    ));
+
+    assert_eq!(history.get_total_token_usage(), expected);
+}
+
 #[test]
 fn items_after_last_model_generated_tokens_include_user_and_tool_output() {
     let history = create_history_with_items(vec![
@@ -945,13 +1004,18 @@ fn inter_agent_assistant_messages_are_turn_boundaries() {
     assert!(is_user_turn_boundary(&item));
 }
 
-#[test]
-fn for_prompt_preserves_inter_agent_assistant_messages() {
+#[tokio::test]
+async fn for_prompt_preserves_inter_agent_assistant_messages() {
     let item = inter_agent_assistant_msg("continue");
     let history = create_history_with_items(vec![item.clone()]);
 
     assert_eq!(raw_items(&history), std::slice::from_ref(&item));
-    assert_eq!(history.for_prompt(&default_input_modalities()), vec![item]);
+    assert_eq!(
+        history
+            .for_prompt(&default_input_modalities(), &InlineAttachmentStore)
+            .await,
+        vec![item]
+    );
 }
 
 #[test]
@@ -1051,10 +1115,12 @@ fn record_annotated_items_preserves_metadata_while_processing_item(
     );
 }
 
-#[test]
-fn for_prompt_annotated_preserves_metadata_while_normalizing_item() {
+#[tokio::test]
+async fn for_prompt_annotated_preserves_metadata_while_normalizing_item() {
     let envelope = ResponseItemEnvelope {
         item: ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "user".to_string(),
             content: vec![
@@ -1076,7 +1142,9 @@ fn for_prompt_annotated_preserves_metadata_while_normalizing_item() {
     let mut history = ContextManager::new();
     history.replace_annotated(vec![envelope.clone()]);
 
-    let normalized = history.for_prompt_annotated(&[InputModality::Text]);
+    let normalized = history
+        .for_prompt_annotated(&[InputModality::Text], &InlineAttachmentStore)
+        .await;
 
     assert_eq!(normalized.len(), 1);
     assert_eq!(normalized[0].metadata, envelope.metadata);
@@ -1119,6 +1187,7 @@ fn total_token_usage_includes_all_items_after_last_model_generated_item() {
             ..Default::default()
         },
         /*model_context_window*/ None,
+        /*includes_reasoning*/ true,
     );
     let added_user = user_msg("new user message");
     let added_tool_output = custom_tool_call_output("tool-tail", "new tool output");
@@ -1128,16 +1197,111 @@ fn total_token_usage_includes_all_items_after_last_model_generated_item() {
     );
 
     assert_eq!(
-        history.get_total_token_usage(/*server_reasoning_included*/ true),
+        history.get_total_token_usage(),
         100 + estimate_item_token_count(&added_user)
             + estimate_item_token_count(&added_tool_output)
     );
 }
 
-#[test]
-fn for_prompt_strips_media_when_model_does_not_support_it() {
+/// Unavailable images become harness-attributed placeholders without changing saved history or
+/// neighboring inline content and its annotations.
+#[tokio::test]
+async fn for_prompt_replaces_unavailable_message_images() {
+    let original: ResponseItem = from_value(json!({
+        "type": "message", "role": "user",
+        "content": [
+            {"type": "input_text", "text": "look"},
+            {"type": "input_image", "file_id": "expired"},
+            {"type": "input_image", "image_url": "data:image/png;base64,aW1hZ2U="}
+        ],
+        "internal_chat_message_metadata_passthrough": {
+            "content_item_kinds": ["user.text", "user.image", "user.image"]
+        }
+    }))
+    .unwrap();
+    let history = create_history_with_items(vec![original.clone()]);
+    let projected = history
+        .clone()
+        .for_prompt_annotated(
+            &[
+                InputModality::Text,
+                InputModality::Image,
+                InputModality::Audio,
+            ],
+            &FailingAttachmentStore,
+        )
+        .await;
+    let expected: ResponseItem = from_value(json!({
+        "type": "message", "role": "user",
+        "content": [
+            {"type": "input_text", "text": "look"},
+            {"type": "input_text", "text": "[image unavailable]"},
+            {"type": "input_image", "image_url": "data:image/png;base64,aW1hZ2U="}
+        ],
+        "internal_chat_message_metadata_passthrough": {
+            "content_item_kinds": ["user.text", "images.unavailable", "user.image"],
+            "content_item_metadata": [{}, {"harness_injected": true}, {}]
+        }
+    }))
+    .unwrap();
+    assert_eq!(projected, vec![ResponseItemEnvelope::new(expected)]);
+    assert_eq!(raw_items(&history), vec![original]);
+}
+
+/// Both tool output formats retain inline images and text when a neighboring file expires.
+#[tokio::test]
+async fn for_prompt_replaces_unavailable_tool_images() {
+    for (call, output) in [
+        (
+            json!({"type": "function_call", "call_id": "call-1", "name": "view_image", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "call-1"}),
+        ),
+        (
+            json!({"type": "custom_tool_call", "call_id": "call-1", "name": "js_repl", "input": "view_image"}),
+            json!({"type": "custom_tool_call_output", "call_id": "call-1"}),
+        ),
+    ] {
+        let call: ResponseItem = from_value(call).unwrap();
+        let mut original = output.clone();
+        original["output"] = json!([
+            {"type": "input_text", "text": "result"},
+            {"type": "input_image", "file_id": "expired"},
+            {"type": "input_image", "image_url": "data:image/png;base64,aW1hZ2U="}
+        ]);
+        let original: ResponseItem = from_value(original).unwrap();
+        let history = create_history_with_items(vec![call.clone(), original.clone()]);
+        let mut expected = output;
+        expected["output"] = json!([
+            {"type": "input_text", "text": "result"},
+            {"type": "input_text", "text": "[image unavailable]"},
+            {"type": "input_image", "image_url": "data:image/png;base64,aW1hZ2U="}
+        ]);
+        let expected: ResponseItem = from_value(expected).unwrap();
+
+        assert_eq!(
+            history
+                .clone()
+                .for_prompt(
+                    &[
+                        InputModality::Text,
+                        InputModality::Image,
+                        InputModality::Audio
+                    ],
+                    &FailingAttachmentStore,
+                )
+                .await,
+            vec![call.clone(), expected]
+        );
+        assert_eq!(raw_items(&history), vec![call, original]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn for_prompt_strips_media_when_model_does_not_support_it() {
     let items = vec![
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "user".to_string(),
             content: vec![
@@ -1171,6 +1335,8 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
             ),
         },
         ResponseItem::FunctionCall {
+            status: None,
+            encrypted_content: None,
             id: None,
             name: "view_image".to_string(),
             namespace: None,
@@ -1201,6 +1367,7 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::CustomToolCall {
+            encrypted_content: None,
             id: None,
             status: None,
             call_id: "tool-1".to_string(),
@@ -1233,10 +1400,14 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
     let fully_supported_items = items.clone();
     let history = create_history_with_items(items);
     let text_only_modalities = vec![InputModality::Text];
-    let stripped = history.for_prompt(&text_only_modalities);
+    let stripped = history
+        .for_prompt(&text_only_modalities, &InlineAttachmentStore)
+        .await;
 
     let expected = vec![
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "user".to_string(),
             content: vec![
@@ -1264,11 +1435,17 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
                         ContentItemKind("audio.unsupported".to_string()),
                         ContentItemKind("user.text".to_string()),
                     ]),
+                    content_item_metadata: from_value(json!([
+                        {}, {"harness_injected": true}, {"harness_injected": true}, {}
+                    ]))
+                    .unwrap(),
                     ..Default::default()
                 },
             ),
         },
         ResponseItem::FunctionCall {
+            status: None,
+            encrypted_content: None,
             id: None,
             name: "view_image".to_string(),
             namespace: None,
@@ -1298,6 +1475,7 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::CustomToolCall {
+            encrypted_content: None,
             id: None,
             status: None,
             call_id: "tool-1".to_string(),
@@ -1328,17 +1506,24 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
     ];
     assert_eq!(stripped, expected);
     assert_eq!(
-        create_history_with_items(fully_supported_items.clone()).for_prompt(&[
-            InputModality::Text,
-            InputModality::Image,
-            InputModality::Audio,
-        ]),
+        create_history_with_items(fully_supported_items.clone())
+            .for_prompt(
+                &[
+                    InputModality::Text,
+                    InputModality::Image,
+                    InputModality::Audio,
+                ],
+                &InlineAttachmentStore
+            )
+            .await,
         fully_supported_items
     );
 
     // With image support, images are preserved
     let modalities = default_input_modalities();
     let with_images = create_history_with_items(vec![ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![
@@ -1355,7 +1540,9 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }]);
-    let preserved = with_images.for_prompt(&modalities);
+    let preserved = with_images
+        .for_prompt(&modalities, &InlineAttachmentStore)
+        .await;
     assert_eq!(preserved.len(), 1);
     if let ResponseItem::Message { content, .. } = &preserved[0] {
         assert_eq!(content.len(), 2);
@@ -1365,6 +1552,8 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
     }
 
     let audio_message = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputAudio {
@@ -1375,15 +1564,21 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
     };
     let with_audio = create_history_with_items(vec![audio_message.clone()]);
     assert_eq!(
-        with_audio.for_prompt(&[InputModality::Text, InputModality::Audio]),
+        with_audio
+            .for_prompt(
+                &[InputModality::Text, InputModality::Audio],
+                &InlineAttachmentStore
+            )
+            .await,
         vec![audio_message]
     );
 }
 
-#[test]
-fn for_prompt_preserves_image_generation_calls_when_images_are_supported() {
+#[tokio::test]
+async fn for_prompt_preserves_image_generation_calls_when_images_are_supported() {
     let history = create_history_with_items(vec![
         ResponseItem::ImageGenerationCall {
+            encrypted_content: None,
             id: Some(ResponseItemId::with_suffix("ig", "123")),
             status: "generating".to_string(),
             revised_prompt: Some("lobster".to_string()),
@@ -1391,6 +1586,8 @@ fn for_prompt_preserves_image_generation_calls_when_images_are_supported() {
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -1402,9 +1599,12 @@ fn for_prompt_preserves_image_generation_calls_when_images_are_supported() {
     ]);
 
     assert_eq!(
-        history.for_prompt(&default_input_modalities()),
+        history
+            .for_prompt(&default_input_modalities(), &InlineAttachmentStore)
+            .await,
         vec![
             ResponseItem::ImageGenerationCall {
+                encrypted_content: None,
                 id: Some(ResponseItemId::with_suffix("ig", "123")),
                 status: "generating".to_string(),
                 revised_prompt: Some("lobster".to_string()),
@@ -1412,6 +1612,8 @@ fn for_prompt_preserves_image_generation_calls_when_images_are_supported() {
                 internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
@@ -1424,10 +1626,12 @@ fn for_prompt_preserves_image_generation_calls_when_images_are_supported() {
     );
 }
 
-#[test]
-fn for_prompt_clears_image_generation_result_when_images_are_unsupported() {
+#[tokio::test]
+async fn for_prompt_clears_image_generation_result_when_images_are_unsupported() {
     let history = create_history_with_items(vec![
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -1437,6 +1641,7 @@ fn for_prompt_clears_image_generation_result_when_images_are_unsupported() {
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::ImageGenerationCall {
+            encrypted_content: None,
             id: Some(ResponseItemId::with_suffix("ig", "123")),
             status: "completed".to_string(),
             revised_prompt: Some("lobster".to_string()),
@@ -1446,9 +1651,13 @@ fn for_prompt_clears_image_generation_result_when_images_are_unsupported() {
     ]);
 
     assert_eq!(
-        history.for_prompt(&[InputModality::Text]),
+        history
+            .for_prompt(&[InputModality::Text], &InlineAttachmentStore)
+            .await,
         vec![
             ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
@@ -1458,6 +1667,7 @@ fn for_prompt_clears_image_generation_result_when_images_are_unsupported() {
                 internal_chat_message_metadata_passthrough: Some(unknown_content_metadata()),
             },
             ResponseItem::ImageGenerationCall {
+                encrypted_content: None,
                 id: Some(ResponseItemId::with_suffix("ig", "123")),
                 status: "completed".to_string(),
                 revised_prompt: Some("lobster".to_string()),
@@ -1514,6 +1724,8 @@ fn estimate_token_count_counts_recorded_base_instructions_once() {
 fn remove_first_item_removes_matching_output_for_function_call() {
     let items = vec![
         ResponseItem::FunctionCall {
+            status: None,
+            encrypted_content: None,
             id: None,
             name: "do_it".to_string(),
             namespace: None,
@@ -1548,6 +1760,8 @@ fn remove_first_item_removes_matching_call_for_output() {
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCall {
+            status: None,
+            encrypted_content: None,
             id: None,
             name: "do_it".to_string(),
             namespace: None,
@@ -1566,6 +1780,7 @@ fn remove_first_item_removes_matching_call_for_output() {
 fn remove_first_item_handles_local_shell_pair() {
     let items = vec![
         ResponseItem::LocalShellCall {
+            encrypted_content: None,
             id: None,
             call_id: Some("call-3".to_string()),
             status: LocalShellStatus::Completed,
@@ -1592,8 +1807,8 @@ fn remove_first_item_handles_local_shell_pair() {
     assert_eq!(raw_items(&h), vec![]);
 }
 
-#[test]
-fn drop_last_n_user_turns_preserves_prefix() {
+#[tokio::test]
+async fn drop_last_n_user_turns_preserves_prefix() {
     let items = vec![
         assistant_msg("session prefix item"),
         user_msg("u1"),
@@ -1606,7 +1821,9 @@ fn drop_last_n_user_turns_preserves_prefix() {
     let mut history = create_history_with_items(items);
     history.drop_last_n_user_turns(/*num_turns*/ 1);
     assert_eq!(
-        history.for_prompt(&modalities),
+        history
+            .for_prompt(&modalities, &InlineAttachmentStore)
+            .await,
         vec![
             assistant_msg("session prefix item"),
             user_msg("u1"),
@@ -1623,7 +1840,10 @@ fn drop_last_n_user_turns_preserves_prefix() {
     ]);
     history.drop_last_n_user_turns(/*num_turns*/ 99);
     assert_eq!(
-        history.clone().for_prompt(&modalities),
+        history
+            .clone()
+            .for_prompt(&modalities, &InlineAttachmentStore)
+            .await,
         vec![assistant_msg("session prefix item")]
     );
     // With no remaining instruction boundary, rollback must not revoke facts from a
@@ -1652,6 +1872,8 @@ fn drop_last_n_user_turns_preserves_prefix() {
         ("steer", "Check the tests too."),
     ] {
         let message = ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: Some(ResponseItemId::with_suffix("msg", id)),
             role: "user".to_owned(),
             content: vec![ContentItem::InputText {
@@ -1725,8 +1947,8 @@ fn rollback_removes_assistant_sources_recorded_ahead_of_queued_input() {
     );
 }
 
-#[test]
-fn drop_last_n_user_turns_ignores_session_prefix_user_messages() {
+#[tokio::test]
+async fn drop_last_n_user_turns_ignores_session_prefix_user_messages() {
     let items = vec![
         user_input_text_msg("<environment_context>ctx</environment_context>"),
         user_input_text_msg(
@@ -1766,7 +1988,9 @@ fn drop_last_n_user_turns_ignores_session_prefix_user_messages() {
     ];
 
     assert_eq!(
-        history.for_prompt(&modalities),
+        history
+            .for_prompt(&modalities, &InlineAttachmentStore)
+            .await,
         expected_prefix_and_first_turn
     );
 
@@ -1802,7 +2026,12 @@ fn drop_last_n_user_turns_ignores_session_prefix_user_messages() {
         assistant_msg("turn 2 assistant"),
     ]);
     history.drop_last_n_user_turns(/*num_turns*/ 2);
-    assert_eq!(history.for_prompt(&modalities), expected_prefix_only);
+    assert_eq!(
+        history
+            .for_prompt(&modalities, &InlineAttachmentStore)
+            .await,
+        expected_prefix_only
+    );
 
     let mut history = create_history_with_items(vec![
         user_input_text_msg("<environment_context>ctx</environment_context>"),
@@ -1822,11 +2051,16 @@ fn drop_last_n_user_turns_ignores_session_prefix_user_messages() {
         assistant_msg("turn 2 assistant"),
     ]);
     history.drop_last_n_user_turns(/*num_turns*/ 3);
-    assert_eq!(history.for_prompt(&modalities), expected_prefix_only);
+    assert_eq!(
+        history
+            .for_prompt(&modalities, &InlineAttachmentStore)
+            .await,
+        expected_prefix_only
+    );
 }
 
-#[test]
-fn drop_last_n_user_turns_trims_context_updates_above_rolled_back_turn() {
+#[tokio::test]
+async fn drop_last_n_user_turns_trims_context_updates_above_rolled_back_turn() {
     let items = vec![
         assistant_msg("session prefix item"),
         user_input_text_msg("turn 1 user"),
@@ -1860,7 +2094,10 @@ fn drop_last_n_user_turns_trims_context_updates_above_rolled_back_turn() {
     history.drop_last_n_user_turns(/*num_turns*/ 1);
 
     assert_eq!(
-        history.clone().for_prompt(&modalities),
+        history
+            .clone()
+            .for_prompt(&modalities, &InlineAttachmentStore)
+            .await,
         vec![
             assistant_msg("session prefix item"),
             user_input_text_msg("turn 1 user"),
@@ -1878,8 +2115,12 @@ fn drop_last_n_user_turns_trims_context_updates_above_rolled_back_turn() {
 #[test]
 fn drop_last_n_user_turns_preserves_annotations_for_surviving_developer_fragments() {
     let turn_id = "rolled-back-turn";
-    let model_switch = ModelSwitchInstructions::new("switched model instructions").render();
+    let model_switch = ModelSwitchInstructions::new("switched model instructions")
+        .render()
+        .expect_text();
     let developer_message = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "developer".to_string(),
         content: vec![
@@ -1916,6 +2157,8 @@ fn drop_last_n_user_turns_preserves_annotations_for_surviving_developer_fragment
     assert_eq!(
         raw_items(&history),
         vec![ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "developer".to_string(),
             content: vec![
@@ -1941,15 +2184,38 @@ fn drop_last_n_user_turns_preserves_annotations_for_surviving_developer_fragment
     );
 }
 
-#[test]
-fn drop_last_n_user_turns_trims_saved_prefix_update_above_rolled_back_turn() {
+#[test_case::test_case(APPROVED_COMMAND_PREFIX_SAVED_MESSAGE_PREFIX, None; "legacy")]
+#[test_case::test_case("Saved for this session", Some(crate::context::SAVED_PREFIX_KIND); "catalog")]
+#[test_case::test_case("Saved for this session", None; "catalog_without_metadata")]
+#[tokio::test]
+async fn drop_last_n_user_turns_trims_saved_prefix_update_above_rolled_back_turn(
+    heading: &str,
+    kind: Option<&str>,
+) {
+    // Without metadata, use the rendered text to exercise the legacy reader's
+    // prefix-based classification of notifications written by this client.
+    let text = match kind {
+        Some(_) => format!("{heading}\n- [\"touch\"]"),
+        None => ApprovedCommandPrefixSaved::new("- [\"touch\"]".to_string(), Some(heading))
+            .render()
+            .expect_text(),
+    };
+    let mut notification = developer_msg(&text);
+    if let Some(kind) = kind
+        && let ResponseItem::Message {
+            internal_chat_message_metadata_passthrough,
+            ..
+        } = &mut notification
+    {
+        internal_chat_message_metadata_passthrough
+            .get_or_insert_with(Default::default)
+            .content_item_kinds = Some(vec![ContentItemKind(kind.to_owned())]);
+    }
     let items = vec![
         assistant_msg("session prefix item"),
         user_input_text_msg("turn 1 user"),
         assistant_msg("turn 1 assistant"),
-        developer_msg(&format!(
-            "{APPROVED_COMMAND_PREFIX_SAVED_MESSAGE_PREFIX}\n- [\"touch\"]"
-        )),
+        notification,
         user_input_text_msg("turn 2 user"),
         assistant_msg("turn 2 assistant"),
     ];
@@ -1959,7 +2225,9 @@ fn drop_last_n_user_turns_trims_saved_prefix_update_above_rolled_back_turn() {
     history.drop_last_n_user_turns(/*num_turns*/ 1);
 
     assert_eq!(
-        history.for_prompt(&modalities),
+        history
+            .for_prompt(&modalities, &InlineAttachmentStore)
+            .await,
         vec![
             assistant_msg("session prefix item"),
             user_input_text_msg("turn 1 user"),
@@ -1968,8 +2236,8 @@ fn drop_last_n_user_turns_trims_saved_prefix_update_above_rolled_back_turn() {
     );
 }
 
-#[test]
-fn drop_last_n_user_turns_clears_reference_context_for_mixed_developer_context_bundles() {
+#[tokio::test]
+async fn drop_last_n_user_turns_clears_reference_context_for_mixed_developer_context_bundles() {
     let items = vec![
         user_input_text_msg("turn 1 user"),
         assistant_msg("turn 1 assistant"),
@@ -1990,7 +2258,10 @@ fn drop_last_n_user_turns_clears_reference_context_for_mixed_developer_context_b
     history.drop_last_n_user_turns(/*num_turns*/ 1);
 
     assert_eq!(
-        history.clone().for_prompt(&modalities),
+        history
+            .clone()
+            .for_prompt(&modalities, &InlineAttachmentStore)
+            .await,
         vec![
             user_input_text_msg("turn 1 user"),
             assistant_msg("turn 1 assistant"),
@@ -2003,6 +2274,7 @@ fn drop_last_n_user_turns_clears_reference_context_for_mixed_developer_context_b
 fn remove_first_item_handles_custom_tool_pair() {
     let items = vec![
         ResponseItem::CustomToolCall {
+            encrypted_content: None,
             id: None,
             status: None,
             call_id: "tool-1".to_string(),
@@ -2024,10 +2296,11 @@ fn remove_first_item_handles_custom_tool_pair() {
     assert_eq!(raw_items(&h), vec![]);
 }
 
-#[test]
-fn normalization_retains_local_shell_outputs() {
+#[tokio::test]
+async fn normalization_retains_local_shell_outputs() {
     let items = vec![
         ResponseItem::LocalShellCall {
+            encrypted_content: None,
             id: None,
             call_id: Some("shell-1".to_string()),
             status: LocalShellStatus::Completed,
@@ -2052,7 +2325,9 @@ fn normalization_retains_local_shell_outputs() {
 
     let modalities = default_input_modalities();
     let history = create_history_with_items(items.clone());
-    let normalized = history.for_prompt(&modalities);
+    let normalized = history
+        .for_prompt(&modalities, &InlineAttachmentStore)
+        .await;
     assert_eq!(normalized, items);
 }
 
@@ -2259,10 +2534,11 @@ fn format_exec_output_prefers_line_marker_when_both_limits_exceeded() {
     assert_truncated_message_matches(&truncated, "line-0-", /*expected_removed*/ 17_423);
 }
 
-#[cfg(not(debug_assertions))]
-#[test]
-fn normalize_adds_missing_output_for_custom_tool_call() {
+#[cfg_attr(not(debug_assertions), test_case::test_case(false; "local"))]
+#[test_case::test_case(true; "inherited")]
+fn normalize_adds_missing_output_for_custom_tool_call(inherited: bool) {
     let items = vec![ResponseItem::CustomToolCall {
+        encrypted_content: None,
         id: None,
         status: None,
         call_id: "tool-x".to_string(),
@@ -2272,6 +2548,10 @@ fn normalize_adds_missing_output_for_custom_tool_call() {
         internal_chat_message_metadata_passthrough: None,
     }];
     let mut h = create_history_with_items(items);
+    Arc::make_mut(&mut h.items)[0]
+        .metadata
+        .get_or_insert_default()
+        .inherited_user_message = inherited;
 
     h.normalize_history(&default_input_modalities());
 
@@ -2279,6 +2559,7 @@ fn normalize_adds_missing_output_for_custom_tool_call() {
         raw_items(&h),
         vec![
             ResponseItem::CustomToolCall {
+                encrypted_content: None,
                 id: None,
                 status: None,
                 call_id: "tool-x".to_string(),
@@ -2298,10 +2579,11 @@ fn normalize_adds_missing_output_for_custom_tool_call() {
     );
 }
 
-#[cfg(not(debug_assertions))]
-#[test]
-fn normalize_adds_missing_output_for_local_shell_call_with_id() {
+#[cfg_attr(not(debug_assertions), test_case::test_case(false; "local"))]
+#[test_case::test_case(true; "inherited")]
+fn normalize_adds_missing_output_for_local_shell_call_with_id(inherited: bool) {
     let items = vec![ResponseItem::LocalShellCall {
+        encrypted_content: None,
         id: None,
         call_id: Some("shell-1".to_string()),
         status: LocalShellStatus::Completed,
@@ -2315,6 +2597,10 @@ fn normalize_adds_missing_output_for_local_shell_call_with_id() {
         internal_chat_message_metadata_passthrough: None,
     }];
     let mut h = create_history_with_items(items);
+    Arc::make_mut(&mut h.items)[0]
+        .metadata
+        .get_or_insert_default()
+        .inherited_user_message = inherited;
 
     h.normalize_history(&default_input_modalities());
 
@@ -2322,6 +2608,7 @@ fn normalize_adds_missing_output_for_local_shell_call_with_id() {
         raw_items(&h),
         vec![
             ResponseItem::LocalShellCall {
+                encrypted_content: None,
                 id: None,
                 call_id: Some("shell-1".to_string()),
                 status: LocalShellStatus::Completed,
@@ -2387,6 +2674,8 @@ fn normalize_mixed_inserts_and_removals() {
     let items = vec![
         // Will get an inserted output
         ResponseItem::FunctionCall {
+            status: None,
+            encrypted_content: None,
             id: None,
             name: "f1".to_string(),
             namespace: None,
@@ -2406,6 +2695,7 @@ fn normalize_mixed_inserts_and_removals() {
         },
         // Will get an inserted custom tool output
         ResponseItem::CustomToolCall {
+            encrypted_content: None,
             id: None,
             status: None,
             call_id: "t1".to_string(),
@@ -2416,6 +2706,7 @@ fn normalize_mixed_inserts_and_removals() {
         },
         // Local shell call also gets an inserted function call output
         ResponseItem::LocalShellCall {
+            encrypted_content: None,
             id: None,
             call_id: Some("s1".to_string()),
             status: LocalShellStatus::Completed,
@@ -2437,6 +2728,8 @@ fn normalize_mixed_inserts_and_removals() {
         raw_items(&h),
         vec![
             ResponseItem::FunctionCall {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 name: "f1".to_string(),
                 namespace: None,
@@ -2454,6 +2747,7 @@ fn normalize_mixed_inserts_and_removals() {
                 internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::CustomToolCall {
+                encrypted_content: None,
                 id: None,
                 status: None,
                 call_id: "t1".to_string(),
@@ -2470,6 +2764,7 @@ fn normalize_mixed_inserts_and_removals() {
                 internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::LocalShellCall {
+                encrypted_content: None,
                 id: None,
                 call_id: Some("s1".to_string()),
                 status: LocalShellStatus::Completed,
@@ -2497,6 +2792,8 @@ fn normalize_mixed_inserts_and_removals() {
 #[test]
 fn normalize_adds_missing_output_for_function_call_inserts_output() {
     let items = vec![ResponseItem::FunctionCall {
+        status: None,
+        encrypted_content: None,
         id: None,
         name: "do_it".to_string(),
         namespace: None,
@@ -2511,6 +2808,8 @@ fn normalize_adds_missing_output_for_function_call_inserts_output() {
         raw_items(&h),
         vec![
             ResponseItem::FunctionCall {
+                encrypted_content: None,
+                status: None,
                 id: None,
                 name: "do_it".to_string(),
                 namespace: None,
@@ -2531,8 +2830,8 @@ fn normalize_adds_missing_output_for_function_call_inserts_output() {
     );
 }
 
-#[test]
-fn normalize_preserves_named_function_call_output_without_call_id() {
+#[tokio::test]
+async fn normalize_preserves_named_function_call_output_without_call_id() {
     let item = ResponseItem::FunctionCallOutput {
         id: None,
         call_id: None,
@@ -2543,13 +2842,20 @@ fn normalize_preserves_named_function_call_output_without_call_id() {
     };
     let history = create_history_with_items(vec![item.clone()]);
 
-    assert_eq!(history.for_prompt(&default_input_modalities()), vec![item]);
+    assert_eq!(
+        history
+            .for_prompt(&default_input_modalities(), &InlineAttachmentStore)
+            .await,
+        vec![item]
+    );
 }
 
-#[test]
-fn for_prompt_assigns_stable_id_to_synthetic_output_without_reordering_history() {
+#[tokio::test]
+async fn for_prompt_assigns_stable_id_to_synthetic_output_without_reordering_history() {
     let items = vec![
         ResponseItem::FunctionCall {
+            status: None,
+            encrypted_content: None,
             id: Some(ResponseItemId::with_suffix("fc", "existing")),
             name: "do_it".to_string(),
             namespace: None,
@@ -2559,6 +2865,8 @@ fn for_prompt_assigns_stable_id_to_synthetic_output_without_reordering_history()
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: Some(ResponseItemId::with_suffix("msg", "later")),
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -2569,8 +2877,12 @@ fn for_prompt_assigns_stable_id_to_synthetic_output_without_reordering_history()
         },
     ];
 
-    let first = create_history_with_items(items.clone()).for_prompt(&default_input_modalities());
-    let second = create_history_with_items(items).for_prompt(&default_input_modalities());
+    let first = create_history_with_items(items.clone())
+        .for_prompt(&default_input_modalities(), &InlineAttachmentStore)
+        .await;
+    let second = create_history_with_items(items)
+        .for_prompt(&default_input_modalities(), &InlineAttachmentStore)
+        .await;
 
     assert_eq!(
         first, second,
@@ -2593,6 +2905,7 @@ fn for_prompt_assigns_stable_id_to_synthetic_output_without_reordering_history()
 #[test]
 fn normalize_adds_missing_output_for_tool_search_call() {
     let items = vec![ResponseItem::ToolSearchCall {
+        encrypted_content: None,
         id: None,
         call_id: Some("search-call-x".to_string()),
         status: Some("completed".to_string()),
@@ -2608,6 +2921,7 @@ fn normalize_adds_missing_output_for_tool_search_call() {
         raw_items(&h),
         vec![
             ResponseItem::ToolSearchCall {
+                encrypted_content: None,
                 id: None,
                 call_id: Some("search-call-x".to_string()),
                 status: Some("completed".to_string()),
@@ -2632,6 +2946,7 @@ fn normalize_adds_missing_output_for_tool_search_call() {
 #[should_panic]
 fn normalize_adds_missing_output_for_custom_tool_call_panics_in_debug() {
     let items = vec![ResponseItem::CustomToolCall {
+        encrypted_content: None,
         id: None,
         status: None,
         call_id: "tool-x".to_string(),
@@ -2649,6 +2964,7 @@ fn normalize_adds_missing_output_for_custom_tool_call_panics_in_debug() {
 #[should_panic]
 fn normalize_adds_missing_output_for_local_shell_call_with_id_panics_in_debug() {
     let items = vec![ResponseItem::LocalShellCall {
+        encrypted_content: None,
         id: None,
         call_id: Some("shell-1".to_string()),
         status: LocalShellStatus::Completed,
@@ -2763,6 +3079,8 @@ fn normalize_keeps_server_tool_search_output_without_matching_call() {
 fn normalize_mixed_inserts_and_removals_panics_in_debug() {
     let items = vec![
         ResponseItem::FunctionCall {
+            status: None,
+            encrypted_content: None,
             id: None,
             name: "f1".to_string(),
             namespace: None,
@@ -2780,6 +3098,7 @@ fn normalize_mixed_inserts_and_removals_panics_in_debug() {
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::CustomToolCall {
+            encrypted_content: None,
             id: None,
             status: None,
             call_id: "t1".to_string(),
@@ -2789,6 +3108,7 @@ fn normalize_mixed_inserts_and_removals_panics_in_debug() {
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::LocalShellCall {
+            encrypted_content: None,
             id: None,
             call_id: Some("s1".to_string()),
             status: LocalShellStatus::Completed,
@@ -2811,6 +3131,8 @@ fn image_data_url_payload_does_not_dominate_message_estimate() {
     let payload = "A".repeat(100_000);
     let image_url = format!("data:image/png;base64,{payload}");
     let image_item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![
@@ -2826,6 +3148,8 @@ fn image_data_url_payload_does_not_dominate_message_estimate() {
         internal_chat_message_metadata_passthrough: None,
     };
     let text_only_item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -2849,6 +3173,8 @@ fn image_data_url_payload_does_not_dominate_message_estimate() {
 #[test]
 fn file_images_use_detail_appropriate_estimates() {
     let item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![
@@ -2948,6 +3274,8 @@ fn image_data_url_payload_does_not_dominate_custom_tool_call_output_estimate() {
 fn audio_data_url_payload_does_not_dominate_message_estimate() {
     let (audio_url, _) = pcm_wav_data_url(/*sample_count*/ 801);
     let item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputAudio { audio_url }],
@@ -3013,6 +3341,8 @@ fn malformed_audio_data_url_falls_back_to_whole_url_size_cost() {
     let audio_url = format!("data:audio/wav;base64,{payload}");
     let fallback_bytes = approx_bytes_for_tokens(approx_token_count(&audio_url)) as i64;
     let item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputAudio { audio_url }],
@@ -3068,6 +3398,8 @@ fn record_items_omits_audio_that_exceeds_the_output_budget() {
 #[test]
 fn non_base64_image_urls_use_image_estimates() {
     let message_item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputImage {
@@ -3147,6 +3479,27 @@ fn passthrough_metadata_does_not_change_context_estimates() {
 }
 
 #[test]
+fn encrypted_compactions_use_replay_cache_estimate() {
+    for (encoded_len, expected_tokens) in [(0, 0), (1, 1), (11, 1), (12, 1), (13, 2), (8_000, 667)]
+    {
+        for item in [
+            ResponseItem::Compaction {
+                id: None,
+                encrypted_content: "a".repeat(encoded_len),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::ContextCompaction {
+                id: None,
+                encrypted_content: Some("a".repeat(encoded_len)),
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ] {
+            assert_eq!(estimate_item_token_count(&item), expected_tokens);
+        }
+    }
+}
+
+#[test]
 fn encrypted_function_output_uses_plaintext_byte_estimate() {
     let encrypted_content = "A".repeat(1_868);
     let item = ResponseItem::FunctionCallOutput {
@@ -3190,6 +3543,8 @@ fn encrypted_function_output_uses_plaintext_byte_estimate() {
 #[test]
 fn data_url_without_base64_marker_uses_image_estimate() {
     let item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputImage {
@@ -3238,6 +3593,8 @@ fn mixed_case_data_url_markers_are_adjusted() {
     let payload = "F".repeat(1_024);
     let image_url = format!("DATA:image/png;BASE64,{payload}");
     let item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputImage {
@@ -3261,6 +3618,8 @@ fn multiple_inline_images_apply_multiple_fixed_costs() {
     let image_url_one = format!("data:image/png;base64,{payload_one}");
     let image_url_two = format!("data:image/jpeg;base64,{payload_two}");
     let item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![
@@ -3397,9 +3756,13 @@ fn original_detail_webp_images_scale_with_dimensions() {
 #[test]
 fn text_only_items_count_decoded_content() {
     let item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: "Hello, \"world\"!\nこんにちは".to_string(),
         }],
         phase: None,

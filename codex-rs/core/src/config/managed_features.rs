@@ -124,6 +124,7 @@ impl ManagedFeatures {
         let mut values = self.get().clone();
         for feature in [
             Feature::EnableMcpApps,
+            Feature::McpConnectionSharing,
             Feature::SecretAuthStorage,
             Feature::McpOAuthRefreshCoordination,
         ] {
@@ -241,6 +242,24 @@ fn parse_feature_requirements(
     let mut pinned_features = BTreeMap::new();
     for (key, enabled) in feature_requirements.entries {
         if key == Feature::Personality.key() {
+            continue;
+        }
+        if key == Feature::Worktrees.key() || key == Feature::RealtimeConversation.key() {
+            push_feature_requirement_warning(
+                &mut startup_warnings,
+                format!(
+                    "Ignoring removed `features` requirement `{key}` from {source}; availability no longer depends on this feature flag."
+                ),
+            );
+            continue;
+        }
+        if matches!(key.as_str(), "shell_zsh_fork" | "unified_exec_zsh_fork") {
+            push_feature_requirement_warning(
+                &mut startup_warnings,
+                format!(
+                    "Ignoring removed `features` requirement `{key}` from {source}; the patched zsh backend has been removed."
+                ),
+            );
             continue;
         }
         if key == Feature::GuardianThreadContext.key() {
