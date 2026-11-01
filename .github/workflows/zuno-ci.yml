@@ -348,13 +348,18 @@ jobs:
           PLATFORM: ${{ matrix.os }}
         run: |
           set -euo pipefail
-          binaries=(--bin zuno --bin codex-code-mode-host --bin codex-exec-server)
+          binaries=(--bin zuno --bin codex-code-mode-host)
           if [[ "$PLATFORM" == linux ]]; then
             binaries+=(--bin bwrap)
           elif [[ "$PLATFORM" == windows ]]; then
             binaries+=(--bin codex-command-runner --bin codex-windows-sandbox-setup)
           fi
           cargo build --locked --release --target "$TARGET" "${binaries[@]}"
+          # The standalone executor links nearly everything zuno links, and linking
+          # both at once ran the 15 GB Windows containers out of memory. The second
+          # pass selects the same packages, so it reuses the first pass's artifacts
+          # and only links codex-exec-server.
+          cargo build --locked --release --target "$TARGET" "${binaries[@]}" --bin codex-exec-server
       - name: Build canonical Zuno package archives
         shell: bash
         env:
